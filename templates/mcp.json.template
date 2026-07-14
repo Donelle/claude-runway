@@ -1,0 +1,38 @@
+{
+  "_comment": "Save this as .mcp.json at the root of each project repo and commit it. Change COLLECTION_NAME per project. Opening Claude Code in a project directory loads that project's .mcp.json automatically, so switching projects switches collections with zero manual action. INDEX_INCLUDE_EXTENSIONS/INDEX_EXCLUDE_DIRS are optional -- leave blank ('') to use the built-in code/doc extension list and default excludes (.git, node_modules, dist, build, etc.) plus the repo's own .gitignore. Set INDEX_INCLUDE_EXTENSIONS (e.g. '.py,.md') to restrict to specific file types, or INDEX_EXCLUDE_DIRS (e.g. 'fixtures,generated') to skip additional folders.",
+
+  "mcpServers": {
+    "qdrant": {
+      "command": "uvx",
+      "args": ["--python", "3.12", "mcp-server-qdrant"],
+      "env": {
+        "QDRANT_URL": "http://localhost:6333",
+        "COLLECTION_NAME": "REPLACE-WITH-THIS-PROJECTS-NAME",
+        "EMBEDDING_MODEL": "sentence-transformers/all-MiniLM-L6-v2",
+        "TOOL_FIND_DESCRIPTION": "Semantically search previously stored project knowledge (code locations, design decisions, past investigation findings) for THIS project. Use this BEFORE grepping or reading files for conceptual questions like 'where is X handled' or 'why was Y built this way'. Do NOT use for exact string, symbol, or error-message matches -- use Grep for those. Returns stored entries as text, including any metadata (e.g. file_path, line_range) attached when stored -- use that metadata to read only the relevant lines instead of the whole file. Input: query (a natural-language question, not a code snippet).",
+        "TOOL_STORE_DESCRIPTION": "Persist a distilled finding for this project's future sessions -- e.g. a bug's root cause, a design decision and its rationale, or the answer to a search that took real exploration to find. Store a short summary, not raw file dumps. ALWAYS include file_path and line_range (or source/url for non-code) in metadata. Do not store speculative or in-progress reasoning. Input: information (concise summary), metadata (JSON, must include file_path/line_range or source when applicable)."
+      }
+    },
+    "codebase-indexer": {
+      "command": "python",
+      "type": "stdio",
+      "args": ["/absolute/path/to/ingest_mcp_server.py"],
+      "env": {
+        "QDRANT_URL": "http://localhost:6333",
+        "COLLECTION_NAME": "REPLACE-WITH-THIS-PROJECTS-NAME",
+        "EMBEDDING_MODEL": "sentence-transformers/all-MiniLM-L6-v2",
+        "INDEX_INCLUDE_EXTENSIONS": "",
+        "INDEX_EXCLUDE_DIRS": ""
+      }
+    },
+    "local-compress": {
+      "command": "python",
+      "type": "stdio",
+      "args": ["/absolute/path/to/compress_mcp_server.py"],
+      "env": {
+        "LMSTUDIO_BASE_URL": "http://localhost:1234/v1",
+        "LMSTUDIO_MODEL": "REPLACE-WITH-MODEL"
+      }
+    }
+  }
+}

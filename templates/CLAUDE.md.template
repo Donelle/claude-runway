@@ -1,0 +1,34 @@
+<!--
+  Copy the sections below into a project's CLAUDE.md. Only include a section
+  if that project actually has the corresponding MCP server configured in
+  its .mcp.json -- referencing tools that aren't connected just wastes
+  context on instructions Claude can't act on.
+-->
+
+## Vector memory (Qdrant MCP)
+
+Two tools: `qdrant-find` (semantic search) and `qdrant-store` (save a note for later retrieval), plus `index_repo`/`sync_repo`/`preview_index`/`get_collection_info` from the codebase-indexer server.
+
+Prefer `qdrant-find` over Grep/Read for conceptual lookups — "where is X handled," "how does Y work," "what did we decide about Z." Use Grep directly for exact identifiers, error strings, or known symbols.
+
+Treat results as leads, not facts. If a result's metadata includes file_path and line_range, open only that span with Read rather than the whole file.
+
+Storage convention for qdrant-store: always include file_path + line_range (or source/url for non-code) and a one-line summary in metadata. Store distilled findings after solving a problem, not raw text or in-progress reasoning.
+
+Run sync_repo at the start of a session (or after a batch of edits) to keep the index current — it only re-embeds files that changed, so it's cheap to run often. Use index_repo with reset=true only for first-time indexing or after changing chunking/embedding settings. Call get_collection_info if qdrant-find comes back empty, to check whether the collection actually has data.
+
+Dedup within a session: if the same conceptual question resurfaces, reuse the earlier qdrant-find result instead of re-querying.
+
+## Local compression (LM Studio MCP)
+
+Four tools: `compress_file`, `compress_command_output`, `fetch_url` (use these), and `compress_text` (narrow case only — see below).
+
+Prefer `compress_command_output` over Bash when a command is expected to produce large, mostly-mechanical output — test suites, builds, verbose linters — and you want to know the gist or whether it failed, not read the full log. Prefer `compress_file` over Read for large mechanical files already on disk (saved logs, big diffs) under the same condition. Prefer `fetch_url` over WebFetch when you want the page reviewed and summarized by the local model instead of by WebFetch's own Anthropic-hosted extraction step — `fetch_url` lets you steer what to extract via `focus`, and does the fetch, extraction, and summarization entirely server-side/locally. Do NOT use `fetch_url` for pages needing auth, JavaScript rendering, or session handling — use WebFetch for those. All three run/read/fetch server-side, so the raw content never enters your context — only the summary does. That's what makes these save tokens; reading the output yourself first and then trying to compress it does not.
+
+POSITIONAL asks (the lead/intro section, the first paragraph, the first N lines, an abstract) work through `focus` alone — describe the position in plain language (e.g. `focus="summarize the lead section"`), the same way you'd describe a topic-based ask. Recognized positional phrasings are auto-truncated to the document's actual beginning before anything else happens, deterministically — this isn't left to the model's judgment, because testing showed even a classifier explicitly told each chunk's position wasn't reliably followed by every local model (one real test still returned a digest of the article's Techniques section mislabeled as "the lead section"). Topic-based asks (a specific fact, a named concept) go through the position-aware classifier and work well, including correctly returning an explicit not-found error rather than fabricating something when a topic isn't actually present — verified against a real page and a real local model. `max_chars` is available as an explicit override on any of the three if you want a specific size rather than the automatic default.
+
+Do NOT use either for source code you intend to edit — read that directly with Read so you have exact, unmodified content to work from. Do NOT use them when you need the exact output verbatim (something you're about to parse, a diff you intend to apply, an exact error string you'll grep for next) — a summary is for deciding where to look next, not a substitute for precise text. If a summary reveals something needing exact follow-up (a line number, an exact error string), read that specific file or re-run a narrower command directly afterward rather than trusting the summary as authoritative.
+
+compress_text does not save tokens if you already had to read something into context to call it — only use it for content you legitimately already hold (e.g. your own long draft), not as a way to compress something you just read or ran.
+
+If list_local_models reports LM Studio isn't reachable or no model is loaded, fall back to reading/running things directly rather than blocking on it.

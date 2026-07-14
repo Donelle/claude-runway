@@ -1,0 +1,21 @@
+# Core -- required for the Qdrant codebase-memory piece (ingest_to_qdrant.py,
+# ingest_mcp_server.py). Install these even if you're not using local-compress.
+mcp[cli]
+mcp-server-qdrant
+qdrant-client
+
+# Local-compress piece (compress_mcp_server.py, hooks/compress_bash_output.py,
+# hooks/redirect_webfetch_to_fetch_url.py) -- only needed if you're using that
+# piece. If compress_mcp_server.py fails to start with "MCP error -32000:
+# Connection closed" in Claude Code, run it directly
+# (python /absolute/path/to/compress_mcp_server.py) to see which of these is
+# missing -- a crash on a missing import here looks exactly like a dead
+# connection to Claude Code, with no clearer error surfaced.
+openai
+requests
+trafilatura
+
+# Optional -- lets ingest_to_qdrant.py / index_repo / sync_repo respect a
+# project's .gitignore when deciding what to index. Safe to omit; falls back
+# to just the built-in include/exclude lists without it.
+pathspec

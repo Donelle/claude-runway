@@ -1,0 +1,34 @@
+{
+  "_comment": "Merge this hooks block into the project's .claude/settings.json (create the file if it doesn't exist) and commit it. Nothing needs to be copied into this project: point the args path at hooks/compress_bash_output.py's real location in the cloned tools repo, the same way .mcp.json already points at ingest_mcp_server.py/compress_mcp_server.py by absolute path. compress_bash_output.py finds local_compress_lib.py automatically (it lives in the libs/ subdirectory of the tools repo root) -- set TOOLS_REPO_DIR explicitly only if you've moved the two files apart. Requires `pip install openai`. Matcher covers Bash, Grep, Glob, WebFetch, and WebSearch -- deliberately NOT Read (or Write/Edit/NotebookEdit), since their output is used as the exact basis for a following Edit and a lossy rewrite there risks a corrupted edit rather than just a lossier summary. See the script's docstring for how it handles undocumented tool_response shapes, and for why Glob/WebFetch/WebSearch often end up as no-ops in practice even though they're included.",
+
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash|Grep|WebFetch|Glob|WebSearch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python",
+            "args": ["/absolute/path/to/tools-repo/hooks/compress_bash_output.py"]
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "WebFetch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python",
+            "args": ["/absolute/path/to/tools-repo/hooks/redirect_webfetch_to_fetch_url.py"]
+          }
+        ]
+      }
+    ]
+  },
+
+  "_pretooluse_note": "redirect_webfetch_to_fetch_url.py hard-denies WebFetch (permissionDecision: deny) and tells Claude to call fetch_url instead -- but ONLY when LM Studio is reachable right now (checked live, not cached); otherwise it fails open and lets WebFetch proceed. This is deliberately a PreToolUse hard deny rather than a PostToolUse rewrite like compress_bash_output.py, because unlike 'is this output too large' (only knowable after the tool runs), 'should this go to fetch_url instead' is knowable before the call -- it only depends on the tool name and whether the local model is up. Known gap: it can't tell in advance if a URL needs auth/JS rendering (where fetch_url's plain GET will fail and WebFetch is actually required) -- the deny reason tells Claude to fall back and inform the user, but this hook will keep denying retries to that same URL. If that's a real problem for your usage, either remove WebFetch from this matcher, or change permissionDecision from deny to ask in the script so a human can override per-call instead of it being fully automatic.",
+
+  "_posttooluse_alternative": "An older, narrower approach (hooks/redirect-to-compress.sh, PreToolUse) hard-blocks only specific known-verbose commands (dotnet test/build) and forces Claude to explicitly call compress_command_output instead. The PostToolUse approach above supersedes it -- it acts on ANY Bash command's actual measured output size rather than a hardcoded list, and fails open (leaves output unchanged) instead of hard-blocking if LM Studio is unreachable. Use redirect-to-compress.sh instead only if you specifically want a hard block rather than silent compression for a known set of commands."
+}
