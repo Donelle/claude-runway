@@ -1,0 +1,129 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-runway"
+version = "0.1.0"
+description = "Local-compute token savings for Claude Code: Qdrant codebase memory + LM Studio local compression."
+readme = "README.md"
+license = { text = "MIT" }
+# Policy minimums are 3.12 (Qdrant piece) / 3.11 (local-compress piece) --
+# see README's "Prerequisites" section -- but the dependency chain itself
+# only needs 3.10, and that's the honest floor for a packaging manifest
+# whose whole point is "works wherever pip/pipx/uvx can resolve it".
+requires-python = ">=3.10"
+
+# Matches requirements.txt's "Core" + local-compress sections combined --
+# NOT split into an optional extra the way requirements.txt splits
+# local-compress out, despite tools/doctor.py and tools/ingest_to_qdrant.py
+# themselves needing none of the openai/requests/trafilatura trio (confirmed
+# by grepping their own imports and their libs/ dependencies -- doctor_lib.py/
+# qdrant_ingest_lib.py are stdlib-only). The reason: claude-runway-setup's
+# OWN default behavior (no --qdrant-only flag) generates a .mcp.json that
+# enables the local-compress MCP server (tools/compress_mcp_server.py) and
+# its hooks -- pointed at THIS SAME install's interpreter, per
+# tools/setup_project.py's _pip_installed_venv_python(). A plain default
+# `pipx install claude-runway` + `claude-runway-setup init` (no flags) with
+# these left as an opt-in extra generates a config for a server that crashes
+# on startup (confirmed live: ModuleNotFoundError: trafilatura, running
+# compress_mcp_server.py against a venv installed without them) -- the
+# hooks fail open in that case rather than crashing outright, but silently
+# do nothing useful either. Bundling them in the default install is what
+# makes the default `claude-runway-setup init` output actually work out of
+# the box; `--qdrant-only` remains available for anyone who genuinely only
+# wants the Qdrant memory piece and would rather not pull these in, but
+# pipx/uvx installs this whole package into one isolated environment
+# regardless, so there's no meaningful "smaller install" to gain by leaving
+# them optional the way requirements.txt's own two-file split achieves for a
+# manual venv.
+#
+# pathspec is ALSO base here, not an extra (PR #136 review, Copilot) -- for
+# a security-relevant reason, not just convenience: libs/qdrant_ingest_lib.py
+# defaults respect_gitignore=True but silently falls back to "don't filter
+# at all" if pathspec isn't importable (no error, no warning -- see
+# load_gitignore_spec's own docstring). --qdrant-api-key writes a real
+# credential into a project's .mcp.json and this repo's OWN documentation
+# tells users to gitignore that file if they do -- so claude-runway-ingest
+# silently NOT respecting that gitignore rule means the credential gets
+# indexed into Qdrant right along with everything else, with no error to
+# notice. requirements.txt's own DEFAULT install (`uv pip install -r
+# requirements.txt`, i.e. everything except the explicitly-labeled "if you
+# only want the Qdrant memory piece" reduced install further down in that
+# same README section) already includes pathspec today -- leaving it an
+# opt-in extra here would have made the new pipx/uvx default STRICTLY worse
+# than the existing documented clone-based default for exactly this reason.
+dependencies = [
+    "mcp[cli]>=2.0.0",
+    # fastmcp>=4.0.0: fastmcp<4.0.0 requires mcp<2.0.0 and uses the renamed
+    # McpError class. The mcp>=2.0.0 bound above enforces this transitively
+    # on fresh installs; an explicit lower bound here covers existing
+    # environments that upgrade mcp without upgrading fastmcp.
+    "fastmcp>=4.0.0",
+    "mcp-server-qdrant",
+    "qdrant-client",
+    "fastembed",
+    "pydantic_settings",
+    "openai",
+    "requests",
+    "trafilatura",
+    "pathspec",
+]
+
+[project.scripts]
+# The "clone this repo, remember its absolute path, plug that path into
+# every invocation" model (issue #50) replaced, for these 3 tools
+# specifically, by ordinary PATH-resolved commands pipx/`uv tool install`
+# put on your PATH persistently (PR #136 review, Copilot: a bare `uvx` does
+# NOT do this -- it's a cache-backed, effectively ephemeral single-command
+# run; see README's "Alternative" callout for the full distinction). The
+# MCP servers (ingest_mcp_server.py/compress_mcp_server.py) aren't included
+# here -- this package declares no console-script entry points for them, so
+# there's nothing on PATH resolving to them either way (a project's
+# .mcp.json still needs a literal command/args pointing at a real file for
+# those specifically) -- a separate concern this issue's own proposal text
+# doesn't cover (see pyproject.toml's module docstring-equivalent comments
+# above).
+claude-runway-ingest = "tools.ingest_to_qdrant:main"
+claude-runway-setup = "tools.setup_project:main"
+claude-runway-doctor = "tools.doctor:main"
+
+[tool.setuptools]
+# Flat layout, explicit list rather than auto-discovery -- this repo root
+# also has skills/, tests/, docs/, none of which should become installed
+# Python packages. libs/, tools/, templates/, and hooks/ are declared as
+# plain top-level packages (not nested under one umbrella package) on
+# purpose: every script in tools/ (and every hook in hooks/) already
+# computes its own repo root from __file__ and resolves libs/'s and
+# templates/'s content relative to that (see e.g.
+# tools/setup_project.py's `run_setup(..., tools_repo_dir, ...)` call,
+# which derives `templates_dir = tools_repo_dir / "templates"`) -- that
+# arithmetic resolves correctly post-install only because pip installs all
+# four as SIBLING directories under site-packages, matching their
+# relationship in this repo today. Renaming/nesting any of them would break
+# that assumption. None of the four has (or needs) an __init__.py --
+# setuptools>=68's PEP 420 implicit-namespace-package support includes a
+# directory in the wheel from a plain "packages" list without one (verified
+# directly: building and inspecting the wheel shows every .py file present).
+# Deliberately NOT added: mypy (`mypy.ini`'s `mypy_path = libs`, needed so
+# tools/*.py's bare `from qdrant_ingest_lib import ...` imports resolve the
+# same way at type-check time as they do at runtime via sys.path) treats a
+# directory with an __init__.py as an importable dotted package -- adding
+# one to libs/ specifically made mypy see libs/qdrant_retry.py under two
+# module identities at once ("libs.qdrant_retry" from the `mypy libs tools
+# hooks` command line, "qdrant_retry" via mypy_path) and hard-error with
+# "Source file found twice under different module names" (confirmed live
+# during this issue's own testing). None of these four directories is ever
+# imported as a Python package by name anywhere in this repo, so there's no
+# upside to an __init__.py to weigh against that downside.
+packages = ["libs", "tools", "templates", "hooks"]
+
+[tool.setuptools.package-data]
+# templates/*.template files aren't .py, so they need an explicit glob to
+# be bundled into the wheel at all -- setuptools only includes .py files
+# automatically for a declared package. Without this, tools/setup_project.py
+# (packaged above) would install cleanly and its console-script entry point
+# would resolve, but every real invocation would crash the first time it
+# tried to load templates/mcp.json.template (confirmed by building and
+# installing a wheel without this section, issue #50).
+templates = ["*.template"]

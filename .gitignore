@@ -1,0 +1,15 @@
+.mypy_cache/
+__*
+.vscode/
+.venv/
+
+# pyproject.toml packaging build artifacts (issue #50) -- generated locally
+# by `pip install -e .` / `python -m build` / `uv build`, never committed.
+*.egg-info/
+build/
+dist/
+
+# Local dogfood install of this toolkit on itself -- contains machine-specific
+# absolute paths, so it is not portable to another clone.
+.mcp.json
+.plans/

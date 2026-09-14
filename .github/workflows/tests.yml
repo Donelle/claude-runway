@@ -1,0 +1,86 @@
+name: Tests
+
+# Runs the existing unit test suite (tests/test_*.py) and mypy on every PR
+# and on pushes to main. See issue #51.
+#
+# The issue's proposal also included a lint step for template/placeholder
+# consistency and EVALUATION.md tool-count drift, gated on "once GROW-01's
+# setup script and GROW-05's self-updating tool-count utility exist" --
+# those were issues #48 and #52. Both have since landed, so the tool-count
+# half of that lint step is now included below ("Check MCP tool counts").
+# It's a smoke check, not a doc-vs-code comparison: EVALUATION.md no
+# longer hardcodes a tool count to compare against (issue #52 replaced
+# that prose with instructions to run this exact script), so there's
+# nothing left to drift out of sync -- this step instead just fails loudly
+# if either server's tool registry stops importing/enumerating cleanly.
+# The broader template/placeholder-consistency half of the original
+# proposal is still a separate, unfiled follow-up.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Least-privilege default for the whole workflow: this job only checks out
+# code, installs public PyPI packages, and runs mypy/unittest -- it never
+# needs to write anything back to the repo (no pushes, no PR comments, no
+# releases), so GITHUB_TOKEN gets read-only access instead of inheriting
+# whatever broader default the repo/org has configured.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      # Pinned to a commit SHA (not the mutable v4 tag) so this job always
+      # runs the exact, audited action code -- a floating tag could move to
+      # unreviewed code after this file was last reviewed. v4.4.0.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      # Same reasoning, pinned to v5.6.0.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          # 3.12+ is the documented policy minimum for the Qdrant piece
+          # (ingest_mcp_server.py/ingest_to_qdrant.py); the local-compress
+          # piece only requires 3.11+. 3.12 satisfies both.
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt --index-url https://pypi.org/simple
+          pip install -r requirements-dev.txt --index-url https://pypi.org/simple
+
+      - name: Type check (mypy)
+        run: mypy libs tools hooks
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Check MCP tool counts (issue #52/GROW-05)
+        run: python tools/report_tool_counts.py
+
+      - name: Build & smoke-test pip packaging (issue #50)
+        # tests/test_pyproject.py only checks the TOML declaratively -- this
+        # is the one place a REAL (non-editable) build+install actually
+        # happens, which is what catches a class of bug that file can't:
+        # confirmed live during this issue's own development that
+        # pyproject.toml can declare all 3 console scripts correctly and
+        # STILL crash on first real use, because templates/*.template
+        # (loaded by claude-runway-setup, not importable Python) silently
+        # didn't make it into the wheel until package-data was added for it.
+        # `pip install .` (not `-e .`) is deliberate -- an editable install
+        # keeps pointing at this checkout's own files, so it would never
+        # have caught that missing-data-file bug in the first place.
+        run: |
+          pip install . --index-url https://pypi.org/simple
+          mkdir -p /tmp/claude-runway-pkgtest
+          claude-runway-doctor --help
+          claude-runway-setup init /tmp/claude-runway-pkgtest --dry-run
+          claude-runway-ingest --help
