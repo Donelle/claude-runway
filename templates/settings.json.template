@@ -1,0 +1,45 @@
+{
+  "_comment": "Merge this hooks block into the project's .claude/settings.json (create the file if it doesn't exist) and commit it. Nothing needs to be copied into this project: point the args path at hooks/compress_bash_output.py's real location in the cloned tools repo, the same way .mcp.json already points at tools/ingest_mcp_server.py and tools/compress_mcp_server.py by absolute path. REPLACE-WITH-VENV-PYTHON: substitute the absolute path to the Python interpreter inside the tools-repo virtual environment (e.g. /home/youruser/tools/claude-runway/.venv/bin/python) -- this is the same venv created during installation, and the same path used in .mcp.json for codebase-indexer and local-compress. Using a plain 'python' here fails on Linux because the hook scripts need packages (openai, requests, etc.) installed in that venv. compress_bash_output.py finds local_compress_lib.py automatically (it lives in the libs/ subdirectory of the tools repo root) -- set TOOLS_REPO_DIR explicitly only if you've moved the two files apart. Matcher covers Bash, Grep, Glob, WebFetch, WebSearch, and (for the opt-in savings tracker, see _savings_tracker_note below) mcp__local-compress__.*, plus a vetted set of additional MCP tools from GitHub and Splunk. The test for inclusion is: does Claude ever use this output as the exact, byte-for-byte basis for a following Edit? If yes, exclude it. The GitHub allowlist is intentionally specific rather than a blanket mcp__github__.*: get_file_contents and get_pull_request_files are explicitly excluded (get_file_contents returns raw file bytes; get_pull_request_files returns per-file patch hunks -- both are frequently the exact source Claude uses to read or implement edits). Bulk mutation calls (push_files, fork_repository) are also excluded since their responses are tiny created-object metadata. The two mutation calls that ARE included (add_issue_comment, create_pull_request_review) pass the test: their responses are newly created object JSON (id, url, body, timestamps), read for confirmation only, never the byte-exact basis for an Edit. The dividing line is edit-basis, not read-vs-write. Within Bash, that same test is applied per-command: commands whose output only has value byte-exact (git, wc/digests, jq, --json/-o json, grep -c, ...) skip compression at any size -- append '# compress-ok' to a command to opt it back in. See the script's docstring for the full list and the bug history, for how it handles undocumented tool_response shapes, and for why Glob/WebFetch/WebSearch often end up as no-ops in practice even though they're included.",
+
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash|Grep|WebFetch|Glob|WebSearch|mcp__local-compress__.*|mcp__github__(?:search_code|search_issues|search_repositories|search_users|list_issues|list_pull_requests|list_commits|get_issue|get_pull_request|get_pull_request_comments|get_pull_request_reviews|get_pull_request_status|add_issue_comment|create_pull_request_review)$|mcp__claude_ai_Splunk__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "REPLACE-WITH-VENV-PYTHON",
+            "args": ["/absolute/path/to/tools-repo/hooks/compress_bash_output.py"]
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "WebFetch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "REPLACE-WITH-VENV-PYTHON",
+            "args": ["/absolute/path/to/tools-repo/hooks/redirect_webfetch_to_fetch_url.py"]
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "REPLACE-WITH-VENV-PYTHON",
+            "args": ["/absolute/path/to/tools-repo/hooks/session_end_savings.py"]
+          }
+        ]
+      }
+    ]
+  },
+
+  "_pretooluse_note": "redirect_webfetch_to_fetch_url.py hard-denies WebFetch (permissionDecision: deny) and tells Claude to call fetch_url instead -- but ONLY when LM Studio is reachable right now (checked live, not cached); otherwise it fails open and lets WebFetch proceed. This is deliberately a PreToolUse hard deny rather than a PostToolUse rewrite like compress_bash_output.py, because unlike 'is this output too large' (only knowable after the tool runs), 'should this go to fetch_url instead' is knowable before the call -- it only depends on the tool name and whether the local model is up. Auth/JS-rendering gap (issue #64): the hook records a SHA-256 digest of each denied URL in the shared SQLite cache (CLAUDE_RUNWAY_CACHE_DB, default ~/.claude/claude-runway/cache.db) at deny-time (not fetch_url-failure-time -- this is a PreToolUse hook and can't observe fetch_url's outcome). The deny message tells Claude to immediately retry the original WebFetch call if fetch_url errors -- that retry is allowed through as a one-shot skip (entry deleted so the next call is denied normally again). Known trade-off: if fetch_url succeeds, the entry remains in the cache until the same URL is looked up again (check_and_clear_if_retrying deletes it on any lookup -- within or beyond the TTL); it is only consumed as an allow if that lookup happens within the TTL window (default 3600 seconds; override via CLAUDE_RUNWAY_WEBFETCH_FAILED_URL_TTL). CLAUDE_RUNWAY_CACHE_DB is shared (codebase-indexer MCP server also reads it), so if you override it, set via shell export (not .mcp.json only) so the hook can inherit it -- hooks have no env field in settings.json. CLAUDE_RUNWAY_WEBFETCH_FAILED_URL_TTL is hook-only; no MCP counterpart.",
+
+  "_savings_tracker_note": "Opt-in savings tracker (see libs/savings_ledger.py and README's 'Savings tracker' section): set CLAUDE_RUNWAY_TRACK_SAVINGS=1 to enable it, off by default. Accepted values (see savings_ledger.py's tracking_enabled()): '1', 'true', or 'yes', case-insensitive and whitespace-trimmed -- anything else, including unset/empty, is treated as off. Claude Code hook entries (unlike MCP servers in .mcp.json) have NO 'env' field of their own -- a hook subprocess simply inherits the ENTIRE parent process environment unfiltered. So CLAUDE_RUNWAY_TRACK_SAVINGS (and, if you override the DB location, CLAUDE_RUNWAY_SAVINGS_DB) must be exported at the OS/shell level (e.g. in ~/.zshrc or ~/.bashrc, wherever `claude` gets launched from) for compress_bash_output.py and session_end_savings.py to see them -- that's the ONLY way a hook can receive a setting like this, since there's no per-hook config field to put it in. This is the opposite problem from the MCP server side (see mcp.json.template's local-compress _comment): a stdio MCP server subprocess actually inherits the ENTIRE parent shell environment too (not a small fixed allowlist), but only reliably if `claude` happened to be launched from a shell that already ran the export -- there's no way to guarantee that across every launch context, so the SAME shell export still isn't something to rely on there without ALSO being listed explicitly in .mcp.json's env block -- and inheritance only has a chance to supply it when that key is genuinely ABSENT from the server's env block; a key present but blank ('') always overrides/masks the inherited value instead of falling through to it. Skipping the shell export always breaks the hooks side outright (they have no other channel to get it from). Skipping the .mcp.json entry ALSO breaks the MCP-server side unconditionally in THIS template specifically, since mcp.json.template/setup_project.py always emit this key explicitly (blank if disabled) rather than omitting it -- there's no inheritance fallback in practice here, even though the underlying mechanism (inheritance for a genuinely absent key) is real in the general case. The same two-place rule applies to CLAUDE_RUNWAY_LMSTUDIO_URL/CLAUDE_RUNWAY_LMSTUDIO_MODEL for these same hook scripts -- see compress_bash_output.py's docstring. CLAUDE_RUNWAY_COMPRESS_THRESHOLD_CHARS is the exception, not a third example of it: compress_bash_output.py is its only reader, so it's shell-only, and an .mcp.json copy is inert. Those three (LMSTUDIO_URL/LMSTUDIO_MODEL/COMPRESS_THRESHOLD_CHARS) were formerly named LMSTUDIO_BASE_URL/LMSTUDIO_MODEL/HOOK_COMPRESS_THRESHOLD_CHARS and the old names are no longer read at all; the CLAUDE_RUNWAY_ prefix exists precisely BECAUSE they have to live in your global shell profile, where an unnamespaced LMSTUDIO_MODEL is easy to collide with and hard to attribute to this toolkit. If you have an old name still set with no new counterpart, local_compress_lib.stale_env_warning() detects it and says so (hard error from the MCP server, stderr + a note on the fail-open path from the hooks) rather than letting it degrade silently."
+}

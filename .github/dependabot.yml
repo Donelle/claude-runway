@@ -1,0 +1,16 @@
+version: 2
+updates:
+  # requirements.txt / requirements-dev.txt at the repo root.
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  # PR #97 pinned actions/checkout and actions/setup-python to commit SHAs
+  # for supply-chain hardening -- Dependabot's github-actions ecosystem is
+  # what keeps those pins from going stale, opening a PR to bump to a newer
+  # audited SHA instead of someone having to notice and do it by hand.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

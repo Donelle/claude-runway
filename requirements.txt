@@ -1,0 +1,35 @@
+# Core -- required for the Qdrant codebase-memory piece (ingest_to_qdrant.py,
+# ingest_mcp_server.py). Install these even if you're not using local-compress.
+#
+# Issue #98: both ingest_mcp_server.py and compress_mcp_server.py have been
+# migrated from `mcp.server.fastmcp.FastMCP` (removed in mcp==2.0.0) to
+# `mcp.server.mcpserver.MCPServer` -- the officially supported path in
+# mcp>=2.0.0. The <2.0.0 pin that PR #97 added as a stopgap is therefore
+# removed here.
+mcp[cli]>=2.0.0
+# fastmcp>=4.0.0 is required because fastmcp<4.0.0 requires mcp<2.0.0 (and
+# uses the renamed McpError class). The mcp>=2.0.0 constraint above enforces
+# this transitively on fresh installs, but an existing environment upgrading
+# only mcp without upgrading fastmcp would bypass that. Declaring the lower
+# bound here makes it explicit for both cases.
+fastmcp>=4.0.0
+mcp-server-qdrant
+qdrant-client
+fastembed
+pydantic_settings
+
+# Local-compress piece (compress_mcp_server.py, hooks/compress_bash_output.py,
+# hooks/redirect_webfetch_to_fetch_url.py) -- only needed if you're using that
+# piece. If compress_mcp_server.py fails to start with "MCP error -32000:
+# Connection closed" in Claude Code, run it directly
+# (python /absolute/path/to/tools/compress_mcp_server.py) to see which of these is
+# missing -- a crash on a missing import here looks exactly like a dead
+# connection to Claude Code, with no clearer error surfaced.
+openai
+requests
+trafilatura
+
+# Optional -- lets ingest_to_qdrant.py / index_repo / sync_repo respect a
+# project's .gitignore when deciding what to index. Safe to omit; falls back
+# to just the built-in include/exclude lists without it.
+pathspec

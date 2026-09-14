@@ -1,0 +1,48 @@
+{
+  "_comment": "Save this as .mcp.json at the root of each project repo and commit it -- UNLESS you set a real QDRANT_API_KEY below (see that field's own note), in which case do NOT commit this file as-is; keep it out of version control for this project instead. Change COLLECTION_NAME per project. Opening Claude Code in a project directory loads that project's .mcp.json automatically, so switching projects switches collections with zero manual action. REPLACE-WITH-VENV-PYTHON: substitute the absolute path to the Python interpreter inside the tools-repo virtual environment (e.g. /home/youruser/tools/claude-runway/.venv/bin/python) -- using a plain 'python' here fails on Linux because the MCP servers need packages installed in that venv. All three servers use the same venv Python. REPLACE-WITH-YOUR-HOME-DIR (qdrant server's FASTEMBED_CACHE_PATH only): substitute your actual absolute home directory (e.g. /home/youruser or /Users/youruser) -- NOT a literal '~', which fastembed's own cache-dir resolution does not expand, so it would create a directory literally named '~' instead of pointing into your home directory. Same value on every project's .mcp.json on a given machine (see README's Environment variables / issue #77). INDEX_INCLUDE_EXTENSIONS/INDEX_EXCLUDE_DIRS are optional -- leave blank ('') to use the built-in code/doc extension list and default excludes (.git, node_modules, dist, build, etc.) plus the repo's own .gitignore. Set INDEX_INCLUDE_EXTENSIONS (e.g. '.py,.md') to restrict to specific file types, or INDEX_EXCLUDE_DIRS (e.g. 'fixtures,generated') to skip additional folders. COLLECTION_DESCRIPTION is optional -- leave blank ('') for no static hint, or set a short one-line description of what this collection contains; applied automatically to the collection's Qdrant metadata at server startup and after index_repo/sync_repo write, so list_collections (from a DIFFERENT project's session) can surface it without anyone having to call set_collection_description by hand (issue #83). QDRANT_API_KEY (present in all three servers' env blocks) is optional -- leave blank ('') for an unauthenticated local Qdrant instance, or set it to your API key for an authenticated remote one; the same variable name mcp-server-qdrant/ingest_mcp_server.py/compress_mcp_server.py all read, so one value keeps every Qdrant-talking server in this file aligned. WARNING if you DO set a real key: this file is otherwise meant to be committed (see the top of this comment), so a real QDRANT_API_KEY here would publish that credential in plaintext to anyone with repo access, permanently in git history even after a later edit -- there's no built-in mechanism here for loading it from an untracked source instead, so keep .mcp.json itself out of version control for this project (add it to .gitignore) or manage the key through your own separate, untracked process.",
+
+  "mcpServers": {
+    "qdrant": {
+      "command": "REPLACE-WITH-VENV-PYTHON/bin/mcp-server-qdrant",
+      "type": "stdio",
+      "env": {
+        "QDRANT_URL": "http://localhost:6333",
+        "QDRANT_API_KEY": "",
+        "COLLECTION_NAME": "REPLACE-WITH-THIS-PROJECTS-NAME",
+        "EMBEDDING_MODEL": "sentence-transformers/all-MiniLM-L6-v2",
+        "FASTEMBED_CACHE_PATH": "REPLACE-WITH-YOUR-HOME-DIR/.claude/claude-runway/fastembed-cache",
+        "TOOL_FIND_DESCRIPTION": "Semantically search previously stored project knowledge (code locations, design decisions, past investigation findings) for THIS project. Use this BEFORE grepping or reading files for conceptual questions like 'where is X handled' or 'why was Y built this way'. Do NOT use for exact string, symbol, or error-message matches -- use Grep for those. Returns stored entries as text, including any metadata (e.g. file_path, line_range) attached when stored -- use that metadata to read only the relevant lines instead of the whole file. Input: query (a natural-language question, not a code snippet).",
+        "TOOL_STORE_DESCRIPTION": "Persist a distilled finding for this project's future sessions -- e.g. a bug's root cause, a design decision and its rationale, or the answer to a search that took real exploration to find. Store a short summary, not raw file dumps. ALWAYS include file_path and line_range (or source/url for non-code) in metadata. Do not store speculative or in-progress reasoning. Input: information (concise summary), metadata (JSON, must include file_path/line_range or source when applicable)."
+      }
+    },
+    "codebase-indexer": {
+      "command": "REPLACE-WITH-VENV-PYTHON",
+      "type": "stdio",
+      "args": ["/absolute/path/to/tools/ingest_mcp_server.py"],
+      "env": {
+        "QDRANT_URL": "http://localhost:6333",
+        "QDRANT_API_KEY": "",
+        "COLLECTION_NAME": "REPLACE-WITH-THIS-PROJECTS-NAME",
+        "COLLECTION_DESCRIPTION": "",
+        "EMBEDDING_MODEL": "sentence-transformers/all-MiniLM-L6-v2",
+        "INDEX_INCLUDE_EXTENSIONS": "",
+        "INDEX_EXCLUDE_DIRS": ""
+      }
+    },
+    "local-compress": {
+      "_comment": "Leave QDRANT_API_KEY empty for unauthenticated local Qdrant — the server normalizes empty strings to null so no auth header is sent. If you DO set a real key here, see the top-level _comment's warning about not committing this file as-is. CLAUDE_RUNWAY_TRACK_SAVINGS/CLAUDE_RUNWAY_SAVINGS_DB are optional (opt-in savings tracker, off by default; CLAUDE_RUNWAY_TRACK_SAVINGS accepts '1', 'true', or 'yes', case-insensitive and whitespace-trimmed -- anything else, including unset/empty, is off). Setting them HERE is still the reliable way to guarantee this server sees them: a stdio MCP server subprocess actually inherits the ENTIRE parent shell environment (not a small fixed allowlist — verified directly, see README's 'Why two places' section and issue #117), with this env block layered on top, added/overriding rather than filtering. But you can't always guarantee `claude` was launched from a shell that already ran a given export (a GUI launcher, a different profile, another machine) — so a custom var merely exported in your shell isn't reliably visible to this server across every launch context unless it's also listed explicitly in this env block, same as any other MCP server config. (This describes Claude Code's own observed subprocess behavior, verified directly -- not something the MCP spec itself mandates; a different MCP client could construct or filter a stdio server's environment differently, so treat this as specific to Claude Code rather than a universal MCP guarantee.) Separately, compress_bash_output.py / session_end_savings.py (hook scripts, not MCP servers) need the SAME values exported at the shell level too — hooks have the opposite problem: no env block of their own in settings.json, so they only ever see what's in the shell environment. See settings.json.template's _savings_tracker_note.",
+      "command": "REPLACE-WITH-VENV-PYTHON",
+      "type": "stdio",
+      "args": ["/absolute/path/to/tools/compress_mcp_server.py"],
+      "env": {
+        "CLAUDE_RUNWAY_LMSTUDIO_URL": "http://localhost:1234/v1",
+        "CLAUDE_RUNWAY_LMSTUDIO_MODEL": "REPLACE-WITH-MODEL",
+        "QDRANT_URL": "http://localhost:6333",
+        "QDRANT_API_KEY": "",
+        "COMPACT_COLLECTION": "conversation-compacts",
+        "CLAUDE_RUNWAY_TRACK_SAVINGS": "",
+        "CLAUDE_RUNWAY_SAVINGS_DB": ""
+      }
+    }
+  }
+}

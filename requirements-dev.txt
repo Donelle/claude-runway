@@ -1,0 +1,9 @@
+# Dev-only tooling for CONTRIBUTING to this repo -- not needed to USE the
+# toolkit (that's requirements.txt, which stays scoped to what an end user
+# installing ClaudeRunway into their own project actually needs). Install
+# after requirements.txt, in the same venv:
+#   uv pip install -r requirements-dev.txt --index-url https://pypi.org/simple
+
+# Type checking -- config lives in mypy.ini. Run with:
+#   .venv/bin/mypy libs tools hooks
+mypy==2.3.1
