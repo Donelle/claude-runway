@@ -13,18 +13,18 @@ Project-scoped to this repo on purpose: it hardcodes claude-runway's actual conv
 ```
 /my-gh-code-it 21
 /my-gh-code-it #21
-/my-gh-code-it https://github.com/YOUR_GITHUB_USERNAME/claude-runway/issues/21
+/my-gh-code-it https://github.com/Donelle/claude-runway/issues/21
 ```
 
 ## Steps
 
 1. **Normalize the input** to a bare issue number (strip a leading `#`, or extract the trailing number from a full URL).
 
-2. **Confirm the repo** via `git remote get-url origin` — expect `github.com` and owner/repo `YOUR_GITHUB_USERNAME/claude-runway`. If the remote doesn't match, stop and ask the user rather than guessing which repo the issue number refers to.
+2. **Confirm the repo** via `git remote get-url origin` — expect `github.com` and owner/repo `Donelle/claude-runway`. If the remote doesn't match, stop and ask the user rather than guessing which repo the issue number refers to.
 
 3. **Fetch the issue**:
    ```bash
-   gh issue view {N} -R YOUR_GITHUB_USERNAME/claude-runway --json number,title,body,labels,assignees,issueType,state,url
+   gh issue view {N} -R Donelle/claude-runway --json number,title,body,labels,assignees,issueType,state,url
    ```
    - If `state` is `CLOSED`, tell the user and ask whether to proceed anyway (e.g. reopening work on a regression) rather than silently continuing.
    - Read the full `body` — issues filed via the code-review pass already contain **Location**, **Verdict/Confirmed**, and **Suggested fix** sections; treat these as a head start on the plan in step 7, not something to re-derive from scratch.
@@ -34,13 +34,13 @@ Project-scoped to this repo on purpose: it hardcodes claude-runway's actual conv
    - `enhancement` label present → `Feature`
    - neither → `Task`
    ```bash
-   gh issue edit {N} -R YOUR_GITHUB_USERNAME/claude-runway --type {Bug|Feature|Task}
+   gh issue edit {N} -R Donelle/claude-runway --type {Bug|Feature|Task}
    ```
    If `issueType` is already set, leave it alone and note the existing value instead.
 
 5. **Set assignee**, only if `assignees` is empty:
    ```bash
-   gh issue edit {N} -R YOUR_GITHUB_USERNAME/claude-runway --add-assignee @me
+   gh issue edit {N} -R Donelle/claude-runway --add-assignee @me
    ```
    If someone is already assigned, tell the user and ask before reassigning — don't silently take over someone else's issue.
 
@@ -49,14 +49,14 @@ Project-scoped to this repo on purpose: it hardcodes claude-runway's actual conv
 7. **Create and link the branch** using GitHub's native linked-branch feature (shows up on the issue itself, not just a plain `git checkout -b`):
    - First check for an existing linked branch so re-running this skill on an in-progress issue doesn't create a duplicate:
      ```bash
-     gh issue develop {N} -R YOUR_GITHUB_USERNAME/claude-runway --list
+     gh issue develop {N} -R Donelle/claude-runway --list
      ```
    - If one already exists, `git fetch` and check it out instead of creating a new one.
    - Otherwise, derive a branch name from the issue type and title — `fix/<short-kebab-slug>` for Bug, `feature/<short-kebab-slug>` for Feature/Task — matching this repo's actual history (`fix/chunker-defects-found-by-dogfooding`, `feature/session-continuity-skills`, etc.), not a ticket-ID-based name. Keep the slug short (aim for ≤ 6 words) and specific to the actual defect/feature, not a verbatim slugification of the full issue title.
    - **Show the proposed branch name to the user and wait for confirmation** before creating it — same "don't act until approved" discipline as the plan gate below, just lighter-weight since it's one name, not a whole plan.
    - Create, link, and check out in one step:
      ```bash
-     gh issue develop {N} -R YOUR_GITHUB_USERNAME/claude-runway --name {branch-name} --checkout
+     gh issue develop {N} -R Donelle/claude-runway --name {branch-name} --checkout
      ```
 
 8. **Load project context** if not already loaded this session — read `README.md` (this repo has no `CLAUDE.md`) plus whichever specific files the issue's **Location** field names. Don't invoke `/my-load-context` blindly; it's written to expect a `CLAUDE.md` this repo doesn't have.

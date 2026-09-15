@@ -5,7 +5,7 @@ description: "Fetch and organize pull request feedback for this repo's GitHub PR
 
 # Skill: my-gh-pr-feedback
 
-Fetch and organize pull request feedback for claude-runway. This is a project-scoped extraction of `/my-pr-review-feedback` — that skill already fully supports GitHub, so this mirror mainly drops the Azure DevOps branching and the `CLAUDE.md` read (this repo has none), hardcodes `YOUR_GITHUB_USERNAME/claude-runway`, and keeps the categorization scheme and verify-before-fixing discipline as-is. The `@copilot` tagging rule was *not* kept as-is — see [Replying to Feedback](#replying-to-feedback): never tag `@copilot` in a reply, full stop, based on confirmed repeat failures on this repo's PR #73 and PR #84.
+Fetch and organize pull request feedback for claude-runway. This is a project-scoped extraction of `/my-pr-review-feedback` — that skill already fully supports GitHub, so this mirror mainly drops the Azure DevOps branching and the `CLAUDE.md` read (this repo has none), hardcodes `Donelle/claude-runway`, and keeps the categorization scheme and verify-before-fixing discipline as-is. The `@copilot` tagging rule was *not* kept as-is — see [Replying to Feedback](#replying-to-feedback): never tag `@copilot` in a reply, full stop, based on confirmed repeat failures on this repo's PR #73 and PR #84.
 
 ## Usage
 ```
@@ -15,19 +15,19 @@ If no PR number is provided, find the active PR for the current branch.
 
 ## Steps
 
-1. **Confirm the repo** via `git remote get-url origin` — expect `YOUR_GITHUB_USERNAME/claude-runway` on `github.com`. Stop and ask if it doesn't match rather than guessing.
+1. **Confirm the repo** via `git remote get-url origin` — expect `Donelle/claude-runway` on `github.com`. Stop and ask if it doesn't match rather than guessing.
 
 2. **Find the PR number** if not provided:
    ```bash
-   gh pr list -R YOUR_GITHUB_USERNAME/claude-runway --head $(git branch --show-current) --json number,url
+   gh pr list -R Donelle/claude-runway --head $(git branch --show-current) --json number,url
    ```
 
 3. **Fetch PR details and feedback**:
    ```bash
-   gh pr view {number} -R YOUR_GITHUB_USERNAME/claude-runway --json title,body,state,mergeable,reviewDecision
-   gh api repos/YOUR_GITHUB_USERNAME/claude-runway/pulls/{number}/comments --paginate     # inline (diff) review comments
-   gh api repos/YOUR_GITHUB_USERNAME/claude-runway/pulls/{number}/reviews --paginate      # review summaries
-   gh api repos/YOUR_GITHUB_USERNAME/claude-runway/issues/{number}/comments --paginate    # general/bot issue comments
+   gh pr view {number} -R Donelle/claude-runway --json title,body,state,mergeable,reviewDecision
+   gh api repos/Donelle/claude-runway/pulls/{number}/comments --paginate     # inline (diff) review comments
+   gh api repos/Donelle/claude-runway/pulls/{number}/reviews --paginate      # review summaries
+   gh api repos/Donelle/claude-runway/issues/{number}/comments --paginate    # general/bot issue comments
    ```
 
 4. **Categorize feedback**:
@@ -92,12 +92,12 @@ Confirmed this reproduces -- <what you did to verify>. Fixed in <commit>: <what 
 
 Reply to an inline comment:
 ```bash
-gh api repos/YOUR_GITHUB_USERNAME/claude-runway/pulls/{pr}/comments/{comment_id}/replies --method POST -f body="..."
+gh api repos/Donelle/claude-runway/pulls/{pr}/comments/{comment_id}/replies --method POST -f body="..."
 ```
 Note the `{pr}` segment — a real mistake made in this session: the endpoint is `pulls/{pr}/comments/{id}/replies`, not `pulls/comments/{id}/replies`; omitting the PR number 404s.
 
 **If an error-comment spam loop happens anyway** (from any source — not just a `@copilot` mention this skill might have missed catching, since a human reviewer or another automation could still trigger the same GitHub-side failure), stop immediately rather than retrying or reposting — it's a GitHub-side backend failure (see [community discussion #188531](https://github.com/orgs/community/discussions/188531)), not something fixable from this side. Clean up the error comments:
 ```bash
-gh api repos/YOUR_GITHUB_USERNAME/claude-runway/issues/comments/{id} --method DELETE
+gh api repos/Donelle/claude-runway/issues/comments/{id} --method DELETE
 ```
 per comment, then move on — the underlying finding is already resolved either way, whether that meant a code fix or an explanatory reply.

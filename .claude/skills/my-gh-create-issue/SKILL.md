@@ -18,7 +18,7 @@ Any of `type=`/`theme=`/`priority=` may be omitted — missing ones get inferred
 
 ## Steps
 
-1. **Confirm the repo** via `git remote get-url origin` — expect `YOUR_GITHUB_USERNAME/claude-runway` on `github.com`. Stop and ask if it doesn't match.
+1. **Confirm the repo** via `git remote get-url origin` — expect `Donelle/claude-runway` on `github.com`. Stop and ask if it doesn't match.
 
 2. **Understand the request.** Parse any `type=`/`theme=`/`priority=` fields out of the input; treat the rest as the free-text description of the bug or idea. If the description alone is too vague to investigate (no file, symptom, or area named), ask one clarifying question before proceeding — don't guess a plausible-sounding subsystem.
 
@@ -33,7 +33,7 @@ Any of `type=`/`theme=`/`priority=` may be omitted — missing ones get inferred
    - Pure documentation fix → `documentation`
    This is the *label*, not GitHub's native Issue Type field (`Task`/`Bug`/`Feature`) — that field gets set later by `/my-gh-code-it` when work actually starts, derived from this same label, so don't set it here.
 
-5. **Determine the theme label** if not given by `theme=`. Run `gh label list -R YOUR_GITHUB_USERNAME/claude-runway` to see the live set (don't hardcode a list here — it will drift) and match against whichever `theme-*` label fits the subsystem step 3 actually touched. As of this skill's creation the themes are:
+5. **Determine the theme label** if not given by `theme=`. Run `gh label list -R Donelle/claude-runway` to see the live set (don't hardcode a list here — it will drift) and match against whichever `theme-*` label fits the subsystem step 3 actually touched. As of this skill's creation the themes are:
    - `theme-install-config` — installation/configuration friction
    - `theme-ingestion` — the Qdrant codebase ingestion pipeline
    - `theme-compression-core` — local compression core & hooks
@@ -78,7 +78,7 @@ Any of `type=`/`theme=`/`priority=` may be omitted — missing ones get inferred
 
 8. **Check for duplicates** before filing:
    ```bash
-   gh issue list -R YOUR_GITHUB_USERNAME/claude-runway --search "{key terms from the title}" --state all
+   gh issue list -R Donelle/claude-runway --search "{key terms from the title}" --state all
    ```
    If a close match exists, show it to the user and ask whether to link/comment on that one instead of filing a new one.
 
@@ -88,12 +88,12 @@ Any of `type=`/`theme=`/`priority=` may be omitted — missing ones get inferred
 
 10. **Ensure every label used actually exists** (`gh label list`), creating any new theme label approved in step 5 first:
     ```bash
-    gh label create "theme-<name>" -R YOUR_GITHUB_USERNAME/claude-runway --description "<one line>" --color "<hex>"
+    gh label create "theme-<name>" -R Donelle/claude-runway --description "<one line>" --color "<hex>"
     ```
 
 11. **Create the issue**:
     ```bash
-    gh issue create -R YOUR_GITHUB_USERNAME/claude-runway \
+    gh issue create -R Donelle/claude-runway \
       --title "<title>" \
       --body-file .plans/{slug}.md \
       --label "<type>,<priority>,<theme if any>"

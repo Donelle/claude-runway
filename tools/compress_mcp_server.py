@@ -927,7 +927,7 @@ def _collection_project_values(client: QdrantClient, collection_name: str, targe
 # with some other subsystem's unrelated uuid5 usage that happened to pick
 # the same namespace by coincidence.
 _COMPACT_ID_NAMESPACE = uuid.uuid5(
-    uuid.NAMESPACE_URL, "https://github.com/YOUR_GITHUB_USERNAME/claude-runway/compact_store"
+    uuid.NAMESPACE_URL, "compact_store:01a0a23a-3633-7309-96ee-244a4002cd96"
 )
 
 

@@ -7,13 +7,13 @@ description: "Autonomously work claude-runway's open bug/enhancement backlog end
 
 Fully autonomous version of the `/my-gh-code-it` → `/my-gh-pr` → `/my-gh-pr-feedback` → merge cycle already used by hand on this repo. Where those three skills pause for human approval (plan review, branch-name confirmation), this one doesn't — it's for the case where the user has explicitly authorized working through tickets without per-step check-ins. It doesn't replace those three skills' *content*; it packages their combined, battle-tested procedure (plus the merge step, which none of them do) into one subagent prompt run via the Agent tool.
 
-**Zero required human touchpoints, confirmed live.** This repo has a repository ruleset ("PR Re-review", `gh api repos/YOUR_GITHUB_USERNAME/claude-runway/rulesets/21478236`) with `copilot_code_review: {review_on_push: true}` active — Copilot automatically re-reviews on EVERY push to a PR targeting the default branch, no manual re-request and no `@copilot` mention needed. Confirmed live (2026-08-25, working issue #45/PR #110): a fix push triggered a fresh Copilot review within ~6 minutes with zero action from anyone. This means the entire review-feedback loop — including every round after the first — can run inside a single subagent call: push, wait, check, fix-and-push-again if needed, repeat, merge. An earlier version of this skill split this into orchestrator-driven `start`/`continue` modes with a mandatory human ping between rounds, because at the time a re-review genuinely required a manual action that risked the `@copilot`-mention failure mode if done wrong. That's no longer true on this repo and the split has been removed — don't reintroduce it without first re-confirming `review_on_push` is still active (`gh api repos/YOUR_GITHUB_USERNAME/claude-runway/rulesets` should list a ruleset with that rule; if it's gone, the old multi-mode design in this file's git history is the fallback).
+**Zero required human touchpoints, confirmed live.** This repo has a repository ruleset ("PR Re-review", `gh api repos/Donelle/claude-runway/rulesets/23376382`) with `copilot_code_review: {review_on_push: true}` active — Copilot automatically re-reviews on EVERY push to a PR targeting the default branch, no manual re-request and no `@copilot` mention needed. Confirmed live (2026-08-25, working issue #45/PR #110): a fix push triggered a fresh Copilot review within ~6 minutes with zero action from anyone. This means the entire review-feedback loop — including every round after the first — can run inside a single subagent call: push, wait, check, fix-and-push-again if needed, repeat, merge. An earlier version of this skill split this into orchestrator-driven `start`/`continue` modes with a mandatory human ping between rounds, because at the time a re-review genuinely required a manual action that risked the `@copilot`-mention failure mode if done wrong. That's no longer true on this repo and the split has been removed — don't reintroduce it without first re-confirming `review_on_push` is still active (`gh api repos/Donelle/claude-runway/rulesets` should list a ruleset with that rule; if it's gone, the old multi-mode design in this file's git history is the fallback).
 
 **Do not skip the verification discipline just because there's no human in the loop.** The two safety practices that matter most when nobody's watching in real time are: (1) verify every review-feedback claim by actual reproduction before touching code, never by taking a reviewer's (bot or human) word for it, and (2) stop and report rather than push forward on anything that isn't a well-defined "make this specific defect go away" fix — a design decision, an ambiguous requirement, or a review disagreement that survives a second explanation round is a *reason to stop*, not something to resolve by guessing or looping indefinitely (see the round cap in Step 4 below).
 
 **Every subagent call below runs as a genuinely fresh, isolated context, in its own git worktree.** These are two separate settings doing two separate jobs — don't conflate them, a future edit that "simplifies" by dropping one thinking the other covers it would reintroduce a real problem: `subagent_type: "general-purpose"` is what makes each Agent call spawn a brand-new agent with no memory of the orchestrator's conversation or any other ticket. `isolation: "worktree"` is what keeps that subagent's own `git checkout`/`commit`/`push` from ever touching whatever the orchestrator or a human happens to be doing in the primary checkout at the same time — confirmed necessary live: an earlier test run without it shared the primary working directory with a concurrent uncommitted edit and only avoided a collision because the subagent happened to scope its `git add` narrowly, not because anything structurally prevented one. Together they're what keeps the *orchestrating* conversation's context flat no matter how many tickets get processed in one run, since every file read, diff, and review-comment thread lives inside a subagent's own throwaway worktree and only a short report ever comes back.
 
-Project-scoped to this repo (hardcodes `YOUR_GITHUB_USERNAME/claude-runway`, `.venv`-based tests, this repo's branch/commit conventions) for the same reason `my-gh-code-it`/`my-gh-pr`/`my-gh-pr-feedback` are.
+Project-scoped to this repo (hardcodes `Donelle/claude-runway`, `.venv`-based tests, this repo's branch/commit conventions) for the same reason `my-gh-code-it`/`my-gh-pr`/`my-gh-pr-feedback` are.
 
 ## Usage
 ```
@@ -28,7 +28,7 @@ Project-scoped to this repo (hardcodes `YOUR_GITHUB_USERNAME/claude-runway`, `.v
    ```bash
    ORIGIN=$(git remote get-url origin 2>/dev/null)
    case "$ORIGIN" in
-     *YOUR_GITHUB_USERNAME/claude-runway*) REPO_OK=yes ;;
+     *Donelle/claude-runway*) REPO_OK=yes ;;
      *) REPO_OK=no ;;
    esac
    test -f .mcp.json && test -f .claude/settings.json \
@@ -129,7 +129,7 @@ Project-scoped to this repo (hardcodes `YOUR_GITHUB_USERNAME/claude-runway`, `.v
 Pass this whole block as the `prompt` for one `Agent` call per ticket, substituting `{ISSUE_NUMBER}` or `{ATTEMPTED_LIST}` as directed above. Don't paraphrase or shorten it — several of these lines exist because skipping them caused a real, confirmed failure the first time this cycle was worked (issue #38, 2026-08-25 by hand; issues #44/#45, 2026-08-25 during this skill's own live testing); the citations are there so a future edit doesn't silently drop the fix.
 
 ````
-You are autonomously working a GitHub issue on YOUR_GITHUB_USERNAME/claude-runway, end to end:
+You are autonomously working a GitHub issue on Donelle/claude-runway, end to end:
 pick-a-ticket (if not given one) → load context → plan → implement → test → PR → verified
 review-feedback loop (may span several rounds, all within this one call — see Step 5) →
 merge. You have full autonomy — do not ask the user anything and do not wait for approval
@@ -163,13 +163,13 @@ call out separately).
 ## Step 0 — determine the target ticket
 {ISSUE_NUMBER}                                   <-- orchestrator fills in ONE of these two
 --- OR ---
-Pick the highest-priority open issue on YOUR_GITHUB_USERNAME/claude-runway labeled `bug` OR
+Pick the highest-priority open issue on Donelle/claude-runway labeled `bug` OR
 `enhancement` that is NOT already assigned to someone other than you, and whose number is
 NOT in this already-attempted list this run: {ATTEMPTED_LIST}. IMPORTANT: `gh issue list`
 silently truncates to 30 results with no `--limit` flag — always pass one. Also note two
 labels do NOT OR together via repeated `--label` flags (that ANDs, requiring both labels on
 the same issue); use `--search` for OR:
-  gh issue list -R YOUR_GITHUB_USERNAME/claude-runway --state open --search "label:bug,enhancement" \
+  gh issue list -R Donelle/claude-runway --state open --search "label:bug,enhancement" \
     --limit 200 --json number,title,labels,assignees
 Sort by priority label (priority-p1 > p2 > p3; unlabeled sorts last), then by issue number
 ascending as a tiebreaker; bug and enhancement are not otherwise prioritized relative to
@@ -208,7 +208,7 @@ under `~/.claude/skills/`, not guaranteed to exist on whichever machine is runni
    the usual "only what changed" — a modest, known cost, not a sign anything's wrong.
 
 ## Step 2 — setup
-5. `git remote get-url origin` must show YOUR_GITHUB_USERNAME/claude-runway — if not, report
+5. `git remote get-url origin` must show Donelle/claude-runway — if not, report
    FAILED immediately, something is wrong with the working directory.
 6. `git fetch origin main` — do NOT `git checkout main` here. Confirmed live: inside your
    isolated worktree, checking out `main` fails outright (`fatal: 'main' is already used by
@@ -218,25 +218,25 @@ under `~/.claude/skills/`, not guaranteed to exist on whichever machine is runni
    whatever GitHub's actual default branch currently is, independent of your local HEAD;
    the `git fetch` here just makes sure your local knowledge of `origin/main`'s tip is
    current for anything you diff against it later (e.g. Step 11's `git diff origin/main...HEAD`).
-7. Fetch the issue: `gh issue view <N> -R YOUR_GITHUB_USERNAME/claude-runway --json
+7. Fetch the issue: `gh issue view <N> -R Donelle/claude-runway --json
    number,title,body,labels,assignees,issueType,state,url`. If state is CLOSED, report
    BLOCKED — don't reopen work on a closed ticket autonomously. Read the body's
    **Location**/**Verdict**/**Suggested fix** sections as a head start, not something to
    re-derive from zero.
 8. Set issueType if null (bug label → Bug, enhancement label → Feature, neither → Task):
-   `gh issue edit <N> -R YOUR_GITHUB_USERNAME/claude-runway --type <type>`
+   `gh issue edit <N> -R Donelle/claude-runway --type <type>`
 9. Set assignee if empty (always the current authenticated user — this is what `@me`
-   resolves to): `gh issue edit <N> -R YOUR_GITHUB_USERNAME/claude-runway --add-assignee @me`.
+   resolves to): `gh issue edit <N> -R Donelle/claude-runway --add-assignee @me`.
    If someone else is already assigned, report BLOCKED — don't take over someone else's
    issue.
 10. **Create and check out the branch BEFORE touching any files** — this order matters: in
    this same cycle worked by hand, the fix got implemented directly on `main` before the
    branch existed, and had to be corrected after the fact. Check for an existing linked
-   branch first (`gh issue develop <N> -R YOUR_GITHUB_USERNAME/claude-runway --list`); if one
+   branch first (`gh issue develop <N> -R Donelle/claude-runway --list`); if one
    exists, `git fetch` and check it out instead of creating a new one. Otherwise pick a
    short, specific name yourself (no need to ask — `fix/<slug>` for Bug, `feature/<slug>`
    for Feature/Task, ≤6 words, matching this repo's real branch history style) and run:
-   `gh issue develop <N> -R YOUR_GITHUB_USERNAME/claude-runway --name <name> --checkout`
+   `gh issue develop <N> -R Donelle/claude-runway --name <name> --checkout`
    **If this (or `gh pr checkout`, when picking up an already-open PR for this ticket)
    fails because the branch is already checked out in another worktree** — confirmed live:
    a prior round's worktree for this same ticket can still be holding the branch if it
@@ -269,7 +269,7 @@ under `~/.claude/skills/`, not guaranteed to exist on whichever machine is runni
     correctly here avoids both a duplicate-PR error and redundant/conflicting
     reimplementation:
     ```bash
-    EXISTING_PR=$(gh pr list -R YOUR_GITHUB_USERNAME/claude-runway --head <branch> --state all --json number,state --jq '.[0] // empty')
+    EXISTING_PR=$(gh pr list -R Donelle/claude-runway --head <branch> --state all --json number,state --jq '.[0] // empty')
     ```
     - **No PR, and no commits ahead of `main`** (`git log origin/main..HEAD --oneline` is
       empty — using `origin/main`, not local `main`, since Step 2 deliberately never checks
@@ -311,11 +311,11 @@ under `~/.claude/skills/`, not guaranteed to exist on whichever machine is runni
       resource in a different domain happened to reuse its number. The prefix costs
       nothing and removes the possibility entirely.
       ```bash
-      ALL_CURRENT_IDS=$( { gh api repos/YOUR_GITHUB_USERNAME/claude-runway/pulls/<PR>/comments --paginate --jq '.[] | "comment:" + (.id|tostring)'
-                            gh api repos/YOUR_GITHUB_USERNAME/claude-runway/pulls/<PR>/reviews  --paginate --jq '.[] | "review:" + (.id|tostring)'
-                            gh api repos/YOUR_GITHUB_USERNAME/claude-runway/issues/<PR>/comments --paginate --jq '.[] | "issue:" + (.id|tostring)'
+      ALL_CURRENT_IDS=$( { gh api repos/Donelle/claude-runway/pulls/<PR>/comments --paginate --jq '.[] | "comment:" + (.id|tostring)'
+                            gh api repos/Donelle/claude-runway/pulls/<PR>/reviews  --paginate --jq '.[] | "review:" + (.id|tostring)'
+                            gh api repos/Donelle/claude-runway/issues/<PR>/comments --paginate --jq '.[] | "issue:" + (.id|tostring)'
                           ; } 2>/dev/null | sort -u )
-      UNRESOLVED_IDS=$(gh api graphql -f query='query { repository(owner: "YOUR_GITHUB_USERNAME", name: "claude-runway") { pullRequest(number: <PR>) { reviewThreads(first: 100) { nodes { isResolved comments(first: 10) { nodes { databaseId } } } } } } }' \
+      UNRESOLVED_IDS=$(gh api graphql -f query='query { repository(owner: "Donelle", name: "claude-runway") { pullRequest(number: <PR>) { reviewThreads(first: 100) { nodes { isResolved comments(first: 10) { nodes { databaseId } } } } } } }' \
         --jq '.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false) | .comments.nodes[] | "comment:" + (.databaseId|tostring)' | sort -u)
       SEEN_IDS=$(comm -23 <(echo "$ALL_CURRENT_IDS") <(echo "$UNRESOLVED_IDS"))
       ```
@@ -329,7 +329,7 @@ under `~/.claude/skills/`, not guaranteed to exist on whichever machine is runni
       `UNRESOLVED_IDS`:
       ```bash
       HEAD_SHA=$(git rev-parse HEAD)
-      EXISTING_REVIEW=$(gh api repos/YOUR_GITHUB_USERNAME/claude-runway/pulls/<PR>/reviews --paginate \
+      EXISTING_REVIEW=$(gh api repos/Donelle/claude-runway/pulls/<PR>/reviews --paginate \
         --jq ".[] | select(.user.login == \"copilot-pull-request-reviewer[bot]\" and .commit_id == \"$HEAD_SHA\") | .id" | head -1)
       ```
       - `EXISTING_REVIEW` is empty → no review exists yet for the current commit at all
@@ -392,12 +392,12 @@ under `~/.claude/skills/`, not guaranteed to exist on whichever machine is runni
     `git add <files> && git commit -m "..." && git push -u origin <branch>`
 17. `gh pr create --base main --head <branch> --title "<tightened summary>" --body
     "<bulleted summary of the change>\n\nFixes #<N>\n\nSee
-    https://github.com/YOUR_GITHUB_USERNAME/claude-runway/issues/<N>\n\n---\n🤖 Opened and driven
+    https://github.com/Donelle/claude-runway/issues/<N>\n\n---\n🤖 Opened and driven
     autonomously via the \`/my-gh-autowork\` skill (plan → implement → test →
     review-feedback loop → merge) — no human wrote or reviewed this before it was pushed;
     verify accordingly."`. **Capture the PR number right here, reliably** — either parse it
     from the URL `gh pr create` prints to stdout (`.../pull/<PR>`), or immediately run
-    `gh pr view <branch> -R YOUR_GITHUB_USERNAME/claude-runway --json number --jq .number`. Do
+    `gh pr view <branch> -R Donelle/claude-runway --json number --jq .number`. Do
     NOT try to (re)discover the PR later via a text/body search (e.g. `gh pr list --search
     "<N> in:body"`) — confirmed live during this skill's own testing to false-positive: a
     search for issue #44 matched an unrelated, already-merged PR from weeks earlier whose
@@ -410,9 +410,9 @@ under `~/.claude/skills/`, not guaranteed to exist on whichever machine is runni
     from step 12, update it if implementation diverged. Post all three as separate issue
     comments:
     ```
-    gh issue comment <N> -R YOUR_GITHUB_USERNAME/claude-runway --body-file .plans/<N>-research.md
-    gh issue comment <N> -R YOUR_GITHUB_USERNAME/claude-runway --body-file .plans/<N>-plan.md
-    gh issue comment <N> -R YOUR_GITHUB_USERNAME/claude-runway --body-file .plans/<N>-validate.md
+    gh issue comment <N> -R Donelle/claude-runway --body-file .plans/<N>-research.md
+    gh issue comment <N> -R Donelle/claude-runway --body-file .plans/<N>-plan.md
+    gh issue comment <N> -R Donelle/claude-runway --body-file .plans/<N>-validate.md
     ```
 
 ## Step 4 — review-feedback loop (verify before acting, capped at 5 rounds total)
@@ -466,7 +466,7 @@ happens there.
     ```bash
     HEAD_SHA=$(git rev-parse HEAD)
     for i in $(seq 1 36); do
-      NEW_COPILOT_IDS=$(gh api repos/YOUR_GITHUB_USERNAME/claude-runway/pulls/<PR>/reviews --paginate \
+      NEW_COPILOT_IDS=$(gh api repos/Donelle/claude-runway/pulls/<PR>/reviews --paginate \
           --jq ".[] | select(.user.login == \"copilot-pull-request-reviewer[bot]\" and .commit_id == \"$HEAD_SHA\") | \"review:\" + (.id|tostring)" 2>/dev/null \
         | sort -u | comm -23 - <(printf '%s\n' $SEEN_IDS | sort -u))
       if [ -n "$NEW_COPILOT_IDS" ]; then
@@ -523,9 +523,9 @@ happens there.
     would never know it was missing:
     ```bash
     FETCH_FAILED=0
-    COMMENT_IDS=$(gh api repos/YOUR_GITHUB_USERNAME/claude-runway/pulls/<PR>/comments --paginate --jq ".[] | select(.user.login != \"$ME\") | \"comment:\" + (.id|tostring)") || FETCH_FAILED=1
-    REVIEW_IDS=$(gh api repos/YOUR_GITHUB_USERNAME/claude-runway/pulls/<PR>/reviews --paginate --jq ".[] | select(.user.login != \"$ME\") | \"review:\" + (.id|tostring)") || FETCH_FAILED=1
-    ISSUE_COMMENT_IDS=$(gh api repos/YOUR_GITHUB_USERNAME/claude-runway/issues/<PR>/comments --paginate --jq ".[] | select(.user.login != \"$ME\") | \"issue:\" + (.id|tostring)") || FETCH_FAILED=1
+    COMMENT_IDS=$(gh api repos/Donelle/claude-runway/pulls/<PR>/comments --paginate --jq ".[] | select(.user.login != \"$ME\") | \"comment:\" + (.id|tostring)") || FETCH_FAILED=1
+    REVIEW_IDS=$(gh api repos/Donelle/claude-runway/pulls/<PR>/reviews --paginate --jq ".[] | select(.user.login != \"$ME\") | \"review:\" + (.id|tostring)") || FETCH_FAILED=1
+    ISSUE_COMMENT_IDS=$(gh api repos/Donelle/claude-runway/issues/<PR>/comments --paginate --jq ".[] | select(.user.login != \"$ME\") | \"issue:\" + (.id|tostring)") || FETCH_FAILED=1
     if [ "$FETCH_FAILED" -eq 1 ]; then
       echo "One or more feedback endpoints failed to fetch — do not treat this as a complete picture."
     fi
@@ -616,17 +616,17 @@ happens there.
     lightweight chat reply, and that invocation itself errors out on this repo.
     - Reply to an inline comment (note the `<PR>` segment — omitting it 404s, a real
       mistake made working this cycle by hand):
-      `gh api repos/YOUR_GITHUB_USERNAME/claude-runway/pulls/<PR>/comments/<comment_id>/replies --method POST -f body="..."`
+      `gh api repos/Donelle/claude-runway/pulls/<PR>/comments/<comment_id>/replies --method POST -f body="..."`
     - A finding buried inside a review body's "Suppressed comments" section (no standalone
       comment id) gets a general PR comment instead:
-      `gh issue comment <PR> -R YOUR_GITHUB_USERNAME/claude-runway --body "..."`
+      `gh issue comment <PR> -R Donelle/claude-runway --body "..."`
     - If an error-comment spam loop happens anyway (from any source), stop immediately —
       it's a GitHub-side backend failure, not fixable from this side — and clean up:
-      `gh api repos/YOUR_GITHUB_USERNAME/claude-runway/issues/comments/<id> --method DELETE`
+      `gh api repos/Donelle/claude-runway/issues/comments/<id> --method DELETE`
       per comment, then continue with the underlying finding (already resolved either way).
 24. Resolve addressed review threads (GraphQL only — REST can't do this):
     ```
-    gh api graphql -f query='query { repository(owner: "YOUR_GITHUB_USERNAME", name: "claude-runway") { pullRequest(number: <PR>) { reviewThreads(first: 100) { nodes { id isResolved comments(first: 1) { nodes { databaseId path body } } } } } } }'
+    gh api graphql -f query='query { repository(owner: "Donelle", name: "claude-runway") { pullRequest(number: <PR>) { reviewThreads(first: 100) { nodes { id isResolved comments(first: 1) { nodes { databaseId path body } } } } } } }'
     ```
     then for each unresolved thread whose finding you addressed this round:
     ```
@@ -647,14 +647,14 @@ happens there.
     time on the same point.**
 
 ## Step 5 — merge
-26. `gh pr view <PR> -R YOUR_GITHUB_USERNAME/claude-runway --json mergeable,mergeStateStatus,statusCheckRollup`.
+26. `gh pr view <PR> -R Donelle/claude-runway --json mergeable,mergeStateStatus,statusCheckRollup`.
     All required checks must be SUCCESS. The `prjiralink` check may show `ACTION_REQUIRED`
     — that's known non-blocking on this repo, ignore it. If any other check is failing and
     you can't fix it (not the code you touched, e.g. an unrelated flake), report FAILED
     with the check name and its log URL rather than force-merging. If the merge itself is
     rejected by a repository rule, report FAILED with the exact error — don't try to work
     around a repo rule autonomously.
-27. `gh pr merge <PR> -R YOUR_GITHUB_USERNAME/claude-runway --squash --delete-branch`
+27. `gh pr merge <PR> -R Donelle/claude-runway --squash --delete-branch`
 28. Confirm: `gh pr view <PR> --json state,mergedAt,mergeCommit` shows MERGED, and
     `gh issue view <N> --json state` shows CLOSED (auto-closed via `Fixes #N`).
 29. Do NOT `git checkout main` here — same reason as Step 2: it fails outright

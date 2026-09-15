@@ -7,7 +7,7 @@ description: "Create a pull request for this repo and post research/plan/validat
 
 Create a pull request for claude-runway and document the work against its GitHub issue — the GitHub-issue equivalent of `/my-post-pr`. GitHub has no direct analog to "attach a file to a ticket," so the RPIV-style artifacts (research/plan/validate) get posted as comments on the issue instead of attached as files, which is the closest native equivalent and keeps the trail visible on the issue itself.
 
-Project-scoped to this repo: hardcodes `YOUR_GITHUB_USERNAME/claude-runway`, README.md as the doc entry point (no `CLAUDE.md` here), and the `.venv`-based test command — no Azure DevOps branching, since this repo is GitHub-only.
+Project-scoped to this repo: hardcodes `Donelle/claude-runway`, README.md as the doc entry point (no `CLAUDE.md` here), and the `.venv`-based test command — no Azure DevOps branching, since this repo is GitHub-only.
 
 ## Usage
 ```
@@ -17,7 +17,7 @@ The issue number is required — unlike `/my-pr-review-feedback`, there's no rel
 
 ## Steps
 
-1. **Confirm the repo** via `git remote get-url origin` — expect `YOUR_GITHUB_USERNAME/claude-runway` on `github.com`. Stop and ask if it doesn't match rather than guessing.
+1. **Confirm the repo** via `git remote get-url origin` — expect `Donelle/claude-runway` on `github.com`. Stop and ask if it doesn't match rather than guessing.
 
 2. **Ensure all changes are committed and pushed**:
    ```bash
@@ -27,7 +27,7 @@ The issue number is required — unlike `/my-pr-review-feedback`, there's no rel
 
 3. **Fetch the issue** for context (title, labels, original **Location**/**Suggested fix** if this repo's code-review-filed issues):
    ```bash
-   gh issue view {N} -R YOUR_GITHUB_USERNAME/claude-runway --json number,title,body,url,labels
+   gh issue view {N} -R Donelle/claude-runway --json number,title,body,url,labels
    ```
 
 4. **Gather PR details**:
@@ -52,9 +52,9 @@ The issue number is required — unlike `/my-pr-review-feedback`, there's no rel
 
 8. **Post the artifacts as comments on the issue**, one per artifact so each stays readable rather than one giant comment:
    ```bash
-   gh issue comment {N} -R YOUR_GITHUB_USERNAME/claude-runway --body-file .plans/{N}-research.md
-   gh issue comment {N} -R YOUR_GITHUB_USERNAME/claude-runway --body-file .plans/{N}-plan.md
-   gh issue comment {N} -R YOUR_GITHUB_USERNAME/claude-runway --body-file .plans/{N}-validate.md
+   gh issue comment {N} -R Donelle/claude-runway --body-file .plans/{N}-research.md
+   gh issue comment {N} -R Donelle/claude-runway --body-file .plans/{N}-plan.md
+   gh issue comment {N} -R Donelle/claude-runway --body-file .plans/{N}-validate.md
    ```
 
 9. **Confirm with**:
