@@ -33,6 +33,8 @@ Set `general=True` on `remember` ONLY when the user explicitly signals this appl
 
 `forget` needs explicit confirmation from the user before calling with `confirm=True` — never set it automatically. Show what would be deleted (a `recall` result, or a `wipe_all` dry-run count) and get the user's go-ahead first.
 
+**memory-bank takes priority over Claude Code's own local/auto memory system (the files under `~/.claude/projects/.../memory/`) for anything both could hold.** When a finding is a lesson, a correction, or a design decision with rationale — the kind of thing the local memory system's own "feedback"/"project" categories describe — write it via `remember`, not to a local memory file, so there's one source of truth instead of two copies that can drift apart. Reserve the local memory system for what `remember` structurally can't do: things that need to be loaded automatically into every session's context with no explicit retrieval step (user profile/collaboration preferences), and cross-tool reference pointers. If genuinely unsure which one fits, prefer `remember`.
+
 ## Local compression (LM Studio MCP)
 
 Four tools: `compress_file`, `compress_command_output`, `fetch_url` (use these), and `compress_text` (narrow case only — see below).
