@@ -18,6 +18,7 @@ Each piece works independently — you don't need LM Studio to use the Qdrant me
 - [Environment variables](#environment-variables) — **must be set in two places and kept in sync**
 - [Verifying it's working](#verifying-its-working)
 - [Cross-repo lookups](#cross-repo-lookups)
+- [Memory bank](#memory-bank)
 - [Skills and hooks](#skills-and-hooks)
   - [Exactness-critical commands (Bash only)](#exactness-critical-commands-bash-only)
   - [fetch_url vs. WebFetch vs. the hooks](#fetch_url-vs-webfetch-vs-the-hooks)
@@ -400,6 +401,56 @@ For that, `ingest_mcp_server.py` (the `codebase-indexer` server) also exposes:
 - **`set_collection_description(collection, description, ...)`** — sets or updates a short, one-line hint for any already-indexed collection (including this project's own), so `list_collections` can surface it later. Stored as native Qdrant collection metadata; Qdrant merges rather than replaces it, so this is always safe to call again to update a hint. For this project's *own* collection specifically, setting `COLLECTION_DESCRIPTION` in `.mcp.json` (Installation step 4) does this automatically — no manual call needed.
 
 All three work from any project's session using just the existing `codebase-indexer` server already in `.mcp.json` — no extra config needed. Naming the collection directly in your prompt still works exactly as before (e.g. "search the `acme-support-ticketsapi` collection for how auth works") — an exact name given directly in the prompt is still the highest-signal way to point Claude at the right tool call. Hints are a fallback for when you *don't* already know which collection to name, not a replacement, and not a reintroduction of the standing alias table this section previously argued against: a hint is discovered live via a `list_collections` tool call each time it's needed, not a table sitting in `.mcp.json`/`CLAUDE.md` that Claude would have to recall on its own without ever checking whether it's still accurate. Hints are cached locally after the first fetch (see [Environment variables](#environment-variables)'s `CLAUDE_RUNWAY_CACHE_DB`) so repeated `list_collections` calls — across sessions, across repos — don't re-pay a per-collection Qdrant round-trip once a hint has been fetched anywhere. The one thing to get right for `find_in_collection`: `embedding_model` must match whatever model the OTHER collection was actually indexed with (check that repo's own `.mcp.json`) — a mismatch is now detected before querying and returns an actionable error rather than silently returning irrelevant results; the check fails open on network errors so a transient Qdrant hiccup never blocks a valid query.
+
+## Memory bank
+
+A durable, cross-session knowledge store — `remember`, `recall`, `forget` — provided by the `memory-bank` MCP server (`tools/memory_bank_mcp_server.py`, backed by `libs/memory_bank_lib.py`).
+
+This is separate from the Qdrant codebase memory piece described in the main README: `qdrant-store`/`qdrant-find` are for THIS project's own conceptual notes about its code; memory-bank is for lessons, decisions, and corrections meant to survive a fresh session, and can span every project on the machine.
+
+### Why a separate collection, not per-project
+
+`codebase-indexer` gives every project its own Qdrant collection, switched automatically by that project's `.mcp.json`. Memory-bank works differently on purpose: every project's memory-bank server writes into the SAME shared Qdrant collection (`MEMORY_BANK_COLLECTION`, default `memory-bank`) — that's what lets `recall` default to "this project's own memories plus anything tagged general" without a separate cross-repo lookup step (see [Cross-repo lookups](#cross-repo-lookups) for how that lookup works for the *codebase* index, which memory-bank deliberately avoids needing).
+
+`forget` does NOT share that same default-scope behavior — it's a deletion tool, not a lookup, so it's deliberately narrower: deleting by an exact `point_id` has no scope concept at all (any point, from any project, though deleting one that isn't this project's own requires `confirm=True`), and its bulk `wipe_all` mode only ever clears THIS project's own memories, explicitly excluding anything tagged `general` — there's no bulk way to wipe cross-project memories at all.
+
+`MEMORY_BANK_ID` is a plain identifier tagging which project wrote a given memory (`metadata.repo`) — it doesn't have to match any real Qdrant collection name. `MEMORY_BANK_COLLECTION` is the actual shared collection name, common to every project on the Qdrant instance.
+
+Because the collection is shared, `EMBEDDING_MODEL` is locked in by whichever project's memory-bank server created it first — every project sharing this collection needs to agree on this one value (see the README's [Known limitations](#known-limitations) for the mismatch-detection behavior this implies).
+
+### Setup
+
+**Recommended:** pass `--memory-bank-collection`/`--memory-bank-id` to `tools/setup_project.py init` ([Installation](#installation)'s step 4) — both are optional:
+
+- `--memory-bank-collection` defaults to the literal `"memory-bank"` if blank. Deliberately NOT derived from anything project-specific, since this is meant to be the SAME value across every project sharing the collection — only override it if you're deliberately running more than one separate memory-bank collection on the same Qdrant instance.
+- `--memory-bank-id` defaults to `--collection-name` (this project's own codebase-index collection name) if blank. Unlike `--memory-bank-collection`, this IS meant to vary per project.
+
+**Neither default is sticky across a rerun.** `setup_project.py init` regenerates its owned server blocks wholesale each time, so omitting either flag on a LATER run recomputes these defaults fresh — it doesn't detect or preserve whatever value is already sitting in the project's current `.mcp.json`. For a project that has already accumulated real memories, rerunning without explicitly passing the SAME `--memory-bank-collection`/`--memory-bank-id` values used originally can silently disconnect from existing ones (a collection override reset back to `"memory-bank"`) or split future memories under a new tag (an ID re-derived from a `--collection-name` that changed since the last run). The CLI's own `--memory-bank-id` help text already warns about this specific case — pass both values explicitly on every rerun once a project has real memories, not just the first time.
+
+The script warns (rather than silently allowing) two collisions:
+
+- **`--memory-bank-id` resolving to `"general"`** — `"general"` is memory-bank's reserved sentinel for cross-project knowledge (see "Using it" below); a project's own ID colliding with it would tag that project's memories as if they applied everywhere. Pass an explicit `--memory-bank-id` to fix.
+- **This project's `--collection-name` equal to `--memory-bank-collection`** — `index_repo`/`sync_repo` refuse outright to run against the shared memory-bank collection (issue #175), so this collision would leave the project's own codebase index unable to run at all. Pass a different `--collection-name` or `--memory-bank-collection` to fix.
+
+**Manual fallback**: copy `templates/mcp.json.template`'s `memory-bank` block into your TARGET PROJECT's own `.mcp.json` (per [Installation](#installation)'s step 4) and edit these fields there — never edit the shared `templates/mcp.json.template` file itself, which doesn't configure any project and risks committing project-specific paths or credentials into this tools repo:
+
+- Replace `REPLACE-WITH-VENV-PYTHON` with the absolute venv Python path.
+- Replace `/absolute/path/to/tools/memory_bank_mcp_server.py` with the real path.
+- Replace `MEMORY_BANK_ID`'s placeholder with a plain identifier for this project (or leave it equal to this project's `COLLECTION_NAME` if unsure).
+- Leave `MEMORY_BANK_COLLECTION` at its default (`memory-bank`) unless you have a specific reason to run a separate shared collection. **If you DO override it, set the exact same value in the `codebase-indexer` block's own `MEMORY_BANK_COLLECTION` entry too** — `index_repo`/`sync_repo`'s guard against ever touching the shared memory-bank collection checks against that block's copy, not this one, so a mismatch here leaves the indexer only protecting the default name while your memories actually live under the custom one. `setup_project.py`'s `--memory-bank-collection` flag (recommended, above) writes both automatically; this is specifically a manual-editing gotcha.
+- `QDRANT_URL`/`QDRANT_API_KEY`/`EMBEDDING_MODEL` follow the same values as the `qdrant`/`codebase-indexer` blocks in the same file — `EMBEDDING_MODEL` specifically must match whatever model created the shared collection, not just this project's own codebase-index collection.
+
+### Using it
+
+- `recall(query, ...)` — defaults to this project's own memories plus anything tagged `general`. Pass `repo=<other-project-id>` or `all_repos=True` only when genuinely needed, not as a default broadening.
+- `remember(summary, description, kind, general=False, ...)` — `summary` is the only field actually searched, so write it the way a future query would be phrased; put the full verbatim detail in `description`. Set `general=True` only when the user explicitly signals the memory applies across every project.
+- `forget(...)` — requires explicit user confirmation before calling with `confirm=True`; show what would be deleted first.
+
+For the exact usage guidance Claude should follow when deciding whether to call these tools, see `templates/CLAUDE.md.template`'s "Durable memory (memory-bank MCP)" section — copy it into a project's `CLAUDE.md` alongside the Qdrant/local-compress sections it already documents.
+
+### Where the data lives
+
+The same Qdrant instance as `codebase-indexer`'s per-project collections, but in one collection shared across every project, and never touched by `index_repo`/`sync_repo`'s reset/delete paths — those always preserve `metadata.source == "memory-bank"` points, even during a full reset (issue #175; see the README's [Known limitations](#known-limitations) for the mechanics of that filtered-delete behavior).
 
 ## Skills and hooks
 

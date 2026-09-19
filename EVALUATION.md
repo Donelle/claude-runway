@@ -31,6 +31,13 @@ This repo has two independent pieces, so there are two independent tracks below.
   - [Step C3: Comparison C2 run (`/my-resume` vs. starting fresh)](#step-c3-comparison-c2-run-my-resume-vs-starting-fresh)
   - [Step C4: What this track can't tell you](#step-c4-what-this-track-cant-tell-you)
 - [Track D: the live per-session savings tracker (`/my-savings`) — an estimate, NOT a fourth measured track](#track-d-the-live-per-session-savings-tracker-my-savings--an-estimate-not-a-fourth-measured-track)
+- [Track E: Durable memory reuse (`remember`/`recall`/`forget`)](#track-e-durable-memory-reuse-rememberrecallforget)
+  - [Step E1: Build a benchmark scenario set (real, previously-researched findings)](#step-e1-build-a-benchmark-scenario-set-real-previously-researched-findings)
+  - [Step E2: Baseline run (memory-bank absent/disabled)](#step-e2-baseline-run-memory-bank-absentdisabled)
+  - [Step E3: Treatment run (memory-bank enabled)](#step-e3-treatment-run-memory-bank-enabled)
+  - [Step E4: Measure the fixed overhead](#step-e4-measure-the-fixed-overhead)
+  - [Step E5: remember:recall ratio (diagnostic only)](#step-e5-rememberrecall-ratio-diagnostic-only)
+  - [Step E6: Why this track is harder to run than A-C](#step-e6-why-this-track-is-harder-to-run-than-a-c)
 - [Compute the result (both tracks)](#compute-the-result-both-tracks)
 - [Caveats](#caveats)
 
@@ -190,6 +197,62 @@ Other differences from Tracks A–C worth being explicit about:
 - **The fixed per-turn schema overhead these tools add is reported separately, never netted out of the headline.** An earlier draft of this design considered `net = gross_saved − (schema_tokens × turns)`, but tool schemas sit in the request's cached prefix — only the first turn pays full price, every turn after is a cache read at roughly a tenth the cost. Subtracting at the full rate would overstate the real tax by nearly 10x on any session past its first turn, manufacturing a "cost" that mostly isn't actually paid. The tracker reports both numbers side by side instead and lets the reader judge.
 - **`fetch_url` is logged but never credited.** Its honest counterfactual is WebFetch's own already-compressed summary (see Track B above), not the raw page — crediting it against raw bytes would overstate savings for a comparison this repo already established isn't apples-to-apples.
 - **Explicitly NOT a substitute for Tracks A–C.** If you want a rigorous, defensible savings number for a report or a decision about whether to keep using this toolkit, run the actual A/B protocol above. `/my-savings` is for a quick, continuous, directional sense of "is this doing anything," not for a claim you'd want to defend under scrutiny.
+
+## Track E: Durable memory reuse (`remember`/`recall`/`forget`)
+
+This track tests the same core claim as every other track — does using the tool save tokens on a task — applied to memory-bank specifically. Two distinct mechanisms drive the savings, and either one alone is enough to produce a measurable win:
+
+1. **Avoiding a repeated research cycle.** A past investigation that took real exploration (multiple tool calls, file reads, cross-referencing, back-and-forth) to reach a conclusion the first time can be retrieved with a single `recall` call in a later session, instead of that exploration happening all over again.
+2. **A shorter answer than reconstructing it from scratch.** Even on a task where some exploration is unavoidable regardless, the stored `summary`/`description` a `remember` call captured is shorter than re-deriving and re-explaining the same reasoning and supporting evidence live.
+
+Both mechanisms produce the same baseline-vs-treatment shape Tracks A–C use: fewer tokens for the treatment condition (memory-bank enabled, prior `remember` entry available) than the baseline (memory-bank absent, forced to re-derive from zero) on a task a fresh session would otherwise have to solve from scratch. (Track D, by contrast, has no baseline/treatment protocol at all — see its own intro above — so it's excluded from this comparison, not implicitly included.)
+
+**Scope: this track only measures reuse, never the original encounter.** The very first time a finding is produced — the research cycle (or the mistake-then-correction cycle) that eventually becomes a `remember` entry — has to happen once regardless of whether memory-bank exists at all; that one-time cost is identical in both conditions, so it's outside the comparison. What's measured below is entirely about occasions *after* that `remember` entry already exists: does a later occasion cost less with it available (treatment) than without it (baseline)? If a scenario can't recur — if the finding only ever mattered once — there's nothing for this track to measure on it at all.
+
+### Step E1: Build a benchmark scenario set (real, previously-researched findings)
+
+Unlike Track A's 8-12 arbitrary questions, these have to be real findings pulled from actual session history (4-6 of them) — a fabricated "finding" tells you nothing about whether `recall` is actually shortcutting real work. Candidates include a root-cause investigation, a design decision with its rationale, or a correction — anything that took genuine multi-step exploration to reach the first time, was (or would be) `remember`-able, and is plausible to come up again in a later, unrelated session. For each scenario, record:
+
+- The task/question that requires the finding, phrased so it's repeatable in a fresh session.
+- The research path taken the first time (roughly how many tool calls/turns it took), so the baseline reproduction is realistic rather than trivially cheap.
+- The corresponding `remember` entry (`summary`/`description`) as it would actually be stored.
+
+### Step E2: Baseline run (memory-bank absent/disabled)
+
+Fully quit/relaunch per scenario (see "Measuring cleanly" above), with the `memory-bank` server disconnected. Run the task as a later occasion would present it — Claude has no access to the earlier finding and must derive it fresh, the same exploration (or, for a correction-flavor scenario, the same class of mistake) a genuinely new encounter would require. Record `/usage` for that full derivation.
+
+Note: "Measuring cleanly"'s "match turn structure" rule does NOT apply here the way it does in Track B, and this is deliberate, not an oversight — there, a turn-count mismatch between conditions is a confound to eliminate before it contaminates the comparison; here, baseline taking more turns than treatment (the full re-derivation vs. a single `recall` call) *is* the effect this track exists to measure. Padding treatment with extra turns or truncating baseline's would remove the exact thing being tested.
+
+### Step E3: Treatment run (memory-bank enabled)
+
+Same task, fresh session, with the corresponding `remember` entry already stored from a prior session. Record `/usage`. Judge the outcome from the transcript (see Step A5), not from the final answer's correctness alone — a right answer with no `recall` call in the transcript is not evidence of a win, it's unfalsifiable: there's no way to tell whether the model reasoned to the same conclusion independently on this particular run, coincidentally, or would have on every run. Classify as one of:
+
+- Recalled and correctly applied (re-derivation avoided) — `recall` was called AND its result is what the answer is actually built on
+- Recalled but ignored (Claude re-derived anyway — no savings on this run, but not the same failure mode as a retrieval miss)
+- Not recalled (retrieval miss — falls back to the same cost as baseline)
+- Wrong memory recalled
+
+Only "recalled and correctly applied" is eligible to count as a win — same discipline Tracks A/B use to discard a cheaper wrong answer, sharpened here to also discard a cheaper answer that merely looks right without a verifiable `recall` behind it.
+
+Report two numbers per scenario set, not one — averaging only over successes overstates memory-bank's real-world value, the same way reporting a cache's hit-rate-conditioned latency instead of its overall latency would:
+
+- **Intention-to-treat result** (primary): `(baseline_tokens − treatment_tokens) / baseline_tokens`, computed from the REAL recorded `/usage` cost of every scenario actually run — never a substituted or assumed value for any outcome. A "not recalled" (retrieval miss) run's real cost will typically land close to baseline's since nothing else changed, but that has to fall out of the actual numbers, not be assumed. A "recalled but ignored" run costs MORE than baseline, not the same — treatment paid for the `recall` round-trip AND the full re-derivation, so its real recorded cost stays in the average as-is; zeroing it out would hide a real regression. "Wrong memory recalled" runs' real token cost also stays in this average — but since that outcome fails the correctness bar entirely, also report its rate/count separately as a distinct answer-quality risk, which the token number alone can't capture.
+- **Success-conditioned result** (secondary, clearly labeled as such): the same formula, computed only over "recalled and correctly applied" scenarios — answers "how much does memory-bank save when retrieval actually works," a real but different question from the intention-to-treat number above.
+
+### Step E4: Measure the fixed overhead
+
+Same pattern as Step A4/B4 — and already wired up rather than something this track still needs to add: `tools/report_tool_counts.py`'s server loop already includes `memory-bank` (`memory_bank_mcp_server`) alongside `local-compress` and `codebase-indexer`, so its 3 tools' (`remember`/`recall`/`forget`) schema-token cost goes through the same shared `libs/mcp_tool_introspect.py` utility as the other two servers. Run `python tools/report_tool_counts.py` for the current live number rather than hand-typing one here — same discipline Step A4/B4 already established, for the same reason: issues #22/#23 are exactly what happens when a schema-token count gets hand-typed into this doc instead of read live.
+
+### Step E5: remember:recall ratio (diagnostic only)
+
+Same role as Track D's savings estimate — a cheap, continuously-observable number, not a pass/fail result. A ratio heavily skewed toward `remember` suggests memories aren't being retrieved when relevant, but doesn't distinguish "nothing to recall yet" from "retrieval isn't working," so it shouldn't be reported as if it were Step E1-E3's result.
+
+### Step E6: Why this track is harder to run than A-C
+
+- **A correct treatment answer only counts as a win if `recall` is verifiably load-bearing in the transcript** — outcome correctness alone can't distinguish "recall saved the re-derivation" from "the model got there anyway on this particular run." This is why Step E3 classifies from the transcript rather than the final answer.
+- **The re-derivation cost in baseline is inherently variable** (same caveat Track C2 raises about re-establishing context not being a fixed-cost operation) — a scenario that happens to be quick to re-derive understates the savings a harder scenario would show, so scenario selection matters more here than in Track A/B's more uniform lookups.
+- **Small N is structural** — credible scenarios have to come from real, previously-researched findings, so this track won't reach Track A's 8-12-task sample size. Treat results as directional.
+- **Reuse value compounds over a memory's lifetime in a way one baseline/treatment pairing can't capture** — a stored finding reused 5 times pays for itself 5 times over, but this protocol only measures a single reuse instance per scenario.
 
 ## Compute the result (both tracks)
 
