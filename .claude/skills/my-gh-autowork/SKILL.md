@@ -667,7 +667,15 @@ happens there.
 ## Final report (your literal last line of output)
 Before the outcome line, give a short summary: files changed, tests added, findings
 verified/declined per round, how many review rounds it took, any deviation from the plan
-and why. Then end with EXACTLY one of these three line shapes:
+and why. If, anywhere during this run (Step 3's implementation, or Step 4's review-feedback
+loop), you hit a genuinely non-obvious root cause or correction worth remembering beyond
+this one ticket, list it here as a suggested memory-bank candidate (one line each: what to
+remember, why) — do NOT call `remember` yourself during this run. This skill runs with zero
+approval gates and can't ask mid-run the way an interactive session would, and storing a
+memory is a real side effect that always needs the user's go-ahead first (see
+templates/CLAUDE.md.template's memory-bank section) — so batch candidates into this final
+report instead of skipping the checkpoint entirely. Then end with EXACTLY one of these three
+line shapes:
 ```
 OUTCOME: MERGED (issue #<n>, PR #<pr>)
 OUTCOME: BLOCKED (issue #<n>) — <one-line reason>

@@ -1274,7 +1274,17 @@ class SyncRepoPreservesEmbeddingsOnChunkAndHashFailures(unittest.TestCase):
                  mock.patch.object(self.ims, "QdrantClient", return_value=fake_client), \
                  mock.patch.object(self.ims, "FastEmbedProvider", return_value=MagicMock()), \
                  mock.patch.object(self.ims, "QdrantConnector", return_value=MagicMock()), \
-                 mock.patch.object(self.ims, "store_batch", new=AsyncMock(return_value=None)):
+                 mock.patch.object(self.ims, "store_batch", new=AsyncMock(return_value=None)), \
+                 mock.patch.object(self.ims, "check_embedding_model_mismatch", return_value=None):
+                # check_embedding_model_mismatch patched out -- this test is
+                # about chunk/hash-failure preservation, not the mismatch
+                # check itself (owned by test_qdrant_model_check.py /
+                # test_ingest_mcp_server_memory_bank_guards.py). fake_client's
+                # unconfigured get_collection() returns a vectors_config the
+                # real check can't recognize, which now correctly fails
+                # closed (PR #178 review, seventh pass) instead of silently
+                # passing, which would otherwise block sync_repo's delete
+                # loop for reasons unrelated to what's being tested here.
                 result = asyncio.run(self.ims.sync_repo(
                     repo_path=str(repo),
                     collection="test-sync-collection",

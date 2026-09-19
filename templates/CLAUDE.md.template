@@ -21,6 +21,18 @@ Dedup within a session: if the same conceptual question resurfaces, reuse the ea
 
 **Cross-repo lookups:** `qdrant-find` only ever searches THIS project's own collection. When a question genuinely requires another already-indexed repo's codebase — e.g. working in a frontend repo but needing to understand how the backend it calls actually implements an endpoint — use `find_in_collection(query, collection)` instead. If the user names an exact collection directly in their prompt, pass it through as given rather than guessing. Call `list_collections` first if you don't know the other repo's exact collection name. Don't reach for this for questions answerable from this project's own collection; it's specifically for when the answer lives in a different repo's code.
 
+## Durable memory (memory-bank MCP)
+
+Three tools: `remember`, `recall`, `forget` — a durable, cross-session knowledge store, separate from `qdrant-store`/`qdrant-find` above (those are for THIS project's own conceptual notes; memory-bank is for lessons, decisions, and corrections meant to survive a fresh session, and can span every project on this machine).
+
+Call `recall` before finalizing a non-trivial change — a past correction, root cause, or design rationale relevant to the current task may already be stored. It defaults to this project's own memories plus anything tagged general (applies everywhere); only pass `repo=<name>` or `all_repos=True` when you genuinely need a different or broader scope than that.
+
+Offer to `remember` something after resolving a real correction, a non-obvious root cause, or a design decision with real rationale behind it — not every exchange. Ask first ("Is this something you'd like to remember for next time?") rather than storing automatically. Write `summary` the way a future query would be phrased (it's the only text actually searched); put the full verbatim detail in `description`.
+
+Set `general=True` on `remember` ONLY when the user explicitly signals this applies across every project — phrases like "remember this globally," "this applies to every project," "remember this across all repos." Default to `False` (scoped to this project) otherwise; don't infer `general=True` from the content alone.
+
+`forget` needs explicit confirmation from the user before calling with `confirm=True` — never set it automatically. Show what would be deleted (a `recall` result, or a `wipe_all` dry-run count) and get the user's go-ahead first.
+
 ## Local compression (LM Studio MCP)
 
 Four tools: `compress_file`, `compress_command_output`, `fetch_url` (use these), and `compress_text` (narrow case only — see below).

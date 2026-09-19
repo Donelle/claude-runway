@@ -60,6 +60,7 @@ If no PR number is provided, find the active PR for the current branch.
    - **Doesn't reproduce** → don't change the code. Reply explaining specifically why, with the reasoning or test evidence — don't silently ignore it, and don't defer to the reviewer by default just because they're a reviewer (or a bot with a confident-sounding tone).
    - This applies to any finding with a concrete, checkable claim — not just correctness/security. Style or "best practice" suggestions without a checkable failure mode don't need a repro; use judgment on those directly.
    - Never tag `@copilot` in the reply — see [Replying to Feedback](#replying-to-feedback) for why: it reliably triggers a broken coding-agent invocation on this repo, confirmed three times (PR #73, PR #84, PR #107), and costs nothing to skip since Copilot's automated review already re-runs on every push with no mention needed.
+   - If a finding reproduces and the fix reflects a non-obvious root cause or a correction worth remembering beyond this one PR, offer to `remember` it via the memory-bank MCP server (if configured for this repo) before moving on — "Is this something you'd like to remember for next time?" Don't store automatically.
 
 9. **Offer interactive follow-up**:
    - "Create todo list for these action items?"

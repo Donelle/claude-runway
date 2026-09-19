@@ -2,8 +2,8 @@
 """
 Prints the LIVE `@mcp.tool()` count AND an estimated schema-token cost for
 every MCP server this repo's users connect (this repo's own
-`compress_mcp_server.py`/`ingest_mcp_server.py`, PLUS the standalone
-third-party `mcp-server-qdrant` package's server) -- instead of a number
+`compress_mcp_server.py`/`ingest_mcp_server.py`/`memory_bank_mcp_server.py`,
+PLUS the standalone third-party `mcp-server-qdrant` package's server) -- instead of a number
 hand-copied into EVALUATION.md that goes stale as tools are added. See
 libs/mcp_tool_introspect.py's docstring for the history of that exact
 failure mode (issues #22/#23), and issue #52/GROW-05 for why one shared,
@@ -17,7 +17,7 @@ Run this instead of trusting (or re-deriving by hand) any hardcoded tool
 count or token estimate in EVALUATION.md's Track A/B "measure the fixed
 overhead" steps -- that's exactly what those sections now point at. Also
 used as a CI smoke check (see .github/workflows/tests.yml): a nonzero
-exit code here means one of the three servers failed to construct or
+exit code here means one of the four servers failed to construct or
 enumerate its own tools, which is a real regression worth failing the
 build on.
 
@@ -30,7 +30,7 @@ the exact same `describe_tools()` blob + `estimate_tokens()` approach
 script's number and that one can never disagree.
 
 The standalone `mcp-server-qdrant` package's server is included here too
-(not just this repo's own two servers) because that package is UNPINNED
+(not just this repo's own servers) because that package is UNPINNED
 in requirements.txt -- its own tool count ("qdrant-find", "qdrant-store",
 currently 2) is not a repo-controlled invariant the way a hardcoded "2"
 in EVALUATION.md's prose implied. Constructing `QdrantMCPServer` directly
@@ -38,7 +38,7 @@ in EVALUATION.md's prose implied. Constructing `QdrantMCPServer` directly
 and using default `QdrantSettings()`/`ToolSettings()` so no live Qdrant
 connection is required) is the only way to check this live rather than
 assuming it never changes -- same "verify, don't assume" standard the
-rest of this fix applies to this repo's own two servers. This does couple
+rest of this fix applies to this repo's own servers. This does couple
 to `mcp_server_qdrant`'s internal `QdrantMCPServer`/`ToolSettings`/
 `QdrantSettings` classes, which aren't a documented public API -- but
 `ingest_mcp_server.py` already couples to that same package's internals
@@ -54,11 +54,11 @@ server and never blocks on stdin, so it's safe to run from a plain
 terminal or CI runner with no other infrastructure up.
 
 Note: importing `compress_mcp_server` requires `openai`/`requests`/
-`trafilatura` (see requirements.txt); importing `ingest_mcp_server` and
-constructing the standalone qdrant server both require
-`mcp-server-qdrant`/`qdrant-client`. All are already required for the CI
-job's `pip install -r requirements.txt` step to succeed at all, so no
-extra dependency is introduced here.
+`trafilatura` (see requirements.txt); importing `ingest_mcp_server`/
+`memory_bank_mcp_server` and constructing the standalone qdrant server all
+require `mcp-server-qdrant`/`qdrant-client`. All are already required for
+the CI job's `pip install -r requirements.txt` step to succeed at all, so
+no extra dependency is introduced here.
 """
 
 import os
@@ -161,6 +161,7 @@ def main() -> int:
     for label, module_name in (
         ("local-compress", "compress_mcp_server"),
         ("codebase-indexer", "ingest_mcp_server"),
+        ("memory-bank", "memory_bank_mcp_server"),
     ):
         try:
             count, tokens = _report_repo_server(module_name)

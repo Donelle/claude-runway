@@ -208,6 +208,47 @@ class BuildMcpServers(unittest.TestCase):
         servers = self._build(compact_collection="")
         self.assertNotEqual(servers["local-compress"]["env"]["COMPACT_COLLECTION"], "")
 
+    def test_memory_bank_server_generated_with_this_projects_repo_tag(self):
+        servers = self._build()
+        self.assertIn("memory-bank", servers)
+        self.assertEqual(servers["memory-bank"]["env"]["MEMORY_BANK_ID"], "my-project")
+
+    def test_memory_bank_id_explicit_value_overrides_collection_name(self):
+        # Regression for PR #178 review (fifth pass): an earlier version
+        # hardcoded MEMORY_BANK_ID to always equal collection_name with no
+        # independent parameter at all, so a project that later changed
+        # --collection-name would silently retag all future memories while
+        # every existing memory stayed under the old identifier.
+        servers = self._build(memory_bank_id="my-preserved-identity")
+        self.assertEqual(servers["memory-bank"]["env"]["MEMORY_BANK_ID"], "my-preserved-identity")
+
+    def test_memory_bank_id_defaults_to_collection_name_when_blank(self):
+        servers = self._build(collection_name="my-project", memory_bank_id="")
+        self.assertEqual(servers["memory-bank"]["env"]["MEMORY_BANK_ID"], "my-project")
+
+    def test_memory_bank_collection_defaults_to_shared_name(self):
+        # Deliberately NOT derived from collection_name -- every project on
+        # a machine must agree on this exact value for memories to actually
+        # be shared/found across projects (issue #175).
+        servers = self._build()
+        self.assertEqual(servers["memory-bank"]["env"]["MEMORY_BANK_COLLECTION"], "memory-bank")
+        self.assertEqual(servers["codebase-indexer"]["env"]["MEMORY_BANK_COLLECTION"], "memory-bank")
+
+    def test_memory_bank_collection_explicit_value_used_verbatim(self):
+        servers = self._build(memory_bank_collection="my-custom-memory-bank")
+        self.assertEqual(servers["memory-bank"]["env"]["MEMORY_BANK_COLLECTION"], "my-custom-memory-bank")
+        self.assertEqual(servers["codebase-indexer"]["env"]["MEMORY_BANK_COLLECTION"], "my-custom-memory-bank")
+
+    def test_memory_bank_collection_never_left_blank(self):
+        # Same "present-but-empty defeats os.environ.get's own fallback"
+        # class of bug as compact_collection above.
+        servers = self._build(memory_bank_collection="")
+        self.assertNotEqual(servers["memory-bank"]["env"]["MEMORY_BANK_COLLECTION"], "")
+
+    def test_memory_bank_qdrant_api_key_applied(self):
+        servers = self._build(qdrant_api_key="my-secret-key")
+        self.assertEqual(servers["memory-bank"]["env"]["QDRANT_API_KEY"], "my-secret-key")
+
 
 class BuildSettingsHooks(unittest.TestCase):
     def _build(self):
@@ -436,6 +477,55 @@ class RunSetupEndToEnd(unittest.TestCase):
             result.mcp_json["mcpServers"]["local-compress"]["env"]["COMPACT_COLLECTION"],
             "conversation-compacts",
         )
+
+    def test_collection_name_colliding_with_general_sentinel_warns(self):
+        # Issue #175: a project resolved/named "general" would be
+        # indistinguishable from memory-bank's reserved cross-project tag.
+        result = run_setup(
+            self.target_repo, REPO_ROOT, home_dir=Path("/home/user"), collection_name="general"
+        )
+        self.assertTrue(any("general" in c and "WARNING" in c for c in result.changes))
+
+    def test_normal_collection_name_does_not_warn(self):
+        result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
+        self.assertFalse(any("WARNING" in c for c in result.changes))
+
+    def test_general_collision_check_keys_off_memory_bank_id_not_collection_name(self):
+        # Regression for PR #178 review (fifth pass): since memory_bank_id
+        # is now independently settable, the "general" collision check must
+        # track the value that actually ends up as the repo tag -- not
+        # collection_name, which is now only its fallback default.
+        result = run_setup(
+            self.target_repo, REPO_ROOT, home_dir=Path("/home/user"),
+            collection_name="general", memory_bank_id="my-real-identity",
+        )
+        self.assertFalse(any("WARNING" in c for c in result.changes))
+
+        result2 = run_setup(
+            self.target_repo, REPO_ROOT, home_dir=Path("/home/user"),
+            collection_name="my-project", memory_bank_id="general",
+        )
+        self.assertTrue(any("general" in c and "WARNING" in c for c in result2.changes))
+
+    def test_collection_name_colliding_with_memory_bank_collection_warns(self):
+        # Regression for PR #178 review: a target repo directory named
+        # e.g. "memory-bank" with both COLLECTION_NAME and
+        # MEMORY_BANK_COLLECTION left at their defaults resolves them to the
+        # SAME string, which makes ingest_mcp_server.py's reserved-name guard
+        # refuse every index_repo/sync_repo call for this project.
+        result = run_setup(
+            self.target_repo, REPO_ROOT, home_dir=Path("/home/user"), collection_name="memory-bank"
+        )
+        self.assertTrue(any("MEMORY_BANK_COLLECTION" in c and "WARNING" in c for c in result.changes))
+
+    def test_distinct_memory_bank_collection_avoids_the_warning(self):
+        # Same colliding COLLECTION_NAME, but an explicit --memory-bank-collection
+        # that differs -- no warning should fire.
+        result = run_setup(
+            self.target_repo, REPO_ROOT, home_dir=Path("/home/user"),
+            collection_name="memory-bank", memory_bank_collection="shared-memories",
+        )
+        self.assertFalse(any("WARNING" in c for c in result.changes))
 
     def test_rerun_with_no_compact_collection_flag_does_not_drift_between_runs(self):
         # Regression for the finding from PR #130 review: a plain re-run

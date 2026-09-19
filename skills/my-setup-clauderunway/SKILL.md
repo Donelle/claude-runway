@@ -66,18 +66,18 @@ hyphens, and fall back to `"project"` if the result is empty (e.g. `My.Cool.App`
 
 Check whether `.mcp.json` already exists in the current directory. If it does,
 read it to see which claude-runway servers are currently configured (`qdrant`,
-`codebase-indexer`, `local-compress`). Note this for the summary at the end.
+`codebase-indexer`, `memory-bank`, `local-compress`). Note this for the summary at the end.
 
 Also extract the following values from the existing config — these would silently
 revert to defaults on re-run without preservation:
 - `COLLECTION_NAME` from `qdrant.env` — use as the collection name default in Q2 when
   present, falling back to the slug default only for unconfigured projects
 - `QDRANT_URL` from `qdrant.env` (default: `http://localhost:6333`)
-- `QDRANT_API_KEY` — check only whether it is non-empty in **any** of the three owned
-  server env blocks (`qdrant.env`, `codebase-indexer.env`, `local-compress.env`); do
-  NOT read the value itself into context. All three blocks are checked because
-  `build_mcp_servers()` sets the same key in all of them, and legacy or hand-edited
-  configs may only have it in one.
+- `QDRANT_API_KEY` — check only whether it is non-empty in **any** of the four owned
+  server env blocks (`qdrant.env`, `codebase-indexer.env`, `memory-bank.env`,
+  `local-compress.env`); do NOT read the value itself into context. All four blocks are
+  checked because `build_mcp_servers()` sets the same key in all of them, and legacy or
+  hand-edited configs may only have it in one.
 
 **If `QDRANT_API_KEY` is non-empty in any owned block, stop immediately** and tell the user:
 
@@ -103,6 +103,29 @@ revert to defaults on re-run without preservation:
   present. Note this is a DIFFERENT env var than `COLLECTION_NAME` above: it names the
   collection the `my-compact`/`my-resume` skills store conversation compacts under, not the
   codebase-memory collection.
+- `MEMORY_BANK_COLLECTION` from `memory-bank.env` — use as the "Keep current" value in Q6
+  when present. A THIRD different collection concept from the two above: the ONE shared
+  Qdrant collection every project's `memory-bank` server stores memories in (default
+  `"memory-bank"`), common across every project on this machine -- unlike `COLLECTION_NAME`
+  (per-project) and `COMPACT_COLLECTION` (per-project by default). Found in Copilot review
+  on PR #178: without extracting this, re-running this skill on a project that had ever
+  customized it away from the default would silently reset it back to `"memory-bank"` on
+  the next run, splitting that project's future memories into a different collection than
+  its past ones -- existing memories wouldn't be deleted, but `recall` would no longer find
+  them, since it would now be pointed at the wrong shared collection entirely.
+- `MEMORY_BANK_ID` from `memory-bank.env` — if present, always pass it explicitly as
+  `--memory-bank-id` in step 5, regardless of what Q2 resolves to. This is a FOURTH,
+  independent identifier: unlike `MEMORY_BANK_COLLECTION` (shared storage location) and
+  `COLLECTION_NAME` (this run's resolved project name), `MEMORY_BANK_ID` is this project's
+  OWN identity tag for memory-bank specifically, and it is NOT re-derived from `COLLECTION_NAME`
+  on a re-run — `setup_project.py` only defaults it from `--collection-name` when
+  `--memory-bank-id` is omitted entirely. Found in Copilot review on PR #178: without this
+  extraction, changing `--collection-name` on a re-run (e.g. via Q2's "Specify") would
+  silently retag all FUTURE memories under the new identifier while every EXISTING memory
+  stayed tagged under the old one, becoming invisible to default recall/wipe scope — nothing
+  deleted, just orphaned. There's no interactive question for this (unlike Q5/Q6) since
+  there's no meaningful choice beyond "preserve whatever is already there" -- same treatment
+  as `COLLECTION_DESCRIPTION`/`INDEX_INCLUDE_EXTENSIONS` below.
 
 **Also detect a prior qdrant-only round-trip**: if `.mcp.json` already exists and has a
 `qdrant` and/or `codebase-indexer` server configured, but has **no** `local-compress` server
@@ -119,9 +142,9 @@ qdrant-only, or staying qdrant-only, never reaches Q5 at all (step 4 is skipped 
 
 Check whether `CLAUDE.md` exists in the current directory and, if so, read it.
 
-### 3. Ask configuration questions — scope and collection name
+### 3. Ask configuration questions — scope, collection name, and memory-bank collection
 
-Use `AskUserQuestion` with two questions:
+Use `AskUserQuestion` with three questions:
 
 **Q1 — Setup scope**
 Header: "Setup scope"
@@ -137,6 +160,19 @@ Header: "Collection"
 If the user picks "Specify", ask them to type the exact collection name they
 want (use `AskUserQuestion` with a single text-entry option or just read their
 next message). Use whatever they provide for the remainder of the skill.
+
+**Q6 — Memory bank collection name**
+Header: "Memory bank"
+Asked here, in step 3 (NOT step 4 alongside Q3-Q5), because `memory-bank` is always
+configured regardless of Q1's answer (issue #175) — unlike Q5 (local-compress's
+compact-collection), which only applies to a full setup and is skipped entirely for
+qdrant-only.
+- If `MEMORY_BANK_COLLECTION` already has a value: show `"Keep current"` as the first option (description: the existing value)
+- Otherwise: show `"Use default"` as the first option (description: `"memory-bank"` — the shared default every project uses unless customized)
+- "Specify" — always present as the second option (description: "Enter a custom shared memory-bank collection name — only do this if you deliberately want a DIFFERENT shared collection than other projects on this machine, since the whole point of this value is that every project sharing it agrees on it"), triggers a follow-up
+
+If the user picks "Specify", ask them to type the exact name they want. Use whatever they
+provide (or the resolved default/current value) as `--memory-bank-collection` in step 5.
 
 ### 4. Ask configuration questions — LM Studio options (full setup only)
 
@@ -189,6 +225,7 @@ Construct the command from all collected inputs. Start with:
 ```
 <venv-python> <CLAUDE_RUNWAY_DIR>/tools/setup_project.py init <cwd>
   --collection-name <name>
+  --memory-bank-collection <name>    # Q6's resolved value -- ALWAYS passed, regardless of qdrant-only
   [--qdrant-only]                    # only if qdrant-only was selected
   [--lmstudio-model <model>]         # only if the user gave a specific model name (omit for auto-detect)
   [--track-savings]                  # only if savings tracker was enabled
@@ -203,6 +240,10 @@ non-default, add the corresponding flag so it is not silently reset:
 - `INDEX_EXCLUDE_DIRS` ≠ empty → add `--exclude-dirs <value>`
 - `CLAUDE_RUNWAY_LMSTUDIO_URL` ≠ `http://localhost:1234/v1` → add `--lmstudio-url <value>`
 - `CLAUDE_RUNWAY_SAVINGS_DB` ≠ empty → add `--savings-db <value>`
+- `MEMORY_BANK_ID` present at all (regardless of value — it has no fixed default to compare
+  against; its "default" is simply being omitted) → add `--memory-bank-id <value>`. See the
+  extraction note in step 2 for why this must never be silently re-derived from Q2's answer
+  on a re-run.
 
 (Q3/Q4's answers already handle `--lmstudio-model` and `--track-savings`; skip those here.)
 
@@ -212,6 +253,16 @@ explicitly for a full setup, the same way `--collection-name` is always passed r
 only added when non-default. Omit this flag entirely for `--qdrant-only` (Q5 was skipped
 in step 4, since `local-compress` — and therefore `COMPACT_COLLECTION` — isn't configured
 at all in that mode).
+
+`--memory-bank-collection` is Q6's resolved value ("Keep current"'s existing value, "Use
+default"'s `"memory-bank"`, or "Specify"'s typed name) — unlike `--compact-collection`,
+this is passed explicitly for **every** run, `--qdrant-only` included, since `memory-bank`
+is never gated behind full-vs-qdrant-only the way `local-compress` is. Omitting this flag
+on a re-run of a project that had ever customized it would silently reset it back to the
+`"memory-bank"` default (found in Copilot review on PR #178) — `setup_project.py`'s
+`--memory-bank-collection` isn't "sticky" across runs any more than `--collection-name`/
+`--compact-collection` are, so it must be re-passed explicitly every time, the same way
+this skill already does for those two.
 
 Use **single quotes** around every dynamic argument on **both platforms** — PowerShell
 single-quotes and POSIX single-quotes both prevent expansion of `$`, `$()`, and
@@ -251,18 +302,28 @@ PowerShell — cmd.exe quoting uses double quotes which PowerShell would expand.
 
 Read the template at `$CLAUDE_RUNWAY_DIR/templates/CLAUDE.md.template`.
 
-From that file, extract two sections as verbatim text:
+From that file, extract three sections as verbatim text:
 - **Qdrant section**: everything from the line `## Vector memory (Qdrant MCP)` up to (but not including) the blank line that immediately precedes the next `##` heading.
+- **Durable memory section**: everything from the line `## Durable memory (memory-bank MCP)` up to (but not including) the blank line that immediately precedes the next `##` heading.
 - **LM Studio section**: everything from the line `## Local compression (LM Studio MCP)` to the end of the file (or the blank line before the next `##` heading, if any).
 
 Do **not** include the HTML comment block at the top of the template — that is a
 template note, not guidance for Claude.
+
+The Durable memory section is added unconditionally, the same as the Qdrant section
+(NOT gated on full-setup vs. qdrant-only the way the LM Studio section is) — `setup_project.py`
+always wires up the `memory-bank` MCP server regardless of which setup mode was chosen (it's
+part of the Qdrant memory piece, not the LM Studio piece), so the CLAUDE.md guidance for it
+must always be present too, or a connected `memory-bank` server would have no usage guidance
+telling Claude when to `remember`/`recall`/`forget`.
 
 **If `CLAUDE.md` does not exist in the target project:**
 
 Create it with:
 ```
 <Qdrant section>
+
+<Durable memory section>
 
 <LM Studio section>   # only if full setup (not qdrant-only)
 ```
@@ -271,6 +332,10 @@ Create it with:
 
 Check whether it already contains `## Vector memory (Qdrant MCP)`.
 - If missing: append the Qdrant section (preceded by a blank line).
+
+Check whether it already contains `## Durable memory (memory-bank MCP)`.
+- If missing: append the Durable memory section (preceded by a blank line). Always add
+  this if missing, regardless of qdrant-only vs. full setup — see the note above.
 
 Check whether it already contains `## Local compression (LM Studio MCP)`.
 - If this is a **full setup** and the section is missing: append it (preceded by a blank line).
@@ -281,8 +346,9 @@ Check whether it already contains `## Local compression (LM Studio MCP)`.
   with `.mcp.json` — leaving LM Studio guidance in place when `local-compress` is gone
   would instruct Claude to call tools that are no longer connected.
 
-If both sections were already in the desired state (present for full setup, absent for
-qdrant-only), note "CLAUDE.md already up to date — no changes made."
+If all sections were already in the desired state (Qdrant and Durable memory present,
+LM Studio present for full setup or absent for qdrant-only), note "CLAUDE.md already up
+to date — no changes made."
 
 Never modify or remove any content already in CLAUDE.md other than the LM Studio section
 removal described above.
@@ -294,7 +360,7 @@ Print a concise summary:
 ```
 Done. Configured <target-project-path>:
 
-  ✓ .mcp.json              — qdrant, codebase-indexer[, local-compress]
+  ✓ .mcp.json              — qdrant, codebase-indexer, memory-bank[, local-compress]
   ✓ .claude/settings.json  — PostToolUse, PreToolUse, SessionEnd hooks   [only if full setup]
   ✓ CLAUDE.md              — <what was added or "already up to date">
 

@@ -151,7 +151,7 @@ def _redact_secrets(mcp_servers: dict) -> dict:
 
 _QDRANT_MCP_JSON_COMMIT_CAUTION = (
     "  - WARNING: --qdrant-api-key was set, so .mcp.json now contains that credential in PLAINTEXT "
-    "across three env blocks (qdrant/codebase-indexer/local-compress). Do NOT commit .mcp.json as-is "
+    "across four env blocks (qdrant/codebase-indexer/memory-bank/local-compress). Do NOT commit .mcp.json as-is "
     "if this repo is or will be shared -- either keep .mcp.json out of version control for this "
     "project (add it to .gitignore) or manage the key through your own untracked mechanism instead "
     "of committing it."
@@ -235,6 +235,8 @@ def cmd_init(args: argparse.Namespace) -> None:
         track_savings=args.track_savings,
         savings_db=args.savings_db,
         compact_collection=args.compact_collection,
+        memory_bank_collection=args.memory_bank_collection,
+        memory_bank_id=args.memory_bank_id,
         include_compress=not args.qdrant_only,
         include_hooks=include_hooks,
         # --qdrant-only means "clean up this toolkit's own stale hooks if
@@ -400,7 +402,7 @@ def parse_args() -> argparse.Namespace:
         "--qdrant-api-key",
         default="",
         help="API key for an authenticated remote Qdrant instance; leave blank for unauthenticated local "
-        "Qdrant. Applied to all three servers' QDRANT_API_KEY -- not 'sticky': pass it on every run, "
+        "Qdrant. Applied to all four servers' QDRANT_API_KEY -- not 'sticky': pass it on every run, "
         "the same as --qdrant-url/--collection-name, or a rerun without it resets these servers back "
         "to unauthenticated. WARNING: writes the key in PLAINTEXT into .mcp.json -- do not commit that "
         "file as-is if this repo is shared; this script will print a reminder instead of the usual "
@@ -418,6 +420,27 @@ def parse_args() -> argparse.Namespace:
     init.add_argument("--track-savings", action="store_true", help="Enable the opt-in savings tracker")
     init.add_argument(
         "--savings-db", default="", help="Override the savings tracker DB path (leave blank for the default)"
+    )
+    init.add_argument(
+        "--memory-bank-collection",
+        default="",
+        help="Base Qdrant collection name the memory-bank server's remember/recall/forget tools share "
+        "across EVERY project (tools/memory_bank_mcp_server.py's MEMORY_BANK_COLLECTION); leave blank to "
+        "use the 'memory-bank' default. Unlike --collection-name, this is deliberately meant to be the SAME "
+        "value across every project on a machine -- every project's memories need to agree on this to "
+        "actually be found by each other. Only change it if you're deliberately isolating a separate "
+        "memory-bank collection from this machine's default.",
+    )
+    init.add_argument(
+        "--memory-bank-id",
+        default="",
+        help="Plain identifier tagging this project's own memories in the shared memory-bank "
+        "collection (memory_bank_mcp_server.py's MEMORY_BANK_ID); leave blank to default to "
+        "--collection-name. Unlike --memory-bank-collection, this IS meant to be per-project -- "
+        "but it's independent of --collection-name, not derived from it every run: pass the "
+        "existing value explicitly on a re-run of a project that has already accumulated real "
+        "memories, or changing --collection-name later would silently retag future memories "
+        "while stranding existing ones under the old identifier (issue #175, PR #178 review).",
     )
     init.add_argument(
         "--compact-collection",

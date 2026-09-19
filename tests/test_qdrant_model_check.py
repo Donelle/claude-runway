@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Tests for _check_embedding_model_mismatch in tools/ingest_mcp_server.py
-(issue #56).
+"""Tests for check_embedding_model_mismatch in libs/qdrant_model_check.py
+(issue #56; relocated here from tools/ingest_mcp_server.py -- issue #175 --
+so tools/memory_bank_mcp_server.py can reuse the identical check).
 
 Stdlib-only (unittest, no pytest) and no network -- all QdrantClient and
 FastEmbedProvider calls are mocked, so these run without a live Qdrant
@@ -11,7 +12,6 @@ instance or model download.
 
 import os
 import sys
-import types
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -19,12 +19,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "libs"))
 sys.path.insert(0, os.path.join(REPO_ROOT, "tools"))
 
-# Minimal env so module-level DEFAULT_* constants don't explode on import.
-os.environ.setdefault("QDRANT_URL", "http://localhost:6333")
-os.environ.setdefault("COLLECTION_NAME", "test-collection")
-os.environ.setdefault("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-
-import ingest_mcp_server as _ims  # noqa: E402
+import qdrant_model_check as _qmc  # noqa: E402
 from qdrant_client.http.models import models as _m  # noqa: E402
 
 
@@ -69,7 +64,7 @@ class CheckEmbeddingModelMismatchTest(unittest.TestCase):
     def setUp(self):
         # Patch call_with_retry so it just calls fn(*args, **kwargs).
         self._patcher = patch.object(
-            _ims, "call_with_retry", side_effect=lambda fn, *a, **kw: fn(*a, **kw)
+            _qmc, "call_with_retry", side_effect=lambda fn, *a, **kw: fn(*a, **kw)
         )
         self._patcher.start()
 
@@ -83,7 +78,7 @@ class CheckEmbeddingModelMismatchTest(unittest.TestCase):
         client = _make_client_named({
             "fast-all-minilm-l6-v2": _m.VectorParams(size=384, distance=_m.Distance.COSINE)
         })
-        result = _ims._check_embedding_model_mismatch(client, "col", provider)
+        result = _qmc.check_embedding_model_mismatch(client, "col", provider)
         self.assertIsNone(result)
 
     def test_named_vector_wrong_name_returns_error(self):
@@ -91,7 +86,7 @@ class CheckEmbeddingModelMismatchTest(unittest.TestCase):
         client = _make_client_named({
             "fast-bge-small-en-v1.5": _m.VectorParams(size=384, distance=_m.Distance.COSINE)
         })
-        result = _ims._check_embedding_model_mismatch(client, "myrepo", provider)
+        result = _qmc.check_embedding_model_mismatch(client, "myrepo", provider)
         self.assertIsNotNone(result)
         self.assertIn("mismatch", result)
         self.assertIn("fast-all-minilm-l6-v2", result)
@@ -102,7 +97,7 @@ class CheckEmbeddingModelMismatchTest(unittest.TestCase):
         client = _make_client_named({
             "fast-all-minilm-l6-v2": _m.VectorParams(size=768, distance=_m.Distance.COSINE)
         })
-        result = _ims._check_embedding_model_mismatch(client, "col", provider)
+        result = _qmc.check_embedding_model_mismatch(client, "col", provider)
         self.assertIsNotNone(result)
         self.assertIn("384", result)
         self.assertIn("768", result)
@@ -113,7 +108,7 @@ class CheckEmbeddingModelMismatchTest(unittest.TestCase):
         # and fail at query time -- return an actionable error immediately instead.
         provider = _make_provider("fast-all-minilm-l6-v2", 384)
         client = _make_client_named({})
-        result = _ims._check_embedding_model_mismatch(client, "col", provider)
+        result = _qmc.check_embedding_model_mismatch(client, "col", provider)
         self.assertIsNotNone(result)
         self.assertIn("mismatch", result)
 
@@ -127,18 +122,21 @@ class CheckEmbeddingModelMismatchTest(unittest.TestCase):
         # can't resolve on an unnamed/default-vector collection.
         provider = _make_provider("fast-all-minilm-l6-v2", 384)
         client = _make_client_single(384)
-        result = _ims._check_embedding_model_mismatch(client, "col", provider)
+        result = _qmc.check_embedding_model_mismatch(client, "col", provider)
         self.assertIsNotNone(result)
         self.assertIn("unnamed", result)
-        # Must recommend reset=true, not sync_repo (which doesn't recreate schema)
-        self.assertIn("reset=true", result)
+        # PR #178 review (third pass): index_repo(reset=true) no longer
+        # recreates an existing collection's schema at all -- must recommend
+        # dropping/recreating the collection directly, not reset=true.
+        self.assertIn("Drop this collection", result)
+        self.assertNotIn("Re-index it using index_repo(reset=true)", result)
 
     def test_single_vector_wrong_size_also_returns_error_about_unnamed_format(self):
         # Dimension mismatch within an unnamed-vector collection is secondary:
         # the collection is already incompatible at the format level.
         provider = _make_provider("fast-all-minilm-l6-v2", 384, model_name="sentence-transformers/all-MiniLM-L6-v2")
         client = _make_client_single(1536)
-        result = _ims._check_embedding_model_mismatch(client, "col", provider)
+        result = _qmc.check_embedding_model_mismatch(client, "col", provider)
         self.assertIsNotNone(result)
         self.assertIn("unnamed", result)
 
@@ -149,7 +147,7 @@ class CheckEmbeddingModelMismatchTest(unittest.TestCase):
         # (sparse-only collection), which cannot satisfy a named dense-vector search.
         provider = _make_provider("fast-all-minilm-l6-v2", 384, model_name="sentence-transformers/all-MiniLM-L6-v2")
         client = _make_client_none_vectors()
-        result = _ims._check_embedding_model_mismatch(client, "col", provider)
+        result = _qmc.check_embedding_model_mismatch(client, "col", provider)
         self.assertIsNotNone(result)
         self.assertIn("mismatch", result)
         self.assertIn("no dense vectors", result)
@@ -160,7 +158,7 @@ class CheckEmbeddingModelMismatchTest(unittest.TestCase):
         provider = _make_provider("fast-all-minilm-l6-v2", 384)
         client = MagicMock()
         client.get_collection.side_effect = RuntimeError("connection refused")
-        result = _ims._check_embedding_model_mismatch(client, "col", provider)
+        result = _qmc.check_embedding_model_mismatch(client, "col", provider)
         self.assertIsNone(result)
 
     def test_get_vector_size_raises_returns_none(self):
@@ -170,8 +168,84 @@ class CheckEmbeddingModelMismatchTest(unittest.TestCase):
         client = _make_client_named({
             "fast-all-minilm-l6-v2": _m.VectorParams(size=384, distance=_m.Distance.COSINE)
         })
-        result = _ims._check_embedding_model_mismatch(client, "col", provider)
+        result = _qmc.check_embedding_model_mismatch(client, "col", provider)
         self.assertIsNone(result)
+
+    # --- fail_closed=True: the two callers (index_repo's and sync_repo's pre-delete checks) that must NOT fail open ---
+
+    def test_fail_closed_returns_error_on_exception_instead_of_none(self):
+        # Regression for PR #178 review (fourth pass): a destructive-delete
+        # caller must never treat "couldn't verify" the same as "confirmed
+        # compatible" -- that's exactly the gap that let reset=True erase an
+        # index before a genuine mismatch was ever actually detected.
+        provider = _make_provider("fast-all-minilm-l6-v2", 384)
+        client = MagicMock()
+        client.get_collection.side_effect = RuntimeError("connection refused")
+        result = _qmc.check_embedding_model_mismatch(client, "col", provider, fail_closed=True)
+        self.assertIsNotNone(result)
+        self.assertIn("Error", result)
+
+    def test_fail_closed_still_returns_none_on_genuine_match(self):
+        # fail_closed must only change the EXCEPTION path -- a real,
+        # successfully-verified match must still return None either way.
+        provider = _make_provider("fast-all-minilm-l6-v2", 384)
+        client = _make_client_named({
+            "fast-all-minilm-l6-v2": _m.VectorParams(size=384, distance=_m.Distance.COSINE)
+        })
+        result = _qmc.check_embedding_model_mismatch(client, "col", provider, fail_closed=True)
+        self.assertIsNone(result)
+
+    def test_fail_closed_still_returns_error_string_on_genuine_mismatch(self):
+        # fail_closed must not change the DEFINITIVE-mismatch path either --
+        # only the "inconclusive" (exception) path is inverted.
+        provider = _make_provider("fast-all-minilm-l6-v2", 384, model_name="sentence-transformers/all-MiniLM-L6-v2")
+        client = _make_client_named({
+            "fast-bge-small-en-v1.5": _m.VectorParams(size=384, distance=_m.Distance.COSINE)
+        })
+        result = _qmc.check_embedding_model_mismatch(client, "col", provider, fail_closed=True)
+        self.assertIsNotNone(result)
+        self.assertIn("mismatch", result)
+
+    def test_default_still_fails_open_on_exception(self):
+        # Explicit regression pin: fail_closed defaults to False, so every
+        # EXISTING caller (find_in_collection, memory_bank_lib.py) is
+        # unaffected by this change.
+        provider = _make_provider("fast-all-minilm-l6-v2", 384)
+        client = MagicMock()
+        client.get_collection.side_effect = RuntimeError("connection refused")
+        result = _qmc.check_embedding_model_mismatch(client, "col", provider)
+        self.assertIsNone(result)
+
+    def test_unrecognized_vectors_config_shape_fails_closed(self):
+        # Regression for PR #178 review (seventh pass): a vectors_config
+        # shape that's neither None, dict, nor VectorParams (a future/other
+        # qdrant-client type this function doesn't recognize) used to fall
+        # through every branch with no explicit return, silently reaching
+        # the shared `return None` -- treating "we don't know what this is"
+        # as "confirmed compatible" even under fail_closed=True. Verified
+        # live: fail_closed=True now returns an actionable error instead.
+        class _UnrecognizedShape:
+            pass
+
+        provider = _make_provider("fast-all-minilm-l6-v2", 384)
+        client = _make_client_named(_UnrecognizedShape())
+        # _make_client_named passes its arg straight through as
+        # info.config.params.vectors, so this works even though it's not
+        # really a dict.
+        result_closed = _qmc.check_embedding_model_mismatch(client, "col", provider, fail_closed=True)
+        self.assertIsNotNone(result_closed)
+        self.assertIn("Error", result_closed)
+
+    def test_unrecognized_vectors_config_shape_still_fails_open_by_default(self):
+        # fail_closed=False (the default) must be unaffected -- an
+        # unrecognized shape is inconclusive, not a definitive mismatch.
+        class _UnrecognizedShape:
+            pass
+
+        provider = _make_provider("fast-all-minilm-l6-v2", 384)
+        client = _make_client_named(_UnrecognizedShape())
+        result_open = _qmc.check_embedding_model_mismatch(client, "col", provider)
+        self.assertIsNone(result_open)
 
     # --- Error message quality ---
 
@@ -181,7 +255,7 @@ class CheckEmbeddingModelMismatchTest(unittest.TestCase):
             "fast-bge-large-en": _m.VectorParams(size=1024, distance=_m.Distance.COSINE),
             "fast-bge-small-en": _m.VectorParams(size=512, distance=_m.Distance.COSINE),
         })
-        result = _ims._check_embedding_model_mismatch(client, "col", provider)
+        result = _qmc.check_embedding_model_mismatch(client, "col", provider)
         self.assertIsNotNone(result)
         # Both present names should appear so the user knows what to choose from
         self.assertIn("fast-bge-large-en", result)
@@ -193,7 +267,7 @@ class CheckEmbeddingModelMismatchTest(unittest.TestCase):
         client = _make_client_named({
             "fast-bge-small-en-v1.5": _m.VectorParams(size=384, distance=_m.Distance.COSINE)
         })
-        result = _ims._check_embedding_model_mismatch(client, "col", provider)
+        result = _qmc.check_embedding_model_mismatch(client, "col", provider)
         self.assertIsNotNone(result)
         self.assertIn(".mcp.json", result)
 

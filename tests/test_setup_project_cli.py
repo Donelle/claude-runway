@@ -144,6 +144,8 @@ def _init_args(target_repo, **overrides) -> argparse.Namespace:
         track_savings=False,
         savings_db="",
         compact_collection="",
+        memory_bank_collection="",
+        memory_bank_id="",
         qdrant_only=False,
         skip_hooks=False,
         dry_run=True,
