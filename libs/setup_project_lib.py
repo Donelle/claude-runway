@@ -150,6 +150,8 @@ def build_mcp_servers(
     track_savings: bool = False,
     savings_db: str = "",
     compact_collection: str = "",
+    memory_bank_collection: str = "",
+    memory_bank_id: str = "",
     include_compress: bool = True,
 ) -> dict:
     """
@@ -199,7 +201,36 @@ def build_mcp_servers(
     would otherwise build a collection name with a leading stray hyphen
     (`-<sanitized-project>-<hash8>`).
 
-    `qdrant_api_key` is applied to all three servers' `QDRANT_API_KEY`
+    `memory_bank_collection`, if blank, defaults to the template's own
+    literal `"memory-bank"` -- the ONE collection every project's
+    memory-bank server shares (issue #175), deliberately NOT derived from
+    `collection_name` the same way `COLLECTION_NAME` is: every project on a
+    machine needs to agree on this exact string for their memories to
+    actually be shared/found across projects, so treating it as per-project
+    the way `collection_name` is would defeat the whole point. Never left
+    blank in the generated env block for the same reason `compact_collection`
+    isn't (see that paragraph above) -- `os.environ.get("MEMORY_BANK_COLLECTION",
+    "memory-bank")`'s own fallback only fires when the key is genuinely
+    ABSENT, not present-but-empty. Applied to BOTH the `codebase-indexer`
+    block (which needs to know this value purely to refuse ever indexing
+    code into it) and the `memory-bank` block itself.
+
+    `memory_bank_id`, if blank, defaults to `collection_name` -- a
+    convenient one-time default for a brand-new project, since most
+    projects have no reason to want it different. But unlike
+    `memory_bank_collection` above, this IS meant to vary per project (it's
+    the per-project identity tag, not the shared storage location) -- found
+    in PR #178 review: an earlier version hardcoded this to always equal
+    `collection_name` with no independent parameter at all, so a project
+    that later changed `--collection-name` would silently retag all FUTURE
+    memories under the new name while every EXISTING memory stayed under
+    the old one, becoming invisible to default recall/wipe scope. Passing
+    `memory_bank_id` explicitly on a re-run (the caller's job -- this
+    function doesn't detect re-runs itself, same as every other setting
+    here) preserves the existing identity independent of whatever
+    `collection_name` resolves to on that run.
+
+    `qdrant_api_key` is applied to all four servers' `QDRANT_API_KEY`
     (confirmed the correct, shared env var name across `mcp-server-qdrant`'s
     own `QdrantSettings` -- `validation_alias="QDRANT_API_KEY"` -- and this
     repo's own `ingest_mcp_server.py`/`compress_mcp_server.py`, which read
@@ -236,6 +267,9 @@ def build_mcp_servers(
         home_dir / ".claude" / "claude-runway" / "fastembed-cache"
     ).as_posix()
 
+    resolved_memory_bank_collection = memory_bank_collection or "memory-bank"
+    resolved_memory_bank_id = memory_bank_id or collection_name
+
     indexer = servers["codebase-indexer"]
     indexer["command"] = venv_python_str
     indexer["args"] = [f"{tools_repo_str}/tools/ingest_mcp_server.py"]
@@ -245,6 +279,15 @@ def build_mcp_servers(
     indexer["env"]["COLLECTION_DESCRIPTION"] = collection_description
     indexer["env"]["INDEX_INCLUDE_EXTENSIONS"] = include_extensions
     indexer["env"]["INDEX_EXCLUDE_DIRS"] = exclude_dirs
+    indexer["env"]["MEMORY_BANK_COLLECTION"] = resolved_memory_bank_collection
+
+    memory_bank = servers["memory-bank"]
+    memory_bank["command"] = venv_python_str
+    memory_bank["args"] = [f"{tools_repo_str}/tools/memory_bank_mcp_server.py"]
+    memory_bank["env"]["QDRANT_URL"] = qdrant_url
+    memory_bank["env"]["QDRANT_API_KEY"] = qdrant_api_key
+    memory_bank["env"]["MEMORY_BANK_ID"] = resolved_memory_bank_id
+    memory_bank["env"]["MEMORY_BANK_COLLECTION"] = resolved_memory_bank_collection
 
     if include_compress:
         compress = servers["local-compress"]
@@ -302,7 +345,7 @@ def build_settings_hooks(template: dict, *, venv_python: Path, tools_repo_dir: P
 # toolkit-owned server a prior run added but this run omits (e.g.
 # `--qdrant-only` after a previous run had configured local-compress) --
 # see merge_mcp_json's docstring.
-_OWNED_MCP_SERVER_KEYS = ("qdrant", "codebase-indexer", "local-compress")
+_OWNED_MCP_SERVER_KEYS = ("qdrant", "codebase-indexer", "memory-bank", "local-compress")
 
 
 def merge_mcp_json(existing: dict, generated_servers: dict, *, owned_keys: tuple = _OWNED_MCP_SERVER_KEYS) -> dict:
@@ -495,6 +538,8 @@ def run_setup(
     track_savings: bool = False,
     savings_db: str = "",
     compact_collection: str = "",
+    memory_bank_collection: str = "",
+    memory_bank_id: str = "",
     include_compress: bool = True,
     include_hooks: bool = True,
     clean_hooks_if_unused: bool = False,
@@ -531,6 +576,11 @@ def run_setup(
     home_dir = Path(home_dir) if home_dir else Path.home()
     resolved_venv_python = Path(venv_python) if venv_python else venv_python_path(tools_repo_dir, windows=windows)
     resolved_collection_name = collection_name or default_collection_name(target_repo)
+    # Same fallback build_mcp_servers applies internally -- computed here too
+    # so the collision check below (and any other caller) can compare against
+    # the SAME resolved value rather than re-deriving/guessing it.
+    resolved_memory_bank_collection = memory_bank_collection or "memory-bank"
+    resolved_memory_bank_id = memory_bank_id or resolved_collection_name
 
     mcp_template = load_json(templates_dir / "mcp.json.template")
     generated_servers = build_mcp_servers(
@@ -549,6 +599,8 @@ def run_setup(
         track_savings=track_savings,
         savings_db=savings_db,
         compact_collection=compact_collection,
+        memory_bank_collection=memory_bank_collection,
+        memory_bank_id=memory_bank_id,
         include_compress=include_compress,
     )
     unresolved = find_unresolved_placeholders(generated_servers)
@@ -561,6 +613,39 @@ def run_setup(
     existing_mcp = load_json(mcp_json_path) if mcp_json_path.exists() else {}
     final_mcp = merge_mcp_json(existing_mcp, generated_servers)
     changes = [f"mcpServers ({', '.join(sorted(generated_servers))}) -> {mcp_json_path}"]
+
+    # Issue #175: memory-bank reserves "general" as its cross-project
+    # sentinel (metadata.repo) -- a project whose own MEMORY_BANK_ID
+    # resolves to exactly that string would be indistinguishable from
+    # genuinely general knowledge. Checked against resolved_memory_bank_id,
+    # NOT resolved_collection_name (PR #178 review, fifth pass) -- since
+    # memory_bank_id is now an independently-settable value, it's the one
+    # that actually ends up as the repo tag; collection_name is only its
+    # DEFAULT when memory_bank_id isn't passed. Warn rather than silently
+    # letting this collide (memory_bank_mcp_server.py itself also refuses
+    # at first use, this just surfaces it earlier, at setup time).
+    if resolved_memory_bank_id == "general":
+        changes.append(
+            "WARNING: this project's MEMORY_BANK_ID resolved to 'general', which collides "
+            "with memory-bank's reserved general-knowledge tag -- pass --memory-bank-id "
+            "with a different value."
+        )
+
+    # Found in PR #178 review: a target repo directory named e.g. "memory-bank"
+    # with both COLLECTION_NAME and MEMORY_BANK_COLLECTION left at their
+    # defaults resolves them to the SAME string -- tools/ingest_mcp_server.py's
+    # reserved-collection-name guard then refuses EVERY index_repo/sync_repo
+    # call for this project, since its own code-index collection IS the
+    # reserved memory-bank name. Warn at setup time rather than leaving this
+    # to surface later as a confusing "Error: ... is configured as the shared
+    # memory-bank collection" on the very first index attempt.
+    if resolved_collection_name == resolved_memory_bank_collection:
+        changes.append(
+            f"WARNING: this project's COLLECTION_NAME ('{resolved_collection_name}') is the same "
+            f"as MEMORY_BANK_COLLECTION -- index_repo/sync_repo will refuse to run at all for this "
+            f"project (they never touch the shared memory-bank collection). Pass --collection-name "
+            f"or --memory-bank-collection so the two differ."
+        )
 
     final_settings: Optional[dict] = None
     generated_hooks: Optional[dict] = None

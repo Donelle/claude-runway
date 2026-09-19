@@ -67,7 +67,9 @@ from qdrant_ingest_lib import (
 from qdrant_retry import call_with_retry, async_call_with_retry
 from qdrant_batch_store import store_batch, ensure_file_path_index, FIELD_INDEXES, UPSERT_BATCH_SIZE
 from qdrant_collection_hints import get_cached_descriptions, set_cached_description
+from qdrant_model_check import check_embedding_model_mismatch
 from mcp_tool_introspect import tool_count
+import memory_bank_lib as mb
 
 # Must run before any FastEmbedProvider(...) construction below (index_repo,
 # sync_repo, find_in_collection each make their own) -- see issue #77 and the
@@ -123,6 +125,13 @@ DEFAULT_EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "sentence-transforme
 # one-off set_collection_description call (issue #83); applied by
 # _sync_static_collection_description() below.
 DEFAULT_COLLECTION_DESCRIPTION = os.environ.get("COLLECTION_DESCRIPTION")
+
+# Same env var name memory_bank_mcp_server.py reads (issue #175) -- used
+# here ONLY to refuse index_repo/sync_repo ever targeting the shared
+# memory-bank collection, not to write into it. Defaults to the same
+# "memory-bank" default so the guard still applies out of the box even on a
+# project that hasn't explicitly configured this var.
+DEFAULT_MEMORY_BANK_COLLECTION = os.environ.get("MEMORY_BANK_COLLECTION", "memory-bank")
 
 
 def _parse_csv_set(value: Optional[str]) -> Optional[set]:
@@ -306,10 +315,19 @@ async def index_repo(
     qdrant-find/qdrant-store MCP server, or search relevance will silently
     break (different models produce incompatible vector spaces).
 
-    Set reset=true to delete all existing entries in the collection first --
-    otherwise re-running this on an already-indexed repo creates duplicate
-    chunks. Do NOT set reset=true if the collection is shared with other
-    data (e.g. conversation-memory summaries) you don't want wiped.
+    Set reset=true to delete all existing NON-memory-bank entries in the
+    collection first -- otherwise re-running this on an already-indexed repo
+    creates duplicate chunks. memory-bank points (metadata.source ==
+    "memory-bank") are always preserved regardless (issue #175) -- but do NOT
+    set reset=true if the collection is shared with OTHER non-code data (e.g.
+    qdrant-store notes, conversation-compacts) you don't want wiped; those
+    still get deleted. Note this means reset=true no longer recreates the
+    collection's underlying vector SCHEMA either (PR #178 review -- an
+    earlier version did, via a full delete_collection, whenever no
+    memory-bank points existed at check-time, but that check-then-act was
+    itself racy against a concurrent write): changing EMBEDDING_MODEL on an
+    existing collection now requires manually dropping it first, outside
+    this tool, before re-running index_repo.
 
     When reset=False and the collection already contains data, this tool
     returns a warning before starting the expensive embedding work (issue
@@ -363,6 +381,17 @@ async def index_repo(
             "configured for this project's .mcp.json. Pass collection explicitly "
             "or set COLLECTION_NAME in this server's env block."
         )
+    # Issue #175: refuse outright, regardless of reset/force, if this would
+    # index code chunks into (or, via reset, wipe) the shared memory-bank
+    # collection -- e.g. a code repo accidentally configured with the same
+    # COLLECTION_NAME as MEMORY_BANK_COLLECTION.
+    if mb.is_memory_bank_collection_name(collection, DEFAULT_MEMORY_BANK_COLLECTION):
+        return (
+            f"Error: '{collection}' is configured as the shared memory-bank "
+            f"collection (MEMORY_BANK_COLLECTION). Refusing to index code into it "
+            f"or reset it via index_repo -- use a different COLLECTION_NAME for "
+            f"this project's code index."
+        )
     qdrant_url = qdrant_url or DEFAULT_QDRANT_URL
     qdrant_api_key = qdrant_api_key or DEFAULT_QDRANT_API_KEY
     embedding_model = embedding_model or DEFAULT_EMBEDDING_MODEL
@@ -376,9 +405,54 @@ async def index_repo(
     # inside `if reset:`) since the non-reset branch below also needs it
     # for the file_path payload-index backfill (issue #54).
     client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
+    # Only constructed here, inside `if reset:`, not unconditionally before
+    # it -- the elif branch below has its own early-return (the "collection
+    # already contains N points" warning) that must NOT pay for a model
+    # load just to return that warning, same reasoning as the recall() fix
+    # earlier in this review. Reused below (not reconstructed) once we reach
+    # the shared embed/store setup.
+    embedding_provider = None
     if reset:
         if call_with_retry(client.collection_exists, collection):
-            call_with_retry(client.delete_collection, collection)
+            embedding_provider = FastEmbedProvider(embedding_model)
+            # Issue #175 / PR #178 review: this ALWAYS takes the filtered
+            # delete (preserving memory-bank points), never a real
+            # delete_collection. An earlier version counted memory-bank
+            # points first and only fell back to the filtered path when the
+            # count was nonzero -- but that count and this delete are two
+            # SEPARATE Qdrant requests with no transaction spanning them, so
+            # a remember() call landing in between could insert a point that
+            # a zero-count-based delete_collection would then destroy anyway,
+            # count notwithstanding. Removing the count-based branch removes
+            # the race entirely instead of trying to narrow it. Tradeoff:
+            # reset=True can no longer fully recreate a collection's vector
+            # schema (needed only when EMBEDDING_MODEL changes -- see
+            # README's Known Limitations) -- is_memory_bank_collection_name's
+            # guard above means this should never actually collide with the
+            # shared memory-bank collection in normal use regardless.
+            #
+            # Found in PR #178 review (third pass): without a check here,
+            # a genuine EMBEDDING_MODEL change (or an unnamed-vector legacy
+            # collection) would still hit this filtered delete FIRST -- wiping
+            # the existing non-memory-bank index -- and only THEN fail on the
+            # embed/store loop below once the schema mismatch surfaces via a
+            # raw Qdrant upsert error, having already destroyed the old index
+            # with nothing successfully re-indexed to replace it. Validating
+            # BEFORE deleting turns that into a clean, non-destructive error.
+            # fail_closed=True (PR #178 review, fourth pass): this is a
+            # PRE-DELETE safety check -- an inconclusive result (a transient
+            # error, not a confirmed match) must block the destructive delete
+            # below, not silently be treated as "compatible." Every other
+            # caller of this function keeps the default fail-open behavior;
+            # this and sync_repo's own pre-delete check below are the only
+            # two destructive call sites where that default is actively
+            # wrong.
+            mismatch = check_embedding_model_mismatch(client, collection, embedding_provider, fail_closed=True)
+            if mismatch:
+                return mismatch
+            call_with_retry(
+                client.delete, collection_name=collection, points_selector=mb.memory_bank_exclusion_filter()
+            )
     elif call_with_retry(client.collection_exists, collection):
         # Check existing point count BEFORE starting the expensive embedding
         # work (issue #58) -- surface the duplicate-risk warning up front so
@@ -393,10 +467,11 @@ async def index_repo(
                 f"reset=True may add duplicate chunks on top of those. "
                 f"Options: (1) use sync_repo instead for an incremental update "
                 f"that avoids duplicates (preferred for most cases), "
-                f"(2) re-run with reset=True to wipe ALL collection data and "
-                f"re-index cleanly (caution: wipes the entire collection, "
-                f"including any conversation-memory or other non-code data "
-                f"stored there), or (3) re-run with force=True to add content "
+                f"(2) re-run with reset=True to wipe non-memory-bank collection "
+                f"data and re-index cleanly (caution: wipes any other non-code "
+                f"data stored there, e.g. qdrant-store notes or conversation-"
+                f"compacts -- memory-bank points are always preserved), "
+                f"or (3) re-run with force=True to add content "
                 f"to the existing index deliberately."
             )
         # FIELD_INDEXES below only takes effect when QdrantConnector's own
@@ -406,7 +481,8 @@ async def index_repo(
         # it needs this explicit backfill instead (issue #54).
         call_with_retry(ensure_file_path_index, client, collection)
 
-    embedding_provider = FastEmbedProvider(embedding_model)
+    if embedding_provider is None:
+        embedding_provider = FastEmbedProvider(embedding_model)
     connector = QdrantConnector(
         qdrant_url=qdrant_url,
         qdrant_api_key=qdrant_api_key,
@@ -657,9 +733,11 @@ async def sync_repo(
     or as a habit at the start of a session) -- it's far cheaper than
     index_repo since it doesn't touch or re-embed anything unchanged. Use
     index_repo with reset=true instead when: this is the first time indexing
-    this repo, chunk_lines/overlap/embedding_model changed and everything
-    needs re-chunking consistently, or the index and manifest seem to have
-    drifted (e.g. after manually editing points in Qdrant).
+    this repo, chunk_lines/overlap changed and everything needs re-chunking
+    consistently, or the index and manifest seem to have drifted (e.g. after
+    manually editing points in Qdrant). If EMBEDDING_MODEL changed, reset=true
+    can no longer rebuild the schema for you (issue #175) -- manually drop the
+    collection first, outside this tool, then run index_repo fresh.
 
     Tracks a small manifest file (.qdrant_index_manifest.json) in the repo
     root to know what's already indexed -- safe to gitignore, don't hand-edit it.
@@ -683,6 +761,14 @@ async def sync_repo(
         return (
             "Error: no collection specified and no COLLECTION_NAME env var "
             "configured for this project's .mcp.json."
+        )
+    # Issue #175: same reserved-collection-name refusal as index_repo -- see
+    # its comment above for why.
+    if mb.is_memory_bank_collection_name(collection, DEFAULT_MEMORY_BANK_COLLECTION):
+        return (
+            f"Error: '{collection}' is configured as the shared memory-bank "
+            f"collection (MEMORY_BANK_COLLECTION). Refusing to sync code into it -- "
+            f"use a different COLLECTION_NAME for this project's code index."
         )
     qdrant_url = qdrant_url or DEFAULT_QDRANT_URL
     qdrant_api_key = qdrant_api_key or DEFAULT_QDRANT_API_KEY
@@ -759,6 +845,12 @@ async def sync_repo(
     successfully_changed = [f for f in changed if f not in chunk_skipped_paths]
 
     client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
+    # Constructed here (moved up from just before the embed/store loop) so
+    # the schema check below can validate BEFORE the delete loop runs --
+    # same reasoning as index_repo's own pre-delete check, and the exact
+    # same "validate/chunk before deleting" principle PR #90's review
+    # already established for this function's chunk-before-delete ordering.
+    embedding_provider = FastEmbedProvider(embedding_model)
 
     # Retry once on a transient dropped connection -- see issue #75/#76 /
     # libs/qdrant_retry.py. This specific call is the one confirmed to
@@ -767,6 +859,20 @@ async def sync_repo(
     # synchronously hashing every file in a large repo, which is long enough
     # for Docker Desktop's vpnkit to reap an idle connection.
     if call_with_retry(client.collection_exists, collection):
+        # Found in PR #178 review (issue #175): without this, a changed
+        # EMBEDDING_MODEL would still delete each changed/removed file's old
+        # chunks below and only discover the mismatch later, once the
+        # embed/store loop's upsert failed against the incompatible schema --
+        # leaving those specific files with NO searchable content at all
+        # (deleted, never replaced), unlike every other skip path in this
+        # function, which deliberately preserves existing embeddings on
+        # failure. fail_closed=True (not the default fail-open) for the same
+        # reason as index_repo's own pre-delete check: this is about to run a
+        # destructive delete, so an inconclusive result must block it, not
+        # silently permit it.
+        mismatch = check_embedding_model_mismatch(client, collection, embedding_provider, fail_closed=True)
+        if mismatch:
+            return mismatch
         # Backfill the metadata.file_path payload index before the
         # delete-by-filter loop below -- this is the exact hotspot issue
         # #54 exists to fix: without an index on this field, each of the
@@ -793,11 +899,19 @@ async def sync_repo(
                     should=[
                         models.FieldCondition(key="metadata.file_path", match=models.MatchValue(value=rel))
                         for rel in batch
-                    ]
+                    ],
+                    # Defense-in-depth (issue #175): today's schema never sets
+                    # metadata.file_path on a memory-bank point, so this isn't
+                    # fixing a live bug -- just closing the gap structurally in
+                    # case a future schema change reintroduces overlap.
+                    must_not=[
+                        models.FieldCondition(
+                            key=mb.SOURCE_FIELD, match=models.MatchValue(value=mb.MEMORY_BANK_SOURCE)
+                        )
+                    ],
                 ),
             )
 
-    embedding_provider = FastEmbedProvider(embedding_model)
     connector = QdrantConnector(
         qdrant_url=qdrant_url,
         qdrant_api_key=qdrant_api_key,
@@ -926,88 +1040,6 @@ def get_collection_info(
     return f"Collection '{collection}': {info.points_count} points, status={info.status}."
 
 
-def _check_embedding_model_mismatch(
-    client: "QdrantClient",
-    collection: str,
-    provider: "FastEmbedProvider",
-) -> Optional[str]:
-    """
-    Compare the embedding provider's expected vector name and dimension against
-    what the collection actually stores, returning an error string on a
-    definitive mismatch or None when the check passes (or is inconclusive).
-
-    Fails open on any exception -- a network error or unexpected config shape
-    must never block a valid query; the caller already verified the collection
-    exists. Only returns an error string when the mismatch is unambiguous.
-
-    Covers three Qdrant vector-config cases:
-    - None -- sparse-only collection with no dense-vector config at all; definitive
-      incompatibility (not inconclusive), same as empty dict.
-    - Dict[str, VectorParams] -- named vectors (mcp-server-qdrant's own format,
-      using a "fast-<model-slug>" key produced by FastEmbedProvider.get_vector_name()).
-      Errors on missing name (including empty dict -- sparse-only) or wrong dimension.
-    - VectorParams -- unnamed/default single vector (older or third-party ingestion).
-      QdrantConnector.search always passes using=get_vector_name(), which Qdrant
-      cannot resolve for an unnamed/default-vector collection. Errors with a note to
-      use index_repo(reset=true) -- NOT sync_repo, which does not recreate the schema.
-    """
-    try:
-        info = call_with_retry(client.get_collection, collection)
-        vectors_config = info.config.params.vectors
-
-        expected_name = provider.get_vector_name()
-        expected_size = provider.get_vector_size()
-
-        from qdrant_client.http.models import models as _m
-        if vectors_config is None or (isinstance(vectors_config, dict) and expected_name not in vectors_config):
-            # vectors_config is None: sparse-only collection with no dense-vector
-            # config at all (a definitive incompatibility, not inconclusive).
-            # Empty dict {}: sparse-only collection -- same incompatibility.
-            # Non-empty dict without the expected key: wrong model was used.
-            # All three cases: QdrantConnector.search would fail trying to resolve
-            # using=expected_name against a collection that doesn't have it.
-            present = sorted(vectors_config.keys()) if isinstance(vectors_config, dict) else []
-            hint = (
-                f", but the collection has: {present}" if present
-                else " (collection has no dense vectors)"
-            )
-            return (
-                f"Error: embedding model mismatch for collection '{collection}'. "
-                f"The model '{provider.model_name}' produces a vector named "
-                f"'{expected_name}'{hint}. "
-                f"Pass the embedding_model that matches the one used when this "
-                f"collection was indexed (check the other repo's .mcp.json)."
-            )
-        elif isinstance(vectors_config, dict):
-            stored_size = vectors_config[expected_name].size
-            if stored_size != expected_size:
-                return (
-                    f"Error: embedding dimension mismatch for collection '{collection}'. "
-                    f"Model '{provider.model_name}' produces {expected_size}-dim vectors, "
-                    f"but the collection's '{expected_name}' vector has {stored_size} dims. "
-                    f"Pass the embedding_model that matches the one used when indexing."
-                )
-        elif isinstance(vectors_config, _m.VectorParams):
-            # Single unnamed VectorParams: QdrantConnector.search always passes
-            # using=get_vector_name(), which Qdrant cannot resolve for an unnamed/
-            # default-vector collection. Return an error immediately rather than
-            # letting it fail downstream with an opaque Qdrant error.
-            # Recovery: index_repo(reset=true) to wipe and recreate with named-vector
-            # schema. sync_repo does NOT recreate the schema, so pointing users there
-            # would silently fail or (worse) delete old points before the upsert fails.
-            return (
-                f"Error: collection '{collection}' uses an unnamed/default vector "
-                f"format (not compatible with mcp-server-qdrant's named-vector search). "
-                f"Re-index it using index_repo(reset=true) so it stores vectors under "
-                f"the '{expected_name}' name that find_in_collection expects."
-            )
-    except Exception:
-        # Network error, unexpected config shape, model-description lookup
-        # failure -- don't block a potentially valid query.
-        return None
-    return None
-
-
 @mcp.tool()
 async def find_in_collection(
     query: str,
@@ -1066,7 +1098,7 @@ async def find_in_collection(
     # Checked AFTER constructing the provider (needed for get_vector_name/size)
     # and BEFORE creating the connector or running the query. Fails open: any
     # exception inside the check is swallowed and the query proceeds normally.
-    mismatch_error = _check_embedding_model_mismatch(client, collection, embedding_provider)
+    mismatch_error = check_embedding_model_mismatch(client, collection, embedding_provider)
     if mismatch_error:
         return mismatch_error
 
