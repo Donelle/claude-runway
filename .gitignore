@@ -2,6 +2,7 @@
 __*
 .vscode/
 .venv/
+.DS_Store
 
 # pyproject.toml packaging build artifacts (issue #50) -- generated locally
 # by `pip install -e .` / `python -m build` / `uv build`, never committed.

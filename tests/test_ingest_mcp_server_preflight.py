@@ -225,7 +225,14 @@ class IndexRepoPreflightWarningTest(unittest.TestCase):
         """reset=True: the pre-flight check is never reached, embedding runs."""
         client = self._make_client(exists=True, points_count=9999)
         client.delete_collection.return_value = True
-        with self._patch_client(client):
+        # reset=True's pre-delete schema check is a different, dedicated
+        # concern (test_ingest_mcp_server_memory_bank_guards.py /
+        # test_qdrant_model_check.py) -- not what this test is pinning.
+        # _make_collection_info only sets points_count, so the real check's
+        # unconfigured vectors_config now correctly fails closed (PR #178
+        # review, seventh pass) rather than silently passing; patch it out here.
+        with self._patch_client(client), \
+             patch.object(_ims, "check_embedding_model_mismatch", return_value=None):
             result = _run(_ims.index_repo(
                 repo_path=REPO_ROOT,
                 collection="test-collection",
