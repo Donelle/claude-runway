@@ -1,6 +1,6 @@
 # Development workflow for this repo
 
-Separately from the `skills/` directory (see the [Files](../README.md#files-27) table) (which ships product features that get installed into *other* projects), this repo also carries its own contributor-facing skills in `.claude/skills/` — project-scoped, so they only work inside claude-runway itself, and hardcode this repo's own coordinates (`Donelle/claude-runway`) rather than trying to be generic. They're the recommended way to work an issue end to end, and are the ideal shape for this project's own development cycle.
+Separately from the `skills/` directory (see the [Files](../README.md#files-34) table) (which ships product features that get installed into *other* projects), this repo also carries its own contributor-facing skills in `.claude/skills/` — project-scoped, so they only work inside claude-runway itself, and hardcode this repo's own coordinates (`Donelle/claude-runway`) rather than trying to be generic. They're the recommended way to work an issue end to end, and are the ideal shape for this project's own development cycle.
 
 | Skill | Invocation | What it does |
 |---|---|---|
