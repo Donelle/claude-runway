@@ -1,0 +1,39 @@
+# Savings tracker
+
+An opt-in, off-by-default feature that estimates context tokens avoided by local compression (`compress_file`, `compress_command_output`, `fetch_url`) and surfaces the estimate automatically at session end plus on demand via `/my-savings`.
+
+**Important framing — this is an estimate, not a benchmark.** `EVALUATION.md` measures savings rigorously: run a task with the tools, run it again without, diff the two (a controlled A/B). This tracker can't do that — there's no baseline run in a live session. Instead it estimates the counterfactual online: `saved ≈ tokens(raw content that was compressed) − tokens(the compressed result actually used)`. Only local-compression events are credited this way, because the tool holds both sides of that comparison directly — it read the raw content and produced the compressed result, so there's nothing to guess. `qdrant-find` activity is intentionally **never** credited as "savings," because its counterfactual (what Grep+Read would have cost instead) isn't observable — the same gap noted under [Skills and hooks](skills-and-hooks.md) for qdrant-find-vs-Grep. Labeling a guess as a measurement would undermine trust in the one number here that IS directly observed. See `EVALUATION.md`'s new "Track D" section for the full distinction.
+
+Token counts throughout are estimates (chars ÷ 3.5, the same crude ratio applied to both sides of every comparison so its error mostly cancels in the resulting percentage) — not Claude's real tokenizer, which isn't public. And because tool schemas ride in the request's cached prefix, the fixed per-turn overhead these 5 tools add is reported once, separately, as an annotation — never subtracted from the headline savings number, since doing that would overstate the real tax by roughly 10x on any session past its first turn (cache reads cost far less than the initial cache write).
+
+**Enabling it:**
+
+1. In `.mcp.json`'s `local-compress` server env block, set `CLAUDE_RUNWAY_TRACK_SAVINGS` to `1` (accepted values: `1`, `true`, or `yes`, case-insensitive and whitespace-trimmed — anything else, including unset, is treated as off).
+2. **Also export `CLAUDE_RUNWAY_TRACK_SAVINGS=1` at the shell level** (e.g. in `~/.zshrc`/`~/.bashrc`, wherever `claude` gets launched from). Both steps are genuinely required, for two different reasons: an MCP server subprocess does inherit your full shell environment (see [Environment variables](environment-variables.md)'s "Why two places" section — not the narrow allowlist this doc used to claim), but only for a key genuinely *absent* from `.mcp.json`'s own `env` block — and `templates/mcp.json.template`/`tools/setup_project.py` always declare `CLAUDE_RUNWAY_TRACK_SAVINGS` explicitly (blank if disabled), so for this toolkit's own generated configs, step 1's explicit entry is unconditionally what the MCP server's own credited tools (`compress_file`/`compress_command_output`/`fetch_url`) actually read — there's no inheritance fallback in practice here. Hook entries in `.claude/settings.json`, by contrast, have no `env` field of their own at all — so they inherit the *entire* parent environment unfiltered, which is exactly what step 2 supplies. Skip step 1 and the MCP server's own credited tools don't see the setting (this toolkit's generated config leaves the key blank rather than omitting it); skip step 2 and `hooks/compress_bash_output.py`/`hooks/session_end_savings.py` don't either — either gap produces silently incomplete tracking, not an error. This is the same rule that applies to `CLAUDE_RUNWAY_LMSTUDIO_URL`/`CLAUDE_RUNWAY_LMSTUDIO_MODEL` for these same hook scripts. `CLAUDE_RUNWAY_COMPRESS_THRESHOLD_CHARS` is the exception, not a fourth example of it — `compress_bash_output.py` is its only reader, so it's shell-only; an `.mcp.json` copy is inert (see [Environment variables](environment-variables.md)'s table). See [Environment variables](environment-variables.md) for the full list and the reason they share a `CLAUDE_RUNWAY_` prefix.
+3. Merge the extended `PostToolUse` matcher (now includes `mcp__local-compress__.*`, a vetted GitHub allowlist, and `mcp__claude_ai_Splunk__.*`) and the new `SessionEnd` hook block from `templates/settings.json.template` into `.claude/settings.json`.
+4. Install the skill: `mkdir -p ~/.claude/skills/my-savings && cp skills/my-savings/SKILL.md ~/.claude/skills/my-savings/SKILL.md`.
+
+**Where the data lives:** a single, central SQLite database — `~/.claude/claude-runway/savings.db` by default, one row per session, tagged by project. It's central (not per-repo) on purpose: the cross-project comparison in `/my-savings detail` needs to query across all your projects at once. Override the location with `CLAUDE_RUNWAY_SAVINGS_DB` (an absolute path) in **both** `.mcp.json` and your shell export if you ever change it from the default — same coordination requirement as `QDRANT_URL` (see [Known limitations](../README.md#known-limitations)). The default needs no such coordination since every script derives it identically. Storage goes through a small function-based interface in `libs/savings_ledger.py`, so SQLite (the current backend) can be swapped later without touching any of its callers.
+
+**Using it:** `/my-savings` shows a simple view (this session + this project's all-time totals); `/my-savings detail` adds a per-tool breakdown, a sparkline of recent sessions, and the cross-project comparison. `fetch_url` calls are always logged but never credited toward the headline number — its honest counterfactual is WebFetch's own already-compressed summary, which isn't something this toolkit observes.
+
+**Real token counts (opt-in):** export `CLAUDE_RUNWAY_PARSE_TRANSCRIPT_TOKENS=1` in your shell (shell-only — no `.mcp.json` counterpart needed, since only `hooks/session_end_savings.py` reads it) to have the `SessionEnd` hook parse the session's transcript JSONL and extract the actual tokens Anthropic processed per turn. When enabled, the savings summary adds a token breakdown table and cache efficiency ratio at the end of each session:
+
+```
+Tokens Anthropic processed · claude-runway
+  Token type       Count     % of total   Relative cost
+  ────────────────────────────────────────────────────────
+  Fresh input      1,523          0.1%    1.00×  (full price)
+  Cache writes     ~5.0M          4.3%    1.25×  (storage overhead)
+  Cache reads    ~110.6M         95.6%    0.10×  (10× cheaper than fresh)
+  Output           ~660K          0.6%    5.00×  (most expensive per token)
+  ────────────────────────────────────────────────────────
+  Total          ~115.6M        100.0%
+
+  Local compression avoided   ~320K est.  (0.3% of total processed)
+  Cache efficiency            72×  (reads vs. fresh input — higher is better)
+```
+
+The **Relative cost** column shows approximate cost ratios vs. full input price (not exact Anthropic rates — those aren't exposed to hooks). The **cache efficiency ratio** (`cache_read_input_tokens ÷ input_tokens`) is a health indicator for how well skills and `CLAUDE.md` are structured for Anthropic's prompt caching layer: a high ratio (e.g. 72×) means context has stabilised into a cacheable shape and Claude is reusing existing knowledge rather than re-ingesting fresh tokens every turn — a sign of well-crafted skills. A low ratio signals a lot of novel uncached content entering each turn.
+
+**Note:** this feature parses Claude Code's internal transcript JSONL format, which is undocumented and may change without notice. It is a stopgap until [anthropics/claude-code#52089](https://github.com/anthropics/claude-code/issues/52089) ships real token counts in the `Stop` hook payload directly (tracked in [#164](https://github.com/Donelle/claude-runway/issues/164)).
