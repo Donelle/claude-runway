@@ -7,7 +7,7 @@ Two things need to be true, not just one, for either piece:
 1. Tasks that benefit from the tool use fewer tokens with it than without.
 2. That's not offset by the tool's own fixed cost — every connected MCP server's tool schemas ride along in context on **every single turn**, whether or not they're used. If most of your work doesn't actually benefit, that fixed tax could outweigh the wins on the tasks that do.
 
-This repo has two independent pieces, so there are two independent tracks below. Read "Measuring cleanly" first regardless of which track you're running — it covers real mistakes made while first trying to test this.
+This repo has two independent core pieces (Qdrant memory, local compression) plus a third durable-memory layer (memory-bank) that shares the Qdrant piece's infrastructure but is independent of local compression — five tracks below (A-E): four measured protocols (A, B, C, E), each testing a different mechanism on its own, plus one live diagnostic estimate (D, which is explicitly NOT a measured protocol — see its own intro). Read "Measuring cleanly" first regardless of which track you're running — it covers real mistakes made while first trying to test this.
 
 ## Table of contents
 
@@ -38,7 +38,7 @@ This repo has two independent pieces, so there are two independent tracks below.
   - [Step E4: Measure the fixed overhead](#step-e4-measure-the-fixed-overhead)
   - [Step E5: remember:recall ratio (diagnostic only)](#step-e5-rememberrecall-ratio-diagnostic-only)
   - [Step E6: Why this track is harder to run than A-C](#step-e6-why-this-track-is-harder-to-run-than-a-c)
-- [Compute the result (both tracks)](#compute-the-result-both-tracks)
+- [Compute the result (all measured tracks)](#compute-the-result-all-measured-tracks)
 - [Caveats](#caveats)
 
 ## Measuring cleanly (read this first)
@@ -221,6 +221,8 @@ Unlike Track A's 8-12 arbitrary questions, these have to be real findings pulled
 
 Fully quit/relaunch per scenario (see "Measuring cleanly" above), with the `memory-bank` server disconnected. Run the task as a later occasion would present it — Claude has no access to the earlier finding and must derive it fresh, the same exploration (or, for a correction-flavor scenario, the same class of mistake) a genuinely new encounter would require. Record `/usage` for that full derivation.
 
+For a genuinely clean baseline, also temporarily remove (or comment out) the "Durable memory" section from the test project's `CLAUDE.md` for this run — same idea as Step A2's `.mcp.json` toggle for Track A. Otherwise Claude may still attempt a `recall` call despite the server being disconnected, which fails outright and adds an extra failed-tool-call turn the treatment condition doesn't have, skewing the comparison in memory-bank's favor for reasons unrelated to `recall`'s actual usefulness. Restore the section before running Step E3.
+
 Note: "Measuring cleanly"'s "match turn structure" rule does NOT apply here the way it does in Track B, and this is deliberate, not an oversight — there, a turn-count mismatch between conditions is a confound to eliminate before it contaminates the comparison; here, baseline taking more turns than treatment (the full re-derivation vs. a single `recall` call) *is* the effect this track exists to measure. Padding treatment with extra turns or truncating baseline's would remove the exact thing being tested.
 
 ### Step E3: Treatment run (memory-bank enabled)
@@ -245,7 +247,7 @@ Same pattern as Step A4/B4 — and already wired up rather than something this t
 
 ### Step E5: remember:recall ratio (diagnostic only)
 
-Same role as Track D's savings estimate — a cheap, continuously-observable number, not a pass/fail result. A ratio heavily skewed toward `remember` suggests memories aren't being retrieved when relevant, but doesn't distinguish "nothing to recall yet" from "retrieval isn't working," so it shouldn't be reported as if it were Step E1-E3's result.
+Same role as Track D's savings estimate — a cheap diagnostic number, not a pass/fail result. Define it as the ratio of `remember` rows to `recall` rows in `~/.claude/claude-runway/memory-events.db`, which the `memory-bank` server writes automatically (on by default — see [Memory bank](docs/memory-bank.md)), so it can be read off the database instead of counted by hand from transcripts. Two limits to state alongside any number: `recall` logs one row per *hit* returned, not one per call, so a single call that returns five memories adds five rows (the `turn` column groups rows that came from the same call, if you need per-call counts); and calls that record nothing — a `recall` with no matches, a failed call, or an embedding-model mismatch — leave no row at all, so "retrieval isn't finding anything" is undercounted rather than shown. If `CLAUDE_RUNWAY_TRACK_MEMORY_EVENTS` is turned off there are no rows, and the ratio has to be derived from session transcripts instead (same approach as Step A5). A ratio heavily skewed toward `remember` suggests memories aren't being retrieved when relevant, but doesn't distinguish "nothing to recall yet" from "retrieval isn't working," so it shouldn't be reported as if it were Step E1-E3's result.
 
 ### Step E6: Why this track is harder to run than A-C
 
@@ -254,12 +256,12 @@ Same role as Track D's savings estimate — a cheap, continuously-observable num
 - **Small N is structural** — credible scenarios have to come from real, previously-researched findings, so this track won't reach Track A's 8-12-task sample size. Treat results as directional.
 - **Reuse value compounds over a memory's lifetime in a way one baseline/treatment pairing can't capture** — a stored finding reused 5 times pays for itself 5 times over, but this protocol only measures a single reuse instance per scenario.
 
-## Compute the result (both tracks)
+## Compute the result (all measured tracks)
 
 - Per-task reduction = `(baseline_tokens − treatment_tokens) / baseline_tokens`
-- Net result = per-task savings across the benchmark, minus the fixed overhead (Step A4 / B4) for that track
+- Fixed overhead (Step A4 / B4 / E4, whichever applies to the track) is reported alongside this reduction as its own separate figure, not subtracted from it into a single blended "net" number — tool schemas sit in the request's cached prefix, so only the first turn pays full price for that overhead, same rationale as Track D's discussion above
 - Only count it as a real win if treatment correctness ≥ baseline correctness on the spot-checked tasks
-- Report the two tracks separately — nothing requires both pieces to individually pay for themselves at the same rate, since a project might only use one piece
+- Report each measured track separately — nothing requires every piece to individually pay for itself at the same rate, since a project might only use a subset of them
 
 ## Caveats
 

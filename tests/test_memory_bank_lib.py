@@ -212,7 +212,7 @@ class RememberPointTest(_PatchRetryMixin, unittest.TestCase):
         client.get_collection.return_value.payload_schema = info.payload_schema
         provider = _make_provider(vector_name="fast-x", dim=4)
 
-        point_id, error = _run(
+        point_id, created_at, error = _run(
             mb.remember_point(
                 client, provider, "col",
                 summary="short summary", description="verbatim full text",
@@ -234,6 +234,12 @@ class RememberPointTest(_PatchRetryMixin, unittest.TestCase):
         self.assertIn("fast-x", point.vector)
         self.assertNotIn("created_at", meta)
 
+        # Issue #177: no weight passed -> stored as DEFAULT_WEIGHT (1.0), in
+        # the SAME initial upsert as source/kind/description/etc -- there is
+        # no window where the point exists without a weight at all, unlike
+        # created_at below.
+        self.assertEqual(meta["weight"], mb.DEFAULT_WEIGHT)
+
         # pending=True is written in the SAME atomic upsert that creates the
         # point (PR #178 review, sixth pass) -- there is no window where the
         # point exists without it, unlike created_at below.
@@ -254,13 +260,45 @@ class RememberPointTest(_PatchRetryMixin, unittest.TestCase):
         self.assertAlmostEqual(set_payload_kwargs["payload"]["created_at"], time.time(), delta=5)
         self.assertIs(set_payload_kwargs["payload"]["pending"], False)
 
+        # Issue #179, PR #197 review: the returned created_at must be the
+        # EXACT same value stamped into the set_payload call above, not a
+        # separately re-sampled time.time() -- that's the whole point of
+        # returning it at all.
+        self.assertEqual(created_at, set_payload_kwargs["payload"]["created_at"])
+
+    def test_explicit_weight_is_stored_verbatim(self):
+        # Issue #177: an explicit weight (not the default) must be stored
+        # exactly as given, not coerced/clamped -- this lower-level helper
+        # trusts the value verbatim; validation (rejecting negative/
+        # non-finite weights) happens at the remember() tool boundary
+        # instead (PR #199 review, fourth pass: an earlier version of this
+        # comment claimed weight validation was out of scope for this
+        # ticket entirely, which went stale once that validation was added
+        # in a later round -- see RememberWeightValidationTest in
+        # tests/test_memory_bank_mcp_server.py for that coverage).
+        client = MagicMock()
+        client.collection_exists.return_value = True
+        client.get_collection.return_value = _matching_collection_info(vector_name="fast-x", dim=4)
+        provider = _make_provider(vector_name="fast-x", dim=4)
+
+        _run(
+            mb.remember_point(
+                client, provider, "col",
+                summary="s", description="d", kind="lesson",
+                repo="my-project", embedding_model="model-x", weight=2.5,
+            )
+        )
+        _, kwargs = client.upsert.call_args
+        meta = kwargs["points"][0].payload["metadata"]
+        self.assertEqual(meta["weight"], 2.5)
+
     def test_schema_mismatch_returns_error_without_upserting(self):
         client = MagicMock()
         client.collection_exists.return_value = True
         client.get_collection.return_value = _matching_collection_info(vector_name="fast-other-model", dim=768)
         provider = _make_provider(vector_name="fast-x", dim=4)
 
-        point_id, error = _run(
+        point_id, created_at, error = _run(
             mb.remember_point(
                 client, provider, "col",
                 summary="s", description="d", kind="lesson",
@@ -268,6 +306,7 @@ class RememberPointTest(_PatchRetryMixin, unittest.TestCase):
             )
         )
         self.assertIsNone(point_id)
+        self.assertIsNone(created_at)
         self.assertIsNotNone(error)
         self.assertIn("Error", error)
         client.upsert.assert_not_called()
@@ -360,6 +399,7 @@ class RecallPointsTest(_PatchRetryMixin, unittest.TestCase):
                 "kind": "lesson",
                 "repo": "proj-a",
                 "embedding_model": "model-x",
+                "created_at": 1700000000.0,
             },
         }
         response = MagicMock()
@@ -375,6 +415,176 @@ class RecallPointsTest(_PatchRetryMixin, unittest.TestCase):
         self.assertEqual(hit["repo"], "proj-a")
         self.assertEqual(hit["embedding_model"], "model-x")
         self.assertEqual(hit["score"], 0.9)
+        self.assertEqual(hit["created_at"], 1700000000.0)
+
+        # Issue #177: no metadata.weight on this point -> defaults to
+        # DEFAULT_WEIGHT (1.0), a true no-op, and effective_score is the
+        # NORMALIZED score (raw similarity rescaled to [0, 1], PR #199
+        # review) scaled by that default -- not the raw score directly.
+        self.assertEqual(hit["weight"], mb.DEFAULT_WEIGHT)
+        self.assertEqual(hit["effective_score"], mb._normalize_similarity(0.9) * mb.DEFAULT_WEIGHT)
+
+    def test_created_at_is_none_for_a_legacy_point_missing_the_field(self):
+        # Issue #179: a point written before metadata.created_at existed at
+        # all must not fabricate a value -- None is the honest signal that
+        # this memory predates the field, not "created at time zero."
+        client = MagicMock()
+        client.collection_exists.return_value = True
+        point = MagicMock()
+        point.id = "legacy"
+        point.score = 0.5
+        point.payload = {
+            "document": "summary text",
+            "metadata": {
+                "description": "full text",
+                "kind": "lesson",
+                "repo": "proj-a",
+                "embedding_model": "model-x",
+            },
+        }
+        response = MagicMock()
+        response.points = [point]
+        client.query_points.return_value = response
+        provider = _make_provider()
+        results = _run(mb.recall_points(client, provider, "col", "query", caller_repo="proj-a"))
+        self.assertIsNone(results[0]["created_at"])
+
+
+def _hit_point(point_id, score, weight=None):
+    """A MagicMock query_points hit with the given raw score/weight, for
+    exercising recall_points' weight-based re-ranking (issue #177)."""
+    point = MagicMock()
+    point.id = point_id
+    point.score = score
+    metadata = {
+        "description": f"desc-{point_id}",
+        "kind": "lesson",
+        "repo": "proj-a",
+        "embedding_model": "model-x",
+    }
+    if weight is not None:
+        metadata["weight"] = weight
+    point.payload = {"document": f"summary-{point_id}", "metadata": metadata}
+    return point
+
+
+class NormalizeSimilarityTest(unittest.TestCase):
+    """PR #199 review: raw cosine similarity is rescaled to a nonnegative
+    [0, 1] domain BEFORE being multiplied by weight -- multiplying a
+    possibly-negative raw score by weight directly would invert the
+    documented weight semantics (see recall_points' own regression test for
+    the concrete reproduction)."""
+
+    def test_maps_full_cosine_range_to_zero_one(self):
+        self.assertEqual(mb._normalize_similarity(-1.0), 0.0)
+        self.assertEqual(mb._normalize_similarity(0.0), 0.5)
+        self.assertEqual(mb._normalize_similarity(1.0), 1.0)
+
+    def test_clamps_float_precision_spillover_outside_range(self):
+        # Not an expected Qdrant response shape, just defensive against
+        # float-precision spillover just outside the theoretical [-1, 1]
+        # bound (e.g. 1.0000000002) -- must not produce a value outside
+        # [0, 1] itself.
+        self.assertEqual(mb._normalize_similarity(1.0000000002), 1.0)
+        self.assertEqual(mb._normalize_similarity(-1.0000000002), 0.0)
+
+
+class RecallPointsWeightRerankingTest(_PatchRetryMixin, unittest.TestCase):
+    """Issue #177: recall_points over-fetches by raw similarity, re-ranks by
+    effective_score = normalize_similarity(score) * weight, then truncates
+    to `limit`."""
+
+    def test_overfetches_by_configured_multiplier(self):
+        client = MagicMock()
+        client.collection_exists.return_value = True
+        response = MagicMock()
+        response.points = []
+        client.query_points.return_value = response
+        provider = _make_provider()
+        _run(mb.recall_points(client, provider, "col", "query", caller_repo="proj-a", limit=5))
+        _, kwargs = client.query_points.call_args
+        self.assertEqual(kwargs["limit"], 5 * mb._RECALL_OVERFETCH_MULTIPLIER)
+
+    def test_higher_weight_outranks_higher_raw_similarity(self):
+        # "b" has the higher RAW similarity (0.9) but weight=1.0; "a" has
+        # lower raw similarity (0.5) but a much higher weight (3.0) --
+        # effective_score (normalize(0.5)*3.0=2.25 vs normalize(0.9)*1.0=0.95)
+        # must put "a" first, which raw-similarity-only ranking would never do.
+        client = MagicMock()
+        client.collection_exists.return_value = True
+        response = MagicMock()
+        response.points = [
+            _hit_point("b", score=0.9, weight=1.0),
+            _hit_point("a", score=0.5, weight=3.0),
+        ]
+        client.query_points.return_value = response
+        provider = _make_provider()
+        results = _run(mb.recall_points(client, provider, "col", "query", caller_repo="proj-a", limit=5))
+        self.assertEqual([r["id"] for r in results], ["a", "b"])
+        self.assertEqual(results[0]["effective_score"], mb._normalize_similarity(0.5) * 3.0)
+        self.assertEqual(results[1]["effective_score"], mb._normalize_similarity(0.9) * 1.0)
+
+    def test_missing_weight_on_a_hit_defaults_to_1_0(self):
+        # A legacy point with no metadata.weight at all must default to
+        # DEFAULT_WEIGHT (1.0), not an implicit penalty or boost -- its
+        # effective_score is normalize_similarity(score) * 1.0 (PR #199
+        # review, third pass: NOT the raw score directly, since weight=1.0
+        # is a no-op for RANKING among equally-weighted hits, not for the
+        # raw score's own numeric value -- see recall_points' docstring).
+        client = MagicMock()
+        client.collection_exists.return_value = True
+        response = MagicMock()
+        response.points = [_hit_point("legacy", score=0.7, weight=None)]
+        client.query_points.return_value = response
+        provider = _make_provider()
+        results = _run(mb.recall_points(client, provider, "col", "query", caller_repo="proj-a"))
+        self.assertEqual(results[0]["weight"], mb.DEFAULT_WEIGHT)
+        self.assertEqual(results[0]["effective_score"], mb._normalize_similarity(0.7))
+
+    def test_negative_raw_similarity_does_not_invert_weight_ordering(self):
+        # Regression for PR #199 review: cosine similarity CAN be negative.
+        # Multiplying a negative raw score directly by weight would let a
+        # weight=0 "de-emphasized" hit (score=-0.8 -> -0.8*0=0) rank ABOVE a
+        # normal weight=1 hit with a less-negative raw score (score=-0.1 ->
+        # -0.1*1=-0.1) -- exactly backwards from "de-emphasize to the
+        # bottom." Confirmed reproducible with these exact numbers before
+        # this fix. Rescaling to [0, 1] first closes it: weight=0 floors to
+        # EXACTLY 0 regardless of the raw score's sign, and the normal hit's
+        # positive effective_score (from its nonnegative rescaled
+        # similarity) correctly ranks above it.
+        client = MagicMock()
+        client.collection_exists.return_value = True
+        response = MagicMock()
+        response.points = [
+            _hit_point("stale-deemphasized", score=-0.8, weight=0.0),
+            _hit_point("normal", score=-0.1, weight=1.0),
+        ]
+        client.query_points.return_value = response
+        provider = _make_provider()
+        results = _run(mb.recall_points(client, provider, "col", "query", caller_repo="proj-a"))
+        self.assertEqual([r["id"] for r in results], ["normal", "stale-deemphasized"])
+        self.assertEqual(results[1]["effective_score"], 0.0)
+        self.assertGreater(results[0]["effective_score"], results[1]["effective_score"])
+
+    def test_truncates_reranked_results_to_limit(self):
+        # More over-fetched candidates than `limit` -- final list must be
+        # exactly `limit` long, in effective_score order, even though the
+        # winner by weight arrives from Qdrant sorted LAST by raw similarity.
+        client = MagicMock()
+        client.collection_exists.return_value = True
+        response = MagicMock()
+        response.points = [
+            _hit_point("hi-raw-1", score=0.95, weight=1.0),
+            _hit_point("hi-raw-2", score=0.90, weight=1.0),
+            _hit_point("hi-raw-3", score=0.85, weight=1.0),
+            _hit_point("low-raw-high-weight", score=0.10, weight=20.0),
+        ]
+        client.query_points.return_value = response
+        provider = _make_provider()
+        results = _run(mb.recall_points(client, provider, "col", "query", caller_repo="proj-a", limit=2))
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0]["id"], "low-raw-high-weight")
+        self.assertEqual(results[1]["id"], "hi-raw-1")
 
 
 class CountMemoryBankPointsTest(_PatchRetryMixin, unittest.TestCase):

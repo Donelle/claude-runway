@@ -20,9 +20,10 @@ so it has to be pinned here.
 import io
 import json
 import os
+import re
 import sys
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hooks"))
 
@@ -78,6 +79,23 @@ MUST_SKIP = [
     ("python x.py -h", "standalone -h"),
     ("df -h", "-h as its own token; tabular output that reads exact anyway"),
     ("gtk-app --help-all", "--help-all is still help output, so matching it is right"),
+    # --- gh api (issue #190): structured REST/GraphQL data, never prose ---
+    (
+        "gh api repos/CVNA-SandboxOrg/claude-runway/pulls/190/comments --paginate",
+        "plain gh api call with no --jq/--json at all (my-gh-pr-feedback's shape)",
+    ),
+    (
+        "gh api graphql -f query='query { repository(name: \"x\") { pullRequest(number: 1) "
+        "{ reviewThreads(first: 100) { nodes { id comments(first: 1) { nodes { body } } } } } } }'",
+        "graphql body-fetch shape",
+    ),
+    (
+        'COMMENT_IDS=$(gh api repos/CVNA-SandboxOrg/claude-runway/pulls/190/comments '
+        '--paginate --jq ".[] | select(.user.login != \\"me\\") | \\"comment:\\" + (.id|tostring)") '
+        "|| FETCH_FAILED=1",
+        "the real VAR=$(...) command-substitution shape used by my-gh-autowork's NEW_IDS diffing "
+        "-- a start-anchored fix would have missed this",
+    ),
 ]
 
 # Commands that should still be compressed normally.
@@ -115,6 +133,9 @@ MUST_COMPRESS = [
     ("python x.py --dry-run # compress-ok", "escape hatch beats the dry-run exemption"),
     # --- case-insensitivity is scoped to the output-format value only (#33) ---
     ('curl -H "Accept: application/json" https://x', "-H is curl's header flag, not -h/help"),
+    # --- gh, but not `gh api`: unaffected by the issue #190 addition ---
+    ('gh pr comment 190 --body "thanks!"', "gh subcommand other than api stays compressible"),
+    ("gh pr view 190 -R x/y", "no --json, no api subcommand -- ordinary human-readable text"),
 ]
 
 
@@ -134,6 +155,100 @@ class ExactnessCritical(unittest.TestCase):
                     _is_exactness_critical(command),
                     f"{command!r} should still be compressed ({why})",
                 )
+
+
+class CompileExtraExactPatterns(unittest.TestCase):
+    """Issue #192: CLAUDE_RUNWAY_EXTRA_EXACT_PATTERNS lets a project add its
+    own exactness-critical patterns on top of the built-in list, without
+    editing this shared hook file. Tests _compile_extra_exact_patterns()
+    directly against the real env var, restoring whatever was there
+    beforehand so this doesn't leak into other tests in the same process."""
+
+    def setUp(self):
+        self._real_env = os.environ.get("CLAUDE_RUNWAY_EXTRA_EXACT_PATTERNS")
+
+    def tearDown(self):
+        if self._real_env is None:
+            os.environ.pop("CLAUDE_RUNWAY_EXTRA_EXACT_PATTERNS", None)
+        else:
+            os.environ["CLAUDE_RUNWAY_EXTRA_EXACT_PATTERNS"] = self._real_env
+
+    def test_unset_yields_no_patterns(self):
+        os.environ.pop("CLAUDE_RUNWAY_EXTRA_EXACT_PATTERNS", None)
+        self.assertEqual(hook._compile_extra_exact_patterns(), [])
+
+    def test_blank_string_yields_no_patterns(self):
+        os.environ["CLAUDE_RUNWAY_EXTRA_EXACT_PATTERNS"] = ""
+        self.assertEqual(hook._compile_extra_exact_patterns(), [])
+
+    def test_semicolon_separated_patterns_all_compiled(self):
+        os.environ["CLAUDE_RUNWAY_EXTRA_EXACT_PATTERNS"] = r"internal-cli;my-hash-tool\b"
+        patterns = hook._compile_extra_exact_patterns()
+        self.assertEqual(len(patterns), 2)
+        self.assertTrue(any(p.search("run internal-cli --dump") for p in patterns))
+        self.assertTrue(any(p.search("my-hash-tool") for p in patterns))
+
+    def test_blank_entries_between_semicolons_are_ignored(self):
+        # A trailing/leading/doubled semicolon (easy to type by hand in a
+        # shell export) must not produce an empty-string pattern that would
+        # match every command via re.search("", ...).
+        os.environ["CLAUDE_RUNWAY_EXTRA_EXACT_PATTERNS"] = " ;internal-cli; ; "
+        patterns = hook._compile_extra_exact_patterns()
+        self.assertEqual(len(patterns), 1)
+        self.assertTrue(patterns[0].search("internal-cli"))
+
+    def test_invalid_pattern_is_skipped_not_fatal(self):
+        # Fail open PER-PATTERN: a typo in one entry must not take down the
+        # other, valid entries alongside it -- same precedent as the
+        # ImportError/stale-env-var fail-open paths elsewhere in this file.
+        os.environ["CLAUDE_RUNWAY_EXTRA_EXACT_PATTERNS"] = r"good-one;(unbalanced["
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            patterns = hook._compile_extra_exact_patterns()
+        self.assertEqual(len(patterns), 1)
+        self.assertTrue(patterns[0].search("good-one"))
+        self.assertIn("skipping invalid", buf.getvalue())
+
+
+class ExtraExactPatternsAffectIsExactnessCritical(unittest.TestCase):
+    """End-to-end through _is_exactness_critical() itself, monkeypatching the
+    module-level compiled list the same way other tests here monkeypatch
+    hook.compress/hook.savings_ledger -- avoids needing a real module reload
+    just to exercise a different env var value."""
+
+    def setUp(self):
+        self._real_patterns = hook._EXTRA_EXACT_PATTERNS
+
+    def tearDown(self):
+        hook._EXTRA_EXACT_PATTERNS = self._real_patterns
+
+    def test_extra_pattern_exempts_a_project_specific_command(self):
+        hook._EXTRA_EXACT_PATTERNS = [re.compile(r"internal-hash-tool")]
+        self.assertTrue(_is_exactness_critical("internal-hash-tool --for record.json"))
+
+    def test_extra_patterns_are_additive_builtin_list_still_works(self):
+        # No extra patterns configured must not regress the builtin list --
+        # this env var can only ADD checks, never replace the existing ones.
+        hook._EXTRA_EXACT_PATTERNS = []
+        self.assertTrue(_is_exactness_critical("git status --short"))
+
+    def test_unrelated_command_is_unaffected_by_an_extra_pattern(self):
+        hook._EXTRA_EXACT_PATTERNS = [re.compile(r"internal-hash-tool")]
+        self.assertFalse(_is_exactness_critical("dotnet build"))
+
+    def test_compress_ok_escape_hatch_still_beats_an_extra_pattern(self):
+        # The existing opt-out must apply uniformly -- a project's own
+        # pattern doesn't get a separate, un-overridable exemption path.
+        hook._EXTRA_EXACT_PATTERNS = [re.compile(r"internal-hash-tool")]
+        self.assertFalse(_is_exactness_critical("internal-hash-tool --for record.json # compress-ok"))
+
+    def test_extra_pattern_matches_anywhere_in_a_segment(self):
+        # Matched anywhere (like _EXACT_FLAG_RE), not start-anchored (like
+        # _EXACT_CMD_RE) -- so a project's pattern still fires even when
+        # wrapped in shell command substitution, the same VAR=$(...) blind
+        # spot issue #190 found for a start-anchored `gh api` addition.
+        hook._EXTRA_EXACT_PATTERNS = [re.compile(r"internal-hash-tool")]
+        self.assertTrue(_is_exactness_critical('ID=$(internal-hash-tool --for record.json)'))
 
 
 class _StubSavingsLedger:
@@ -371,6 +486,148 @@ class MainFallsBackToGenericForNonFooterMcpTools(unittest.TestCase):
         # existing (unchanged) behavior, distinct from the fallback path's
         # "hook:<tool_name>" naming asserted above.
         self.assertEqual(args[1], "compress_file")
+
+
+class CompactFindMultiEntryIsNeverGenericallyCompressed(unittest.TestCase):
+    """Issue #193: compact_find's output is structured data /my-resume
+    parses for control flow (a "Found {N} compact(s)" header + N discrete
+    dated/labeled entries), not prose to skim. Generic size-based
+    compression collapses multiple entries into one flowing narrative
+    before /my-resume ever sees discrete entries to count, breaking its
+    0/1/2+ branching. A response whose own header reports N > 1 must be
+    left completely untouched, regardless of size -- the same true no-op
+    _SELF_COMPRESSING_MCP_TOOLS gets. N <= 1 (including no header at all,
+    e.g. an error string) must still fall through to the ordinary
+    size-based path, unchanged from before this fix (issue #25's original
+    intent: compact_find isn't unconditionally exempt)."""
+
+    def setUp(self):
+        self.stub = _StubSavingsLedger()
+        self._real_ledger = hook.savings_ledger
+        self._real_available = hook._SAVINGS_LEDGER_AVAILABLE
+        self._real_compress = hook.compress
+        hook.savings_ledger = self.stub
+        hook._SAVINGS_LEDGER_AVAILABLE = True
+        hook.compress = _fake_compress
+
+    def tearDown(self):
+        hook.savings_ledger = self._real_ledger
+        hook._SAVINGS_LEDGER_AVAILABLE = self._real_available
+        hook.compress = self._real_compress
+
+    def _run_main(self, payload):
+        real_stdin = sys.stdin
+        sys.stdin = io.StringIO(json.dumps(payload))
+        out = io.StringIO()
+        try:
+            with redirect_stdout(out):
+                try:
+                    hook.main()
+                except SystemExit:
+                    pass
+        finally:
+            sys.stdin = real_stdin
+        return out.getvalue()
+
+    def _multi_entry_response(self, n):
+        # Scaled off hook.THRESHOLD (not the code's documented 2000
+        # default) rather than a fixed repeat count -- this repo's own
+        # dogfood shell overrides CLAUDE_RUNWAY_COMPRESS_THRESHOLD_CHARS to
+        # 4000, and a hardcoded assumption would fail confusingly here.
+        per_entry_chars = (hook.THRESHOLD // max(n, 1)) + 200
+        lines = [f"Found {n} compact(s) for project 'claude-runway':\n"]
+        for i in range(1, n + 1):
+            lines.append(f"--- {i}. 2026-09-{i:02d} — session {i} (id: abcd1234) ---")
+            lines.append("STORED COMPACT CONTENT. " * (per_entry_chars // 25 + 1))
+            lines.append("")
+        return "\n".join(lines)
+
+    def test_multi_entry_response_over_threshold_is_left_completely_untouched(self):
+        response = self._multi_entry_response(5)
+        self.assertGreater(len(response), hook.THRESHOLD)
+        payload = {
+            "session_id": "sess-1",
+            "cwd": "/repos/claude-runway",
+            "tool_name": "mcp__local-compress__compact_find",
+            "tool_response": response,
+        }
+        printed = self._run_main(payload)
+        self.assertEqual(printed, "", "a multi-entry compact_find result must be a true no-op")
+        self.assertEqual(len(self.stub.calls), 0)
+
+    def test_single_entry_response_over_threshold_still_gets_compressed(self):
+        # N == 1 has no multi-entry structure to lose -- must still follow
+        # the ordinary size-based fallback path (issue #25's intent).
+        response = self._multi_entry_response(1)
+        self.assertGreater(len(response), hook.THRESHOLD)
+        payload = {
+            "session_id": "sess-1",
+            "cwd": "/repos/claude-runway",
+            "tool_name": "mcp__local-compress__compact_find",
+            "tool_response": response,
+        }
+        printed = self._run_main(payload)
+        self.assertIn("updatedToolOutput", printed)
+        self.assertIn("GIST", printed)
+        self.assertEqual(len(self.stub.calls), 1)
+
+    def test_headerless_response_over_threshold_still_gets_compressed(self):
+        # Regression guard: an error string or any other compact_find
+        # response shape with no "Found N compact(s)" header at all (e.g.
+        # "No compacts found for project ...") must behave exactly as it
+        # did before this fix -- fall through to size-based compression.
+        response = "No compacts found for project 'claude-runway'. " * 100
+        self.assertGreater(len(response), hook.THRESHOLD)
+        payload = {
+            "session_id": "sess-1",
+            "cwd": "/repos/claude-runway",
+            "tool_name": "mcp__local-compress__compact_find",
+            "tool_response": response,
+        }
+        printed = self._run_main(payload)
+        self.assertIn("updatedToolOutput", printed)
+        self.assertEqual(len(self.stub.calls), 1)
+
+    def test_multi_entry_response_under_threshold_is_a_true_noop_either_way(self):
+        # Small multi-entry response: already a no-op via the normal
+        # under-threshold path, but confirms the new header check doesn't
+        # change that outcome (no ledger event either way).
+        response = self._multi_entry_response(2)[:100]
+        payload = {
+            "session_id": "sess-1",
+            "cwd": "/repos/claude-runway",
+            "tool_name": "mcp__local-compress__compact_find",
+            "tool_response": response,
+        }
+        printed = self._run_main(payload)
+        self.assertEqual(printed, "")
+        self.assertEqual(len(self.stub.calls), 0)
+
+
+class CompactFindEntryCountHelper(unittest.TestCase):
+    """Direct unit coverage for _compact_find_entry_count, independent of
+    the full hook dispatch path exercised above."""
+
+    def test_extracts_count_from_header(self):
+        text = "Found 3 compact(s) for project 'foo':\n--- 1. ... ---"
+        self.assertEqual(hook._compact_find_entry_count(text), 3)
+
+    def test_returns_none_when_no_header_present(self):
+        self.assertIsNone(hook._compact_find_entry_count("just some other text"))
+
+    def test_ignores_header_phrase_when_not_at_the_leaf_start(self):
+        # PR #194 review: the header regex must be anchored to the START of
+        # the leaf, not just matched anywhere in it -- otherwise a STORED
+        # compact's own content quoting this exact phrase mid-string (e.g. a
+        # past /my-compact session about debugging this very hook) would be
+        # mistaken for the real leading header. Reproduced live before the
+        # fix: this returned 5, not None.
+        fake = "Some earlier stored compact discusses: Found 5 compact(s) for project 'other':\nmore text"
+        self.assertIsNone(hook._compact_find_entry_count(fake))
+
+    def test_finds_header_nested_in_a_dict_or_list(self):
+        nested = {"content": [{"type": "text", "text": "Found 2 compact(s) for project 'x':\n..."}]}
+        self.assertEqual(hook._compact_find_entry_count(nested), 2)
 
 
 class HandleGenericGroupsBySiblingRecord(unittest.TestCase):

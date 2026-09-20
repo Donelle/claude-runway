@@ -144,6 +144,11 @@ comments below) and Splunk:
 Env vars (same names local_compress_lib.py / compress_mcp_server.py use):
     CLAUDE_RUNWAY_LMSTUDIO_URL, CLAUDE_RUNWAY_LMSTUDIO_MODEL,
     CLAUDE_RUNWAY_COMPRESS_THRESHOLD_CHARS (default 2000),
+    CLAUDE_RUNWAY_EXTRA_EXACT_PATTERNS (optional, default unset -- semicolon-
+    separated regex patterns a project can add ON TOP OF the built-in
+    exactness-critical list below, e.g. for an internal CLI whose output must
+    stay byte-exact; see the _EXTRA_EXACT_PATTERNS block for matching
+    semantics and issue #192),
     CLAUDE_RUNWAY_TRACK_SAVINGS (opt-in savings tracker, off by default -- see
     libs/savings_ledger.py), CLAUDE_RUNWAY_SAVINGS_DB (optional override of
     the savings DB's location; must match the value set in compress_mcp_server.py's
@@ -346,6 +351,31 @@ _EXACT_FLAG_RE = re.compile(
     # same reasoning as --version. Bundled forms (`ls -lh`) deliberately don't
     # match; only a standalone -h does.
     r"|--help\b|\s-h(?:\s|$)"
+    # `gh api` (REST or GraphQL) always returns structured JSON meant to be
+    # parsed field-by-field -- an exact ID substituted into a follow-up call,
+    # or a comment/review body read verbatim to decide what to reply to or
+    # fix -- never prose to skim. Same rationale as the `jq|yq` command
+    # exemption above, just reached through `gh` instead of a literal pipe to
+    # the `jq` binary (issue #190).
+    #
+    # Matched ANYWHERE rather than as a start-of-segment command (like
+    # `jq|yq`) on purpose: the real call sites in this repo's own skills wrap
+    # it in shell command substitution, e.g.
+    #   COMMENT_IDS=$(gh api repos/.../pulls/<PR>/comments --paginate --jq "...")
+    # A start-anchored match can't see past that `VAR=$(...)` wrapper, since
+    # the leading-assignment sub-pattern only accepts a quoted string or a
+    # whitespace-free token as the assigned value -- verified directly before
+    # picking this approach, a start-anchored `gh\s+api` addition matched the
+    # bare form but returned False on this exact wrapped form.
+    #
+    # Also deliberately broader than gating on `--jq`/`graphql` specifically:
+    # issue #190's own suggested fix (those two flags only) was verified
+    # incomplete before implementing -- this repo's `my-gh-pr-feedback` skill
+    # calls `gh api .../comments --paginate` with neither flag at all, so a
+    # narrower fix would have left that skill's primary feedback-fetch step
+    # exactly as exposed as before. One `gh api` match covers all three real
+    # shapes (plain, `--jq`-filtered, and `graphql`) plus any future one.
+    r"|\bgh\s+api\b"
 )
 
 # Escape hatch: a genuinely large exempt output (a 5MB `git diff`) can opt back
@@ -360,6 +390,61 @@ _EXACT_FLAG_RE = re.compile(
 # also matches how it's documented and how a real shell comment behaves.
 _FORCE_COMPRESS_RE = re.compile(r"#\s*compress-ok\s*\Z")
 
+# --- Project-level extra exactness-critical patterns (issue #192) ----------
+#
+# hooks/compress_bash_output.py is shared across every project that installs
+# this toolkit -- each project's .claude/settings.json points at the SAME
+# cloned copy by absolute path (see docs/installation.md). A project with its
+# own domain-specific command whose output must stay byte-exact (an internal
+# CLI, a custom script returning an exact hash/ID) had no way to exempt it
+# without editing this shared file directly, which would change behavior for
+# every OTHER project pointing at the same clone. This env var is the
+# per-project override channel -- same shell-only pattern already used for
+# CLAUDE_RUNWAY_COMPRESS_THRESHOLD_CHARS above, since hooks have no `.mcp.json`
+# env block to read from.
+#
+# Additive only, deliberately: there is no matching "disable a builtin
+# pattern" knob. A project silently un-exempting git/wc/etc. would reintroduce
+# the exact lossy-git bug class this whole file exists to prevent (see the
+# bug-history comment above _EXACT_CMDS). CLAUDE_RUNWAY_EXTRA_EXACT_PATTERNS
+# can only ADD to _is_exactness_critical()'s check, never remove from it.
+#
+# Matched ANYWHERE in a segment -- like _EXACT_FLAG_RE, not the start-anchored
+# _EXACT_CMD_RE -- because the anywhere-matched form has no blind spot for a
+# `VAR=$(...)` wrapper (see the `gh api` addition's comment above, issue #190),
+# and a project adding its own pattern is far more likely to want "this
+# command anywhere in the pipeline" than the narrower start-of-segment
+# semantics the builtin command list uses.
+#
+# Patterns are semicolon-separated, not comma-separated like this repo's other
+# multi-value env vars (e.g. INDEX_EXCLUDE_DIRS) -- a regex quantifier like
+# `{2,4}` is a realistic pattern here in a way a literal semicolon in a regex
+# is not, so comma would silently mis-split a legitimate pattern.
+#
+# Fails open PER-PATTERN, not all-or-nothing: a typo in pattern 2 of 3 must
+# not silently disable patterns 1 and 3 too. Each invalid pattern is skipped
+# and reported on stderr -- the same fail-open precedent as the ImportError
+# and stale-env-var paths above -- never crashes the hook or blocks Bash.
+def _compile_extra_exact_patterns():
+    raw = os.environ.get("CLAUDE_RUNWAY_EXTRA_EXACT_PATTERNS", "")
+    compiled = []
+    for piece in raw.split(";"):
+        pattern = piece.strip()
+        if not pattern:
+            continue
+        try:
+            compiled.append(re.compile(pattern))
+        except re.error as e:
+            print(
+                f"compress_bash_output.py: skipping invalid "
+                f"CLAUDE_RUNWAY_EXTRA_EXACT_PATTERNS entry {pattern!r}: {e}",
+                file=sys.stderr,
+            )
+    return compiled
+
+
+_EXTRA_EXACT_PATTERNS = _compile_extra_exact_patterns()
+
 
 def _is_exactness_critical(command: str) -> bool:
     """True if any segment of a (possibly compound) Bash command produces
@@ -373,7 +458,11 @@ def _is_exactness_critical(command: str) -> bool:
         return False
     for segment in re.split(r"\|\||&&|[;|\n]", command):
         segment = segment.strip()
-        if segment and (_EXACT_CMD_RE.match(segment) or _EXACT_FLAG_RE.search(segment)):
+        if not segment:
+            continue
+        if _EXACT_CMD_RE.match(segment) or _EXACT_FLAG_RE.search(segment):
+            return True
+        if any(extra.search(segment) for extra in _EXTRA_EXACT_PATTERNS):
             return True
     return False
 
@@ -664,6 +753,35 @@ def _finish_compression_outcome(outcome, tool_name, source, session_id, project)
     sys.exit(0)
 
 
+# Matches compact_find's own header verbatim (compress_mcp_server.py:1516):
+# f"Found {len(entries)} compact(s) for project '{project}':\n". Anchored to
+# the START of the leaf (^, no re.MULTILINE, so this only matches the
+# absolute beginning of the string) -- not just anchored to that exact
+# phrasing -- so a STORED compact's own content can never be mistaken for
+# the real header just because it happens to quote the same phrase
+# mid-string (e.g. a past /my-compact session about debugging this very
+# hook). The genuine header is always the first thing compact_find's own
+# "\n".join(lines) call emits, so requiring position 0 costs nothing for
+# the real case while closing that false-match window (PR #194 review).
+_COMPACT_FIND_HEADER_RE = re.compile(r"^Found (\d+) compact\(s\) for project '")
+
+
+def _compact_find_entry_count(tool_response):
+    """Extract N from compact_find's "Found {N} compact(s) for project..."
+    header (issue #193), searching every string leaf of the (possibly
+    nested) tool response via the same _walk_strings used elsewhere in this
+    file. Returns None if no such header is found anywhere -- e.g. an error
+    string ("No compacts found for project..."), some other response shape
+    entirely, or a leaf where the phrase appears but not at that leaf's own
+    start -- which the caller treats as "nothing to special-case, fall
+    through to the ordinary size-based path" rather than as N=0."""
+    for _, s in _walk_strings(tool_response):
+        m = _COMPACT_FIND_HEADER_RE.search(s)
+        if m:
+            return int(m.group(1))
+    return None
+
+
 def _dispatch(payload):
     """Everything main() does after the payload has been parsed off stdin --
     split out so main() can wrap this whole body in one try/except (issue
@@ -708,6 +826,26 @@ def _dispatch(payload):
         bare_tool_name = tool_name[len(MCP_SAVINGS_TOOL_PREFIX):]
         if bare_tool_name in _SELF_COMPRESSING_MCP_TOOLS:
             sys.exit(0)
+        # compact_find's output is structured data /my-resume parses for
+        # control flow (issue #193), not prose to skim: a "Found {N}
+        # compact(s)" header followed by N discrete dated/labeled entries.
+        # /my-resume branches on that count (0 -> tell the user to run
+        # /my-compact, 1 -> restore silently, 2+ -> AskUserQuestion picker
+        # with one option per entry). Generic size-based compression below
+        # collapses all N entries into a single flowing narrative before
+        # /my-resume ever sees discrete entries to count, so the picker
+        # never fires and the merged summary can misrepresent which
+        # entries exist at all. Skip compression outright whenever the
+        # header itself reports more than one entry. A single-entry (or
+        # header-less, e.g. "No compacts found...") response has no
+        # multi-entry structure to lose, so it still gets the ordinary
+        # size-based path below -- preserving issue #25's original intent
+        # that compact_find isn't UNCONDITIONALLY exempt, just exempt when
+        # exemption actually matters.
+        if bare_tool_name == "compact_find":
+            entry_count = _compact_find_entry_count(tool_response)
+            if entry_count is not None and entry_count > 1:
+                sys.exit(0)
         outcome = _handle_generic(tool_response)
         _finish_compression_outcome(outcome, tool_name, tool_name, session_id, project)
 

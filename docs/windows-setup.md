@@ -2,7 +2,7 @@
 
 Step-by-step setup for running LM Studio with CUDA hardware acceleration on laptops with dual graphics (Intel UHD integrated + a dedicated NVIDIA GPU). This targets the specific hardware combination most many corporate-issued laptops ship with, but the same steps apply to any Windows laptop with Intel/NVIDIA Optimus hybrid graphics.
 
-This is relevant to this repo's local-compress piece (`compress_mcp_server.py`), which depends on LM Studio running locally with a model loaded — see the README's Prerequisites section.
+This is relevant to this repo's local-compress piece (`compress_mcp_server.py`), which depends on LM Studio running locally with a model loaded — see [Prerequisites](prerequisites.md).
 
 ---
 
