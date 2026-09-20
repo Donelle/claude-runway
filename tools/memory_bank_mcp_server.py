@@ -86,7 +86,6 @@ async def remember(
     description: str,
     kind: str,
     general: bool = False,
-    collection: Optional[str] = None,
     ctx: Context = None,  # type: ignore[assignment]
 ) -> str:
     """
@@ -110,11 +109,8 @@ async def remember(
     every project," "remember this across all repos." Default False (scoped
     to this project) otherwise; don't infer general=True from the content
     alone, only from an explicit signal like that.
-
-    collection defaults to this server's configured MEMORY_BANK_COLLECTION
-    env var -- only pass this explicitly to target a different collection.
     """
-    collection = collection or DEFAULT_MEMORY_BANK_COLLECTION
+    collection = DEFAULT_MEMORY_BANK_COLLECTION
     repo, error = mb.resolve_repo(DEFAULT_MEMORY_BANK_ID, general)
     if error:
         return error
@@ -142,7 +138,6 @@ async def recall(
     kind: Optional[str] = None,
     repo: Optional[str] = None,
     all_repos: bool = False,
-    collection: Optional[str] = None,
     limit: int = 5,
     ctx: Context = None,  # type: ignore[assignment]
 ) -> str:
@@ -162,7 +157,7 @@ async def recall(
 
     kind narrows further if given. limit caps how many hits come back.
     """
-    collection = collection or DEFAULT_MEMORY_BANK_COLLECTION
+    collection = DEFAULT_MEMORY_BANK_COLLECTION
     caller_repo, error = mb.resolve_repo(DEFAULT_MEMORY_BANK_ID, general=False)
     if error and not (repo or all_repos):
         # A caller with no valid own repo can still explicitly search a
@@ -223,7 +218,6 @@ def forget(
     point_id: Optional[str] = None,
     wipe_all: bool = False,
     confirm: bool = False,
-    collection: Optional[str] = None,
 ) -> str:
     """
     Delete memories. Two mutually exclusive modes -- passing both or
@@ -245,7 +239,7 @@ def forget(
     if bool(point_id) == bool(wipe_all):
         return "Error: pass exactly one of point_id or wipe_all, not both or neither."
 
-    collection = collection or DEFAULT_MEMORY_BANK_COLLECTION
+    collection = DEFAULT_MEMORY_BANK_COLLECTION
     caller_repo, error = mb.resolve_repo(DEFAULT_MEMORY_BANK_ID, general=False)
     if error:
         return error

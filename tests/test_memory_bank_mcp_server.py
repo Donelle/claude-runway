@@ -83,6 +83,28 @@ class RecallNonexistentCollectionTest(unittest.TestCase):
         mock_provider_cls.assert_not_called()
 
 
+class CollectionOverrideRemovedTest(unittest.TestCase):
+    """Regression for issue #188: remember/recall/forget used to accept a
+    caller-controlled `collection` kwarg with no validation, letting a call
+    write/read/delete memory-bank points in a collection other than the one
+    configured via MEMORY_BANK_COLLECTION -- bypassing index_repo/sync_repo's
+    reserved-collection guard, which only ever checks the configured name.
+    The fix removes the parameter entirely rather than validating it, so a
+    caller-supplied `collection` must now be rejected at the call boundary."""
+
+    def test_remember_rejects_collection_kwarg(self):
+        with self.assertRaises(TypeError):
+            _mbs.remember(summary="s", description="d", kind="k", collection="other")
+
+    def test_recall_rejects_collection_kwarg(self):
+        with self.assertRaises(TypeError):
+            _mbs.recall(query="anything", collection="other")
+
+    def test_forget_rejects_collection_kwarg(self):
+        with self.assertRaises(TypeError):
+            _mbs.forget(point_id="some-id", collection="other")
+
+
 class ToolRegistrationTest(unittest.TestCase):
     def test_registers_exactly_three_tools(self):
         from mcp_tool_introspect import tool_count
