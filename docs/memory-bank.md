@@ -44,6 +44,46 @@ The script warns (rather than silently allowing) two collisions:
 
 For the exact usage guidance Claude should follow when deciding whether to call these tools, see `templates/CLAUDE.md.template`'s "Durable memory (memory-bank MCP)" section — copy it into a project's `CLAUDE.md` alongside the Qdrant/local-compress sections it already documents.
 
+## Usage event logging
+
+`recall`/`remember` calls are passively logged, one row per event, to a dedicated
+`~/.claude/claude-runway/memory-events.db` (issue #179) — a diagnostic signal for
+validating the reuse thesis behind this feature (are stored memories actually
+getting recalled later, by which projects, how soon after creation) without
+relying entirely on manually-run scenarios. `forget` is deliberately NOT logged
+here — tracking it would only be meaningful alongside an autonomous-removal
+feature that doesn't exist yet, since `forget` today always requires explicit
+human `confirm=True`.
+
+This is a SEPARATE file from `libs/savings_ledger.py`'s `savings.db` on purpose:
+that file tracks session-level token-savings aggregates, a different concern
+from per-point access tracking, and mixing the two would couple unrelated
+metric domains together. It only ever stores ids/timestamps/kind/repo/session
+metadata — never a memory's `summary` or `description` text.
+
+Unlike `CLAUDE_RUNWAY_TRACK_SAVINGS` (opt-in, off by default), this is **on by
+default** — it costs one local SQLite `INSERT`, no network call, no model
+call, and no token cost, unlike the savings tracker's transcript-parsing
+sibling feature. Set `CLAUDE_RUNWAY_TRACK_MEMORY_EVENTS` to a falsy value to
+disable it, or `CLAUDE_RUNWAY_MEMORY_EVENTS_DB` to relocate the file — see
+[Environment variables](environment-variables.md). Neither needs the
+"set in both `.mcp.json` and the shell" coordination those two savings-tracker
+variables need, since no hook ever reads this file — only the `memory-bank`
+MCP server does.
+
+Each row records `event_type` (`recall`/`remember`), `point_id`, `repo`,
+`kind`, `summary_created_at` (the memory's own creation time, denormalized at
+log time), `event_timestamp`, `turn` (a per-session call-sequence counter —
+"3rd memory-bank call this session," not a real Claude Code conversation
+turn), `session_id`, and `project`. `session_id` is a process-lifetime UUID
+generated once when the MCP server starts, not Claude Code's own internal
+session id — an MCP server has no access to that (only hooks receive one, via
+their stdin payload); since a stdio server is spawned fresh per Claude Code
+session, this is a documented, practical proxy for "this session," not the
+real thing. Surfacing this data (a query/report tool, a `/my-savings`-style
+summary) is intentionally out of scope for now — this is passive collection
+only.
+
 ## Where the data lives
 
 The same Qdrant instance as `codebase-indexer`'s per-project collections, but in one collection shared across every project, and never touched by `index_repo`/`sync_repo`'s reset/delete paths — those always preserve `metadata.source == "memory-bank"` points, even during a full reset (issue #175; see the README's [Known limitations](../README.md#known-limitations) for the mechanics of that filtered-delete behavior).

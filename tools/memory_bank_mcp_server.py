@@ -27,9 +27,11 @@ MCP protocol messages. Nothing in this file should ever call print() --
 progress and results must be returned as tool output, not printed.
 """
 
+import itertools
 import json
 import os
 import sys
+import uuid
 from typing import Optional
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "libs"))
@@ -43,6 +45,7 @@ from qdrant_retry import call_with_retry
 from qdrant_model_check import check_embedding_model_mismatch
 from mcp_tool_introspect import tool_count
 import memory_bank_lib as mb
+import memory_events_lib as mev
 
 # Must run before any FastEmbedProvider(...) construction below -- see
 # ingest_mcp_server.py's identical call and issue #77 for why.
@@ -65,6 +68,32 @@ DEFAULT_MEMORY_BANK_COLLECTION = os.environ.get("MEMORY_BANK_COLLECTION", "memor
 # same value as codebase-indexer's own COLLECTION_NAME for convenience, but
 # they're independent settings -- nothing enforces they stay identical.
 DEFAULT_MEMORY_BANK_ID = os.environ.get("MEMORY_BANK_ID")
+
+# Issue #179: this server has no access to Claude Code's own session_id --
+# only hooks get one, via their stdin payload (see
+# tools/compress_mcp_server.py's _append_savings_footer docstring for the
+# identical constraint on the local-compress server). A stdio MCP server
+# subprocess is spawned fresh per Claude Code session (one process per
+# session -- see libs/qdrant_collection_hints.py's docstring), so a
+# process-lifetime UUID generated once here, at import time, is a
+# documented proxy for "this session": it will never equal Claude Code's
+# own internal id, but it uniquely identifies this one server run, which in
+# practice IS one Claude Code session.
+_SESSION_ID = uuid.uuid4().hex
+
+# Per-session call-sequence counter for memory_events_lib's `turn` field --
+# incremented once per remember()/recall() TOOL INVOCATION (see _next_turn),
+# not once per event row logged, and (PR #197 review) regardless of whether
+# that particular call ends up actually logging anything -- a validation
+# error, a missing collection, or an empty recall still consumed a turn
+# number, matching "the Nth memory-bank call this session," not "the Nth
+# LOGGED memory-bank call." forget() never advances this, since forget
+# events aren't tracked at all (issue #179 scope).
+_turn_counter = itertools.count(1)
+
+
+def _next_turn() -> int:
+    return next(_turn_counter)
 
 
 mcp = MCPServer("memory-bank")
@@ -110,6 +139,17 @@ async def remember(
     to this project) otherwise; don't infer general=True from the content
     alone, only from an explicit signal like that.
     """
+    # turn is captured HERE, unconditionally, before any of the fallible
+    # steps below (repo resolution, the actual write) -- PR #197 review: a
+    # previous version only called _next_turn() deep inside the
+    # tracking-enabled branch, AFTER a successful write, so a validation
+    # error or a schema mismatch silently skipped a turn number instead of
+    # consuming one. `turn` is meant to mean "the Nth memory-bank call this
+    # session" (see _next_turn's docstring), which has to count every call
+    # attempt, not just the ones that end up logged.
+    tracking = mev.tracking_enabled()
+    turn = _next_turn() if tracking else None
+
     collection = DEFAULT_MEMORY_BANK_COLLECTION
     repo, error = mb.resolve_repo(DEFAULT_MEMORY_BANK_ID, general)
     if error:
@@ -122,13 +162,32 @@ async def remember(
     # (called by remember_point below) now does an equivalent check itself, positioned
     # right before the actual write rather than earlier -- checking here too would just
     # be a redundant round-trip with a WIDER race window, not extra safety.
-    point_id, mismatch = await mb.remember_point(
+    point_id, created_at, mismatch = await mb.remember_point(
         client, embedding_provider, collection,
         summary=summary, description=description, kind=kind,
         repo=repo, embedding_model=DEFAULT_EMBEDDING_MODEL,
     )
     if mismatch:
         return mismatch
+    if tracking:
+        # summary_created_at is the EXACT value remember_point itself
+        # stamped into metadata.created_at (PR #197 review) -- a previous
+        # version re-sampled time.time() here instead, which under
+        # call_with_retry's retries (up to 4 attempts, each with a backoff)
+        # could diverge from the real stamped value by much more than a
+        # negligible amount, corrupting the time-to-first-reuse metric this
+        # field exists to support.
+        assert turn is not None  # tracking is True here, so _next_turn() already ran above
+        mev.record_memory_event(
+            event_type="remember",
+            point_id=point_id,
+            repo=repo,
+            kind=kind,
+            summary_created_at=created_at,
+            session_id=_SESSION_ID,
+            project=DEFAULT_MEMORY_BANK_ID,
+            turn=turn,
+        )
     return f"Remembered (id={point_id}, repo='{repo}', kind='{kind}')."
 
 
@@ -157,6 +216,14 @@ async def recall(
 
     kind narrows further if given. limit caps how many hits come back.
     """
+    # Captured HERE, unconditionally, for the same reason remember() above
+    # does (PR #197 review): turn must count every recall() INVOCATION --
+    # a validation error, a missing collection, an embedding mismatch, or a
+    # genuinely empty result set are all still "a call this session," even
+    # though none of them reach the logging branch below.
+    tracking = mev.tracking_enabled()
+    turn = _next_turn() if tracking else None
+
     collection = DEFAULT_MEMORY_BANK_COLLECTION
     caller_repo, error = mb.resolve_repo(DEFAULT_MEMORY_BANK_ID, general=False)
     if error and not (repo or all_repos):
@@ -200,6 +267,25 @@ async def recall(
     )
     if not results:
         return f"No memories found for '{query}'."
+
+    if tracking:
+        # One turn value for this whole call (issue #179): "3rd memory-bank
+        # call this session" describes the CALL, not each individual hit --
+        # a recall() returning 5 hits logs 5 rows that all share this same
+        # turn number, not 5 separate turns. turn was already captured at
+        # the top of this function (see comment there).
+        assert turn is not None  # tracking is True here, so _next_turn() already ran above
+        for hit in results:
+            mev.record_memory_event(
+                event_type="recall",
+                point_id=hit.get("id"),
+                repo=hit.get("repo"),
+                kind=hit.get("kind"),
+                summary_created_at=hit.get("created_at"),
+                session_id=_SESSION_ID,
+                project=DEFAULT_MEMORY_BANK_ID,
+                turn=turn,
+            )
 
     # JSON, not hand-rolled XML-ish text (PR #178 review, eighth pass):
     # summary/description/kind are arbitrary stored text (see

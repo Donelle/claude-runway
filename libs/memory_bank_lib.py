@@ -297,11 +297,23 @@ async def remember_point(
     alongside `description` (verbatim, payload-only, never embedded) and the
     tool-set `source`/`repo`/`embedding_model` metadata.
 
-    Returns `(point_id, None)` on success, or `(None, error_message)` if
-    `ensure_collection` finds this project's embedding model doesn't actually
-    match the collection's schema (see that function's docstring for why this
-    can happen even when the collection already existed) -- same `(value,
-    error)` convention `resolve_repo` uses.
+    Returns `(point_id, created_at, None)` on success, or
+    `(None, None, error_message)` if `ensure_collection` finds this
+    project's embedding model doesn't actually match the collection's schema
+    (see that function's docstring for why this can happen even when the
+    collection already existed) -- same `(value, error)` two-outcome
+    convention `resolve_repo` uses, just with an extra success-only field.
+
+    `created_at` (issue #179, PR #197 review) is the EXACT `time.time()`
+    value this function itself stamped into `metadata.created_at` below --
+    returned so a caller logging a memory-events row for this write (see
+    `tools/memory_bank_mcp_server.py`'s `remember()`) can record the real
+    creation timestamp instead of re-sampling `time.time()` after this
+    function returns. Re-sampling would drift from the real stamped value by
+    however long the upsert + set_payload round trips (plus any
+    `call_with_retry` backoff) took -- not always negligible, and this field
+    exists specifically to support a time-to-first-reuse metric that a
+    drifted value would corrupt.
 
     Known residual gap, accepted as-is rather than built out further (PR #178
     review, seventh pass): if the initial upsert below succeeds but the
@@ -324,7 +336,7 @@ async def remember_point(
     """
     mismatch = ensure_collection(client, collection, embedding_provider)
     if mismatch:
-        return None, mismatch
+        return None, None, mismatch
     ensure_memory_bank_indexes(client, collection)
     vector_name = embedding_provider.get_vector_name()
     embeddings = await embedding_provider.embed_documents([summary])
@@ -392,14 +404,15 @@ async def remember_point(
     # two operations from the same caller (a remember() finishing at almost
     # the exact instant that same project's own wipe_all begins), not an
     # adversarial multi-tenant race.
+    created_at = time.time()
     call_with_retry(
         client.set_payload,
         collection_name=collection,
-        payload={"created_at": time.time(), "pending": False},
+        payload={"created_at": created_at, "pending": False},
         points=[point_id],
         key="metadata",
     )
-    return point_id, None
+    return point_id, created_at, None
 
 
 async def recall_points(
@@ -417,9 +430,15 @@ async def recall_points(
     Searches `summary` vectors, always scoped to `metadata.source ==
     "memory-bank"`, plus the repo/kind narrowing `_scope_filter` builds.
     Returns a list of dicts: id/summary/description/kind/repo/
-    embedding_model/score. Returns [] (not an error) when the collection
-    doesn't exist yet -- an empty memory bank is a normal, expected state,
-    not a failure.
+    embedding_model/score/created_at. Returns [] (not an error) when the
+    collection doesn't exist yet -- an empty memory bank is a normal,
+    expected state, not a failure.
+
+    `created_at` (issue #179) is the point's own `metadata.created_at`
+    (a float `time.time()` value stamped by `remember_point`, or None for a
+    legacy point written before that field existed) -- included so a caller
+    logging a memory-events row for this hit can denormalize the memory's
+    real creation time without a second Qdrant round trip.
     """
     if not call_with_retry(client.collection_exists, collection):
         return []
@@ -448,6 +467,7 @@ async def recall_points(
                 "repo": meta.get("repo"),
                 "embedding_model": meta.get("embedding_model"),
                 "score": point.score,
+                "created_at": meta.get("created_at"),
             }
         )
     return results

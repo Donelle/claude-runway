@@ -212,7 +212,7 @@ class RememberPointTest(_PatchRetryMixin, unittest.TestCase):
         client.get_collection.return_value.payload_schema = info.payload_schema
         provider = _make_provider(vector_name="fast-x", dim=4)
 
-        point_id, error = _run(
+        point_id, created_at, error = _run(
             mb.remember_point(
                 client, provider, "col",
                 summary="short summary", description="verbatim full text",
@@ -254,13 +254,19 @@ class RememberPointTest(_PatchRetryMixin, unittest.TestCase):
         self.assertAlmostEqual(set_payload_kwargs["payload"]["created_at"], time.time(), delta=5)
         self.assertIs(set_payload_kwargs["payload"]["pending"], False)
 
+        # Issue #179, PR #197 review: the returned created_at must be the
+        # EXACT same value stamped into the set_payload call above, not a
+        # separately re-sampled time.time() -- that's the whole point of
+        # returning it at all.
+        self.assertEqual(created_at, set_payload_kwargs["payload"]["created_at"])
+
     def test_schema_mismatch_returns_error_without_upserting(self):
         client = MagicMock()
         client.collection_exists.return_value = True
         client.get_collection.return_value = _matching_collection_info(vector_name="fast-other-model", dim=768)
         provider = _make_provider(vector_name="fast-x", dim=4)
 
-        point_id, error = _run(
+        point_id, created_at, error = _run(
             mb.remember_point(
                 client, provider, "col",
                 summary="s", description="d", kind="lesson",
@@ -268,6 +274,7 @@ class RememberPointTest(_PatchRetryMixin, unittest.TestCase):
             )
         )
         self.assertIsNone(point_id)
+        self.assertIsNone(created_at)
         self.assertIsNotNone(error)
         self.assertIn("Error", error)
         client.upsert.assert_not_called()
@@ -360,6 +367,7 @@ class RecallPointsTest(_PatchRetryMixin, unittest.TestCase):
                 "kind": "lesson",
                 "repo": "proj-a",
                 "embedding_model": "model-x",
+                "created_at": 1700000000.0,
             },
         }
         response = MagicMock()
@@ -375,6 +383,32 @@ class RecallPointsTest(_PatchRetryMixin, unittest.TestCase):
         self.assertEqual(hit["repo"], "proj-a")
         self.assertEqual(hit["embedding_model"], "model-x")
         self.assertEqual(hit["score"], 0.9)
+        self.assertEqual(hit["created_at"], 1700000000.0)
+
+    def test_created_at_is_none_for_a_legacy_point_missing_the_field(self):
+        # Issue #179: a point written before metadata.created_at existed at
+        # all must not fabricate a value -- None is the honest signal that
+        # this memory predates the field, not "created at time zero."
+        client = MagicMock()
+        client.collection_exists.return_value = True
+        point = MagicMock()
+        point.id = "legacy"
+        point.score = 0.5
+        point.payload = {
+            "document": "summary text",
+            "metadata": {
+                "description": "full text",
+                "kind": "lesson",
+                "repo": "proj-a",
+                "embedding_model": "model-x",
+            },
+        }
+        response = MagicMock()
+        response.points = [point]
+        client.query_points.return_value = response
+        provider = _make_provider()
+        results = _run(mb.recall_points(client, provider, "col", "query", caller_repo="proj-a"))
+        self.assertIsNone(results[0]["created_at"])
 
 
 class CountMemoryBankPointsTest(_PatchRetryMixin, unittest.TestCase):
