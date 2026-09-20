@@ -393,6 +393,148 @@ class MainFallsBackToGenericForNonFooterMcpTools(unittest.TestCase):
         self.assertEqual(args[1], "compress_file")
 
 
+class CompactFindMultiEntryIsNeverGenericallyCompressed(unittest.TestCase):
+    """Issue #193: compact_find's output is structured data /my-resume
+    parses for control flow (a "Found {N} compact(s)" header + N discrete
+    dated/labeled entries), not prose to skim. Generic size-based
+    compression collapses multiple entries into one flowing narrative
+    before /my-resume ever sees discrete entries to count, breaking its
+    0/1/2+ branching. A response whose own header reports N > 1 must be
+    left completely untouched, regardless of size -- the same true no-op
+    _SELF_COMPRESSING_MCP_TOOLS gets. N <= 1 (including no header at all,
+    e.g. an error string) must still fall through to the ordinary
+    size-based path, unchanged from before this fix (issue #25's original
+    intent: compact_find isn't unconditionally exempt)."""
+
+    def setUp(self):
+        self.stub = _StubSavingsLedger()
+        self._real_ledger = hook.savings_ledger
+        self._real_available = hook._SAVINGS_LEDGER_AVAILABLE
+        self._real_compress = hook.compress
+        hook.savings_ledger = self.stub
+        hook._SAVINGS_LEDGER_AVAILABLE = True
+        hook.compress = _fake_compress
+
+    def tearDown(self):
+        hook.savings_ledger = self._real_ledger
+        hook._SAVINGS_LEDGER_AVAILABLE = self._real_available
+        hook.compress = self._real_compress
+
+    def _run_main(self, payload):
+        real_stdin = sys.stdin
+        sys.stdin = io.StringIO(json.dumps(payload))
+        out = io.StringIO()
+        try:
+            with redirect_stdout(out):
+                try:
+                    hook.main()
+                except SystemExit:
+                    pass
+        finally:
+            sys.stdin = real_stdin
+        return out.getvalue()
+
+    def _multi_entry_response(self, n):
+        # Scaled off hook.THRESHOLD (not the code's documented 2000
+        # default) rather than a fixed repeat count -- this repo's own
+        # dogfood shell overrides CLAUDE_RUNWAY_COMPRESS_THRESHOLD_CHARS to
+        # 4000, and a hardcoded assumption would fail confusingly here.
+        per_entry_chars = (hook.THRESHOLD // max(n, 1)) + 200
+        lines = [f"Found {n} compact(s) for project 'claude-runway':\n"]
+        for i in range(1, n + 1):
+            lines.append(f"--- {i}. 2026-09-{i:02d} — session {i} (id: abcd1234) ---")
+            lines.append("STORED COMPACT CONTENT. " * (per_entry_chars // 25 + 1))
+            lines.append("")
+        return "\n".join(lines)
+
+    def test_multi_entry_response_over_threshold_is_left_completely_untouched(self):
+        response = self._multi_entry_response(5)
+        self.assertGreater(len(response), hook.THRESHOLD)
+        payload = {
+            "session_id": "sess-1",
+            "cwd": "/repos/claude-runway",
+            "tool_name": "mcp__local-compress__compact_find",
+            "tool_response": response,
+        }
+        printed = self._run_main(payload)
+        self.assertEqual(printed, "", "a multi-entry compact_find result must be a true no-op")
+        self.assertEqual(len(self.stub.calls), 0)
+
+    def test_single_entry_response_over_threshold_still_gets_compressed(self):
+        # N == 1 has no multi-entry structure to lose -- must still follow
+        # the ordinary size-based fallback path (issue #25's intent).
+        response = self._multi_entry_response(1)
+        self.assertGreater(len(response), hook.THRESHOLD)
+        payload = {
+            "session_id": "sess-1",
+            "cwd": "/repos/claude-runway",
+            "tool_name": "mcp__local-compress__compact_find",
+            "tool_response": response,
+        }
+        printed = self._run_main(payload)
+        self.assertIn("updatedToolOutput", printed)
+        self.assertIn("GIST", printed)
+        self.assertEqual(len(self.stub.calls), 1)
+
+    def test_headerless_response_over_threshold_still_gets_compressed(self):
+        # Regression guard: an error string or any other compact_find
+        # response shape with no "Found N compact(s)" header at all (e.g.
+        # "No compacts found for project ...") must behave exactly as it
+        # did before this fix -- fall through to size-based compression.
+        response = "No compacts found for project 'claude-runway'. " * 100
+        self.assertGreater(len(response), hook.THRESHOLD)
+        payload = {
+            "session_id": "sess-1",
+            "cwd": "/repos/claude-runway",
+            "tool_name": "mcp__local-compress__compact_find",
+            "tool_response": response,
+        }
+        printed = self._run_main(payload)
+        self.assertIn("updatedToolOutput", printed)
+        self.assertEqual(len(self.stub.calls), 1)
+
+    def test_multi_entry_response_under_threshold_is_a_true_noop_either_way(self):
+        # Small multi-entry response: already a no-op via the normal
+        # under-threshold path, but confirms the new header check doesn't
+        # change that outcome (no ledger event either way).
+        response = self._multi_entry_response(2)[:100]
+        payload = {
+            "session_id": "sess-1",
+            "cwd": "/repos/claude-runway",
+            "tool_name": "mcp__local-compress__compact_find",
+            "tool_response": response,
+        }
+        printed = self._run_main(payload)
+        self.assertEqual(printed, "")
+        self.assertEqual(len(self.stub.calls), 0)
+
+
+class CompactFindEntryCountHelper(unittest.TestCase):
+    """Direct unit coverage for _compact_find_entry_count, independent of
+    the full hook dispatch path exercised above."""
+
+    def test_extracts_count_from_header(self):
+        text = "Found 3 compact(s) for project 'foo':\n--- 1. ... ---"
+        self.assertEqual(hook._compact_find_entry_count(text), 3)
+
+    def test_returns_none_when_no_header_present(self):
+        self.assertIsNone(hook._compact_find_entry_count("just some other text"))
+
+    def test_ignores_header_phrase_when_not_at_the_leaf_start(self):
+        # PR #194 review: the header regex must be anchored to the START of
+        # the leaf, not just matched anywhere in it -- otherwise a STORED
+        # compact's own content quoting this exact phrase mid-string (e.g. a
+        # past /my-compact session about debugging this very hook) would be
+        # mistaken for the real leading header. Reproduced live before the
+        # fix: this returned 5, not None.
+        fake = "Some earlier stored compact discusses: Found 5 compact(s) for project 'other':\nmore text"
+        self.assertIsNone(hook._compact_find_entry_count(fake))
+
+    def test_finds_header_nested_in_a_dict_or_list(self):
+        nested = {"content": [{"type": "text", "text": "Found 2 compact(s) for project 'x':\n..."}]}
+        self.assertEqual(hook._compact_find_entry_count(nested), 2)
+
+
 class HandleGenericGroupsBySiblingRecord(unittest.TestCase):
     """Issue #38: sibling records (e.g. WebSearch's `results` list) must be
     compressed independently, not concatenated into one blob whose result

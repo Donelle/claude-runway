@@ -689,6 +689,35 @@ def _finish_compression_outcome(outcome, tool_name, source, session_id, project)
     sys.exit(0)
 
 
+# Matches compact_find's own header verbatim (compress_mcp_server.py:1516):
+# f"Found {len(entries)} compact(s) for project '{project}':\n". Anchored to
+# the START of the leaf (^, no re.MULTILINE, so this only matches the
+# absolute beginning of the string) -- not just anchored to that exact
+# phrasing -- so a STORED compact's own content can never be mistaken for
+# the real header just because it happens to quote the same phrase
+# mid-string (e.g. a past /my-compact session about debugging this very
+# hook). The genuine header is always the first thing compact_find's own
+# "\n".join(lines) call emits, so requiring position 0 costs nothing for
+# the real case while closing that false-match window (PR #194 review).
+_COMPACT_FIND_HEADER_RE = re.compile(r"^Found (\d+) compact\(s\) for project '")
+
+
+def _compact_find_entry_count(tool_response):
+    """Extract N from compact_find's "Found {N} compact(s) for project..."
+    header (issue #193), searching every string leaf of the (possibly
+    nested) tool response via the same _walk_strings used elsewhere in this
+    file. Returns None if no such header is found anywhere -- e.g. an error
+    string ("No compacts found for project..."), some other response shape
+    entirely, or a leaf where the phrase appears but not at that leaf's own
+    start -- which the caller treats as "nothing to special-case, fall
+    through to the ordinary size-based path" rather than as N=0."""
+    for _, s in _walk_strings(tool_response):
+        m = _COMPACT_FIND_HEADER_RE.search(s)
+        if m:
+            return int(m.group(1))
+    return None
+
+
 def _dispatch(payload):
     """Everything main() does after the payload has been parsed off stdin --
     split out so main() can wrap this whole body in one try/except (issue
@@ -733,6 +762,26 @@ def _dispatch(payload):
         bare_tool_name = tool_name[len(MCP_SAVINGS_TOOL_PREFIX):]
         if bare_tool_name in _SELF_COMPRESSING_MCP_TOOLS:
             sys.exit(0)
+        # compact_find's output is structured data /my-resume parses for
+        # control flow (issue #193), not prose to skim: a "Found {N}
+        # compact(s)" header followed by N discrete dated/labeled entries.
+        # /my-resume branches on that count (0 -> tell the user to run
+        # /my-compact, 1 -> restore silently, 2+ -> AskUserQuestion picker
+        # with one option per entry). Generic size-based compression below
+        # collapses all N entries into a single flowing narrative before
+        # /my-resume ever sees discrete entries to count, so the picker
+        # never fires and the merged summary can misrepresent which
+        # entries exist at all. Skip compression outright whenever the
+        # header itself reports more than one entry. A single-entry (or
+        # header-less, e.g. "No compacts found...") response has no
+        # multi-entry structure to lose, so it still gets the ordinary
+        # size-based path below -- preserving issue #25's original intent
+        # that compact_find isn't UNCONDITIONALLY exempt, just exempt when
+        # exemption actually matters.
+        if bare_tool_name == "compact_find":
+            entry_count = _compact_find_entry_count(tool_response)
+            if entry_count is not None and entry_count > 1:
+                sys.exit(0)
         outcome = _handle_generic(tool_response)
         _finish_compression_outcome(outcome, tool_name, tool_name, session_id, project)
 
