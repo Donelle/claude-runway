@@ -120,10 +120,10 @@ Setup:
 Register in .claude/settings.json (see settings.json.template) -- point
 the args path at this script's location in the cloned tools repo, nothing
 needs to be copied into the target project. The full recommended matcher
-is in settings.json.template, which extends the base set below with vetted
-MCP tool allowlists for GitHub (individually vetted against the edit-basis
+is in settings.json.template, which extends the base set below with a vetted
+MCP tool allowlist for GitHub (individually vetted against the edit-basis
 rule -- get_file_contents and get_pull_request_files excluded, see dispatch
-comments below) and Splunk:
+comments below):
 {
   "hooks": {
     "PostToolUse": [
@@ -849,7 +849,7 @@ def _dispatch(payload):
         outcome = _handle_generic(tool_response)
         _finish_compression_outcome(outcome, tool_name, tool_name, session_id, project)
 
-    # Generic MCP tools from other servers (GitHub, Splunk, JIRA, etc.) --
+    # Generic MCP tools from other servers (GitHub, etc.) --
     # NOT mcp__local-compress__, whose path comes first above. All of these
     # go through _handle_generic: the generic walker is schema-agnostic and
     # the dividing line for whether a tool belongs in the matcher at all
