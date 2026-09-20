@@ -1196,8 +1196,13 @@ class CompressCommandOutputDefaultsToRedaction(unittest.TestCase):
         os.environ["CLAUDE_RUNWAY_TEST_SECRET"] = secret
         self.addCleanup(os.environ.pop, "CLAUDE_RUNWAY_TEST_SECRET", None)
 
+        # Read the secret through the current interpreter rather than shell
+        # expansion (`printf "%s" "$VAR"`): compress_command_output runs its
+        # command with shell=True, which is cmd.exe on Windows, where "$VAR"
+        # is never expanded -- the command would print the literal variable
+        # name and this test would fail for a reason unrelated to redaction.
         result = _run(mod.compress_command_output(
-            command='printf "%s" "$CLAUDE_RUNWAY_TEST_SECRET"',
+            command=f'"{sys.executable}" -c "import os; print(os.environ[\'CLAUDE_RUNWAY_TEST_SECRET\'])"',
         ))
         self.assertNotIn(secret, result)
         self.assertIn("credential-shaped value(s) redacted", result)
