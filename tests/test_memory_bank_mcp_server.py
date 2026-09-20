@@ -17,7 +17,7 @@ import os
 import sys
 import unittest
 from contextlib import redirect_stderr
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "libs"))
@@ -81,6 +81,221 @@ class RecallNonexistentCollectionTest(unittest.TestCase):
              patch("memory_bank_mcp_server.FastEmbedProvider") as mock_provider_cls:
             _run(_mbs.recall(query="anything"))
         mock_provider_cls.assert_not_called()
+
+
+class CollectionOverrideRemovedTest(unittest.TestCase):
+    """Regression for issue #188: remember/recall/forget used to accept a
+    caller-controlled `collection` kwarg with no validation, letting a call
+    write/read/delete memory-bank points in a collection other than the one
+    configured via MEMORY_BANK_COLLECTION -- bypassing index_repo/sync_repo's
+    reserved-collection guard, which only ever checks the configured name.
+    The fix removes the parameter entirely rather than validating it, so a
+    caller-supplied `collection` must now be rejected at the call boundary."""
+
+    def test_remember_rejects_collection_kwarg(self):
+        with self.assertRaises(TypeError):
+            _mbs.remember(summary="s", description="d", kind="k", collection="other")
+
+    def test_recall_rejects_collection_kwarg(self):
+        with self.assertRaises(TypeError):
+            _mbs.recall(query="anything", collection="other")
+
+    def test_forget_rejects_collection_kwarg(self):
+        with self.assertRaises(TypeError):
+            _mbs.forget(point_id="some-id", collection="other")
+
+
+class MemoryEventLoggingTest(unittest.TestCase):
+    """Issue #179: remember()/recall() log a memory-events row via
+    memory_events_lib, guarded by its own tracking_enabled() switch --
+    entirely separate from the point_id/description content itself."""
+
+    def test_remember_logs_one_event_when_tracking_enabled(self):
+        with patch("memory_bank_mcp_server.QdrantClient"), \
+             patch("memory_bank_mcp_server.FastEmbedProvider"), \
+             patch.object(_mb, "remember_point", new=AsyncMock(return_value=("new-id", 1700000000.0, None))), \
+             patch.object(_mbs.mev, "tracking_enabled", return_value=True), \
+             patch.object(_mbs.mev, "record_memory_event") as mock_record:
+            result = _run(_mbs.remember(summary="s", description="d", kind="lesson"))
+        self.assertIn("Remembered", result)
+        mock_record.assert_called_once()
+        _, kwargs = mock_record.call_args
+        self.assertEqual(kwargs["event_type"], "remember")
+        self.assertEqual(kwargs["point_id"], "new-id")
+        self.assertEqual(kwargs["kind"], "lesson")
+        # Issue #179, PR #197 review: summary_created_at must be the EXACT
+        # value remember_point stamped/returned, not a re-sampled time.time().
+        self.assertEqual(kwargs["summary_created_at"], 1700000000.0)
+
+    def test_remember_does_not_log_when_tracking_disabled(self):
+        with patch("memory_bank_mcp_server.QdrantClient"), \
+             patch("memory_bank_mcp_server.FastEmbedProvider"), \
+             patch.object(_mb, "remember_point", new=AsyncMock(return_value=("new-id", 1700000000.0, None))), \
+             patch.object(_mbs.mev, "tracking_enabled", return_value=False), \
+             patch.object(_mbs.mev, "record_memory_event") as mock_record:
+            _run(_mbs.remember(summary="s", description="d", kind="lesson"))
+        mock_record.assert_not_called()
+
+    def test_remember_does_not_log_on_embedding_mismatch(self):
+        # A mismatch means nothing was actually written -- there is no real
+        # memory event to log.
+        with patch("memory_bank_mcp_server.QdrantClient"), \
+             patch("memory_bank_mcp_server.FastEmbedProvider"), \
+             patch.object(_mb, "remember_point", new=AsyncMock(return_value=(None, None, "Error: mismatch"))), \
+             patch.object(_mbs.mev, "tracking_enabled", return_value=True), \
+             patch.object(_mbs.mev, "record_memory_event") as mock_record:
+            result = _run(_mbs.remember(summary="s", description="d", kind="lesson"))
+        self.assertIn("Error", result)
+        mock_record.assert_not_called()
+
+    def test_remember_advances_turn_even_on_embedding_mismatch(self):
+        # Regression for PR #197 review: turn must be consumed for every
+        # invocation, including ones that end up not logging anything --
+        # otherwise a later successful call's turn number understates how
+        # many memory-bank calls actually happened this session.
+        with patch("memory_bank_mcp_server.QdrantClient"), \
+             patch("memory_bank_mcp_server.FastEmbedProvider"), \
+             patch.object(_mb, "remember_point", new=AsyncMock(return_value=(None, None, "Error: mismatch"))), \
+             patch.object(_mbs.mev, "tracking_enabled", return_value=True):
+            turn_before = _mbs._next_turn()
+            _run(_mbs.remember(summary="s", description="d", kind="lesson"))
+            turn_after = _mbs._next_turn()
+        # Two _next_turn() calls plus one remember() call in between should
+        # advance the counter by 3 total steps from turn_before to turn_after.
+        self.assertEqual(turn_after, turn_before + 2)
+
+    def _recall_setup(self, results):
+        fake_client = MagicMock()
+        fake_client.collection_exists.return_value = True
+        return patch("memory_bank_mcp_server.QdrantClient", return_value=fake_client), \
+            patch("memory_bank_mcp_server.check_embedding_model_mismatch", return_value=None), \
+            patch("memory_bank_mcp_server.FastEmbedProvider"), \
+            patch.object(_mb, "recall_points", new=AsyncMock(return_value=results))
+
+    def test_recall_logs_one_event_per_hit_sharing_a_turn(self):
+        results = [
+            {"id": "p1", "summary": "s1", "description": "d1", "kind": "lesson", "repo": "proj-a",
+             "embedding_model": "m", "score": 0.9, "created_at": 111.0},
+            {"id": "p2", "summary": "s2", "description": "d2", "kind": "idea", "repo": "proj-a",
+             "embedding_model": "m", "score": 0.8, "created_at": 222.0},
+        ]
+        p1, p2, p3, p4 = self._recall_setup(results)
+        with p1, p2, p3, p4, \
+             patch.object(_mbs.mev, "tracking_enabled", return_value=True), \
+             patch.object(_mbs.mev, "record_memory_event") as mock_record:
+            _run(_mbs.recall(query="anything"))
+        self.assertEqual(mock_record.call_count, 2)
+        calls = mock_record.call_args_list
+        turns = {c.kwargs["turn"] for c in calls}
+        self.assertEqual(len(turns), 1)  # both hits share the same turn
+        self.assertEqual(calls[0].kwargs["event_type"], "recall")
+        self.assertEqual(calls[0].kwargs["point_id"], "p1")
+        self.assertEqual(calls[0].kwargs["summary_created_at"], 111.0)
+        self.assertEqual(calls[1].kwargs["point_id"], "p2")
+
+    def test_recall_does_not_log_when_tracking_disabled(self):
+        results = [{"id": "p1", "summary": "s1", "description": "d1", "kind": "lesson",
+                    "repo": "proj-a", "embedding_model": "m", "score": 0.9, "created_at": 111.0}]
+        p1, p2, p3, p4 = self._recall_setup(results)
+        with p1, p2, p3, p4, \
+             patch.object(_mbs.mev, "tracking_enabled", return_value=False), \
+             patch.object(_mbs.mev, "record_memory_event") as mock_record:
+            _run(_mbs.recall(query="anything"))
+        mock_record.assert_not_called()
+
+    def test_recall_does_not_log_when_no_results(self):
+        p1, p2, p3, p4 = self._recall_setup([])
+        with p1, p2, p3, p4, \
+             patch.object(_mbs.mev, "tracking_enabled", return_value=True), \
+             patch.object(_mbs.mev, "record_memory_event") as mock_record:
+            _run(_mbs.recall(query="anything"))
+        mock_record.assert_not_called()
+
+    def test_recall_advances_turn_even_when_no_results(self):
+        # Regression for PR #197 review: an empty recall still consumed a
+        # turn number -- it was a real memory-bank call, even though nothing
+        # gets logged for it.
+        p1, p2, p3, p4 = self._recall_setup([])
+        with p1, p2, p3, p4, \
+             patch.object(_mbs.mev, "tracking_enabled", return_value=True):
+            turn_before = _mbs._next_turn()
+            _run(_mbs.recall(query="anything"))
+            turn_after = _mbs._next_turn()
+        self.assertEqual(turn_after, turn_before + 2)
+
+
+class RememberWeightValidationTest(unittest.TestCase):
+    """PR #199 review: a negative weight actively breaks recall_points'
+    ranking invariant (weight=0 must be a true floor, weight>1 must only
+    ever boost -- both assume weight>=0), so it's rejected at the tool
+    boundary before any Qdrant/embedding-provider work happens."""
+
+    def test_negative_weight_rejected_without_constructing_client(self):
+        with patch("memory_bank_mcp_server.QdrantClient") as mock_client_cls, \
+             patch("memory_bank_mcp_server.FastEmbedProvider") as mock_provider_cls, \
+             patch.object(_mb, "remember_point") as mock_remember:
+            result = _run(_mbs.remember(summary="s", description="d", kind="lesson", weight=-1.0))
+        self.assertIn("Error", result)
+        mock_client_cls.assert_not_called()
+        mock_provider_cls.assert_not_called()
+        mock_remember.assert_not_called()
+
+    def test_positive_infinity_weight_rejected(self):
+        # Regression for PR #199 review (second pass): float("inf") < 0 is
+        # False in Python, so `inf` (reachable from ordinary JSON-RPC input,
+        # e.g. the JSON literal 1e999 parses to inf) silently bypassed a
+        # `weight < 0`-only check -- it must be caught by a finiteness check
+        # too, not just negativity.
+        with patch("memory_bank_mcp_server.QdrantClient") as mock_client_cls, \
+             patch.object(_mb, "remember_point") as mock_remember:
+            result = _run(_mbs.remember(summary="s", description="d", kind="lesson", weight=float("inf")))
+        self.assertIn("Error", result)
+        mock_client_cls.assert_not_called()
+        mock_remember.assert_not_called()
+
+    def test_nan_weight_rejected(self):
+        # Regression for PR #199 review (second pass): float("nan") < 0 is
+        # ALSO False in Python (every comparison with NaN is False), so NaN
+        # silently bypassed a `weight < 0`-only check too, and would have
+        # made sort() ordering in recall_points undefined.
+        with patch("memory_bank_mcp_server.QdrantClient") as mock_client_cls, \
+             patch.object(_mb, "remember_point") as mock_remember:
+            result = _run(_mbs.remember(summary="s", description="d", kind="lesson", weight=float("nan")))
+        self.assertIn("Error", result)
+        mock_client_cls.assert_not_called()
+        mock_remember.assert_not_called()
+
+    def test_zero_weight_is_allowed(self):
+        with patch("memory_bank_mcp_server.QdrantClient"), \
+             patch("memory_bank_mcp_server.FastEmbedProvider"), \
+             patch.object(_mb, "remember_point", new=AsyncMock(return_value=("new-id", 1700000000.0, None))):
+            result = _run(_mbs.remember(summary="s", description="d", kind="lesson", weight=0.0))
+        self.assertIn("Remembered", result)
+
+
+class RememberWeightPassthroughTest(unittest.TestCase):
+    """Issue #177: remember()'s weight param must reach mb.remember_point
+    unchanged, defaulting to mb.DEFAULT_WEIGHT (1.0) when not given."""
+
+    def test_default_weight_passed_through(self):
+        with patch("memory_bank_mcp_server.QdrantClient"), \
+             patch("memory_bank_mcp_server.FastEmbedProvider"), \
+             patch.object(_mb, "remember_point", new=AsyncMock(return_value=("new-id", 1700000000.0, None))) as mock_remember, \
+             patch.object(_mbs.mev, "tracking_enabled", return_value=False):
+            result = _run(_mbs.remember(summary="s", description="d", kind="lesson"))
+        _, kwargs = mock_remember.call_args
+        self.assertEqual(kwargs["weight"], _mb.DEFAULT_WEIGHT)
+        self.assertIn(f"weight={_mb.DEFAULT_WEIGHT}", result)
+
+    def test_explicit_weight_passed_through(self):
+        with patch("memory_bank_mcp_server.QdrantClient"), \
+             patch("memory_bank_mcp_server.FastEmbedProvider"), \
+             patch.object(_mb, "remember_point", new=AsyncMock(return_value=("new-id", 1700000000.0, None))) as mock_remember, \
+             patch.object(_mbs.mev, "tracking_enabled", return_value=False):
+            result = _run(_mbs.remember(summary="s", description="d", kind="lesson", weight=2.0))
+        _, kwargs = mock_remember.call_args
+        self.assertEqual(kwargs["weight"], 2.0)
+        self.assertIn("weight=2.0", result)
 
 
 class ToolRegistrationTest(unittest.TestCase):

@@ -85,6 +85,33 @@ class PyprojectTomlIsWellFormed(unittest.TestCase):
             self.assertIn(expected, deps)
         self.assertNotIn("compress", self.data["project"].get("optional-dependencies", {}))
 
+    def test_memory_bank_files_are_present_in_declared_packages(self):
+        # Issue #182: the memory-bank MCP server (tools/memory_bank_mcp_server.py,
+        # backed by libs/memory_bank_lib.py and libs/memory_events_lib.py --
+        # added later than this file, in issue #175/PR #178) must ship in a
+        # pip-installed package the same way ingest_mcp_server.py/
+        # compress_mcp_server.py already do. setuptools packages by whole
+        # DIRECTORY here (see the [tool.setuptools] comment block above),
+        # not by an explicit file list, so there's no per-file declaration
+        # that could omit these -- confirmed directly by building a real
+        # wheel and inspecting its contents during this issue's own testing.
+        # This test pins that fact against the files actually on disk, so a
+        # future change to `packages` (e.g. narrowing it, or moving these
+        # files out of tools/libs) can't silently drop the memory-bank
+        # server from a real wheel again without failing here first.
+        packages = set(self.data["tool"]["setuptools"]["packages"])
+        for rel_path in (
+            "tools/memory_bank_mcp_server.py",
+            "libs/memory_bank_lib.py",
+            "libs/memory_events_lib.py",
+        ):
+            package_dir, _, _filename = rel_path.partition("/")
+            self.assertIn(package_dir, packages)
+            self.assertTrue(
+                os.path.isfile(os.path.join(REPO_ROOT, rel_path)),
+                f"{rel_path} missing on disk",
+            )
+
     def test_pathspec_is_base_not_optional(self):
         # PR #136 review (Copilot), second round: same class of finding as
         # the compress trio above, but security-relevant rather than just a
