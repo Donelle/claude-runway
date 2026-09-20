@@ -25,6 +25,7 @@ Each piece works independently — you don't need LM Studio to use the Qdrant me
 - [Session continuity skills](docs/session-continuity.md)
 - [Savings tracker](docs/savings-tracker.md)
 - [Development workflow for this repo](docs/development-workflow.md)
+- [EVALUATION.md](EVALUATION.md) — measuring whether this actually reduces token usage
 - [Known limitations](#known-limitations)
 
 ## Files (27)
