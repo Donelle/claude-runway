@@ -224,6 +224,80 @@ class MemoryEventLoggingTest(unittest.TestCase):
         self.assertEqual(turn_after, turn_before + 2)
 
 
+class RememberWeightValidationTest(unittest.TestCase):
+    """PR #199 review: a negative weight actively breaks recall_points'
+    ranking invariant (weight=0 must be a true floor, weight>1 must only
+    ever boost -- both assume weight>=0), so it's rejected at the tool
+    boundary before any Qdrant/embedding-provider work happens."""
+
+    def test_negative_weight_rejected_without_constructing_client(self):
+        with patch("memory_bank_mcp_server.QdrantClient") as mock_client_cls, \
+             patch("memory_bank_mcp_server.FastEmbedProvider") as mock_provider_cls, \
+             patch.object(_mb, "remember_point") as mock_remember:
+            result = _run(_mbs.remember(summary="s", description="d", kind="lesson", weight=-1.0))
+        self.assertIn("Error", result)
+        mock_client_cls.assert_not_called()
+        mock_provider_cls.assert_not_called()
+        mock_remember.assert_not_called()
+
+    def test_positive_infinity_weight_rejected(self):
+        # Regression for PR #199 review (second pass): float("inf") < 0 is
+        # False in Python, so `inf` (reachable from ordinary JSON-RPC input,
+        # e.g. the JSON literal 1e999 parses to inf) silently bypassed a
+        # `weight < 0`-only check -- it must be caught by a finiteness check
+        # too, not just negativity.
+        with patch("memory_bank_mcp_server.QdrantClient") as mock_client_cls, \
+             patch.object(_mb, "remember_point") as mock_remember:
+            result = _run(_mbs.remember(summary="s", description="d", kind="lesson", weight=float("inf")))
+        self.assertIn("Error", result)
+        mock_client_cls.assert_not_called()
+        mock_remember.assert_not_called()
+
+    def test_nan_weight_rejected(self):
+        # Regression for PR #199 review (second pass): float("nan") < 0 is
+        # ALSO False in Python (every comparison with NaN is False), so NaN
+        # silently bypassed a `weight < 0`-only check too, and would have
+        # made sort() ordering in recall_points undefined.
+        with patch("memory_bank_mcp_server.QdrantClient") as mock_client_cls, \
+             patch.object(_mb, "remember_point") as mock_remember:
+            result = _run(_mbs.remember(summary="s", description="d", kind="lesson", weight=float("nan")))
+        self.assertIn("Error", result)
+        mock_client_cls.assert_not_called()
+        mock_remember.assert_not_called()
+
+    def test_zero_weight_is_allowed(self):
+        with patch("memory_bank_mcp_server.QdrantClient"), \
+             patch("memory_bank_mcp_server.FastEmbedProvider"), \
+             patch.object(_mb, "remember_point", new=AsyncMock(return_value=("new-id", 1700000000.0, None))):
+            result = _run(_mbs.remember(summary="s", description="d", kind="lesson", weight=0.0))
+        self.assertIn("Remembered", result)
+
+
+class RememberWeightPassthroughTest(unittest.TestCase):
+    """Issue #177: remember()'s weight param must reach mb.remember_point
+    unchanged, defaulting to mb.DEFAULT_WEIGHT (1.0) when not given."""
+
+    def test_default_weight_passed_through(self):
+        with patch("memory_bank_mcp_server.QdrantClient"), \
+             patch("memory_bank_mcp_server.FastEmbedProvider"), \
+             patch.object(_mb, "remember_point", new=AsyncMock(return_value=("new-id", 1700000000.0, None))) as mock_remember, \
+             patch.object(_mbs.mev, "tracking_enabled", return_value=False):
+            result = _run(_mbs.remember(summary="s", description="d", kind="lesson"))
+        _, kwargs = mock_remember.call_args
+        self.assertEqual(kwargs["weight"], _mb.DEFAULT_WEIGHT)
+        self.assertIn(f"weight={_mb.DEFAULT_WEIGHT}", result)
+
+    def test_explicit_weight_passed_through(self):
+        with patch("memory_bank_mcp_server.QdrantClient"), \
+             patch("memory_bank_mcp_server.FastEmbedProvider"), \
+             patch.object(_mb, "remember_point", new=AsyncMock(return_value=("new-id", 1700000000.0, None))) as mock_remember, \
+             patch.object(_mbs.mev, "tracking_enabled", return_value=False):
+            result = _run(_mbs.remember(summary="s", description="d", kind="lesson", weight=2.0))
+        _, kwargs = mock_remember.call_args
+        self.assertEqual(kwargs["weight"], 2.0)
+        self.assertIn("weight=2.0", result)
+
+
 class ToolRegistrationTest(unittest.TestCase):
     def test_registers_exactly_three_tools(self):
         from mcp_tool_introspect import tool_count

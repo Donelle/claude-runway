@@ -29,6 +29,7 @@ progress and results must be returned as tool output, not printed.
 
 import itertools
 import json
+import math
 import os
 import sys
 import uuid
@@ -115,6 +116,7 @@ async def remember(
     description: str,
     kind: str,
     general: bool = False,
+    weight: float = mb.DEFAULT_WEIGHT,
     ctx: Context = None,  # type: ignore[assignment]
 ) -> str:
     """
@@ -138,6 +140,13 @@ async def remember(
     every project," "remember this across all repos." Default False (scoped
     to this project) otherwise; don't infer general=True from the content
     alone, only from an explicit signal like that.
+    weight: a static, FINITE, NONNEGATIVE quality multiplier (default 1.0, a
+    true no-op) `recall` uses to re-rank hits instead of raw similarity
+    alone -- infinite/NaN/negative values are rejected outright. Use a value
+    >1.0 to boost a known-good memory above equally-similar competitors, or
+    0.0 to de-emphasize a stale/superseded one without deleting it. There is
+    no separate "update weight" tool -- to change it later, `forget` the
+    point and `remember` it again.
     """
     # turn is captured HERE, unconditionally, before any of the fallible
     # steps below (repo resolution, the actual write) -- PR #197 review: a
@@ -149,6 +158,28 @@ async def remember(
     # attempt, not just the ones that end up logged.
     tracking = mev.tracking_enabled()
     turn = _next_turn() if tracking else None
+
+    # Rejected here, at the tool boundary, same as recall()'s `limit < 1`
+    # check below -- before resolve_repo/QdrantClient/embedding provider, so
+    # an invalid weight never pays for any of that (PR #199 review): a
+    # negative weight isn't just "unusual," it actively BREAKS the ranking
+    # invariant recall_points' effective_score depends on (weight=0 must be
+    # a true floor, weight>1 must only ever boost -- both assume weight>=0).
+    #
+    # `math.isfinite(weight)` is checked FIRST, not just `weight < 0` (PR
+    # #199 review, second pass): `float("inf") < 0` and `float("nan") < 0`
+    # are both False in Python, so `inf`/`nan` (both reachable from ordinary
+    # JSON-RPC numeric input -- e.g. the JSON literal `1e999` parses to
+    # `inf`) silently passed the negativity check alone. `inf` would then
+    # make every future recall's effective_score infinite (and
+    # `json.dumps(..., allow_nan=True)`'s default emits the non-standard
+    # `Infinity`/`NaN` tokens for it -- not valid per the JSON spec, and not
+    # every consumer's parser accepts them), and `nan` makes `sort()`
+    # comparisons undefined (confirmed: `nan < x` and `nan > x` are both
+    # always False, so a `nan`-weighted hit's position among other hits
+    # depends on sort implementation detail, not a real ranking).
+    if not math.isfinite(weight) or weight < 0:
+        return f"Error: weight must be a finite number 0 or greater (got {weight})."
 
     collection = DEFAULT_MEMORY_BANK_COLLECTION
     repo, error = mb.resolve_repo(DEFAULT_MEMORY_BANK_ID, general)
@@ -165,7 +196,7 @@ async def remember(
     point_id, created_at, mismatch = await mb.remember_point(
         client, embedding_provider, collection,
         summary=summary, description=description, kind=kind,
-        repo=repo, embedding_model=DEFAULT_EMBEDDING_MODEL,
+        repo=repo, embedding_model=DEFAULT_EMBEDDING_MODEL, weight=weight,
     )
     if mismatch:
         return mismatch
@@ -188,7 +219,7 @@ async def remember(
             project=DEFAULT_MEMORY_BANK_ID,
             turn=turn,
         )
-    return f"Remembered (id={point_id}, repo='{repo}', kind='{kind}')."
+    return f"Remembered (id={point_id}, repo='{repo}', kind='{kind}', weight={weight})."
 
 
 @mcp.tool()
@@ -215,6 +246,14 @@ async def recall(
     automatic cross-repo discovery was rejected).
 
     kind narrows further if given. limit caps how many hits come back.
+
+    Results are ranked by `effective_score` (raw similarity rescaled to a
+    nonnegative scale, then multiplied by `weight`), not raw similarity alone
+    (issue #177) -- a memory `remember`ed with a
+    higher `weight` can outrank a more similarly-worded but lower-weight
+    (or stale/superseded) one. Each result includes both `score` (raw
+    similarity) and `effective_score` (what ranking actually used) so this
+    is inspectable, not hidden.
     """
     # Captured HERE, unconditionally, for the same reason remember() above
     # does (PR #197 review): turn must count every recall() INVOCATION --

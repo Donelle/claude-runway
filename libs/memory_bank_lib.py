@@ -74,8 +74,65 @@ REPO_FIELD = "metadata.repo"
 EMBEDDING_MODEL_FIELD = "metadata.embedding_model"
 CREATED_AT_FIELD = "metadata.created_at"
 PENDING_FIELD = "metadata.pending"
+WEIGHT_FIELD = "metadata.weight"
 
 MEMORY_BANK_SOURCE = "memory-bank"
+
+# Default weight for a point with no metadata.weight at all (issue #177) --
+# either a point written before this field existed, or one explicitly
+# remembered with weight=1.0 (the default). Multiplicative against
+# NORMALIZED similarity (see _normalize_similarity below, PR #199 review --
+# the multiplier is applied to a rescaled [0, 1] value, not the raw score
+# directly), so this value is specifically chosen to be a true no-op:
+# 1.0 preserves today's plain-similarity ORDERING exactly (it's a constant
+# scale factor across every hit), though NOT the raw score's numeric value --
+# effective_score is normalized_similarity * weight, never equal to the raw
+# score itself, even at weight=1.0.
+DEFAULT_WEIGHT = 1.0
+
+# recall_points over-fetches this many times `limit` from query_points BEFORE
+# applying the weight multiplier and truncating (issue #177) -- re-ranking by
+# effective_score = normalize_similarity(raw_score) * weight (PR #199
+# review -- NOT raw_score * weight directly, see _normalize_similarity's
+# docstring for why) has to happen against a wider raw-similarity pool than
+# the final `limit`, or a genuinely high-weight but lower-raw-similarity
+# match could get cut by Qdrant's own similarity-only ordering before
+# re-ranking ever sees it. 3x is a fixed implementation choice (the ticket
+# calls out the two-stage SHAPE -- fetch pool, re-rank, truncate -- as the
+# spec decision, not this exact multiplier).
+_RECALL_OVERFETCH_MULTIPLIER = 3
+
+
+def _normalize_similarity(raw_score: float) -> float:
+    """
+    Rescales a raw cosine similarity (mathematically ranged [-1, 1], though
+    Qdrant's own configured Distance.COSINE metric is what recall_points
+    actually queries against) to a nonnegative [0, 1] scale BEFORE it's
+    multiplied by `weight` (PR #199 review, issue #177's own implementation).
+
+    Cosine similarity is not restricted to nonnegative values -- multiplying
+    a NEGATIVE raw score by `weight` directly would invert the documented
+    weight semantics: a `weight=0` memory (meant to be de-emphasized to the
+    bottom) with a negative raw score (e.g. score=-0.8) would compute
+    effective_score=(-0.8 * 0)=0, which can rank ABOVE a normal `weight=1`
+    memory with a LESS-negative raw score (e.g. score=-0.1,
+    effective_score=-0.1*1=-0.1) -- exactly backwards from "de-emphasized."
+    The same inversion applies to `weight>1`: it would DEMOTE (push more
+    negative) rather than boost a negative-score hit. Confirmed reproducible
+    with exactly these numbers, not just a theoretical concern.
+
+    Rescaling to [0, 1] first closes both: `weight=0` now always floors to
+    EXACTLY 0 regardless of the raw score's sign, and `weight>1` always
+    boosts (never demotes) since the rescaled value is never negative.
+    `min`/`max`-clamped defensively against float-precision spillover just
+    outside [-1, 1] (e.g. a raw score of 1.0000000002), not because Qdrant is
+    expected to return one.
+
+    This is an internal ranking mechanism only -- the `score` field in a
+    recall_points hit dict stays the RAW, un-rescaled similarity Qdrant
+    returned (unchanged meaning, see recall_points' own docstring for why).
+    """
+    return max(0.0, min(1.0, (raw_score + 1.0) / 2.0))
 
 # Reserved metadata.repo value for knowledge that isn't tied to any one
 # project -- set via remember(general=True). Collides, in principle, with a
@@ -291,11 +348,22 @@ async def remember_point(
     kind: str,
     repo: str,
     embedding_model: str,
+    weight: float = DEFAULT_WEIGHT,
 ) -> tuple:
     """
     Embeds `summary` (the only text actually searched) and stores it
     alongside `description` (verbatim, payload-only, never embedded) and the
     tool-set `source`/`repo`/`embedding_model` metadata.
+
+    `weight` (issue #177) is a static, caller-supplied quality multiplier --
+    `recall_points` re-ranks by `effective_score = normalized_similarity *
+    weight` (see `_normalize_similarity`'s docstring for why raw similarity
+    is rescaled to a nonnegative domain first, not multiplied directly)
+    instead of raw similarity alone, so a stale or superseded memory doesn't
+    outrank a more trustworthy one purely by having more similar wording.
+    Stored verbatim in `metadata.weight`; a point with no such field at all
+    (written before this change) is treated as `weight=1.0` at read time by
+    `recall_points` -- a true no-op, not a behavior change for existing data.
 
     Returns `(point_id, created_at, None)` on success, or
     `(None, None, error_message)` if `ensure_collection` finds this
@@ -374,6 +442,7 @@ async def remember_point(
                         "description": description,
                         "repo": repo,
                         "embedding_model": embedding_model,
+                        "weight": weight,
                         "pending": True,
                     },
                 },
@@ -430,34 +499,63 @@ async def recall_points(
     Searches `summary` vectors, always scoped to `metadata.source ==
     "memory-bank"`, plus the repo/kind narrowing `_scope_filter` builds.
     Returns a list of dicts: id/summary/description/kind/repo/
-    embedding_model/score/created_at. Returns [] (not an error) when the
-    collection doesn't exist yet -- an empty memory bank is a normal,
-    expected state, not a failure.
+    embedding_model/score/weight/effective_score/created_at, sorted by
+    `effective_score` descending and truncated to `limit`. Returns [] (not an
+    error) when the collection doesn't exist yet -- an empty memory bank is a
+    normal, expected state, not a failure.
 
     `created_at` (issue #179) is the point's own `metadata.created_at`
     (a float `time.time()` value stamped by `remember_point`, or None for a
     legacy point written before that field existed) -- included so a caller
     logging a memory-events row for this hit can denormalize the memory's
     real creation time without a second Qdrant round trip.
+
+    `weight`/`effective_score` (issue #177): `score` stays the RAW cosine
+    similarity Qdrant returned (unchanged meaning, for backward compat with
+    any existing caller reading it) -- `effective_score` is what re-ranking
+    and truncation actually use, so raw similarity alone can't tell "most
+    trustworthy" from "most similar wording." A point with no `metadata.weight`
+    (written before this field existed) is treated as `weight=1.0`, a true
+    no-op for ORDERING purposes among other default-weight hits (PR #199
+    review, third pass: NOT a no-op against the raw score's own numeric
+    value -- `effective_score` is always `_normalize_similarity(score) *
+    weight`, below, so it never literally equals the raw `score`, even at
+    weight=1.0; only the relative ranking among equally-weighted hits is
+    preserved, since rescaling is monotonic). `query_points` itself is asked
+    for `limit * _RECALL_OVERFETCH_MULTIPLIER` candidates, not just `limit`
+    -- re-ranking against only `limit` raw-similarity hits could never let a
+    high-weight-but-lower-raw-similarity match rise above one Qdrant's own
+    similarity-only ordering already cut before re-ranking saw it.
+
+    `effective_score` is computed from `_normalize_similarity(score) * weight`,
+    NOT `score * weight` directly (PR #199 review) -- see that function's
+    docstring for why multiplying a possibly-negative raw cosine similarity
+    by `weight` directly would invert the documented weight semantics
+    (a `weight=0` memory could rank ABOVE a normal one).
     """
     if not call_with_retry(client.collection_exists, collection):
         return []
     vector_name = embedding_provider.get_vector_name()
     query_vector = await embedding_provider.embed_query(query)
     query_filter = _scope_filter(caller_repo, repo, all_repos, kind)
+    fetch_limit = limit * _RECALL_OVERFETCH_MULTIPLIER
     response = call_with_retry(
         client.query_points,
         collection_name=collection,
         query=query_vector,
         using=vector_name,
         query_filter=query_filter,
-        limit=limit,
+        limit=fetch_limit,
         with_payload=True,
     )
     results = []
     for point in response.points:
         payload = point.payload or {}
         meta = payload.get("metadata") or {}
+        weight = meta.get("weight")
+        if weight is None:
+            weight = DEFAULT_WEIGHT
+        score = point.score
         results.append(
             {
                 "id": point.id,
@@ -466,11 +564,14 @@ async def recall_points(
                 "kind": meta.get("kind"),
                 "repo": meta.get("repo"),
                 "embedding_model": meta.get("embedding_model"),
-                "score": point.score,
+                "score": score,
+                "weight": weight,
+                "effective_score": _normalize_similarity(score) * weight,
                 "created_at": meta.get("created_at"),
             }
         )
-    return results
+    results.sort(key=lambda r: r["effective_score"], reverse=True)
+    return results[:limit]
 
 
 def count_memory_bank_points(client: "QdrantClient", collection: str, repo: Optional[str] = None) -> int:
