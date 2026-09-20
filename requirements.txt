@@ -1,5 +1,9 @@
 # Core -- required for the Qdrant codebase-memory piece (ingest_to_qdrant.py,
-# ingest_mcp_server.py). Install these even if you're not using local-compress.
+# ingest_mcp_server.py) and the memory-bank piece (tools/memory_bank_mcp_server.py,
+# issue #175) -- memory-bank reuses this same Qdrant client machinery (mcp,
+# mcp-server-qdrant's FastEmbedProvider, qdrant-client), so no separate
+# dependency section is needed for it. Install these even if you're not using
+# local-compress.
 #
 # Issue #98: both ingest_mcp_server.py and compress_mcp_server.py have been
 # migrated from `mcp.server.fastmcp.FastMCP` (removed in mcp==2.0.0) to
