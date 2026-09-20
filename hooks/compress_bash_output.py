@@ -144,6 +144,11 @@ comments below) and Splunk:
 Env vars (same names local_compress_lib.py / compress_mcp_server.py use):
     CLAUDE_RUNWAY_LMSTUDIO_URL, CLAUDE_RUNWAY_LMSTUDIO_MODEL,
     CLAUDE_RUNWAY_COMPRESS_THRESHOLD_CHARS (default 2000),
+    CLAUDE_RUNWAY_EXTRA_EXACT_PATTERNS (optional, default unset -- semicolon-
+    separated regex patterns a project can add ON TOP OF the built-in
+    exactness-critical list below, e.g. for an internal CLI whose output must
+    stay byte-exact; see the _EXTRA_EXACT_PATTERNS block for matching
+    semantics and issue #192),
     CLAUDE_RUNWAY_TRACK_SAVINGS (opt-in savings tracker, off by default -- see
     libs/savings_ledger.py), CLAUDE_RUNWAY_SAVINGS_DB (optional override of
     the savings DB's location; must match the value set in compress_mcp_server.py's
@@ -385,6 +390,61 @@ _EXACT_FLAG_RE = re.compile(
 # also matches how it's documented and how a real shell comment behaves.
 _FORCE_COMPRESS_RE = re.compile(r"#\s*compress-ok\s*\Z")
 
+# --- Project-level extra exactness-critical patterns (issue #192) ----------
+#
+# hooks/compress_bash_output.py is shared across every project that installs
+# this toolkit -- each project's .claude/settings.json points at the SAME
+# cloned copy by absolute path (see docs/installation.md). A project with its
+# own domain-specific command whose output must stay byte-exact (an internal
+# CLI, a custom script returning an exact hash/ID) had no way to exempt it
+# without editing this shared file directly, which would change behavior for
+# every OTHER project pointing at the same clone. This env var is the
+# per-project override channel -- same shell-only pattern already used for
+# CLAUDE_RUNWAY_COMPRESS_THRESHOLD_CHARS above, since hooks have no `.mcp.json`
+# env block to read from.
+#
+# Additive only, deliberately: there is no matching "disable a builtin
+# pattern" knob. A project silently un-exempting git/wc/etc. would reintroduce
+# the exact lossy-git bug class this whole file exists to prevent (see the
+# bug-history comment above _EXACT_CMDS). CLAUDE_RUNWAY_EXTRA_EXACT_PATTERNS
+# can only ADD to _is_exactness_critical()'s check, never remove from it.
+#
+# Matched ANYWHERE in a segment -- like _EXACT_FLAG_RE, not the start-anchored
+# _EXACT_CMD_RE -- because the anywhere-matched form has no blind spot for a
+# `VAR=$(...)` wrapper (see the `gh api` addition's comment above, issue #190),
+# and a project adding its own pattern is far more likely to want "this
+# command anywhere in the pipeline" than the narrower start-of-segment
+# semantics the builtin command list uses.
+#
+# Patterns are semicolon-separated, not comma-separated like this repo's other
+# multi-value env vars (e.g. INDEX_EXCLUDE_DIRS) -- a regex quantifier like
+# `{2,4}` is a realistic pattern here in a way a literal semicolon in a regex
+# is not, so comma would silently mis-split a legitimate pattern.
+#
+# Fails open PER-PATTERN, not all-or-nothing: a typo in pattern 2 of 3 must
+# not silently disable patterns 1 and 3 too. Each invalid pattern is skipped
+# and reported on stderr -- the same fail-open precedent as the ImportError
+# and stale-env-var paths above -- never crashes the hook or blocks Bash.
+def _compile_extra_exact_patterns():
+    raw = os.environ.get("CLAUDE_RUNWAY_EXTRA_EXACT_PATTERNS", "")
+    compiled = []
+    for piece in raw.split(";"):
+        pattern = piece.strip()
+        if not pattern:
+            continue
+        try:
+            compiled.append(re.compile(pattern))
+        except re.error as e:
+            print(
+                f"compress_bash_output.py: skipping invalid "
+                f"CLAUDE_RUNWAY_EXTRA_EXACT_PATTERNS entry {pattern!r}: {e}",
+                file=sys.stderr,
+            )
+    return compiled
+
+
+_EXTRA_EXACT_PATTERNS = _compile_extra_exact_patterns()
+
 
 def _is_exactness_critical(command: str) -> bool:
     """True if any segment of a (possibly compound) Bash command produces
@@ -398,7 +458,11 @@ def _is_exactness_critical(command: str) -> bool:
         return False
     for segment in re.split(r"\|\||&&|[;|\n]", command):
         segment = segment.strip()
-        if segment and (_EXACT_CMD_RE.match(segment) or _EXACT_FLAG_RE.search(segment)):
+        if not segment:
+            continue
+        if _EXACT_CMD_RE.match(segment) or _EXACT_FLAG_RE.search(segment):
+            return True
+        if any(extra.search(segment) for extra in _EXTRA_EXACT_PATTERNS):
             return True
     return False
 
