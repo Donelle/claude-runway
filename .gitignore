@@ -14,6 +14,4 @@ dist/
 # absolute paths, so it is not portable to another clone.
 .mcp.json
 .plans/
-.ai-docs/
-.claude/
 CLAUDE.md
