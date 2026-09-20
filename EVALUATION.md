@@ -152,7 +152,7 @@ Whether C1 shows a win depends on conversation length — short conversations ma
 
 Without any compaction workflow, the alternative to a long session is abandoning context entirely and paying to re-establish it — re-reading key files, re-exploring the codebase, re-asking questions already answered. `/my-resume` amortizes that re-establishment cost.
 
-This comparison is harder to measure precisely because "re-establishing context from scratch" isn't a repeatable, fixed-cost operation — it depends on the task and how much the developer remembers. A practical proxy: measure the token cost of the first 3-5 turns of a fresh session (with `/my-load-context` as a stand-in for natural re-exploration) vs. the cost of `/my-resume` alone.
+This comparison is harder to measure precisely because "re-establishing context from scratch" isn't a repeatable, fixed-cost operation — it depends on the task and how much the developer remembers. A practical proxy: measure the token cost of the first 3-5 turns of a fresh session (with `/my-gh-load-context` as a stand-in for natural re-exploration) vs. the cost of `/my-resume` alone.
 
 ### Step C1: Build a benchmark scenario
 

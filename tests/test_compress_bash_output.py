@@ -850,7 +850,7 @@ class MainFailsOpenOnUnexpectedException(unittest.TestCase):
 
 class MainHandlesGenericMcpTools(unittest.TestCase):
     """Issue #63: MCP tools from servers other than local-compress (e.g.
-    mcp__github__search_code, mcp__claude_ai_Splunk__*) must go through
+    mcp__github__search_code) must go through
     _handle_generic when included in the matcher -- large responses get
     compressed, small ones are left untouched. The dispatch path is the
     new `if tool_name.startswith("mcp__"):` branch in _dispatch(), which
@@ -921,28 +921,6 @@ class MainHandlesGenericMcpTools(unittest.TestCase):
         # No hookSpecificOutput at all -- genuine under-threshold no-op.
         self.assertEqual(printed, "")
         self.assertEqual(len(self.stub.calls), 0)
-
-    def test_large_splunk_search_result_gets_compressed(self):
-        # mcp__claude_ai_Splunk__search_datadog_logs returns rows of log
-        # events -- read for gist (did the deploy succeed? any errors?),
-        # never used as a byte-exact source to edit from.
-        # Sized to guarantee the aggregate is over THRESHOLD regardless of
-        # the configured value (CLAUDE_RUNWAY_COMPRESS_THRESHOLD_CHARS can
-        # override the 2000 default -- this repo's dogfood shell sets 4000).
-        line_count = hook.THRESHOLD // 50 + 10
-        big_log = "\n".join(
-            f"2025-01-01T00:00:00Z level=info msg=SPLUNK_LOG_LINE_{i} " + "x" * 40
-            for i in range(line_count)
-        )
-        self.assertGreater(len(big_log), hook.THRESHOLD)
-        payload = {
-            "session_id": "sess-1",
-            "cwd": "/repos/my-project",
-            "tool_name": "mcp__claude_ai_Splunk__search_datadog_logs",
-            "tool_response": big_log,
-        }
-        printed = self._run_main(payload)
-        self.assertIn("updatedToolOutput", printed)
 
     def test_github_search_code_savings_event_recorded(self):
         # Confirms the generic mcp__ path records a savings event via
