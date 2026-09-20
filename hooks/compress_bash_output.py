@@ -346,6 +346,31 @@ _EXACT_FLAG_RE = re.compile(
     # same reasoning as --version. Bundled forms (`ls -lh`) deliberately don't
     # match; only a standalone -h does.
     r"|--help\b|\s-h(?:\s|$)"
+    # `gh api` (REST or GraphQL) always returns structured JSON meant to be
+    # parsed field-by-field -- an exact ID substituted into a follow-up call,
+    # or a comment/review body read verbatim to decide what to reply to or
+    # fix -- never prose to skim. Same rationale as the `jq|yq` command
+    # exemption above, just reached through `gh` instead of a literal pipe to
+    # the `jq` binary (issue #190).
+    #
+    # Matched ANYWHERE rather than as a start-of-segment command (like
+    # `jq|yq`) on purpose: the real call sites in this repo's own skills wrap
+    # it in shell command substitution, e.g.
+    #   COMMENT_IDS=$(gh api repos/.../pulls/<PR>/comments --paginate --jq "...")
+    # A start-anchored match can't see past that `VAR=$(...)` wrapper, since
+    # the leading-assignment sub-pattern only accepts a quoted string or a
+    # whitespace-free token as the assigned value -- verified directly before
+    # picking this approach, a start-anchored `gh\s+api` addition matched the
+    # bare form but returned False on this exact wrapped form.
+    #
+    # Also deliberately broader than gating on `--jq`/`graphql` specifically:
+    # issue #190's own suggested fix (those two flags only) was verified
+    # incomplete before implementing -- this repo's `my-gh-pr-feedback` skill
+    # calls `gh api .../comments --paginate` with neither flag at all, so a
+    # narrower fix would have left that skill's primary feedback-fetch step
+    # exactly as exposed as before. One `gh api` match covers all three real
+    # shapes (plain, `--jq`-filtered, and `graphql`) plus any future one.
+    r"|\bgh\s+api\b"
 )
 
 # Escape hatch: a genuinely large exempt output (a 5MB `git diff`) can opt back

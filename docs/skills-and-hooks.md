@@ -24,8 +24,11 @@ The same "is this output the exact basis for what happens next" question gets as
 | `env`, `printenv`, `jq`, `yq`, `pip freeze`, `npm ls`, `base64`, `openssl`, `xxd`, `od` | `grep -c` (and bundled forms like `grep -rc`) |
 | | `--dry-run` (a preview's output *is* the exact planned action) |
 | | `--help`, standalone `-h` (flag spellings get copied into the next command; bundled `-lh`/`-sh` don't match) |
+| | `gh api` (REST or GraphQL, any flags) — always structured JSON meant to be parsed field-by-field, never prose to skim (issue #190) |
 
 Start-of-segment matching happens after leading `VAR=val` assignments and `sudo`, so `FOO=1 git log` and `sudo git status` are caught while `--message "regit"` is not. *Every* segment of a compound command is checked (split on `||`, `&&`, `;`, `|`, newline), because a pipeline's outputs interleave into one stdout — there's no way to compress only part of it, so one exactness-critical segment protects the whole command.
+
+`gh api` is matched anywhere rather than as a start-of-segment command (unlike `jq`/`yq`) because the real call sites that motivated it wrap the call in shell command substitution (`COMMENT_IDS=$(gh api ... --jq "...")`), which a start-anchored match can't see past — verified directly before picking this approach (issue #190). It's also deliberately broader than gating on `--jq`/`graphql` specifically: a narrower fix would have left plain `gh api ... --paginate` calls (no `--jq`, no `--json`) still exposed.
 
 Why this isn't just a higher threshold: a threshold sees only bytes, and the dangerous outputs are frequently the **small** ones. The bug that motivated this — `git show HEAD:f.json | grep -c pattern; git log` compressed 1217 → 924 chars — saved ~300 chars and dropped the `grep -c` count, the entire point of the call. The surrounding `git log` prose survived, so the summary *read* as complete, which is the worst property a lossy summary can have: there's nothing to notice. Raising the threshold would have caught that one incident by accident while still compressing a 3000-char `git diff` and still refusing to compress a 1500-char build log.
 

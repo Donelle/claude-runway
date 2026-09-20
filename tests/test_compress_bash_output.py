@@ -78,6 +78,23 @@ MUST_SKIP = [
     ("python x.py -h", "standalone -h"),
     ("df -h", "-h as its own token; tabular output that reads exact anyway"),
     ("gtk-app --help-all", "--help-all is still help output, so matching it is right"),
+    # --- gh api (issue #190): structured REST/GraphQL data, never prose ---
+    (
+        "gh api repos/CVNA-SandboxOrg/claude-runway/pulls/190/comments --paginate",
+        "plain gh api call with no --jq/--json at all (my-gh-pr-feedback's shape)",
+    ),
+    (
+        "gh api graphql -f query='query { repository(name: \"x\") { pullRequest(number: 1) "
+        "{ reviewThreads(first: 100) { nodes { id comments(first: 1) { nodes { body } } } } } } }'",
+        "graphql body-fetch shape",
+    ),
+    (
+        'COMMENT_IDS=$(gh api repos/CVNA-SandboxOrg/claude-runway/pulls/190/comments '
+        '--paginate --jq ".[] | select(.user.login != \\"me\\") | \\"comment:\\" + (.id|tostring)") '
+        "|| FETCH_FAILED=1",
+        "the real VAR=$(...) command-substitution shape used by my-gh-autowork's NEW_IDS diffing "
+        "-- a start-anchored fix would have missed this",
+    ),
 ]
 
 # Commands that should still be compressed normally.
@@ -115,6 +132,9 @@ MUST_COMPRESS = [
     ("python x.py --dry-run # compress-ok", "escape hatch beats the dry-run exemption"),
     # --- case-insensitivity is scoped to the output-format value only (#33) ---
     ('curl -H "Accept: application/json" https://x', "-H is curl's header flag, not -h/help"),
+    # --- gh, but not `gh api`: unaffected by the issue #190 addition ---
+    ('gh pr comment 190 --body "thanks!"', "gh subcommand other than api stays compressible"),
+    ("gh pr view 190 -R x/y", "no --json, no api subcommand -- ordinary human-readable text"),
 ]
 
 

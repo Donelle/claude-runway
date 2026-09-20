@@ -509,10 +509,13 @@ happens there.
     PR #<PR>; can't confirm the PR is clean` and stop — a human (or a later re-run of this
     same skill, which Step 11's resume logic will pick straight back up from this PR) can
     check whether the review is just slow or something's actually stuck. (A `gh api
-    ... --paginate` call's output may look
-    summarized/compressed rather than raw JSON — this repo's own `PostToolUse` compression
-    hook did that. This pattern already reads via `--jq`/`jq`, which is on that hook's
-    byte-exact exemption list, so it reaches you unmodified either way.)
+    ... --paginate` call's output used to be able to come back summarized/compressed rather
+    than raw JSON — this repo's own `PostToolUse` compression hook did that once for real
+    during PR #187's review-feedback pass (a fabricated phrase in a summarized review body,
+    documented in memory-bank), because the hook's exemption list never actually recognized
+    `gh`'s own `--jq` flag or `gh api graphql`, despite an earlier version of this note
+    claiming otherwise. Fixed for issue #190: the hook now matches `gh api` (REST or
+    GraphQL, any flags) as exactness-critical, so this pattern reaches you unmodified.)
 20. The poll above only reaches here when a new Copilot review specifically arrived — a
     genuine timeout is Step 19's `FAILED` path above, not this one; there's no "nothing
     new, not a timeout" case, so this step doesn't need one either. NOW gather the full
