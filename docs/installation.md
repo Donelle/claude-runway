@@ -318,11 +318,10 @@ Only copy from the repo's top-level `skills/` directory. The `.claude/skills/` d
 **2. Remove the tool.**
 
 ```bash
-uv tool uninstall claude-runway      # installed with uv tool install
-pipx uninstall claude-runway         # installed with pipx
+uv tool uninstall claude-runway
 ```
 
-This deletes the tool's own environment and the `claude-runway-setup`, `claude-runway-ingest` and `claude-runway-doctor` commands. If you cloned the repo instead (steps 1–3), delete the clone, including its `.venv`.
+This deletes the tool's own environment and the `claude-runway-setup`, `claude-runway-ingest` and `claude-runway-doctor` commands.
 
 **3. Remove what's left outside the package** (each is optional — skip anything you want to keep):
 
