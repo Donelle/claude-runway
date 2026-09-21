@@ -286,6 +286,8 @@ Nothing here updates automatically. Whichever way you installed, you keep the sn
 
 **3. Re-run setup if the templates changed.** Generated configs are a snapshot of `templates/mcp.json.template`/`templates/settings.json.template` at the time you ran `setup_project.py init`, so a release that adds a server block or changes a hook matcher doesn't reach an existing project on its own. Re-run `init` (or `claude-runway-setup init`) for each project — it merges rather than clobbers, and `--dry-run` previews the result first. If a project already has memory-bank memories, pass the **same** `--memory-bank-collection`/`--memory-bank-id` values you used originally: neither default is sticky across a rerun (see [Memory bank](memory-bank.md#setup)). Run `python tools/doctor.py /path/to/target-repo` afterwards to confirm `.mcp.json` and your shell environment still agree (see [Environment variables](environment-variables.md#keeping-them-in-sync)).
 
+**Skills are not refreshed by any of the above.** The copies in `~/.claude/skills/` don't change when the package does, and `uv tool install` never installs them in the first place (see the callout under step 3). To pick up newer skill versions, re-copy them from [Session continuity skills](session-continuity.md) and [Savings tracker](savings-tracker.md).
+
 **Dependencies can also drift between updates.** `mcp-server-qdrant` is unpinned in `requirements.txt`, so a fresh install or reinstall may pull a newer upstream release than the one you tested with.
 
 ## Uninstalling
