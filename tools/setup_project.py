@@ -4,7 +4,7 @@ One-time setup for a target project repo: writes that repo's `.mcp.json`
 and `.claude/settings.json` with every `REPLACE-WITH-*` /
 `/absolute/path/to/...` placeholder from `templates/mcp.json.template` and
 `templates/settings.json.template` filled in automatically, instead of the
-manual copy-and-hand-edit flow in README's Installation steps 4/4b/5
+manual copy-and-hand-edit flow in `docs/installation.md`'s steps 4/4b/5
 (issue #48). Also structurally prevents stale hand-typed example paths
 (issue #34/BUG-14) recurring, since every path here is computed, not typed.
 
@@ -48,11 +48,11 @@ TOOLS_REPO_DIR = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))
 def _pip_installed_venv_python() -> Optional[Path]:
     """
     Issue #50: `setup_project_lib.venv_python_path`'s DEFAULT assumes the
-    "clone this repo, `uv venv` right next to it" layout README's
-    Installation step 3 documents -- `TOOLS_REPO_DIR / ".venv" / "bin" /
+    "clone this repo, `uv venv` right next to it" layout
+    `docs/installation.md`'s step 3 documents -- `TOOLS_REPO_DIR / ".venv" / "bin" /
     "python"`. That assumption breaks when this script runs as the
     `claude-runway-setup` console script from a `pipx`/`uv tool install`
-    install (the two methods README's "Alternative" callout actually
+    install (the two methods `docs/installation.md`'s "Alternative" callout actually
     documents): there IS no `.venv` sibling directory next to the installed
     `tools`/`libs` packages under site-packages -- pipx/uv tool manage their
     own venv elsewhere, and `sys.executable` (whichever interpreter is
@@ -77,7 +77,7 @@ def _pip_installed_venv_python() -> Optional[Path]:
     `~/.local/bin` under `--user`), breaking the "sibling of the
     interpreter" assumption `mcp_server_qdrant_path` relies on. This isn't
     silently unhandled: it's out of scope, since neither the issue nor
-    README's own "Alternative" callout documents or recommends that install
+    `docs/installation.md`'s own "Alternative" callout documents or recommends that install
     method -- pipx/`uv tool install` are the only ones actually promised to
     work, and both were verified to satisfy this function's assumption
     directly (see the previous paragraph).
