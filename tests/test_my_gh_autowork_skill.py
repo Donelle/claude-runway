@@ -141,9 +141,10 @@ class SettingsTemplateContentRequirements(unittest.TestCase):
             self.assertIn(rule, self.content)
 
     def test_permissions_note_does_not_overclaim_narrow_safety(self):
-        # Same finding as ReadmeContentRequirements.
-        # test_narrow_rules_not_presented_as_absolutely_safe -- the template note
-        # is actually where the fullest account of this lives.
+        # The template note is where the fullest account of the code-execution
+        # caveat lives, so it must carry it itself: even narrow per-subcommand
+        # rules still permit arbitrary commands (e.g. git fetch --upload-pack), and
+        # autonomous development inherently needs code-execution authority.
         self.assertIn("upload-pack", self.content)
         self.assertIn("code-execution authority", self.content.lower())
 
