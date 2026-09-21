@@ -114,28 +114,28 @@ class SkillContentRequirements(unittest.TestCase):
 
 
 class ReadmeContentRequirements(unittest.TestCase):
-    """Pin the new Known limitations bullet for issue #195."""
+    """Pin the Known limitations bullet about the auto mode classifier (upstream issue #195)."""
 
     def setUp(self):
         with open(README_PATH, encoding="utf-8") as f:
             self.content = f.read()
 
-    def test_readme_documents_issue_195(self):
-        self.assertIn("#195", self.content)
+    def test_readme_documents_auto_mode_classifier_finding(self):
+        # This repo's tracker doesn't contain upstream issue #195, so the README
+        # bullet is self-contained and pinned by its subject rather than the number.
         self.assertIn("auto mode classifier", self.content.lower())
 
     def test_bullet_lives_under_known_limitations(self):
         known_limitations_idx = self.content.find("## Known limitations")
-        # Upstream searches for the "issues/195" URL; this repo's README carries no
-        # issue-URL links (they pointed at the upstream org's tracker), so pin the
-        # plain "#195" reference instead.
-        issue_195_idx = self.content.find("#195")
+        # Pinned by the bullet's subject, not an issue number: #195 is an upstream
+        # tracker number that doesn't resolve in this repo.
+        bullet_idx = self.content.lower().find("auto mode classifier")
         self.assertNotEqual(known_limitations_idx, -1)
-        self.assertNotEqual(issue_195_idx, -1)
+        self.assertNotEqual(bullet_idx, -1)
         self.assertGreater(
-            issue_195_idx,
+            bullet_idx,
             known_limitations_idx,
-            "issue #195 bullet must be under the Known limitations heading",
+            "the auto mode classifier bullet must be under the Known limitations heading",
         )
 
     def test_warns_against_wildcard_permissions(self):
