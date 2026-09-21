@@ -109,6 +109,35 @@ class SkillContentRequirements(unittest.TestCase):
             self.assertIn(rule, self.content)
 
 
+class AutoPickExclusionContentRequirements(unittest.TestCase):
+    """Pin the auto-pick label-exclusion behavior added to Step 0's picking logic
+   : a future edit could silently drop the negative label filters or the
+    explicit-issue override note, and the rest of the suite wouldn't notice, since
+    this is prose guidance for a subagent, not executable code."""
+
+    def setUp(self):
+        with open(SKILL_PATH, encoding="utf-8") as f:
+            self.content = f.read()
+
+    def test_excludes_blocked_label_from_search(self):
+        self.assertIn("-label:blocked", self.content)
+
+    def test_excludes_theme_design_label_from_search(self):
+        self.assertIn("-label:theme-design", self.content)
+
+    def test_prose_documents_both_exclusions(self):
+        self.assertIn("NOT labeled", self.content)
+        self.assertIn("`blocked` or `theme-design`", self.content)
+
+    def test_explicit_issue_number_overrides_exclusion(self):
+        # An explicitly-named ticket must still be worked regardless of its labels --
+        # the exclusion is for auto-pick only, not a blanket ban on ever touching a
+        # blocked/theme-design issue.
+        idx = self.content.find("This exclusion applies to auto-pick only")
+        self.assertNotEqual(idx, -1, "explicit-override note must exist")
+        self.assertIn("{ISSUE_NUMBER}", self.content[idx : idx + 300])
+
+
 class SettingsTemplateContentRequirements(unittest.TestCase):
     """Pin the new _permissions_note documenting suggested baseline rules."""
 

@@ -176,17 +176,26 @@ call out separately).
 {ISSUE_NUMBER}                                   <-- orchestrator fills in ONE of these two
 --- OR ---
 Pick the highest-priority open issue on Donelle/claude-runway labeled `bug` OR
-`enhancement` that is NOT already assigned to someone other than you, and whose number is
-NOT in this already-attempted list this run: {ATTEMPTED_LIST}. IMPORTANT: `gh issue list`
-silently truncates to 30 results with no `--limit` flag — always pass one. Also note two
-labels do NOT OR together via repeated `--label` flags (that ANDs, requiring both labels on
-the same issue); use `--search` for OR:
-  gh issue list -R Donelle/claude-runway --state open --search "label:bug,enhancement" \
+`enhancement` that is NOT already assigned to someone other than you, is NOT labeled
+`blocked` or `theme-design`, and whose number is NOT in this already-attempted list this
+run: {ATTEMPTED_LIST}. The `blocked`/`theme-design` exclusion is deliberate: a `blocked`
+issue is waiting on something outside this skill's control (an upstream fix, a human
+decision), and a `theme-design` issue is a pre-implementation design/brainstorm doc, not a
+ticket with a concrete fix to implement — auto-picking either would either stall the run or
+produce the wrong kind of output. IMPORTANT: `gh issue list` silently truncates to 30
+results with no `--limit` flag — always pass one. Also note two labels do NOT OR together
+via repeated `--label` flags (that ANDs, requiring both labels on the same issue); use
+`--search` for OR, and GitHub's search syntax negates a qualifier with a leading `-`
+(`-label:X` excludes issues carrying that label):
+  gh issue list -R Donelle/claude-runway --state open \
+    --search "label:bug,enhancement -label:blocked -label:theme-design" \
     --limit 200 --json number,title,labels,assignees
 Sort by priority label (priority-p1 > p2 > p3; unlabeled sorts last), then by issue number
 ascending as a tiebreaker; bug and enhancement are not otherwise prioritized relative to
 each other. If nothing qualifies, output exactly `OUTCOME: DONE` as your entire response
-and stop — do not proceed to any step below.
+and stop — do not proceed to any step below. **This exclusion applies to auto-pick only —
+if the orchestrator instead passes an explicit {ISSUE_NUMBER}, work it regardless of its
+labels; a human naming a specific ticket is a deliberate override of this default.**
 
 ## Step 1 — load project context (this repo's own /my-load-context, inlined)
 This is inlined rather than invoked as `/my-load-context` because that's a personal skill
