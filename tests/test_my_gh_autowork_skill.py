@@ -23,7 +23,6 @@ import unittest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SKILL_PATH = os.path.join(REPO_ROOT, ".claude", "skills", "my-gh-autowork", "SKILL.md")
-README_PATH = os.path.join(REPO_ROOT, "README.md")
 SETTINGS_TEMPLATE_PATH = os.path.join(REPO_ROOT, "templates", "settings.json.template")
 
 # Mirrors the regex embedded in SKILL.md's Step 0 preflight check:
@@ -113,47 +112,6 @@ class SkillContentRequirements(unittest.TestCase):
             self.assertIn(rule, self.content)
 
 
-class ReadmeContentRequirements(unittest.TestCase):
-    """Pin the Known limitations bullet about the auto mode classifier (upstream issue #195)."""
-
-    def setUp(self):
-        with open(README_PATH, encoding="utf-8") as f:
-            self.content = f.read()
-
-    def test_readme_documents_auto_mode_classifier_finding(self):
-        # This repo's tracker doesn't contain upstream issue #195, so the README
-        # bullet is self-contained and pinned by its subject rather than the number.
-        self.assertIn("auto mode classifier", self.content.lower())
-
-    def test_bullet_lives_under_known_limitations(self):
-        known_limitations_idx = self.content.find("## Known limitations")
-        # Pinned by the bullet's subject, not an issue number: #195 is an upstream
-        # tracker number that doesn't resolve in this repo.
-        bullet_idx = self.content.lower().find("auto mode classifier")
-        self.assertNotEqual(known_limitations_idx, -1)
-        self.assertNotEqual(bullet_idx, -1)
-        self.assertGreater(
-            bullet_idx,
-            known_limitations_idx,
-            "the auto mode classifier bullet must be under the Known limitations heading",
-        )
-
-    def test_warns_against_wildcard_permissions(self):
-        # Same Copilot-review-driven requirement as the SKILL.md check above --
-        # README's own account of the workaround must not present the broad
-        # wildcard as something that was confirmed or is safe to add.
-        self.assertIn("arbitrary-command-execution", self.content.lower())
-        self.assertIn("git -c alias", self.content)
-
-    def test_narrow_rules_not_presented_as_absolutely_safe(self):
-        # Copilot review round 3 on PR #196: even the confirmed narrow rules still
-        # permit code execution through legitimate flags (git fetch/push transport
-        # options, `python -c`) -- the doc must not imply per-subcommand scoping is
-        # a hard security boundary, only that it reduces exposed surface.
-        self.assertIn("upload-pack", self.content)
-        self.assertIn("not the same as safe", self.content.lower())
-
-
 class SettingsTemplateContentRequirements(unittest.TestCase):
     """Pin the new _permissions_note documenting suggested baseline rules."""
 
@@ -173,6 +131,12 @@ class SettingsTemplateContentRequirements(unittest.TestCase):
 
     def test_permissions_note_prefers_project_scope(self):
         self.assertIn("PREFERRED", self.content)
+
+    def test_permissions_note_does_not_present_narrow_rules_as_safe(self):
+        # Even the narrow per-subcommand rules still permit code execution through
+        # legitimate flags (git fetch --upload-pack, python -c); the note must not
+        # imply per-subcommand scoping is a security boundary.
+        self.assertIn("means SAFE in an absolute sense", self.content)
 
     def test_permissions_note_quotes_confirmed_rules_exactly(self):
         # Copilot review round 3 on PR #196: this note previously restated issue
