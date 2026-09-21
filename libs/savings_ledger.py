@@ -398,6 +398,29 @@ def _connect():
     db_path = resolve_db_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
+    try:
+        _ensure_schema(conn)
+    except Exception:
+        # Close before re-raising: a failed schema/migration step (a version
+        # with no registered migration, or a migration that raises partway
+        # through) would otherwise leave this connection open, kept alive
+        # only by the propagating exception's traceback, so the db file
+        # stays locked until that traceback is released. Harmless on POSIX,
+        # but on Windows an open handle makes the file undeletable, which is
+        # how this was found (a test's TemporaryDirectory cleanup raised
+        # WinError 32). memory_events_lib._connect already does the same for
+        # the same reason.
+        conn.close()
+        raise
+    return conn
+
+
+def _ensure_schema(conn) -> None:
+    """
+    Creates any missing tables on an already-open connection and brings its
+    schema up to SCHEMA_VERSION. Split out of _connect() so that function
+    can close the connection if any step here raises.
+    """
     # Checked BEFORE the CREATE TABLE calls below, specifically so
     # _run_migrations can tell a genuinely fresh DB (nothing to migrate --
     # see its docstring) apart from a pre-existing one that needs its
@@ -445,7 +468,6 @@ def _connect():
     # Only after all three tables are guaranteed to exist -- a migration may
     # assume `sessions`/`session_tools`/`meta` are all already there.
     _run_migrations(conn, is_new_db=not sessions_existed)
-    return conn
 
 
 def set_meta(key: str, value: str) -> None:

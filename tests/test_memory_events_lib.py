@@ -42,8 +42,12 @@ class ResolveDbPath(unittest.TestCase):
             self.assertNotEqual(path, Path.home() / ".claude" / "claude-runway" / "cache.db")
 
     def test_absolute_override_is_used_as_is(self):
-        with mock.patch.dict(os.environ, {"CLAUDE_RUNWAY_MEMORY_EVENTS_DB": "/custom/memory-events.db"}, clear=False):
-            self.assertEqual(ev.resolve_db_path(), Path("/custom/memory-events.db"))
+        # "/custom/..." has no drive letter, so it isn't absolute on Windows
+        # (see the same test in test_cache_db.py); abspath() makes it
+        # genuinely absolute there and is a no-op on POSIX.
+        custom = os.path.abspath("/custom/memory-events.db")
+        with mock.patch.dict(os.environ, {"CLAUDE_RUNWAY_MEMORY_EVENTS_DB": custom}, clear=False):
+            self.assertEqual(ev.resolve_db_path(), Path(custom))
 
     def test_relative_override_is_anchored_to_home_not_cwd(self):
         with mock.patch.dict(os.environ, {"CLAUDE_RUNWAY_MEMORY_EVENTS_DB": "relative/mem.db"}, clear=False):

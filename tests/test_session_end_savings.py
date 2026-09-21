@@ -119,8 +119,16 @@ class TranscriptParsing(unittest.TestCase):
             captured["actual_tokens"] = actual_tokens
             return {}
 
+        # Start from the real environment minus the one var under test, so a
+        # developer who exports CLAUDE_RUNWAY_PARSE_TRANSCRIPT_TOKENS in their
+        # shell (the documented way to enable the feature) doesn't leak it
+        # into the "env var not set" case. Each test then supplies exactly the
+        # value it means to via `env`.
+        patched_env = {k: v for k, v in os.environ.items() if k != "CLAUDE_RUNWAY_PARSE_TRANSCRIPT_TOKENS"}
+        patched_env.update(env)
+
         patchers = [
-            mock.patch.dict(os.environ, env),
+            mock.patch.dict(os.environ, patched_env, clear=True),
             mock.patch.object(hook.savings_ledger, "tracking_enabled", return_value=True),
             mock.patch.object(hook.savings_ledger, "read_session_events", return_value=[object()]),
             mock.patch.object(hook.savings_ledger, "project_name_from_cwd", return_value="proj"),

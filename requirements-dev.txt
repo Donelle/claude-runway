@@ -7,3 +7,4 @@
 # Type checking -- config lives in mypy.ini. Run with:
 #   .venv/bin/mypy libs tools hooks
 mypy==2.3.1
+pytest
