@@ -167,6 +167,8 @@ uv pip install pathspec --index-url https://pypi.org/simple
 > **Use `pipx install`/`uv tool install` here, NOT bare `uvx`.** `uvx` (`uv tool run`) executes a single command in a cache-backed, effectively ephemeral environment — it does not durably add all 3 console scripts to your `PATH` the way the persistent installs above do, and `uv cache clean` (or uv's own cache eviction) can remove that environment later. `claude-runway-setup init` specifically writes config that hardcodes absolute paths into whichever environment ran it (the interpreter path above, plus the MCP-server/hook paths below) — pointing those at a `uvx`-backed environment risks them going stale once that cache entry is gone, and the "next step" reminder it prints (`claude-runway-ingest ...`) would need that same environment to still exist. A one-off `uvx --from git+https://github.com/Donelle/claude-runway.git claude-runway-doctor /path/to/project` for a quick, non-persistent check is fine (the explicit `--from` is required here, not optional decoration — bare `uvx claude-runway-doctor` treats `claude-runway-doctor` itself as the distribution name to resolve, which doesn't exist as a published package; confirmed live, it fails before the entry point ever runs); `claude-runway-setup init` is not that kind of one-off.
 >
 > **What none of this changes:** `tools/ingest_mcp_server.py`/`tools/compress_mcp_server.py` (the MCP servers `.mcp.json` actually launches) and the hook scripts under `hooks/` still get referenced by an absolute file path in the generated config — same as the clone workflow, just pointing into pipx's/`uv tool`'s own managed install location instead of a repo you cloned yourself. This isn't because Claude Code's `.mcp.json`/`.claude/settings.json` formats can't resolve a bare command via `PATH` — they can (this repo's own doc examples elsewhere use `"command": "python"`/`"python3"` exactly that way) — it's that this package declares no console-script entry points for those specific files, so there's nothing bare on `PATH` for them to resolve to regardless of install method, and pipx/`uv tool install` don't expose a dependency's own console script (like `mcp-server-qdrant`) globally either. An absolute path sidesteps both gaps at once.
+>
+> **What this doesn't install: the skills.** `claude-runway-setup init` only writes a project's `.mcp.json`/`.claude/settings.json`, and the package itself contains just `libs/`, `tools/`, `hooks/` and `templates/` — `skills/` isn't part of the wheel. `/my-compact`, `/my-resume`, `/my-savings` and `/my-setup-clauderunway` have to be copied into `~/.claude/skills/` separately (see [Updating](#updating) for a way to do that without keeping your own clone, and [Session continuity skills](session-continuity.md)/[Savings tracker](savings-tracker.md) for what each one needs). `/my-setup-clauderunway` additionally expects `CLAUDE_RUNWAY_DIR` to point at a clone of this repo, so with a pipx/`uv tool install` setup you'll usually just run `claude-runway-setup init` directly instead.
 
 **4. Per project you want memory for:**
 
@@ -260,3 +262,44 @@ python tools/ingest_to_qdrant.py --repo-path /path/to/project --collection <proj
 Or ask Claude to run it via the `index_repo` tool once `.mcp.json` is set up.
 
 **7. Ongoing use:** ask Claude to run `sync_repo` at the start of a session, or add it as a standing instruction in `CLAUDE.md` (see `templates/CLAUDE.md.template`). It only re-embeds changed files, so it's cheap to run routinely.
+
+## Updating
+
+Nothing here updates automatically. Whichever way you installed, you keep the snapshot you installed until you refresh it yourself.
+
+**1. Pull in the new code**
+
+- **Cloned repo** (steps 1–3): `git pull` in the clone, then re-run `uv pip install -r requirements.txt --index-url https://pypi.org/simple` in its venv if `requirements.txt` changed. The absolute paths already written into your projects' `.mcp.json`/`.claude/settings.json` keep pointing at the same files, so they pick up the new code as-is.
+- **pipx / `uv tool install`**: `uv tool install` builds from whatever commit was on the default branch at that moment and pins to it. To move to the latest commit:
+
+  ```bash
+  uv tool install --reinstall git+https://github.com/Donelle/claude-runway.git
+  # pipx equivalent:
+  pipx install --force git+https://github.com/Donelle/claude-runway.git
+  ```
+
+  `uv tool upgrade claude-runway` is the lighter-weight alternative. If it reports nothing to upgrade when you expect changes, use the `--reinstall` form above. To stay on a fixed version instead of the moving default branch, install from `git+https://github.com/Donelle/claude-runway.git@<tag-or-commit>`. `uv tool list` shows what's installed, but not how far behind it is.
+
+  The interpreter, MCP-server and hook paths that `claude-runway-setup init` wrote into each project live inside the tool's own environment, so a reinstall replaces the files at those same paths and existing configs keep working.
+
+**2. Restart Claude Code.** MCP servers read their code and environment once at startup, so a running session keeps the old server code until you quit and relaunch `claude`.
+
+**3. Re-run setup if the templates changed.** Generated configs are a snapshot of `templates/mcp.json.template`/`templates/settings.json.template` at the time you ran `setup_project.py init`, so a release that adds a server block or changes a hook matcher doesn't reach an existing project on its own. Re-run `init` (or `claude-runway-setup init`) for each project — it merges rather than clobbers, and `--dry-run` previews the result first. If a project already has memory-bank memories, pass the **same** `--memory-bank-collection`/`--memory-bank-id` values you used originally: neither default is sticky across a rerun (see [Memory bank](memory-bank.md#setup)). Run `python tools/doctor.py /path/to/target-repo` afterwards to confirm `.mcp.json` and your shell environment still agree (see [Environment variables](environment-variables.md#keeping-them-in-sync)).
+
+**4. Refresh the skills.** The copies in `~/.claude/skills/` don't change when the package does, and `uv tool install` never installs them in the first place (see the callout under step 3). With a clone, re-run the `cp` commands from [Session continuity skills](session-continuity.md) and [Savings tracker](savings-tracker.md). Without one, take a throwaway shallow clone and copy the whole `skills/` directory:
+
+```bash
+git clone --depth 1 https://github.com/Donelle/claude-runway.git /tmp/claude-runway-skills
+mkdir -p ~/.claude/skills
+cp -r /tmp/claude-runway-skills/skills/* ~/.claude/skills/
+```
+
+```powershell
+git clone --depth 1 https://github.com/Donelle/claude-runway.git $env:TEMP\claude-runway-skills
+New-Item -ItemType Directory -Force ~\.claude\skills | Out-Null
+Copy-Item -Recurse -Force $env:TEMP\claude-runway-skills\skills\* ~\.claude\skills\
+```
+
+Only copy from the repo's top-level `skills/` directory. The `.claude/skills/` directory holds contributor-only skills for working on this repo itself (see [Development workflow](development-workflow.md)) and doesn't belong in your own `~/.claude/skills/`.
+
+**Dependencies can also drift between updates.** `mcp-server-qdrant` is unpinned in `requirements.txt`, so a fresh install or reinstall may pull a newer upstream release than the one you tested with.
