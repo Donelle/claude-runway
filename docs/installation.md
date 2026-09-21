@@ -167,6 +167,8 @@ uv pip install pathspec --index-url https://pypi.org/simple
 > **Use `pipx install`/`uv tool install` here, NOT bare `uvx`.** `uvx` (`uv tool run`) executes a single command in a cache-backed, effectively ephemeral environment — it does not durably add all 3 console scripts to your `PATH` the way the persistent installs above do, and `uv cache clean` (or uv's own cache eviction) can remove that environment later. `claude-runway-setup init` specifically writes config that hardcodes absolute paths into whichever environment ran it (the interpreter path above, plus the MCP-server/hook paths below) — pointing those at a `uvx`-backed environment risks them going stale once that cache entry is gone, and the "next step" reminder it prints (`claude-runway-ingest ...`) would need that same environment to still exist. A one-off `uvx --from git+https://github.com/Donelle/claude-runway.git claude-runway-doctor /path/to/project` for a quick, non-persistent check is fine (the explicit `--from` is required here, not optional decoration — bare `uvx claude-runway-doctor` treats `claude-runway-doctor` itself as the distribution name to resolve, which doesn't exist as a published package; confirmed live, it fails before the entry point ever runs); `claude-runway-setup init` is not that kind of one-off.
 >
 > **What none of this changes:** `tools/ingest_mcp_server.py`/`tools/compress_mcp_server.py` (the MCP servers `.mcp.json` actually launches) and the hook scripts under `hooks/` still get referenced by an absolute file path in the generated config — same as the clone workflow, just pointing into pipx's/`uv tool`'s own managed install location instead of a repo you cloned yourself. This isn't because Claude Code's `.mcp.json`/`.claude/settings.json` formats can't resolve a bare command via `PATH` — they can (this repo's own doc examples elsewhere use `"command": "python"`/`"python3"` exactly that way) — it's that this package declares no console-script entry points for those specific files, so there's nothing bare on `PATH` for them to resolve to regardless of install method, and pipx/`uv tool install` don't expose a dependency's own console script (like `mcp-server-qdrant`) globally either. An absolute path sidesteps both gaps at once.
+>
+> **What this doesn't install: the skills.** `claude-runway-setup init` only writes a project's `.mcp.json`/`.claude/settings.json`, and the package itself contains just `libs/`, `tools/`, `hooks/` and `templates/` — `skills/` isn't part of the wheel. `/my-compact`, `/my-resume`, `/my-savings` and `/my-setup-clauderunway` have to be copied into `~/.claude/skills/` separately ([Session continuity skills](session-continuity.md) has the copy commands for `/my-compact` and `/my-resume`, and [Savings tracker](savings-tracker.md) has the one for `/my-savings`; neither page covers `/my-setup-clauderunway`). `/my-setup-clauderunway` is clone-only: it expects `CLAUDE_RUNWAY_DIR` to point at a clone of this repo and has no linked page, so with a pipx/`uv tool install` setup skip it and run `claude-runway-setup init` directly. If you do have a clone and want it, run `mkdir -p ~/.claude/skills/my-setup-clauderunway && cp skills/my-setup-clauderunway/SKILL.md ~/.claude/skills/my-setup-clauderunway/SKILL.md` from it.
 
 **4. Per project you want memory for:**
 
@@ -260,3 +262,58 @@ python tools/ingest_to_qdrant.py --repo-path /path/to/project --collection <proj
 Or ask Claude to run it via the `index_repo` tool once `.mcp.json` is set up.
 
 **7. Ongoing use:** ask Claude to run `sync_repo` at the start of a session, or add it as a standing instruction in `CLAUDE.md` (see `templates/CLAUDE.md.template`). It only re-embeds changed files, so it's cheap to run routinely.
+
+## Updating
+
+Nothing here updates automatically. Whichever way you installed, you keep the snapshot you installed until you refresh it yourself.
+
+**1. Pull in the new code**
+
+- **Cloned repo** (steps 1–3): `git pull` in the clone, then re-run `uv pip install -r requirements.txt --index-url https://pypi.org/simple` in its venv if `requirements.txt` changed. The absolute paths already written into your projects' `.mcp.json`/`.claude/settings.json` keep pointing at the same files, so they pick up the new code as-is.
+- **pipx / `uv tool install`**: `uv tool install` builds from whatever commit was on the default branch at that moment and pins to it. To move to the latest commit:
+
+  ```bash
+  uv tool install --reinstall git+https://github.com/Donelle/claude-runway.git
+  # pipx equivalent:
+  pipx install --force git+https://github.com/Donelle/claude-runway.git
+  ```
+
+  `uv tool upgrade claude-runway` is the lighter-weight alternative. If it reports nothing to upgrade when you expect changes, use the `--reinstall` form above. To stay on a fixed version instead of the moving default branch, install from `git+https://github.com/Donelle/claude-runway.git@<tag-or-commit>`. `uv tool list` shows what's installed, but not how far behind it is.
+
+  The interpreter, MCP-server and hook paths that `claude-runway-setup init` wrote into each project live inside the tool's own environment, so a reinstall replaces the files at those same paths and existing configs keep working.
+
+**2. Restart Claude Code.** MCP servers read their code and environment once at startup, so a running session keeps the old server code until you quit and relaunch `claude`.
+
+**3. Re-run setup if the templates changed.** Generated configs are a snapshot of `templates/mcp.json.template`/`templates/settings.json.template` at the time you ran `setup_project.py init`, so a release that adds a server block or changes a hook matcher doesn't reach an existing project on its own. Re-run `init` (or `claude-runway-setup init`) for each project. It leaves unrelated servers and hooks alone, but it rebuilds every toolkit-owned server block (`qdrant`, `codebase-indexer`, `memory-bank`, `local-compress`) from the flags of *that run*, and no option carries over from an earlier one. So repeat **every** non-default flag you used originally (Qdrant URL/API key, collection names, LM Studio and savings settings, `--qdrant-only` and any other mode flag), or those settings silently revert to defaults. Use `--dry-run` first to review the result. If a project already has memory-bank memories, pass the **same** `--memory-bank-collection`/`--memory-bank-id` values you used originally: neither default is sticky across a rerun (see [Memory bank](memory-bank.md#setup)). Run `python tools/doctor.py /path/to/target-repo` (or `claude-runway-doctor /path/to/target-repo` for a pipx/`uv tool install` setup, which has no `tools/` directory) afterwards to confirm `.mcp.json` and your shell environment still agree (see [Environment variables](environment-variables.md#keeping-them-in-sync)).
+
+**Skills are not refreshed by any of the above.** The copies in `~/.claude/skills/` don't change when the package does, and `uv tool install` never installs them in the first place (see the callout under step 3). To pick up newer skill versions, re-copy `my-compact`/`my-resume` from [Session continuity skills](session-continuity.md) and `my-savings` from [Savings tracker](savings-tracker.md). `my-setup-clauderunway` has no linked page; if you installed it from a clone, re-run the `cp` command in the callout under step 3.
+
+**Dependencies can also drift between updates.** `mcp-server-qdrant` is unpinned in `requirements.txt`, so a fresh install or reinstall may pull a newer upstream release than the one you tested with.
+
+## Uninstalling
+
+`claude-runway-setup` has no uninstall or cleanup command (`init` is its only subcommand), and removing the tool doesn't remove what it wrote elsewhere — a project's config keeps pointing at the deleted environment, and its MCP servers and hooks then fail until you clean that up. So do the steps in this order.
+
+**0. Note any custom data paths first.** If you overrode `CLAUDE_RUNWAY_SAVINGS_DB`, `CLAUDE_RUNWAY_CACHE_DB`, `CLAUDE_RUNWAY_MEMORY_EVENTS_DB` or `FASTEMBED_CACHE_PATH` (see [Environment variables](environment-variables.md)), write down where they point now, in each project's `.mcp.json` `env` block and in your shell profile. Step 1 deletes the `.mcp.json` values and step 3 removes the shell exports, after which nothing records where that data lives.
+
+**1. Clean up each configured project (before removing the tool).**
+
+- In the project's `.mcp.json`, delete the `qdrant`, `codebase-indexer`, `memory-bank` and (if present) `local-compress` server blocks, or delete the file if this toolkit was all it held.
+- In the project's `.claude/settings.json`, delete the hook blocks this toolkit added (`compress_bash_output.py`, `redirect_webfetch_to_fetch_url.py`, `session_end_savings.py`). `claude-runway-setup init /path/to/project --qdrant-only` strips those hooks for you, but it has to run while the tool is still installed.
+- Remove the sections you copied from `templates/CLAUDE.md.template` into the project's `CLAUDE.md` (step 5 above).
+- Delete the `.qdrant_index_manifest.json` that `sync_repo`/`index_repo` left in the repo root, if it isn't already gitignored.
+
+**2. Remove the tool.**
+
+```bash
+uv tool uninstall claude-runway
+```
+
+This deletes the tool's own environment and the `claude-runway-setup`, `claude-runway-ingest` and `claude-runway-doctor` commands.
+
+**3. Remove what's left outside the package** (each is optional — skip anything you want to keep):
+
+- **Skills:** the copies in `~/.claude/skills/` — `my-compact`, `my-resume`, `my-savings` and `my-setup-clauderunway`.
+- **Local data:** `~/.claude/claude-runway/` (on Windows, `%USERPROFILE%\.claude\claude-runway`), plus any custom locations you noted in step 0. The default directory holds `savings.db`, `cache.db`, `memory-events.db` and the `fastembed-cache`. Deleting it discards your savings history and the memory-bank usage log; the embedding model is simply downloaded again if you reinstall.
+- **Qdrant collections:** they stay in Qdrant until you drop them — each project's own collection, the shared `memory-bank` collection, and the conversation-compact collections (`conversation-compacts-<project>-<hash8>`). Use the dashboard at <http://localhost:6333/dashboard>, or `curl -X DELETE http://localhost:6333/collections/<name>`. Dropping `memory-bank` permanently deletes every project's `remember` entries. If the Qdrant container was set up only for this toolkit, `docker compose down -v` removes it along with its volume.
+- **Shell profile:** any `CLAUDE_RUNWAY_*` exports (see [Environment variables](environment-variables.md)), `CLAUDE_RUNWAY_DIR` if you used `/my-setup-clauderunway`, and `TOOLS_REPO_DIR` if you set it. Restart Claude Code afterwards so the change takes effect.
