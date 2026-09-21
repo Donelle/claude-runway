@@ -223,20 +223,28 @@ class CheckDualEnvVars(unittest.TestCase):
         # The default needs no coordination -- both sides derive it identically.
         self.assertEqual(self._check({"CLAUDE_RUNWAY_SAVINGS_DB": ""}, {}), [])
 
+    # The "/custom/..." literals below go through os.path.abspath(): without a
+    # drive letter they aren't absolute on Windows, so doctor_lib would
+    # (correctly) anchor them to home_dir and report a different string than
+    # the literal. abspath() leaves them unchanged on POSIX.
+
     def test_savings_db_overridden_on_mcp_side_only_is_flagged(self):
-        mcp_env = {"CLAUDE_RUNWAY_SAVINGS_DB": "/custom/savings.db"}
+        custom = os.path.abspath("/custom/savings.db")
+        mcp_env = {"CLAUDE_RUNWAY_SAVINGS_DB": custom}
         mismatches = self._check(mcp_env, {})
         self.assertEqual(len(mismatches), 1)
-        self.assertEqual(mismatches[0].mcp_json_value, "/custom/savings.db")
+        self.assertEqual(mismatches[0].mcp_json_value, custom)
         self.assertEqual(mismatches[0].shell_value, str(self.home_dir / ".claude" / "claude-runway" / "savings.db"))
 
     def test_savings_db_overridden_differently_on_both_sides_is_flagged(self):
-        mcp_env = {"CLAUDE_RUNWAY_SAVINGS_DB": "/custom/a.db"}
-        shell_env = {"CLAUDE_RUNWAY_SAVINGS_DB": "/custom/b.db"}
+        custom_a = os.path.abspath("/custom/a.db")
+        custom_b = os.path.abspath("/custom/b.db")
+        mcp_env = {"CLAUDE_RUNWAY_SAVINGS_DB": custom_a}
+        shell_env = {"CLAUDE_RUNWAY_SAVINGS_DB": custom_b}
         mismatches = self._check(mcp_env, shell_env)
         self.assertEqual(len(mismatches), 1)
-        self.assertEqual(mismatches[0].mcp_json_value, "/custom/a.db")
-        self.assertEqual(mismatches[0].shell_value, "/custom/b.db")
+        self.assertEqual(mismatches[0].mcp_json_value, custom_a)
+        self.assertEqual(mismatches[0].shell_value, custom_b)
 
     def test_savings_db_overridden_identically_on_both_sides_is_not_a_mismatch(self):
         mcp_env = {"CLAUDE_RUNWAY_SAVINGS_DB": "/custom/a.db"}
@@ -265,11 +273,12 @@ class CheckDualEnvVars(unittest.TestCase):
         # The fix must only stop FALSE positives -- a real divergence still
         # needs to be reported.
         mcp_env = {"CLAUDE_RUNWAY_SAVINGS_DB": "~/savings.db"}
-        shell_env = {"CLAUDE_RUNWAY_SAVINGS_DB": "/completely/different/path.db"}
+        different = os.path.abspath("/completely/different/path.db")
+        shell_env = {"CLAUDE_RUNWAY_SAVINGS_DB": different}
         mismatches = self._check(mcp_env, shell_env)
         self.assertEqual(len(mismatches), 1)
         self.assertEqual(mismatches[0].mcp_json_value, str(self.home_dir / "savings.db"))
-        self.assertEqual(mismatches[0].shell_value, "/completely/different/path.db")
+        self.assertEqual(mismatches[0].shell_value, different)
 
     def test_multiple_mismatches_all_reported(self):
         mcp_env = {

@@ -300,6 +300,31 @@ class MigrationTransactionSafety(SavingsLedgerTestCase):
         )
         conn.close()
 
+    def test_connection_is_closed_when_a_migration_fails(self):
+        # _connect() opens the connection before running migrations, so a
+        # failure there must close it rather than leak an open handle to the
+        # db file (kept alive only by the exception's traceback). Invisible
+        # on POSIX, but on Windows an open handle makes the file undeletable
+        # -- this is what made the two tests above error in tearDown. Checked
+        # directly here so it's a regression guard on every platform.
+        _old_schema_db_path(self._db_path())
+        opened = []
+        real_connect = sqlite3.connect
+
+        def _capturing_connect(*args, **kwargs):
+            conn = real_connect(*args, **kwargs)
+            opened.append(conn)
+            return conn
+
+        with mock.patch.object(sqlite3, "connect", _capturing_connect):
+            with mock.patch.object(L, "SCHEMA_VERSION", 5):
+                with self.assertRaises(RuntimeError):
+                    L._connect()
+
+        self.assertEqual(len(opened), 1)
+        with self.assertRaises(sqlite3.ProgrammingError):
+            opened[0].execute("SELECT 1")  # "Cannot operate on a closed database."
+
     def test_second_connection_cannot_interleave_a_migration_in_progress(self):
         # Direct check of the mechanism the real fix relies on: once one
         # connection holds BEGIN IMMEDIATE's write lock, a second connection

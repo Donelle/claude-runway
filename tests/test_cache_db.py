@@ -45,8 +45,13 @@ class ResolveCacheDbPath(unittest.TestCase):
             )
 
     def test_absolute_override_is_used_as_is(self):
-        with mock.patch.dict(os.environ, {"CLAUDE_RUNWAY_CACHE_DB": "/custom/cache.db"}, clear=False):
-            self.assertEqual(resolve_cache_db_path(), Path("/custom/cache.db"))
+        # "/custom/cache.db" has no drive letter, so it isn't absolute on
+        # Windows and would (correctly) be anchored to the home directory
+        # instead. abspath() gives a genuinely absolute path on every
+        # platform and leaves this one unchanged on POSIX.
+        custom = os.path.abspath("/custom/cache.db")
+        with mock.patch.dict(os.environ, {"CLAUDE_RUNWAY_CACHE_DB": custom}, clear=False):
+            self.assertEqual(resolve_cache_db_path(), Path(custom))
 
     def test_relative_override_is_anchored_to_home_not_cwd(self):
         with mock.patch.dict(os.environ, {"CLAUDE_RUNWAY_CACHE_DB": "relative/cache.db"}, clear=False):
