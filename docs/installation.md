@@ -303,3 +303,30 @@ Copy-Item -Recurse -Force $env:TEMP\claude-runway-skills\skills\* ~\.claude\skil
 Only copy from the repo's top-level `skills/` directory. The `.claude/skills/` directory holds contributor-only skills for working on this repo itself (see [Development workflow](development-workflow.md)) and doesn't belong in your own `~/.claude/skills/`.
 
 **Dependencies can also drift between updates.** `mcp-server-qdrant` is unpinned in `requirements.txt`, so a fresh install or reinstall may pull a newer upstream release than the one you tested with.
+
+## Uninstalling
+
+`claude-runway-setup` has no uninstall or cleanup command (`init` is its only subcommand), and removing the tool doesn't remove what it wrote elsewhere — a project's config keeps pointing at the deleted environment, and its MCP servers and hooks then fail until you clean that up. So do the steps in this order.
+
+**1. Clean up each configured project (before removing the tool).**
+
+- In the project's `.mcp.json`, delete the `qdrant`, `codebase-indexer`, `memory-bank` and (if present) `local-compress` server blocks, or delete the file if this toolkit was all it held.
+- In the project's `.claude/settings.json`, delete the hook blocks this toolkit added (`compress_bash_output.py`, `redirect_webfetch_to_fetch_url.py`, `session_end_savings.py`). `claude-runway-setup init /path/to/project --qdrant-only` strips those hooks for you, but it has to run while the tool is still installed.
+- Remove the sections you copied from `templates/CLAUDE.md.template` into the project's `CLAUDE.md` (step 5 above).
+- Delete the `.qdrant_index_manifest.json` that `sync_repo`/`index_repo` left in the repo root, if it isn't already gitignored.
+
+**2. Remove the tool.**
+
+```bash
+uv tool uninstall claude-runway      # installed with uv tool install
+pipx uninstall claude-runway         # installed with pipx
+```
+
+This deletes the tool's own environment and the `claude-runway-setup`, `claude-runway-ingest` and `claude-runway-doctor` commands. If you cloned the repo instead (steps 1–3), delete the clone, including its `.venv`.
+
+**3. Remove what's left outside the package** (each is optional — skip anything you want to keep):
+
+- **Skills:** the copies in `~/.claude/skills/` — `my-compact`, `my-resume`, `my-savings` and `my-setup-clauderunway`.
+- **Local data:** `~/.claude/claude-runway/` (on Windows, `%USERPROFILE%\.claude\claude-runway`), which holds `savings.db`, `cache.db`, `memory-events.db` and the `fastembed-cache`. Deleting it discards your savings history and the memory-bank usage log; the embedding model is simply downloaded again if you reinstall.
+- **Qdrant collections:** they stay in Qdrant until you drop them — each project's own collection, the shared `memory-bank` collection, and the conversation-compact collections (`conversation-compacts-<project>-<hash8>`). Use the dashboard at <http://localhost:6333/dashboard>, or `curl -X DELETE http://localhost:6333/collections/<name>`. Dropping `memory-bank` permanently deletes every project's `remember` entries. If the Qdrant container was set up only for this toolkit, `docker compose down -v` removes it along with its volume.
+- **Shell profile:** any `CLAUDE_RUNWAY_*` exports (see [Environment variables](environment-variables.md)), `CLAUDE_RUNWAY_DIR` if you used `/my-setup-clauderunway`, and `TOOLS_REPO_DIR` if you set it. Restart Claude Code afterwards so the change takes effect.
