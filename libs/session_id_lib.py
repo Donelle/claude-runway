@@ -59,21 +59,27 @@ Cleanup (two layers, both driven by `hooks/record_session_id.py`):
   - Layer 2 (crash-safety net, write side): the `SessionStart` registration
     (issue #231; replaced the original `PostToolUse '.*'` registration to
     cut per-tool-call subprocess overhead) opportunistically sweeps markers
-    older than `CLAUDE_RUNWAY_SESSION_MARKER_TTL_HOURS` (default 48) -- see
-    `sweep_stale_shadow_markers`/`should_sweep`/`mark_swept`. Bounded to run
-    at most once per hour (a sentinel file's mtime, not a counter) so sweep
-    cost doesn't scale with total sessions-directory size on every session
-    lifecycle event. The hook always refreshes its OWN marker before
-    sweeping (see that script), so a live session can never observe its own
-    marker as stale and prune itself AT the moment a lifecycle event fires.
-    Unlike the old `PostToolUse` registration, nothing refreshes a marker
-    BETWEEN a session's own `resume`/`clear`/`compact` events anymore (a
-    `fork` doesn't count here -- it mints a marker for the fork's brand-new
-    session_id, per `hooks/record_session_id.py`'s own docstring, not a
-    refresh of the parent session's existing one) -- a single session that
-    runs longer than the TTL without hitting one of those events can have
-    its still-live marker swept by another session's sweep (tracked as
-    issue #233).
+    older than `CLAUDE_RUNWAY_SESSION_MARKER_TTL_HOURS` (default 168h / 1
+    week) -- see `sweep_stale_shadow_markers`/`should_sweep`/`mark_swept`.
+    Bounded to run at most once per hour (a sentinel file's mtime, not a
+    counter) so sweep cost doesn't scale with total sessions-directory size
+    on every session lifecycle event. The hook always refreshes its OWN
+    marker before sweeping (see that script), so a live session can never
+    observe its own marker as stale and prune itself AT the moment a
+    lifecycle event fires. Unlike the old `PostToolUse` registration,
+    nothing refreshes a marker BETWEEN a session's own
+    `resume`/`clear`/`compact` events anymore (a `fork` doesn't count here
+    -- it mints a marker for the fork's brand-new session_id, per
+    `hooks/record_session_id.py`'s own docstring, not a refresh of the
+    parent session's existing one) -- a single session that runs longer
+    than the TTL without hitting one of those events can have its
+    still-live marker swept by another session's sweep. Issue #233 raised
+    the default from 48h to 168h to shrink this window, but didn't
+    eliminate it -- a session outliving 168h with no such event is still
+    exposed; the more complete fix
+    (falling back to TRANSCRIPT_SCAN when SHADOW_FILE is stale) is tracked
+    separately as issue #236 (#233 originally miscited #213/#214 for this --
+    both are closed, unrelated dedup tickets; corrected on PR #235 review).
 """
 
 from __future__ import annotations
@@ -344,7 +350,7 @@ def _session_id_from_shadow_file(project: Optional[str]) -> Optional[str]:
 
 # --- Layer 2: crash-safety sweep, rate-limited via a sentinel file ----------
 
-_DEFAULT_SESSION_MARKER_TTL_HOURS = 48.0
+_DEFAULT_SESSION_MARKER_TTL_HOURS = 168.0  # 1 week (issue #233, up from 48h)
 _SWEEP_INTERVAL_SECONDS = 3600  # bound sweep cost to roughly once per hour per project
 _SENTINEL_FILENAME = ".last_sweep"
 
@@ -403,7 +409,7 @@ def mark_swept(now: Optional[float] = None) -> None:
 def sweep_stale_shadow_markers(now: Optional[float] = None) -> int:
     """
     Deletes every `session_*.jsonl` marker older than the TTL
-    (`CLAUDE_RUNWAY_SESSION_MARKER_TTL_HOURS`, default 48h). Only ever
+    (`CLAUDE_RUNWAY_SESSION_MARKER_TTL_HOURS`, default 168h / 1 week). Only ever
     considers this module's own `session_*.jsonl` markers -- never touches
     a bare `<session_id>.jsonl` file, since those belong to
     `savings_ledger`'s own event log (present in the same directory for

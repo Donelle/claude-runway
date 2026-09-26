@@ -221,7 +221,11 @@ class ShadowFileSweep(SessionIdLibTestCase):
     def test_sweep_deletes_markers_older_than_ttl(self):
         L.record_shadow_marker("sess-old", project="/repos/proj-a")
         old_path = L._shadow_marker_path("sess-old")
-        very_old = time.time() - (49 * 3600)  # older than the 48h default
+        # Derived from the real constant (not hand-typed) so this doesn't
+        # silently go stale the next time the default TTL changes -- same
+        # class of drift EVALUATION.md already flags for hardcoded numbers
+        # (issues #22/#23).
+        very_old = time.time() - ((L._DEFAULT_SESSION_MARKER_TTL_HOURS + 1) * 3600)
         os.utime(old_path, (very_old, very_old))
         L.record_shadow_marker("sess-fresh", project="/repos/proj-a")
 
@@ -275,9 +279,20 @@ class ShadowFileSweep(SessionIdLibTestCase):
     def test_invalid_ttl_env_var_falls_back_to_default(self):
         os.environ["CLAUDE_RUNWAY_SESSION_MARKER_TTL_HOURS"] = "not-a-number"
         L.record_shadow_marker("sess-a", project="/repos/proj-a")
-        # Fresh marker, well under the 48h default -- must survive.
+        # Fresh marker, well under the default TTL -- must survive.
         deleted = L.sweep_stale_shadow_markers()
         self.assertEqual(deleted, 0)
+
+    def test_default_ttl_is_168_hours(self):
+        # Pins issue #233's fix directly: SessionStart-based refresh (#231)
+        # only resets a marker's mtime on resume/clear/compact, not on
+        # every tool call, so the default TTL was raised from 48h to 168h
+        # (1 week) to shrink the window where a long-running session's
+        # marker can be swept out from under it. A future accidental
+        # revert of the constant fails HERE, not just as a side effect of
+        # a timing test elsewhere.
+        self.assertEqual(L._ttl_hours(), 168.0)
+        self.assertEqual(L._DEFAULT_SESSION_MARKER_TTL_HOURS, 168.0)
 
     def test_non_positive_ttl_env_var_falls_back_to_default(self):
         # "0" and negative values parse fine via float() without raising,

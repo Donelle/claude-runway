@@ -18,8 +18,9 @@ this SAME script:
     resume, clear, compact, fork): writes this session's own marker ONCE,
     then -- rate-limited via a sentinel file, roughly once per hour --
     sweeps any marker older than `CLAUDE_RUNWAY_SESSION_MARKER_TTL_HOURS`
-    (default 48). Writing self BEFORE sweeping guarantees a live session
-    can never observe its own marker as stale and prune itself. Firing on
+    (default 168h / 1 week -- issue #233). Writing self BEFORE sweeping
+    guarantees a live session can never observe its own marker as stale
+    and prune itself. Firing on
     ALL start types ensures correctness across the full session lifecycle:
     `startup`/`fork` create a new marker for a brand-new session_id;
     `resume`/`clear`/`compact` refresh the mtime for an already-known one.
@@ -52,7 +53,7 @@ Setup: see templates/settings.json.template's core SessionStart/SessionEnd
 blocks -- nothing needs to be copied into a target project, same convention
 as every other hook in this repo.
 
-Env vars: `CLAUDE_RUNWAY_SESSION_MARKER_TTL_HOURS` (shell-only, default 48;
+Env vars: `CLAUDE_RUNWAY_SESSION_MARKER_TTL_HOURS` (shell-only, default 168h;
 see libs/session_id_lib.py's `_ttl_hours()`).
 """
 
