@@ -140,6 +140,16 @@ except ImportError:
 
 TRACK_SAVINGS = _SAVINGS_LEDGER_AVAILABLE and savings_ledger.tracking_enabled()
 
+# metrics_lib is likewise optional at import time (issue #208) -- same
+# fail-open reasoning as savings_ledger above: an older checkout of just this
+# file, without libs/metrics_lib.py, must not crash server startup over a
+# brand-new, still domain-empty store.
+try:
+    import metrics_lib
+    _METRICS_LIB_AVAILABLE = True
+except ImportError:
+    _METRICS_LIB_AVAILABLE = False
+
 COMPACT_QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
 COMPACT_QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY")
 COMPACT_COLLECTION = os.environ.get("COMPACT_COLLECTION", "conversation-compacts")
@@ -1933,6 +1943,68 @@ def savings_trend(project: Optional[str] = None, bucket: str = "week", n: int = 
         # Same reasoning as savings_summary's try/except -- best-effort feature,
         # must not fail the tool call over a DB problem.
         return f"Error: could not read savings data ({e}). The savings database may be corrupted or inaccessible; this doesn't affect anything else."
+
+
+@mcp.tool()
+def get_metrics(metric_id: str, view: str = "summary", bucket: str = "week", n: int = 12, format: str = "text") -> str:
+    """
+    Reads the shared cross-tool metrics store (issue #208): ONE generic
+    SQLite table any domain in this toolkit can write into via
+    `libs/metrics_lib.py`'s `MetricsStore` class, aggregated here into
+    whichever `view` is requested. Deliberately the ONLY new tool this
+    ticket adds (see `libs/metrics_lib.py`'s module docstring for why a
+    single generic dispatch tool matters here specifically) -- a future
+    domain writing a new `metric_id` never needs a new tool, only a new
+    value passed to this one.
+
+    No domain writes into this store yet as of this ticket landing (see
+    issue #208's "Explicitly out of scope" section) -- every view below
+    returns an honest "no events recorded yet" result for any metric_id
+    until a future ticket migrates a real domain onto it.
+
+    metric_id: the domain to query (e.g. "autowork", "memory-bank") --
+      whatever string a future writer used when calling `record()`/
+      `increment()`/`decrement()`.
+
+    view controls which aggregation to return:
+      "summary"       (default) — total event count + total value across
+                       every event_type for this metric_id.
+      "by_event_type"           — per-event_type breakdown, largest total
+                       value first.
+      "trend"                   — day/week-bucketed history (see `bucket`/`n`).
+
+    bucket ("day" or "week", default "week") and n (max buckets, default 12)
+      only apply to view="trend" — ignored otherwise.
+
+    format controls the output format:
+      "text" (default) — human-readable text.
+      "json"            — JSON object with keys "view"/"data".
+    """
+    if not _METRICS_LIB_AVAILABLE:
+        return "Error: libs/metrics_lib.py is not available in this install -- get_metrics requires it."
+    if view not in ("summary", "by_event_type", "trend"):
+        return f"Error: unrecognised view {view!r}. Valid values: 'summary', 'by_event_type', 'trend'."
+    if format not in ("text", "json"):
+        return f"Error: unrecognised format {format!r}. Valid values: 'text', 'json'."
+    if bucket not in ("day", "week"):
+        return f"Error: unrecognised bucket {bucket!r}. Valid values: 'day', 'week'."
+    if not isinstance(n, int) or n < 1:
+        return "Error: n must be a positive integer."
+    try:
+        store = metrics_lib.MetricsStore()
+        if view == "summary":
+            summary_data = store.summary(metric_id)
+            return metrics_lib.format_json("summary", summary_data) if format == "json" else metrics_lib.format_summary_view(summary_data)
+        if view == "by_event_type":
+            by_type_data = store.by_event_type(metric_id)
+            return metrics_lib.format_json("by_event_type", by_type_data) if format == "json" else metrics_lib.format_by_event_type_view(metric_id, by_type_data)
+        # view == "trend"
+        trend_data = store.trend(metric_id, bucket=bucket, n=n)
+        return metrics_lib.format_json("trend", trend_data) if format == "json" else metrics_lib.format_trend_view(metric_id, trend_data, bucket=bucket)
+    except Exception as e:
+        # Same reasoning as savings_summary's try/except -- best-effort feature,
+        # must not fail the tool call over a DB problem.
+        return f"Error: could not read metrics data ({e}). The metrics database may be corrupted or inaccessible; this doesn't affect anything else."
 
 
 if __name__ == "__main__":

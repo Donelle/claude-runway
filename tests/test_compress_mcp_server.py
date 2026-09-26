@@ -1030,6 +1030,7 @@ class LogFixedOverheadEnumeratesRegisteredTools(unittest.TestCase):
                 "savings_summary",
                 "savings_detail",
                 "savings_trend",
+                "get_metrics",
             },
         )
         self.assertIn("schema_overhead_tokens", captured)

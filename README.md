@@ -11,7 +11,7 @@ Each piece works independently — you don't need LM Studio to use the Qdrant me
 
 ## Table of contents
 
-- [Files (36)](#files-36)
+- [Files (38)](#files-38)
 - [Prerequisites](docs/prerequisites.md)
   - [Windows GPU setup for LM Studio](docs/windows-setup.md)
 - [Installation](docs/installation.md)
@@ -24,11 +24,12 @@ Each piece works independently — you don't need LM Studio to use the Qdrant me
   - [fetch_url vs. WebFetch vs. the hooks](docs/skills-and-hooks.md#fetch_url-vs-webfetch-vs-the-hooks)
 - [Session continuity skills](docs/session-continuity.md)
 - [Savings tracker](docs/savings-tracker.md)
+- [Shared metrics store](docs/metrics.md)
 - [Development workflow for this repo](docs/development-workflow.md)
 - [EVALUATION.md](EVALUATION.md) — measuring whether this actually reduces token usage
 - [Known limitations](#known-limitations)
 
-## Files (36)
+## Files (38)
 
 | File                              | Purpose                                                                                                                                                                                                                   |
 | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -55,6 +56,7 @@ Each piece works independently — you don't need LM Studio to use the Qdrant me
 | `tools/compress_mcp_server.py`    | MCP server exposing `compress_file`, `compress_command_output`, `fetch_url`, `compress_text`, `list_local_models`, the session-continuity tools `compact_store`/`compact_find`/`compact_prune` (see [Session continuity skills](docs/session-continuity.md)), and (for the opt-in savings tracker) `savings_summary`/`savings_detail`/`savings_trend`, backed by a local LM Studio model. Run `python tools/report_tool_counts.py` for the live tool count and schema-token cost rather than trusting a number written here. Still a draft — design notes and open questions are in the file's docstring. |
 | `libs/savings_ledger.py`          | Shared, dependency-light storage + formatting for the opt-in savings tracker (see [Savings tracker](docs/savings-tracker.md)). Two-tier storage (transient per-session JSONL, perpetual per-project SQLite) behind a small function-based interface — swapping SQLite for another backend later only touches this file. |
 | `libs/session_id_lib.py`          | Shared module classifying every way this toolkit's MCP-server/hook code can get or approximate a `session_id`, behind one `session_id(strategy, ...)` entry point with four strategies (`HOOK_PAYLOAD`, `SHADOW_FILE`, `TRANSCRIPT_SCAN`, `PROXY`) — see the module's own docstring for the full decision table. `SHADOW_FILE` is kept populated by `hooks/record_session_id.py` below, deliberately independent of `libs/savings_ledger.py` (same sessions directory convention, no code dependency). |
+| `libs/metrics_lib.py`             | Shared, generic cross-tool metrics store (see [Shared metrics store](docs/metrics.md)) — a `MetricsStore` class over ONE SQLite table (`~/.claude/claude-runway/metrics.db`) any domain can write append-only events into via `record`/`increment`/`decrement`, aggregated via `summary`/`by_event_type`/`trend`. Infrastructure only as of this ticket — no domain writes into it yet; migrating `savings_ledger.py`/`memory_events_lib.py` or `my-gh-autowork`'s own run metrics onto it are separate follow-ups. |
 | `templates/mcp.json.template`     | Per-project Claude Code config wiring up the `qdrant-find`/`qdrant-store` server, the `codebase-indexer` server, the `memory-bank` server (issue #175 — its `MEMORY_BANK_COLLECTION` is the ONE collection shared across every project, unlike `qdrant`/`codebase-indexer`'s per-project `COLLECTION_NAME`), and (optionally) `local-compress` (which uses neither — its own `COMPACT_COLLECTION` plus project-derived suffixing) to the same project. |
 | `templates/CLAUDE.md.template`    | Usage rules for Claude covering when to reach for each tool (and when NOT to) — copy the relevant section(s) into a project's `CLAUDE.md`. Note: CLAUDE.md guidance only applies to open-ended prompts, not skills — see [Skills and hooks](docs/skills-and-hooks.md). |
 | `templates/settings.json.template` | Two tiers of hook config: a CORE `PostToolUse`/`SessionEnd` pair (always included, only `--skip-hooks` omits it) registering `hooks/record_session_id.py` below; and an optional, local-compress-gated `PostToolUse` block that compresses tool output over a size threshold — by size, not by a hardcoded list of commands, apart from the byte-exact Bash exemptions in [Skills and hooks](docs/skills-and-hooks.md#exactness-critical-commands-bash-only). See [Skills and hooks](docs/skills-and-hooks.md).                                                                  |
@@ -65,6 +67,7 @@ Each piece works independently — you don't need LM Studio to use the Qdrant me
 | `skills/my-compact/SKILL.md`      | Slash command that summarizes the current conversation via LM Studio and stores it in Qdrant — a local alternative to native `/compact`. See [Session continuity skills](docs/session-continuity.md). |
 | `skills/my-resume/SKILL.md`       | Slash command that retrieves a stored session compact from Qdrant by project and label, and restores it into a fresh session. See [Session continuity skills](docs/session-continuity.md). |
 | `skills/my-savings/SKILL.md`      | Slash command that shows the savings tracker's simple or detail view (`/my-savings` / `/my-savings detail`). See [Savings tracker](docs/savings-tracker.md). |
+| `skills/my-metrics/SKILL.md`      | Slash command that shows a view of the shared cross-tool metrics store for a given `metricId` (`/my-metrics <metricId> [view] [bucket]`). See [Shared metrics store](docs/metrics.md). |
 | `skills/my-setup-clauderunway/SKILL.md` | Slash command that interactively configures a target project for ClaudeRunway — runs `setup_project.py` with guided options and also handles the `CLAUDE.md` update step that the CLI doesn't do. Requires `CLAUDE_RUNWAY_DIR` to be exported. Install to `~/.claude/skills/` and run `/my-setup-clauderunway` from any project you want to configure. |
 | `tests/test_compress_bash_output.py` | Table tests for the Bash exactness-critical exempt list (see [Exactness-critical commands](docs/skills-and-hooks.md#exactness-critical-commands-bash-only)). Stdlib `unittest`, no network — run with `.venv/bin/python -m unittest discover -s tests`. The exempt list is the one place here where a regex mistake is silent in *both* directions (a false positive forfeits savings unnoticed; a false negative reintroduces the lossy-`git` bug), so the cases are pinned rather than reasoned about. |
 | `EVALUATION.md`                   | A plan for measuring whether this actually reduces token usage, rather than assuming it does — covers both the Qdrant memory piece and the local-compress piece as separate tracks, plus Track C for the session continuity skills, plus hard-won lessons on measuring `/usage` cleanly. |
