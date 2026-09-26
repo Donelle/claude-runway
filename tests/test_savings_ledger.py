@@ -66,8 +66,16 @@ class SavingsLedgerTestCase(unittest.TestCase):
             session_id_lib, "_sessions_dir", return_value=db_path.parent / "sessions"
         )
         self._session_id_lib_sessions_patch.start()
+        # Same for TRANSCRIPT_SCAN's fallback: without this, a real live Claude
+        # Code transcript under ~/.claude/projects/ for a checkout whose
+        # basename matches a test's project (e.g. "claude-runway") leaks in.
+        self._session_id_lib_projects_patch = mock.patch.object(
+            session_id_lib, "_transcript_projects_dir", return_value=db_path.parent / "projects"
+        )
+        self._session_id_lib_projects_patch.start()
 
     def tearDown(self):
+        self._session_id_lib_projects_patch.stop()
         self._session_id_lib_sessions_patch.stop()
         self._env_patch.stop()
         self._tmpdir.cleanup()
