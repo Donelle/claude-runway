@@ -23,8 +23,10 @@ specifically during issue #206's own research; the wheel `data` category's
 pipx behaves the same way).
 """
 
+import importlib.util
 import os
 import sys
+from typing import Any, Callable
 
 
 def _add_src_to_sys_path() -> None:
@@ -33,10 +35,33 @@ def _add_src_to_sys_path() -> None:
         sys.path.insert(0, src_dir)
 
 
+def _load_tool_main(name: str) -> "Callable[[], Any]":
+    """
+    Load <env>/src/tools/<name>.py by exact file path, under a unique module
+    name, and return its `main`. NOT `from tools.<name> import main`:
+    <env>/src/tools has no __init__.py, so it's only a namespace-package
+    portion, and Python prefers ANY regular `tools` package anywhere on
+    sys.path (another dependency's, or one on PYTHONPATH) over a namespace
+    portion, even one earlier on sys.path -- the command would then fail with
+    ModuleNotFoundError or run unrelated code. Each tools/*.py script puts
+    its own sibling libs/ on sys.path relative to its __file__, so loading
+    it by path needs nothing else.
+    """
+    path = os.path.join(sys.prefix, "src", "tools", f"{name}.py")
+    module_name = f"_claude_runway_tool_{name}"
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"claude-runway: can't load {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module.main  # type: ignore[no-any-return]
+
+
 def ingest_main() -> None:
     """Entry point for the `claude-runway-ingest` console script."""
     _add_src_to_sys_path()
-    from tools.ingest_to_qdrant import main
+    main = _load_tool_main("ingest_to_qdrant")
 
     main()
 
@@ -44,7 +69,7 @@ def ingest_main() -> None:
 def setup_main() -> None:
     """Entry point for the `claude-runway-setup` console script."""
     _add_src_to_sys_path()
-    from tools.setup_project import main
+    main = _load_tool_main("setup_project")
 
     main()
 
@@ -59,6 +84,6 @@ def doctor_main() -> int:
     doctor-detected mismatch into a false "exit 0".
     """
     _add_src_to_sys_path()
-    from tools.doctor import main
+    main = _load_tool_main("doctor")
 
-    return main()
+    return int(main())
