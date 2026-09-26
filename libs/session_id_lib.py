@@ -300,16 +300,16 @@ def _session_id_from_shadow_file(
     """
     Scans the sessions directory for the most-recently-modified
     `session_*.jsonl` marker, filtered by project. Unlike TRANSCRIPT_SCAN,
-    this strategy never evaluates `project` as a path -- `_sessions_dir()`
-    is a fixed, shared location regardless of `project`, and a marker's own
-    recorded project (however it was written -- `record_shadow_marker`
-    happens to store an absolute path today) is reduced to
-    `Path(marker_project).name` before comparing, so only a bare name is
-    ever actually compared against. `project` is therefore accepted AS
-    GIVEN -- a bare name like `"claude-runway"` -- with no `os.path.isabs`
-    requirement and no `os.getcwd()` fallback (contrast with
-    TRANSCRIPT_SCAN/`_resolve_project`, which genuinely need a real
-    absolute path to derive Claude Code's own `<slug>` directory name).
+    this strategy never evaluates `project` as a path for the primary scan
+    -- `_sessions_dir()` is a fixed, shared location regardless of
+    `project`, and a marker's own recorded project (however it was written
+    -- `record_shadow_marker` happens to store an absolute path today) is
+    reduced to `Path(marker_project).name` before comparing, so only a bare
+    name is ever actually compared against. `project` is therefore accepted
+    AS GIVEN -- a bare name like `"claude-runway"` -- with no
+    `os.path.isabs` requirement (contrast with TRANSCRIPT_SCAN/
+    `_resolve_project`, which genuinely need a real absolute path to derive
+    Claude Code's own `<slug>` directory name).
 
     Passing `None` does NOT mean "no filter" here -- a marker's basename
     can never equal `None`, so an omitted `project` always returns `None`
@@ -319,10 +319,14 @@ def _session_id_from_shadow_file(
     semantics) must implement that itself rather than relying on this
     strategy's `None` to mean the same thing.
 
-    Returns None if the directory doesn't exist, is empty, or no marker
-    matches the given project -- never substitutes a DIFFERENTLY-NAMED
-    project's session id, the same caution
+    Returns None if the directory doesn't exist, is empty, or the
+    swept-marker fallback (see below) also finds nothing -- never
+    substitutes a DIFFERENTLY-NAMED project's session id, the same caution
     savings_ledger.current_session_id() applies for the identical reason.
+    Exception: when no matching marker is found AND the MCP process's own
+    cwd basename matches `project`, the swept-marker fallback calls
+    `os.getcwd()` and delegates to TRANSCRIPT_SCAN with that path (see
+    below for the full guard logic).
 
     **Stale-marker fallback (issue #236):** if the most-recently-modified
     matching marker is older than `CLAUDE_RUNWAY_SESSION_MARKER_TTL_HOURS`,
@@ -336,6 +340,27 @@ def _session_id_from_shadow_file(
     TRANSCRIPT_SCAN also returns None, None is returned -- SHADOW_FILE never
     fabricates a session_id. `now` is injectable for testing (defaults to
     `time.time()`).
+
+    **Swept-marker fallback (issue #253):** if NO matching marker is found
+    at all (every marker for this project has been swept by
+    `sweep_stale_shadow_markers()`), calls `os.getcwd()` and -- if its
+    basename matches `project` -- passes it directly to
+    `_session_id_from_transcript_scan(cwd)`. This is less precise than the
+    stale-marker fallback (which uses the marker's own recorded absolute
+    path), but better than None for the common case where the MCP server is
+    running from the project directory. `_resolve_project` is NOT involved
+    on this path; the cwd guard means TRANSCRIPT_SCAN always receives a
+    real, already-validated absolute path, never None.
+
+    To preserve `current_session_id`'s cross-project guarantee (issue #35),
+    the fallback only fires when `Path(os.getcwd()).name == project` --
+    i.e. when the MCP server's own cwd belongs to the requested project. If
+    the cwd belongs to a DIFFERENT project (e.g. the server was started from
+    `/repos/projectA` but the caller asked about `"projectB"`), returning
+    projectA's session_id labeled as projectB's would be worse than None.
+
+    Only attempted when `project` is not None -- a marker's basename can
+    never equal None, so there is nothing to scope the fallback to either.
 
     Known limitation (project-scoping is by BASENAME, not full path): two
     distinct projects that happen to share the same final path component
@@ -354,8 +379,6 @@ def _session_id_from_shadow_file(
             dated.append((p.stat().st_mtime, p))
         except OSError:
             continue  # a concurrent SessionEnd cleanup can delete a marker mid-scan
-    if not dated:
-        return None
     dated.sort(key=lambda pair: pair[0], reverse=True)
 
     for mtime, p in dated:
@@ -378,6 +401,25 @@ def _session_id_from_shadow_file(
                 # using the recorded absolute path is always the right anchor).
                 return _session_id_from_transcript_scan(marker_project)
             return _strip_marker_prefix(p.stem)
+    # No matching marker found at all -- either the sessions dir is empty (all
+    # markers swept) or no marker in the dir belongs to the requested project.
+    # Fall back to TRANSCRIPT_SCAN as a last resort (issue #253): it reads
+    # Claude Code's own undocumented project-transcript directory and has zero
+    # hook dependency, so it can still find a live session even when every
+    # shadow marker for the project is gone.
+    #
+    # Guard: only use cwd when its basename matches the requested project --
+    # if the MCP server is running from a DIFFERENT project's directory,
+    # returning that project's session_id labeled as `project`'s would violate
+    # current_session_id()'s cross-project guarantee (issue #35). A non-matching
+    # cwd is no better than None here.
+    if project is not None:
+        try:
+            cwd = os.getcwd()
+        except OSError:
+            return None
+        if Path(cwd).name == project:
+            return _session_id_from_transcript_scan(cwd)
     return None
 
 

@@ -471,11 +471,60 @@ class ShadowFileStaleMarkerFallback(SessionIdLibTestCase):
         self.assertIsNone(result)
         mock_scan.assert_called_once_with("/repos/myapp")
 
-    def test_no_matching_marker_at_all_returns_none_without_transcript_fallback(self):
-        # No marker for "myapp" exists -- returns None, TRANSCRIPT_SCAN not called.
-        self.sessions_dir.mkdir(parents=True)
+    def test_no_matching_marker_at_all_falls_back_to_transcript_scan(self):
+        # Issue #253: when the sessions dir has markers but none match the
+        # requested project (all swept by sweep_stale_shadow_markers()), fall
+        # back to TRANSCRIPT_SCAN with the MCP server's cwd (not None) when the
+        # cwd's basename matches the requested project.
+        # Contrast with the stale-marker case (issue #236), where the marker's
+        # own recorded absolute path is used so TRANSCRIPT_SCAN always scans the
+        # right project root regardless of cwd.
+        L.record_shadow_marker("sess-other", project="/repos/other-project")
+        with mock.patch.object(os, "getcwd", return_value="/repos/myapp"):
+            with mock.patch.object(L, "_session_id_from_transcript_scan", return_value="live-from-ts") as mock_scan:
+                result = L._session_id_from_shadow_file("myapp")  # "myapp" has no marker
+        self.assertEqual(result, "live-from-ts")
+        mock_scan.assert_called_once_with("/repos/myapp")
+
+    def test_no_matching_marker_transcript_scan_returns_none(self):
+        # Issue #253: TRANSCRIPT_SCAN is called but also finds nothing -- None returned.
+        L.record_shadow_marker("sess-other", project="/repos/other-project")
+        with mock.patch.object(os, "getcwd", return_value="/repos/myapp"):
+            with mock.patch.object(L, "_session_id_from_transcript_scan", return_value=None) as mock_scan:
+                result = L._session_id_from_shadow_file("myapp")
+        self.assertIsNone(result)
+        mock_scan.assert_called_once_with("/repos/myapp")
+
+    def test_cwd_mismatch_skips_swept_marker_fallback(self):
+        # Cross-project guard (issue #35): if the MCP server's cwd basename
+        # does NOT match the requested project, skip the fallback -- returning
+        # the wrong project's session_id would be worse than returning None.
+        L.record_shadow_marker("sess-other", project="/repos/other-project")
+        with mock.patch.object(os, "getcwd", return_value="/repos/projectA"):
+            with mock.patch.object(L, "_session_id_from_transcript_scan") as mock_scan:
+                result = L._session_id_from_shadow_file("projectB")
+        self.assertIsNone(result)
+        mock_scan.assert_not_called()
+
+    def test_empty_sessions_dir_falls_back_to_transcript_scan_on_cwd_match(self):
+        # Issue #253 (Copilot review fix): when the project's last marker was
+        # swept AND it was the only marker (dated is empty), the fallback must
+        # still fire -- the early `if not dated: return None` was removed to
+        # cover this case.
+        self.sessions_dir.mkdir(parents=True)  # dir exists but empty
+        with mock.patch.object(os, "getcwd", return_value="/repos/myapp"):
+            with mock.patch.object(L, "_session_id_from_transcript_scan", return_value="ts-result") as mock_scan:
+                result = L._session_id_from_shadow_file("myapp")
+        self.assertEqual(result, "ts-result")
+        mock_scan.assert_called_once_with("/repos/myapp")
+
+    def test_project_none_with_swept_markers_skips_transcript_fallback(self):
+        # project=None means no marker's basename can ever equal None --
+        # there is nothing to scope the fallback to, so TRANSCRIPT_SCAN
+        # must NOT be called when project is None, even when markers exist.
+        L.record_shadow_marker("sess-other", project="/repos/other-project")
         with mock.patch.object(L, "_session_id_from_transcript_scan") as mock_scan:
-            result = L._session_id_from_shadow_file("myapp")
+            result = L._session_id_from_shadow_file(None)
         self.assertIsNone(result)
         mock_scan.assert_not_called()
 
