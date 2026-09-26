@@ -1,3 +1,5 @@
+# Not a rogue folder. This exists so 'claude-runway-setup'/'claude-runway-ingest'/
+# 'claude-runway-doctor' work as installed commands in the pipx/uv install path.
 """
 Tiny importable shim package backing claude-runway's 3 console-script entry
 points (issue #206). Exists purely to bridge a gap `[project.scripts]`
