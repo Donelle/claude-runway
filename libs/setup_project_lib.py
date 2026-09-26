@@ -45,7 +45,18 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
+
+# Flat import, not a package-relative one: every libs/*.py module lives in
+# the same libs/ directory, which callers (tools/setup_project.py, test
+# harnesses) add to sys.path directly rather than treating libs/ as a real
+# Python package -- see e.g. libs/memory_bank_lib.py's own
+# `from qdrant_retry import ...`. qdrant_ingest_lib.py stays importable
+# without `fastembed`/`qdrant-client` installed (warm_fastembed_cache
+# imports fastembed lazily, inside the function, only when actually
+# called), so this doesn't add a real dependency to this otherwise
+# dependency-free module.
+from qdrant_ingest_lib import warm_fastembed_cache
 
 
 def default_collection_name(repo_path: Path) -> str:
@@ -133,6 +144,18 @@ def find_unresolved_placeholders(value: object) -> list:
     return found
 
 
+def resolved_fastembed_cache_path(home_dir: Path) -> Path:
+    """
+    Single source of truth for where a generated `.mcp.json`'s `qdrant`
+    server's `FASTEMBED_CACHE_PATH` points -- factored out of
+    `build_mcp_servers` (issue #221) so `run_setup`'s own fastembed-warm-up
+    step (which needs this SAME path to warm/verify before deciding whether
+    `HF_HUB_OFFLINE=1` is safe to write) can't drift from what actually gets
+    written into the config.
+    """
+    return home_dir / ".claude" / "claude-runway" / "fastembed-cache"
+
+
 def build_mcp_servers(
     template: dict,
     *,
@@ -153,6 +176,7 @@ def build_mcp_servers(
     memory_bank_collection: str = "",
     memory_bank_id: str = "",
     include_compress: bool = True,
+    hf_hub_offline: bool = False,
 ) -> dict:
     """
     Returns a fresh `mcpServers` dict (deep-copied from `template`, never
@@ -245,6 +269,23 @@ def build_mcp_servers(
     run (the same pattern already used for `--qdrant-url`/`--collection-
     name`/etc. -- none of this CLI's other options are "sticky" either) is
     what keeps it from reverting.
+
+    `hf_hub_offline` (issue #221) is deliberately NOT something this
+    function decides for itself -- it stays a pure computation over an
+    already-decided bool, computed by `run_setup`'s own fastembed-warm-up
+    step (see `qdrant_ingest_lib.warm_fastembed_cache`) BEFORE calling this
+    function, since deciding it here would require this function to make a
+    live network call / touch disk beyond the template, breaking the "pure,
+    no network/disk side effects" property every existing test of this
+    function (and every OTHER caller) already relies on. When True, writes
+    `HF_HUB_OFFLINE=1` into the qdrant server's env block -- confirmed
+    directly that this cuts `mcp-server-qdrant`'s own startup from ~59.6s to
+    ~2.0s against an already-warm cache, by skipping the live
+    huggingface.co revision-resolution call `fastembed`'s `TextEmbedding`
+    otherwise always makes even on a cache hit. Never left unset either way
+    (same "present-but-blank, not absent" convention as
+    `CLAUDE_RUNWAY_TRACK_SAVINGS`/`compact_collection`/etc. above) --
+    `False` writes an explicit empty string, not a missing key.
     """
     servers = copy.deepcopy(template["mcpServers"])
     venv_python_str = venv_python.as_posix()
@@ -263,9 +304,8 @@ def build_mcp_servers(
     qdrant["env"]["QDRANT_URL"] = qdrant_url
     qdrant["env"]["QDRANT_API_KEY"] = qdrant_api_key
     qdrant["env"]["COLLECTION_NAME"] = collection_name
-    qdrant["env"]["FASTEMBED_CACHE_PATH"] = (
-        home_dir / ".claude" / "claude-runway" / "fastembed-cache"
-    ).as_posix()
+    qdrant["env"]["FASTEMBED_CACHE_PATH"] = resolved_fastembed_cache_path(home_dir).as_posix()
+    qdrant["env"]["HF_HUB_OFFLINE"] = "1" if hf_hub_offline else ""
 
     resolved_memory_bank_collection = memory_bank_collection or "memory-bank"
     resolved_memory_bank_id = memory_bank_id or collection_name
@@ -632,15 +672,34 @@ def run_setup(
     clean_hooks_if_unused: bool = False,
     home_dir: Optional[Path] = None,
     templates_dir: Optional[Path] = None,
+    attempt_fastembed_warmup: bool = False,
+    fastembed_warmup_fn: Optional[Callable[..., bool]] = None,
 ) -> SetupResult:
     """
-    Pure computation (no disk writes) of the final `.mcp.json`/`.claude/
-    settings.json` contents for `target_repo`. The caller (the CLI in
-    tools/setup_project.py) is responsible for actually writing the result
-    or printing it for --dry-run. Reads the target repo's CURRENT files if
-    they already exist, so re-running this (or running it against a repo
-    with pre-existing unrelated config) merges rather than clobbers -- see
-    merge_mcp_json/merge_settings_hooks.
+    Pure computation (no disk writes to `target_repo`, with one deliberate
+    exception -- see `attempt_fastembed_warmup` below) of the final
+    `.mcp.json`/`.claude/settings.json` contents for `target_repo`. The
+    caller (the CLI in tools/setup_project.py) is responsible for actually
+    writing the result or printing it for --dry-run. Reads the target repo's
+    CURRENT files if they already exist, so re-running this (or running it
+    against a repo with pre-existing unrelated config) merges rather than
+    clobbers -- see merge_mcp_json/merge_settings_hooks.
+
+    `attempt_fastembed_warmup` (issue #221, default False -- opt-in, so
+    every EXISTING caller/test of this function keeps its current
+    network/disk-free behavior unchanged) is that one deliberate exception:
+    when True, this calls `qdrant_ingest_lib.warm_fastembed_cache` (or
+    `fastembed_warmup_fn` if given -- tests inject a fake here so they never
+    import real `fastembed` or touch the network) BEFORE building the
+    qdrant server's env block, using the SAME `EMBEDDING_MODEL` string
+    already baked into `mcp.json.template` and the SAME
+    `FASTEMBED_CACHE_PATH` this run is about to write (via
+    `resolved_fastembed_cache_path`) -- so the thing that gets
+    warmed/verified is always the thing the generated config actually
+    points at. The CLI passes `attempt_fastembed_warmup=not args.dry_run`: a
+    preview shouldn't have network/disk side effects. Whether this succeeds
+    or not, a `changes` entry records the outcome so both --dry-run and a
+    real run surface it.
 
     `include_hooks=False` corresponds to the CLI's `--skip-hooks`: don't
     touch `.claude/settings.json` at all, even if it already has this
@@ -671,6 +730,22 @@ def run_setup(
     resolved_memory_bank_id = memory_bank_id or resolved_collection_name
 
     mcp_template = load_json(templates_dir / "mcp.json.template")
+
+    # Issue #221: decide -- BEFORE building the qdrant server's env block --
+    # whether it's safe to set HF_HUB_OFFLINE=1, so mcp-server-qdrant's own
+    # startup never pays for a live huggingface.co round-trip against a
+    # model that's already fully cached. Uses the exact same
+    # EMBEDDING_MODEL/FASTEMBED_CACHE_PATH values this run is about to
+    # write, so what gets warmed/verified always matches what the generated
+    # config actually points at. Opt-in (default False) and injectable
+    # (fastembed_warmup_fn) so every existing caller/test is unaffected.
+    hf_hub_offline = False
+    if attempt_fastembed_warmup:
+        warmup_fn = fastembed_warmup_fn or warm_fastembed_cache
+        embedding_model = mcp_template["mcpServers"]["qdrant"]["env"]["EMBEDDING_MODEL"]
+        fastembed_cache_path = resolved_fastembed_cache_path(home_dir)
+        hf_hub_offline = bool(warmup_fn(embedding_model, fastembed_cache_path))
+
     generated_servers = build_mcp_servers(
         mcp_template,
         collection_name=resolved_collection_name,
@@ -690,6 +765,7 @@ def run_setup(
         memory_bank_collection=memory_bank_collection,
         memory_bank_id=memory_bank_id,
         include_compress=include_compress,
+        hf_hub_offline=hf_hub_offline,
     )
     unresolved = find_unresolved_placeholders(generated_servers)
     if unresolved:
@@ -701,6 +777,14 @@ def run_setup(
     existing_mcp = load_json(mcp_json_path) if mcp_json_path.exists() else {}
     final_mcp = merge_mcp_json(existing_mcp, generated_servers)
     changes = [f"mcpServers ({', '.join(sorted(generated_servers))}) -> {mcp_json_path}"]
+    if attempt_fastembed_warmup:
+        changes.append(
+            "Confirmed the fastembed cache is warm; HF_HUB_OFFLINE=1 set for the qdrant server (issue #221)."
+            if hf_hub_offline
+            else "Could not confirm the fastembed cache is fully warm -- HF_HUB_OFFLINE left blank, so the "
+            "qdrant server's startup may still occasionally pay for a slow huggingface.co round-trip "
+            "(issue #221). Safe to re-run this setup later to retry."
+        )
 
     # Issue #175: memory-bank reserves "general" as its cross-project
     # sentinel (metadata.repo) -- a project whose own MEMORY_BANK_ID

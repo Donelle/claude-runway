@@ -42,6 +42,7 @@ from setup_project_lib import (  # noqa: E402
     mcp_server_qdrant_path,
     merge_mcp_json,
     merge_settings_hooks,
+    resolved_fastembed_cache_path,
     run_setup,
     strip_toolkit_hooks,
     venv_python_path,
@@ -248,6 +249,43 @@ class BuildMcpServers(unittest.TestCase):
     def test_memory_bank_qdrant_api_key_applied(self):
         servers = self._build(qdrant_api_key="my-secret-key")
         self.assertEqual(servers["memory-bank"]["env"]["QDRANT_API_KEY"], "my-secret-key")
+
+    def test_hf_hub_offline_defaults_blank(self):
+        # Issue #221: a bare unconditional "1" here would break a genuinely
+        # first-time setup (empty fastembed cache) outright -- this function
+        # never decides the value itself, it only ever writes whatever the
+        # caller (run_setup, after its own warm/verify step) tells it to.
+        servers = self._build()
+        self.assertEqual(servers["qdrant"]["env"]["HF_HUB_OFFLINE"], "")
+
+    def test_hf_hub_offline_true_sets_1(self):
+        servers = self._build(hf_hub_offline=True)
+        self.assertEqual(servers["qdrant"]["env"]["HF_HUB_OFFLINE"], "1")
+
+    def test_hf_hub_offline_false_is_explicit_blank_not_absent(self):
+        servers = self._build(hf_hub_offline=False)
+        self.assertIn("HF_HUB_OFFLINE", servers["qdrant"]["env"])
+        self.assertEqual(servers["qdrant"]["env"]["HF_HUB_OFFLINE"], "")
+
+
+class ResolvedFastembedCachePath(unittest.TestCase):
+    def test_matches_the_value_build_mcp_servers_writes(self):
+        # Single source of truth (issue #221) -- build_mcp_servers' own
+        # FASTEMBED_CACHE_PATH must always equal this helper's output, so
+        # run_setup's warm-up step warms/verifies the SAME path the
+        # generated config actually points at.
+        home = Path("/home/user")
+        servers = build_mcp_servers(
+            MCP_TEMPLATE,
+            collection_name="my-project",
+            venv_python=Path("/home/user/tools/claude-runway/.venv/bin/python"),
+            tools_repo_dir=Path("/home/user/tools/claude-runway"),
+            home_dir=home,
+        )
+        self.assertEqual(
+            servers["qdrant"]["env"]["FASTEMBED_CACHE_PATH"],
+            resolved_fastembed_cache_path(home).as_posix(),
+        )
 
 
 def _find_block_args(hooks: dict, event: str, script_name: str) -> list:
@@ -769,6 +807,49 @@ class RunSetupEndToEnd(unittest.TestCase):
             # compatibility, while str(Path) uses the OS separator.
             actual = block["hooks"][0]["args"][0].replace("\\", "/")
             self.assertIn(moved_tools_repo.as_posix(), actual)
+
+    def test_fastembed_warmup_not_attempted_by_default(self):
+        # Every EXISTING caller/test of run_setup must keep its current
+        # network/disk-free behavior unchanged -- attempt_fastembed_warmup
+        # defaults to False, and fastembed_warmup_fn must never even be
+        # looked at (let alone called) when that's the case. A fn that
+        # raises if called makes this a hard failure, not a silent pass.
+        def _must_not_be_called(*args, **kwargs):
+            raise AssertionError("fastembed_warmup_fn must not be called when attempt_fastembed_warmup=False")
+
+        result = run_setup(
+            self.target_repo, REPO_ROOT, home_dir=Path("/home/user"),
+            fastembed_warmup_fn=_must_not_be_called,
+        )
+        self.assertEqual(result.mcp_json["mcpServers"]["qdrant"]["env"]["HF_HUB_OFFLINE"], "")
+
+    def test_fastembed_warmup_success_sets_hf_hub_offline_and_records_change(self):
+        calls = []
+
+        def _fake_warmup(model_name, cache_dir):
+            calls.append((model_name, cache_dir))
+            return True
+
+        result = run_setup(
+            self.target_repo, REPO_ROOT, home_dir=Path("/home/user"),
+            attempt_fastembed_warmup=True, fastembed_warmup_fn=_fake_warmup,
+        )
+        self.assertEqual(result.mcp_json["mcpServers"]["qdrant"]["env"]["HF_HUB_OFFLINE"], "1")
+        self.assertTrue(any("HF_HUB_OFFLINE=1" in c for c in result.changes))
+        # Called with the SAME EMBEDDING_MODEL/cache path the generated
+        # config actually ends up with -- not re-derived independently.
+        self.assertEqual(len(calls), 1)
+        model_name, cache_dir = calls[0]
+        self.assertEqual(model_name, MCP_TEMPLATE["mcpServers"]["qdrant"]["env"]["EMBEDDING_MODEL"])
+        self.assertEqual(Path(cache_dir), resolved_fastembed_cache_path(Path("/home/user")))
+
+    def test_fastembed_warmup_failure_leaves_hf_hub_offline_blank_and_records_change(self):
+        result = run_setup(
+            self.target_repo, REPO_ROOT, home_dir=Path("/home/user"),
+            attempt_fastembed_warmup=True, fastembed_warmup_fn=lambda model, cache_dir: False,
+        )
+        self.assertEqual(result.mcp_json["mcpServers"]["qdrant"]["env"]["HF_HUB_OFFLINE"], "")
+        self.assertTrue(any("Could not confirm" in c for c in result.changes))
 
 
 if __name__ == "__main__":

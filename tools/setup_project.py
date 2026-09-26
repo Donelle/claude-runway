@@ -244,6 +244,11 @@ def cmd_init(args: argparse.Namespace) -> None:
         memory_bank_id=args.memory_bank_id,
         include_compress=not args.qdrant_only,
         include_hooks=include_hooks,
+        # Issue #221: warm/verify the fastembed cache (and set
+        # HF_HUB_OFFLINE=1 if that succeeds) on every REAL run -- but never
+        # on --dry-run, which promises "nothing written" and shouldn't have
+        # network/disk side effects just to preview what would happen.
+        attempt_fastembed_warmup=not args.dry_run,
         # clean_hooks_if_unused's own special-case path is only relevant
         # when include_hooks=False (--skip-hooks now, exclusively) -- since
         # --qdrant-only keeps include_hooks=True (issue #198: core hooks are
