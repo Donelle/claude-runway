@@ -60,6 +60,15 @@ class SkillContentRequirements(unittest.TestCase):
         with open(SKILL_PATH, encoding="utf-8") as f:
             self.content = f.read()
 
+    def test_documents_self_modification_workaround(self):
+        # The skill no longer cites specific ticket numbers in its prose (a later
+        # cleanup pass intentionally stripped historical issue/PR citations as
+        # scaffolding with no lasting value to a reader or to the subagent, which
+        # receives this whole file as its prompt every run) -- pin the substantive
+        # claim itself instead: a self-correction attempt via editing
+        # .claude/settings.json was separately blocked as self-modification.
+        self.assertIn("self-modification", self.content.lower())
+
     def test_mentions_auto_mode_classifier(self):
         self.assertIn("auto mode classifier", self.content.lower())
 
@@ -67,7 +76,7 @@ class SkillContentRequirements(unittest.TestCase):
         # The caveat must sit near the original claim, not be buried elsewhere,
         # so a reader of the opening claim actually sees the qualification.
         idx_claim = self.content.find("Zero required human touchpoints")
-        idx_caveat = self.content.find("Caveat: this claim")
+        idx_caveat = self.content.find("**Caveat:")
         self.assertNotEqual(idx_claim, -1, "original claim text must still exist")
         self.assertNotEqual(idx_caveat, -1, "caveat must exist")
         self.assertLess(
