@@ -48,7 +48,7 @@ file. Fails open, unconditionally and silently: a broken sessions directory
 call or a broken session shutdown, since this hook's own job is a pure
 side-effect nobody's else's correctness depends on synchronously.
 
-Setup: see templates/settings.json.template's core PostToolUse/SessionEnd
+Setup: see templates/settings.json.template's core SessionStart/SessionEnd
 blocks -- nothing needs to be copied into a target project, same convention
 as every other hook in this repo.
 

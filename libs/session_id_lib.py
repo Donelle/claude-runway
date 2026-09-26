@@ -56,16 +56,24 @@ Cleanup (two layers, both driven by `hooks/record_session_id.py`):
   - Layer 1 (graceful): a `SessionEnd` registration of the same hook script
     deletes its own session's marker on normal exit (see
     `delete_shadow_marker`).
-  - Layer 2 (crash-safety net, write side): the `PostToolUse` registration
-    opportunistically sweeps markers older than
-    `CLAUDE_RUNWAY_SESSION_MARKER_TTL_HOURS` (default 48) -- see
+  - Layer 2 (crash-safety net, write side): the `SessionStart` registration
+    (issue #231; replaced the original `PostToolUse '.*'` registration to
+    cut per-tool-call subprocess overhead) opportunistically sweeps markers
+    older than `CLAUDE_RUNWAY_SESSION_MARKER_TTL_HOURS` (default 48) -- see
     `sweep_stale_shadow_markers`/`should_sweep`/`mark_swept`. Bounded to run
     at most once per hour (a sentinel file's mtime, not a counter) so sweep
-    cost doesn't scale with total sessions-directory size on every single
-    tool call. The hook always refreshes its OWN marker before sweeping
-    (see that script), so a live session can never observe its own marker
-    as stale and prune itself, regardless of how long it's been since that
-    session's last tool call relative to the TTL.
+    cost doesn't scale with total sessions-directory size on every session
+    lifecycle event. The hook always refreshes its OWN marker before
+    sweeping (see that script), so a live session can never observe its own
+    marker as stale and prune itself AT the moment a lifecycle event fires.
+    Unlike the old `PostToolUse` registration, nothing refreshes a marker
+    BETWEEN a session's own `resume`/`clear`/`compact` events anymore (a
+    `fork` doesn't count here -- it mints a marker for the fork's brand-new
+    session_id, per `hooks/record_session_id.py`'s own docstring, not a
+    refresh of the parent session's existing one) -- a single session that
+    runs longer than the TTL without hitting one of those events can have
+    its still-live marker swept by another session's sweep (tracked as
+    issue #233).
 """
 
 from __future__ import annotations
@@ -231,8 +239,10 @@ def record_shadow_marker(raw_session_id: str, project: str) -> None:
     """
     Writes/OVERWRITES (never appends) this session's Type-2 shadow marker
     with just `{"project": "<absolute project path>"}` -- called by
-    `hooks/record_session_id.py` on (broad-matcher) PostToolUse to keep this
-    session's marker fresh. Every marker always carries a real `project` tag
+    `hooks/record_session_id.py` on `SessionStart` (every start type:
+    `startup`/`resume`/`clear`/`compact`/`fork`) to write or refresh this
+    session's marker once per lifecycle event. Every marker always carries
+    a real `project` tag
     regardless of what else is configured, so project-filtered lookups work
     for every project, not only ones that also have `savings_ledger` writing
     richer content.
@@ -401,9 +411,13 @@ def sweep_stale_shadow_markers(now: Optional[float] = None) -> int:
     module's own `finalize_session()` at SessionEnd.
 
     Safe by construction ONLY if the caller refreshes its own marker first
-    (see `hooks/record_session_id.py`): a live session's own next tool call
-    refreshes its file's mtime, so anything old enough to cross the TTL can
-    only be a dead session's leftover marker.
+    (see `hooks/record_session_id.py`): a live session refreshes its
+    marker's mtime on its own next `SessionStart`-type lifecycle event
+    (`resume`/`clear`/`compact`), so anything old enough to cross the TTL is
+    USUALLY a dead session's leftover marker -- but not always: a session
+    that never hits another such event before running longer than the TTL
+    (no restart/resume/clear/compact in between) is indistinguishable from
+    a dead one and can be swept out from under it (issue #233).
 
     Known limitation (cross-PROCESS TOCTOU, narrowed but not eliminated):
     the staleness check and the unlink below are two separate syscalls, so
@@ -421,9 +435,14 @@ def sweep_stale_shadow_markers(now: Optional[float] = None) -> int:
     cross-process coordination for this marker mechanism (see issue #198's
     "no schema/migration concerns... trivial to reason about" rationale for
     staying file-based over e.g. SQLite) -- the residual race here is the
-    same category of trade-off, and the worst case is self-healing anyway
-    (the affected session's own next tool call recreates its marker on the
-    very next `PostToolUse` hook invocation).
+    same category of trade-off, and the worst case is usually self-healing
+    (the affected session's own next `resume`/`clear`/`compact` event
+    recreates its marker -- a `fork` doesn't count here, since it mints a
+    marker for the fork's brand-new session_id rather than refreshing the
+    parent's, per `hooks/record_session_id.py`'s own docstring). Unlike the
+    old `PostToolUse` registration, this no longer self-heals on the very
+    next tool call -- a session with no such lifecycle event before it ends
+    simply never gets the chance (same underlying gap as issue #233).
 
     Returns the number of markers deleted (mainly useful for tests).
     """
