@@ -131,11 +131,20 @@ class AutoPickExclusionContentRequirements(unittest.TestCase):
 
     def test_explicit_issue_number_overrides_exclusion(self):
         # An explicitly-named ticket must still be worked regardless of its labels --
-        # the exclusion is for auto-pick only, not a blanket ban on ever touching a
-        # blocked/theme-design issue.
-        idx = self.content.find("This exclusion applies to auto-pick only")
+        # the label exclusion is for auto-pick only, not a blanket ban on ever touching a
+        # blocked/theme-design issue. Issue #240 added a second exclusion (assignee/branch/
+        # PR) that is explicitly NOT overridden the same way, so the pinned phrase narrowed
+        # from "this exclusion" to "the label-based exclusions above" to stay accurate.
+        idx = self.content.find("apply to auto-pick only")
         self.assertNotEqual(idx, -1, "explicit-override note must exist")
         self.assertIn("{ISSUE_NUMBER}", self.content[idx : idx + 300])
+
+    def test_assignee_branch_pr_check_not_overridden_by_explicit_issue(self):
+        # Issue #240: unlike the label-based exclusions, the already-in-progress check
+        # (assignee/branch/PR) still applies even to an explicit {ISSUE_NUMBER} invocation --
+        # Step 8 is what enforces it in that case, since Step 0's own filtering is bypassed.
+        self.assertIn("NOT overridden by an", self.content)
+        self.assertIn("no:assignee", self.content)
 
 
 class SettingsTemplateContentRequirements(unittest.TestCase):

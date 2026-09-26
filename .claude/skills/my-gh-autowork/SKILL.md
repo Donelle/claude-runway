@@ -176,26 +176,51 @@ call out separately).
 {ISSUE_NUMBER}                                   <-- orchestrator fills in ONE of these two
 --- OR ---
 Pick the highest-priority open issue on Donelle/claude-runway labeled `bug` OR
-`enhancement` that is NOT already assigned to someone other than you, is NOT labeled
-`blocked` or `theme-design`, and whose number is NOT in this already-attempted list this
-run: {ATTEMPTED_LIST}. The `blocked`/`theme-design` exclusion is deliberate: a `blocked`
-issue is waiting on something outside this skill's control (an upstream fix, a human
-decision), and a `theme-design` issue is a pre-implementation design/brainstorm doc, not a
-ticket with a concrete fix to implement — auto-picking either would either stall the run or
-produce the wrong kind of output. IMPORTANT: `gh issue list` silently truncates to 30
-results with no `--limit` flag — always pass one. Also note two labels do NOT OR together
-via repeated `--label` flags (that ANDs, requiring both labels on the same issue); use
-`--search` for OR, and GitHub's search syntax negates a qualifier with a leading `-`
-(`-label:X` excludes issues carrying that label):
+`enhancement` that has no assignee at all, is NOT labeled `blocked` or `theme-design`, and
+whose number is NOT in this already-attempted list this run: {ATTEMPTED_LIST}. The
+`blocked`/`theme-design` exclusion is deliberate: a `blocked` issue is waiting on something
+outside this skill's control (an upstream fix, a human decision), and a `theme-design`
+issue is a pre-implementation design/brainstorm doc, not a ticket with a concrete fix to
+implement — auto-picking either would either stall the run or produce the wrong kind of
+output. IMPORTANT: `gh issue list` silently truncates to 30 results with no `--limit` flag
+— always pass one. Also note two labels do NOT OR together via repeated `--label` flags
+(that ANDs, requiring both labels on the same issue); use `--search` for OR, and GitHub's
+search syntax negates a qualifier with a leading `-` (`-label:X` excludes issues carrying
+that label). `no:assignee` (issue #240) matches only issues with ZERO assignees — not "not
+assigned to me"; any assignee at all, including yourself from an earlier attempt, excludes
+an issue from auto-pick now:
   gh issue list -R Donelle/claude-runway --state open \
-    --search "label:bug,enhancement -label:blocked -label:theme-design" \
+    --search "label:bug,enhancement -label:blocked -label:theme-design no:assignee" \
     --limit 200 --json number,title,labels,assignees
 Sort by priority label (priority-p1 > p2 > p3; unlabeled sorts last), then by issue number
 ascending as a tiebreaker; bug and enhancement are not otherwise prioritized relative to
-each other. If nothing qualifies, output exactly `OUTCOME: DONE` as your entire response
-and stop — do not proceed to any step below. **This exclusion applies to auto-pick only —
-if the orchestrator instead passes an explicit {ISSUE_NUMBER}, work it regardless of its
-labels; a human naming a specific ticket is a deliberate override of this default.**
+each other.
+
+**Then, walking that sorted list in order, skip any candidate that already has a linked
+branch (issue #240)** — an empty `assignees` field alone doesn't prove nobody has started
+on it; a branch can exist without an assignee (e.g. someone ran `gh issue develop` without
+ever running `gh issue edit --add-assignee`). For each candidate, in order:
+  gh issue develop <candidate> -R Donelle/claude-runway --list
+A printed branch name means this candidate is already spoken for — move to the next
+candidate WITHOUT adding this number to `attempted` (it was never picked, so it isn't a
+worked-and-failed ticket the way a BLOCKED/FAILED outcome's ticket would be). Nothing
+printed means this candidate has no assignee and no branch — pick it and proceed to Step 1
+below. (This walk only checks for a branch, not a PR, per candidate, to avoid an extra API
+call per candidate that gets skipped anyway — Step 8 below re-checks both branch AND PR for
+whichever ticket actually gets picked, as the authoritative gate.)
+
+If nothing qualifies at all, or every remaining candidate after this walk turns out to
+already be spoken for, output exactly `OUTCOME: DONE` as your entire response and stop — do
+not proceed to any step below. **The label-based exclusions above (`blocked`/
+`theme-design`) apply to auto-pick only — if the orchestrator instead passes an explicit
+{ISSUE_NUMBER}, work it regardless of its labels; a human naming a specific ticket is a
+deliberate override of that default. The assignee/branch/PR check is NOT overridden by an
+explicit issue number, though** — Step 8 below runs this same check again for every
+invocation, auto-picked or explicit, and reports BLOCKED if it's already spoken for and you
+aren't already on its own branch. The difference an explicit invocation makes is only that
+there's no "next candidate" to fall back to, so a BLOCKED report there ends the whole run
+(per the Final report section's existing single-invocation behavior) rather than silently
+trying another ticket.
 
 ## Step 1 — load project context (this repo's own /my-load-context, inlined)
 This is inlined rather than invoked as `/my-load-context` because that's a personal skill
@@ -238,141 +263,79 @@ under `~/.claude/skills/`, not guaranteed to exist on whichever machine is runni
    `gh issue develop --checkout` step below creates the new branch server-side, off
    whatever GitHub's actual default branch currently is, independent of your local HEAD;
    the `git fetch` here just makes sure your local knowledge of `origin/main`'s tip is
-   current for anything you diff against it later (e.g. Step 11's `git diff origin/main...HEAD`).
+   current for anything you diff against it later (e.g. Step 18's `git diff --stat origin/main`
+   when writing the validate artifact).
 7. Fetch the issue: `gh issue view <N> -R Donelle/claude-runway --json
    number,title,body,labels,assignees,issueType,state,url`. If state is CLOSED, report
    BLOCKED — don't reopen work on a closed ticket autonomously. Read the body's
    **Location**/**Verdict**/**Suggested fix** sections as a head start, not something to
    re-derive from zero.
-8. Set issueType if null (bug label → Bug, enhancement label → Feature, neither → Task):
+8. **Check whether this ticket is already being worked on — report BLOCKED immediately
+   unless you're already on its own branch (issue #240; moved to run before the issue-type
+   edit below per Copilot review on this PR — the gate must sit before ANY mutation, not
+   just before branch/assignee changes, or an explicit invocation of an already-in-progress
+   ticket would still flip its issue type before reporting BLOCKED).** This is an absolute
+   check: it doesn't matter WHO the existing assignee is, including yourself from an earlier
+   attempt — any pre-existing signal below means this ticket is spoken for, full stop. (For
+   an auto-picked ticket this is mostly a defense-in-depth backstop — Step 0 above already
+   filtered out anything with an assignee or a linked branch before ever reaching here —
+   but for an explicit `{ISSUE_NUMBER}` invocation, which bypasses Step 0's filtering
+   entirely, this is the ONLY point that catches it.)
+   - Determine the ticket's own linked branch, if any:
+     `gh issue develop <N> -R Donelle/claude-runway --list`
+   - If a linked branch was found, check for a PR on it (`--state all`, since a merged/
+     closed PR on a still-open issue is itself a signal worth surfacing):
+     `gh pr list -R Donelle/claude-runway --head <branch> --state all --json number,state,url`
+   - **The one exception:** if the linked branch found above is already the branch checked
+     out in THIS worktree right now (`git branch --show-current`), you're actively
+     continuing a session already on it — proceed normally to Step 9 below. In this
+     subagent's fresh-worktree model (Step 1 above always resets to `origin/main` before
+     anything else runs) this exception cannot actually fire in practice — nothing before
+     this point ever checks out a ticket-specific branch — it's stated here only for
+     consistency with `/my-gh-code-it`'s identical check, in case the isolation model ever
+     changes.
+   - **Otherwise**, if the issue's `assignees` (from Step 7 above) is non-empty, OR a
+     linked branch was found, OR a PR was found: report
+     `OUTCOME: BLOCKED (issue #<N>) — already in progress: <assignee login(s) if any>,
+     <branch name if any>, <PR #<n> if any>` and stop — do not set issue type, do not set
+     assignee, do not create a branch, do not touch any files.
+   - If none of the above signals are present, set assignee (always the current
+     authenticated user — this is what `@me` resolves to):
+     `gh issue edit <N> -R Donelle/claude-runway --add-assignee @me`
+9. Set issueType if null (bug label → Bug, enhancement label → Feature, neither → Task):
    `gh issue edit <N> -R Donelle/claude-runway --type <type>`
-9. Set assignee if empty (always the current authenticated user — this is what `@me`
-   resolves to): `gh issue edit <N> -R Donelle/claude-runway --add-assignee @me`.
-   If someone else is already assigned, report BLOCKED — don't take over someone else's
-   issue.
 10. **Create and check out the branch BEFORE touching any files** — this order matters: in
    this same cycle worked by hand, the fix got implemented directly on `main` before the
-   branch existed, and had to be corrected after the fact. Check for an existing linked
-   branch first (`gh issue develop <N> -R Donelle/claude-runway --list`); if one
-   exists, `git fetch` and check it out instead of creating a new one. Otherwise pick a
-   short, specific name yourself (no need to ask — `fix/<slug>` for Bug, `feature/<slug>`
-   for Feature/Task, ≤6 words, matching this repo's real branch history style) and run:
+   branch existed, and had to be corrected after the fact. Step 8 above already guarantees
+   no linked branch exists yet for this ticket (otherwise you'd have reported BLOCKED there
+   instead of reaching here) — issue #240 removed the old "check for an existing branch,
+   reuse it" path here for exactly that reason: reuse is no longer a case this step can
+   encounter. Pick a short, specific name yourself (no need to ask — `fix/<slug>` for Bug,
+   `feature/<slug>` for Feature/Task, ≤6 words, matching this repo's real branch history
+   style) and run:
    `gh issue develop <N> -R Donelle/claude-runway --name <name> --checkout`
-   **If this (or `gh pr checkout`, when picking up an already-open PR for this ticket)
-   fails because the branch is already checked out in another worktree** — confirmed live:
-   a prior round's worktree for this same ticket can still be holding the branch if it
-   wasn't cleaned up. Find it with `git worktree list` (works from ANY worktree — they all
-   share the same `.git` metadata, so you don't need the primary checkout's path). **Only
-   remove an entry you can positively confirm is this same ticket's own stale artifact —
-   the branch being locked elsewhere does not by itself prove that worktree is stale; it
-   could belong to an active human or an unrelated concurrent process, and force-removing
-   someone else's in-progress work would defeat the entire point of worktree isolation.**
-   Treat an entry as safe to remove only if BOTH hold:
-   - its path or branch name is clearly this ticket's own (this repo's own primary/branch
-     naming, or the harness's `agent-<id>`-style worktree path for a PRIOR attempt at THIS
-     issue number — never a worktree whose branch/path you can't tie to this specific
-     ticket), AND
-   - `git -C <path> status --short` is empty (nothing uncommitted) and any commits it has
-     are already reachable from that SAME branch's remote copy — run this WITH `-C <path>`
-     (a filesystem path is not a git revision, and the comparison direction matters: it's
-     `origin/<branch>..HEAD`, not the reverse), confirmed live:
-     `git -C <path> log origin/<branch>..HEAD --oneline` empty means nothing unpushed sits
-     there — i.e. its real work, if any, already made it to the remote.
-   If either check fails, don't force anything — report BLOCKED with what you found, so a
-   human can look at what's actually in that worktree before it's touched. Only once
-   confirmed safe: `git worktree remove <stale-path>` (plain, not `--force` — if it still
-   complains, that's itself a sign the "nothing uncommitted" check above was wrong, so stop
-   and report BLOCKED rather than forcing past it).
+   If this fails for any reason — including a stale worktree from an unrelated process
+   still holding a same-named branch — report BLOCKED with the exact error rather than
+   investigating or force-removing anything yourself. Step 8's guarantee means a genuine
+   failure here is unexpected and worth a human's eyes, not autonomous cleanup (an earlier
+   version of this step contained ~15 lines of worktree-cleanup logic for exactly this
+   failure mode, back when it was a normal, expected case under the old resume-on-reattempt
+   design; it isn't anymore, so that investigation no longer earns its complexity here).
 
-11. **Check whether this ticket is already mid-flight before doing anything else** —
-    confirmed necessary live: a prior attempt (this run or an earlier one) may have failed
-    or stopped partway through, and a fresh subagent has no memory of that. Resuming
-    correctly here avoids both a duplicate-PR error and redundant/conflicting
-    reimplementation:
-    ```bash
-    EXISTING_PR=$(gh pr list -R Donelle/claude-runway --head <branch> --state all --json number,state --jq '.[0] // empty')
-    ```
-    - **No PR, and no commits ahead of `main`** (`git log origin/main..HEAD --oneline` is
-      empty — using `origin/main`, not local `main`, since Step 2 deliberately never checks
-      local `main` out or updates it in this worktree)
-      → nothing was done yet on this branch. Proceed normally to Step 3 (plan and
-      implement) below.
-    - **No PR, but commits already exist ahead of `main`** → a prior attempt implemented
-      (and maybe pushed) before failing. Do NOT blindly redo the implementation. Read
-      what's already there (`git diff origin/main...HEAD`), bootstrap `.venv/` per Step 3
-      below if it isn't already there in this worktree, then re-run
-      `.venv/bin/python -m unittest discover -s tests` and `.venv/bin/mypy libs tools
-      hooks` against the current branch state: if both are clean and the diff looks like
-      it genuinely addresses the issue,
-      treat implementation as done — push if not already pushed, write/complete the
-      `.plans/<N>-*.md` artifacts if missing, and go straight to PR creation (within Step
-      3, the `gh pr create` step). If tests fail or the diff looks incomplete/wrong,
-      continue/fix the existing work in place rather than starting over from a blank slate.
-    - **An OPEN PR already exists for this branch** → the ticket is already past
-      implementation and into (or done with) the review cycle. Capture that PR's number
-      and skip straight to Step 4 (the review-feedback loop) using it — do not touch the
-      rest of Step 3 (implement/PR-create) at all; calling `gh pr create` again on a
-      branch that already has an open PR errors. **Before starting Step 4's round loop,
-      pre-seed `seen_ids` with EVERYTHING that already exists right now, MINUS the ids
-      belonging to any still-unresolved review thread** — not just the inline-comment
-      domain. A GraphQL `reviewThreads` query only returns inline comment `databaseId`s,
-      not review-envelope ids (from `pulls/.../reviews`) or general issue-comment ids
-      (from `issues/.../comments`) — pre-seeding from that query alone leaves those other
-      two domains unseeded, so an already-fully-handled review envelope or a general
-      "suppressed comment" reply from a prior attempt would look "new" again on resume and
-      get redundantly reprocessed. Self-authored ids don't need separate handling here —
-      Step 4's poll filters those out by login on every round regardless of resume state,
-      including this pre-seed. **Every id gathered anywhere in this whole flow — here and
-      in Step 4's own poll — is prefixed with its domain (`comment:`, `review:`,
-      `issue:`).** These three REST resource types are backed by separate database
-      sequences, not one shared id space (confirmed live: comment ids and review ids on
-      this very PR sit in completely different numeric ranges) — bare numeric ids could
-      coincidentally collide across domains as both counters grow over time, and a
-      collision would silently make one resource look "already seen" because an unrelated
-      resource in a different domain happened to reuse its number. The prefix costs
-      nothing and removes the possibility entirely.
-      ```bash
-      ALL_CURRENT_IDS=$( { gh api repos/Donelle/claude-runway/pulls/<PR>/comments --paginate --jq '.[] | "comment:" + (.id|tostring)'
-                            gh api repos/Donelle/claude-runway/pulls/<PR>/reviews  --paginate --jq '.[] | "review:" + (.id|tostring)'
-                            gh api repos/Donelle/claude-runway/issues/<PR>/comments --paginate --jq '.[] | "issue:" + (.id|tostring)'
-                          ; } 2>/dev/null | sort -u )
-      UNRESOLVED_IDS=$(gh api graphql -f query='query { repository(owner: "Donelle", name: "claude-runway") { pullRequest(number: <PR>) { reviewThreads(first: 100) { nodes { isResolved comments(first: 10) { nodes { databaseId } } } } } } }' \
-        --jq '.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false) | .comments.nodes[] | "comment:" + (.databaseId|tostring)' | sort -u)
-      SEEN_IDS=$(comm -23 <(echo "$ALL_CURRENT_IDS") <(echo "$UNRESOLVED_IDS"))
-      ```
-      This treats everything that already exists as handled UNLESS it's still sitting in
-      an open thread. **But an empty `UNRESOLVED_IDS` does NOT by itself prove the current
-      commit was actually reviewed** — two real gaps: resuming right after a prior
-      `FAILED`-on-timeout attempt (Step 19) can mean NO review has landed for this commit
-      at all yet, and "Suppressed comments" (a review body's own text, not a separate
-      GraphQL thread) never gets a thread id in the first place, so it can't show up as
-      "unresolved" here even when genuinely unaddressed. Resolve this before trusting
-      `UNRESOLVED_IDS`:
-      ```bash
-      HEAD_SHA=$(git rev-parse HEAD)
-      EXISTING_REVIEW=$(gh api repos/Donelle/claude-runway/pulls/<PR>/reviews --paginate \
-        --jq ".[] | select(.user.login == \"copilot-pull-request-reviewer[bot]\" and .commit_id == \"$HEAD_SHA\") | .id" | head -1)
-      ```
-      - `EXISTING_REVIEW` is empty → no review exists yet for the current commit at all
-        (this is exactly the case a resume-after-timeout produces). Do NOT skip to merge.
-        Run Step 19's poll (same HEAD-SHA-matched form) to wait for one, then continue
-        through Steps 20–25 exactly like any other round — resuming doesn't change this
-        part, only the pre-seeding above does.
-      - `EXISTING_REVIEW` is non-empty → a review of the current commit does exist. Read
-        ITS body specifically for a "Suppressed comments" section (the same content-check
-        Step 21 already does for any new review) — if present and you can't positively
-        confirm from your own prior reply/comment history that it was already addressed,
-        treat it as a new finding and jump into Step 21 with it. Only if there's genuinely
-        nothing outstanding (empty `UNRESOLVED_IDS` AND no unaddressed suppressed content
-        in `EXISTING_REVIEW`) → skip Step 4's poll, go straight to Step 5 (merge).
-      When there IS something to process either way, treat it as this round's `NEW_IDS`
-      and jump directly into Step 21's content-reading/verification logic (fix
-        or decline each, per Step 22, then reply/resolve per Steps 23–24, then Step 25
-        decides the next round exactly as it would for any other round).
-    - **A MERGED or CLOSED PR already exists for this branch, but the issue is still
-      OPEN** → this shouldn't happen if `Fixes #N` worked correctly, but if it does, don't
-      guess at why — report BLOCKED with the PR number and its state, so a human can sort
-      out whether it needs reopening, a new fix, or just closing the issue manually.
+11. **Mid-flight resume is intentionally not supported (issue #240).** Step 8 above already
+    reports BLOCKED on any pre-existing assignee, linked branch, or PR for this ticket — the
+    only tickets that reach this point have none of those, so there is nothing to resume.
+    (An earlier version of this step contained ~90 lines of logic for continuing a ticket a
+    prior attempt had gotten partway through — detecting an already-open PR, or commits
+    already ahead of `main` with no PR yet, and picking up from wherever that left off,
+    including pre-seeding the review-feedback loop's `seen_ids` for an already-open PR.
+    That capability was deliberately removed: the new preflight in Step 8 now treats any
+    pre-existing signal as another actor's or a stalled attempt's territory and stops there
+    instead of continuing it — including the "MERGED/CLOSED PR but issue still OPEN"
+    anomaly this step used to handle separately, which Step 8's `--state all` PR check now
+    also catches as an in-progress signal on its own. A ticket a prior attempt stalled on
+    now requires a human to clear its assignee/branch/PR before it can be auto-picked or
+    explicitly retried again.)
 
 ## Step 3 — plan and implement
 12. Read whatever specific file(s) the issue's Location field names (README was already
@@ -443,8 +406,9 @@ any later fix — automatically triggers a fresh Copilot review with zero manual
 this whole loop runs inside this one call; there's no orchestrator hand-off and no human
 touchpoint needed.
 
-Maintain a `seen_ids` set locally (starts empty on a fresh ticket; see Step 11 above for
-what to pre-seed it with when resuming an already-open PR) across the rounds below — every
+Maintain a `seen_ids` set locally (starts empty — issue #240 removed the old resume-an-
+already-open-PR path, so there is no pre-seeding case anymore; Step 8 already confirmed this
+ticket had no pre-existing PR before you ever got here) across the rounds below — every
 inline comment id, review-envelope id, and general-issue-comment id you've already looked
 at goes in it, so "new" always means "not in this set yet."
 
@@ -527,9 +491,11 @@ happens there.
     clean; it may just mean the review hasn't arrived yet, and merging in that ambiguous
     state risks shipping code no review actually covered. Report
     `OUTCOME: FAILED (issue #<N>) — Copilot's review did not arrive within 9 minutes on
-    PR #<PR>; can't confirm the PR is clean` and stop — a human (or a later re-run of this
-    same skill, which Step 11's resume logic will pick straight back up from this PR) can
-    check whether the review is just slow or something's actually stuck. (A `gh api
+    PR #<PR>; can't confirm the PR is clean` and stop — a human can check whether the review
+    is just slow or something's actually stuck. (A later re-run of this skill will NOT pick
+    this back up automatically — issue #240 removed mid-flight resume, so Step 8 will now
+    report this ticket BLOCKED as already-in-progress on any re-attempt; clearing its
+    assignee/branch/PR first is required before it can be retried.) (A `gh api
     ... --paginate` call's output used to be able to come back summarized/compressed rather
     than raw JSON — this repo's own `PostToolUse` compression hook did that once for real
     during PR #187's review-feedback pass (a fabricated phrase in a summarized review body,
@@ -578,13 +544,13 @@ happens there.
     id was technically new; doing so burns a round of the 5-round cap for nothing, which
     matters on a ticket that genuinely needs several real rounds. Only proceed to Step 22
     below when there's an actual finding to verify.
-22. **First, initialize defensively if needed, then increment `ROUND` and check the cap —
-    before touching any code this round.** If `ROUND`/`ROUND_HISTORY` aren't already set,
-    set them now (`ROUND=0`, `ROUND_HISTORY=""`) before proceeding — Step 11's resume-an-
-    open-PR shortcut jumps directly into this step from Step 21 without ever passing
-    through the round loop's own preamble where these are normally initialized, so relying
-    solely on that preamble leaves them unset on a resumed ticket and the cap silently
-    unenforced. `ROUND=$((ROUND + 1))`. If `ROUND` is now greater than 5, STOP: do not fix, reply to, or
+22. **Increment `ROUND` and check the cap — before touching any code this round.**
+    (An earlier version of this step also defensively re-initialized `ROUND`/
+    `ROUND_HISTORY` here, in case Step 11's now-removed resume-an-open-PR shortcut jumped
+    directly into this step from Step 21 without ever passing through the round loop's own
+    preamble above. Issue #240 removed that shortcut, so every path reaching here has
+    already gone through the preamble, and that defensive re-init no longer earns its
+    keep.) `ROUND=$((ROUND + 1))`. If `ROUND` is now greater than 5, STOP: do not fix, reply to, or
     reproduce anything from this round's findings — but DO first append a one-line summary
     of what this round's new finding(s) actually ARE (straight from `NEW_IDS`'s content, not
     from investigating them) to `ROUND_HISTORY`. Skipping this would leave the human reading
