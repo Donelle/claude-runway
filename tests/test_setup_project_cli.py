@@ -32,6 +32,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -178,6 +179,8 @@ def _init_args(target_repo, **overrides) -> argparse.Namespace:
         memory_bank_id="",
         qdrant_only=False,
         skip_hooks=False,
+        install_skills=False,
+        skills_dir="",
         dry_run=True,
     )
     defaults.update(overrides)
@@ -699,6 +702,152 @@ class MainIsTheConsoleScriptEntryPoint(unittest.TestCase):
             mod.main()
         fake_parse_args.assert_called_once_with()
         fake_func.assert_called_once_with(fake_args)
+
+
+class InstallSkillsFlag(unittest.TestCase):
+    """`--install-skills` (issue #205): fresh install, no-op on identical,
+    update on modified, --dry-run writes nothing, --skills-dir override,
+    skills-only mode (no target_repo) touching no project config, and the
+    now-optional target_repo still being required when --install-skills
+    isn't given."""
+
+    def setUp(self):
+        self.mod = _load_setup_project()
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.target_repo = Path(self._tmpdir.name) / "my-project"
+        self.target_repo.mkdir()
+        self.skills_dir = Path(self._tmpdir.name) / "skills-dest"
+        # A fake tools-repo skills/ layout, independent of this real repo's
+        # own skills/ -- so this test doesn't depend on (or need updating
+        # for) whatever skills happen to actually exist here today.
+        self.fake_tools_repo = Path(self._tmpdir.name) / "fake-tools-repo"
+        (self.fake_tools_repo / "skills" / "my-fake-skill").mkdir(parents=True)
+        (self.fake_tools_repo / "skills" / "my-fake-skill" / "SKILL.md").write_text(
+            "# My Fake Skill\ncontent v1\n", encoding="utf-8"
+        )
+        # cmd_init's normal (non-skills-only) branch still calls run_setup,
+        # which needs a real templates/ dir under whatever TOOLS_REPO_DIR
+        # this test mocks -- copy the real one in so tests combining
+        # --install-skills with a real target_repo exercise the actual
+        # cmd_init path end to end, not just the skills-only branch.
+        shutil.copytree(REPO_ROOT / "templates", self.fake_tools_repo / "templates")
+
+    def _run(self, **overrides):
+        args = _init_args(self.target_repo, install_skills=True, skills_dir=str(self.skills_dir), **overrides)
+        with mock.patch.object(self.mod, "TOOLS_REPO_DIR", self.fake_tools_repo):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                self.mod.cmd_init(args)
+            return buf.getvalue()
+
+    def test_fresh_install_writes_the_skill_file(self):
+        self._run(dry_run=False)
+        written = (self.skills_dir / "my-fake-skill" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertEqual(written, "# My Fake Skill\ncontent v1\n")
+
+    def test_dry_run_writes_nothing(self):
+        output = self._run(dry_run=True)
+        self.assertFalse((self.skills_dir / "my-fake-skill" / "SKILL.md").exists())
+        self.assertIn("Would install my-fake-skill", output)
+
+    def test_rerun_on_identical_content_reports_up_to_date_and_does_not_rewrite(self):
+        self._run(dry_run=False)
+        installed_path = self.skills_dir / "my-fake-skill" / "SKILL.md"
+        mtime_before = installed_path.stat().st_mtime_ns
+        output = self._run(dry_run=False)
+        self.assertIn("my-fake-skill: up to date", output)
+        self.assertEqual(installed_path.stat().st_mtime_ns, mtime_before)
+
+    def test_changed_source_updates_the_existing_file(self):
+        self._run(dry_run=False)
+        (self.fake_tools_repo / "skills" / "my-fake-skill" / "SKILL.md").write_text(
+            "# My Fake Skill\ncontent v2\n", encoding="utf-8"
+        )
+        output = self._run(dry_run=False)
+        self.assertIn("Updating my-fake-skill", output)
+        written = (self.skills_dir / "my-fake-skill" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertEqual(written, "# My Fake Skill\ncontent v2\n")
+
+    def test_combined_with_target_repo_also_writes_mcp_json(self):
+        self._run(dry_run=False)
+        self.assertTrue((self.target_repo / ".mcp.json").exists())
+        self.assertTrue((self.skills_dir / "my-fake-skill" / "SKILL.md").exists())
+
+    def test_skills_only_mode_touches_no_project_config(self):
+        args = argparse.Namespace(
+            target_repo=None,
+            install_skills=True,
+            skills_dir=str(self.skills_dir),
+            dry_run=False,
+        )
+        with mock.patch.object(self.mod, "TOOLS_REPO_DIR", self.fake_tools_repo):
+            self.mod.cmd_init(args)
+        self.assertTrue((self.skills_dir / "my-fake-skill" / "SKILL.md").exists())
+        self.assertFalse((self.target_repo / ".mcp.json").exists())
+        self.assertFalse((self.target_repo / ".claude").exists())
+
+    def test_crlf_source_round_trips_byte_for_byte_and_stays_up_to_date(self):
+        # Regression for Copilot review finding on PR #224: read_text()'s
+        # universal-newline translation on read, combined with a text-mode
+        # write on the way back out, silently converted a CRLF source's
+        # line endings -- lossy on every platform, and on Windows
+        # specifically the root cause of an installed skill perpetually
+        # re-reporting (and rewriting) as "update" even though the shipped
+        # content never changed, since the freshly-written dest's CRLF
+        # bytes never matched a freshly re-read source's own bytes.
+        (self.fake_tools_repo / "skills" / "my-fake-skill" / "SKILL.md").write_bytes(
+            b"# My Fake Skill\r\ncontent v1\r\n"
+        )
+        self._run(dry_run=False)
+        installed_path = self.skills_dir / "my-fake-skill" / "SKILL.md"
+        self.assertEqual(installed_path.read_bytes(), b"# My Fake Skill\r\ncontent v1\r\n")
+
+        output = self._run(dry_run=False)
+        self.assertIn("my-fake-skill: up to date", output)
+
+    def test_my_setup_clauderunway_prints_the_clone_caveat(self):
+        (self.fake_tools_repo / "skills" / "my-setup-clauderunway").mkdir()
+        (self.fake_tools_repo / "skills" / "my-setup-clauderunway" / "SKILL.md").write_text(
+            "# my-setup-clauderunway\n", encoding="utf-8"
+        )
+        output = self._run(dry_run=False)
+        self.assertIn("CLAUDE_RUNWAY_DIR", output)
+
+    def test_my_setup_clauderunway_caveat_is_state_neutral(self):
+        # Regression for Copilot review finding on PR #224: the caveat
+        # previously asserted "was installed/updated too" unconditionally,
+        # which is false during --dry-run (nothing written) and when the
+        # skill is already up to date (nothing changed) -- contradicting
+        # the preceding per-skill status line printed just above it.
+        (self.fake_tools_repo / "skills" / "my-setup-clauderunway").mkdir()
+        (self.fake_tools_repo / "skills" / "my-setup-clauderunway" / "SKILL.md").write_text(
+            "# my-setup-clauderunway\n", encoding="utf-8"
+        )
+        dry_run_output = self._run(dry_run=True)
+        self.assertIn("CLAUDE_RUNWAY_DIR", dry_run_output)
+        self.assertNotIn("was installed/updated", dry_run_output)
+
+        # A real run makes it up to date; a THIRD run (still real) should
+        # print the caveat again even though this round's plan action is
+        # "up_to_date", not "install"/"update".
+        self._run(dry_run=False)
+        up_to_date_output = self._run(dry_run=False)
+        self.assertIn("up to date", up_to_date_output)
+        self.assertIn("CLAUDE_RUNWAY_DIR", up_to_date_output)
+        self.assertNotIn("was installed/updated", up_to_date_output)
+
+    def test_parse_args_requires_target_repo_unless_install_skills_given(self):
+        with mock.patch.object(sys, "argv", ["setup_project.py", "init"]):
+            with self.assertRaises(SystemExit) as ctx:
+                self.mod.parse_args()
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_parse_args_allows_install_skills_alone(self):
+        with mock.patch.object(sys, "argv", ["setup_project.py", "init", "--install-skills"]):
+            parsed = self.mod.parse_args()
+        self.assertIsNone(parsed.target_repo)
+        self.assertTrue(parsed.install_skills)
 
 
 if __name__ == "__main__":

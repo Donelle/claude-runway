@@ -59,7 +59,7 @@ get_metrics(metric_id, view="summary", bucket="week", n=12, format="text")
 
 ## Using it
 
-**Install the skill first**: `mkdir -p ~/.claude/skills/my-metrics && cp skills/my-metrics/SKILL.md ~/.claude/skills/my-metrics/SKILL.md` — product skills are only discovered once copied under `~/.claude/skills/`; the setup flow doesn't install them for you (same step `docs/savings-tracker.md`'s "Enabling it" section documents for `/my-savings`).
+**Install the skill first**: `claude-runway-setup init --install-skills` (or `python tools/setup_project.py init --install-skills` from a clone) installs/updates `my-metrics` along with every other product skill — equivalent manual copy: `mkdir -p ~/.claude/skills/my-metrics && cp skills/my-metrics/SKILL.md ~/.claude/skills/my-metrics/SKILL.md`. Product skills are only discovered once installed under `~/.claude/skills/` — the rest of the setup flow (`.mcp.json`/`.claude/settings.json`) doesn't install them for you (same step `docs/savings-tracker.md`'s "Enabling it" section documents for `/my-savings`).
 
 `/my-metrics <metricId> [view] [bucket]` — thin wrapper matching `/my-savings`'s shape, e.g.:
 

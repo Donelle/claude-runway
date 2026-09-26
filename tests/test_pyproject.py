@@ -43,14 +43,17 @@ class PyprojectTomlIsWellFormed(unittest.TestCase):
         self.assertEqual(scripts.get("claude-runway-setup"), "tools.setup_project:main")
         self.assertEqual(scripts.get("claude-runway-doctor"), "tools.doctor:main")
 
-    def test_packages_include_all_four_sibling_directories(self):
-        # libs/tools/templates/hooks must stay siblings under site-packages
-        # for the __file__-relative path arithmetic in tools/*.py and
-        # hooks/*.py to keep resolving correctly post-install -- see
-        # pyproject.toml's own [tool.setuptools] comment block for the full
-        # reasoning (including why none of the four has an __init__.py).
+    def test_packages_include_all_five_sibling_directories(self):
+        # libs/tools/templates/hooks/skills must stay siblings under
+        # site-packages for the __file__-relative path arithmetic in
+        # tools/*.py and hooks/*.py to keep resolving correctly post-install
+        # -- see pyproject.toml's own [tool.setuptools] comment block for
+        # the full reasoning (including why none of the five has an
+        # __init__.py). "skills" added for issue #205 so
+        # `claude-runway-setup init --install-skills` has a source of truth
+        # to read from a pipx/`uv tool install` layout too, not just a clone.
         packages = set(self.data["tool"]["setuptools"]["packages"])
-        self.assertEqual(packages, {"libs", "tools", "templates", "hooks"})
+        self.assertEqual(packages, {"libs", "tools", "templates", "hooks", "skills"})
 
     def test_templates_glob_is_declared_as_package_data(self):
         # templates/*.template files aren't .py -- without this, they'd
@@ -59,6 +62,13 @@ class PyprojectTomlIsWellFormed(unittest.TestCase):
         # building a wheel without this section during development).
         package_data = self.data["tool"]["setuptools"]["package-data"]
         self.assertIn("*.template", package_data.get("templates", []))
+
+    def test_skills_glob_is_declared_as_package_data(self):
+        # Issue #205: skills/*/SKILL.md files aren't .py either -- same
+        # "silently dropped from the wheel without an explicit glob" risk
+        # templates/*.template has, just one directory level deeper.
+        package_data = self.data["tool"]["setuptools"]["package-data"]
+        self.assertIn("*/SKILL.md", package_data.get("skills", []))
 
     def test_core_dependencies_match_requirements_txt_core_section(self):
         # Not a byte-for-byte diff against requirements.txt (that file has

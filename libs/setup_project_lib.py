@@ -611,6 +611,112 @@ def strip_toolkit_hooks(existing: dict) -> dict:
     return merged
 
 
+def default_skills_dir(home_dir: Path) -> Path:
+    """
+    Default install destination for `plan_skill_installs` below (issue
+    #205) -- `~/.claude/skills/`, the SAME user-level location
+    `docs/session-continuity.md`/`docs/savings-tracker.md` already document
+    installing skills to by hand ("install globally... only once"), and
+    what `/my-resume`'s own per-project scoping (by current directory name,
+    not by install location) already assumes. `--skills-dir` overrides this
+    for e.g. a per-project `<repo>/.claude/skills` install instead.
+    """
+    return home_dir / ".claude" / "skills"
+
+
+@dataclass
+class SkillInstallPlan:
+    """
+    One entry per skill directory found under `tools_repo_dir/skills/`
+    (issue #205) -- `name` is the skill's directory name (e.g.
+    "my-compact"), `action` is one of "install" (dest doesn't exist yet),
+    "up_to_date" (dest already holds byte-identical content -- nothing to
+    do), or "update" (dest exists but differs -- overwrite). `content` is
+    the shipped SKILL.md's full text, already read here so a caller can
+    write it without touching `source` again (and so --dry-run/tests never
+    need to re-read the file to report what WOULD be written).
+    """
+
+    name: str
+    action: str
+    source: Path
+    dest: Path
+    content: str
+
+
+def plan_skill_installs(tools_repo_dir: Path, skills_dir: Path) -> list:
+    """
+    Read-only planning step for `claude-runway-setup init --install-skills`
+    (issue #205) -- scans `tools_repo_dir/skills/*/SKILL.md` (the shipped
+    source of truth: the SAME path for a clone and a pipx/`uv tool install`,
+    since `skills/` is now packaged as a sibling of `libs/tools/templates/
+    hooks` under `[tool.setuptools] packages` in pyproject.toml, exactly the
+    same "sibling directories under site-packages" arithmetic every other
+    TOOLS_REPO_DIR-relative path in this module already relies on) and
+    reports what installing into `skills_dir` would do to each one -- never
+    writes anything itself. Mirrors `run_setup`'s own "pure computation, the
+    CLI does the actual writing" split, so this stays trivially testable
+    with only tmp directories, no mocking of file I/O needed.
+
+    Only `SKILL.md` files are considered; a skill directory without one
+    (shouldn't happen for anything shipped by this repo, but a defensive
+    skip rather than a crash for e.g. a stray non-skill directory someone
+    drops under `skills/`) is silently omitted from the plan. Returns `[]`
+    if `tools_repo_dir/skills` doesn't exist at all, rather than raising --
+    letting a caller decide how to report "nothing to install" is more
+    useful than forcing every caller to handle a missing-directory
+    exception for what may just be an unusual install layout.
+
+    Sorted by skill name for stable, deterministic output across runs (a
+    plain `Path.iterdir()` order isn't guaranteed) -- matters for both
+    human-readable --dry-run output and assertion-friendly tests.
+    """
+    plans: list = []
+    skills_root = Path(tools_repo_dir) / "skills"
+    if not skills_root.is_dir():
+        return plans
+    skills_dir = Path(skills_dir)
+    for skill_dir in sorted(p for p in skills_root.iterdir() if p.is_dir()):
+        source = skill_dir / "SKILL.md"
+        if not source.is_file():
+            continue
+        # Read as raw bytes then decode, NOT source.read_text() (Copilot
+        # review on PR #224): read_text() opens in universal-newlines text
+        # mode, which silently translates a CRLF source's line endings to
+        # bare "\n" -- lossy on every platform, and specifically broken on
+        # Windows once combined with _atomic_write's own text-mode write
+        # (which re-translates "\n" back to the PLATFORM's line ending,
+        # CRLF there): the written dest then has CRLF bytes while `content`
+        # (and every future run's freshly re-read `content`) has bare "\n",
+        # so the byte comparison below never matches and every install
+        # perpetually reports (and rewrites) as "update", never "up_to_date".
+        # Reading raw bytes here, and _atomic_write below writing raw bytes
+        # right back with no text-mode translation on either end, keeps
+        # this byte-for-byte round-trippable regardless of platform or
+        # what line-ending style the shipped SKILL.md actually uses.
+        content = source.read_bytes().decode("utf-8")
+        dest = skills_dir / skill_dir.name / "SKILL.md"
+        if not dest.exists():
+            action = "install"
+        else:
+            # Compare raw bytes, not decoded text (Copilot review on PR #224):
+            # a pre-existing dest SKILL.md a user hand-edited and saved in a
+            # non-UTF-8 encoding would otherwise raise UnicodeDecodeError
+            # here, crashing the entire --install-skills run before the
+            # documented "different -> update" path ever got a chance to
+            # run. Reading bytes on both sides needs no decoding of dest at
+            # all -- source is always our own shipped UTF-8 content
+            # (already read above), so encoding it once and comparing bytes
+            # is both simpler and more precise than a lossy decode (e.g.
+            # errors="replace") would be.
+            if dest.read_bytes() == content.encode("utf-8"):
+                action = "up_to_date"
+            else:
+                action = "update"
+        plans.append(SkillInstallPlan(name=skill_dir.name, action=action, source=source, dest=dest, content=content))
+    return plans
+
+
 @dataclass
 class SetupResult:
     """

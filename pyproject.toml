@@ -122,7 +122,17 @@ claude-runway-doctor = "tools.doctor:main"
 # during this issue's own testing). None of these four directories is ever
 # imported as a Python package by name anywhere in this repo, so there's no
 # upside to an __init__.py to weigh against that downside.
-packages = ["libs", "tools", "templates", "hooks"]
+#
+# "skills" added for issue #205: ships skills/*/SKILL.md (my-compact,
+# my-resume, my-savings, my-metrics, my-setup-clauderunway) in the wheel so
+# `claude-runway-setup init --install-skills` (libs/setup_project_lib.py's
+# plan_skill_installs) has a source of truth to read from a pipx/`uv tool
+# install` layout too, not just a clone -- TOOLS_REPO_DIR/skills resolves
+# identically either way since skills/ is installed as a sibling of the
+# other four, same as they are of each other. skills/ has no __init__.py
+# either, for the same PEP 420 implicit-namespace-package reasoning as the
+# rest of this section (it's never imported as a Python package by name).
+packages = ["libs", "tools", "templates", "hooks", "skills"]
 
 [tool.setuptools.package-data]
 # templates/*.template files aren't .py, so they need an explicit glob to
@@ -133,3 +143,8 @@ packages = ["libs", "tools", "templates", "hooks"]
 # tried to load templates/mcp.json.template (confirmed by building and
 # installing a wheel without this section, issue #50).
 templates = ["*.template"]
+# Same reasoning as templates above, for skills/*/SKILL.md (issue #205):
+# without this glob, the "skills" package entry just above would include the
+# directory but drop every non-.py file inside it, silently shipping empty
+# skill directories.
+skills = ["*/SKILL.md"]

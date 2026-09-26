@@ -14,6 +14,8 @@ Usage:
     python tools/setup_project.py init /path/to/target-repo --qdrant-only
     python tools/setup_project.py init /path/to/target-repo \
         --collection-name my-project --lmstudio-model google/gemma-3-4b --track-savings
+    python tools/setup_project.py init /path/to/target-repo --install-skills
+    python tools/setup_project.py init --install-skills   # skills only, no target_repo (issue #205)
 
 The templates stay the single source of truth: this script loads and
 patches them (see libs/setup_project_lib.py) rather than duplicating their
@@ -40,7 +42,7 @@ from typing import Optional
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "libs"))
 
-from setup_project_lib import run_setup  # noqa: E402
+from setup_project_lib import default_skills_dir, plan_skill_installs, run_setup  # noqa: E402
 
 TOOLS_REPO_DIR = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -96,9 +98,9 @@ def _pip_installed_venv_python() -> Optional[Path]:
     return Path(sys.executable)
 
 
-def _write_json(path: Path, data: dict) -> None:
+def _atomic_write(path: Path, content: str) -> None:
     """
-    Writes JSON atomically: serialize to a temp file in the SAME directory
+    Writes text atomically: serialize to a temp file in the SAME directory
     as the destination, flush + fsync it, then os.replace() over the real
     path. Found in PR #113 review: the previous open(path, "w") truncated
     the destination immediately, so an interruption or disk-full error
@@ -107,20 +109,45 @@ def _write_json(path: Path, data: dict) -> None:
     to preserve, not clobber. os.replace() is atomic on both POSIX and
     Windows as long as source and destination share a filesystem, which a
     temp file created in the destination's own directory guarantees.
+
+    Factored out of _write_json (issue #205) so --install-skills's SKILL.md
+    writes share the exact same atomicity guarantee instead of a second,
+    possibly-drifted copy of this logic -- a skill file is no less worth
+    protecting from a truncate-then-crash than .mcp.json/settings.json is.
+
+    Writes via a BINARY-mode file handle (`content.encode("utf-8")`), not
+    a text-mode one (Copilot review on PR #224): opening in text mode
+    without an explicit `newline=""` translates every "\n" in `content` to
+    the PLATFORM's own line ending on write (CRLF on Windows) -- combined
+    with `libs/setup_project_lib.py`'s `plan_skill_installs` reading a
+    skill's source as raw bytes specifically to preserve its ORIGINAL line
+    endings (see that function's own comment), a text-mode write here would
+    silently reintroduce a mismatch: the freshly-written dest file would
+    have CRLF while the next run's freshly re-read `content` has whatever
+    the source actually contains, so the byte comparison there would never
+    settle into "up_to_date" on Windows -- every run would report (and
+    rewrite) the same install as "update", forever. Binary mode does no
+    newline translation at all, so what's encoded is exactly what lands on
+    disk, matching plan_skill_installs' own byte-for-byte comparison.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_path_str = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     tmp_path = Path(tmp_path_str)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-            f.write("\n")
+        with os.fdopen(fd, "wb") as f:
+            f.write(content.encode("utf-8"))
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, path)
     except BaseException:
         tmp_path.unlink(missing_ok=True)
         raise
+
+
+def _write_json(path: Path, data: dict) -> None:
+    """Thin JSON-serializing wrapper over _atomic_write -- see that
+    function's docstring for the actual atomicity mechanics."""
+    _atomic_write(path, json.dumps(data, indent=2) + "\n")
 
 
 _REDACTED = "***REDACTED***"
@@ -207,7 +234,67 @@ def _quote_command(argv: list, *, windows: bool) -> str:
     return " ".join(shlex.quote(a) for a in argv)
 
 
+_MY_SETUP_CLAUDERUNWAY_CAVEAT = (
+    "Note: my-setup-clauderunway is among the skills covered above, but it still requires "
+    "CLAUDE_RUNWAY_DIR (exported in your shell) pointing at a full clone with tools/setup_project.py "
+    "on disk -- it checks this itself at its own step 1, and can't bootstrap itself purely from a "
+    "pipx/`uv tool install` install. Harmless to have installed if you don't use it from this environment."
+)
+
+
+def _resolve_skills_dir(args: argparse.Namespace) -> Path:
+    """Shared --skills-dir resolution for both cmd_init branches below --
+    defaults to setup_project_lib.default_skills_dir(~) when --skills-dir
+    wasn't passed, otherwise uses the given path as-is (resolved, so a
+    relative --skills-dir behaves predictably regardless of cwd)."""
+    if args.skills_dir:
+        return Path(args.skills_dir).resolve()
+    return default_skills_dir(Path.home())
+
+
+def _report_and_apply_skill_plan(plans: list, *, dry_run: bool) -> None:
+    """
+    Prints per-skill install/update/up-to-date status (issue #205's item 3)
+    and, unless --dry-run, actually writes each non-up-to-date SKILL.md via
+    _atomic_write. Kept as one function (not split into "plan" + "print" +
+    "apply" separately) since every existing caller in this file always
+    wants both together -- --dry-run's "print only" behavior is expressed
+    via the dry_run flag rather than by the caller simply not calling the
+    apply half, so there's exactly one place this pairing can drift.
+    """
+    if not plans:
+        print("  (no skills found under skills/ to install -- check this installation)")
+        return
+    verb = "Would install" if dry_run else "Installing"
+    verb_update = "Would update" if dry_run else "Updating"
+    for plan in plans:
+        if plan.action == "up_to_date":
+            print(f"  - {plan.name}: up to date ({plan.dest})")
+        elif plan.action == "install":
+            print(f"  - {verb} {plan.name} -> {plan.dest}")
+        else:
+            print(f"  - {verb_update} {plan.name} -> {plan.dest}")
+        if not dry_run and plan.action != "up_to_date":
+            _atomic_write(plan.dest, plan.content)
+    if any(p.name == "my-setup-clauderunway" for p in plans):
+        print(_MY_SETUP_CLAUDERUNWAY_CAVEAT)
+
+
 def cmd_init(args: argparse.Namespace) -> None:
+    # Issue #205: `target_repo` is now optional (nargs="?") specifically so
+    # `--install-skills` can run alone, with no project to configure at all
+    # -- parse_args() already refuses this combination (target_repo absent
+    # AND --install-skills absent) before cmd_init is ever called, so
+    # reaching here with target_repo is None means --install-skills is
+    # necessarily set. Skills-only mode touches nothing under target_repo --
+    # no .mcp.json, no .claude/settings.json, no run_setup call at all.
+    if args.target_repo is None:
+        skills_dir = _resolve_skills_dir(args)
+        plans = plan_skill_installs(TOOLS_REPO_DIR, skills_dir)
+        print(("Would install/update skills under " if args.dry_run else "Installing/updating skills under ") + f"{skills_dir}:")
+        _report_and_apply_skill_plan(plans, dry_run=args.dry_run)
+        return
+
     target_repo = Path(args.target_repo).resolve()
     if not target_repo.is_dir():
         print(f"error: target repo path does not exist or is not a directory: {target_repo}", file=sys.stderr)
@@ -371,6 +458,10 @@ def cmd_init(args: argparse.Namespace) -> None:
         print(next_step_note)
         if args.qdrant_api_key:
             print(_QDRANT_MCP_JSON_COMMIT_CAUTION)
+        if args.install_skills:
+            skills_dir = _resolve_skills_dir(args)
+            print(f"\nWould also install/update skills under {skills_dir}:")
+            _report_and_apply_skill_plan(plan_skill_installs(TOOLS_REPO_DIR, skills_dir), dry_run=True)
         return
 
     # Write order matters specifically for --qdrant-only: it REMOVES
@@ -408,13 +499,28 @@ def cmd_init(args: argparse.Namespace) -> None:
     else:
         print("  - Commit .mcp.json to the repo. Do NOT commit .claude/settings.json — it contains absolute paths specific to this machine.")
 
+    if args.install_skills:
+        skills_dir = _resolve_skills_dir(args)
+        print(f"\nInstalling/updating skills under {skills_dir}:")
+        _report_and_apply_skill_plan(plan_skill_installs(TOOLS_REPO_DIR, skills_dir), dry_run=False)
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="command", required=True)
 
     init = sub.add_parser("init", help="Write .mcp.json/.claude/settings.json into a target repo")
-    init.add_argument("target_repo", help="Path to the project repo to configure")
+    # Issue #205: optional (nargs="?") so `--install-skills` can run alone,
+    # skills-only, with no project to configure at all. Still required for
+    # every OTHER use of `init` -- enforced below, after parsing, rather
+    # than left to argparse itself (argparse has no built-in way to say "X
+    # is required unless Y is set").
+    init.add_argument(
+        "target_repo",
+        nargs="?",
+        default=None,
+        help="Path to the project repo to configure; omit when passing --install-skills alone (skills-only mode)",
+    )
     init.add_argument(
         "--collection-name",
         default=None,
@@ -509,10 +615,34 @@ def parse_args() -> argparse.Namespace:
         help="Configure local-compress in .mcp.json but don't write/merge .claude/settings.json's hooks "
         "(leaves any existing settings.json completely untouched, unlike --qdrant-only)",
     )
+    init.add_argument(
+        "--install-skills",
+        action="store_true",
+        help="Install/update this toolkit's product skills (skills/*/SKILL.md) into --skills-dir (default "
+        "~/.claude/skills) -- missing skills are installed, changed ones are updated, identical ones are left "
+        "alone. Combine with target_repo to do both in one run, or pass alone (omitting target_repo) for "
+        "skills-only mode that touches no project config at all (issue #205).",
+    )
+    init.add_argument(
+        "--skills-dir",
+        default="",
+        help="Override the skills install destination (default: ~/.claude/skills); e.g. '<repo>/.claude/skills' "
+        "for a per-project install instead of the usual global one",
+    )
     init.add_argument("--dry-run", action="store_true", help="Print what would be written without writing")
     init.set_defaults(func=cmd_init)
 
-    return p.parse_args()
+    parsed = p.parse_args()
+    # target_repo is nargs="?" specifically to allow skills-only mode
+    # (--install-skills with no project to configure) -- but for every
+    # OTHER invocation of `init`, it's still required. argparse itself has
+    # no way to express "positional required unless this flag is set", so
+    # enforce it here instead, using the same subparser (init.error) so the
+    # error message/exit code (2) matches argparse's own usage-error
+    # convention rather than a bespoke sys.exit elsewhere.
+    if parsed.command == "init" and parsed.target_repo is None and not parsed.install_skills:
+        init.error("the following arguments are required: target_repo (unless --install-skills is given alone)")
+    return parsed
 
 
 def main() -> None:

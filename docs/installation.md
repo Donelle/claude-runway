@@ -168,7 +168,7 @@ uv pip install pathspec --index-url https://pypi.org/simple
 >
 > **What none of this changes:** `tools/ingest_mcp_server.py`/`tools/compress_mcp_server.py` (the MCP servers `.mcp.json` actually launches) and the hook scripts under `hooks/` still get referenced by an absolute file path in the generated config — same as the clone workflow, just pointing into pipx's/`uv tool`'s own managed install location instead of a repo you cloned yourself. This isn't because Claude Code's `.mcp.json`/`.claude/settings.json` formats can't resolve a bare command via `PATH` — they can (this repo's own doc examples elsewhere use `"command": "python"`/`"python3"` exactly that way) — it's that this package declares no console-script entry points for those specific files, so there's nothing bare on `PATH` for them to resolve to regardless of install method, and pipx/`uv tool install` don't expose a dependency's own console script (like `mcp-server-qdrant`) globally either. An absolute path sidesteps both gaps at once.
 >
-> **What this doesn't install: the skills.** `claude-runway-setup init` only writes a project's `.mcp.json`/`.claude/settings.json`, and the package itself contains just `libs/`, `tools/`, `hooks/` and `templates/` — `skills/` isn't part of the wheel. `/my-compact`, `/my-resume`, `/my-savings` and `/my-setup-clauderunway` have to be copied into `~/.claude/skills/` separately ([Session continuity skills](session-continuity.md) has the copy commands for `/my-compact` and `/my-resume`, and [Savings tracker](savings-tracker.md) has the one for `/my-savings`; neither page covers `/my-setup-clauderunway`). `/my-setup-clauderunway` is clone-only: it expects `CLAUDE_RUNWAY_DIR` to point at a clone of this repo and has no linked page, so with a pipx/`uv tool install` setup skip it and run `claude-runway-setup init` directly. If you do have a clone and want it, run `mkdir -p ~/.claude/skills/my-setup-clauderunway && cp skills/my-setup-clauderunway/SKILL.md ~/.claude/skills/my-setup-clauderunway/SKILL.md` from it.
+> **The product skills (`skills/`) ship in this same install** (issue [#14](https://github.com/Donelle/claude-runway/issues/14)) — `claude-runway-setup init --install-skills` reads them from wherever this package landed (a clone or a pipx/`uv tool install` environment, transparently) and installs/updates them under `~/.claude/skills/`, so a tool-install user doesn't need a clone just for this step either. See [Session continuity skills](session-continuity.md#installation)/[Savings tracker](savings-tracker.md)/[Shared metrics store](metrics.md) for the per-skill details. One caveat: `my-setup-clauderunway` itself still needs `CLAUDE_RUNWAY_DIR` pointing at a full clone to actually run, regardless of how it was installed — the command prints a reminder about this whenever that skill is among the ones covered by the run (including `--dry-run` previews and a run where it was already up to date, not only when it was actually installed/updated).
 
 **4. Per project you want memory for:**
 
@@ -199,6 +199,12 @@ python tools/setup_project.py init /path/to/target-repo --qdrant-only
 # --lmstudio-url, --qdrant-url, --qdrant-api-key, --include-extensions, --exclude-dirs, --track-savings,
 # --compact-collection
 python tools/setup_project.py init --help
+
+# Install/update the product skills (my-compact/my-resume/my-savings/my-metrics/
+# my-setup-clauderunway) into ~/.claude/skills/ -- combine with a target_repo to do
+# both in one run, or pass alone (no target_repo) for skills-only mode (issue #205):
+python tools/setup_project.py init /path/to/target-repo --install-skills
+python tools/setup_project.py init --install-skills   # skills only
 ```
 
 **If you pass `--qdrant-api-key`**, the real key is written in plaintext into `.mcp.json` (never echoed back in `--dry-run`'s preview or the printed follow-up command, which are both redacted/placeholdered instead) — the script prints a warning reminding you NOT to commit `.mcp.json` as-is in that case, replacing the usual "commit it" instruction. There's no built-in mechanism here for keeping the key out of a committed `.mcp.json`; either gitignore `.mcp.json` for that project or manage the key through your own separate process.

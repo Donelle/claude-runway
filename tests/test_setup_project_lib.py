@@ -37,11 +37,13 @@ from setup_project_lib import (  # noqa: E402
     build_mcp_servers,
     build_settings_hooks,
     default_collection_name,
+    default_skills_dir,
     find_unresolved_placeholders,
     load_json,
     mcp_server_qdrant_path,
     merge_mcp_json,
     merge_settings_hooks,
+    plan_skill_installs,
     resolved_fastembed_cache_path,
     run_setup,
     strip_toolkit_hooks,
@@ -850,6 +852,95 @@ class RunSetupEndToEnd(unittest.TestCase):
         )
         self.assertEqual(result.mcp_json["mcpServers"]["qdrant"]["env"]["HF_HUB_OFFLINE"], "")
         self.assertTrue(any("Could not confirm" in c for c in result.changes))
+
+
+class DefaultSkillsDir(unittest.TestCase):
+    def test_is_dot_claude_skills_under_home(self):
+        self.assertEqual(default_skills_dir(Path("/home/user")), Path("/home/user/.claude/skills"))
+
+
+class PlanSkillInstalls(unittest.TestCase):
+    """`plan_skill_installs` (issue #205) -- pure, read-only planning over a
+    fake tools-repo `skills/` layout (never this real repo's own skills/,
+    so these tests don't need updating whenever a skill is added/renamed
+    here)."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.tools_repo_dir = Path(self._tmpdir.name) / "tools-repo"
+        self.skills_dir = Path(self._tmpdir.name) / "dest-skills"
+        (self.tools_repo_dir / "skills" / "skill-a").mkdir(parents=True)
+        (self.tools_repo_dir / "skills" / "skill-a" / "SKILL.md").write_text("skill a v1", encoding="utf-8")
+        (self.tools_repo_dir / "skills" / "skill-b").mkdir(parents=True)
+        (self.tools_repo_dir / "skills" / "skill-b" / "SKILL.md").write_text("skill b v1", encoding="utf-8")
+
+    def test_missing_skills_dir_in_tools_repo_returns_empty_list(self):
+        empty_tools_repo = Path(self._tmpdir.name) / "no-skills-here"
+        empty_tools_repo.mkdir()
+        self.assertEqual(plan_skill_installs(empty_tools_repo, self.skills_dir), [])
+
+    def test_fresh_dest_reports_install_for_every_skill(self):
+        plans = plan_skill_installs(self.tools_repo_dir, self.skills_dir)
+        self.assertEqual({p.name for p in plans}, {"skill-a", "skill-b"})
+        self.assertTrue(all(p.action == "install" for p in plans))
+        # Sorted by name -- stable, deterministic output.
+        self.assertEqual([p.name for p in plans], ["skill-a", "skill-b"])
+
+    def test_byte_identical_dest_reports_up_to_date(self):
+        (self.skills_dir / "skill-a").mkdir(parents=True)
+        (self.skills_dir / "skill-a" / "SKILL.md").write_text("skill a v1", encoding="utf-8")
+        plans = plan_skill_installs(self.tools_repo_dir, self.skills_dir)
+        by_name = {p.name: p for p in plans}
+        self.assertEqual(by_name["skill-a"].action, "up_to_date")
+        self.assertEqual(by_name["skill-b"].action, "install")
+
+    def test_differing_dest_reports_update(self):
+        (self.skills_dir / "skill-a").mkdir(parents=True)
+        (self.skills_dir / "skill-a" / "SKILL.md").write_text("skill a v0-stale", encoding="utf-8")
+        plans = plan_skill_installs(self.tools_repo_dir, self.skills_dir)
+        by_name = {p.name: p for p in plans}
+        self.assertEqual(by_name["skill-a"].action, "update")
+        self.assertEqual(by_name["skill-a"].content, "skill a v1")
+
+    def test_directory_without_skill_md_is_skipped(self):
+        (self.tools_repo_dir / "skills" / "not-a-skill").mkdir()
+        plans = plan_skill_installs(self.tools_repo_dir, self.skills_dir)
+        self.assertEqual({p.name for p in plans}, {"skill-a", "skill-b"})
+
+    def test_never_writes_anything_itself(self):
+        # Purely a planning step -- the dest directory shouldn't even be
+        # created by calling this, let alone populated.
+        plan_skill_installs(self.tools_repo_dir, self.skills_dir)
+        self.assertFalse(self.skills_dir.exists())
+
+    def test_crlf_source_content_is_preserved_verbatim(self):
+        # Regression for Copilot review finding on PR #224: source.read_text()
+        # opens in universal-newlines text mode, silently translating a
+        # CRLF source's line endings to bare "\n" -- lossy regardless of
+        # platform, and (combined with a text-mode write) the root cause of
+        # a Windows install perpetually re-reporting "update" for content
+        # that never actually changed. Reading raw bytes and decoding
+        # keeps the ORIGINAL line endings intact in `content`.
+        crlf_path = self.tools_repo_dir / "skills" / "skill-a" / "SKILL.md"
+        crlf_path.write_bytes(b"line one\r\nline two\r\n")
+        plans = plan_skill_installs(self.tools_repo_dir, self.skills_dir)
+        plan_a = next(p for p in plans if p.name == "skill-a")
+        self.assertEqual(plan_a.content, "line one\r\nline two\r\n")
+
+    def test_non_utf8_dest_is_reported_as_update_not_a_crash(self):
+        # Regression for Copilot review finding on PR #224: a pre-existing
+        # dest SKILL.md saved in a non-UTF-8 encoding (e.g. a user's editor
+        # defaulting to latin-1, or plain corruption) previously raised
+        # UnicodeDecodeError from a decoding comparison, aborting the ENTIRE
+        # --install-skills run before the documented "different -> update"
+        # path ever got a chance to run for this or any other skill.
+        (self.skills_dir / "skill-a").mkdir(parents=True)
+        (self.skills_dir / "skill-a" / "SKILL.md").write_bytes(b"\xff\xfe not valid utf-8")
+        plans = plan_skill_installs(self.tools_repo_dir, self.skills_dir)
+        by_name = {p.name: p for p in plans}
+        self.assertEqual(by_name["skill-a"].action, "update")
+        self.assertEqual(by_name["skill-b"].action, "install")
 
 
 if __name__ == "__main__":
