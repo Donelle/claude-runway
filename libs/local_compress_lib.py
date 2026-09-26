@@ -12,15 +12,23 @@ when there's no MCP Context available (e.g. from the hook).
 
 import asyncio
 import hashlib
+import json
 import os
 import re
-from typing import Optional
+import urllib.request
+from typing import Optional, Tuple
 
 from openai import OpenAI
 
 DEFAULT_BASE_URL = os.environ.get("CLAUDE_RUNWAY_LMSTUDIO_URL", "http://localhost:1234/v1")
 DEFAULT_MODEL = os.environ.get("CLAUDE_RUNWAY_LMSTUDIO_MODEL")  # intentionally no fallback -- see compress_mcp_server.py NOTE 2
 DEFAULT_CHUNK_CHARS = 12_000  # conservative per-call size -- local models vary widely in context window
+
+# Timeout (seconds) for the /api/v0/models probe in fetch_loaded_models below.
+# Generous by default since most callers (resolve_model) aren't on a
+# per-keystroke hot path; callers that ARE latency-sensitive (the WebFetch
+# redirect hook) pass their own shorter timeout explicitly.
+LM_STUDIO_V0_TIMEOUT_SECONDS = 5.0
 
 # Renamed from the bare LMSTUDIO_*/HOOK_* names to a CLAUDE_RUNWAY_* namespace.
 # The rename matters because these have to be exported at the OS/shell level for
@@ -432,7 +440,21 @@ def section_has_mixed_runs(body: str) -> bool:
     return has_prose and has_bullets
 
 
-def client(base_url: Optional[str]) -> OpenAI:
+def client(base_url: Optional[str], timeout: Optional[float] = None) -> OpenAI:
+    """
+    `timeout` is optional and omitted from the OpenAI() call entirely when
+    not given (rather than passed through as `timeout=None`, which the
+    OpenAI SDK would treat as "wait forever" -- the opposite of "use the
+    SDK's own default"). This keeps every existing single-arg `client(b)`
+    call site (the real compress() completion path, and test stand-ins
+    across this repo that patch `client` with a one-arg lambda) behaved
+    identically; only fetch_loaded_models' /v1 fallback below (PR #318
+    review) passes an explicit timeout, so a short-timeout caller like the
+    WebFetch redirect hook's reachability check doesn't silently fall back
+    to a long-hanging default timeout.
+    """
+    if timeout is not None:
+        return OpenAI(base_url=base_url or DEFAULT_BASE_URL, api_key="lm-studio", timeout=timeout)
     return OpenAI(base_url=base_url or DEFAULT_BASE_URL, api_key="lm-studio")
 
 
@@ -1355,6 +1377,117 @@ def classify_relevant(
     return True
 
 
+def _http_get_json(url: str, timeout: float):
+    """
+    Minimal stdlib-only GET-and-parse-JSON helper for fetch_loaded_models'
+    /api/v0/models probe below -- deliberately NOT `requests` (PR #318
+    review, high severity): both hooks/compress_bash_output.py and
+    hooks/redirect_webfetch_to_fetch_url.py document a standalone install
+    path of `pip install openai` ONLY, and both import this module directly
+    (not through compress_mcp_server.py's own requirements.txt, which does
+    include `requests` for fetch_url). Each hook fails OPEN on any
+    ImportError, so a new top-level third-party dependency here would have
+    silently disabled compression/redirect in a clean environment following
+    those documented instructions, with no error ever surfacing. urllib is
+    part of the standard library, so this adds no new dependency at all.
+
+    Raises urllib.error.HTTPError on a non-2xx response (e.g. a real 404,
+    exactly like `requests`' `raise_for_status()` would) and
+    urllib.error.URLError/OSError on a connection failure or timeout --
+    both are already subclasses of OSError/Exception, so the bare
+    `except Exception` at every call site here catches either uniformly,
+    same as it did for `requests`' exceptions.
+    """
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def fetch_loaded_models(base_url: Optional[str], timeout: float = LM_STUDIO_V0_TIMEOUT_SECONDS) -> Tuple[list, str]:
+    """
+    Returns (ids, source) -- the actual guarantee on `ids` is
+    SOURCE-DEPENDENT, not a single uniform "loaded and chat-capable" promise
+    (PR #318 review), so callers needing to know which guarantee applies
+    must check `source`, not just assume the stronger one:
+      - source == "v0": ids are LM Studio's native /api/v0/models endpoint's
+        own report of what's currently LOADED, filtered to exclude entries
+        it reports as embeddings-type (see the KNOWN RESIDUAL LIMITATION
+        paragraph below for why even this isn't a 100% guarantee).
+      - source == "v1": /api/v0 wasn't available, so this fell back to the
+        OpenAI-compatible /v1/models endpoint, which lists every DOWNLOADED
+        model regardless of whether it's actually loaded (issue #296) --
+        `ids` here may include models that aren't loaded at all.
+    Callers use `source` to avoid claiming "loaded" in a message when the
+    fallback path can't actually confirm that.
+
+    /v1/models is still the ultimate source of truth for "is LM Studio
+    reachable at all" -- if /api/v0 fails AND the /v1 fallback also raises,
+    that exception propagates to the caller unchanged, matching the exact
+    contract every existing caller's `except` block already relies on (a bare
+    `client(base_url).models.list()` call used to be what they wrapped).
+
+    Filtering rule (from the issue's real repro): check `state == "loaded"`
+    FIRST, not `type`. The issue's repro showed `type` alone is unreliable --
+    a NOT-loaded embedding model (jina-embeddings-v5-text-small-text-matching)
+    reported `type: "llm"` -- so checking `state` first (rather than
+    excluding by `type` regardless of load state) means that specific
+    not-loaded, mistyped model is correctly excluded here for being
+    not-loaded, not by accident of its type.
+
+    KNOWN RESIDUAL LIMITATION (PR #318 review): `type != "embeddings"` is
+    still the only signal available to exclude a LOADED embedding model
+    (which can't serve a chat completion) once `state == "loaded"` -- and
+    `/api/v0/models` exposes no OTHER field that reliably distinguishes
+    "chat-capable" from "embeddings-only". If a model's `type` is itself
+    misreported as `"llm"` while genuinely loaded (the issue only confirmed
+    this specific mistyping for a not-loaded model, but nothing in LM
+    Studio's schema ties the mistyping to load state), that entry still
+    passes here uncaught. This mirrors the exact unreliability this
+    docstring already documents for `type` -- there is currently no more
+    reliable field in `/api/v0/models`'s response to check instead. Still a
+    real improvement over the pre-fix code, which excluded nothing at all.
+    """
+    effective_base = base_url or DEFAULT_BASE_URL
+    root = effective_base.rstrip("/")
+    if root.endswith("/v1"):
+        root = root[: -len("/v1")]
+    v0_url = f"{root}/api/v0/models"
+
+    try:
+        payload = _http_get_json(v0_url, timeout)
+        # PR #318 review: a 200 response that ISN'T actually the /api/v0
+        # schema (e.g. a reverse proxy returning its own JSON error body, or
+        # a non-LM-Studio server that happens to answer this exact path with
+        # something unrelated) used to silently fall through to `entries =
+        # []` -- reporting "zero loaded models" via a WORKING server, rather
+        # than falling back to /v1/models like a genuinely-absent /api/v0
+        # (a 404) correctly does. Raising here instead routes it into the
+        # except block below, so an unrecognized shape is treated the same
+        # as "this endpoint isn't usable" rather than "nothing is loaded".
+        if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+            raise ValueError(f"/api/v0/models returned an unexpected shape: {payload!r}")
+        entries = payload["data"]
+        ids = [
+            entry["id"]
+            for entry in entries
+            if entry.get("state") == "loaded" and entry.get("type") != "embeddings" and entry.get("id")
+        ]
+        return ids, "v0"
+    except Exception:
+        # /api/v0 isn't available -- a non-LM-Studio OpenAI-compatible
+        # server, or an LM Studio release predating that endpoint. Fall back
+        # to /v1/models unchanged so behavior there doesn't regress. If LM
+        # Studio is genuinely unreachable, this raises too -- callers already
+        # catch that.
+        # PR #318 review: pass `timeout` through here too -- a caller like
+        # the WebFetch redirect hook relies on a short timeout to fail open
+        # promptly; without this, a hung/unreachable server would fall
+        # through to the OpenAI SDK's own (much longer) default timeout on
+        # this fallback path, silently defeating that caller's short budget.
+        models = client(base_url, timeout=timeout).models.list()
+        return [m.id for m in models.data], "v1"
+
+
 def resolve_model(explicit_model: Optional[str], base_url: Optional[str]):
     """
     Returns (model_id, error_message). Exactly one will be None.
@@ -1383,21 +1516,34 @@ def resolve_model(explicit_model: Optional[str], base_url: Optional[str]):
         return DEFAULT_MODEL, None
 
     try:
-        models = client(base_url).models.list()
+        ids, source = fetch_loaded_models(base_url)
     except Exception as e:
         return None, f"Could not reach LM Studio at {base_url or DEFAULT_BASE_URL} to auto-detect a model: {e}"
 
-    ids = [m.id for m in models.data]
     if len(ids) == 1:
         return ids[0], None
     if not ids:
         return None, "LM Studio is reachable but no model is loaded. Load one in LM Studio, or pass model= explicitly."
+    # source == "v0" means these really are confirmed LOADED chat models
+    # (issue #296) -- say so precisely. source == "v1" means /api/v0 wasn't
+    # reachable, so this can no longer distinguish loaded from
+    # merely-downloaded -- the wording must not claim "loaded" for something
+    # it can't actually confirm.
+    if source == "v0":
+        subject = f"Multiple loaded chat models found ({', '.join(ids)})"
+    else:
+        subject = (
+            f"Multiple models are available ({', '.join(ids)}), and LM Studio's /api/v0 endpoint "
+            "(which reports true load state) wasn't reachable, so it's unclear which are actually loaded"
+        )
     return None, (
-        f"Multiple models are loaded ({', '.join(ids)}) -- can't auto-detect which one to use. "
+        f"{subject} -- can't auto-detect which one to use. "
         "Pass model= explicitly, or set CLAUDE_RUNWAY_LMSTUDIO_MODEL to pin a default. "
         "NOTE: that var must be set in BOTH .mcp.json's env block (for the MCP server) "
         "and exported at the shell level (for the hooks) -- setting only one leaves the "
-        "other half hitting this exact error. See the README's 'Environment variables' section."
+        "other half hitting this exact error. See the README's 'Environment variables' section. "
+        "If you only expected one model here, run tools/doctor.py -- a misspelled/mismatched "
+        "env var pin is a common way to land in this exact error."
     )
 
 

@@ -120,10 +120,10 @@ from local_compress_lib import (
     DEFAULT_BASE_URL,
     DEFAULT_CHUNK_CHARS,
     DEFAULT_FOCUS,
-    client as _client,
     compress as _compress_impl,
     derive_compact_label,
     estimate_tokens,
+    fetch_loaded_models,
     redact_credentials,
 )
 from mcp_tool_introspect import describe_tools, tool_count
@@ -270,16 +270,33 @@ def _log_fixed_overhead():
 @mcp.tool()
 def list_local_models(base_url: Optional[str] = None) -> str:
     """
-    List model IDs currently available on the local LM Studio server. Use
-    this to find the exact model string for compress_text's model param, or
-    to check LM Studio is actually reachable before relying on it.
+    List the model ID(s) currently LOADED (not merely downloaded) on the
+    local LM Studio server. Use this to find the exact model string for
+    compress_text's model param, or to check LM Studio is actually reachable
+    before relying on it.
+
+    Issue #296: this used to report every model /v1/models returned, which
+    is every DOWNLOADED model (LM Studio's default is JIT loading, so a
+    downloaded model isn't necessarily loaded) -- misleading when the output
+    is used directly as a model= value that must name something actually
+    loaded. Now uses local_compress_lib.fetch_loaded_models, which prefers
+    LM Studio's native /api/v0/models endpoint (true per-model load state)
+    and only falls back to /v1/models -- unchanged, same old limitation --
+    when /api/v0 isn't available; the reply says explicitly when that
+    fallback happened, since load state can't be confirmed there.
     """
     try:
-        models = _client(base_url).models.list()
+        ids, source = fetch_loaded_models(base_url)
     except Exception as e:
         return f"Could not reach LM Studio at {base_url or DEFAULT_BASE_URL}: {e}"
-    ids = [m.id for m in models.data]
-    return ("Available local models: " + ", ".join(ids)) if ids else "LM Studio is reachable but no model is loaded."
+    if not ids:
+        return "LM Studio is reachable but no model is loaded."
+    if source == "v0":
+        return "Loaded chat models: " + ", ".join(ids)
+    return (
+        "Models available (load state unknown -- LM Studio's /api/v0 endpoint wasn't "
+        "reachable, so this can't confirm which are actually loaded): " + ", ".join(ids)
+    )
 
 
 async def _compress(

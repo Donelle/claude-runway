@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Tests for hooks/redirect_webfetch_to_fetch_url.py.
 
-Stdlib-only (unittest, no pytest) and no network -- OpenAI's client is
-stubbed via mock.patch.object on the hook module's own OpenAI reference, the
-same monkeypatch-and-restore approach test_local_compress_lib.py's
-SectionCompressionEndToEnd uses for LM Studio calls:
+Stdlib-only (unittest, no pytest) and no network -- LM Studio's response is
+stubbed by directly assigning a replacement onto the hook module's own
+`fetch_loaded_models` reference (imported from local_compress_lib into the
+hook's namespace) and restoring the original via addCleanup, NOT
+mock.patch.object -- the same plain-assignment monkeypatch-and-restore
+approach test_local_compress_lib.py's SectionCompressionEndToEnd uses for
+LM Studio calls:
 
     .venv/bin/python -m unittest discover -s tests
 
@@ -20,6 +23,20 @@ with a model pinned (the pin must not bypass reachability itself, since
 resolve_model's own pinned branch never checks it -- see the fix's
 docstring for why that matters specifically for this hook).
 
+Issue #296: _lmstudio_reachable used to call `.models.list()` (the
+OpenAI-compatible /v1/models endpoint) directly and count every entry it
+returned as "loaded" -- but /v1/models lists every DOWNLOADED model
+regardless of whether it's actually loaded (LM Studio's JIT-loading
+default). It now goes through local_compress_lib.fetch_loaded_models
+instead, which prefers LM Studio's native /api/v0/models endpoint (true
+per-model load state) and only falls back to /v1/models -- unchanged, same
+old limitation -- when /api/v0 isn't available. These tests patch
+`hook.fetch_loaded_models` directly (its return is (ids, source), or it
+raises to simulate "LM Studio unreachable") rather than mocking HTTP/OpenAI
+calls, since fetch_loaded_models' own behavior is covered by
+test_local_compress_lib.py -- this file only needs to confirm
+_lmstudio_reachable's decision tree built on top of it.
+
 Issue #64: _DeniedUrlCache records denied URLs with a timestamp so a retry
 WebFetch call for the same URL within the TTL is allowed through (fetch_url
 was presumably tried and failed between the two calls). After allowing, the
@@ -31,7 +48,6 @@ import os
 import sys
 import tempfile
 import unittest
-from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hooks"))
@@ -39,40 +55,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 import redirect_webfetch_to_fetch_url as hook  # noqa: E402
 
 
-def _fake_models(*ids):
-    return SimpleNamespace(data=[SimpleNamespace(id=i) for i in ids])
-
-
-class FakeOpenAI:
-    """Stand-in for openai.OpenAI. Constructed with the same kwargs the hook
-    passes (base_url/api_key/timeout, all ignored here); .models.list()
-    returns `response` or raises `error`, set per test via the class
-    attributes below rather than per-instance, since the hook constructs a
-    fresh client on every call."""
-    response = None
-    error = None
-
-    def __init__(self, *args, **kwargs):
-        pass
-
-    class _Models:
-        def list(self):
-            if FakeOpenAI.error is not None:
-                raise FakeOpenAI.error
-            return FakeOpenAI.response
-
-    @property
-    def models(self):
-        return FakeOpenAI._Models()
-
-
 class LmstudioReachable(unittest.TestCase):
     def setUp(self):
-        FakeOpenAI.response = None
-        FakeOpenAI.error = None
-        patcher = mock.patch.object(hook, "OpenAI", FakeOpenAI)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        self._orig_fetch_loaded_models = hook.fetch_loaded_models
         # DEFAULT_MODEL/stale_env_warning are plain names imported into the
         # hook's own module namespace -- patching them there (not on
         # local_compress_lib) is what _lmstudio_reachable actually looks up.
@@ -81,8 +66,17 @@ class LmstudioReachable(unittest.TestCase):
         self.addCleanup(self._restore_hook_globals)
 
     def _restore_hook_globals(self):
+        hook.fetch_loaded_models = self._orig_fetch_loaded_models
         hook.DEFAULT_MODEL = self._orig_default_model
         hook.stale_env_warning = self._orig_stale_env_warning
+
+    def _loaded(self, *ids, source="v0"):
+        hook.fetch_loaded_models = lambda base_url, timeout=None: (list(ids), source)
+
+    def _unreachable(self):
+        def _raise(base_url, timeout=None):
+            raise ConnectionError("LM Studio is down")
+        hook.fetch_loaded_models = _raise
 
     def _pin(self, model_id):
         hook.DEFAULT_MODEL = model_id
@@ -92,27 +86,27 @@ class LmstudioReachable(unittest.TestCase):
 
     def test_unreachable_returns_false(self):
         # Regression guard: the original "server doesn't respond" case.
-        FakeOpenAI.error = ConnectionError("LM Studio is down")
+        self._unreachable()
         self._pin(None)
         self.assertFalse(hook._lmstudio_reachable(None))
 
     def test_reachable_exactly_one_model_no_pin_returns_true(self):
         # Regression guard: the case that already worked before the fix.
-        FakeOpenAI.response = _fake_models("model-a")
+        self._loaded("model-a")
         self._pin(None)
         self._stale(False)
         self.assertTrue(hook._lmstudio_reachable(None))
 
     def test_reachable_zero_models_no_pin_returns_false(self):
         # The bug: reachable, but resolve_model would refuse (no model loaded).
-        FakeOpenAI.response = _fake_models()
+        self._loaded()
         self._pin(None)
         self._stale(False)
         self.assertFalse(hook._lmstudio_reachable(None))
 
     def test_reachable_multiple_models_no_pin_returns_false(self):
         # The bug: reachable, but resolve_model can't auto-detect among 2+.
-        FakeOpenAI.response = _fake_models("model-a", "model-b")
+        self._loaded("model-a", "model-b")
         self._pin(None)
         self._stale(False)
         self.assertFalse(hook._lmstudio_reachable(None))
@@ -121,23 +115,23 @@ class LmstudioReachable(unittest.TestCase):
         # The case a bare `len(models.data) == 1` check (the issue's literal
         # suggested fix) would still get WRONG: resolve_model would succeed
         # here via the pin, never even looking at the loaded count.
-        FakeOpenAI.response = _fake_models("model-a", "model-b")
+        self._loaded("model-a", "model-b")
         self._pin("pinned-model")
         self.assertTrue(hook._lmstudio_reachable(None))
 
     def test_unreachable_even_with_pin_returns_false(self):
         # The pin must NOT bypass the reachability check itself -- unlike
-        # resolve_model's own pinned branch, which never calls .models.list()
-        # at all. This hook has no later real call to fall back on, so it
-        # has to check reachability unconditionally first.
-        FakeOpenAI.error = ConnectionError("LM Studio is down")
+        # resolve_model's own pinned branch, which never calls
+        # fetch_loaded_models at all. This hook has no later real call to
+        # fall back on, so it has to check reachability unconditionally first.
+        self._unreachable()
         self._pin("pinned-model")
         self.assertFalse(hook._lmstudio_reachable(None))
 
     def test_stale_env_var_returns_false(self):
         # Reachable and even exactly one model loaded, but resolve_model
         # would still hard-error on an unmigrated old env var name.
-        FakeOpenAI.response = _fake_models("model-a")
+        self._loaded("model-a")
         self._pin(None)
         self._stale(True)
         self.assertFalse(hook._lmstudio_reachable(None))
@@ -153,9 +147,19 @@ class LmstudioReachable(unittest.TestCase):
         # fetch_url -- which would then immediately fail on the very same
         # stale check resolve_model now runs first. Must return False here
         # so this hook fails open (lets WebFetch through) instead.
-        FakeOpenAI.response = _fake_models("model-a")
+        self._loaded("model-a")
         self._pin("pinned-model")
         self._stale(True)
+        self.assertFalse(hook._lmstudio_reachable(None))
+
+    def test_v1_fallback_source_still_applies_same_count_rule(self):
+        # Issue #296: when fetch_loaded_models had to fall back to /v1/models
+        # (source="v1"), _lmstudio_reachable applies the exact same "exactly
+        # one -> True" rule to whatever ids it got back -- it doesn't special
+        # case the fallback source, since resolve_model itself doesn't either.
+        self._loaded("model-a", "model-b", source="v1")
+        self._pin(None)
+        self._stale(False)
         self.assertFalse(hook._lmstudio_reachable(None))
 
 
