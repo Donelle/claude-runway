@@ -16,6 +16,18 @@ env-var-redirection approach tests/test_cache_db.py uses for its own
 sibling module) so nothing here ever touches the real
 ~/.claude/claude-runway/ store, and _sessions_dir() -- derived from
 resolve_db_path().parent -- lands under that temp dir too.
+
+Issue #213: current_session_id(project=...) now delegates to
+session_id_lib.session_id(SessionIdStrategy.SHADOW_FILE, ...), which scans
+its OWN, separately-resolved (session_id_lib._sessions_dir(), hardcoded to
+~/.claude/claude-runway/sessions -- see that module's docstring) marker
+directory, independent of CLAUDE_RUNWAY_SAVINGS_DB. SavingsLedgerTestCase
+below also redirects THAT directory to the same temp dir, both so these
+tests stay deterministic (a real machine running this very test suite can
+have real, live session_id_lib markers sitting under the real
+~/.claude/claude-runway/sessions right now) and so project-filtered
+fixtures can be set up via session_id_lib.record_shadow_marker() directly
+(matching what the CORE hooks/record_session_id.py hook actually writes).
 """
 
 import csv as _csv_mod
@@ -32,6 +44,7 @@ from unittest import mock
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "libs"))
 
 import savings_ledger as L  # noqa: E402
+import session_id_lib  # noqa: E402
 
 
 class SavingsLedgerTestCase(unittest.TestCase):
@@ -43,7 +56,19 @@ class SavingsLedgerTestCase(unittest.TestCase):
         self._env_patch = mock.patch.dict(os.environ, {"CLAUDE_RUNWAY_SAVINGS_DB": str(db_path)})
         self._env_patch.start()
 
+        # Issue #213: session_id_lib's own sessions dir is independent of
+        # CLAUDE_RUNWAY_SAVINGS_DB (see module docstring above) -- redirect it
+        # to the SAME temp dir savings_ledger's own _sessions_dir() resolves
+        # to above, so current_session_id(project=...)'s delegation is both
+        # deterministic (never touches a real machine's live markers) and
+        # testable against fixtures this file controls.
+        self._session_id_lib_sessions_patch = mock.patch.object(
+            session_id_lib, "_sessions_dir", return_value=db_path.parent / "sessions"
+        )
+        self._session_id_lib_sessions_patch.start()
+
     def tearDown(self):
+        self._session_id_lib_sessions_patch.stop()
         self._env_patch.stop()
         self._tmpdir.cleanup()
 
@@ -56,8 +81,11 @@ class RecordEventProjectField(SavingsLedgerTestCase):
         self.assertEqual(events[0]["project"], "repo-a")
 
     def test_project_defaults_to_none(self):
-        # Matches the pre-fix JSONL shape (no project key at all, in effect)
-        # so old-format events never accidentally match a project filter.
+        # Matches the pre-fix JSONL shape (no project key at all, in effect).
+        # Issue #213: this field no longer drives current_session_id()'s
+        # project-filtered lookup at all (that now reads session_id_lib's
+        # shadow markers instead) -- kept as a data-integrity guard so an
+        # omitted project is stored honestly as None, not fabricated.
         L.record_event("sess-1", "hook:Bash", 1000, 100, True, "some cmd")
         events = L.read_session_events("sess-1")
         self.assertIsNone(events[0]["project"])
@@ -65,8 +93,18 @@ class RecordEventProjectField(SavingsLedgerTestCase):
 
 class CurrentSessionIdProjectFilter(SavingsLedgerTestCase):
     """The core of issue #35's fix: current_session_id(project=...) must not
-    hand back a real, unrelated session just because its JSONL happens to be
-    the most recently modified file in the shared sessions dir."""
+    hand back a real, unrelated session just because its marker happens to be
+    the most recently modified file in the shared sessions dir.
+
+    Issue #213: the project-FILTERED cases below now set up their fixtures
+    via session_id_lib.record_shadow_marker() (what the CORE
+    hooks/record_session_id.py hook actually writes) rather than
+    L.record_event() (this module's own transient compression-event log),
+    since current_session_id(project=...) delegates to session_id_lib's
+    SHADOW_FILE strategy, which scans the former, not the latter. The
+    UNFILTERED cases are UNCHANGED -- that path still scans this module's own
+    _sessions_dir() via record_event()-created files, per current_session_id's
+    own docstring."""
 
     def test_returns_none_with_no_sessions_at_all(self):
         self.assertIsNone(L.current_session_id())
@@ -85,39 +123,52 @@ class CurrentSessionIdProjectFilter(SavingsLedgerTestCase):
 
     def test_project_filter_skips_a_more_recently_touched_other_project(self):
         # The exact failure mode from the issue and my confirmation comment:
-        # a DIFFERENT project's session is the most recently modified file,
+        # a DIFFERENT project's session is the most recently modified marker,
         # but the caller asked for a specific project -- it must not be
         # substituted in.
-        L.record_event("sess-mine", "hook:Bash", 100, 10, True, project="claude-runway")
-        L.record_event("sess-other", "hook:Bash", 100, 10, True, project="Acme.Support.Nx")
-        old_path = L._session_jsonl_path("sess-mine")
-        new_path = L._session_jsonl_path("sess-other")
+        session_id_lib.record_shadow_marker("sess-mine", project="claude-runway")
+        session_id_lib.record_shadow_marker("sess-other", project="Acme.Support.Nx")
+        old_path = session_id_lib._shadow_marker_path("sess-mine")
+        new_path = session_id_lib._shadow_marker_path("sess-other")
         os.utime(old_path, (1000, 1000))
-        os.utime(new_path, (2000, 2000))  # sess-other is the more recent file
+        os.utime(new_path, (2000, 2000))  # sess-other is the more recent marker
 
-        # Unfiltered: picks the most recent file, regardless of project.
-        self.assertEqual(L.current_session_id(), "sess-other")
-        # Filtered by the ACTUAL project: correctly finds the older file,
+        # Filtered by the ACTUAL project: correctly finds the older marker,
         # not the more-recently-touched unrelated one.
         self.assertEqual(L.current_session_id(project="claude-runway"), "sess-mine")
+        self.assertEqual(L.current_session_id(project="Acme.Support.Nx"), "sess-other")
 
     def test_project_filter_returns_none_when_nothing_matches(self):
         # No live session at all for the requested project -- must return
         # None (caller shows "no live session"), not substitute an unrelated
         # session just because it's the only one that exists.
-        L.record_event("sess-other", "hook:Bash", 100, 10, True, project="some-other-repo")
+        session_id_lib.record_shadow_marker("sess-other", project="some-other-repo")
         self.assertIsNone(L.current_session_id(project="claude-runway"))
 
-    def test_project_filter_never_matches_a_pre_fix_event_with_no_project(self):
-        # An event recorded before this fix shipped has no "project" key at
-        # all (or None, per RecordEventProjectField above) -- must fail
-        # toward "no live session shown," never toward a false match.
-        L.record_event("sess-legacy", "hook:Bash", 100, 10, True)  # no project kwarg
+    def test_project_filter_never_matches_a_marker_for_a_different_basename(self):
+        # A marker recorded under a project whose basename differs from the
+        # filter must not match -- same "no substitution" guarantee as
+        # session_id_lib's own SHADOW_FILE tests, exercised here through the
+        # delegating caller.
+        session_id_lib.record_shadow_marker("sess-legacy", project="/some/other/path")
         self.assertIsNone(L.current_session_id(project="claude-runway"))
-        # Sanity check: unfiltered (project=None) still finds it -- the
-        # legacy event isn't unreadable, it just can't satisfy a project
-        # filter it was never tagged for.
-        self.assertEqual(L.current_session_id(), "sess-legacy")
+
+
+class SessionIdDelegatesToSessionIdLibTest(SavingsLedgerTestCase):
+    """Issue #213: current_session_id(project=...) must come from
+    libs/session_id_lib.py's SessionIdStrategy.SHADOW_FILE rather than this
+    module re-implementing its own marker scan -- asserting on the exact
+    returned session_id (not just "some session_id came back") is what
+    actually proves delegation happened, matching PR #218's precedent for the
+    sibling PROXY-strategy migration (issue #214)."""
+
+    def test_matches_session_id_lib_directly_for_the_same_project(self):
+        session_id_lib.record_shadow_marker("sess-abc", project="claude-runway")
+        expected = session_id_lib.session_id(
+            session_id_lib.SessionIdStrategy.SHADOW_FILE, project="claude-runway"
+        )
+        self.assertEqual(expected, "sess-abc")  # sanity: the fixture itself is valid
+        self.assertEqual(L.current_session_id(project="claude-runway"), expected)
 
 
 def _old_schema_db_path(db_path: Path) -> None:
