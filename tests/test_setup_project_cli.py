@@ -384,8 +384,10 @@ class HookEnvReminderShownForSkipHooks(unittest.TestCase):
         self.assertIn("CLAUDE_RUNWAY_TRACK_SAVINGS=1", buf.getvalue())
 
     def test_qdrant_only_with_track_savings_does_not_show_the_reminder(self):
-        # qdrant-only actively removes toolkit hooks (clean_hooks_if_unused),
-        # so there's genuinely nothing left for the reminder to be about.
+        # qdrant-only omits local-compress (and its compress-gated hooks)
+        # entirely -- issue #198's CORE record_session_id.py hook is still
+        # written, but it reads none of --track-savings/--lmstudio-*, so
+        # there's genuinely nothing left for THIS reminder to be about.
         args = _init_args(self.target_repo, qdrant_only=True, track_savings=True)
         buf = io.StringIO()
         with redirect_stdout(buf):

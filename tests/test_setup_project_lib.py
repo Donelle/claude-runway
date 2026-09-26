@@ -250,12 +250,27 @@ class BuildMcpServers(unittest.TestCase):
         self.assertEqual(servers["memory-bank"]["env"]["QDRANT_API_KEY"], "my-secret-key")
 
 
+def _find_block_args(hooks: dict, event: str, script_name: str) -> list:
+    """Test helper: finds the args list of whichever block under `event`
+    references `script_name` by basename -- position-independent, matching
+    build_settings_hooks' own basename-matching approach rather than
+    assuming a fixed array index (issue #198 added a second block per
+    event, so a fixed index would be fragile against future reordering)."""
+    for block in hooks.get(event, []):
+        for inner in block.get("hooks", []):
+            args = inner.get("args") or []
+            if args and Path(args[-1]).name == script_name:
+                return args
+    raise AssertionError(f"no block found for {script_name!r} under {event!r}")
+
+
 class BuildSettingsHooks(unittest.TestCase):
-    def _build(self):
+    def _build(self, include_compress: bool = True):
         return build_settings_hooks(
             SETTINGS_TEMPLATE,
             venv_python=Path("/home/user/tools/claude-runway/.venv/bin/python"),
             tools_repo_dir=Path("/home/user/tools/claude-runway"),
+            include_compress=include_compress,
         )
 
     def test_no_placeholders_survive(self):
@@ -264,17 +279,48 @@ class BuildSettingsHooks(unittest.TestCase):
     def test_each_hook_points_at_its_own_script(self):
         hooks = self._build()
         self.assertEqual(
-            hooks["PostToolUse"][0]["hooks"][0]["args"],
+            _find_block_args(hooks, "PostToolUse", "compress_bash_output.py"),
             ["/home/user/tools/claude-runway/hooks/compress_bash_output.py"],
         )
         self.assertEqual(
-            hooks["PreToolUse"][0]["hooks"][0]["args"],
+            _find_block_args(hooks, "PreToolUse", "redirect_webfetch_to_fetch_url.py"),
             ["/home/user/tools/claude-runway/hooks/redirect_webfetch_to_fetch_url.py"],
         )
         self.assertEqual(
-            hooks["SessionEnd"][0]["hooks"][0]["args"],
+            _find_block_args(hooks, "SessionEnd", "session_end_savings.py"),
             ["/home/user/tools/claude-runway/hooks/session_end_savings.py"],
         )
+
+    def test_core_hook_present_under_both_events_regardless_of_compress(self):
+        # Issue #198: record_session_id.py is CORE/base install -- present
+        # (and correctly patched) under both PostToolUse and SessionEnd
+        # whether or not local-compress is included.
+        for include_compress in (True, False):
+            hooks = self._build(include_compress=include_compress)
+            self.assertEqual(
+                _find_block_args(hooks, "PostToolUse", "record_session_id.py"),
+                ["/home/user/tools/claude-runway/hooks/record_session_id.py"],
+            )
+            self.assertEqual(
+                _find_block_args(hooks, "SessionEnd", "record_session_id.py"),
+                ["/home/user/tools/claude-runway/hooks/record_session_id.py"],
+            )
+
+    def test_include_compress_false_drops_compress_gated_blocks(self):
+        hooks = self._build(include_compress=False)
+        with self.assertRaises(AssertionError):
+            _find_block_args(hooks, "PostToolUse", "compress_bash_output.py")
+        with self.assertRaises(AssertionError):
+            _find_block_args(hooks, "PreToolUse", "redirect_webfetch_to_fetch_url.py")
+        with self.assertRaises(AssertionError):
+            _find_block_args(hooks, "SessionEnd", "session_end_savings.py")
+        # PreToolUse's event key survives as an empty list rather than being
+        # deleted -- so a later merge_settings_hooks call still processes
+        # this event and strips any STALE compress-gated block a prior full
+        # setup left in an existing settings.json (see this module's
+        # build_settings_hooks docstring).
+        self.assertEqual(hooks["PreToolUse"], [])
+        self.assertEqual(find_unresolved_placeholders(hooks), [])
 
 
 class MergeMcpJson(unittest.TestCase):
@@ -553,6 +599,53 @@ class RunSetupEndToEnd(unittest.TestCase):
         self.assertNotIn("local-compress", result.mcp_json["mcpServers"])
         self.assertIsNone(result.settings_json)
 
+    def test_cli_style_qdrant_only_still_writes_core_hooks(self):
+        # Issue #198: the CLI's --qdrant-only keeps include_hooks=True (only
+        # --skip-hooks sets it False) and passes include_compress=False --
+        # record_session_id.py (CORE/base install) must still be written,
+        # while the compress-gated hooks must not.
+        result = run_setup(
+            self.target_repo, REPO_ROOT, home_dir=Path("/home/user"), include_compress=False, include_hooks=True
+        )
+        self.assertIsNotNone(result.settings_json)
+        self.assertEqual(
+            _find_block_args(result.settings_json["hooks"], "PostToolUse", "record_session_id.py"),
+            [f"{REPO_ROOT.as_posix()}/hooks/record_session_id.py"],
+        )
+        self.assertEqual(
+            _find_block_args(result.settings_json["hooks"], "SessionEnd", "record_session_id.py"),
+            [f"{REPO_ROOT.as_posix()}/hooks/record_session_id.py"],
+        )
+        with self.assertRaises(AssertionError):
+            _find_block_args(result.settings_json["hooks"], "PostToolUse", "compress_bash_output.py")
+        with self.assertRaises(AssertionError):
+            _find_block_args(result.settings_json["hooks"], "PreToolUse", "redirect_webfetch_to_fetch_url.py")
+        with self.assertRaises(AssertionError):
+            _find_block_args(result.settings_json["hooks"], "SessionEnd", "session_end_savings.py")
+
+    def test_cli_style_qdrant_only_rerun_strips_stale_compress_hooks(self):
+        # A prior FULL setup wrote compress-gated hooks; a later --qdrant-only
+        # -style rerun (include_hooks=True, include_compress=False) must
+        # strip those stale blocks while keeping the core one, all through
+        # the normal merge path -- no separate clean_hooks_if_unused branch
+        # needed anymore for this case (issue #198).
+        first = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
+        (self.target_repo / ".claude").mkdir()
+        (self.target_repo / ".claude" / "settings.json").write_text(
+            json.dumps(first.settings_json), encoding="utf-8"
+        )
+
+        second = run_setup(
+            self.target_repo, REPO_ROOT, home_dir=Path("/home/user"), include_compress=False, include_hooks=True
+        )
+        self.assertEqual(len(second.settings_json["hooks"]["PostToolUse"]), 1)
+        self.assertEqual(second.settings_json["hooks"]["PreToolUse"], [])
+        self.assertEqual(len(second.settings_json["hooks"]["SessionEnd"]), 1)
+        self.assertEqual(
+            _find_block_args(second.settings_json["hooks"], "PostToolUse", "record_session_id.py"),
+            [f"{REPO_ROOT.as_posix()}/hooks/record_session_id.py"],
+        )
+
     def test_merges_with_an_already_existing_mcp_json(self):
         (self.target_repo / ".mcp.json").write_text(
             json.dumps({"mcpServers": {"github": {"command": "unrelated"}}}), encoding="utf-8"
@@ -568,9 +661,12 @@ class RunSetupEndToEnd(unittest.TestCase):
             json.dumps(first.settings_json), encoding="utf-8"
         )
         second = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
-        self.assertEqual(len(second.settings_json["hooks"]["PostToolUse"]), 1)
+        # PostToolUse/SessionEnd each carry TWO blocks by default (issue #198's
+        # always-on core record_session_id.py block, alongside the
+        # compress-gated one); PreToolUse has no core hook, so still just 1.
+        self.assertEqual(len(second.settings_json["hooks"]["PostToolUse"]), 2)
         self.assertEqual(len(second.settings_json["hooks"]["PreToolUse"]), 1)
-        self.assertEqual(len(second.settings_json["hooks"]["SessionEnd"]), 1)
+        self.assertEqual(len(second.settings_json["hooks"]["SessionEnd"]), 2)
 
     def test_generated_mcp_servers_never_includes_an_unrelated_existing_secret(self):
         # Regression for the finding from PR #113 review: the full merged
@@ -664,12 +760,15 @@ class RunSetupEndToEnd(unittest.TestCase):
         )
 
         post_hooks = second.settings_json["hooks"]["PostToolUse"]
-        self.assertEqual(len(post_hooks), 1)
-        # Normalize path separators before comparing: JSON settings may
-        # store paths with forward slashes on Windows for cross-platform
-        # compatibility, while str(Path) uses the OS separator.
-        actual = post_hooks[0]["hooks"][0]["args"][0].replace("\\", "/")
-        self.assertIn(moved_tools_repo.as_posix(), actual)
+        # Two blocks (core record_session_id.py + compress_bash_output.py),
+        # not duplicated -- issue #198 added the second block per event.
+        self.assertEqual(len(post_hooks), 2)
+        for block in post_hooks:
+            # Normalize path separators before comparing: JSON settings may
+            # store paths with forward slashes on Windows for cross-platform
+            # compatibility, while str(Path) uses the OS separator.
+            actual = block["hooks"][0]["args"][0].replace("\\", "/")
+            self.assertIn(moved_tools_repo.as_posix(), actual)
 
 
 if __name__ == "__main__":

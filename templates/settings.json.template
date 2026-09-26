@@ -4,6 +4,16 @@
   "hooks": {
     "PostToolUse": [
       {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "REPLACE-WITH-VENV-PYTHON",
+            "args": ["/absolute/path/to/tools-repo/hooks/record_session_id.py"]
+          }
+        ]
+      },
+      {
         "matcher": "Bash|Grep|WebFetch|Glob|WebSearch|mcp__local-compress__.*|mcp__github__(?:search_code|search_issues|search_repositories|search_users|list_issues|list_pull_requests|list_commits|get_issue|get_pull_request|get_pull_request_comments|get_pull_request_reviews|get_pull_request_status|add_issue_comment|create_pull_request_review)$",
         "hooks": [
           {
@@ -32,12 +42,23 @@
           {
             "type": "command",
             "command": "REPLACE-WITH-VENV-PYTHON",
+            "args": ["/absolute/path/to/tools-repo/hooks/record_session_id.py"]
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "REPLACE-WITH-VENV-PYTHON",
             "args": ["/absolute/path/to/tools-repo/hooks/session_end_savings.py"]
           }
         ]
       }
     ]
   },
+
+  "_core_hooks_note": "record_session_id.py (PostToolUse + SessionEnd, both above) is CORE/base install (issue #198) -- unlike every other hook in this file, it is written for EVERY project regardless of --qdrant-only/--skip-hooks's local-compress gating (only --skip-hooks, the full opt-out, omits it too). It keeps libs/session_id_lib.py's SHADOW_FILE session-id strategy actually populated: the PostToolUse registration (broad matcher '.*', deliberately not scoped to compress_bash_output.py's own tool list, so its marker's mtime tracks real recent activity regardless of which other hooks are configured) refreshes this session's own marker then, rate-limited to roughly once/hour via a sentinel file, sweeps markers older than CLAUDE_RUNWAY_SESSION_MARKER_TTL_HOURS (default 48h, shell-only -- see docs/environment-variables.md); the SessionEnd registration deletes this session's own marker on graceful exit. See libs/session_id_lib.py's module docstring for the full strategy table and hooks/record_session_id.py's own docstring for the write-then-sweep ordering that keeps a live session from ever pruning its own marker.",
 
   "_pretooluse_note": "redirect_webfetch_to_fetch_url.py hard-denies WebFetch (permissionDecision: deny) and tells Claude to call fetch_url instead -- but ONLY when LM Studio is reachable right now (checked live, not cached); otherwise it fails open and lets WebFetch proceed. This is deliberately a PreToolUse hard deny rather than a PostToolUse rewrite like compress_bash_output.py, because unlike 'is this output too large' (only knowable after the tool runs), 'should this go to fetch_url instead' is knowable before the call -- it only depends on the tool name and whether the local model is up. Auth/JS-rendering gap (issue #64): the hook records a SHA-256 digest of each denied URL in the shared SQLite cache (CLAUDE_RUNWAY_CACHE_DB, default ~/.claude/claude-runway/cache.db) at deny-time (not fetch_url-failure-time -- this is a PreToolUse hook and can't observe fetch_url's outcome). The deny message tells Claude to immediately retry the original WebFetch call if fetch_url errors -- that retry is allowed through as a one-shot skip (entry deleted so the next call is denied normally again). Known trade-off: if fetch_url succeeds, the entry remains in the cache until the same URL is looked up again (check_and_clear_if_retrying deletes it on any lookup -- within or beyond the TTL); it is only consumed as an allow if that lookup happens within the TTL window (default 3600 seconds; override via CLAUDE_RUNWAY_WEBFETCH_FAILED_URL_TTL). CLAUDE_RUNWAY_CACHE_DB is shared (codebase-indexer MCP server also reads it), so if you override it, set via shell export (not .mcp.json only) so the hook can inherit it -- hooks have no env field in settings.json. CLAUDE_RUNWAY_WEBFETCH_FAILED_URL_TTL is hook-only; no MCP counterpart.",
 

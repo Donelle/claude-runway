@@ -172,7 +172,7 @@ uv pip install pathspec --index-url https://pypi.org/simple
 
 **4. Per project you want memory for:**
 
-**Recommended: run the setup script instead of hand-editing the steps below.** `tools/setup_project.py` reads `templates/mcp.json.template` (and, unless `--qdrant-only` is passed, `templates/settings.json.template`) and writes a target project's `.mcp.json`/`.claude/settings.json` with every placeholder below filled in automatically — venv Python path, collection name (defaulted from the target repo's directory name), absolute script paths, home directory — instead of hand-typing them, some of which are required to match exactly across files. Safe to re-run: it merges into (rather than clobbers) any existing `.mcp.json`/`.claude/settings.json` content this toolkit doesn't own, and won't duplicate a hook block it already added.
+**Recommended: run the setup script instead of hand-editing the steps below.** `tools/setup_project.py` reads `templates/mcp.json.template` (and, unless `--skip-hooks` is passed, `templates/settings.json.template`) and writes a target project's `.mcp.json`/`.claude/settings.json` with every placeholder below filled in automatically — venv Python path, collection name (defaulted from the target repo's directory name), absolute script paths, home directory — instead of hand-typing them, some of which are required to match exactly across files. Safe to re-run: it merges into (rather than clobbers) any existing `.mcp.json`/`.claude/settings.json` content this toolkit doesn't own, and won't duplicate a hook block it already added. **`--qdrant-only` no longer skips `templates/settings.json.template` entirely** (issue #198): it only omits the local-compress-dependent hook entries (`compress_bash_output.py`, `redirect_webfetch_to_fetch_url.py`, `session_end_savings.py`) — the CORE `record_session_id.py` hook is written either way, since it's base install now, not local-compress-gated. Only `--skip-hooks` (a full opt-out of touching `.claude/settings.json` at all) omits everything, including the core hook.
 
 **Alternatively, use the `/my-setup-clauderunway` Claude Code skill** (see `skills/my-setup-clauderunway/SKILL.md`): install it once to `~/.claude/skills/`, export `CLAUDE_RUNWAY_DIR` in your shell profile pointing at this tools repo, then run `/my-setup-clauderunway` from any project you want to configure. It wraps `setup_project.py` with a guided question flow and also handles the `CLAUDE.md` update step that the CLI doesn't do.
 
@@ -188,9 +188,11 @@ python tools/setup_project.py init /path/to/target-repo --dry-run   # preview fi
 python tools/setup_project.py init /path/to/target-repo             # then write for real
 
 # Qdrant memory only, no local-compress: also removes this toolkit's own
-# hooks from .claude/settings.json if a prior run had added them, so
-# switching to qdrant-only doesn't leave stale compress-dependent hooks
-# still firing (leaves the file alone if it never had any):
+# COMPRESS-DEPENDENT hooks from .claude/settings.json if a prior run had
+# added them, so switching to qdrant-only doesn't leave those still firing.
+# The CORE hooks/record_session_id.py hook (issue #198) is written either
+# way -- it's base install, not local-compress-dependent, and only
+# --skip-hooks (a full opt-out of touching settings.json at all) omits it:
 python tools/setup_project.py init /path/to/target-repo --qdrant-only
 
 # common options: --collection-name, --collection-description, --lmstudio-model,

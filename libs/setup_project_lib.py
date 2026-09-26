@@ -306,36 +306,120 @@ def build_mcp_servers(
     return servers
 
 
-# (event, script filename) for every hook this toolkit's templates define.
-# Single source of truth for both build_settings_hooks (which patches these)
-# and _is_toolkit_owned_hook_block below (which recognizes a block as ours
-# by script filename alone, independent of the mutable path/matcher around
-# it) -- keeping them derived from the same tuple is what stops the two
-# from silently drifting apart if a script is ever renamed or a new hook
-# added.
-_TOOLKIT_HOOK_SCRIPTS = (
+# (event, script filename) for every hook this toolkit's templates define,
+# split into two groups (issue #198):
+#   - _CORE_HOOK_SCRIPTS: written for EVERY project regardless of
+#     --qdrant-only/local-compress config -- today, just record_session_id.py
+#     (registered under both PostToolUse and SessionEnd), which keeps
+#     libs/session_id_lib.py's SHADOW_FILE strategy actually populated.
+#   - _COMPRESS_HOOK_SCRIPTS: only written when local-compress is configured
+#     (include_compress=True below) -- the pre-existing three hooks.
+# _TOOLKIT_HOOK_SCRIPTS (both groups combined) is the single source of truth
+# for _is_toolkit_owned_hook below (which recognizes a block as ours by
+# script filename alone, independent of the mutable path/matcher/array
+# position around it) -- keeping every group derived from the same tuples is
+# what stops them from silently drifting apart if a script is ever renamed
+# or a new hook added.
+_CORE_HOOK_SCRIPTS = (
+    ("PostToolUse", "record_session_id.py"),
+    ("SessionEnd", "record_session_id.py"),
+)
+_COMPRESS_HOOK_SCRIPTS = (
     ("PostToolUse", "compress_bash_output.py"),
     ("PreToolUse", "redirect_webfetch_to_fetch_url.py"),
     ("SessionEnd", "session_end_savings.py"),
 )
+_TOOLKIT_HOOK_SCRIPTS = _CORE_HOOK_SCRIPTS + _COMPRESS_HOOK_SCRIPTS
 
 
-def build_settings_hooks(template: dict, *, venv_python: Path, tools_repo_dir: Path) -> dict:
+def _find_and_patch_block(blocks: list, script_name: str, *, command: str, args: list) -> bool:
+    """
+    Finds the (single) block in `blocks` whose FIRST inner hook's args
+    reference `script_name` by basename, and patches its command/args in
+    place. Matching by script basename (not array position) so the
+    template's own block ORDER is free to change without this needing to
+    track index numbers per event -- the same basename-matching principle
+    _is_toolkit_owned_hook already uses for the identical reason (a moved
+    tools-repo checkout / recreated venv / reordered template must still be
+    recognized). Returns True if a block was found and patched, False
+    otherwise (the caller treats "not found" as a template bug, since every
+    script in _TOOLKIT_HOOK_SCRIPTS is expected to have exactly one
+    matching block in the real settings.json.template).
+    """
+    for block in blocks:
+        inner_hooks = block.get("hooks") or []
+        if not inner_hooks:
+            continue
+        first_args = inner_hooks[0].get("args") or []
+        if first_args and Path(first_args[-1]).name == script_name:
+            inner_hooks[0]["command"] = command
+            inner_hooks[0]["args"] = args
+            return True
+    return False
+
+
+def _strip_block_for_script(blocks: list, script_name: str) -> list:
+    """Returns `blocks` with any block whose first inner hook references
+    `script_name` removed entirely -- used to drop a compress-gated
+    template block outright (not just leave it unpatched, which would ship
+    with unresolved REPLACE-WITH-VENV-PYTHON/.../ placeholders) when
+    include_compress=False."""
+    kept = []
+    for block in blocks:
+        inner_hooks = block.get("hooks") or []
+        first_args = inner_hooks[0].get("args") if inner_hooks else []
+        if inner_hooks and first_args and Path(first_args[-1]).name == script_name:
+            continue
+        kept.append(block)
+    return kept
+
+
+def build_settings_hooks(
+    template: dict, *, venv_python: Path, tools_repo_dir: Path, include_compress: bool = True
+) -> dict:
     """
     Returns a fresh `hooks` dict (PostToolUse/PreToolUse/SessionEnd) with
     every REPLACE-WITH-VENV-PYTHON / /absolute/path/to/tools-repo/...
     placeholder resolved. Mirrors build_mcp_servers()'s "patch known fields,
     don't blind-replace" approach.
+
+    `_CORE_HOOK_SCRIPTS` are ALWAYS patched and kept, regardless of
+    `include_compress` (issue #198 -- record_session_id.py is base install).
+    `_COMPRESS_HOOK_SCRIPTS` are patched and kept only when
+    `include_compress=True`; when False, their template blocks are dropped
+    from the returned dict entirely (not merely left unpatched) -- the
+    EVENT KEY itself is deliberately still present with a (possibly empty)
+    list rather than removed, so a caller merging this into an EXISTING
+    settings.json (see merge_settings_hooks) still processes that event and
+    strips any stale compress-gated block a PRIOR full setup left there,
+    even when this run contributes nothing new for it.
     """
     hooks = copy.deepcopy(template["hooks"])
     venv_python_str = venv_python.as_posix()
     # See build_mcp_servers()'s matching comment -- no .resolve() here either.
     tools_repo_str = Path(tools_repo_dir).as_posix()
 
-    for event, script_name in _TOOLKIT_HOOK_SCRIPTS:
-        entry = hooks[event][0]["hooks"][0]
-        entry["command"] = venv_python_str
-        entry["args"] = [f"{tools_repo_str}/hooks/{script_name}"]
+    for event, script_name in _CORE_HOOK_SCRIPTS:
+        blocks = hooks.get(event, [])
+        if not _find_and_patch_block(
+            blocks, script_name, command=venv_python_str, args=[f"{tools_repo_str}/hooks/{script_name}"]
+        ):
+            raise RuntimeError(
+                f"setup_project_lib bug: no template block found for core hook {script_name!r} under {event!r}"
+            )
+
+    for event, script_name in _COMPRESS_HOOK_SCRIPTS:
+        blocks = hooks.get(event, [])
+        if include_compress:
+            if not _find_and_patch_block(
+                blocks, script_name, command=venv_python_str, args=[f"{tools_repo_str}/hooks/{script_name}"]
+            ):
+                raise RuntimeError(
+                    f"setup_project_lib bug: no template block found for {script_name!r} under {event!r}"
+                )
+        else:
+            hooks[event] = _strip_block_for_script(blocks, script_name)
+
     return hooks
 
 
@@ -507,11 +591,14 @@ class SetupResult:
     with it -- a real credential leak, not a hypothetical one, since
     merging in unrelated existing servers/hooks untouched is this whole
     module's own explicit design goal (see merge_mcp_json/
-    merge_settings_hooks). `generated_settings_hooks` is None whenever this
-    run added nothing new to preview (either --skip-hooks's "leave
-    settings.json alone", or --qdrant-only's "only remove, nothing to add"
-    -- the latter's removal is safe to summarize by name in `changes`
-    without printing any content).
+    merge_settings_hooks). `generated_settings_hooks` is None only for
+    --skip-hooks's "leave settings.json alone entirely" -- NOT for
+    --qdrant-only (issue #198): that mode still generates and returns the
+    CORE record_session_id.py hooks (they're written/kept either way, not
+    local-compress-gated), it just omits the compress-dependent blocks
+    from what it builds. So --qdrant-only's `changes` entry summarizes a
+    real (non-empty) `generated_settings_hooks` value, same as a normal
+    run -- callers/dry-run code should not assume it's None for this mode.
     """
 
     mcp_json: dict
@@ -555,20 +642,21 @@ def run_setup(
     with pre-existing unrelated config) merges rather than clobbers -- see
     merge_mcp_json/merge_settings_hooks.
 
-    `include_hooks=False` has two distinct meanings depending on
-    `clean_hooks_if_unused`, corresponding to this toolkit's two different
-    CLI flags (found needing to be distinguished in PR #113 review):
-    - `clean_hooks_if_unused=False` (the CLI's `--skip-hooks`): don't touch
-      `.claude/settings.json` at all, even if it already has this toolkit's
-      hooks in it. The caller explicitly asked to leave that file alone.
-    - `clean_hooks_if_unused=True` (the CLI's `--qdrant-only`): ACTIVELY
-      remove any of this toolkit's own hook blocks from an existing
-      `.claude/settings.json` (see strip_toolkit_hooks) -- "qdrant only"
-      means local-compress-dependent hooks (which would otherwise silently
-      keep firing, or keep denying WebFetch in favor of a now-unconfigured
-      `fetch_url`) shouldn't survive either. A target with no existing
-      settings.json has nothing to clean, so this never creates the file
-      just to leave it empty.
+    `include_hooks=False` corresponds to the CLI's `--skip-hooks`: don't
+    touch `.claude/settings.json` at all, even if it already has this
+    toolkit's hooks in it -- the caller explicitly asked to leave that file
+    alone. `clean_hooks_if_unused=True` is this same escape hatch's OWN
+    lower-level cleanup path (see `strip_toolkit_hooks`), still supported
+    for a caller that wants "leave settings.json alone UNLESS it already has
+    stale toolkit hooks, in which case remove them" -- but the CLI itself no
+    longer needs it (issue #198): `--qdrant-only` now keeps
+    `include_hooks=True` (record_session_id.py is CORE/base install and must
+    still be written) and instead passes `include_compress=False` into the
+    `include_hooks=True` branch below, whose `build_settings_hooks(
+    include_compress=False)` + `merge_settings_hooks` already strip any
+    STALE compress-gated block a prior full setup left behind, as a normal
+    part of that same write -- no separate "clean, don't add" branch
+    required for that case anymore.
     """
     target_repo = Path(target_repo)
     tools_repo_dir = Path(tools_repo_dir)
@@ -652,7 +740,10 @@ def run_setup(
     if include_hooks:
         settings_template = load_json(templates_dir / "settings.json.template")
         generated_hooks = build_settings_hooks(
-            settings_template, venv_python=resolved_venv_python, tools_repo_dir=tools_repo_dir
+            settings_template,
+            venv_python=resolved_venv_python,
+            tools_repo_dir=tools_repo_dir,
+            include_compress=include_compress,
         )
         unresolved = find_unresolved_placeholders(generated_hooks)
         if unresolved:

@@ -213,7 +213,12 @@ def cmd_init(args: argparse.Namespace) -> None:
         print(f"error: target repo path does not exist or is not a directory: {target_repo}", file=sys.stderr)
         sys.exit(1)
 
-    include_hooks = not args.qdrant_only and not args.skip_hooks
+    # Issue #198: --qdrant-only no longer suppresses settings.json entirely --
+    # record_session_id.py is CORE/base install and must be written (and, on
+    # a rerun after a prior full setup, keep the compress-gated blocks
+    # stripped) regardless of --qdrant-only. Only --skip-hooks (the explicit
+    # full opt-out) leaves settings.json completely untouched.
+    include_hooks = not args.skip_hooks
     # None when TOOLS_REPO_DIR/.venv exists (the documented clone workflow --
     # see _pip_installed_venv_python's docstring): run_setup then falls back
     # to its own pure venv_python_path default exactly as before this issue,
@@ -239,11 +244,15 @@ def cmd_init(args: argparse.Namespace) -> None:
         memory_bank_id=args.memory_bank_id,
         include_compress=not args.qdrant_only,
         include_hooks=include_hooks,
-        # --qdrant-only means "clean up this toolkit's own stale hooks if
-        # present", not just "don't add new ones" -- see run_setup's
-        # docstring. --skip-hooks, by contrast, means "leave settings.json
-        # completely alone", so it must NOT set this.
-        clean_hooks_if_unused=args.qdrant_only,
+        # clean_hooks_if_unused's own special-case path is only relevant
+        # when include_hooks=False (--skip-hooks now, exclusively) -- since
+        # --qdrant-only keeps include_hooks=True (issue #198: core hooks are
+        # always written), build_settings_hooks(include_compress=False)
+        # already drops the compress-gated blocks, and merge_settings_hooks
+        # strips any STALE compress-gated block a prior full setup left in
+        # an existing settings.json as part of the normal include_hooks=True
+        # path -- no separate cleanup branch needed for that case anymore.
+        clean_hooks_if_unused=False,
     )
 
     for change in result.changes:
@@ -254,11 +263,18 @@ def cmd_init(args: argparse.Namespace) -> None:
     # wrote there) completely untouched -- it does not remove them -- so
     # the hook-side env mismatch this reminder warns about is still just as
     # real under --skip-hooks as under a normal run. Only --qdrant-only is
-    # guaranteed to leave no toolkit hooks active (see clean_hooks_if_unused
-    # above), so it's the only flag that should suppress this. Found in PR
-    # #113 review: gating on include_hooks silenced the reminder for
-    # --skip-hooks + --track-savings/--lmstudio-model/etc, even though any
-    # existing hooks would keep running with stale/default values.
+    # guaranteed to leave no COMPRESS-DEPENDENT hooks active (removal
+    # happens through build_settings_hooks(include_compress=False) plus the
+    # normal merge path above -- NOT clean_hooks_if_unused, which is
+    # hardcoded False here; see its own comment above for why) -- issue
+    # #198 means it no longer removes ALL toolkit hooks (the CORE
+    # record_session_id.py hook is written/kept either way), but that core
+    # hook doesn't read any of the env vars this reminder is about, so
+    # suppressing it under --qdrant-only is still correct -- just not
+    # because every toolkit hook is gone. Found in PR #113 review: gating
+    # on include_hooks silenced the reminder for --skip-hooks +
+    # --track-savings/--lmstudio-model/etc, even though any existing hooks
+    # would keep running with stale/default values.
     reminders = _hook_env_reminders(args) if not args.qdrant_only else []
     if reminders:
         print(
@@ -353,8 +369,10 @@ def cmd_init(args: argparse.Namespace) -> None:
         return
 
     # Write order matters specifically for --qdrant-only: it REMOVES
-    # local-compress from .mcp.json and REMOVES this toolkit's own hooks
-    # from settings.json in the same run. Found in PR #113 review: writing
+    # local-compress from .mcp.json and REMOVES this toolkit's
+    # local-compress-dependent hooks from settings.json in the same run
+    # (issue #198: the CORE record_session_id.py hook is written/kept
+    # either way, not removed). Found in PR #113 review: writing
     # .mcp.json first meant that if the settings.json write then failed
     # (e.g. an unwritable .claude/ directory), local-compress was already
     # gone but the stale PreToolUse hook was still active -- denying
@@ -460,7 +478,9 @@ def parse_args() -> argparse.Namespace:
         "'<compact-collection>-<sanitized-project>-<hash8>'.",
     )
     # Mutually exclusive: their settings.json semantics genuinely conflict.
-    # --qdrant-only actively REMOVES this toolkit's hooks if present;
+    # --qdrant-only actively REMOVES this toolkit's local-compress-dependent
+    # hooks if present (the CORE record_session_id.py hook is written/kept
+    # either way, per issue #198 -- it isn't removed);
     # --skip-hooks promises to leave settings.json untouched either way.
     # Found in PR #113 review: passing both together silently let
     # --qdrant-only's cleanup win, deleting existing hooks despite
@@ -472,8 +492,11 @@ def parse_args() -> argparse.Namespace:
         "--qdrant-only",
         action="store_true",
         help="Only configure the Qdrant codebase-memory piece: omit local-compress from .mcp.json, "
-        "and remove this toolkit's own hook blocks from .claude/settings.json if a prior run had "
-        "added them (leaves the file untouched if it never had any)",
+        "and remove this toolkit's local-compress-dependent hook blocks from .claude/settings.json if "
+        "a prior run had added them. The CORE record_session_id.py hook (issue #198) is still written "
+        "(or kept) either way, since it's base install now, not local-compress-gated -- so the file is "
+        "no longer left untouched even on a project that never had any hooks before; use --skip-hooks "
+        "instead if you want settings.json fully untouched",
     )
     hooks_mode.add_argument(
         "--skip-hooks",

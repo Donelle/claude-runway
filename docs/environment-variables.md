@@ -16,6 +16,7 @@
 | `CLAUDE_RUNWAY_WEBFETCH_FAILED_URL_TTL` | `3600` (seconds) | `redirect_webfetch_to_fetch_url.py` hook only | **shell only** — hook-only variable, no MCP counterpart |
 | `CLAUDE_RUNWAY_TRACK_MEMORY_EVENTS` | on | `memory-bank` MCP server only | **`.mcp.json` only, if overridden** — no hook reads this, so there's no "two places" coordination to do. Opt-OUT (set to `0`/`false`/`no` to disable), unlike `CLAUDE_RUNWAY_TRACK_SAVINGS`'s opt-in default — see [Memory bank](memory-bank.md)'s "Usage event logging" section for why. |
 | `CLAUDE_RUNWAY_MEMORY_EVENTS_DB` | `~/.claude/claude-runway/memory-events.db` | `memory-bank` MCP server only | **`.mcp.json` only, if overridden** — same reasoning as above; the default needs no configuration at all |
+| `CLAUDE_RUNWAY_SESSION_MARKER_TTL_HOURS` | `48` (hours) | `hooks/record_session_id.py` only | **shell only** — hook-only variable, no MCP counterpart. Controls how old a `libs/session_id_lib.py` Type-2 (SHADOW_FILE) shadow marker can get before the hook's own rate-limited sweep deletes it as a dead session's leftover (issue #198). An invalid (non-numeric) value falls back to the default rather than erroring. |
 
 ## Why two places
 
