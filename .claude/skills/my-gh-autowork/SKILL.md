@@ -89,26 +89,28 @@ Project-scoped to this repo (hardcodes `Donelle/claude-runway`, `.venv`-based te
       section below, this just means reading it rather than asking for a new format.
       Combine that with the model and timestamp noted in 2a and this Agent call's own
       `usage` block (`duration_ms` / 1000 → `wall_clock_s`, `subagent_tokens`, `tool_uses`
-      → `tool_calls`), then call:
+      → `tool_calls`), then call the `record_metric` tool (from the `local-compress` MCP
+      server — the same server that hosts `get_metrics`/`savings_summary`):
       ```
-      compact_store(
-        project="claude-runway-autowork-metrics",
-        label=f"issue-{n}-{HHMMSS}",
-        date=<today, ISO format YYYY-MM-DD>,
-        information=<JSON string: {"issue": n, "pr": pr_or_null, "outcome": "...",
-                       "model": "...", "rounds": N, "manual_interventions": N,
-                       "wall_clock_s": N, "subagent_tokens": N, "tool_calls": N,
-                       "findings": [{"category": "...", "reproduced": bool, "fixed": bool}]}>
+      record_metric(
+        metric_id="autowork",
+        event_type=<"ticket_" + outcome lowercased: "ticket_merged", "ticket_blocked", or "ticket_failed">,
+        value=1.0,
+        metadata=<JSON string: {"issue": n, "pr": pr_or_null, "outcome": "...",
+                    "model": "...", "rounds": N, "manual_interventions": N,
+                    "wall_clock_s": N, "subagent_tokens": N, "tool_calls": N,
+                    "findings": [{"category": "...", "reproduced": bool, "fixed": bool}]}>,
+        session_id=f"issue-{n}-{HHMMSS}"
       )
       ```
-      **`{HHMMSS}` in the label is not decorative — it's what keeps two attempts at the
-      SAME issue on the SAME calendar day from colliding.** `compact_store` derives its
-      point id from `(project, label, date)` and upserts on a match (issue #36); a
-      fixed `f"issue-{n}"` label would let a same-day retry silently overwrite an earlier
-      attempt's entry — e.g. a timeout/`FAILED` run followed by a same-day successful
-      retry would erase the very failure signal this whole feature exists to retain
-      (flagged in PR review on #127). The per-attempt timestamp makes every attempt its
-      own point regardless of how many times the same issue is worked in one day.
+      **`{HHMMSS}` in the `session_id` is not decorative — it keeps two attempts at the
+      SAME issue on the SAME calendar day distinguishable as separate rows** (issue #210:
+      the shared metrics store is append-only, so two calls never collide the way
+      `compact_store`'s upsert-on-`(project, label, date)` did — every call creates a new
+      row regardless; the per-attempt timestamp is stored as `session_id` in the raw table
+      for future per-attempt filtering, though current read tools (`get_metrics`/
+      `/my-metrics`) aggregate by `metric_id` only and do not yet expose a `session_id`
+      filter — that's a separate follow-up).
       `manual_interventions` counts any `SendMessage` resume THIS orchestrator had to send
       this same subagent to get a compliant final report (0 for a clean single-call
       ticket — see ticket #1's stalling incident in this skill's own commit history for
@@ -116,13 +118,11 @@ Project-scoped to this repo (hardcodes `Donelle/claude-runway`, `.venv`-based te
 
       **This logging step is best-effort and additive — it must never change what the
       outer 2b/2c control flow does next, only whether a metrics entry got recorded.**
-      `compact_store` can fail two different ways, and both need checking (a raised
-      exception is NOT the only failure shape): it can also return an ordinary string
-      starting with `Error:` instead of raising (see `/my-compact`'s own Step 6 discipline
-      for the same check) — treat either shape as "logging failed," note it, and move on
-      to whatever 2b/2c already say to do for this ticket's actual outcome. Concretely:
-      for a `MERGED` result in an `all` run, still continue to the next ticket even if
-      logging failed; for a `BLOCKED`/`FAILED` result, still **stop the whole run
+      `record_metric` returns either `"OK"` or a string starting with `"Error:"` — treat
+      either a raised exception OR an `"Error:"` return as "logging failed," note it, and
+      move on to whatever 2b/2c already say to do for this ticket's actual outcome.
+      Concretely: for a `MERGED` result in an `all` run, still continue to the next ticket
+      even if logging failed; for a `BLOCKED`/`FAILED` result, still **stop the whole run
       immediately** and surface the reason, even if logging failed; for a single-ticket
       invocation (no argument, or an explicit issue number), the run still ends after this
       one call regardless. A metrics-logging failure is never itself a reason to stop a

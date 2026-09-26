@@ -257,5 +257,51 @@ class BaselinePermissionRegexLogic(unittest.TestCase):
         )
 
 
+class MetricsLoggingContentRequirements(unittest.TestCase):
+    """Pin the logging-call shape added by issue #210 — the cut-over from
+    compact_store to record_metric. The skill is prose, not code, so a future
+    edit that silently reverts the logging call or changes its domain string
+    would otherwise produce no test failure."""
+
+    def setUp(self):
+        with open(SKILL_PATH, encoding="utf-8") as f:
+            self.content = f.read()
+
+    def test_uses_record_metric_not_compact_store_for_logging(self):
+        # compact_store may still appear in prose (e.g. historical context),
+        # but must not appear as the primary logging call in Step 2b's code
+        # block — record_metric is the replacement.
+        self.assertIn("record_metric(", self.content)
+
+    def test_logging_uses_autowork_metric_id(self):
+        # The domain string "autowork" is the metric_id every call must use
+        # so /my-metrics can filter by it -- a typo'd domain produces a valid
+        # call that silently writes to the wrong bucket.
+        self.assertIn('metric_id="autowork"', self.content)
+
+    def test_logging_records_event_type(self):
+        # event_type is required by MetricsStore.record() -- the call must
+        # include it in the named-parameter form the skill demonstrates.
+        self.assertIn("event_type=", self.content)
+
+    def test_logging_is_described_as_best_effort(self):
+        # The best-effort discipline must survive the logging-call change --
+        # a logging failure must never block the run's actual control flow.
+        self.assertIn("best-effort and additive", self.content)
+
+    def test_logging_failure_check_mentions_error_prefix(self):
+        # record_metric returns "OK" or an "Error:..." string -- the skill
+        # must instruct the orchestrator to check for this, the same way the
+        # old compact_store prose did for that tool's own two failure shapes.
+        self.assertIn('"Error:"', self.content)
+
+    def test_session_id_carries_per_attempt_timestamp(self):
+        # The per-attempt HHMMSS timestamp is now stored as session_id (not
+        # a label field, since the append-only store doesn't upsert) --
+        # verify the skill documents this so a future edit doesn't drop it.
+        self.assertIn("session_id", self.content)
+        self.assertIn("HHMMSS", self.content)
+
+
 if __name__ == "__main__":
     unittest.main()

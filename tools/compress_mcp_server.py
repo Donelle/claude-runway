@@ -1957,10 +1957,9 @@ def get_metrics(metric_id: str, view: str = "summary", bucket: str = "week", n: 
     domain writing a new `metric_id` never needs a new tool, only a new
     value passed to this one.
 
-    No domain writes into this store yet as of this ticket landing (see
-    issue #208's "Explicitly out of scope" section) -- every view below
-    returns an honest "no events recorded yet" result for any metric_id
-    until a future ticket migrates a real domain onto it.
+    As of issue #210, my-gh-autowork's per-ticket outcome logging writes
+    into this store under metric_id="autowork". Any metric_id with no
+    recorded events returns an honest "no events recorded yet" result.
 
     metric_id: the domain to query (e.g. "autowork", "memory-bank") --
       whatever string a future writer used when calling `record()`/
@@ -2005,6 +2004,76 @@ def get_metrics(metric_id: str, view: str = "summary", bucket: str = "week", n: 
         # Same reasoning as savings_summary's try/except -- best-effort feature,
         # must not fail the tool call over a DB problem.
         return f"Error: could not read metrics data ({e}). The metrics database may be corrupted or inaccessible; this doesn't affect anything else."
+
+
+@mcp.tool()
+def record_metric(
+    metric_id: str,
+    event_type: str,
+    value: float = 1.0,
+    metadata: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> str:
+    """
+    Writes one append-only event to the shared cross-tool metrics store
+    (issue #210 — the write counterpart to get_metrics). Any domain in
+    this toolkit can call this to record an event; the primary consumer
+    as of this ticket is my-gh-autowork's per-ticket outcome logging
+    (cut over from compact_store by this ticket).
+
+    metric_id: the domain (e.g. "autowork", "memory-bank") — caller-defined,
+      no fixed enum.
+    event_type: domain-defined event kind (e.g. "ticket_merged", "ticket_blocked").
+    value: a signed numeric delta (default 1.0). Must be finite — non-finite
+      values (inf/-inf/nan) are rejected by MetricsStore.record() and logged to
+      stderr; this tool surfaces that as an "Error:..." return instead.
+    metadata: optional JSON string of domain-specific extra fields (e.g.
+      '{"issue": 42, "pr": 101, "rounds": 2}'). Must be valid JSON if supplied;
+      an invalid JSON string is returned as an "Error:..." string rather than
+      raising.
+    session_id: optional caller-supplied session identifier for per-session
+      filtering later.
+
+    Returns "OK" on success, or an "Error:..." string on any failure —
+    including input-validation failures (non-finite value, invalid metadata
+    JSON) AND DB write failures (MetricsStore.record() returns False, which
+    this tool maps to an "Error:..." string). DB write failures are also
+    logged to stderr and never raised (fail-open: a broken/locked/corrupt
+    metrics db must never break the actual domain operation being measured),
+    but the "Error:..." return is the only signal the tool's caller sees.
+    """
+    if not _METRICS_LIB_AVAILABLE:
+        return "Error: libs/metrics_lib.py is not available in this install -- record_metric requires it."
+    import json as _json
+    import math as _math
+    if not _math.isfinite(value):
+        return f"Error: value must be finite (got {value!r})."
+    metadata_dict: Optional[dict] = None
+    if metadata is not None:
+        try:
+            metadata_dict = _json.loads(metadata)
+        except (ValueError, TypeError) as e:
+            return f"Error: metadata must be valid JSON if supplied ({e})."
+        if not isinstance(metadata_dict, dict):
+            return "Error: metadata must be a JSON object (dict), not an array or scalar."
+    store = metrics_lib.MetricsStore()
+    # record() fails open (returns False, logs to stderr) -- a broken metrics
+    # db must never look like a tool call failure for the domain operation
+    # that triggered the logging. Map a False return to an "Error:..." string
+    # so the SKILL.md "Error:" check can detect it, rather than unconditionally
+    # returning "OK" even when the write silently failed (Copilot review on
+    # PR #247: an always-"OK" return made the SKILL.md error check unreachable
+    # for the most important failure mode — an unwritable or locked db path).
+    ok = store.record(
+        metric_id=metric_id,
+        event_type=event_type,
+        value=value,
+        metadata=metadata_dict,
+        session_id=session_id,
+    )
+    if not ok:
+        return f"Error: could not write metric {metric_id}/{event_type} to the database (details logged to server stderr)."
+    return "OK"
 
 
 if __name__ == "__main__":

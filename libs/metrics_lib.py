@@ -19,8 +19,8 @@ memory_events_lib.py's `memory-events.db` -- both are genuinely tailored
 schemas that already work well for their one specific domain each,
 migrating them onto this generic store is an explicit follow-up, not part
 of this ticket (see issue #208's "Explicitly out of scope" section).
-Likewise my-gh-autowork's own migration off `compact_store` is tracked as
-its own separate two-part follow-up, blocked on this module landing first.
+As of issue #210, my-gh-autowork's per-ticket outcome logging is the first
+real domain writing into this store (`metric_id="autowork"`).
 
 Storage shape: single append-only `metrics` table --
 `(id, metric_id, event_type, value, metadata, event_timestamp, session_id)`.
@@ -170,9 +170,11 @@ class MetricsStore:
         metadata: Optional[dict] = None,
         session_id: Optional[str] = None,
         event_timestamp: Optional[str] = None,
-    ) -> None:
+    ) -> bool:
         """
-        Append one row. `metric_id`/`event_type` are domain-defined strings
+        Append one row. Returns True on success, False on any failure.
+
+        `metric_id`/`event_type` are domain-defined strings
         (no fixed enum here, unlike `memory_events_lib`'s `event_type` --
         this table is meant to serve domains not yet known, so validating
         against a hardcoded set would defeat the point). `metadata`, if
@@ -207,8 +209,9 @@ class MetricsStore:
 
         Fails OPEN on any write failure (unwritable/locked/corrupt db file,
         non-JSON-serializable metadata, or a non-finite `value`): caught and
-        logged to stderr, never raised. By the time this runs, the actual
-        operation this event describes has already happened -- a broken
+        logged to stderr, never raised -- returns False instead. By the time
+        this runs, the actual operation this event describes has already
+        happened -- a broken
         passive metrics log must never turn that into a reported failure
         for the caller. Same fail-open philosophy as
         `memory_events_lib.record_memory_event`.
@@ -230,7 +233,7 @@ class MetricsStore:
         """
         if not math.isfinite(value):
             print(f"[claude-runway] refusing to record non-finite metric value for {metric_id}/{event_type}: {value!r}", file=sys.stderr)
-            return
+            return False
         if event_timestamp is not None:
             try:
                 # PR #246 review (Copilot, round 1): a regex only checks
@@ -264,12 +267,12 @@ class MetricsStore:
                     f"event_timestamp override (expected canonical ISO 8601 UTC 'YYYY-MM-DDTHH:MM:SSZ'): {event_timestamp!r}",
                     file=sys.stderr,
                 )
-                return
+                return False
         try:
             metadata_json = json.dumps(metadata) if metadata is not None else None
         except (TypeError, ValueError) as e:
             print(f"[claude-runway] could not serialize metrics metadata for {metric_id}/{event_type}: {e}", file=sys.stderr)
-            return
+            return False
         # `conn` is closed in a `finally`, not just after a successful
         # `with conn:` block -- `with conn:` only manages the transaction
         # (commit/rollback), it does NOT close the connection itself, and a
@@ -293,8 +296,10 @@ class MetricsStore:
                         session_id,
                     ),
                 )
+            return True
         except (sqlite3.Error, OSError) as e:
             print(f"[claude-runway] could not record metric {metric_id}/{event_type}: {e}", file=sys.stderr)
+            return False
         finally:
             if conn is not None:
                 conn.close()
@@ -306,10 +311,11 @@ class MetricsStore:
         by: float = 1.0,
         metadata: Optional[dict] = None,
         session_id: Optional[str] = None,
-    ) -> None:
+    ) -> bool:
         """Thin sugar over record() storing a positive signed delta -- NOT a
-        mutable counter, see module docstring for why."""
-        self.record(metric_id, event_type, value=by, metadata=metadata, session_id=session_id)
+        mutable counter, see module docstring for why. Returns record()'s
+        success bool."""
+        return self.record(metric_id, event_type, value=by, metadata=metadata, session_id=session_id)
 
     def decrement(
         self,
@@ -318,9 +324,10 @@ class MetricsStore:
         by: float = 1.0,
         metadata: Optional[dict] = None,
         session_id: Optional[str] = None,
-    ) -> None:
-        """Thin sugar over record() storing a negative signed delta."""
-        self.record(metric_id, event_type, value=-by, metadata=metadata, session_id=session_id)
+    ) -> bool:
+        """Thin sugar over record() storing a negative signed delta. Returns
+        record()'s success bool."""
+        return self.record(metric_id, event_type, value=-by, metadata=metadata, session_id=session_id)
 
     # -------------------------------------------------------------------
     # Reads -- raise on failure (see module docstring); callers wrap these

@@ -2,7 +2,7 @@
 
 Show a view of ClaudeRunway's shared cross-tool metrics store (issue #208): a generic SQLite table (`~/.claude/claude-runway/metrics.db`) any domain in this toolkit can write into via `libs/metrics_lib.py`'s `MetricsStore` class, read here through the `get_metrics` MCP tool (from the `local-compress` server).
 
-**Important — this is generic infrastructure, not a specific report.** No domain writes into this store yet as of this ticket landing (migrating `savings_ledger`/`memory_events_lib`, or `my-gh-autowork`'s own run metrics, onto it are separate follow-up tickets — see issue #208's "Explicitly out of scope" section). Until a future domain writes real data, every `metric_id` you try here will honestly report "no events recorded yet" — that's expected, not a bug.
+**Important — this is generic infrastructure, not a specific report.** As of issue #210, `my-gh-autowork`'s per-ticket outcome logging writes into this store under `metric_id="autowork"` — use `/my-metrics autowork` to see outcome totals. Other domains (`savings_ledger`, `memory_events_lib`) remain on their own stores for now. Any `metric_id` with no recorded events will honestly report "no events recorded yet" — that's expected for domains not yet migrated, not a bug.
 
 Required argument: `metricId` — the domain to query (e.g. `autowork`, `memory-bank`), whatever string a writer used when calling `record()`/`increment()`/`decrement()`.
 

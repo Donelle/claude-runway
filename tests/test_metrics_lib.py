@@ -119,6 +119,22 @@ class RecordRoundTrip(MetricsStoreTestCase):
         self.store.record("autowork", "ticket_merged", metadata={"bad": {1, 2, 3}})
         self.assertEqual(self._all_rows(), [])
 
+    def test_record_returns_true_on_success(self):
+        # PR #247 review: record() previously returned None unconditionally,
+        # making the record_metric MCP tool's "Error:" check unreachable for
+        # DB write failures. Now returns True on success so callers can
+        # distinguish success from the False returned on any failure path.
+        result = self.store.record("autowork", "ticket_merged")
+        self.assertTrue(result)
+
+    def test_record_returns_false_on_non_serializable_metadata(self):
+        result = self.store.record("autowork", "ticket_merged", metadata={"bad": {1, 2, 3}})
+        self.assertFalse(result)
+
+    def test_record_returns_false_on_non_finite_value(self):
+        result = self.store.record("autowork", "ticket_merged", value=float("inf"))
+        self.assertFalse(result)
+
 
 class EventTimestampOverride(MetricsStoreTestCase):
     """Issue #209: record() gained an optional event_timestamp override so
@@ -269,9 +285,12 @@ class RecordFailsOpen(unittest.TestCase):
             bad_path = blocking_file / "sub" / "metrics.db"
             store = M.MetricsStore(db_path=bad_path)
             try:
-                store.record("autowork", "ticket_merged")
+                result = store.record("autowork", "ticket_merged")
             except Exception as e:  # pragma: no cover -- must not happen
                 self.fail(f"record() raised instead of failing open: {e}")
+            # PR #247 review: record() now returns False on failure so the
+            # record_metric MCP tool's "Error:" check can actually fire.
+            self.assertFalse(result)
 
 
 class SummaryTestCase(MetricsStoreTestCase):
