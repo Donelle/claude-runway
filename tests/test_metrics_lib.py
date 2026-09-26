@@ -41,8 +41,12 @@ class ResolveDbPath(unittest.TestCase):
             self.assertNotEqual(path, Path.home() / ".claude" / "claude-runway" / "memory-events.db")
 
     def test_absolute_override_is_used_as_is(self):
-        with mock.patch.dict(os.environ, {"CLAUDE_RUNWAY_METRICS_DB": "/custom/metrics.db"}, clear=False):
-            self.assertEqual(M.resolve_db_path(), Path("/custom/metrics.db"))
+        # os.path.abspath resolves to a drive-letter path on Windows so
+        # Path.is_absolute() returns True on both platforms, matching what
+        # production code's resolve_db_path() actually checks.
+        abs_path = os.path.abspath("/custom/metrics.db")
+        with mock.patch.dict(os.environ, {"CLAUDE_RUNWAY_METRICS_DB": abs_path}, clear=False):
+            self.assertEqual(M.resolve_db_path(), Path(abs_path))
 
     def test_relative_override_is_anchored_to_home_not_cwd(self):
         with mock.patch.dict(os.environ, {"CLAUDE_RUNWAY_METRICS_DB": "relative/metrics.db"}, clear=False):
