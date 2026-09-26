@@ -16,9 +16,16 @@ The optional label argument to `/my-compact` (e.g. `/my-compact "auth refactor"`
 **Installation:**
 
 ```bash
+claude-runway-setup init --install-skills   # installs/updates every product skill, including these two
+```
+
+(Or, from a clone: `python tools/setup_project.py init --install-skills`.) This installs/updates ALL of this repo's product skills at once (not just these two) — missing ones are installed, changed ones are updated, identical ones are left alone (issue [#14](https://github.com/Donelle/claude-runway/issues/14)). Works the same way whether you cloned this repo or installed it via pipx/`uv tool install` (see [Installation](installation.md)'s "Alternative" callout) — `skills/` ships in the package either way. Equivalent manual copy, if you'd rather not run the CLI:
+
+```bash
 mkdir -p ~/.claude/skills/my-compact ~/.claude/skills/my-resume
 cp skills/my-compact/SKILL.md ~/.claude/skills/my-compact/SKILL.md
 cp skills/my-resume/SKILL.md ~/.claude/skills/my-resume/SKILL.md
 ```
 
-Skills install globally (under `~/.claude/skills/`) rather than per-project, so you only need to do this once. The `/my-resume` command retrieves the right session by matching the `project` field in metadata against the current working directory name — switching projects automatically scopes the results.
+Skills install globally (under `~/.claude/skills/`) rather than per-project, so you only need to do this once — pass `--skills-dir <path>` to `--install-skills` if you want a per-project install instead (e.g. `<repo>/.claude/skills`). The `/my-resume` command retrieves the right session by matching the `project` field in metadata against the current working directory name — switching projects automatically scopes the results.
+

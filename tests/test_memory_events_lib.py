@@ -246,5 +246,45 @@ class ConnectionCleanupOnFailure(unittest.TestCase):
         fake_conn.close.assert_called_once()
 
 
+class RecordMemoryMetricTest(unittest.TestCase):
+    """Issue #211: record_memory_metric() writes a plain per-call-attempt
+    tally into metrics.db via libs/metrics_lib.py's MetricsStore --
+    deliberately separate from record_memory_event/memory-events.db above
+    (that table stays entirely untouched by this function)."""
+
+    def test_valid_event_types_call_metrics_store_increment(self):
+        for event_type in ("recall", "remember", "forget"):
+            with mock.patch("memory_events_lib.metrics_lib.MetricsStore") as mock_store_cls:
+                mock_store = mock_store_cls.return_value
+                ev.record_memory_metric(event_type, session_id="sess-1")
+            mock_store_cls.assert_called_once_with()
+            mock_store.increment.assert_called_once_with(
+                metric_id="memory-bank", event_type=event_type, session_id="sess-1"
+            )
+
+    def test_session_id_defaults_to_none(self):
+        with mock.patch("memory_events_lib.metrics_lib.MetricsStore") as mock_store_cls:
+            mock_store = mock_store_cls.return_value
+            ev.record_memory_metric("recall")
+        mock_store.increment.assert_called_once_with(
+            metric_id="memory-bank", event_type="recall", session_id=None
+        )
+
+    def test_forget_is_valid_here_even_though_record_memory_event_rejects_it(self):
+        # The whole point of _VALID_METRIC_EVENT_TYPES being wider than
+        # _VALID_EVENT_TYPES: a plain call count for "forget" carries none of
+        # the "autonomous removal" concern that excludes it from the richer
+        # per-point memory_events log.
+        with mock.patch("memory_events_lib.metrics_lib.MetricsStore") as mock_store_cls:
+            ev.record_memory_metric("forget")
+        mock_store_cls.return_value.increment.assert_called_once()
+
+    def test_unknown_event_type_raises_without_touching_metrics_store(self):
+        with mock.patch("memory_events_lib.metrics_lib.MetricsStore") as mock_store_cls:
+            with self.assertRaises(ValueError):
+                ev.record_memory_metric("something-else")
+        mock_store_cls.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

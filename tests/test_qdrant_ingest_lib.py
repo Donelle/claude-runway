@@ -26,6 +26,7 @@ The first three were found by indexing this repo with its own indexer:
      this repo's own defaults never hit the bad case.
 """
 
+import builtins
 import hashlib
 import os
 import sys
@@ -54,6 +55,7 @@ from qdrant_ingest_lib import (  # noqa: E402
     iter_files,
     python_boundary_indexes,
     validate_chunk_params,
+    warm_fastembed_cache,
 )
 
 # Chunk params matching the CLI defaults closely enough to be representative.
@@ -1060,6 +1062,151 @@ class EnsurePersistentFastembedCache(unittest.TestCase):
         with mock.patch.dict(os.environ, {"FASTEMBED_CACHE_PATH": "/custom/cache/dir"}, clear=False):
             ensure_persistent_fastembed_cache()
             self.assertEqual(os.environ["FASTEMBED_CACHE_PATH"], "/custom/cache/dir")
+
+
+class _FakeTextEmbedding:
+    """Test double for fastembed.TextEmbedding -- takes a scripted sequence
+    of per-call outcomes (True = succeeds, False = raises) and records each
+    call's args/kwargs, so tests can assert warm_fastembed_cache's phase 2
+    really does pass local_files_only=True as an explicit constructor
+    kwarg (NOT via an HF_HUB_OFFLINE env mutation -- see this test class'
+    own docstring for why that approach was wrong and was replaced)."""
+
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)
+        self.calls: list = []
+
+    def __call__(self, model_name, cache_dir=None, **kwargs):
+        self.calls.append({"model_name": model_name, "cache_dir": cache_dir, "kwargs": kwargs})
+        if not self.outcomes:
+            raise AssertionError("_FakeTextEmbedding called more times than scripted")
+        if not self.outcomes.pop(0):
+            raise RuntimeError("simulated fastembed failure")
+        return MagicMock()
+
+
+class WarmFastembedCache(unittest.TestCase):
+    """warm_fastembed_cache (issue #221) -- the two-phase gate that decides
+    whether it's safe to write HF_HUB_OFFLINE=1 into a generated .mcp.json's
+    qdrant server env block. Phase 1 ("warm", network allowed) retries with
+    backoff; phase 2 ("confirm", local_files_only=True) proves the result
+    actually loads with zero network access -- a successful phase 1 call
+    alone must NOT be treated as sufficient proof of that.
+
+    Phase 2 originally mutated os.environ["HF_HUB_OFFLINE"] around the
+    confirmation call instead of passing local_files_only=True -- found
+    wrong in PR #223 review and reproduced directly against this repo's
+    own real huggingface_hub install: huggingface_hub.constants reads
+    HF_HUB_OFFLINE from the environment exactly ONCE, at whichever moment
+    that module is first imported (which phase 1 already triggers, via
+    fastembed's own import of huggingface_hub) -- mutating os.environ
+    afterward has NO effect on huggingface_hub.is_offline_mode() for the
+    rest of the process, so that version's "confirmation" could still
+    silently use the network and return True. local_files_only=True is a
+    plain per-call argument fastembed threads straight through to
+    huggingface_hub.snapshot_download's own network-call gate, so it
+    works correctly regardless of import order.
+    """
+
+    def _sleep_calls(self):
+        calls: list = []
+        return calls, (lambda seconds: calls.append(seconds))
+
+    def test_success_on_first_try(self):
+        fake = _FakeTextEmbedding([True, True])
+        _, fake_sleep = self._sleep_calls()
+        result = warm_fastembed_cache(
+            "some/model", Path("/cache/dir"), text_embedding_cls=fake, sleep=fake_sleep
+        )
+        self.assertTrue(result)
+        self.assertEqual(len(fake.calls), 2, "one phase-1 call, one phase-2 confirmation call")
+
+    def test_phase_two_passes_local_files_only_true_phase_one_does_not(self):
+        fake = _FakeTextEmbedding([True, True])
+        result = warm_fastembed_cache(
+            "some/model", Path("/cache/dir"), text_embedding_cls=fake, sleep=lambda s: None
+        )
+        self.assertTrue(result)
+        # Phase 1 (first call) must NOT force local_files_only -- network
+        # access is exactly what a genuinely cold cache needs there.
+        self.assertNotIn("local_files_only", fake.calls[0]["kwargs"])
+        # Phase 2 (second call) MUST pass local_files_only=True explicitly.
+        self.assertEqual(fake.calls[1]["kwargs"].get("local_files_only"), True)
+
+    def test_phase_two_does_not_touch_hf_hub_offline_env_var(self):
+        # Regression guard for the reverted env-mutation approach above --
+        # this function must not read OR write HF_HUB_OFFLINE at all.
+        fake = _FakeTextEmbedding([True, True])
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("HF_HUB_OFFLINE", None)
+            warm_fastembed_cache("some/model", Path("/cache/dir"), text_embedding_cls=fake, sleep=lambda s: None)
+            self.assertNotIn("HF_HUB_OFFLINE", os.environ)
+
+    def test_succeeds_after_retries_within_attempts_budget(self):
+        fake = _FakeTextEmbedding([False, False, True, True])
+        sleep_calls, fake_sleep = self._sleep_calls()
+        result = warm_fastembed_cache(
+            "some/model", Path("/cache/dir"), attempts=3, backoff_seconds=2.0,
+            text_embedding_cls=fake, sleep=fake_sleep,
+        )
+        self.assertTrue(result)
+        self.assertEqual(len(fake.calls), 4)
+        # Backoff applied after attempt 1 and attempt 2 (not after the
+        # attempt that finally succeeded, and not before phase 2).
+        self.assertEqual(sleep_calls, [2.0, 4.0])
+
+    def test_all_phase_one_attempts_failing_returns_false_without_phase_two(self):
+        fake = _FakeTextEmbedding([False, False, False])
+        sleep_calls, fake_sleep = self._sleep_calls()
+        result = warm_fastembed_cache(
+            "some/model", Path("/cache/dir"), attempts=3, text_embedding_cls=fake, sleep=fake_sleep
+        )
+        self.assertFalse(result)
+        self.assertEqual(len(fake.calls), 3, "no phase-2 confirmation call once phase 1 never succeeds")
+        self.assertEqual(len(sleep_calls), 2, "backoff between attempts, but not after the final failed attempt")
+
+    def test_phase_one_success_but_phase_two_failure_returns_false(self):
+        # A phase-1 success alone must not be trusted -- if the offline
+        # confirmation itself fails, this must still report False so the
+        # caller does NOT write HF_HUB_OFFLINE=1 against an incomplete cache.
+        fake = _FakeTextEmbedding([True, False])
+        result = warm_fastembed_cache(
+            "some/model", Path("/cache/dir"), text_embedding_cls=fake, sleep=lambda s: None
+        )
+        self.assertFalse(result)
+        self.assertEqual(len(fake.calls), 2)
+
+    def test_returns_false_when_fastembed_is_not_importable(self):
+        # sys.modules[name] = None is the standard way to simulate an
+        # ImportError for a specific module without needing it genuinely
+        # uninstalled in this test environment.
+        with mock.patch.dict(sys.modules, {"fastembed": None}):
+            self.assertFalse(warm_fastembed_cache("some/model", Path("/cache/dir")))
+
+    def test_returns_false_when_fastembed_import_raises_a_non_import_error(self):
+        # Regression for the finding from PR #223 review: importing
+        # fastembed transitively imports onnxruntime/tokenizers/etc., any of
+        # which can fail with something other than ImportError on a broken
+        # native/runtime dependency (e.g. an incompatible ABI) -- this
+        # function's own "never raises" contract must hold for that case
+        # too, not just a genuinely-missing package.
+        real_import = builtins.__import__
+
+        def _fake_import(name, *args, **kwargs):
+            if name == "fastembed":
+                raise OSError("simulated native dependency failure")
+            return real_import(name, *args, **kwargs)
+
+        with mock.patch.object(builtins, "__import__", side_effect=_fake_import):
+            self.assertFalse(warm_fastembed_cache("some/model", Path("/cache/dir")))
+
+    def test_cache_dir_passed_through_as_a_string(self):
+        fake = _FakeTextEmbedding([True, True])
+        warm_fastembed_cache(
+            "some/model", Path("/cache/dir"), text_embedding_cls=fake, sleep=lambda s: None
+        )
+        for call in fake.calls:
+            self.assertEqual(call["cache_dir"], str(Path("/cache/dir")))
 
 
 class ValidateChunkParams(unittest.TestCase):

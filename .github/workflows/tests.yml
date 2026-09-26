@@ -66,21 +66,90 @@ jobs:
       - name: Check MCP tool counts (issue #52/GROW-05)
         run: python tools/report_tool_counts.py
 
-      - name: Build & smoke-test pip packaging (issue #50)
-        # tests/test_pyproject.py only checks the TOML declaratively -- this
-        # is the one place a REAL (non-editable) build+install actually
-        # happens, which is what catches a class of bug that file can't:
-        # confirmed live during this issue's own development that
-        # pyproject.toml can declare all 3 console scripts correctly and
-        # STILL crash on first real use, because templates/*.template
-        # (loaded by claude-runway-setup, not importable Python) silently
-        # didn't make it into the wheel until package-data was added for it.
-        # `pip install .` (not `-e .`) is deliberate -- an editable install
-        # keeps pointing at this checkout's own files, so it would never
-        # have caught that missing-data-file bug in the first place.
+  # Issue #206 acceptance criterion: on each of Windows/macOS/Linux, a
+  # `uv tool install`/pipx-style install (built wheel installed into a
+  # FRESH environment, not this checkout's own venv) must put
+  # libs/tools/hooks/templates/skills under <env>/src/, all 3 console
+  # scripts must run, and `claude-runway-setup init --dry-run` must
+  # generate config whose script/hook paths exist on disk. A separate job
+  # (not a step in `test` above) because it needs the OS matrix below --
+  # `test` stays ubuntu-only since mypy/unittest have no OS-specific
+  # behavior to catch. Replaces the single ubuntu-only
+  # "Build & smoke-test pip packaging" step this job used to be inline in
+  # `test` (issue #50) -- same checks, now run on all 3 platforms instead
+  # of just one; tests/test_pyproject.py's BuiltWheelHasExpectedDataLayout
+  # covers the wheel-CONTENTS half of this same acceptance criterion
+  # without needing 3 OS runners, since a wheel's own DATA-category
+  # install-to-sys.prefix behavior is a wheel-spec guarantee, not
+  # OS-specific -- this job instead covers the parts that genuinely are
+  # OS-specific: real path separators, real venv layout (`bin` vs
+  # `Scripts`), and real console-script shims.
+  packaging-smoke:
+    name: Packaging smoke test (issue #206)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.12"
+
+      - name: Build wheel, install into a FRESH env, and smoke-test (issue #206)
+        # `shell: bash` -- GitHub-hosted Windows runners ship Git Bash, so
+        # this one script works unmodified across all three OSes instead of
+        # needing a separate PowerShell/cmd variant. The two things that
+        # genuinely differ per-OS (the venv's script directory name -- "bin"
+        # vs "Scripts" -- and whether an executable needs a suffix) are
+        # detected inline below rather than assumed. A FRESH venv (not
+        # `pip install .` into the job's own Python, which is what the
+        # ubuntu-only predecessor step did) is deliberate here: it's the
+        # only way to confirm the payload lands under THAT environment's
+        # own `<prefix>/src/`, matching what a real `pipx install`/`uv tool
+        # install` does into ITS OWN managed venv.
+        shell: bash
         run: |
-          pip install . --index-url https://pypi.org/simple
-          mkdir -p /tmp/claude-runway-pkgtest
-          claude-runway-doctor --help
-          claude-runway-setup init /tmp/claude-runway-pkgtest --dry-run
-          claude-runway-ingest --help
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          # `python -m build` (unlike `pip install`) has no `--index-url`
+          # flag of its own -- passing one is a straight CLI parse error
+          # ("unrecognized arguments: --index-url"), confirmed live
+          # (Copilot review, PR #228). `--no-isolation` sidesteps the whole
+          # question: it reuses THIS pip install (already pointed at public
+          # PyPI via --index-url below) instead of `build` spinning up its
+          # own nested, isolated pip environment that would need a SEPARATE
+          # way to be told which index to use (e.g. PIP_INDEX_URL) --
+          # confirmed live that installing setuptools/wheel/build here, then
+          # building with --no-isolation, produces an identical wheel to a
+          # fully isolated build.
+          python -m pip install --index-url https://pypi.org/simple "setuptools>=68" wheel build
+          python -m build --wheel --no-isolation -o dist
+          python -m venv fresh-env
+          if [ -f fresh-env/Scripts/python.exe ]; then
+            VENV_PY=fresh-env/Scripts/python.exe
+            VENV_BIN=fresh-env/Scripts
+          else
+            VENV_PY=fresh-env/bin/python
+            VENV_BIN=fresh-env/bin
+          fi
+          "$VENV_PY" -m pip install --upgrade pip
+          "$VENV_PY" -m pip install dist/*.whl --index-url https://pypi.org/simple
+
+          # Acceptance criterion: the payload lands under <env>/src/, a
+          # SIBLING of the venv's own bin/Scripts directory -- not back in
+          # site-packages.
+          "$VENV_PY" -c "import sys, os
+          for name in ('libs', 'tools', 'hooks', 'templates', 'skills'):
+              p = os.path.join(sys.prefix, 'src', name)
+              assert os.path.isdir(p), 'missing ' + p
+          print('OK: libs/tools/hooks/templates/skills all present under <env>/src/')"
+
+          "$VENV_BIN/claude-runway-doctor" --help
+          "$VENV_BIN/claude-runway-ingest" --help
+          mkdir -p pkgtest-target
+          "$VENV_BIN/claude-runway-setup" init "$(pwd)/pkgtest-target" --dry-run

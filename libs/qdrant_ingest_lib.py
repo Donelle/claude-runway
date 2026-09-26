@@ -1068,6 +1068,139 @@ def ensure_persistent_fastembed_cache() -> None:
     )
 
 
+def warm_fastembed_cache(
+    model_name: str,
+    cache_dir: Path,
+    *,
+    attempts: int = 3,
+    backoff_seconds: float = 2.0,
+    text_embedding_cls=None,
+    sleep=None,
+) -> bool:
+    """
+    Issue #221: a fully-cached fastembed model still isn't enough on its own
+    to make the STANDALONE `mcp-server-qdrant` process's own startup
+    network-free -- `huggingface_hub.snapshot_download` (called internally by
+    `fastembed.TextEmbedding.__init__`) always makes a live HTTP call to
+    huggingface.co to resolve the revision/file listing before falling back
+    to the local cache, unless `HF_HUB_OFFLINE=1` is set. That round-trip's
+    latency is unbounded (VPN, proxy, unauthenticated HF Hub rate limiting)
+    and can consume Claude Code's 30s MCP connection timeout before the
+    server ever answers `initialize` -- reproduced directly: 59.6s with the
+    network round-trip vs. 2.0s with `HF_HUB_OFFLINE=1` already set, against
+    the exact same already-cached model.
+
+    Setting `HF_HUB_OFFLINE=1` unconditionally in the generated `.mcp.json`
+    is NOT safe on its own -- on a genuinely first-time setup (empty cache)
+    it would prevent the model from ever downloading at all, trading an
+    intermittent slow startup for a guaranteed broken one. This function is
+    the two-phase gate that makes it safe to set:
+
+    Phase 1 ("warm"): construct `fastembed.TextEmbedding(model_name,
+    cache_dir=cache_dir)` up to `attempts` times with linear backoff,
+    network allowed. Covers both "already warm" (this call is cheap/
+    effectively a cache hit) and "not yet cached" (a real download, retried
+    across transient failures -- rate limiting, a flaky connection).
+
+    Phase 2 ("confirm"): once phase 1 succeeds at least once, reconstruct
+    the SAME `TextEmbedding` one more time with `local_files_only=True`
+    passed as an explicit constructor kwarg. This is the only reliable way
+    to actually PROVE the on-disk snapshot is complete enough to load with
+    zero network access -- checking for specific expected filenames would
+    hardcode `huggingface_hub`'s cache-directory layout (and `fastembed`'s
+    internal model-name-to-HF-repo mapping), both of which are third-party
+    implementation details this toolkit doesn't own and shouldn't assume
+    are stable across versions. A successful phase-1 call alone does NOT
+    prove this: it's allowed to succeed via a partial/fallback path that
+    still needs the network on a later real launch.
+
+    Deliberately NOT done by mutating `os.environ["HF_HUB_OFFLINE"]` around
+    the phase-2 call (an earlier version of this function did exactly
+    that, and it was WRONG -- found in PR #223 review, reproduced directly
+    against this repo's own real `huggingface_hub` install):
+    `huggingface_hub.constants` reads `HF_HUB_OFFLINE` from the
+    environment exactly ONCE, into a module-level constant, at whichever
+    moment that module is first imported -- which phase 1, just above,
+    has ALREADY triggered (via `fastembed`'s own import of
+    `huggingface_hub`). Mutating `os.environ` afterward has NO effect on
+    `huggingface_hub.is_offline_mode()`/`constants.HF_HUB_OFFLINE` for the
+    rest of this process (confirmed directly: construct once, then set
+    `HF_HUB_OFFLINE=1`, and `is_offline_mode()` still reports `False`) --
+    so that version's "confirmation" call could still silently use the
+    network and return `True`, exactly the false-confidence failure mode
+    this whole function exists to prevent. `local_files_only=True`, by
+    contrast, is a plain PER-CALL argument that `fastembed`'s own
+    `download_model` threads straight through to
+    `huggingface_hub.snapshot_download(local_files_only=...)`, whose own
+    network-call gate (`if commit_hash is None and not local_files_only:`)
+    checks that literal parameter, not any import-time-frozen env-derived
+    constant -- so it works correctly regardless of import order.
+    Confirmed directly against this repo's own real fastembed cache:
+    ~0.05s and zero network calls with `local_files_only=True` against an
+    already-warm cache; a `ValueError` in under 1ms (no hang, no retry)
+    against a missing/incomplete one.
+
+    Returns True only if BOTH phases succeed -- i.e. it's genuinely safe for
+    the caller to write `HF_HUB_OFFLINE=1` into the generated `.mcp.json`'s
+    `qdrant` server env block. Returns False (leaving the caller to omit/
+    blank that env var, falling back to today's existing -- slower but
+    still eventually-working -- behavior) if every phase-1 attempt failed,
+    the phase-2 confirmation itself failed, or `fastembed` isn't importable
+    at all. Never raises: every failure mode here is something the caller
+    should degrade gracefully from, not crash a setup run over.
+
+    `text_embedding_cls`/`sleep` are injectable purely for tests, so they
+    never import real `fastembed` or actually sleep through backoff --
+    default to the real `fastembed.TextEmbedding` (imported lazily here, not
+    at module level, so this module stays importable without `fastembed`
+    installed for every OTHER caller that never exercises this path) and
+    `time.sleep` respectively.
+    """
+    if sleep is None:
+        import time as _time
+
+        sleep = _time.sleep
+
+    if text_embedding_cls is None:
+        try:
+            from fastembed import TextEmbedding as text_embedding_cls  # type: ignore[no-redef]
+        except Exception:
+            # Broad on purpose (not just ImportError, per this function's own
+            # "never raises" contract above): importing fastembed transitively
+            # imports onnxruntime/tokenizers/etc., any of which can fail with
+            # something other than ImportError on a broken native/runtime
+            # dependency (an incompatible ABI, a missing shared library) --
+            # found in PR #223 review. A real setup run must degrade to
+            # "offline mode not confirmed" here, not abort outright over an
+            # OPTIONAL confirmation step.
+            return False
+
+    cache_dir_str = str(cache_dir)
+
+    warmed = False
+    for attempt in range(1, attempts + 1):
+        try:
+            text_embedding_cls(model_name, cache_dir=cache_dir_str)
+            warmed = True
+            break
+        except Exception:
+            if attempt < attempts:
+                sleep(backoff_seconds * attempt)
+    if not warmed:
+        return False
+
+    # Phase 2: prove it loads with zero network access. local_files_only=True
+    # is a per-call argument (see this function's own docstring for why this
+    # is NOT the same as mutating HF_HUB_OFFLINE in os.environ, which does
+    # NOT work here) -- fastembed threads it straight through to
+    # huggingface_hub.snapshot_download's own network-call gate.
+    try:
+        text_embedding_cls(model_name, cache_dir=cache_dir_str, local_files_only=True)
+        return True
+    except Exception:
+        return False
+
+
 def batched(items: list, size: int):
     """
     Yields successive `size`-length slices of `items` (the final slice may be

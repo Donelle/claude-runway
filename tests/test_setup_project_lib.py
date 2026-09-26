@@ -37,11 +37,14 @@ from setup_project_lib import (  # noqa: E402
     build_mcp_servers,
     build_settings_hooks,
     default_collection_name,
+    default_skills_dir,
     find_unresolved_placeholders,
     load_json,
     mcp_server_qdrant_path,
     merge_mcp_json,
     merge_settings_hooks,
+    plan_skill_installs,
+    resolved_fastembed_cache_path,
     run_setup,
     strip_toolkit_hooks,
     venv_python_path,
@@ -249,13 +252,65 @@ class BuildMcpServers(unittest.TestCase):
         servers = self._build(qdrant_api_key="my-secret-key")
         self.assertEqual(servers["memory-bank"]["env"]["QDRANT_API_KEY"], "my-secret-key")
 
+    def test_hf_hub_offline_defaults_blank(self):
+        # Issue #221: a bare unconditional "1" here would break a genuinely
+        # first-time setup (empty fastembed cache) outright -- this function
+        # never decides the value itself, it only ever writes whatever the
+        # caller (run_setup, after its own warm/verify step) tells it to.
+        servers = self._build()
+        self.assertEqual(servers["qdrant"]["env"]["HF_HUB_OFFLINE"], "")
+
+    def test_hf_hub_offline_true_sets_1(self):
+        servers = self._build(hf_hub_offline=True)
+        self.assertEqual(servers["qdrant"]["env"]["HF_HUB_OFFLINE"], "1")
+
+    def test_hf_hub_offline_false_is_explicit_blank_not_absent(self):
+        servers = self._build(hf_hub_offline=False)
+        self.assertIn("HF_HUB_OFFLINE", servers["qdrant"]["env"])
+        self.assertEqual(servers["qdrant"]["env"]["HF_HUB_OFFLINE"], "")
+
+
+class ResolvedFastembedCachePath(unittest.TestCase):
+    def test_matches_the_value_build_mcp_servers_writes(self):
+        # Single source of truth (issue #221) -- build_mcp_servers' own
+        # FASTEMBED_CACHE_PATH must always equal this helper's output, so
+        # run_setup's warm-up step warms/verifies the SAME path the
+        # generated config actually points at.
+        home = Path("/home/user")
+        servers = build_mcp_servers(
+            MCP_TEMPLATE,
+            collection_name="my-project",
+            venv_python=Path("/home/user/tools/claude-runway/.venv/bin/python"),
+            tools_repo_dir=Path("/home/user/tools/claude-runway"),
+            home_dir=home,
+        )
+        self.assertEqual(
+            servers["qdrant"]["env"]["FASTEMBED_CACHE_PATH"],
+            resolved_fastembed_cache_path(home).as_posix(),
+        )
+
+
+def _find_block_args(hooks: dict, event: str, script_name: str) -> list:
+    """Test helper: finds the args list of whichever block under `event`
+    references `script_name` by basename -- position-independent, matching
+    build_settings_hooks' own basename-matching approach rather than
+    assuming a fixed array index (issue #198 added a second block per
+    event, so a fixed index would be fragile against future reordering)."""
+    for block in hooks.get(event, []):
+        for inner in block.get("hooks", []):
+            args = inner.get("args") or []
+            if args and Path(args[-1]).name == script_name:
+                return args
+    raise AssertionError(f"no block found for {script_name!r} under {event!r}")
+
 
 class BuildSettingsHooks(unittest.TestCase):
-    def _build(self):
+    def _build(self, include_compress: bool = True):
         return build_settings_hooks(
             SETTINGS_TEMPLATE,
             venv_python=Path("/home/user/tools/claude-runway/.venv/bin/python"),
             tools_repo_dir=Path("/home/user/tools/claude-runway"),
+            include_compress=include_compress,
         )
 
     def test_no_placeholders_survive(self):
@@ -264,17 +319,51 @@ class BuildSettingsHooks(unittest.TestCase):
     def test_each_hook_points_at_its_own_script(self):
         hooks = self._build()
         self.assertEqual(
-            hooks["PostToolUse"][0]["hooks"][0]["args"],
+            _find_block_args(hooks, "PostToolUse", "compress_bash_output.py"),
             ["/home/user/tools/claude-runway/hooks/compress_bash_output.py"],
         )
         self.assertEqual(
-            hooks["PreToolUse"][0]["hooks"][0]["args"],
+            _find_block_args(hooks, "PreToolUse", "redirect_webfetch_to_fetch_url.py"),
             ["/home/user/tools/claude-runway/hooks/redirect_webfetch_to_fetch_url.py"],
         )
         self.assertEqual(
-            hooks["SessionEnd"][0]["hooks"][0]["args"],
+            _find_block_args(hooks, "SessionEnd", "session_end_savings.py"),
             ["/home/user/tools/claude-runway/hooks/session_end_savings.py"],
         )
+
+    def test_core_hook_present_under_both_events_regardless_of_compress(self):
+        # Issues #198, #231: record_session_id.py is CORE/base install --
+        # present (and correctly patched) under SessionStart and SessionEnd
+        # whether or not local-compress is included.  It is NOT in PostToolUse
+        # (moved from PostToolUse '.*' to SessionStart in issue #231).
+        for include_compress in (True, False):
+            hooks = self._build(include_compress=include_compress)
+            self.assertEqual(
+                _find_block_args(hooks, "SessionStart", "record_session_id.py"),
+                ["/home/user/tools/claude-runway/hooks/record_session_id.py"],
+            )
+            self.assertEqual(
+                _find_block_args(hooks, "SessionEnd", "record_session_id.py"),
+                ["/home/user/tools/claude-runway/hooks/record_session_id.py"],
+            )
+            with self.assertRaises(AssertionError):
+                _find_block_args(hooks, "PostToolUse", "record_session_id.py")
+
+    def test_include_compress_false_drops_compress_gated_blocks(self):
+        hooks = self._build(include_compress=False)
+        with self.assertRaises(AssertionError):
+            _find_block_args(hooks, "PostToolUse", "compress_bash_output.py")
+        with self.assertRaises(AssertionError):
+            _find_block_args(hooks, "PreToolUse", "redirect_webfetch_to_fetch_url.py")
+        with self.assertRaises(AssertionError):
+            _find_block_args(hooks, "SessionEnd", "session_end_savings.py")
+        # PreToolUse's event key survives as an empty list rather than being
+        # deleted -- so a later merge_settings_hooks call still processes
+        # this event and strips any STALE compress-gated block a prior full
+        # setup left in an existing settings.json (see this module's
+        # build_settings_hooks docstring).
+        self.assertEqual(hooks["PreToolUse"], [])
+        self.assertEqual(find_unresolved_placeholders(hooks), [])
 
 
 class MergeMcpJson(unittest.TestCase):
@@ -553,6 +642,60 @@ class RunSetupEndToEnd(unittest.TestCase):
         self.assertNotIn("local-compress", result.mcp_json["mcpServers"])
         self.assertIsNone(result.settings_json)
 
+    def test_cli_style_qdrant_only_still_writes_core_hooks(self):
+        # Issues #198, #231: the CLI's --qdrant-only keeps include_hooks=True
+        # (only --skip-hooks sets it False) and passes include_compress=False
+        # -- record_session_id.py (CORE/base install) must still be written
+        # under SessionStart and SessionEnd, while compress-gated hooks must not.
+        result = run_setup(
+            self.target_repo, REPO_ROOT, home_dir=Path("/home/user"), include_compress=False, include_hooks=True
+        )
+        self.assertIsNotNone(result.settings_json)
+        self.assertEqual(
+            _find_block_args(result.settings_json["hooks"], "SessionStart", "record_session_id.py"),
+            [f"{REPO_ROOT.as_posix()}/hooks/record_session_id.py"],
+        )
+        self.assertEqual(
+            _find_block_args(result.settings_json["hooks"], "SessionEnd", "record_session_id.py"),
+            [f"{REPO_ROOT.as_posix()}/hooks/record_session_id.py"],
+        )
+        with self.assertRaises(AssertionError):
+            _find_block_args(result.settings_json["hooks"], "PostToolUse", "record_session_id.py")
+        with self.assertRaises(AssertionError):
+            _find_block_args(result.settings_json["hooks"], "PostToolUse", "compress_bash_output.py")
+        with self.assertRaises(AssertionError):
+            _find_block_args(result.settings_json["hooks"], "PreToolUse", "redirect_webfetch_to_fetch_url.py")
+        with self.assertRaises(AssertionError):
+            _find_block_args(result.settings_json["hooks"], "SessionEnd", "session_end_savings.py")
+
+    def test_cli_style_qdrant_only_rerun_strips_stale_compress_hooks(self):
+        # A prior FULL setup wrote compress-gated hooks; a later --qdrant-only
+        # -style rerun (include_hooks=True, include_compress=False) must
+        # strip those stale blocks while keeping the core one, all through
+        # the normal merge path -- no separate clean_hooks_if_unused branch
+        # needed anymore for this case (issue #198).
+        first = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
+        (self.target_repo / ".claude").mkdir()
+        (self.target_repo / ".claude" / "settings.json").write_text(
+            json.dumps(first.settings_json), encoding="utf-8"
+        )
+
+        second = run_setup(
+            self.target_repo, REPO_ROOT, home_dir=Path("/home/user"), include_compress=False, include_hooks=True
+        )
+        # record_session_id.py moved to SessionStart (issue #231): PostToolUse
+        # loses the '.*' core block, leaving only the (now-stripped) compress
+        # block → empty list. SessionStart has the core record_session_id.py
+        # block. SessionEnd has record_session_id.py only (no savings hook).
+        self.assertEqual(len(second.settings_json["hooks"]["SessionStart"]), 1)
+        self.assertEqual(len(second.settings_json["hooks"]["PostToolUse"]), 0)
+        self.assertEqual(second.settings_json["hooks"]["PreToolUse"], [])
+        self.assertEqual(len(second.settings_json["hooks"]["SessionEnd"]), 1)
+        self.assertEqual(
+            _find_block_args(second.settings_json["hooks"], "SessionStart", "record_session_id.py"),
+            [f"{REPO_ROOT.as_posix()}/hooks/record_session_id.py"],
+        )
+
     def test_merges_with_an_already_existing_mcp_json(self):
         (self.target_repo / ".mcp.json").write_text(
             json.dumps({"mcpServers": {"github": {"command": "unrelated"}}}), encoding="utf-8"
@@ -568,9 +711,15 @@ class RunSetupEndToEnd(unittest.TestCase):
             json.dumps(first.settings_json), encoding="utf-8"
         )
         second = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
+        # SessionStart: 1 core block (record_session_id.py, issue #231).
+        # PostToolUse: 1 compress block (compress_bash_output.py only; core
+        #   record_session_id.py moved from PostToolUse to SessionStart in #231).
+        # PreToolUse: 1 block (redirect_webfetch_to_fetch_url.py).
+        # SessionEnd: 2 blocks (record_session_id.py + session_end_savings.py).
+        self.assertEqual(len(second.settings_json["hooks"]["SessionStart"]), 1)
         self.assertEqual(len(second.settings_json["hooks"]["PostToolUse"]), 1)
         self.assertEqual(len(second.settings_json["hooks"]["PreToolUse"]), 1)
-        self.assertEqual(len(second.settings_json["hooks"]["SessionEnd"]), 1)
+        self.assertEqual(len(second.settings_json["hooks"]["SessionEnd"]), 2)
 
     def test_generated_mcp_servers_never_includes_an_unrelated_existing_secret(self):
         # Regression for the finding from PR #113 review: the full merged
@@ -663,13 +812,153 @@ class RunSetupEndToEnd(unittest.TestCase):
             home_dir=Path("/home/user"),
         )
 
+        # PostToolUse: 1 block (compress_bash_output.py); record_session_id.py
+        # moved to SessionStart in issue #231 -- no longer in PostToolUse.
+        # SessionStart: 1 block (record_session_id.py).
+        # Both must reference the moved tools repo path, not the old one.
         post_hooks = second.settings_json["hooks"]["PostToolUse"]
         self.assertEqual(len(post_hooks), 1)
-        # Normalize path separators before comparing: JSON settings may
-        # store paths with forward slashes on Windows for cross-platform
-        # compatibility, while str(Path) uses the OS separator.
-        actual = post_hooks[0]["hooks"][0]["args"][0].replace("\\", "/")
-        self.assertIn(moved_tools_repo.as_posix(), actual)
+        for block in post_hooks:
+            actual = block["hooks"][0]["args"][0].replace("\\", "/")
+            self.assertIn(moved_tools_repo.as_posix(), actual)
+
+        start_hooks = second.settings_json["hooks"]["SessionStart"]
+        self.assertEqual(len(start_hooks), 1)
+        for block in start_hooks:
+            actual = block["hooks"][0]["args"][0].replace("\\", "/")
+            self.assertIn(moved_tools_repo.as_posix(), actual)
+
+    def test_fastembed_warmup_not_attempted_by_default(self):
+        # Every EXISTING caller/test of run_setup must keep its current
+        # network/disk-free behavior unchanged -- attempt_fastembed_warmup
+        # defaults to False, and fastembed_warmup_fn must never even be
+        # looked at (let alone called) when that's the case. A fn that
+        # raises if called makes this a hard failure, not a silent pass.
+        def _must_not_be_called(*args, **kwargs):
+            raise AssertionError("fastembed_warmup_fn must not be called when attempt_fastembed_warmup=False")
+
+        result = run_setup(
+            self.target_repo, REPO_ROOT, home_dir=Path("/home/user"),
+            fastembed_warmup_fn=_must_not_be_called,
+        )
+        self.assertEqual(result.mcp_json["mcpServers"]["qdrant"]["env"]["HF_HUB_OFFLINE"], "")
+
+    def test_fastembed_warmup_success_sets_hf_hub_offline_and_records_change(self):
+        calls = []
+
+        def _fake_warmup(model_name, cache_dir):
+            calls.append((model_name, cache_dir))
+            return True
+
+        result = run_setup(
+            self.target_repo, REPO_ROOT, home_dir=Path("/home/user"),
+            attempt_fastembed_warmup=True, fastembed_warmup_fn=_fake_warmup,
+        )
+        self.assertEqual(result.mcp_json["mcpServers"]["qdrant"]["env"]["HF_HUB_OFFLINE"], "1")
+        self.assertTrue(any("HF_HUB_OFFLINE=1" in c for c in result.changes))
+        # Called with the SAME EMBEDDING_MODEL/cache path the generated
+        # config actually ends up with -- not re-derived independently.
+        self.assertEqual(len(calls), 1)
+        model_name, cache_dir = calls[0]
+        self.assertEqual(model_name, MCP_TEMPLATE["mcpServers"]["qdrant"]["env"]["EMBEDDING_MODEL"])
+        self.assertEqual(Path(cache_dir), resolved_fastembed_cache_path(Path("/home/user")))
+
+    def test_fastembed_warmup_failure_leaves_hf_hub_offline_blank_and_records_change(self):
+        result = run_setup(
+            self.target_repo, REPO_ROOT, home_dir=Path("/home/user"),
+            attempt_fastembed_warmup=True, fastembed_warmup_fn=lambda model, cache_dir: False,
+        )
+        self.assertEqual(result.mcp_json["mcpServers"]["qdrant"]["env"]["HF_HUB_OFFLINE"], "")
+        self.assertTrue(any("Could not confirm" in c for c in result.changes))
+
+
+class DefaultSkillsDir(unittest.TestCase):
+    def test_is_dot_claude_skills_under_home(self):
+        self.assertEqual(default_skills_dir(Path("/home/user")), Path("/home/user/.claude/skills"))
+
+
+class PlanSkillInstalls(unittest.TestCase):
+    """`plan_skill_installs` (issue #205) -- pure, read-only planning over a
+    fake tools-repo `skills/` layout (never this real repo's own skills/,
+    so these tests don't need updating whenever a skill is added/renamed
+    here)."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.tools_repo_dir = Path(self._tmpdir.name) / "tools-repo"
+        self.skills_dir = Path(self._tmpdir.name) / "dest-skills"
+        (self.tools_repo_dir / "skills" / "skill-a").mkdir(parents=True)
+        (self.tools_repo_dir / "skills" / "skill-a" / "SKILL.md").write_text("skill a v1", encoding="utf-8")
+        (self.tools_repo_dir / "skills" / "skill-b").mkdir(parents=True)
+        (self.tools_repo_dir / "skills" / "skill-b" / "SKILL.md").write_text("skill b v1", encoding="utf-8")
+
+    def test_missing_skills_dir_in_tools_repo_returns_empty_list(self):
+        empty_tools_repo = Path(self._tmpdir.name) / "no-skills-here"
+        empty_tools_repo.mkdir()
+        self.assertEqual(plan_skill_installs(empty_tools_repo, self.skills_dir), [])
+
+    def test_fresh_dest_reports_install_for_every_skill(self):
+        plans = plan_skill_installs(self.tools_repo_dir, self.skills_dir)
+        self.assertEqual({p.name for p in plans}, {"skill-a", "skill-b"})
+        self.assertTrue(all(p.action == "install" for p in plans))
+        # Sorted by name -- stable, deterministic output.
+        self.assertEqual([p.name for p in plans], ["skill-a", "skill-b"])
+
+    def test_byte_identical_dest_reports_up_to_date(self):
+        (self.skills_dir / "skill-a").mkdir(parents=True)
+        (self.skills_dir / "skill-a" / "SKILL.md").write_text("skill a v1", encoding="utf-8")
+        plans = plan_skill_installs(self.tools_repo_dir, self.skills_dir)
+        by_name = {p.name: p for p in plans}
+        self.assertEqual(by_name["skill-a"].action, "up_to_date")
+        self.assertEqual(by_name["skill-b"].action, "install")
+
+    def test_differing_dest_reports_update(self):
+        (self.skills_dir / "skill-a").mkdir(parents=True)
+        (self.skills_dir / "skill-a" / "SKILL.md").write_text("skill a v0-stale", encoding="utf-8")
+        plans = plan_skill_installs(self.tools_repo_dir, self.skills_dir)
+        by_name = {p.name: p for p in plans}
+        self.assertEqual(by_name["skill-a"].action, "update")
+        self.assertEqual(by_name["skill-a"].content, "skill a v1")
+
+    def test_directory_without_skill_md_is_skipped(self):
+        (self.tools_repo_dir / "skills" / "not-a-skill").mkdir()
+        plans = plan_skill_installs(self.tools_repo_dir, self.skills_dir)
+        self.assertEqual({p.name for p in plans}, {"skill-a", "skill-b"})
+
+    def test_never_writes_anything_itself(self):
+        # Purely a planning step -- the dest directory shouldn't even be
+        # created by calling this, let alone populated.
+        plan_skill_installs(self.tools_repo_dir, self.skills_dir)
+        self.assertFalse(self.skills_dir.exists())
+
+    def test_crlf_source_content_is_preserved_verbatim(self):
+        # Regression for Copilot review finding on PR #224: source.read_text()
+        # opens in universal-newlines text mode, silently translating a
+        # CRLF source's line endings to bare "\n" -- lossy regardless of
+        # platform, and (combined with a text-mode write) the root cause of
+        # a Windows install perpetually re-reporting "update" for content
+        # that never actually changed. Reading raw bytes and decoding
+        # keeps the ORIGINAL line endings intact in `content`.
+        crlf_path = self.tools_repo_dir / "skills" / "skill-a" / "SKILL.md"
+        crlf_path.write_bytes(b"line one\r\nline two\r\n")
+        plans = plan_skill_installs(self.tools_repo_dir, self.skills_dir)
+        plan_a = next(p for p in plans if p.name == "skill-a")
+        self.assertEqual(plan_a.content, "line one\r\nline two\r\n")
+
+    def test_non_utf8_dest_is_reported_as_update_not_a_crash(self):
+        # Regression for Copilot review finding on PR #224: a pre-existing
+        # dest SKILL.md saved in a non-UTF-8 encoding (e.g. a user's editor
+        # defaulting to latin-1, or plain corruption) previously raised
+        # UnicodeDecodeError from a decoding comparison, aborting the ENTIRE
+        # --install-skills run before the documented "different -> update"
+        # path ever got a chance to run for this or any other skill.
+        (self.skills_dir / "skill-a").mkdir(parents=True)
+        (self.skills_dir / "skill-a" / "SKILL.md").write_bytes(b"\xff\xfe not valid utf-8")
+        plans = plan_skill_installs(self.tools_repo_dir, self.skills_dir)
+        by_name = {p.name: p for p in plans}
+        self.assertEqual(by_name["skill-a"].action, "update")
+        self.assertEqual(by_name["skill-b"].action, "install")
 
 
 if __name__ == "__main__":

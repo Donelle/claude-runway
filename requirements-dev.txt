@@ -8,3 +8,15 @@
 #   .venv/bin/mypy libs tools hooks
 mypy==2.3.1
 pytest
+
+# Issue #206: tests/test_pyproject.py builds a REAL wheel (via `python -m
+# build --wheel --no-isolation`) and inspects its actual contents, rather
+# than only parsing pyproject.toml's static tables -- setup.py's data_files
+# glob logic can't be pinned any other way, since it's real Python code
+# that runs at build time, not declarative TOML. `--no-isolation` reuses
+# this venv's own already-installed `setuptools`/`wheel` instead of `build`
+# creating a fresh isolated env per invocation (which would otherwise need
+# network access on every test run just to re-fetch setuptools).
+setuptools>=68
+wheel
+build

@@ -234,9 +234,12 @@ except ImportError:
 def _record_savings_event(session_id, tool, raw_tokens, out_tokens, credited, source="", project=None):
     """Best-effort -- a ledger-logging bug must never break the hook's real job
     (making sure Claude sees the right output). `project` is threaded through to
-    record_event's own `project` field -- see that function's docstring and
-    issue #35: this is what lets current_session_id()'s later project-filtered
-    lookup avoid picking an unrelated live session from a different project."""
+    record_event's own `project` field -- originally (issue #35) what let
+    current_session_id()'s project-filtered lookup avoid picking an unrelated
+    live session from a different project; as of issue #213 that lookup
+    delegates to session_id_lib's shadow markers instead (populated by the
+    separate hooks/record_session_id.py hook, not this one), so this field is
+    now informational only -- see savings_ledger.record_event's own docstring."""
     if not (_SAVINGS_LEDGER_AVAILABLE and session_id and savings_ledger.tracking_enabled()):
         return
     try:
@@ -794,9 +797,12 @@ def _dispatch(payload):
     tool_response = payload.get("tool_response")
     # Same source session_end_savings.py already uses for the identical
     # purpose -- derived once here so both _record_savings_event call sites
-    # below tag their JSONL entries with it (issue #35: this is what lets
-    # current_session_id()'s later project-filtered lookup tell this
-    # session's events apart from an unrelated project's).
+    # below tag their JSONL entries with it. Originally (issue #35) this is
+    # what let current_session_id()'s project-filtered lookup tell this
+    # session's events apart from an unrelated project's; as of issue #213
+    # that lookup delegates to session_id_lib's shadow markers instead, so
+    # this tag is now informational only -- see savings_ledger.record_event's
+    # own docstring.
     project = savings_ledger.project_name_from_cwd(payload.get("cwd", "")) if _SAVINGS_LEDGER_AVAILABLE else None
 
     if tool_name and tool_name.startswith(MCP_SAVINGS_TOOL_PREFIX):
