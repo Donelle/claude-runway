@@ -332,7 +332,10 @@ class FindFirstHeadingBoundary(unittest.TestCase):
         )
         with open(readme_path, encoding="utf-8") as f:
             text = f.read()
-        boundary = _find_first_heading_boundary(text)
+        # max_offset=len(text): the first heading this heuristic accepts in the
+        # README sits after the Files table, so the default 20_000-char window
+        # would tie this test to the table's length rather than to the bug.
+        boundary = _find_first_heading_boundary(text, max_offset=len(text))
         self.assertIsNotNone(boundary, "the real README has headings; None means the bug regressed")
 
 

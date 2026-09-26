@@ -106,7 +106,7 @@ import subprocess
 import sys
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "libs"))
 
@@ -139,6 +139,16 @@ except ImportError:
     _SAVINGS_LEDGER_AVAILABLE = False
 
 TRACK_SAVINGS = _SAVINGS_LEDGER_AVAILABLE and savings_ledger.tracking_enabled()
+
+# metrics_lib is likewise optional at import time (issue #208) -- same
+# fail-open reasoning as savings_ledger above: an older checkout of just this
+# file, without libs/metrics_lib.py, must not crash server startup over a
+# brand-new, still domain-empty store.
+try:
+    import metrics_lib
+    _METRICS_LIB_AVAILABLE = True
+except ImportError:
+    _METRICS_LIB_AVAILABLE = False
 
 COMPACT_QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
 COMPACT_QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY")
@@ -1933,6 +1943,184 @@ def savings_trend(project: Optional[str] = None, bucket: str = "week", n: int = 
         # Same reasoning as savings_summary's try/except -- best-effort feature,
         # must not fail the tool call over a DB problem.
         return f"Error: could not read savings data ({e}). The savings database may be corrupted or inaccessible; this doesn't affect anything else."
+
+
+@mcp.tool()
+def get_metrics(metric_id: str, view: str = "summary", bucket: str = "week", n: int = 12, format: str = "text", session_id: Optional[str] = None) -> str:
+    """
+    Reads the shared cross-tool metrics store (issue #208): ONE generic
+    SQLite table any domain in this toolkit can write into via
+    `libs/metrics_lib.py`'s `MetricsStore` class, aggregated here into
+    whichever `view` is requested. Deliberately the ONLY new tool this
+    ticket adds (see `libs/metrics_lib.py`'s module docstring for why a
+    single generic dispatch tool matters here specifically) -- a future
+    domain writing a new `metric_id` never needs a new tool, only a new
+    value passed to this one.
+
+    As of issue #210, my-gh-autowork's per-ticket outcome logging writes
+    into this store under metric_id="autowork". Any metric_id with no
+    recorded events returns an honest "no events recorded yet" result.
+
+    metric_id: the domain to query (e.g. "autowork", "memory-bank") --
+      whatever string a future writer used when calling `record()`/
+      `increment()`/`decrement()`.
+
+    view controls which aggregation to return:
+      "summary"       (default) — total event count + total value across
+                       every event_type for this metric_id.
+      "by_event_type"           — per-event_type breakdown, largest total
+                       value first.
+      "trend"                   — day/week-bucketed history (see `bucket`/`n`).
+      "detail"        (issue #249) — raw per-event rows, most-recent first,
+                       with each row's `metadata` deserialized and rendered
+                       (see `n` below for how many rows). This is the view
+                       for the richer per-run detail a domain stores in
+                       `metadata` (e.g. my-gh-autowork's model/rounds/
+                       wall_clock_s/findings) that summary/by_event_type
+                       never surface, since those two only ever aggregate
+                       `value`.
+
+    bucket ("day" or "week", default "week") only applies to view="trend" —
+      ignored otherwise.
+
+    n (default 12) means "max buckets" for view="trend", or "max rows" for
+      view="detail" — ignored for "summary"/"by_event_type". Reused across
+      both rather than adding a second row-count parameter, since exactly
+      one of the two meanings ever applies for a given call.
+
+    session_id (issue #248, extended to "detail" by issue #249), when given,
+      narrows view="summary"/"by_event_type"/"detail" down to rows matching
+      this exact session_id AND metric_id — e.g. one specific
+      `my-gh-autowork` attempt's own `f"issue-{n}-{HHMMSS}"` marker (issue
+      #210), instead of that metric_id's entire history. Omitting it (the
+      default) keeps today's metric_id-only aggregate/listing unchanged.
+      Ignored for view="trend" — per-session filtering doesn't compose with
+      time-bucketed grouping (out of scope for issue #248; see that issue
+      for why), so a session_id passed alongside view="trend" has no effect
+      on the result.
+
+    format controls the output format:
+      "text" (default) — human-readable text.
+      "json"            — JSON object with keys "view"/"data".
+    """
+    if not _METRICS_LIB_AVAILABLE:
+        return "Error: libs/metrics_lib.py is not available in this install -- get_metrics requires it."
+    if view not in ("summary", "by_event_type", "trend", "detail"):
+        return f"Error: unrecognised view {view!r}. Valid values: 'summary', 'by_event_type', 'trend', 'detail'."
+    if format not in ("text", "json"):
+        return f"Error: unrecognised format {format!r}. Valid values: 'text', 'json'."
+    # Copilot review on this PR: bucket/n are documented as "ignored" for
+    # views that don't use them, but were validated unconditionally
+    # regardless of view -- so an irrelevant bucket="month" or n=0 rejected
+    # a perfectly good view="summary" call, contradicting that doc. Scoped
+    # to only the views that actually consume each argument: bucket is
+    # trend-only; n applies to trend (bucket count) AND detail (row limit).
+    if view == "trend" and bucket not in ("day", "week"):
+        return f"Error: unrecognised bucket {bucket!r}. Valid values: 'day', 'week'."
+    if view in ("trend", "detail") and (not isinstance(n, int) or n < 1):
+        return "Error: n must be a positive integer."
+    try:
+        store = metrics_lib.MetricsStore()
+        if view == "summary":
+            summary_data = store.summary(metric_id, session_id=session_id)
+            return metrics_lib.format_json("summary", summary_data) if format == "json" else metrics_lib.format_summary_view(summary_data, session_id=session_id)
+        if view == "by_event_type":
+            by_type_data = store.by_event_type(metric_id, session_id=session_id)
+            return metrics_lib.format_json("by_event_type", by_type_data) if format == "json" else metrics_lib.format_by_event_type_view(metric_id, by_type_data, session_id=session_id)
+        if view == "detail":
+            detail_data = store.detail(metric_id, session_id=session_id, limit=n)
+            return metrics_lib.format_json("detail", detail_data) if format == "json" else metrics_lib.format_detail_view(metric_id, detail_data, session_id=session_id)
+        # view == "trend"
+        trend_data = store.trend(metric_id, bucket=bucket, n=n)
+        return metrics_lib.format_json("trend", trend_data) if format == "json" else metrics_lib.format_trend_view(metric_id, trend_data, bucket=bucket)
+    except Exception as e:
+        # Same reasoning as savings_summary's try/except -- best-effort feature,
+        # must not fail the tool call over a DB problem.
+        return f"Error: could not read metrics data ({e}). The metrics database may be corrupted or inaccessible; this doesn't affect anything else."
+
+
+@mcp.tool()
+def record_metric(
+    metric_id: str,
+    event_type: str,
+    value: float = 1.0,
+    metadata: Optional[Union[str, dict]] = None,
+    session_id: Optional[str] = None,
+) -> str:
+    """
+    Writes one append-only event to the shared cross-tool metrics store
+    (issue #210 — the write counterpart to get_metrics). Any domain in
+    this toolkit can call this to record an event; the primary consumer
+    as of this ticket is my-gh-autowork's per-ticket outcome logging
+    (cut over from compact_store by this ticket).
+
+    metric_id: the domain (e.g. "autowork", "memory-bank") — caller-defined,
+      no fixed enum.
+    event_type: domain-defined event kind (e.g. "ticket_merged", "ticket_blocked").
+    value: a signed numeric delta (default 1.0). Must be finite — non-finite
+      values (inf/-inf/nan) are rejected by MetricsStore.record() and logged to
+      stderr; this tool surfaces that as an "Error:..." return instead.
+    metadata: optional domain-specific extra fields, as either a JSON string
+      (e.g. '{"issue": 42, "pr": 101, "rounds": 2}') or an already-parsed
+      dict — the schema accepts both shapes directly. A string is validated
+      as JSON and must decode to an object; an invalid JSON string, or one
+      that decodes to a non-object (a list/scalar), is returned as an
+      "Error:..." string rather than raising. The dict form exists because,
+      back when this parameter was typed as a plain string, some MCP clients
+      silently coerced a string argument that happened to look like JSON into
+      a native object before this tool ever saw it, bypassing that
+      string-only schema entirely and failing every such call outright
+      (confirmed live: Claude Code itself does this coercion for a
+      JSON-object-shaped string argument). Accepting both shapes now means a
+      call succeeds regardless of which one the calling client actually
+      sends.
+    session_id: optional caller-supplied session identifier — stored on the
+      row for later per-session filtering via get_metrics(view="summary"/
+      "by_event_type"/"detail", session_id=...) (issue #248, extended to
+      "detail" by issue #249).
+
+    Returns "OK" on success, or an "Error:..." string on any failure —
+    including input-validation failures (non-finite value, invalid metadata
+    JSON) AND DB write failures (MetricsStore.record() returns False, which
+    this tool maps to an "Error:..." string). DB write failures are also
+    logged to stderr and never raised (fail-open: a broken/locked/corrupt
+    metrics db must never break the actual domain operation being measured),
+    but the "Error:..." return is the only signal the tool's caller sees.
+    """
+    if not _METRICS_LIB_AVAILABLE:
+        return "Error: libs/metrics_lib.py is not available in this install -- record_metric requires it."
+    import json as _json
+    import math as _math
+    if not _math.isfinite(value):
+        return f"Error: value must be finite (got {value!r})."
+    metadata_dict: Optional[dict] = None
+    if isinstance(metadata, dict):
+        metadata_dict = metadata
+    elif metadata is not None:
+        try:
+            metadata_dict = _json.loads(metadata)
+        except (ValueError, TypeError) as e:
+            return f"Error: metadata must be valid JSON if supplied ({e})."
+        if not isinstance(metadata_dict, dict):
+            return "Error: metadata must be a JSON object (dict), not an array or scalar."
+    store = metrics_lib.MetricsStore()
+    # record() fails open (returns False, logs to stderr) -- a broken metrics
+    # db must never look like a tool call failure for the domain operation
+    # that triggered the logging. Map a False return to an "Error:..." string
+    # so the SKILL.md "Error:" check can detect it, rather than unconditionally
+    # returning "OK" even when the write silently failed (Copilot review on
+    # PR #247: an always-"OK" return made the SKILL.md error check unreachable
+    # for the most important failure mode — an unwritable or locked db path).
+    ok = store.record(
+        metric_id=metric_id,
+        event_type=event_type,
+        value=value,
+        metadata=metadata_dict,
+        session_id=session_id,
+    )
+    if not ok:
+        return f"Error: could not write metric {metric_id}/{event_type} to the database (details logged to server stderr)."
+    return "OK"
 
 
 if __name__ == "__main__":

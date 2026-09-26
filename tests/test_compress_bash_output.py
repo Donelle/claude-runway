@@ -274,9 +274,12 @@ class _StubSavingsLedger:
 class RecordSavingsEventForwardsProject(unittest.TestCase):
     """Issue #35: hooks/compress_bash_output.py is savings_ledger's SOLE
     writer, so _record_savings_event forwarding its `project` argument
-    through to record_event is what lets current_session_id()'s later
+    through to record_event is what tags each transient event with its
+    project. Originally (issue #35) this is what let current_session_id()'s
     project-filtered lookup tell this session's events apart from an
-    unrelated project's."""
+    unrelated project's; as of issue #213 that lookup reads session_id_lib's
+    shadow markers instead, so this forwarding is now informational/
+    debugging coverage only -- see savings_ledger.record_event's docstring."""
 
     def setUp(self):
         self.stub = _StubSavingsLedger()
@@ -299,8 +302,9 @@ class RecordSavingsEventForwardsProject(unittest.TestCase):
 
     def test_project_defaults_to_none_when_not_passed(self):
         # Regression guard: an omitted project must stay None, not silently
-        # become an empty string or the literal word "None" -- either would
-        # still (wrongly) match a real project filter's string comparison.
+        # become an empty string or the literal word "None" -- honesty of
+        # the stored value matters even though (issue #213) this field no
+        # longer drives current_session_id()'s project-filtered lookup.
         hook._record_savings_event("sess-1", "hook:Bash", 1000, 100, True, "cmd")
         _, kwargs = self.stub.calls[0]
         self.assertIsNone(kwargs.get("project"))

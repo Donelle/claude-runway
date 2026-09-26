@@ -32,7 +32,6 @@ import json
 import math
 import os
 import sys
-import uuid
 from typing import Optional
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "libs"))
@@ -45,6 +44,7 @@ from qdrant_ingest_lib import ensure_persistent_fastembed_cache
 from qdrant_retry import call_with_retry
 from qdrant_model_check import check_embedding_model_mismatch
 from mcp_tool_introspect import tool_count
+from session_id_lib import SessionIdStrategy, session_id as _resolve_session_id
 import memory_bank_lib as mb
 import memory_events_lib as mev
 
@@ -73,14 +73,26 @@ DEFAULT_MEMORY_BANK_ID = os.environ.get("MEMORY_BANK_ID")
 # Issue #179: this server has no access to Claude Code's own session_id --
 # only hooks get one, via their stdin payload (see
 # tools/compress_mcp_server.py's _append_savings_footer docstring for the
-# identical constraint on the local-compress server). A stdio MCP server
-# subprocess is spawned fresh per Claude Code session (one process per
-# session -- see libs/qdrant_collection_hints.py's docstring), so a
-# process-lifetime UUID generated once here, at import time, is a
-# documented proxy for "this session": it will never equal Claude Code's
-# own internal id, but it uniquely identifies this one server run, which in
-# practice IS one Claude Code session.
-_SESSION_ID = uuid.uuid4().hex
+# identical constraint on the local-compress server). Delegates to
+# libs/session_id_lib.py's SessionIdStrategy.PROXY (issue #198/#214) rather
+# than minting its own uuid.uuid4().hex here -- same process-lifetime,
+# cached-once, thread-safe proxy behavior, just no longer duplicated: see
+# that module's docstring for the full four-strategy rationale (this MCP
+# server has no hook payload and no need for a real session boundary here,
+# just a stable per-process grouping key).
+_raw_session_id = _resolve_session_id(SessionIdStrategy.PROXY)
+# session_id()'s return type is Optional[str] because OTHER strategies can
+# genuinely fail to resolve one -- but _proxy_session_id() (what PROXY
+# dispatches to) always returns a str unconditionally, never None. Narrowing
+# that here via an explicit annotation (rather than threading Optional[str]
+# through every record_memory_event call below, or leaving mypy to widen
+# _SESSION_ID's type back to Optional[str] at every OTHER use site, which a
+# bare assert right after the assignment does not prevent for a module-level
+# global) keeps this module's own session_id type exactly what it was
+# before this delegation (a plain str), matching
+# memory_events_lib.record_memory_event's session_id: str parameter.
+assert _raw_session_id is not None, "SessionIdStrategy.PROXY always resolves a value"
+_SESSION_ID: str = _raw_session_id
 
 # Per-session call-sequence counter for memory_events_lib's `turn` field --
 # incremented once per remember()/recall() TOOL INVOCATION (see _next_turn),
@@ -158,6 +170,14 @@ async def remember(
     # attempt, not just the ones that end up logged.
     tracking = mev.tracking_enabled()
     turn = _next_turn() if tracking else None
+    if tracking:
+        # Issue #211: a plain per-call-attempt tally into metrics.db,
+        # separate from the rich mev.record_memory_event(...) call below --
+        # fired here, before ANY of the fallible steps that follow (weight
+        # validation, repo resolution, the actual write), so an invalid
+        # weight or a repo-resolution error still counts as a call, matching
+        # `turn`'s own "count every invocation" philosophy just above.
+        mev.record_memory_metric("remember", session_id=_SESSION_ID)
 
     # Rejected here, at the tool boundary, same as recall()'s `limit < 1`
     # check below -- before resolve_repo/QdrantClient/embedding provider, so
@@ -262,6 +282,14 @@ async def recall(
     # though none of them reach the logging branch below.
     tracking = mev.tracking_enabled()
     turn = _next_turn() if tracking else None
+    if tracking:
+        # Issue #211: a plain per-call-attempt tally into metrics.db, fired
+        # unconditionally for every recall() invocation (unlike the per-hit
+        # mev.record_memory_event(...) logging further down, which only
+        # fires when there are actual results) -- a validation error, an
+        # embedding mismatch, or a genuinely empty result set are all still
+        # "a recall call," same as `turn` above already counts them.
+        mev.record_memory_metric("recall", session_id=_SESSION_ID)
 
     collection = DEFAULT_MEMORY_BANK_COLLECTION
     caller_repo, error = mb.resolve_repo(DEFAULT_MEMORY_BANK_ID, general=False)
@@ -361,6 +389,15 @@ def forget(
     count to the user and get explicit confirmation before re-calling with
     confirm=True.
     """
+    if mev.tracking_enabled():
+        # Issue #211: forget() has no existing memory_events_lib tracking at
+        # all (its rich record_memory_event log deliberately excludes
+        # "forget" -- see that module's docstring), so this is the first use
+        # of mev here. Fired before the point_id/wipe_all validation below,
+        # so even that error still counts as a call attempt, matching
+        # remember()/recall()'s own "count every invocation" placement.
+        mev.record_memory_metric("forget", session_id=_SESSION_ID)
+
     if bool(point_id) == bool(wipe_all):
         return "Error: pass exactly one of point_id or wipe_all, not both or neither."
 

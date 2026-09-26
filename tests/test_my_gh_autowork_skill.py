@@ -26,13 +26,16 @@ SKILL_PATH = os.path.join(REPO_ROOT, ".claude", "skills", "my-gh-autowork", "SKI
 SETTINGS_TEMPLATE_PATH = os.path.join(REPO_ROOT, "templates", "settings.json.template")
 
 # Mirrors the regex embedded in SKILL.md's Step 0 preflight check:
-#   jq -e '(.permissions.allow // []) | any(test("^Bash\\((git|gh|uv)[ :)]|^Bash\\(\\.venv/bin/"))'
+#   jq -e '(.permissions.allow // []) | any(test("^Bash\\((git|gh|uv)[ :)]|^Bash\\(\\.venv/(bin|Scripts)/"))'
 # The `[ :)]` delimiter right after git/gh/uv is required (Copilot review round 2 on
 # PR #196): an earlier version with no delimiter (`^Bash\((git|gh|uv|\.venv/bin/)`)
 # false-positived on unrelated tool names sharing the same leading letters, e.g.
 # `Bash(github-cli:*)`, `Bash(ghastly:*)`, `Bash(uvicorn:*)` -- confirmed live by
 # running this exact regex against those three strings before fixing it.
-_BASELINE_PERMISSION_RE = re.compile(r"^Bash\((git|gh|uv)[ :)]|^Bash\(\.venv/bin/")
+# The venv branch matches both `bin/` (Linux/macOS) and `Scripts/` (Windows), per
+# issue #230 -- a Windows-only setup using `.venv/Scripts/python` would otherwise
+# have incorrectly reported "no" and stopped the preflight unnecessarily.
+_BASELINE_PERMISSION_RE = re.compile(r"^Bash\((git|gh|uv)[ :)]|^Bash\(\.venv/(bin|Scripts)/")
 
 
 def has_baseline_permission(allow_list):
@@ -57,6 +60,15 @@ class SkillContentRequirements(unittest.TestCase):
         with open(SKILL_PATH, encoding="utf-8") as f:
             self.content = f.read()
 
+    def test_documents_self_modification_workaround(self):
+        # The skill no longer cites specific ticket numbers in its prose (a later
+        # cleanup pass intentionally stripped historical issue/PR citations as
+        # scaffolding with no lasting value to a reader or to the subagent, which
+        # receives this whole file as its prompt every run) -- pin the substantive
+        # claim itself instead: a self-correction attempt via editing
+        # .claude/settings.json was separately blocked as self-modification.
+        self.assertIn("self-modification", self.content.lower())
+
     def test_mentions_auto_mode_classifier(self):
         self.assertIn("auto mode classifier", self.content.lower())
 
@@ -64,7 +76,7 @@ class SkillContentRequirements(unittest.TestCase):
         # The caveat must sit near the original claim, not be buried elsewhere,
         # so a reader of the opening claim actually sees the qualification.
         idx_claim = self.content.find("Zero required human touchpoints")
-        idx_caveat = self.content.find("Caveat: this claim")
+        idx_caveat = self.content.find("**Caveat:")
         self.assertNotEqual(idx_claim, -1, "original claim text must still exist")
         self.assertNotEqual(idx_caveat, -1, "caveat must exist")
         self.assertLess(
@@ -82,8 +94,10 @@ class SkillContentRequirements(unittest.TestCase):
 
     def test_preflight_stops_on_missing_permissions(self):
         # Must instruct a hard stop, matching the existing dogfood-preflight pattern.
+        # Window is 2500 (was 2000) to accommodate the issue #230 note appended to the
+        # preflight's explanatory paragraph without pushing STOP out of sight.
         section = self.content[self.content.find("Baseline Bash permission preflight"):]
-        self.assertIn("STOP", section[:2000])
+        self.assertIn("STOP", section[:2500])
 
     def test_does_not_overclaim_certainty(self):
         # The causal relationship between the permission fix and the classifier's
@@ -107,6 +121,62 @@ class SkillContentRequirements(unittest.TestCase):
         # rules, not a generalization of them.
         for rule in ["git fetch *", "git push *", "gh pr *", "gh api *"]:
             self.assertIn(rule, self.content)
+
+
+class AutoPickExclusionContentRequirements(unittest.TestCase):
+    """Pin the auto-pick label-exclusion behavior added to Step 0's picking logic
+   : a future edit could silently drop the negative label filters or the
+    explicit-issue override note, and the rest of the suite wouldn't notice, since
+    this is prose guidance for a subagent, not executable code."""
+
+    def setUp(self):
+        with open(SKILL_PATH, encoding="utf-8") as f:
+            self.content = f.read()
+
+    def test_excludes_blocked_label_from_search(self):
+        self.assertIn("-label:blocked", self.content)
+
+    def test_excludes_theme_design_label_from_search(self):
+        self.assertIn("-label:theme-design", self.content)
+
+    def test_prose_documents_both_exclusions(self):
+        self.assertIn("NOT labeled", self.content)
+        self.assertIn("`blocked` or `theme-design`", self.content)
+
+    def test_explicit_issue_number_overrides_exclusion(self):
+        # An explicitly-named ticket must still be worked regardless of its labels --
+        # the label exclusion is for auto-pick only, not a blanket ban on ever touching a
+        # blocked/theme-design issue. Issue #240 added a second exclusion (assignee/branch/
+        # PR) that is explicitly NOT overridden the same way, so the pinned phrase narrowed
+        # from "this exclusion" to "the label-based exclusions above" to stay accurate.
+        idx = self.content.find("apply to auto-pick only")
+        self.assertNotEqual(idx, -1, "explicit-override note must exist")
+        self.assertIn("{ISSUE_NUMBER}", self.content[idx : idx + 300])
+
+    def test_assignee_branch_pr_check_not_overridden_by_explicit_issue(self):
+        # Issue #240: unlike the label-based exclusions, the already-in-progress check
+        # (assignee/branch/PR) still applies even to an explicit {ISSUE_NUMBER} invocation --
+        # Step 8 is what enforces it in that case, since Step 0's own filtering is bypassed.
+        self.assertIn("NOT overridden by an", self.content)
+        self.assertIn("no:assignee", self.content)
+
+    def test_search_command_has_no_positive_label_restriction(self):
+        # Copilot review on PR #258: the other tests in this class only assert the
+        # negative exclusions (-label:blocked, -label:theme-design) are present --
+        # none of them would fail if a future edit silently restored the old
+        # `label:bug,enhancement` positive restriction alongside them, since that's
+        # an *addition*, not a removal, of pinned text. Extract Step 0's actual
+        # --search command and assert it carries no positive label:X term at all.
+        match = re.search(r'--search "([^"]+)"', self.content)
+        self.assertIsNotNone(match, "Step 0's --search command must be present")
+        search_query = match.group(1)
+        # every label: qualifier in the query must be negated
+        for term in search_query.split():
+            if "label:" in term:
+                self.assertTrue(
+                    term.startswith("-label:"),
+                    f"found a positive label restriction in the search query: {term!r}",
+                )
 
 
 class SettingsTemplateContentRequirements(unittest.TestCase):
@@ -172,6 +242,11 @@ class BaselinePermissionRegexLogic(unittest.TestCase):
     def test_matches_venv_rule(self):
         self.assertTrue(has_baseline_permission(["Bash(.venv/bin/python:*)"]))
 
+    def test_matches_venv_scripts_rule(self):
+        # Windows venv uses Scripts/ not bin/ -- the preflight must accept either
+        # form so a Windows-only setup doesn't incorrectly report "no". Issue #230.
+        self.assertTrue(has_baseline_permission(["Bash(.venv/Scripts/python:*)"]))
+
     def test_no_match_on_unrelated_rules(self):
         self.assertFalse(has_baseline_permission(["Bash(dotnet build:*)"]))
 
@@ -207,6 +282,52 @@ class BaselinePermissionRegexLogic(unittest.TestCase):
         self.assertTrue(
             has_baseline_permission(["Bash(uvicorn:*)", "Bash(git push:*)"])
         )
+
+
+class MetricsLoggingContentRequirements(unittest.TestCase):
+    """Pin the logging-call shape added by issue #210 — the cut-over from
+    compact_store to record_metric. The skill is prose, not code, so a future
+    edit that silently reverts the logging call or changes its domain string
+    would otherwise produce no test failure."""
+
+    def setUp(self):
+        with open(SKILL_PATH, encoding="utf-8") as f:
+            self.content = f.read()
+
+    def test_uses_record_metric_not_compact_store_for_logging(self):
+        # compact_store may still appear in prose (e.g. historical context),
+        # but must not appear as the primary logging call in Step 2b's code
+        # block — record_metric is the replacement.
+        self.assertIn("record_metric(", self.content)
+
+    def test_logging_uses_autowork_metric_id(self):
+        # The domain string "autowork" is the metric_id every call must use
+        # so /my-metrics can filter by it -- a typo'd domain produces a valid
+        # call that silently writes to the wrong bucket.
+        self.assertIn('metric_id="autowork"', self.content)
+
+    def test_logging_records_event_type(self):
+        # event_type is required by MetricsStore.record() -- the call must
+        # include it in the named-parameter form the skill demonstrates.
+        self.assertIn("event_type=", self.content)
+
+    def test_logging_is_described_as_best_effort(self):
+        # The best-effort discipline must survive the logging-call change --
+        # a logging failure must never block the run's actual control flow.
+        self.assertIn("best-effort and additive", self.content)
+
+    def test_logging_failure_check_mentions_error_prefix(self):
+        # record_metric returns "OK" or an "Error:..." string -- the skill
+        # must instruct the orchestrator to check for this, the same way the
+        # old compact_store prose did for that tool's own two failure shapes.
+        self.assertIn('"Error:"', self.content)
+
+    def test_session_id_carries_per_attempt_timestamp(self):
+        # The per-attempt HHMMSS timestamp is now stored as session_id (not
+        # a label field, since the append-only store doesn't upsert) --
+        # verify the skill documents this so a future edit doesn't drop it.
+        self.assertIn("session_id", self.content)
+        self.assertIn("HHMMSS", self.content)
 
 
 if __name__ == "__main__":

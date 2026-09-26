@@ -71,65 +71,72 @@ dependencies = [
 ]
 
 [project.scripts]
-# The "clone this repo, remember its absolute path, plug that path into
-# every invocation" model (issue #50) replaced, for these 3 tools
-# specifically, by ordinary PATH-resolved commands pipx/`uv tool install`
-# put on your PATH persistently (PR #136 review, Copilot: a bare `uvx` does
-# NOT do this -- it's a cache-backed, effectively ephemeral single-command
-# run; see docs/installation.md's "Alternative" callout for the full distinction). The
-# MCP servers (ingest_mcp_server.py/compress_mcp_server.py/
-# memory_bank_mcp_server.py -- the last one added later, issue #175, same
-# reasoning applies) aren't included here -- this package declares no
-# console-script entry points for them, so there's nothing on PATH resolving
-# to them either way (a project's .mcp.json still needs a literal
-# command/args pointing at a real file for those specifically) -- a separate
-# concern this issue's own proposal text doesn't cover (see pyproject.toml's
-# module docstring-equivalent comments above). This does NOT mean these
-# servers are missing from the built package, though (issue #182): they
-# still get installed like any other .py file, since `packages = ["libs",
-# "tools", "templates", "hooks"]` below declares whole directories, not an
-# explicit file list -- confirmed by building a real wheel and inspecting
-# its contents, and pinned by tests/test_pyproject.py.
-claude-runway-ingest = "tools.ingest_to_qdrant:main"
-claude-runway-setup = "tools.setup_project:main"
-claude-runway-doctor = "tools.doctor:main"
+# Issue #206: libs/tools/hooks/templates/skills are no longer
+# `[tool.setuptools] packages` (see that section below) -- they ship as
+# wheel DATA files instead, landing at <env>/src/{libs,tools,hooks,
+# templates,skills} rather than directly in site-packages, so they no
+# longer pollute the top-level import namespace with generically-named
+# packages (`tools`, `libs`, `hooks`) any dependency in the same
+# environment could collide with. That means `tools.ingest_to_qdrant:main`
+# no longer resolves on its own -- `tools` isn't importable via a bare
+# sys.path search anymore (nothing in site-packages puts <env>/src on
+# sys.path automatically). `claude_runway` (see that package, and setup.py's
+# data_files) is a tiny real site-packages package that exists purely to
+# bridge this gap: each entry point below calls into it, it puts <env>/src
+# on sys.path (located via sys.prefix, the one thing that sits at the same
+# relative place on Windows/macOS/Linux), then imports and calls the real
+# tools/*.py `main()` exactly as before -- behavior is unchanged, only how
+# entry_points resolves it. See claude_runway/__init__.py for the shim.
+claude-runway-ingest = "claude_runway:ingest_main"
+claude-runway-setup = "claude_runway:setup_main"
+claude-runway-doctor = "claude_runway:doctor_main"
 
 [tool.setuptools]
-# Flat layout, explicit list rather than auto-discovery -- this repo root
-# also has skills/, tests/, docs/, none of which should become installed
-# Python packages. libs/, tools/, templates/, and hooks/ are declared as
-# plain top-level packages (not nested under one umbrella package) on
-# purpose: every script in tools/ (and every hook in hooks/) already
-# computes its own repo root from __file__ and resolves libs/'s and
-# templates/'s content relative to that (see e.g.
-# tools/setup_project.py's `run_setup(..., tools_repo_dir, ...)` call,
-# which derives `templates_dir = tools_repo_dir / "templates"`) -- that
-# arithmetic resolves correctly post-install only because pip installs all
-# four as SIBLING directories under site-packages, matching their
-# relationship in this repo today. Renaming/nesting any of them would break
-# that assumption. None of the four has (or needs) an __init__.py --
-# setuptools>=68's PEP 420 implicit-namespace-package support includes a
-# directory in the wheel from a plain "packages" list without one (verified
-# directly: building and inspecting the wheel shows every .py file present).
-# Deliberately NOT added: mypy (`mypy.ini`'s `mypy_path = libs`, needed so
-# tools/*.py's bare `from qdrant_ingest_lib import ...` imports resolve the
-# same way at type-check time as they do at runtime via sys.path) treats a
-# directory with an __init__.py as an importable dotted package -- adding
-# one to libs/ specifically made mypy see libs/qdrant_retry.py under two
-# module identities at once ("libs.qdrant_retry" from the `mypy libs tools
-# hooks` command line, "qdrant_retry" via mypy_path) and hard-error with
-# "Source file found twice under different module names" (confirmed live
-# during this issue's own testing). None of these four directories is ever
-# imported as a Python package by name anywhere in this repo, so there's no
-# upside to an __init__.py to weigh against that downside.
-packages = ["libs", "tools", "templates", "hooks"]
+# `claude_runway` is the ONE real, importable site-packages package this
+# project declares (issue #206) -- see its own module docstring for why it
+# exists (bridging [project.scripts] entry points to the data-files layout
+# below) and [project.scripts]'s comment above for the full chain. It has
+# an __init__.py deliberately (unlike libs/tools/hooks/templates/skills
+# below): it genuinely is imported by dotted name (`claude_runway:
+# ingest_main`), unlike any of those five, so PEP 420 implicit-namespace
+# packaging doesn't apply here the way the comment below explains for them.
+packages = ["claude_runway"]
 
-[tool.setuptools.package-data]
-# templates/*.template files aren't .py, so they need an explicit glob to
-# be bundled into the wheel at all -- setuptools only includes .py files
-# automatically for a declared package. Without this, tools/setup_project.py
-# (packaged above) would install cleanly and its console-script entry point
-# would resolve, but every real invocation would crash the first time it
-# tried to load templates/mcp.json.template (confirmed by building and
-# installing a wheel without this section, issue #50).
-templates = ["*.template"]
+# libs/, tools/, templates/, hooks/, and skills/ are NOT declared as
+# setuptools packages anymore (issue #206 -- previously
+# `packages = ["libs", "tools", "templates", "hooks", "skills"]` put all
+# five directly in site-packages, the generic top-level-namespace layout
+# this issue moves away from). setup.py's `data_files()` instead globs each
+# directory and ships them as wheel DATA files under
+# <env>/src/{libs,tools,hooks,templates,skills} -- installed as siblings of
+# each other under a dedicated `src/` directory, exactly as they are in
+# this repo today, so every script's own __file__-relative arithmetic (e.g.
+# tools/setup_project.py's `run_setup(..., tools_repo_dir, ...)` deriving
+# `templates_dir = tools_repo_dir / "templates"`, and each hook's `_root`/
+# `_candidates` lookup) keeps resolving correctly post-install with no code
+# changes -- only WHERE the sibling set lives changed (<env>/src/ instead
+# of site-packages), not the sibling relationship itself. See setup.py for
+# the actual glob-based file lists (a glob, not a hand-typed list, so a new
+# module in any of these directories ships automatically -- see that file's
+# own docstring for why skills/ specifically needs one data_files tuple PER
+# skill subdirectory rather than one shared "skills" target).
+#
+# None of these five directories has (or needs) an __init__.py.
+# libs/, hooks/, templates/, and skills/ are never imported as a Python
+# package by dotted name anywhere in this repo -- each script/hook resolves
+# libs/'s content via __file__ + sys.path and a bare (non-dotted) import
+# (e.g. `from qdrant_ingest_lib import ...`), hooks/ is only ever invoked as
+# a standalone script, and templates/skills aren't Python at all.
+# `tools/` is the one exception (Copilot review, PR #228): claude_runway's
+# shim DOES import it by dotted name (`from tools.ingest_to_qdrant import
+# main`, etc.) once <env>/src is added to sys.path -- this works with no
+# __init__.py because Python's PEP 420 implicit-namespace-package support
+# lets a plain directory be imported this way. mypy (`mypy.ini`'s
+# `mypy_path = libs`) is specifically why libs/ must stay import-nameless,
+# though, not tools/ -- adding an __init__.py to libs/ specifically made
+# mypy see libs/qdrant_retry.py under two module identities at once
+# (confirmed live in this issue's own testing predecessor, issue #50/PR
+# #136's own history) -- see that repo history for the "Source file found
+# twice under different module names" mypy error an __init__.py there
+# previously caused.
+
