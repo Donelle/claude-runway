@@ -330,5 +330,91 @@ class MetricsLoggingContentRequirements(unittest.TestCase):
         self.assertIn("HHMMSS", self.content)
 
 
+def dedupe_preserve_order(numbers):
+    """Reference implementation of the Step 1 remaining-queue de-dup rule:
+    build the queue from a raw invocation list, keeping only each number's
+    first occurrence, in the order it first appeared."""
+    seen = set()
+    result = []
+    for n in numbers:
+        if n not in seen:
+            seen.add(n)
+            result.append(n)
+    return result
+
+
+class ExplicitTicketListContentRequirements(unittest.TestCase):
+    """Pin the list-mode contract added for /my-gh-autowork's third invocation
+    form (`/my-gh-autowork 45 52 61`). Copilot review on PR #316 flagged both
+    the missing test coverage for this contract (this class) and a real
+    duplicate-ticket bug in the original queue-building prose, fixed alongside
+    these tests -- test_queue_deduplicates_while_preserving_order below is the
+    regression guard for that specific fix."""
+
+    def setUp(self):
+        with open(SKILL_PATH, encoding="utf-8") as f:
+            self.content = f.read()
+
+    def test_usage_documents_explicit_list_form(self):
+        self.assertIn("45 52 61", self.content)
+
+    def test_queue_is_separate_from_attempted(self):
+        self.assertIn("remaining queue", self.content)
+        self.assertIn("separate from `attempted`", self.content)
+
+    def test_queue_deduplication_is_documented(self):
+        # Regression guard for the Copilot-flagged bug: a repeated ticket
+        # number (e.g. `45 52 45`) must not be scheduled twice, since its
+        # first run already merges/closes it and a second attempt would hit
+        # Step 7's CLOSED-ticket check and abort the whole run.
+        self.assertIn("de-duplicated while preserving first-seen order", self.content)
+        self.assertIn("45 52 45", self.content)
+
+    def test_queue_deduplicates_while_preserving_order(self):
+        # Exercises the actual algorithm the prose describes, not just its
+        # presence in the text -- mirrors this file's existing dual strategy
+        # of prose-pinning plus a direct logic check (see
+        # BaselinePermissionRegexLogic above for the Step 0 precedent).
+        self.assertEqual(dedupe_preserve_order([45, 52, 45]), [45, 52])
+        self.assertEqual(dedupe_preserve_order([45, 52, 61]), [45, 52, 61])
+        self.assertEqual(dedupe_preserve_order([7, 7, 7]), [7])
+
+    def test_list_mode_never_substitutes_attempted_list(self):
+        idx = self.content.find("Which placeholder to substitute depends on invocation mode")
+        self.assertNotEqual(idx, -1, "substitution-rule paragraph must exist")
+        section = " ".join(self.content[idx : idx + 800].split())
+        self.assertIn("List mode never uses `{ATTEMPTED_LIST}`", section)
+
+    def test_all_mode_always_substitutes_attempted_list_with_no_exception(self):
+        # Regression guard for a Copilot-flagged contradiction (PR #316, round 2):
+        # an earlier version of this paragraph said {ISSUE_NUMBER} covered "the
+        # current ticket of an `all` run once Step 0's auto-pick has chosen one" --
+        # but the orchestrator never knows an all-mode ticket in advance, only the
+        # subagent's own internal Step 0 discovers it. Pin that `all`/no-argument
+        # calls substitute {ATTEMPTED_LIST} unconditionally, with no ISSUE_NUMBER
+        # exception carved out for them.
+        idx = self.content.find("Which placeholder to substitute depends on invocation mode")
+        self.assertNotEqual(idx, -1, "substitution-rule paragraph must exist")
+        section = " ".join(self.content[idx : idx + 800].split())
+        self.assertIn("with no exception", section)
+        self.assertIn("no point at which `all` substitutes `{ISSUE_NUMBER}`", section)
+
+    def test_list_mode_stops_on_blocked_or_failed_rather_than_skipping(self):
+        idx = self.content.find("An explicit list of tickets")
+        self.assertNotEqual(idx, -1, "explicit-list continuation branch must exist")
+        # Normalize whitespace first -- this prose line-wraps with real
+        # newlines/indentation in the source file, so a phrase spanning a
+        # wrap point (e.g. "run\n        immediately") would otherwise fail
+        # a plain substring check despite reading as one phrase to a human.
+        section = " ".join(self.content[idx : idx + 900].split())
+        self.assertIn("stops the whole run immediately", section)
+
+    def test_list_mode_empty_queue_is_not_a_done_outcome(self):
+        idx = self.content.find("An explicit list of tickets")
+        section = " ".join(self.content[idx : idx + 1200].split())
+        self.assertIn("not a failure", section)
+        self.assertIn("no subagent call ever produces a `DONE` outcome in this mode", section)
+
+
 if __name__ == "__main__":
     unittest.main()

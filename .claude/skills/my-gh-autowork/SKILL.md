@@ -23,6 +23,7 @@ Project-scoped to this repo (hardcodes `Donelle/claude-runway`, `.venv`-based te
 ```
 /my-gh-autowork              # pick the single highest-priority open ticket and work it fully
 /my-gh-autowork 45           # work that specific issue fully
+/my-gh-autowork 45 52 61     # work exactly these issues, in the order given, one at a time
 /my-gh-autowork all          # work the entire open ticket backlog, one ticket at a time
 ```
 
@@ -55,6 +56,8 @@ Project-scoped to this repo (hardcodes `Donelle/claude-runway`, `.venv`-based te
 
 1. **Track only a minimal `attempted` list of issue numbers** across this run — nothing else about a completed ticket needs to live in this conversation's context. Starts empty.
 
+   **If this invocation named an explicit list of tickets** (e.g. `/my-gh-autowork 45 52 61`), also track a **remaining queue**: the given numbers, **de-duplicated while preserving first-seen order** (e.g. `45 52 45` builds the queue `[45, 52]`, not `[45, 52, 45]`) — without this, a repeated number would still be sitting in the queue after its first occurrence already merged/closed the ticket, and re-picking it later would hit Step 7's "state is CLOSED → report BLOCKED" check and abort the whole run, contradicting the very guarantee this paragraph makes. This is separate from `attempted` — `attempted` is bookkeeping for Step 0's auto-pick exclusion (irrelevant in list mode, since every ticket here is explicitly named, never auto-picked) plus the final summary; the queue is what Step 2c below actually advances through to pick the next `{ISSUE_NUMBER}`. Remove a ticket from the queue once its own Agent call in Step 2 returns, regardless of outcome — it should never be worked twice in the same run.
+
 2. **Loop, one subagent call per ticket:**
    a. Before calling, note which model this Agent call will run as (an explicit `model`
       param on this call, or the harness default this conversation is itself running as,
@@ -71,6 +74,17 @@ Project-scoped to this repo (hardcodes `Donelle/claude-runway`, `.venv`-based te
       spontaneously called `ScheduleWakeup` at this exact moment before, then correctly
       self-corrected in the same turn — but a failed tool call is wasted latency, so avoid
       calling it here in the first place.
+
+      **Which placeholder to substitute depends on invocation mode:** `{ISSUE_NUMBER}` —
+      the single explicit number given, or (in list mode) the next number off the front of
+      the remaining queue tracked in Step 1 — for a single-ticket invocation or an explicit
+      list ONLY. `{ATTEMPTED_LIST}` for every call in a no-argument or `all` invocation,
+      with no exception: the orchestrator never knows which ticket an auto-pick run will
+      choose in advance (only the subagent's own Step 0 discovers that, internally, by
+      excluding everything in `{ATTEMPTED_LIST}`), so there is no point at which `all`
+      substitutes `{ISSUE_NUMBER}` instead. List mode never uses `{ATTEMPTED_LIST}` — there
+      is no auto-pick step to exclude anything from, since every ticket in the queue was
+      named explicitly up front.
    b. Read its final report — exactly one of:
       - `OUTCOME: MERGED (issue #<n>, PR #<n>)` → append `<n>` to `attempted`, log this
         ticket to the metrics store (see below), continue to the next ticket.
@@ -128,12 +142,25 @@ Project-scoped to this repo (hardcodes `Donelle/claude-runway`, `.venv`-based te
       invocation (no argument, or an explicit issue number), the run still ends after this
       one call regardless. A metrics-logging failure is never itself a reason to stop a
       run that would otherwise continue, or continue a run that would otherwise stop.
-   c. If this invocation was `all`, go back to 2a for the next ticket (unless the outcome
-      was `BLOCKED`/`FAILED`/`DONE`, per 2b above). **For every OTHER invocation — an
-      explicit issue number, or no argument at all — the run ends after this one call,
-      regardless of outcome.** No-argument mode picks and works exactly one ticket, per
-      Usage above; it must not fall through to looping like `all` just because it also
-      goes through Step 0's auto-pick logic to choose that one ticket.
+   c. **Continuation depends on which invocation mode this run is:**
+      - **`all`** — go back to 2a for the next auto-picked ticket (unless the outcome was
+        `BLOCKED`/`FAILED`/`DONE`, per 2b above).
+      - **An explicit list of tickets** (e.g. `/my-gh-autowork 45 52 61`) — remove the
+        just-worked ticket from the remaining queue (Step 1), then, unless the outcome was
+        `BLOCKED`/`FAILED`, go back to 2a for the next ticket at the front of the queue,
+        substituting it as `{ISSUE_NUMBER}` (list mode never substitutes
+        `{ATTEMPTED_LIST}` — see 2a). A `BLOCKED`/`FAILED` outcome stops the whole run
+        immediately, same as `all` — a human should look at what went wrong before the
+        rest of a hand-picked list gets worked, same reasoning as `all`'s identical rule.
+        Once the queue empties with no `BLOCKED`/`FAILED` along the way, end the run — this
+        is list mode's normal, successful end state (the equivalent of `all`'s `DONE`), not
+        a failure; no subagent call ever produces a `DONE` outcome in this mode, since the
+        queue is fully known up front rather than discovered by auto-pick.
+      - **Every other invocation — a single explicit issue number, or no argument at all**
+        — the run ends after this one call, regardless of outcome. No-argument mode picks
+        and works exactly one ticket, per Usage above; it must not fall through to looping
+        like `all` just because it also goes through Step 0's auto-pick logic to choose
+        that one ticket.
 
 3. **After the run ends**, give the user a summary table: ticket #, outcome, PR # if any, and the one-line reason for any non-merge outcome. Don't start a new run without being asked again, even if this invocation was `all`.
 
