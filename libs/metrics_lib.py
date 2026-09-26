@@ -169,6 +169,7 @@ class MetricsStore:
         value: float = 1.0,
         metadata: Optional[dict] = None,
         session_id: Optional[str] = None,
+        event_timestamp: Optional[str] = None,
     ) -> None:
         """
         Append one row. `metric_id`/`event_type` are domain-defined strings
@@ -180,6 +181,29 @@ class MetricsStore:
         need it (none of the three below actually need it today -- it's
         carried through for a future domain-specific reporting view to read
         directly from the raw table if needed).
+
+        `event_timestamp`, if given, overrides the default "stamp with the
+        current time" behavior below -- added for issue #209's one-time
+        migration of `my-gh-autowork`'s pre-existing Qdrant-stored history
+        into this store (`tools/migrate_autowork_metrics.py`), which needs
+        to preserve each migrated event's OWN original date rather than
+        having every historical entry collapse onto the migration's own
+        run-time: `trend()`'s day/week bucketing would otherwise put years
+        of prior history into a single "today" bucket. Must already be full
+        ISO 8601 UTC (`"YYYY-MM-DDTHH:MM:SSZ"`, matching this column's own
+        documented format) -- validated via `datetime.strptime` (REAL
+        calendar/time validation, e.g. rejects `"2026-99-99T99:99:99Z"`;
+        PR #246 review caught an earlier version that only checked
+        character-class SHAPE via regex, which would have accepted that
+        exact string and persisted it, only for `trend()`'s own
+        `datetime.fromisoformat` parsing to raise `ValueError` on it later
+        for every future `trend()` call against this metric_id, not just
+        this one row). Validated with the same fail-open philosophy as the
+        non-finite `value` guard above: an invalid override is refused
+        before the DB is even opened (logged to stderr, nothing written).
+        Ordinary callers should never pass this -- omitting it (the
+        default) keeps today's "stamp with now" behavior for every existing
+        call site.
 
         Fails OPEN on any write failure (unwritable/locked/corrupt db file,
         non-JSON-serializable metadata, or a non-finite `value`): caught and
@@ -207,6 +231,40 @@ class MetricsStore:
         if not math.isfinite(value):
             print(f"[claude-runway] refusing to record non-finite metric value for {metric_id}/{event_type}: {value!r}", file=sys.stderr)
             return
+        if event_timestamp is not None:
+            try:
+                # PR #246 review (Copilot, round 1): a regex only checks
+                # character SHAPE, not that the value is a real calendar
+                # date/time -- it would accept "2026-99-99T99:99:99Z" and
+                # persist it, which trend()'s datetime.fromisoformat parsing
+                # then raises ValueError on for every future call against
+                # this metric_id, not just this one row (confirmed by
+                # reproduction). datetime.strptime performs real
+                # calendar/time validation, not just character-class
+                # matching.
+                #
+                # PR #246 review (Copilot, round 2): strptime alone still
+                # isn't sufficient -- it's lenient about zero-padding, so it
+                # happily parses "2026-8-5T01:02:03Z" (non-zero-padded month/
+                # day) and would have persisted that non-canonical string
+                # verbatim, only for trend()'s datetime.fromisoformat (which
+                # requires the STRICT zero-padded form) to raise on it later
+                # (confirmed by reproduction: strptime parses it, fromisoformat
+                # rejects it). Reformatting the parsed value back through
+                # strftime and requiring an EXACT round-trip match to the
+                # original string is what actually enforces the canonical
+                # "YYYY-MM-DDTHH:MM:SSZ" shape AND real calendar validity
+                # together -- a value that round-trips has to be both.
+                parsed = datetime.strptime(event_timestamp, "%Y-%m-%dT%H:%M:%SZ")
+                if parsed.strftime("%Y-%m-%dT%H:%M:%SZ") != event_timestamp:
+                    raise ValueError("not canonical (fails strict round-trip)")
+            except (TypeError, ValueError):
+                print(
+                    f"[claude-runway] refusing to record metric {metric_id}/{event_type} with invalid "
+                    f"event_timestamp override (expected canonical ISO 8601 UTC 'YYYY-MM-DDTHH:MM:SSZ'): {event_timestamp!r}",
+                    file=sys.stderr,
+                )
+                return
         try:
             metadata_json = json.dumps(metadata) if metadata is not None else None
         except (TypeError, ValueError) as e:
@@ -231,7 +289,7 @@ class MetricsStore:
                         event_type,
                         float(value),
                         metadata_json,
-                        time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        event_timestamp or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                         session_id,
                     ),
                 )

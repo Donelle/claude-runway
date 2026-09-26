@@ -120,6 +120,76 @@ class RecordRoundTrip(MetricsStoreTestCase):
         self.assertEqual(self._all_rows(), [])
 
 
+class EventTimestampOverride(MetricsStoreTestCase):
+    """Issue #209: record() gained an optional event_timestamp override so
+    tools/migrate_autowork_metrics.py can backfill historical Qdrant-derived
+    events under their OWN original date, instead of every migrated row
+    collapsing onto the migration's own run-time."""
+
+    def test_explicit_event_timestamp_is_used_verbatim(self):
+        self.store.record("autowork", "ticket_merged", event_timestamp="2026-08-15T00:00:00Z")
+        rows = self._all_rows()
+        self.assertEqual(rows[0][4], "2026-08-15T00:00:00Z")
+
+    def test_omitting_it_keeps_stamping_current_time(self):
+        # Existing behavior for every current call site must be unchanged --
+        # this just confirms the new parameter defaulting to None doesn't
+        # alter the pre-existing "stamp with now" path.
+        with mock.patch.object(M.time, "gmtime", return_value=M.time.struct_time((2026, 1, 2, 3, 4, 5, 0, 1, 0))):
+            self.store.record("autowork", "ticket_merged")
+        rows = self._all_rows()
+        self.assertEqual(rows[0][4], "2026-01-02T03:04:05Z")
+
+    def test_invalid_format_is_rejected_and_writes_nothing(self):
+        self.store.record("autowork", "ticket_merged", event_timestamp="2026-08-15")  # missing time component
+        self.assertEqual(self._all_rows(), [])
+
+    def test_non_iso_garbage_is_rejected_and_writes_nothing(self):
+        self.store.record("autowork", "ticket_merged", event_timestamp="not-a-timestamp")
+        self.assertEqual(self._all_rows(), [])
+
+    def test_shape_valid_but_calendar_invalid_timestamp_is_rejected(self):
+        """PR #246 review (Copilot): a regex checking only `\\d{4}-\\d{2}-\\d{2}
+        T\\d{2}:\\d{2}:\\d{2}Z` shape would accept "2026-99-99T99:99:99Z"
+        (no such month/day/hour/minute/second) and persist it, which later
+        crashes trend()'s datetime.fromisoformat parsing. strptime performs
+        real calendar/time validation instead of just character-class
+        matching -- confirmed by reproduction before the fix."""
+        self.store.record("autowork", "ticket_merged", event_timestamp="2026-99-99T99:99:99Z")
+        self.assertEqual(self._all_rows(), [])
+
+    def test_calendar_invalid_date_with_valid_time_is_also_rejected(self):
+        # Narrower case of the above: only the date portion is impossible
+        # (Feb 30 doesn't exist), time portion is fine on its own.
+        self.store.record("autowork", "ticket_merged", event_timestamp="2026-02-30T12:00:00Z")
+        self.assertEqual(self._all_rows(), [])
+
+    def test_non_zero_padded_timestamp_is_rejected(self):
+        """PR #246 review, round 2 (Copilot): datetime.strptime alone is
+        lenient about zero-padding and happily parses "2026-8-5T01:02:03Z",
+        which datetime.fromisoformat (what trend() actually calls) then
+        rejects -- confirmed by reproduction. A strict round-trip
+        (strftime the parsed value back and require an exact match) is
+        what actually enforces the canonical zero-padded shape."""
+        self.store.record("autowork", "ticket_merged", event_timestamp="2026-8-5T01:02:03Z")
+        self.assertEqual(self._all_rows(), [])
+
+    def test_canonical_zero_padded_timestamp_still_accepted(self):
+        # The round-trip check must not reject genuinely canonical values.
+        self.store.record("autowork", "ticket_merged", event_timestamp="2026-08-05T01:02:03Z")
+        rows = self._all_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][4], "2026-08-05T01:02:03Z")
+
+    def test_ordinary_values_around_a_rejected_one_are_unaffected(self):
+        self.store.record("autowork", "ticket_merged", value=1.0)
+        self.store.record("autowork", "ticket_merged", event_timestamp="garbage")
+        self.store.record("autowork", "ticket_merged", value=2.0)
+        rows = self._all_rows()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({r[2] for r in rows}, {1.0, 2.0})
+
+
 class NonFiniteValueRejection(MetricsStoreTestCase):
     """Regression for PR #222 review: a non-finite value (inf/-inf/nan)
     must never be persisted -- one such row poisons SUM(value) for every
