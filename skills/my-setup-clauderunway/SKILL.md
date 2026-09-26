@@ -149,7 +149,7 @@ Use `AskUserQuestion` with three questions:
 **Q1 — Setup scope**
 Header: "Setup scope"
 - "Full setup (Recommended)" — Qdrant memory + LM Studio compression + PostToolUse/PreToolUse/SessionEnd hooks
-- "Qdrant-only" — no LM Studio server, no hooks (good for projects where LM Studio isn't in use or you want to add it later)
+- "Qdrant-only" — no LM Studio server, no LM Studio-dependent hooks (good for projects where LM Studio isn't in use or you want to add it later). The CORE `record_session_id.py` hook (registered under `SessionStart`/`SessionEnd`) is still installed either way — since #198/#231, it's a base-install hook independent of qdrant-only vs. full setup.
 
 **Q2 — Collection name**
 Header: "Collection"
@@ -361,7 +361,7 @@ Print a concise summary:
 Done. Configured <target-project-path>:
 
   ✓ .mcp.json              — qdrant, codebase-indexer, memory-bank[, local-compress]
-  ✓ .claude/settings.json  — PostToolUse, PreToolUse, SessionEnd hooks   [only if full setup]
+  ✓ .claude/settings.json  — SessionStart/SessionEnd record_session_id.py hook (always)[; PostToolUse, PreToolUse, SessionEnd hooks — only if full setup]
   ✓ CLAUDE.md              — <what was added or "already up to date">
 
 Next: run the initial index (from inside the tools repo, venv activated):
@@ -370,8 +370,11 @@ Next: run the initial index (from inside the tools repo, venv activated):
 ```
 
 **Shell export reminders** — skip this block entirely if qdrant-only was selected
-(hooks are not installed, so there is nothing to export). This mirrors
-`setup_project.py`'s own behavior (`reminders = [] if qdrant_only`).
+(the CORE `record_session_id.py` hook is still installed, but it doesn't read
+any of the LM-Studio-related settings below, and none of the LM-Studio-dependent
+hooks that DO read them are installed in this mode — so there is nothing to
+export). This mirrors `setup_project.py`'s own behavior (`reminders = [] if
+qdrant_only`).
 
 Otherwise, print this block whenever ANY of the following apply (these settings must
 also be in the shell profile that launches `claude`, since hook scripts inherit the
