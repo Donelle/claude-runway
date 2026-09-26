@@ -636,6 +636,14 @@ def run_upgrade(
             skipped += 1
             continue
         mcp_json, settings_json = migration.apply(mcp_json, settings_json, ctx)
+        # An apply() can deliberately no-op when its safety guard isn't met
+        # (e.g. record-session-id-sessionstart won't remove the PostToolUse
+        # fallback while no SessionStart block exists). Only count it as
+        # applied if detect() agrees the gap is actually closed now.
+        if migration.detect(mcp_json, settings_json):
+            print(f"      Not applied: its precondition isn't met yet, so {migration.id} stays pending.")
+            skipped += 1
+            continue
         applied.append(migration.id)
 
     if dry_run:

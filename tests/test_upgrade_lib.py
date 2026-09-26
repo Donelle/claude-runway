@@ -745,6 +745,22 @@ class RunUpgradeEndToEnd(unittest.TestCase):
         second_pending = pending_migrations(*self._read_configs())
         self.assertIn(declined_id, {m.id for m in second_pending})
 
+    def test_guarded_no_op_is_not_reported_as_applied(self):
+        # Declining the migration that ADDS SessionStart makes
+        # record-session-id-sessionstart's safety guard no-op its removal.
+        # It must stay pending, not be counted (and reported) as applied.
+        def _decline_add(migration, index, total):
+            return migration.id != "record-session-id-hooks-missing"
+
+        applied = run_upgrade(self.target_repo, REPO_ROOT, _VENV_PYTHON, prompt_fn=_decline_add)
+        self.assertNotIn("record-session-id-sessionstart", applied)
+        self.assertIn("memory-bank-server-missing", applied)
+
+        _, settings_json = self._read_configs()
+        wildcard_blocks = [b for b in settings_json["hooks"]["PostToolUse"] if b.get("matcher") == ".*"]
+        self.assertEqual(len(wildcard_blocks), 1, "PostToolUse fallback must survive without SessionStart")
+        self.assertIn("record-session-id-sessionstart", {m.id for m in pending_migrations(*self._read_configs())})
+
     def test_prompt_fn_receives_index_and_total(self):
         seen = []
 
