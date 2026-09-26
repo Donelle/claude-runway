@@ -43,9 +43,9 @@ Project-scoped to this repo (hardcodes `Donelle/claude-runway`, `.venv`-based te
 
    **Baseline Bash permission preflight — run this ONLY after `DOGFOODING: yes`, before the first `Agent` call.** This does not, and cannot, guarantee the server-side auto mode classifier documented above won't reject the `Agent` call anyway (its reasoning is opaque and the one observed data point doesn't confirm causation) — but a missing baseline permission rule is a known, checkable precondition of the one workaround that has actually worked, so ruling it out first turns a possible opaque classifier denial into an actionable, specific message instead. Claude Code merges `permissions.allow` from BOTH the project's own `.claude/settings.json` and the user's `~/.claude/settings.json` — check both, since the working example that was observed lived only in the user-level file, not a project one:
    ```bash
-   jq -e '(.permissions.allow // []) | any(test("^Bash\\((git|gh|uv)[ :)]|^Bash\\(\\.venv/bin/"))' \
+   jq -e '(.permissions.allow // []) | any(test("^Bash[(](git|gh|uv)[ :)]|^Bash[(][.]venv/bin/"))' \
      .claude/settings.json >/dev/null 2>&1 && echo "PROJECT: yes" || echo "PROJECT: no"
-   jq -e '(.permissions.allow // []) | any(test("^Bash\\((git|gh|uv)[ :)]|^Bash\\(\\.venv/bin/"))' \
+   jq -e '(.permissions.allow // []) | any(test("^Bash[(](git|gh|uv)[ :)]|^Bash[(][.]venv/bin/"))' \
      ~/.claude/settings.json >/dev/null 2>&1 && echo "USER: yes" || echo "USER: no"
    ```
    The `[ :)]` right after `git`/`gh`/`uv` is load-bearing, not decorative — without it, `test("^Bash\\((git|gh|uv|\\.venv/bin/)")` (an earlier version of this check) matched unrelated tool names that merely start with the same letters, e.g. `Bash(github-cli:*)`, `Bash(ghastly:*)`, `Bash(uvicorn:*)` all false-positived as `yes` (confirmed live against exactly these three), letting the preflight silently proceed with no real `git`/`gh`/`uv` access at all — the opposite of what this check exists to catch. Requiring a space/colon/close-paren immediately after the command name rules those out while still matching `Bash(git fetch:*)`/`Bash(gh pr:*)`/`Bash(uv venv:*)`/etc.
