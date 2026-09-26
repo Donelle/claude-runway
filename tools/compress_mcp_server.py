@@ -1971,19 +1971,33 @@ def get_metrics(metric_id: str, view: str = "summary", bucket: str = "week", n: 
       "by_event_type"           — per-event_type breakdown, largest total
                        value first.
       "trend"                   — day/week-bucketed history (see `bucket`/`n`).
+      "detail"        (issue #249) — raw per-event rows, most-recent first,
+                       with each row's `metadata` deserialized and rendered
+                       (see `n` below for how many rows). This is the view
+                       for the richer per-run detail a domain stores in
+                       `metadata` (e.g. my-gh-autowork's model/rounds/
+                       wall_clock_s/findings) that summary/by_event_type
+                       never surface, since those two only ever aggregate
+                       `value`.
 
-    bucket ("day" or "week", default "week") and n (max buckets, default 12)
-      only apply to view="trend" — ignored otherwise.
+    bucket ("day" or "week", default "week") only applies to view="trend" —
+      ignored otherwise.
 
-    session_id (issue #248), when given, narrows view="summary"/
-      "by_event_type" down to rows matching this exact session_id AND
-      metric_id — e.g. one specific `my-gh-autowork` attempt's own
-      `f"issue-{n}-{HHMMSS}"` marker (issue #210), instead of that
-      metric_id's entire history. Omitting it (the default) keeps today's
-      metric_id-only aggregate unchanged. Ignored for view="trend" — per-
-      session filtering doesn't compose with time-bucketed grouping (out of
-      scope for issue #248; see that issue for why), so a session_id passed
-      alongside view="trend" has no effect on the result.
+    n (default 12) means "max buckets" for view="trend", or "max rows" for
+      view="detail" — ignored for "summary"/"by_event_type". Reused across
+      both rather than adding a second row-count parameter, since exactly
+      one of the two meanings ever applies for a given call.
+
+    session_id (issue #248, extended to "detail" by issue #249), when given,
+      narrows view="summary"/"by_event_type"/"detail" down to rows matching
+      this exact session_id AND metric_id — e.g. one specific
+      `my-gh-autowork` attempt's own `f"issue-{n}-{HHMMSS}"` marker (issue
+      #210), instead of that metric_id's entire history. Omitting it (the
+      default) keeps today's metric_id-only aggregate/listing unchanged.
+      Ignored for view="trend" — per-session filtering doesn't compose with
+      time-bucketed grouping (out of scope for issue #248; see that issue
+      for why), so a session_id passed alongside view="trend" has no effect
+      on the result.
 
     format controls the output format:
       "text" (default) — human-readable text.
@@ -1991,13 +2005,19 @@ def get_metrics(metric_id: str, view: str = "summary", bucket: str = "week", n: 
     """
     if not _METRICS_LIB_AVAILABLE:
         return "Error: libs/metrics_lib.py is not available in this install -- get_metrics requires it."
-    if view not in ("summary", "by_event_type", "trend"):
-        return f"Error: unrecognised view {view!r}. Valid values: 'summary', 'by_event_type', 'trend'."
+    if view not in ("summary", "by_event_type", "trend", "detail"):
+        return f"Error: unrecognised view {view!r}. Valid values: 'summary', 'by_event_type', 'trend', 'detail'."
     if format not in ("text", "json"):
         return f"Error: unrecognised format {format!r}. Valid values: 'text', 'json'."
-    if bucket not in ("day", "week"):
+    # Copilot review on this PR: bucket/n are documented as "ignored" for
+    # views that don't use them, but were validated unconditionally
+    # regardless of view -- so an irrelevant bucket="month" or n=0 rejected
+    # a perfectly good view="summary" call, contradicting that doc. Scoped
+    # to only the views that actually consume each argument: bucket is
+    # trend-only; n applies to trend (bucket count) AND detail (row limit).
+    if view == "trend" and bucket not in ("day", "week"):
         return f"Error: unrecognised bucket {bucket!r}. Valid values: 'day', 'week'."
-    if not isinstance(n, int) or n < 1:
+    if view in ("trend", "detail") and (not isinstance(n, int) or n < 1):
         return "Error: n must be a positive integer."
     try:
         store = metrics_lib.MetricsStore()
@@ -2007,6 +2027,9 @@ def get_metrics(metric_id: str, view: str = "summary", bucket: str = "week", n: 
         if view == "by_event_type":
             by_type_data = store.by_event_type(metric_id, session_id=session_id)
             return metrics_lib.format_json("by_event_type", by_type_data) if format == "json" else metrics_lib.format_by_event_type_view(metric_id, by_type_data, session_id=session_id)
+        if view == "detail":
+            detail_data = store.detail(metric_id, session_id=session_id, limit=n)
+            return metrics_lib.format_json("detail", detail_data) if format == "json" else metrics_lib.format_detail_view(metric_id, detail_data, session_id=session_id)
         # view == "trend"
         trend_data = store.trend(metric_id, bucket=bucket, n=n)
         return metrics_lib.format_json("trend", trend_data) if format == "json" else metrics_lib.format_trend_view(metric_id, trend_data, bucket=bucket)
@@ -2043,7 +2066,8 @@ def record_metric(
       raising.
     session_id: optional caller-supplied session identifier — stored on the
       row for later per-session filtering via get_metrics(view="summary"/
-      "by_event_type", session_id=...) (issue #248).
+      "by_event_type"/"detail", session_id=...) (issue #248, extended to
+      "detail" by issue #249).
 
     Returns "OK" on success, or an "Error:..." string on any failure —
     including input-validation failures (non-finite value, invalid metadata

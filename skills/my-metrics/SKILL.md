@@ -6,9 +6,9 @@ Show a view of ClaudeRunway's shared cross-tool metrics store (issue #208): a ge
 
 Required argument: `metricId` — the domain to query (e.g. `autowork`, `memory-bank`), whatever string a writer used when calling `record()`/`increment()`/`decrement()`.
 
-Optional argument: `view` — `summary` (default), `by_event_type`, or `trend` (optionally followed by `day` or `week` for the bucket size, e.g. `/my-metrics autowork trend day`).
+Optional argument: `view` — `summary` (default), `by_event_type`, `trend` (optionally followed by `day` or `week` for the bucket size, e.g. `/my-metrics autowork trend day`), or `detail` (issue #249) — raw per-event rows, most-recent first, with each row's `metadata` fields shown (e.g. autowork's model/rounds/wall_clock_s/findings) instead of just an aggregate count/total.
 
-Optional argument: `sessionId` (issue #248) — narrows `summary`/`by_event_type` down to one specific session's rows (e.g. one `my-gh-autowork` attempt's own `issue-<n>-<HHMMSS>` marker from issue #210), instead of that `metricId`'s entire history. Not supported for `view=trend` (per-session filtering doesn't compose with time-bucketed grouping — see issue #248) — pass it after `view` for `summary`/`by_event_type` only, e.g. `/my-metrics autowork summary issue-248-143022`.
+Optional argument: `sessionId` (issue #248, extended to `detail` by issue #249) — narrows `summary`/`by_event_type`/`detail` down to one specific session's rows (e.g. one `my-gh-autowork` attempt's own `issue-<n>-<HHMMSS>` marker from issue #210), instead of that `metricId`'s entire history. Not supported for `view=trend` (per-session filtering doesn't compose with time-bucketed grouping — see issue #248) — pass it after `view` for `summary`/`by_event_type`/`detail` only, e.g. `/my-metrics autowork summary issue-248-143022`.
 
 ## When to use
 
@@ -16,11 +16,11 @@ Run this any time you want to inspect a specific metric domain's recorded events
 
 ## Steps
 
-1. **Parse the arguments**: the first word is `metricId` (required — if missing, ask the user which metric_id to query rather than guessing one). The second word, if present, is `view` (`summary`/`by_event_type`/`trend`); default to `summary` if omitted.
+1. **Parse the arguments**: the first word is `metricId` (required — if missing, ask the user which metric_id to query rather than guessing one). The second word, if present, is `view` (`summary`/`by_event_type`/`trend`/`detail`); default to `summary` if omitted.
    - If `view` is `trend`: a third word equal to exactly `day` or `week` sets the bucket size; default to `week` if omitted. At most 3 words are valid for `trend` — reject BOTH (a) any third word that isn't exactly `day` or `week` (e.g. something that looks like a `sessionId`), AND (b) any word beyond the third (e.g. `/my-metrics autowork trend day issue-248-143022`, where `day` is a valid bucket but the trailing `issue-248-143022` is not). Either case is an unsupported argument for `trend` — treat it as an error and tell the user per-session trend filtering isn't available (see issue #248) rather than silently dropping it.
-   - If `view` is `summary` or `by_event_type`, an optional third word is `sessionId` — pass it through as-is. At most 3 words are valid here too — reject a 4th word the same way.
+   - If `view` is `summary`, `by_event_type`, or `detail` (issue #249), an optional third word is `sessionId` — pass it through as-is. At most 3 words are valid here too — reject a 4th word the same way.
 
-2. **Call the `get_metrics` MCP tool** (from the `local-compress` server) with `metric_id=<metricId>` and `view=<view>` (plus `bucket=<bucket>` when `view="trend"`, or `session_id=<sessionId>` when given for `summary`/`by_event_type`). Print its return value to the user verbatim — it's pre-formatted text, not something to summarize or reformat.
+2. **Call the `get_metrics` MCP tool** (from the `local-compress` server) with `metric_id=<metricId>` and `view=<view>` (plus `bucket=<bucket>` when `view="trend"`, or `session_id=<sessionId>` when given for `summary`/`by_event_type`/`detail`). Print its return value to the user verbatim — it's pre-formatted text, not something to summarize or reformat.
 
 3. **If the tool reports "no events recorded yet"**: this is normal — relay it plainly, don't treat it as an error, and don't fabricate example data.
 

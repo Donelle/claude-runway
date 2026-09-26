@@ -51,7 +51,7 @@ rather than an ORM -- swapping the backend later only touches this file.
 Writes fail OPEN (a broken/locked/corrupt metrics db must never break the
 actual domain operation being measured), matching
 `memory_events_lib.record_memory_event`'s philosophy exactly. Reads
-(summary/by_event_type/trend) do NOT fail open -- they raise, the same way
+(summary/by_event_type/trend/detail) do NOT fail open -- they raise, the same way
 `savings_ledger.py`'s query_* functions do; it's the CALLER's job to decide
 whether a read failure should produce a friendly error string (see
 `get_metrics` in tools/compress_mcp_server.py, which wraps these in a
@@ -116,7 +116,7 @@ def _connect(db_path: Path) -> sqlite3.Connection:
             )
             """
         )
-        # Supports summary()/by_event_type()/trend() below -- created eagerly
+        # Supports summary()/by_event_type()/trend()/detail() below -- created eagerly
         # rather than waiting for a later feature to add them, since ALTER-ing
         # indexes onto a table that may already hold rows is strictly more
         # disruptive than creating them alongside the table from day one.
@@ -137,6 +137,34 @@ def _connect(db_path: Path) -> sqlite3.Connection:
         conn.close()
         raise
     return conn
+
+
+def _contains_non_finite(obj) -> bool:
+    """
+    True if `obj` (a decoded JSON value -- dict/list/scalar, recursively)
+    contains a non-finite float (inf/-inf/nan) anywhere. Needed because
+    Python's `json` module is, by default, lenient in BOTH directions about
+    the non-standard `NaN`/`Infinity`/`-Infinity` tokens: `json.dumps()`
+    happily serializes a non-finite float (unlike `record()`'s own
+    top-level `value` param, which is explicitly rejected via
+    `math.isfinite()` before that point -- see record()'s docstring for
+    why persisting one poisons every future aggregate), and `json.loads()`
+    happily parses those same tokens back. Metadata's own nested values
+    never went through record()'s `value` guard, so a non-finite number
+    embedded in `metadata` (e.g. an autowork run's own `wall_clock_s`)
+    reaches detail() unfiltered. Confirmed live (Copilot review on this
+    PR): storing `{"wall_clock_s": float("nan")}` as metadata round-trips
+    through record()/detail() unchanged, and format_json() then emits a
+    bare `NaN` token, which is not valid JSON per RFC 8259 even though
+    Python's own `json.dumps`/`json.loads` accept it.
+    """
+    if isinstance(obj, float):
+        return not math.isfinite(obj)
+    if isinstance(obj, dict):
+        return any(_contains_non_finite(v) for v in obj.values())
+    if isinstance(obj, list):
+        return any(_contains_non_finite(v) for v in obj)
+    return False
 
 
 class MetricsStore:
@@ -179,10 +207,10 @@ class MetricsStore:
         this table is meant to serve domains not yet known, so validating
         against a hardcoded set would defeat the point). `metadata`, if
         given, must be JSON-serializable; it's stored as TEXT and decoded
-        back to a dict by summary()/by_event_type()/trend() callers that
-        need it (none of the three below actually need it today -- it's
-        carried through for a future domain-specific reporting view to read
-        directly from the raw table if needed).
+        back to a dict by detail() (issue #249) -- the domain-specific
+        reporting view this was originally carried through for.
+        summary()/by_event_type()/trend() still never need it; they only
+        ever aggregate `value`.
 
         `event_timestamp`, if given, overrides the default "stamp with the
         current time" behavior below -- added for issue #209's one-time
@@ -396,6 +424,118 @@ class MetricsStore:
             for r in rows
         ]
 
+    def detail(self, metric_id: str, session_id: Optional[str] = None, limit: int = 12) -> list:
+        """
+        Raw per-event rows for one metric_id, most-recent first (unlike
+        trend()'s oldest-first time series -- a "what happened recently"
+        log reads naturally newest-first). Each row: `{"event_type",
+        "value", "metadata", "event_timestamp", "session_id"}`, where
+        `metadata` is deserialized from its stored JSON text back into a
+        dict (or `None` if the row has no metadata, or -- defensively,
+        since this reads data record() already validated at write time --
+        if the stored text somehow isn't valid JSON, or decodes to
+        something JSON-valid but not an object, e.g. a list or scalar).
+
+        Added for issue #249: `summary()`/`by_event_type()` only ever
+        aggregate `value`, never surfacing `metadata` -- this is the "future
+        domain-specific reporting view" record()'s own docstring says
+        `metadata` is carried through for. Deliberately generic (no
+        domain-specific field names hardcoded here) so any future metric_id
+        that stores structured metadata gets this view for free, matching
+        this module's "one generic store, no per-domain tool" design.
+
+        `session_id` (issue #249), when given, narrows to rows matching
+        BOTH `metric_id` AND this exact `session_id` -- same semantics as
+        summary()/by_event_type(). Unlike trend(), detail() DOES support
+        session_id filtering: "show me this one run's metadata" is exactly
+        the use case a session-scoped detail view is for.
+
+        `limit` caps the number of rows returned (default 12, matching
+        trend()'s own default bucket count) -- capped via SQL `LIMIT`, not
+        a Python-side slice, so this never pulls more rows off disk than
+        requested.
+
+        Ordered by `event_timestamp DESC, id DESC` -- NOT `event_timestamp`
+        alone (Copilot review on this PR): `event_timestamp` only has
+        one-second resolution, so multiple events genuinely can tie (a
+        my-gh-autowork run's own findings/metadata are typically all logged
+        within the same second). With only `event_timestamp DESC`, SQLite's
+        tie-break among equal keys is not "most recently inserted first" --
+        confirmed live with 15 same-second rows, `LIMIT 12` returned the
+        OLDEST 12 of them, not the newest, silently dropping the very rows a
+        "most recent" view exists to show. `id` is the table's own
+        autoincrement primary key, so it's already a reliable insertion-order
+        tie-breaker with no extra column needed.
+
+        Raises `ValueError` if `limit` isn't a positive integer -- same
+        fail-loud convention as trend()'s `bucket` validation (see this
+        module's docstring: reads don't fail open). `detail()` is public
+        library API, not gated solely behind the `get_metrics` MCP tool's
+        own `n`-must-be-positive check -- a direct call bypassing that
+        wrapper needs its own guard. Copilot review on this PR: SQLite
+        treats a negative `LIMIT` as "no limit," so `limit=-1` here would
+        otherwise silently return the metric_id's ENTIRE history instead of
+        capping it -- confirmed live (50 rows inserted, `limit=-1` returned
+        all 50).
+        """
+        if not isinstance(limit, int) or limit < 1:
+            raise ValueError(f"limit must be a positive integer, got {limit!r}.")
+        query = (
+            "SELECT event_type, value, metadata, event_timestamp, session_id "
+            "FROM metrics WHERE metric_id = ?"
+        )
+        params: tuple = (metric_id,)
+        if session_id is not None:
+            query += " AND session_id = ?"
+            params = (metric_id, session_id)
+        query += " ORDER BY event_timestamp DESC, id DESC LIMIT ?"
+        params = params + (limit,)
+        conn = _connect(self._resolve_path())
+        try:
+            rows = conn.execute(query, params).fetchall()
+        finally:
+            conn.close()
+        result = []
+        for event_type, value, metadata_json, event_timestamp, row_session_id in rows:
+            metadata: Optional[dict] = None
+            if metadata_json is not None:
+                try:
+                    decoded = json.loads(metadata_json)
+                except (TypeError, ValueError):
+                    decoded = None
+                # Copilot review on this PR: json.loads() succeeding only
+                # proves the stored text is valid JSON, not that it's an
+                # OBJECT -- a list or scalar is equally valid JSON (e.g. a
+                # corrupted/external row storing "[1, 2, 3]"), and
+                # format_detail_view() below calls .items() on whatever
+                # comes back, which raises AttributeError on anything that
+                # isn't a dict. Reproduced live: a stored list metadata value
+                # crashed format_detail_view() with exactly that error before
+                # this check. Treat a non-dict decode the same as malformed
+                # JSON -- degrade to None rather than let it reach the
+                # formatter.
+                metadata = decoded if isinstance(decoded, dict) else None
+                # Copilot review on this PR: a non-finite float (inf/-inf/
+                # nan) nested anywhere in metadata round-trips through
+                # json.loads()/json.dumps() unchanged (both are lenient
+                # about these non-standard tokens by default), but
+                # format_json() then emits a bare NaN/Infinity token, which
+                # is not valid JSON per RFC 8259. Degrade the same way as
+                # other malformed metadata rather than let it reach a JSON
+                # consumer.
+                if metadata is not None and _contains_non_finite(metadata):
+                    metadata = None
+            result.append(
+                {
+                    "event_type": event_type,
+                    "value": value,
+                    "metadata": metadata,
+                    "event_timestamp": event_timestamp,
+                    "session_id": row_session_id,
+                }
+            )
+        return result
+
     def trend(self, metric_id: str, bucket: str = "week", n: int = 12) -> list:
         """
         Groups a metric_id's history by day or week, same bucketing
@@ -538,6 +678,29 @@ def format_by_event_type_view(metric_id: str, rows: list, session_id: Optional[s
     return "\n".join(lines)
 
 
+def format_detail_view(metric_id: str, rows: list, session_id: Optional[str] = None) -> str:
+    header = f"ClaudeRunway · Metrics · {metric_id} · Detail (most recent {len(rows)})"
+    if not rows:
+        return f"{header}\n\n{_no_events_message(session_id)}"
+    lines = [header, ""]
+    for i, r in enumerate(rows):
+        if i > 0:
+            lines.append("")
+        session_part = f"  session={r['session_id']}" if r.get("session_id") else ""
+        lines.append(
+            f"  {r['event_timestamp']}  {r['event_type']}  value={_fmt_value(r['value'])}{session_part}"
+        )
+        metadata = r.get("metadata")
+        if metadata:
+            for key, value in metadata.items():
+                # Lists/dicts (e.g. autowork's "findings") render as compact
+                # JSON rather than Python's repr -- readable without this
+                # generic formatter needing to know any domain's field shapes.
+                rendered = json.dumps(value) if isinstance(value, (dict, list)) else str(value)
+                lines.append(f"    {key}: {rendered}")
+    return "\n".join(lines)
+
+
 def format_trend_view(metric_id: str, trend_rows: list, bucket: str = "week") -> str:
     bucket_label = "Weekly" if bucket == "week" else "Daily"
     header = f"ClaudeRunway · Metrics · {metric_id} · {bucket_label} trend"
@@ -561,6 +724,6 @@ def format_trend_view(metric_id: str, trend_rows: list, bucket: str = "week") ->
 
 
 def format_json(view: str, data) -> str:
-    """Machine-readable JSON export for any of the three views above --
-    `data` is whatever summary()/by_event_type()/trend() returned."""
+    """Machine-readable JSON export for any of the four views above --
+    `data` is whatever summary()/by_event_type()/trend()/detail() returned."""
     return json.dumps({"view": view, "data": data}, indent=2)

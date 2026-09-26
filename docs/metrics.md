@@ -41,12 +41,16 @@ store.decrement("autowork", "open_tickets")   # sugar over record(value=-by)
 store.summary("autowork")          # {"metric_id", "event_count", "total_value", "first_event_at", "last_event_at"}
 store.by_event_type("autowork")    # [{"event_type", "event_count", "total_value"}, ...] sorted by total_value desc
 store.trend("autowork", bucket="week", n=12)  # [{"bucket", "event_count", "total_value"}, ...] oldest first
+store.detail("autowork", limit=12) # [{"event_type", "value", "metadata", "event_timestamp", "session_id"}, ...] most recent first
 
 store.summary("autowork", session_id="issue-248-143022")        # same shape, narrowed to one session
 store.by_event_type("autowork", session_id="issue-248-143022")  # same shape, narrowed to one session
+store.detail("autowork", session_id="issue-248-143022")         # same shape, narrowed to one session
 ```
 
-`summary()`/`by_event_type()` also take an optional `session_id` (issue #248) to narrow the aggregate down to one specific session's rows (e.g. one `my-gh-autowork` attempt's own `issue-<n>-<HHMMSS>` marker from issue #210) instead of the metric_id's entire history. Omitting it keeps the metric_id-only aggregate unchanged. Not available on `trend()` — per-session filtering doesn't compose with time-bucketed grouping (out of scope for #248). The text formatters (`format_summary_view`/`format_by_event_type_view`) are session-aware too: a `session_id`-filtered query with zero matching rows reports "No events recorded yet for this metric_id with session_id=...", not the unqualified "no events for this metric_id" message — that message would be misleading when other sessions under the same metric_id do have data.
+`summary()`/`by_event_type()`/`detail()` also take an optional `session_id` (issue #248, extended to `detail()` by issue #249) to narrow the result down to one specific session's rows (e.g. one `my-gh-autowork` attempt's own `issue-<n>-<HHMMSS>` marker from issue #210) instead of the metric_id's entire history. Omitting it keeps the metric_id-only result unchanged. Not available on `trend()` — per-session filtering doesn't compose with time-bucketed grouping (out of scope for #248). The text formatters (`format_summary_view`/`format_by_event_type_view`/`format_detail_view`) are session-aware too: a `session_id`-filtered query with zero matching rows reports "No events recorded yet for this metric_id with session_id=...", not the unqualified "no events for this metric_id" message — that message would be misleading when other sessions under the same metric_id do have data.
+
+`detail()` (issue #249) is the raw, per-event counterpart to `summary()`/`by_event_type()`'s aggregates: it returns individual rows, most-recent first, with each row's `metadata` deserialized back into a dict — the richer per-run detail (e.g. autowork's `model`/`rounds`/`wall_clock_s`/`subagent_tokens`/`tool_calls`/`findings`) that the two aggregate views never surface, since those only ever sum `value`. Deliberately generic: it doesn't hardcode any domain's metadata field names, so any future `metric_id` that stores structured metadata gets this view for free. `limit` caps the number of rows returned (default 12, same default as `trend()`'s bucket count) via SQL `LIMIT`, not a Python-side slice.
 
 `record()` also takes an optional `event_timestamp` override (issue #209) — full ISO 8601 UTC (`"YYYY-MM-DDTHH:MM:SSZ"`), used verbatim instead of the current time. Ordinary callers should never pass this; it exists for backfilling historical events with their own original date (see `tools/migrate_autowork_metrics.py` below) — an invalid format fails open (logged to stderr, nothing written), same as the non-finite `value` guard.
 
@@ -78,9 +82,10 @@ Returns `"OK"` on success or an `"Error:..."` string on any failure — includin
 get_metrics(metric_id, view="summary", bucket="week", n=12, format="text", session_id=None)
 ```
 
-- `view`: `"summary"` (default, total event count + total value), `"by_event_type"` (per-event_type breakdown), or `"trend"` (day/week-bucketed history).
-- `bucket`/`n`: only apply to `view="trend"`.
-- `session_id` (issue #248): only applies to `view="summary"`/`"by_event_type"` — narrows the result to one specific session (e.g. one `my-gh-autowork` attempt's `issue-<n>-<HHMMSS>` marker). Ignored for `view="trend"` (not supported there — see the `MetricsStore` section above).
+- `view`: `"summary"` (default, total event count + total value), `"by_event_type"` (per-event_type breakdown), `"trend"` (day/week-bucketed history), or `"detail"` (issue #249 — raw per-event rows with deserialized `metadata`, most recent first).
+- `bucket`: only applies to `view="trend"`.
+- `n`: "max buckets" for `view="trend"`, or "max rows" for `view="detail"` — ignored for `"summary"`/`"by_event_type"`. Reused across both rather than a second row-count parameter, since only one meaning ever applies for a given call.
+- `session_id` (issue #248, extended to `"detail"` by issue #249): applies to `view="summary"`/`"by_event_type"`/`"detail"` — narrows the result to one specific session (e.g. one `my-gh-autowork` attempt's `issue-<n>-<HHMMSS>` marker). Ignored for `view="trend"` (not supported there — see the `MetricsStore` section above).
 - `format`: `"text"` (default, human-readable) or `"json"`.
 
 ## Historical migration (`tools/migrate_autowork_metrics.py`, issue #209)
@@ -121,6 +126,7 @@ live logging now goes through `record_metric` (issue #210's cutover) — new run
 - `/my-metrics autowork` — summary view (total tickets worked, all outcomes).
 - `/my-metrics autowork by_event_type` — breakdown by outcome type (`ticket_merged`, `ticket_blocked`, `ticket_failed`).
 - `/my-metrics autowork trend day` — daily trend.
-- `/my-metrics autowork summary issue-248-143022` — summary narrowed to one specific autowork attempt's `session_id` (issue #248). Only supported for `summary`/`by_event_type`, not `trend`.
+- `/my-metrics autowork detail` — the last 12 autowork runs, each with its full `metadata` (model, rounds, wall_clock_s, subagent_tokens, tool_calls, findings) shown (issue #249).
+- `/my-metrics autowork summary issue-248-143022` — summary narrowed to one specific autowork attempt's `session_id` (issue #248). Only supported for `summary`/`by_event_type`/`detail`, not `trend`.
 
 Live data (post-cutover runs) appears immediately with no migration needed. Pre-cutover history (tickets worked before issue #210 landed) requires running `tools/migrate_autowork_metrics.py` once against your own Qdrant instance (issue #209) — it is not automatic, and a fresh install has no history until either the migration runs or at least one post-cutover ticket is worked.

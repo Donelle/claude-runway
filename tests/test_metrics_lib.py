@@ -397,6 +397,174 @@ class SessionIdFilter(MetricsStoreTestCase):
         self.assertEqual(rows[0]["event_count"], 2)
 
 
+class Detail(MetricsStoreTestCase):
+    """Issue #249: detail() is the raw, per-event counterpart to summary()/
+    by_event_type()'s aggregates -- individual rows, most-recent first, with
+    metadata deserialized back into a dict. Deliberately generic (no
+    domain-specific field names), so these tests use plain/arbitrary
+    metadata rather than autowork's actual shape."""
+
+    def test_returns_rows_most_recent_first(self):
+        self.store.record("autowork", "x", value=1.0, event_timestamp="2026-09-01T00:00:00Z")
+        self.store.record("autowork", "x", value=1.0, event_timestamp="2026-09-03T00:00:00Z")
+        self.store.record("autowork", "x", value=1.0, event_timestamp="2026-09-02T00:00:00Z")
+        rows = self.store.detail("autowork", limit=10)
+        timestamps = [r["event_timestamp"] for r in rows]
+        self.assertEqual(
+            timestamps,
+            ["2026-09-03T00:00:00Z", "2026-09-02T00:00:00Z", "2026-09-01T00:00:00Z"],
+        )
+
+    def test_limit_caps_returned_rows(self):
+        for i in range(5):
+            self.store.record("autowork", "x", value=1.0, event_timestamp=f"2026-09-0{i + 1}T00:00:00Z")
+        rows = self.store.detail("autowork", limit=2)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["event_timestamp"], "2026-09-05T00:00:00Z")
+
+    def test_default_limit_is_twelve(self):
+        for i in range(15):
+            self.store.record("autowork", "x", value=1.0, event_timestamp=f"2026-09-{i + 1:02d}T00:00:00Z")
+        rows = self.store.detail("autowork")
+        self.assertEqual(len(rows), 12)
+
+    def test_metadata_is_deserialized_back_into_a_dict(self):
+        self.store.record("autowork", "ticket_merged", value=1.0, metadata={"model": "claude-sonnet-5", "rounds": 5})
+        rows = self.store.detail("autowork", limit=10)
+        self.assertEqual(rows[0]["metadata"], {"model": "claude-sonnet-5", "rounds": 5})
+
+    def test_row_with_no_metadata_reports_none(self):
+        self.store.record("autowork", "ticket_merged", value=1.0)
+        rows = self.store.detail("autowork", limit=10)
+        self.assertIsNone(rows[0]["metadata"])
+
+    def test_malformed_stored_metadata_degrades_to_none_not_a_raise(self):
+        # record() always writes valid JSON, so this simulates a row that
+        # somehow ended up with non-JSON metadata text (corruption, or a
+        # write from outside MetricsStore's own validation) -- detail()
+        # must not crash reading it back.
+        conn = sqlite3.connect(str(self._db_path))
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS metrics ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, metric_id TEXT NOT NULL, "
+            "event_type TEXT NOT NULL, value REAL NOT NULL, metadata TEXT, "
+            "event_timestamp TEXT NOT NULL, session_id TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO metrics (metric_id, event_type, value, metadata, event_timestamp) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("autowork", "x", 1.0, "{not valid json", "2026-09-01T00:00:00Z"),
+        )
+        conn.commit()
+        conn.close()
+        rows = self.store.detail("autowork", limit=10)
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0]["metadata"])
+
+    def test_session_id_narrows_to_matching_rows(self):
+        self.store.record("autowork", "ticket_merged", value=1.0, session_id="issue-249-100000")
+        self.store.record("autowork", "ticket_merged", value=1.0, session_id="issue-250-110000")
+        rows = self.store.detail("autowork", session_id="issue-249-100000", limit=10)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["session_id"], "issue-249-100000")
+
+    def test_unknown_session_id_returns_empty_list(self):
+        self.store.record("autowork", "ticket_merged", value=1.0, session_id="issue-249-100000")
+        self.assertEqual(self.store.detail("autowork", session_id="no-such-session"), [])
+
+    def test_omitting_session_id_keeps_unfiltered_behavior(self):
+        self.store.record("autowork", "ticket_merged", value=1.0, session_id="issue-249-100000")
+        self.store.record("autowork", "ticket_merged", value=1.0, session_id="issue-250-110000")
+        rows = self.store.detail("autowork", limit=10)
+        self.assertEqual(len(rows), 2)
+
+    def test_session_id_does_not_cross_metric_ids(self):
+        self.store.record("autowork", "x", value=1.0, session_id="shared-session")
+        self.store.record("memory-bank", "x", value=1.0, session_id="shared-session")
+        rows = self.store.detail("autowork", session_id="shared-session")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["event_type"], "x")
+
+    def test_empty_metric_id_returns_empty_list(self):
+        self.assertEqual(self.store.detail("no-such-metric"), [])
+
+    def test_same_second_ties_still_return_most_recently_inserted(self):
+        # Copilot review on PR #255: event_timestamp only has one-second
+        # resolution, so many events genuinely can tie (e.g. an autowork
+        # run's own log line). Ordering by event_timestamp alone doesn't
+        # guarantee newest-first among ties -- reproduced live before the
+        # id DESC tie-breaker was added: 15 same-second rows returned the
+        # OLDEST 12, not the newest.
+        for i in range(15):
+            self.store.record("autowork", "x", value=1.0, event_timestamp="2026-09-25T12:00:00Z", session_id=f"row-{i}")
+        rows = self.store.detail("autowork", limit=12)
+        returned = [r["session_id"] for r in rows]
+        self.assertEqual(returned, [f"row-{i}" for i in range(14, 2, -1)])
+
+    def test_negative_limit_raises_rather_than_returning_unbounded_history(self):
+        # Copilot review on PR #255: detail() is public library API, not
+        # gated solely behind get_metrics's own n-must-be-positive check.
+        # SQLite treats a negative LIMIT as "no limit" -- confirmed live
+        # before this validation existed: limit=-1 against 50 inserted rows
+        # returned all 50, not zero/an error.
+        self.store.record("autowork", "x", value=1.0)
+        with self.assertRaises(ValueError):
+            self.store.detail("autowork", limit=-1)
+
+    def test_zero_limit_raises(self):
+        self.store.record("autowork", "x", value=1.0)
+        with self.assertRaises(ValueError):
+            self.store.detail("autowork", limit=0)
+
+    def test_non_finite_nested_metadata_value_degrades_to_none(self):
+        # Copilot review on PR #255: record()'s own math.isfinite() guard
+        # only covers the top-level `value` param, not numbers nested inside
+        # `metadata` -- a non-finite float there round-trips through
+        # json.loads()/json.dumps() unchanged (both lenient about NaN/
+        # Infinity by default), and format_json() would then emit invalid
+        # JSON (bare NaN, not valid per RFC 8259). Reproduced live before
+        # this check existed.
+        self.store.record("autowork", "x", value=1.0, metadata={"wall_clock_s": float("nan"), "rounds": 5})
+        rows = self.store.detail("autowork", limit=10)
+        self.assertIsNone(rows[0]["metadata"])
+
+    def test_non_finite_nested_in_a_list_also_degrades_to_none(self):
+        self.store.record("autowork", "x", value=1.0, metadata={"samples": [1.0, float("inf"), 3.0]})
+        rows = self.store.detail("autowork", limit=10)
+        self.assertIsNone(rows[0]["metadata"])
+
+    def test_ordinary_finite_metadata_is_unaffected(self):
+        self.store.record("autowork", "x", value=1.0, metadata={"wall_clock_s": 12.5, "rounds": 5})
+        rows = self.store.detail("autowork", limit=10)
+        self.assertEqual(rows[0]["metadata"], {"wall_clock_s": 12.5, "rounds": 5})
+
+    def test_non_dict_json_metadata_degrades_to_none(self):
+        # Copilot review on PR #255: json.loads() succeeding only proves the
+        # stored text is valid JSON, not that it decodes to an object -- a
+        # list or scalar is equally valid JSON. Reproduced live: a stored
+        # list metadata value crashed format_detail_view() (which calls
+        # .items() unconditionally) before this check existed.
+        conn = sqlite3.connect(str(self._db_path))
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS metrics ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, metric_id TEXT NOT NULL, "
+            "event_type TEXT NOT NULL, value REAL NOT NULL, metadata TEXT, "
+            "event_timestamp TEXT NOT NULL, session_id TEXT)"
+        )
+        for metadata_text in ("[1, 2, 3]", '"just a string"', "42"):
+            conn.execute(
+                "INSERT INTO metrics (metric_id, event_type, value, metadata, event_timestamp) "
+                "VALUES (?, ?, ?, ?, ?)",
+                ("autowork", "x", 1.0, metadata_text, "2026-09-01T00:00:00Z"),
+            )
+        conn.commit()
+        conn.close()
+        rows = self.store.detail("autowork", limit=10)
+        self.assertEqual(len(rows), 3)
+        for row in rows:
+            self.assertIsNone(row["metadata"])
+
+
 class Trend(MetricsStoreTestCase):
     """Mirrors test_savings_ledger.py's QueryTrend test suite -- same
     bucketing semantics (ISO week via datetime.isocalendar(), day via the
@@ -615,6 +783,37 @@ class FormattingHelpers(unittest.TestCase):
             {"bucket": "2026-W37", "event_count": 2, "total_value": 3.0},
         ], bucket="week")
         self.assertIn("2026-W37", text)
+
+    def test_format_detail_view_empty(self):
+        text = M.format_detail_view("autowork", [])
+        self.assertIn("No events recorded yet", text)
+
+    def test_format_detail_view_empty_with_session_id_names_the_session(self):
+        text = M.format_detail_view("autowork", [], session_id="issue-249-999999")
+        self.assertIn("issue-249-999999", text)
+        self.assertNotIn("No events recorded yet for this metric_id.", text)
+
+    def test_format_detail_view_renders_metadata_fields(self):
+        text = M.format_detail_view("autowork", [
+            {
+                "event_type": "ticket_merged",
+                "value": 1.0,
+                "metadata": {"model": "claude-sonnet-5", "rounds": 5, "findings": [{"category": "docs"}]},
+                "event_timestamp": "2026-09-25T21:34:00Z",
+                "session_id": "issue-249-213400",
+            },
+        ])
+        self.assertIn("ticket_merged", text)
+        self.assertIn("model: claude-sonnet-5", text)
+        self.assertIn("rounds: 5", text)
+        self.assertIn('"category": "docs"', text)
+        self.assertIn("issue-249-213400", text)
+
+    def test_format_detail_view_row_with_no_metadata_still_renders(self):
+        text = M.format_detail_view("autowork", [
+            {"event_type": "x", "value": 1.0, "metadata": None, "event_timestamp": "2026-09-25T00:00:00Z", "session_id": None},
+        ])
+        self.assertIn("x", text)
 
     def test_format_json_roundtrips(self):
         raw = M.format_json("summary", {"metric_id": "autowork", "event_count": 1, "total_value": 1.0})
