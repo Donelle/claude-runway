@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Tests for .claude/skills/my-gh-autowork/SKILL.md -- issue #195's documentation of
+"""Tests for .claude/skills/my-gh-autowork/SKILL.md -- the documentation of
 the server-side auto mode classifier that can block the orchestrator's own `Agent`
 call, independent of `.claude/settings.json`.
 
 The skill is a markdown document of prose instructions, not a Python module, so this
 mirrors tests/test_my_resume_skill.py's content-pinning strategy: assert the key
-strings introduced for issue #195 remain present, so a future edit that removes or
+strings introduced for the classifier caveat remain present, so a future edit that removes or
 waters down the caveat/preflight check gets an explicit failure here instead of a
 silent regression. The Step 0 preflight check's actual `jq` regex is also exercised
 directly against representative settings.json shapes, so the check's logic is
@@ -23,7 +23,6 @@ import unittest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SKILL_PATH = os.path.join(REPO_ROOT, ".claude", "skills", "my-gh-autowork", "SKILL.md")
-README_PATH = os.path.join(REPO_ROOT, "README.md")
 SETTINGS_TEMPLATE_PATH = os.path.join(REPO_ROOT, "templates", "settings.json.template")
 
 # Mirrors the regex embedded in SKILL.md's Step 0 preflight check:
@@ -52,14 +51,11 @@ class SkillFileExists(unittest.TestCase):
 
 
 class SkillContentRequirements(unittest.TestCase):
-    """Pin the key content added for issue #195 in SKILL.md's text."""
+    """Pin the key content added for the auto mode classifier in SKILL.md's text."""
 
     def setUp(self):
         with open(SKILL_PATH, encoding="utf-8") as f:
             self.content = f.read()
-
-    def test_references_issue_195(self):
-        self.assertIn("#195", self.content)
 
     def test_mentions_auto_mode_classifier(self):
         self.assertIn("auto mode classifier", self.content.lower())
@@ -68,7 +64,7 @@ class SkillContentRequirements(unittest.TestCase):
         # The caveat must sit near the original claim, not be buried elsewhere,
         # so a reader of the opening claim actually sees the qualification.
         idx_claim = self.content.find("Zero required human touchpoints")
-        idx_caveat = self.content.find("Caveat (issue #195)")
+        idx_caveat = self.content.find("Caveat: this claim")
         self.assertNotEqual(idx_claim, -1, "original claim text must still exist")
         self.assertNotEqual(idx_caveat, -1, "caveat must exist")
         self.assertLess(
@@ -107,51 +103,10 @@ class SkillContentRequirements(unittest.TestCase):
         self.assertIn("arbitrary-command-execution bypass", self.content)
 
     def test_confirms_only_the_specific_narrow_rules(self):
-        # The actually-confirmed workaround from issue #195 -- these exact four
+        # The actually-confirmed workaround -- these exact four
         # rules, not a generalization of them.
         for rule in ["git fetch *", "git push *", "gh pr *", "gh api *"]:
             self.assertIn(rule, self.content)
-
-
-class ReadmeContentRequirements(unittest.TestCase):
-    """Pin the new Known limitations bullet for issue #195."""
-
-    def setUp(self):
-        with open(README_PATH, encoding="utf-8") as f:
-            self.content = f.read()
-
-    def test_readme_documents_issue_195(self):
-        self.assertIn("#195", self.content)
-        self.assertIn("auto mode classifier", self.content.lower())
-
-    def test_bullet_lives_under_known_limitations(self):
-        known_limitations_idx = self.content.find("## Known limitations")
-        # Upstream searches for the "issues/195" URL; this repo's README carries no
-        # issue-URL links (they pointed at the upstream org's tracker), so pin the
-        # plain "#195" reference instead.
-        issue_195_idx = self.content.find("#195")
-        self.assertNotEqual(known_limitations_idx, -1)
-        self.assertNotEqual(issue_195_idx, -1)
-        self.assertGreater(
-            issue_195_idx,
-            known_limitations_idx,
-            "issue #195 bullet must be under the Known limitations heading",
-        )
-
-    def test_warns_against_wildcard_permissions(self):
-        # Same Copilot-review-driven requirement as the SKILL.md check above --
-        # README's own account of the workaround must not present the broad
-        # wildcard as something that was confirmed or is safe to add.
-        self.assertIn("arbitrary-command-execution", self.content.lower())
-        self.assertIn("git -c alias", self.content)
-
-    def test_narrow_rules_not_presented_as_absolutely_safe(self):
-        # Copilot review round 3 on PR #196: even the confirmed narrow rules still
-        # permit code execution through legitimate flags (git fetch/push transport
-        # options, `python -c`) -- the doc must not imply per-subcommand scoping is
-        # a hard security boundary, only that it reduces exposed surface.
-        self.assertIn("upload-pack", self.content)
-        self.assertIn("not the same as safe", self.content.lower())
 
 
 class SettingsTemplateContentRequirements(unittest.TestCase):
@@ -164,9 +119,6 @@ class SettingsTemplateContentRequirements(unittest.TestCase):
     def test_has_permissions_note(self):
         self.assertIn("_permissions_note", self.content)
 
-    def test_permissions_note_mentions_issue_195(self):
-        self.assertIn("#195", self.content)
-
     def test_permissions_note_warns_against_wildcards(self):
         self.assertIn("arbitrary-command-execution bypass", self.content)
         self.assertIn("git -c alias", self.content)
@@ -174,18 +126,25 @@ class SettingsTemplateContentRequirements(unittest.TestCase):
     def test_permissions_note_prefers_project_scope(self):
         self.assertIn("PREFERRED", self.content)
 
+    def test_permissions_note_does_not_present_narrow_rules_as_safe(self):
+        # Even the narrow per-subcommand rules still permit code execution through
+        # legitimate flags (git fetch --upload-pack, python -c); the note must not
+        # imply per-subcommand scoping is a security boundary.
+        self.assertIn("means SAFE in an absolute sense", self.content)
+
     def test_permissions_note_quotes_confirmed_rules_exactly(self):
-        # Copilot review round 3 on PR #196: this note previously restated issue
-        # #195's confirmed rules in colon syntax ('Bash(git fetch:*)') instead of
-        # quoting them exactly as the issue itself did (space before the wildcard).
-        # The "confirmed-to-work" claim must use the issue's own literal quote.
+        # An earlier review round found this note restating the confirmed rules in
+        # colon syntax ('Bash(git fetch:*)') instead of quoting them exactly as the
+        # original report did (space before the wildcard). The "confirmed-to-work"
+        # claim must use the original report's own literal quote.
         for rule in ["git fetch *", "git push *", "gh pr *", "gh api *"]:
             self.assertIn(rule, self.content)
 
     def test_permissions_note_does_not_overclaim_narrow_safety(self):
-        # Same finding as ReadmeContentRequirements.
-        # test_narrow_rules_not_presented_as_absolutely_safe -- the template note
-        # is actually where the fullest account of this lives.
+        # The template note is where the fullest account of the code-execution
+        # caveat lives, so it must carry it itself: even narrow per-subcommand
+        # rules still permit arbitrary commands (e.g. git fetch --upload-pack), and
+        # autonomous development inherently needs code-execution authority.
         self.assertIn("upload-pack", self.content)
         self.assertIn("code-execution authority", self.content.lower())
 

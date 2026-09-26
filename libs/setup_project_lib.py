@@ -3,7 +3,7 @@ Shared, dependency-free logic behind `tools/setup_project.py` -- computing
 defaults and patching `templates/mcp.json.template` /
 `templates/settings.json.template` into a real, ready-to-use `.mcp.json` /
 `.claude/settings.json` for a target project repo, instead of the manual
-copy-and-hand-edit flow README's Installation steps 4/4b/5 otherwise require
+copy-and-hand-edit flow `docs/installation.md`'s steps 4/4b/5 otherwise require
 (issue #48). Kept separate from `tools/setup_project.py` (the thin CLI) the
 same way `qdrant_ingest_lib.py`/`local_compress_lib.py` are kept separate
 from their own CLI/MCP-server callers -- pure functions here are what make
@@ -14,8 +14,8 @@ Deliberately patches KNOWN fields structurally (dict/list traversal) rather
 than doing a blind string find-and-replace of the placeholder tokens over
 the raw template text. This matters for one field specifically:
 `mcp.json.template`'s `qdrant` server has `"command":
-"REPLACE-WITH-VENV-PYTHON/bin/mcp-server-qdrant"`, but README's own
-Installation step 3 instructs substituting `REPLACE-WITH-VENV-PYTHON`
+"REPLACE-WITH-VENV-PYTHON/bin/mcp-server-qdrant"`, but `docs/installation.md`'s own
+step 3 instructs substituting `REPLACE-WITH-VENV-PYTHON`
 everywhere with the *full python interpreter path* (e.g.
 `.../.venv/bin/python`). Doing that literal substitution on this one field
 produces a broken, doubled path: `.../.venv/bin/python/bin/mcp-server-qdrant`
@@ -72,7 +72,7 @@ def default_collection_name(repo_path: Path) -> str:
 def venv_python_path(tools_repo_dir: Path, *, windows: bool = False) -> Path:
     """
     Deterministic path to the tools-repo's OWN venv python interpreter,
-    matching the layout README's Installation step 3 creates
+    matching the layout `docs/installation.md`'s step 3 creates
     (`uv venv --python 3.12` at the tools-repo root). Takes `windows`
     as an explicit parameter rather than reading `os.name`/`sys.platform`
     directly so this stays a pure function callers (including tests) can

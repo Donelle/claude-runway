@@ -9,7 +9,7 @@ description = "Local-compute token savings for Claude Code: Qdrant codebase memo
 readme = "README.md"
 license = { text = "MIT" }
 # Policy minimums are 3.12 (Qdrant piece) / 3.11 (local-compress piece) --
-# see README's "Prerequisites" section -- but the dependency chain itself
+# see docs/prerequisites.md -- but the dependency chain itself
 # only needs 3.10, and that's the honest floor for a packaging manifest
 # whose whole point is "works wherever pip/pipx/uvx can resolve it".
 requires-python = ">=3.10"
@@ -76,7 +76,7 @@ dependencies = [
 # specifically, by ordinary PATH-resolved commands pipx/`uv tool install`
 # put on your PATH persistently (PR #136 review, Copilot: a bare `uvx` does
 # NOT do this -- it's a cache-backed, effectively ephemeral single-command
-# run; see README's "Alternative" callout for the full distinction). The
+# run; see docs/installation.md's "Alternative" callout for the full distinction). The
 # MCP servers (ingest_mcp_server.py/compress_mcp_server.py/
 # memory_bank_mcp_server.py -- the last one added later, issue #175, same
 # reasoning applies) aren't included here -- this package declares no
