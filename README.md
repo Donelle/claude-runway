@@ -11,7 +11,7 @@ Each piece works independently — you don't need LM Studio to use the Qdrant me
 
 ## Table of contents
 
-- [Files (38)](#files-38)
+- [Files (39)](#files-39)
 - [Prerequisites](docs/prerequisites.md)
   - [Windows GPU setup for LM Studio](docs/windows-setup.md)
 - [Installation](docs/installation.md)
@@ -29,7 +29,7 @@ Each piece works independently — you don't need LM Studio to use the Qdrant me
 - [EVALUATION.md](EVALUATION.md) — measuring whether this actually reduces token usage
 - [Known limitations](#known-limitations)
 
-## Files (38)
+## Files (39)
 
 | File                              | Purpose                                                                                                                                                                                                                   |
 | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -42,6 +42,7 @@ Each piece works independently — you don't need LM Studio to use the Qdrant me
 | `libs/mcp_tool_introspect.py`     | Live introspection of a server's `@mcp.tool()` functions, so tool counts and schema-token estimates are read from the code instead of hand-typed into docs (issues #22/#23/#52). Shared by the startup overhead log, `tools/report_tool_counts.py`, and the savings tracker's "Tool overhead" line. |
 | `tools/report_tool_counts.py`     | CLI: `python tools/report_tool_counts.py` prints the live tool count and estimated schema-token cost for `local-compress`, `codebase-indexer`, `memory-bank` and the standalone `qdrant` server. This is the number `EVALUATION.md`'s Steps A4/B4/E4 refer to; exits non-zero if a server's tools can't be constructed or enumerated, so it doubles as a CI smoke check. |
 | `libs/qdrant_ingest_lib.py`       | Shared, dependency-free chunking logic. `.md`/`.mdx` chunk by heading. Curly-brace languages (`.cs`, `.ts`/`.tsx`, `.js`/`.jsx`, `.java`, `.go`, `.c`/`.h`/`.cpp`/`.hpp`, `.php`, `.swift`, `.kt`, `.scala`, `.rs`) and `.py` chunk boundary-aware — a lightweight brace/bracket-depth heuristic nudges each chunk's cut to the nearest safe function/class boundary instead of an arbitrary fixed line count, falling back to a fixed-line cut when no boundary exists nearby. Every other code extension (`.rb`, `.sql`, `.sh`, `.yaml`/`.yml`, `.json`) and non-markdown docs (`.txt`/`.rst`, since `#` there means "comment", not "heading") still chunk by fixed line windows. Used by both files below — keeps them from drifting apart. |
+| `libs/upgrade_lib.py`             | Shared logic behind `tools/setup_project.py upgrade` — a config-migration tool for an ALREADY-configured project: unlike `init` (above), which resets every toolkit-owned setting to whatever flags that run passes, `upgrade` compares the target's current `.mcp.json`/`.claude/settings.json` against a fixed, ordered list of named, individually-detectable config gaps (`MIGRATIONS`), tells the user about each pending one, and applies only the ones they approve (every pending one with `--auto-yes`; `--dry-run` previews with nothing written). Each `Migration`'s own `detect` is the sole source of truth for whether it still applies, so re-running is always safe. Ships 3 migrations covering gaps from #175 (memory-bank server), #198 (`record_session_id.py` hooks), and #221 (`HF_HUB_OFFLINE`). |
 | `tools/ingest_to_qdrant.py`       | Standalone CLI script for one-off/manual full indexing. Prints progress to the terminal; use this for the first big index of a repo.                                                                                      |
 | `tools/ingest_mcp_server.py`      | MCP server exposing `index_repo`, `sync_repo`, `preview_index`, `get_collection_info`, `find_in_collection`, and `list_collections` as tools Claude can call directly. `find_in_collection`/`list_collections` let a session in one project search a DIFFERENT already-indexed repo's collection by exact name — e.g. searching a backend repo's collection from a frontend repo's session — since `qdrant-find` itself is locked to this project's own collection (see [Cross-repo lookups](docs/cross-repo-lookups.md)). `index_repo`/`sync_repo` refuse outright if pointed at the shared memory-bank collection, and their reset/delete paths always preserve memory-bank points (issue #175). |
 | `libs/qdrant_model_check.py`      | Shared embedding-model mismatch check used by `find_in_collection`, `index_repo`, `sync_repo` (all above), and `memory_bank_lib.py` (below) — relocated out of `ingest_mcp_server.py` (issue #175) so callers can't drift apart. Fails open on a network error/inconclusive shape by default; returns a loud, actionable error only on a definitive schema-level mismatch. `index_repo(reset=True)`'s and `sync_repo`'s pre-delete checks opt into `fail_closed=True` instead, since an inconclusive result there must block a destructive delete, not silently permit it. |

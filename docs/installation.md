@@ -207,6 +207,14 @@ python tools/setup_project.py init /path/to/target-repo --install-skills
 python tools/setup_project.py init --install-skills   # skills only
 ```
 
+**Already configured this project before and just want to pick up a new feature a recent release added, without re-running `init` and re-specifying every option you originally set?** Use `upgrade` instead (issue #225): it compares this project's current `.mcp.json`/`.claude/settings.json` against a fixed list of specific, named config gaps this toolkit knows how to fill (e.g. the `memory-bank` server, `record_session_id.py`'s hooks, `HF_HUB_OFFLINE`), tells you about each one it finds still missing, and applies only the ones you approve — leaving everything else (including anything `init` would otherwise reset back to its own defaults/flags) untouched. Safe to run repeatedly: once a migration is applied, it no longer shows up as pending.
+
+```bash
+python tools/setup_project.py upgrade /path/to/target-repo             # interactive: prompts per pending migration
+python tools/setup_project.py upgrade /path/to/target-repo --dry-run   # preview only, writes nothing
+python tools/setup_project.py upgrade /path/to/target-repo --auto-yes  # apply every pending migration, no prompts (scripting/CI)
+```
+
 **If you pass `--qdrant-api-key`**, the real key is written in plaintext into `.mcp.json` (never echoed back in `--dry-run`'s preview or the printed follow-up command, which are both redacted/placeholdered instead) — the script prints a warning reminding you NOT to commit `.mcp.json` as-is in that case, replacing the usual "commit it" instruction. There's no built-in mechanism here for keeping the key out of a committed `.mcp.json`; either gitignore `.mcp.json` for that project or manage the key through your own separate process.
 
 The manual steps below still apply if you'd rather hand-edit (or need to understand exactly what the script does / verify its output):

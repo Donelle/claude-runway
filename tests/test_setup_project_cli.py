@@ -850,5 +850,122 @@ class InstallSkillsFlag(unittest.TestCase):
         self.assertTrue(parsed.install_skills)
 
 
+class UpgradeSubcommand(unittest.TestCase):
+    """`upgrade` (issue #225): argument parsing, and cmd_upgrade delegating
+    to upgrade_lib.run_upgrade with the same venv-python resolution cmd_init
+    already uses (_pip_installed_venv_python(), falling back to
+    setup_project_lib.venv_python_path for the documented clone workflow)."""
+
+    def setUp(self):
+        self.mod = _load_setup_project()
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.target_repo = Path(self._tmpdir.name) / "my-project"
+        self.target_repo.mkdir()
+        # is_project_configured (Copilot review, PR #227) now gates
+        # cmd_upgrade before it ever calls run_upgrade -- give this fixture
+        # a minimal, already-configured .mcp.json (a 'qdrant' server block
+        # is the only thing that check looks for) so tests that mock
+        # run_upgrade directly still reach it. test_nonexistent_target_repo_
+        # errors_out and test_unconfigured_target_repo_errors_out below
+        # cover the two refusal paths themselves.
+        (self.target_repo / ".mcp.json").write_text(
+            json.dumps({"mcpServers": {"qdrant": {}}}), encoding="utf-8"
+        )
+
+    def test_parse_args_requires_target_repo(self):
+        with mock.patch.object(sys, "argv", ["setup_project.py", "upgrade"]):
+            with self.assertRaises(SystemExit) as ctx:
+                self.mod.parse_args()
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_parse_args_defaults(self):
+        with mock.patch.object(sys, "argv", ["setup_project.py", "upgrade", str(self.target_repo)]):
+            parsed = self.mod.parse_args()
+        self.assertEqual(parsed.target_repo, str(self.target_repo))
+        self.assertFalse(parsed.dry_run)
+        self.assertFalse(parsed.auto_yes)
+        self.assertIs(parsed.func, self.mod.cmd_upgrade)
+
+    def test_parse_args_accepts_dry_run_and_auto_yes(self):
+        with mock.patch.object(
+            sys, "argv", ["setup_project.py", "upgrade", str(self.target_repo), "--dry-run", "--auto-yes"]
+        ):
+            parsed = self.mod.parse_args()
+        self.assertTrue(parsed.dry_run)
+        self.assertTrue(parsed.auto_yes)
+
+    def test_nonexistent_target_repo_errors_out(self):
+        args = argparse.Namespace(
+            target_repo=str(self.target_repo / "does-not-exist"), dry_run=False, auto_yes=True
+        )
+        with self.assertRaises(SystemExit) as ctx:
+            self.mod.cmd_upgrade(args)
+        self.assertEqual(ctx.exception.code, 1)
+
+    def test_unconfigured_target_repo_errors_out(self):
+        # Regression for the finding from Copilot review on PR #227: a real,
+        # existing directory that was simply never `init`'d (no .mcp.json,
+        # or one with no 'qdrant' server) must be refused with a clear error
+        # and exit code, not silently write a broken partial config.
+        unconfigured = Path(self._tmpdir.name) / "never-init-run"
+        unconfigured.mkdir()
+        args = argparse.Namespace(target_repo=str(unconfigured), dry_run=False, auto_yes=True)
+        with self.assertRaises(SystemExit) as ctx:
+            self.mod.cmd_upgrade(args)
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertFalse((unconfigured / ".mcp.json").exists())
+
+    def test_delegates_to_run_upgrade_with_resolved_venv_python(self):
+        # Explicitly mock _pip_installed_venv_python's None case (the
+        # documented clone workflow) rather than relying on this test
+        # environment's own ambient TOOLS_REPO_DIR/.venv -- confirmed live
+        # that CI's own runner (tests/test_setup_project_cli.py's other
+        # PipInstalledLayoutReminder tests already follow this same pattern)
+        # has no such directory at all, since its own workflow installs
+        # dependencies with a plain `pip install` into the runner's system
+        # Python rather than this repo's Step-15-documented `uv venv`
+        # bootstrap -- asserting on the real, ambient value broke this test
+        # in CI while passing locally.
+        captured = {}
+
+        def _fake_run_upgrade(target_repo, tools_repo_dir, venv_python, *, auto_yes, dry_run):
+            captured.update(
+                target_repo=target_repo, tools_repo_dir=tools_repo_dir, venv_python=venv_python,
+                auto_yes=auto_yes, dry_run=dry_run,
+            )
+            return []
+
+        args = argparse.Namespace(target_repo=str(self.target_repo), dry_run=True, auto_yes=False)
+        with mock.patch.object(self.mod, "_pip_installed_venv_python", return_value=None), \
+             mock.patch.object(self.mod, "run_upgrade", side_effect=_fake_run_upgrade):
+            self.mod.cmd_upgrade(args)
+
+        self.assertEqual(captured["target_repo"], self.target_repo.resolve())
+        self.assertEqual(captured["tools_repo_dir"], self.mod.TOOLS_REPO_DIR)
+        self.assertTrue(captured["dry_run"])
+        self.assertFalse(captured["auto_yes"])
+        # None (the clone workflow) must fall back to
+        # setup_project_lib.venv_python_path -- the same default run_setup
+        # itself would use for `init`.
+        expected = self.mod.venv_python_path(self.mod.TOOLS_REPO_DIR, windows=(os.name == "nt"))
+        self.assertEqual(captured["venv_python"], expected)
+
+    def test_pip_installed_layout_passes_sys_executable_through(self):
+        fake_python = Path("/opt/pipx/venvs/claude-runway/bin/python")
+        captured = {}
+
+        def _fake_run_upgrade(target_repo, tools_repo_dir, venv_python, *, auto_yes, dry_run):
+            captured["venv_python"] = venv_python
+            return []
+
+        args = argparse.Namespace(target_repo=str(self.target_repo), dry_run=False, auto_yes=True)
+        with mock.patch.object(self.mod, "_pip_installed_venv_python", return_value=fake_python), \
+             mock.patch.object(self.mod, "run_upgrade", side_effect=_fake_run_upgrade):
+            self.mod.cmd_upgrade(args)
+
+        self.assertEqual(captured["venv_python"], fake_python)
+
+
 if __name__ == "__main__":
     unittest.main()

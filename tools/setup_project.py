@@ -17,6 +17,17 @@ Usage:
     python tools/setup_project.py init /path/to/target-repo --install-skills
     python tools/setup_project.py init --install-skills   # skills only, no target_repo (issue #205)
 
+    python tools/setup_project.py upgrade /path/to/target-repo             # apply pending config migrations
+    python tools/setup_project.py upgrade /path/to/target-repo --dry-run
+    python tools/setup_project.py upgrade /path/to/target-repo --auto-yes
+
+`upgrade` (issue #225) is for an ALREADY-configured project: unlike `init`,
+which resets every toolkit-owned setting to whatever this run's flags/
+defaults are, `upgrade` compares the target's current `.mcp.json`/
+`.claude/settings.json` against a fixed set of named, individually
+detectable config gaps (see `libs/upgrade_lib.py`) and applies only the ones
+the user approves, leaving everything else untouched.
+
 The templates stay the single source of truth: this script loads and
 patches them (see libs/setup_project_lib.py) rather than duplicating their
 content, so future template changes flow through to new setups automatically.
@@ -42,7 +53,8 @@ from typing import Optional
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "libs"))
 
-from setup_project_lib import default_skills_dir, plan_skill_installs, run_setup  # noqa: E402
+from setup_project_lib import default_skills_dir, plan_skill_installs, run_setup, venv_python_path  # noqa: E402
+from upgrade_lib import is_project_configured, run_upgrade  # noqa: E402
 
 TOOLS_REPO_DIR = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -505,6 +517,57 @@ def cmd_init(args: argparse.Namespace) -> None:
         _report_and_apply_skill_plan(plan_skill_installs(TOOLS_REPO_DIR, skills_dir), dry_run=False)
 
 
+def cmd_upgrade(args: argparse.Namespace) -> None:
+    """
+    Structured like `cmd_init`: validate `target_repo` exists, compute the
+    same `venv_python_override = _pip_installed_venv_python()` value
+    `cmd_init` already relies on, then delegate to `upgrade_lib.run_upgrade`
+    -- which owns the actual migration-detection/prompting/writing and its
+    own printed output (see that function's docstring for why). Unlike
+    `cmd_init`'s `run_setup`, `run_upgrade` needs a concrete `venv_python`
+    (not `None`-meaning-"use your own pure default"), so the `None` case
+    from `_pip_installed_venv_python()` (the documented clone workflow) is
+    resolved here via `venv_python_path` -- the exact same fallback
+    `run_setup` performs internally for `init`.
+
+    Also checks `upgrade_lib.is_project_configured` up front, exiting with a
+    clear error/exit code 1 if `target_repo` has no existing toolkit
+    `.mcp.json` at all -- `upgrade` is only for an ALREADY-configured
+    project (a brand-new one needs `init` first). Found in Copilot review
+    on PR #227 and confirmed live: without this check, `run_upgrade` treated
+    a missing/empty `.mcp.json` the same as `{}`, so every migration's
+    `detect` fired unconditionally and wrote a BROKEN partial config (a
+    `qdrant` server block with no `command`/`type` at all) for a directory
+    that was never `init`'d. `run_upgrade` itself carries the same guard
+    (see its own docstring) for a caller that invokes it directly, bypassing
+    this CLI -- this earlier check exists purely so `cmd_upgrade` gets a
+    clean, distinguishable exit code instead of a silent empty result.
+    """
+    target_repo = Path(args.target_repo).resolve()
+    if not target_repo.is_dir():
+        print(f"error: target repo path does not exist or is not a directory: {target_repo}", file=sys.stderr)
+        sys.exit(1)
+    if not is_project_configured(target_repo):
+        print(
+            f"error: {target_repo} has no existing toolkit configuration (.mcp.json with a 'qdrant' "
+            "server) -- `upgrade` only applies migrations to an ALREADY-configured project. Run "
+            "`init` first, then `upgrade` to pick up anything released since.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    venv_python_override = _pip_installed_venv_python()
+    resolved_venv_python = venv_python_override or venv_python_path(TOOLS_REPO_DIR, windows=(os.name == "nt"))
+
+    run_upgrade(
+        target_repo,
+        TOOLS_REPO_DIR,
+        resolved_venv_python,
+        auto_yes=args.auto_yes,
+        dry_run=args.dry_run,
+    )
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="command", required=True)
@@ -631,6 +694,26 @@ def parse_args() -> argparse.Namespace:
     )
     init.add_argument("--dry-run", action="store_true", help="Print what would be written without writing")
     init.set_defaults(func=cmd_init)
+
+    # Issue #225: a config-migration tool for an ALREADY-configured project --
+    # unlike `init`, which resets every toolkit-owned setting to this run's
+    # flags/defaults, `upgrade` compares the target's current .mcp.json/
+    # .claude/settings.json against a fixed set of named, individually
+    # detectable gaps (libs/upgrade_lib.py's MIGRATIONS) and applies only the
+    # ones the user approves. No feature-selection flags (--qdrant-only,
+    # --lmstudio-model, etc.) -- migrations are self-contained and derive
+    # everything they need from the existing config or the template.
+    upgrade = sub.add_parser(
+        "upgrade", help="Apply pending config migrations to an already-configured project"
+    )
+    upgrade.add_argument("target_repo", help="Path to the already-configured project repo to migrate")
+    upgrade.add_argument(
+        "--dry-run", action="store_true", help="Print pending migrations without writing anything"
+    )
+    upgrade.add_argument(
+        "--auto-yes", action="store_true", help="Apply every pending migration without prompting (for scripting/CI)"
+    )
+    upgrade.set_defaults(func=cmd_upgrade)
 
     parsed = p.parse_args()
     # target_repo is nargs="?" specifically to allow skills-only mode
