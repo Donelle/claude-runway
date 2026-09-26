@@ -11,7 +11,7 @@ Four strategies exist:
 | Type | Strategy        | Mechanism                                                                                                  | Needs a hook? | Real ID? | Risk |
 |------|-----------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------|----------|------|
 | 1    | HOOK_PAYLOAD    | Claude Code hands every hook `session_id`/`transcript_path` directly on stdin -- trivial extraction.        | Yes (hook only) | Yes -- authoritative | None |
-| 2    | SHADOW_FILE     | `hooks/record_session_id.py` writes a small presence marker (`session_<id>.jsonl`) into the sessions directory `savings_ledger.py` also uses (own filename prefix, no shared format); an MCP tool call scans for the most-recently-modified marker, optionally filtered by project. | Yes (recoverable elsewhere) | Yes, recovered from what the hook wrote | Only available where the hook ran |
+| 2    | SHADOW_FILE     | `hooks/record_session_id.py` writes a small presence marker (`session_<id>.jsonl`) into the sessions directory `savings_ledger.py` also uses (own filename prefix, no shared format); an MCP tool call scans for the most-recently-modified marker, optionally filtered by project. | Conditionally No — swept-marker fallback (PR #254) reaches TRANSCRIPT_SCAN only if the sessions directory exists; stale-marker fallback (PR #252) additionally requires a prior hook run to have written the marker | Yes — hook marker on primary path; TRANSCRIPT_SCAN result on fallback paths | Primary path: hook required. Stale-marker fallback: TRANSCRIPT_SCAN layout risk only (cwd-independent; uses marker's recorded path). Swept-marker fallback: cwd-sensitive + TRANSCRIPT_SCAN layout risk. |
 | 3    | TRANSCRIPT_SCAN | Claude Code itself continuously writes `~/.claude/projects/<slug>/<session-id>.jsonl` for every session, hook or no hook. `<slug>` is the project's absolute path with every `/` replaced by `-`. Picks the most-recently-modified file's stem. | No | Yes -- zero hook dependency | Depends on an undocumented, empirically-observed internal convention (macOS-verified only) |
 | 4    | PROXY           | One `uuid.uuid4().hex` generated once per process and cached, reused for every event that process logs.     | No | No -- proxy, spans the whole process | None -- pure in-memory |
 
@@ -77,9 +77,9 @@ Cleanup (two layers, both driven by `hooks/record_session_id.py`):
     the default from 48h to 168h to shrink this window, but didn't
     eliminate it -- a session outliving 168h with no such event is still
     exposed; the more complete fix
-    (falling back to TRANSCRIPT_SCAN when SHADOW_FILE is stale) is tracked
-    separately as issue #236 (#233 originally miscited #213/#214 for this --
-    both are closed, unrelated dedup tickets; corrected on PR #235 review).
+    (falling back to TRANSCRIPT_SCAN when SHADOW_FILE is stale or its
+    markers are fully swept) shipped in PR #252 (stale-marker fallback)
+    and PR #254 (swept-marker fallback).
 """
 
 from __future__ import annotations
@@ -307,9 +307,12 @@ def _session_id_from_shadow_file(
     reduced to `Path(marker_project).name` before comparing, so only a bare
     name is ever actually compared against. `project` is therefore accepted
     AS GIVEN -- a bare name like `"claude-runway"` -- with no
-    `os.path.isabs` requirement (contrast with TRANSCRIPT_SCAN/
-    `_resolve_project`, which genuinely need a real absolute path to derive
-    Claude Code's own `<slug>` directory name).
+    `os.path.isabs` requirement for the primary scan (contrast with
+    TRANSCRIPT_SCAN/`_resolve_project`, which genuinely need a real
+    absolute path to derive Claude Code's own `<slug>` directory name;
+    the swept-marker fallback below passes `os.getcwd()` to TRANSCRIPT_SCAN
+    internally, but that path comes from the environment, not from
+    `project`).
 
     Passing `None` does NOT mean "no filter" here -- a marker's basename
     can never equal `None`, so an omitted `project` always returns `None`
@@ -319,14 +322,13 @@ def _session_id_from_shadow_file(
     semantics) must implement that itself rather than relying on this
     strategy's `None` to mean the same thing.
 
-    Returns None if the directory doesn't exist, is empty, or the
-    swept-marker fallback (see below) also finds nothing -- never
-    substitutes a DIFFERENTLY-NAMED project's session id, the same caution
+    Returns None if the directory doesn't exist, or the swept-marker
+    fallback (see below) also finds nothing -- never substitutes a
+    DIFFERENTLY-NAMED project's session id, the same caution
     savings_ledger.current_session_id() applies for the identical reason.
-    Exception: when no matching marker is found AND the MCP process's own
-    cwd basename matches `project`, the swept-marker fallback calls
-    `os.getcwd()` and delegates to TRANSCRIPT_SCAN with that path (see
-    below for the full guard logic).
+    An empty sessions directory still reaches the swept-marker fallback
+    (the marker-scan loop simply has nothing to iterate), so "empty
+    directory" is NOT a return-None condition on its own.
 
     **Stale-marker fallback (issue #236):** if the most-recently-modified
     matching marker is older than `CLAUDE_RUNWAY_SESSION_MARKER_TTL_HOURS`,
@@ -342,8 +344,9 @@ def _session_id_from_shadow_file(
     `time.time()`).
 
     **Swept-marker fallback (issue #253):** if NO matching marker is found
-    at all (every marker for this project has been swept by
-    `sweep_stale_shadow_markers()`), calls `os.getcwd()` and -- if its
+    at all (whether because all markers were swept by
+    `sweep_stale_shadow_markers()` or because none was ever written),
+    calls `os.getcwd()` and -- if its
     basename matches `project` -- passes it directly to
     `_session_id_from_transcript_scan(cwd)`. This is less precise than the
     stale-marker fallback (which uses the marker's own recorded absolute
@@ -561,10 +564,12 @@ def _project_slug(project: Optional[str]) -> Optional[str]:
     Claude Code's own (undocumented, empirically observed) convention:
     `<slug>` is the project's absolute path with every `/` replaced by `-`.
     Verified directly against this machine's own `~/.claude/projects/`
-    (macOS). NOT verified on Windows -- the `/`-separator convention (and
-    how a Windows-style path would map to it, if at all) is unconfirmed
-    there; don't depend on this for a Windows-installed project without
-    checking first.
+    (macOS). NOT supported on Windows: `str(Path(...))` on Windows produces
+    backslashes (`\\`) rather than forward slashes, so the `/`→`-`
+    replacement leaves them unchanged -- the slug would be
+    `\\repos\\my-project` instead of `-repos-my-project`, making
+    TRANSCRIPT_SCAN effectively broken for Windows-resident projects until
+    this is addressed.
 
     Returns None (rather than raising) if `project` is omitted and
     `os.getcwd()` itself fails -- see `_resolve_project`.
