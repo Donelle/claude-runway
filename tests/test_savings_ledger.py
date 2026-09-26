@@ -126,12 +126,18 @@ class CurrentSessionIdProjectFilter(SavingsLedgerTestCase):
         # a DIFFERENT project's session is the most recently modified marker,
         # but the caller asked for a specific project -- it must not be
         # substituted in.
+        # Use recent relative timestamps so issue #236's stale-marker fallback
+        # does not fire (markers within TTL are returned directly, not
+        # passed to TRANSCRIPT_SCAN): sess-other is 30s more recent than
+        # sess-mine, but sess-mine is still well within the 168h TTL.
+        import time as _time
+        now = _time.time()
         session_id_lib.record_shadow_marker("sess-mine", project="claude-runway")
         session_id_lib.record_shadow_marker("sess-other", project="Acme.Support.Nx")
         old_path = session_id_lib._shadow_marker_path("sess-mine")
         new_path = session_id_lib._shadow_marker_path("sess-other")
-        os.utime(old_path, (1000, 1000))
-        os.utime(new_path, (2000, 2000))  # sess-other is the more recent marker
+        os.utime(old_path, (now - 60, now - 60))
+        os.utime(new_path, (now - 30, now - 30))  # sess-other is the more recent marker
 
         # Filtered by the ACTUAL project: correctly finds the older marker,
         # not the more-recently-touched unrelated one.

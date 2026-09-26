@@ -431,6 +431,84 @@ class ProxyStrategy(SessionIdLibTestCase):
         self.assertEqual(len(set(results)), 1)
 
 
+class ShadowFileStaleMarkerFallback(SessionIdLibTestCase):
+    """Issue #236: when the best-matching SHADOW_FILE marker is stale (older
+    than CLAUDE_RUNWAY_SESSION_MARKER_TTL_HOURS), fall back to TRANSCRIPT_SCAN
+    before returning None -- a live session that has outlived the TTL without
+    triggering a hook lifecycle event should still be recoverable."""
+
+    def _write_stale_marker(self, session_id: str, project_abs: str, ttl_hours: float = 168.0) -> float:
+        """Write a marker and backdate its mtime so it's clearly past the TTL."""
+        L.record_shadow_marker(session_id, project=project_abs)
+        marker = L._shadow_marker_path(session_id)
+        stale_time = time.time() - (ttl_hours * 3600 + 1)
+        os.utime(marker, (stale_time, stale_time))
+        return stale_time
+
+    def test_fresh_marker_returns_session_id_without_fallback(self):
+        # A non-stale marker is returned directly -- no TRANSCRIPT_SCAN call.
+        L.record_shadow_marker("fresh-sess", project="/repos/myapp")
+        result = L._session_id_from_shadow_file("myapp")
+        self.assertEqual(result, "fresh-sess")
+
+    def test_stale_marker_falls_back_to_transcript_scan_result(self):
+        # The matching marker is past the TTL; TRANSCRIPT_SCAN finds a live one.
+        # Copilot review on PR #252: TRANSCRIPT_SCAN must receive the marker's
+        # own recorded absolute path, not None/os.getcwd(), so it scans the
+        # RIGHT project's transcript directory even when the caller's cwd
+        # differs from the marker's project.
+        self._write_stale_marker("stale-sess", "/repos/myapp")
+        with mock.patch.object(L, "_session_id_from_transcript_scan", return_value="live-from-transcript") as mock_scan:
+            result = L._session_id_from_shadow_file("myapp")
+        self.assertEqual(result, "live-from-transcript")
+        mock_scan.assert_called_once_with("/repos/myapp")  # marker's own absolute path
+
+    def test_stale_marker_with_transcript_scan_returning_none_returns_none(self):
+        # Neither strategy can resolve -- return None rather than fabricating.
+        self._write_stale_marker("stale-sess", "/repos/myapp")
+        with mock.patch.object(L, "_session_id_from_transcript_scan", return_value=None) as mock_scan:
+            result = L._session_id_from_shadow_file("myapp")
+        self.assertIsNone(result)
+        mock_scan.assert_called_once_with("/repos/myapp")
+
+    def test_no_matching_marker_at_all_returns_none_without_transcript_fallback(self):
+        # No marker for "myapp" exists -- returns None, TRANSCRIPT_SCAN not called.
+        self.sessions_dir.mkdir(parents=True)
+        with mock.patch.object(L, "_session_id_from_transcript_scan") as mock_scan:
+            result = L._session_id_from_shadow_file("myapp")
+        self.assertIsNone(result)
+        mock_scan.assert_not_called()
+
+    def test_project_none_returns_none_even_with_stale_markers(self):
+        # Passing project=None never matches any marker, so no fallback fires.
+        self._write_stale_marker("stale-sess", "/repos/myapp")
+        with mock.patch.object(L, "_session_id_from_transcript_scan") as mock_scan:
+            result = L._session_id_from_shadow_file(None)
+        self.assertIsNone(result)
+        mock_scan.assert_not_called()
+
+    def test_stale_threshold_reads_ttl_env_var(self):
+        # A custom TTL of 1h: marker 2h old is stale; marker 0.5h old is fresh.
+        os.environ["CLAUDE_RUNWAY_SESSION_MARKER_TTL_HOURS"] = "1"
+        self._write_stale_marker("stale-sess", "/repos/myapp", ttl_hours=1.0)
+        with mock.patch.object(L, "_session_id_from_transcript_scan", return_value="ts-result") as mock_scan:
+            result = L._session_id_from_shadow_file("myapp")
+        self.assertEqual(result, "ts-result")
+        mock_scan.assert_called_once_with("/repos/myapp")
+
+    def test_fresh_under_custom_ttl_not_fallen_back(self):
+        # Marker is 2h old but TTL is 3h -- should NOT fall back.
+        os.environ["CLAUDE_RUNWAY_SESSION_MARKER_TTL_HOURS"] = "3"
+        L.record_shadow_marker("recent-sess", project="/repos/myapp")
+        marker = L._shadow_marker_path("recent-sess")
+        two_hours_ago = time.time() - (2 * 3600)
+        os.utime(marker, (two_hours_ago, two_hours_ago))
+        with mock.patch.object(L, "_session_id_from_transcript_scan") as mock_scan:
+            result = L._session_id_from_shadow_file("myapp")
+        self.assertEqual(result, "recent-sess")
+        mock_scan.assert_not_called()
+
+
 class UnknownStrategy(SessionIdLibTestCase):
     def test_raises_value_error(self):
         with self.assertRaises(ValueError):

@@ -292,7 +292,11 @@ def _strip_marker_prefix(stem: str) -> str:
     return stem
 
 
-def _session_id_from_shadow_file(project: Optional[str]) -> Optional[str]:
+def _session_id_from_shadow_file(
+    project: Optional[str],
+    *,
+    now: Optional[float] = None,
+) -> Optional[str]:
     """
     Scans the sessions directory for the most-recently-modified
     `session_*.jsonl` marker, filtered by project. Unlike TRANSCRIPT_SCAN,
@@ -320,6 +324,19 @@ def _session_id_from_shadow_file(project: Optional[str]) -> Optional[str]:
     project's session id, the same caution
     savings_ledger.current_session_id() applies for the identical reason.
 
+    **Stale-marker fallback (issue #236):** if the most-recently-modified
+    matching marker is older than `CLAUDE_RUNWAY_SESSION_MARKER_TTL_HOURS`,
+    falls back to `_session_id_from_transcript_scan(marker_project)` before
+    returning None -- TRANSCRIPT_SCAN has zero hook dependency and works for
+    sessions that have outlived the TTL without triggering a lifecycle event
+    (the residual gap issue #233 narrowed but didn't eliminate). Passes the
+    matched marker's own recorded absolute path (`marker_project`) rather
+    than None so TRANSCRIPT_SCAN scans the RIGHT project's transcript
+    directory (not the MCP process's own cwd, which may differ). If
+    TRANSCRIPT_SCAN also returns None, None is returned -- SHADOW_FILE never
+    fabricates a session_id. `now` is injectable for testing (defaults to
+    `time.time()`).
+
     Known limitation (project-scoping is by BASENAME, not full path): two
     distinct projects that happen to share the same final path component
     (e.g. `/Users/alice/app` and `/Users/bob/other/app`, both recorded as
@@ -341,9 +358,25 @@ def _session_id_from_shadow_file(project: Optional[str]) -> Optional[str]:
         return None
     dated.sort(key=lambda pair: pair[0], reverse=True)
 
-    for _, p in dated:
+    for mtime, p in dated:
         marker_project = _read_shadow_marker_project(p)
         if marker_project is not None and Path(marker_project).name == project:
+            _now = time.time() if now is None else now
+            if (_now - mtime) > _ttl_hours() * 3600:
+                # The best matching marker is stale (issue #236): the session
+                # may still be live but its marker was swept or never refreshed
+                # across a lifecycle event that exceeded the TTL. Fall back to
+                # TRANSCRIPT_SCAN rather than returning None -- it reads Claude
+                # Code's own undocumented project-transcript directory and has
+                # zero hook dependency, so it works for live sessions that
+                # SHADOW_FILE can no longer see.
+                # Pass `marker_project` (the absolute path recorded in the
+                # marker) rather than None so TRANSCRIPT_SCAN scans the SAME
+                # project's transcript directory, not the MCP process's own
+                # cwd (which may be a completely different project, or even a
+                # different checkout of the same project at a different path --
+                # using the recorded absolute path is always the right anchor).
+                return _session_id_from_transcript_scan(marker_project)
             return _strip_marker_prefix(p.stem)
     return None
 
