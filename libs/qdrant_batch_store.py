@@ -121,7 +121,11 @@ async def store_batch(
                 vector={vector_name: embedding},
                 payload={"document": entry.content, METADATA_PATH: entry.metadata},
             )
-            for entry, embedding in zip(batch, embeddings)
+            # strict=False: identical to pre-ruff behavior (a bare zip()
+            # already silently truncates to the shorter iterable) -- see
+            # issue #297's hard constraint against changing runtime behavior
+            # while adopting ruff's B905 rule.
+            for entry, embedding in zip(batch, embeddings, strict=False)
         ]
         await async_call_with_retry(connector._client.upsert, collection_name=collection_name, points=points)
         stored += len(batch)

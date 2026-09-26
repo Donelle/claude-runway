@@ -1227,7 +1227,12 @@ class SectionCompressionEndToEnd(unittest.TestCase):
         # is 0 just like a real outage, but no request ever actually failed.
         for empty in ("", "   ", "\n\n"):
             with self.subTest(empty=repr(empty)):
-                out = self._run(lambda *a, **k: empty)
+                # Bind `empty` as a default arg (not a free variable) so the
+                # lambda captures this iteration's value rather than
+                # whatever `empty` is bound to when the lambda is later
+                # called -- harmless here since it's called within the same
+                # iteration, but ruff's B023 flags the pattern regardless.
+                out = self._run(lambda *a, empty=empty, **k: empty)
                 self.assertNotIn(
                     "LM Studio appears unreachable", out,
                     "an empty-but-live response must never look like a request failure",

@@ -173,7 +173,6 @@ class DeniedUrlCache(unittest.TestCase):
     """
 
     def setUp(self):
-        import sqlite3
         # Temporary file DB: the implementation closes connections between
         # calls, which would destroy an in-memory DB. A temp file survives
         # open/close cycles and is cleaned up in tearDown.

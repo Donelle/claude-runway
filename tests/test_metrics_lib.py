@@ -108,7 +108,7 @@ class RecordRoundTrip(MetricsStoreTestCase):
         self.assertIsNone(rows[0][3])
 
     def test_multiple_records_all_persisted(self):
-        for i in range(3):
+        for _i in range(3):
             self.store.record("autowork", "ticket_merged", value=1.0)
         rows = self._all_rows()
         self.assertEqual(len(rows), 3)
@@ -685,7 +685,7 @@ class TrendDoesNotMaterializeFullHistory(MetricsStoreTestCase):
     from being pulled."""
 
     def test_trend_never_calls_fetchall(self):
-        for i in range(20):
+        for _i in range(20):
             self.store.record("autowork", "x", value=1.0)
         original_connect = M._connect
         with mock.patch("metrics_lib._connect", side_effect=lambda p: _NoFetchAllConnection(original_connect(p))):

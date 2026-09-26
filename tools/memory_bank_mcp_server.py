@@ -85,11 +85,12 @@ _raw_session_id = _resolve_session_id(SessionIdStrategy.PROXY)
 # genuinely fail to resolve one -- but _proxy_session_id() (what PROXY
 # dispatches to) always returns a str unconditionally, never None. Narrowing
 # that here via an explicit annotation (rather than threading Optional[str]
-# through every record_memory_event call below, or leaving mypy to widen
-# _SESSION_ID's type back to Optional[str] at every OTHER use site, which a
-# bare assert right after the assignment does not prevent for a module-level
-# global) keeps this module's own session_id type exactly what it was
-# before this delegation (a plain str), matching
+# through every record_memory_event call below, or leaving the type checker
+# (mypy originally, Pyright since issue #297 -- both behave the same way
+# here) widen _SESSION_ID's type back to Optional[str] at every OTHER use
+# site, which a bare assert right after the assignment does not prevent for
+# a module-level global) keeps this module's own session_id type exactly
+# what it was before this delegation (a plain str), matching
 # memory_events_lib.record_memory_event's session_id: str parameter.
 assert _raw_session_id is not None, "SessionIdStrategy.PROXY always resolves a value"
 _SESSION_ID: str = _raw_session_id

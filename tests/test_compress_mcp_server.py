@@ -1672,7 +1672,7 @@ class CompactPruneTests(unittest.TestCase):
         # keep_last_n=1 should keep "newest valid" and delete... the bad-date
         # entry is simply preserved outside the quota (not treated as newest),
         # so after pruning we should still have the real one.
-        result = _run(mod.compact_prune(project="proj", keep_last_n=1, dry_run=False))
+        _run(mod.compact_prune(project="proj", keep_last_n=1, dry_run=False))
 
         remaining = list(mod.QdrantClient().collections[canonical_col].values())
         real_dates = [p.payload.get("date") for p in remaining]

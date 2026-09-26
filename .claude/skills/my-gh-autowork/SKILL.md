@@ -388,18 +388,27 @@ under `~/.claude/skills/`, not guaranteed to exist on whichever machine is runni
     (The second/third lines are cheap no-ops if already satisfied, so it's fine to always
     run them rather than trying to detect exactly what's missing.) After bootstrapping,
     resolve the interpreter path once — Windows venv uses `Scripts/`, Linux/macOS uses
-    `bin/`. Mypy is invoked via `$PYTHON -m mypy` rather than as a direct `$MYPY` binary,
-    so only one allow rule (`.venv/Scripts/python` or `.venv/bin/python`) is needed instead
-    of two:
+    `bin/`. ruff and Pyright (issue #297 — replaces mypy so the editor's Pylance
+    extension and this gate agree) are each invoked via `$PYTHON -m ruff`/`$PYTHON -m
+    pyright` rather than as direct `$RUFF`/`$PYRIGHT` binaries, so only one allow rule
+    (`.venv/Scripts/python` or `.venv/bin/python`) is needed instead of three:
     ```bash
     PYTHON=$(if [ -f .venv/Scripts/python ]; then echo .venv/Scripts/python; else echo .venv/bin/python; fi)
     ```
-    Then run and require both clean before proceeding:
+    Then run and require all three clean before proceeding. **`--pythonpath
+    $PYTHON` on the Pyright call is required, not optional** (Copilot review,
+    PR #319): `pyproject.toml`'s `[tool.pyright]` deliberately has no
+    `venvPath`/`venv` setting (a hardcoded `.venv` there broke CI, which
+    never creates one), so without `--pythonpath` Pyright falls back to
+    whatever Python is first on `PATH` and reports every third-party import
+    as missing — confirmed live, even when invoking it as `$PYTHON -m
+    pyright` from inside the venv itself:
     ```
     $PYTHON -m unittest discover -s tests
-    $PYTHON -m mypy libs tools hooks
+    $PYTHON -m ruff check libs tools hooks tests
+    $PYTHON -m pyright --pythonpath "$PYTHON"
     ```
-    If you cannot get both clean after reasonable effort, report FAILED with what's
+    If you cannot get all three clean after reasonable effort, report FAILED with what's
     failing and why, rather than committing broken code.
 16. Commit (no `Fixes #N` in the commit message — that goes in the PR body only, or
     GitHub's squash-merge won't attribute it right) and push:
@@ -605,8 +614,8 @@ actionable) does NOT increment it, since no fix cycle happens there.
     testing of this skill caught a real bug this way — an 8-hex-char/32-bit hash suffix
     genuinely can collide, confirmed by brute-forcing to a real collision, not just
     theorizing about the birthday bound). Two outcomes only:
-    - **Reproduces** → fix it, add a regression test, re-run the full test suite + mypy,
-      commit, push (this auto-triggers the next review). **Do NOT jump back to the poll
+    - **Reproduces** → fix it, add a regression test, re-run the full test suite + ruff +
+      Pyright, commit, push (this auto-triggers the next review). **Do NOT jump back to the poll
       immediately after this push** — a reproduced finding still needs the same reply and
       thread-resolution as a declined one (Steps 23–24 below apply to every finding this
       round, reproduced or declined, not just declined ones); skipping straight back to

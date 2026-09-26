@@ -96,6 +96,7 @@ import json
 import os
 import sqlite3
 import sys
+from typing import NoReturn
 
 # Same redundant resolution order as compress_bash_output.py -- see that
 # file's comment for the full bug history this guards against. libs/ under
@@ -376,11 +377,11 @@ def _lmstudio_reachable(base_url) -> bool:
     return len(ids) == 1
 
 
-def _allow():
+def _allow() -> NoReturn:
     sys.exit(0)  # no JSON on stdout -- Claude Code treats this as allow
 
 
-def _deny(reason: str):
+def _deny(reason: str) -> NoReturn:
     print(json.dumps({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",

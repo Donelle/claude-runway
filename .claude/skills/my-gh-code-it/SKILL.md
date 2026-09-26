@@ -82,15 +82,24 @@ Project-scoped to this repo on purpose: it hardcodes claude-runway's actual conv
 
 12. **Write or update unit tests** in the relevant `tests/test_*.py` file, following existing patterns in that file (e.g. `test_local_compress_lib.py`'s stub-injection technique for anything touching LM Studio, so tests don't require a live model).
 
-13. **Run the test suite, then type-check**:
+13. **Run the test suite, then lint and type-check**:
     ```bash
     .venv/bin/python -m unittest discover -s tests
-    .venv/bin/mypy libs tools hooks
+    .venv/bin/ruff check libs tools hooks tests
+    .venv/bin/pyright --pythonpath .venv/bin/python
     ```
-    All tests must pass, including any new ones, and mypy must report no
-    issues. mypy is installed via `requirements-dev.txt` (a separate,
-    dev-only file from `requirements.txt` — see that file's own comment); if
-    it's missing from this repo's venv, install it with
+    **The `--pythonpath` flag is required** (Copilot review, PR #319):
+    `pyproject.toml`'s `[tool.pyright]` deliberately has no `venvPath`/`venv`
+    setting (a hardcoded `.venv` broke CI, which never creates one), so
+    without `--pythonpath` Pyright falls back to whatever Python is first on
+    `PATH` and reports every third-party import as missing — confirmed live,
+    even when running `.venv/bin/pyright` itself, not just a bare `pyright`.
+    All tests must pass, including any new ones, and both ruff and Pyright
+    must report no issues (issue #297 — Pyright replaced mypy so the editor's
+    Pylance extension and this gate agree). Both are installed via
+    `requirements-dev.txt` (a separate, dev-only file from
+    `requirements.txt` — see that file's own comment); if either is missing
+    from this repo's venv, install with
     `uv pip install -r requirements-dev.txt --index-url https://pypi.org/simple`
     (not `.venv/bin/pip install` — `uv venv` doesn't seed a `pip` executable
     by default, so that would fail in exactly the recovery case this is

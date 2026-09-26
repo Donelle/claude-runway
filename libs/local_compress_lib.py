@@ -1950,9 +1950,11 @@ async def compress(
     # chars_limited/auto_truncated but text[:max_chars] is a no-op. Computed
     # before the slice so the comparison is against the real original length.
     # Written as "max_chars is not None and ..." rather than "chars_limited
-    # and ..." so mypy can narrow max_chars from Optional[int] to int within
-    # this same expression -- it can't do that narrowing through a separate
-    # bool variable, even though chars_limited means exactly the same thing.
+    # and ..." so the type checker (mypy originally, Pyright since issue #297
+    # -- both share this same limitation) can narrow max_chars from
+    # Optional[int] to int within this same expression -- neither can do
+    # that narrowing through a separate bool variable, even though
+    # chars_limited means exactly the same thing.
     was_truncated = max_chars is not None and len(text) > max_chars
     if max_chars is not None:
         text = text[:max_chars]
@@ -2032,6 +2034,10 @@ async def compress(
     model, error = resolve_model(model, base_url)
     if error:
         return f"Error: {error}"
+    # resolve_model()'s own docstring: "exactly one will be None" -- error is
+    # falsy here, so model is guaranteed non-None. Pyright can't infer that
+    # correlation between two tuple-unpacked values on its own (issue #297).
+    assert model is not None
 
     # The resolved model id is now known -- compute the cache key and check
     # before any LM Studio COMPRESSION work. Note that resolve_model() above
@@ -2215,6 +2221,10 @@ async def compress(
         if compressed is None:
             return f"Error: LM Studio request failed while combining chunk summaries -- check it's still running at {base_url or DEFAULT_BASE_URL}."
         compressed = compressed.strip()
+    # Both branches above leave `compressed` a plain `str` (the None case
+    # already returned early) -- Pyright doesn't merge that narrowing back
+    # into the outer `Optional[str]`-declared variable on its own.
+    assert compressed is not None
 
     # Unconditional (unlike preserve_identifiers/preserve_sections below,
     # which are opt-in): this repairs one specific, high-value fact -- the

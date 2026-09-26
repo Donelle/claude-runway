@@ -131,23 +131,35 @@ from qdrant_retry import call_with_retry
 
 # savings_ledger is optional at import time (e.g. an older checkout of just
 # this file without libs/savings_ledger.py) -- fails open to "tracking off"
-# rather than crashing server startup over an opt-in feature.
+# rather than crashing server startup over an opt-in feature. The explicit
+# `savings_ledger = None` in the except branch (issue #297, adopting Pyright)
+# keeps the name always bound -- every function below that touches
+# savings_ledger checks _SAVINGS_LEDGER_AVAILABLE/TRACK_SAVINGS first and
+# then asserts it's not None, which is always true at runtime (that's exactly
+# what _SAVINGS_LEDGER_AVAILABLE records) but lets Pyright narrow the type
+# instead of reporting a possibly-unbound/Optional-access error.
 try:
     import savings_ledger
     _SAVINGS_LEDGER_AVAILABLE = True
 except ImportError:
+    savings_ledger = None  # type: ignore[assignment]
     _SAVINGS_LEDGER_AVAILABLE = False
 
-TRACK_SAVINGS = _SAVINGS_LEDGER_AVAILABLE and savings_ledger.tracking_enabled()
+if _SAVINGS_LEDGER_AVAILABLE:
+    assert savings_ledger is not None
+    TRACK_SAVINGS = savings_ledger.tracking_enabled()
+else:
+    TRACK_SAVINGS = False
 
 # metrics_lib is likewise optional at import time (issue #208) -- same
 # fail-open reasoning as savings_ledger above: an older checkout of just this
 # file, without libs/metrics_lib.py, must not crash server startup over a
-# brand-new, still domain-empty store.
+# brand-new, still domain-empty store. Same `= None` reasoning as above.
 try:
     import metrics_lib
     _METRICS_LIB_AVAILABLE = True
 except ImportError:
+    metrics_lib = None  # type: ignore[assignment]
     _METRICS_LIB_AVAILABLE = False
 
 COMPACT_QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
@@ -258,6 +270,7 @@ def _log_fixed_overhead():
     """
     if not TRACK_SAVINGS:
         return
+    assert savings_ledger is not None  # TRACK_SAVINGS implies this (see module top)
     try:
         blob = describe_tools(mcp)
         overhead = estimate_tokens(blob)
@@ -343,10 +356,13 @@ async def compress_file(
     base_url: Optional[str] = None,
     # MCPServer injects context by matching the `Context` annotation on a
     # parameter name. `ctx: Context = None` keeps the framework-visible type
-    # annotation while suppressing mypy's "None isn't a valid Context default"
+    # annotation while suppressing a "None isn't a valid Context default"
     # complaint per-line, avoiding the need to widen to Optional[Context].
+    # Confirmed still needed under Pyright (issue #297 -- replaced mypy):
+    # removing the ignore surfaces Pyright's own equivalent
+    # reportArgumentType error here, just phrased differently than mypy's.
     # Same reasoning at every other `ctx` parameter below and in
-    # ingest_mcp_server.py.
+    # ingest_mcp_server.py/memory_bank_mcp_server.py.
     ctx: Context = None,  # type: ignore[assignment]
 ) -> str:
     """
@@ -1643,7 +1659,8 @@ async def compact_prune(
     # collection membership so we know WHERE each point lives for deletion.
     # qdrant_client stubs type scroll() results as list[Record] (which is not
     # an importable public type in every version we support) -- use a plain
-    # untyped list and suppress the two attribute accesses mypy flags below,
+    # untyped list and suppress the two attribute accesses a type checker
+    # (mypy originally, Pyright since issue #297) would otherwise flag below,
     # the same pattern call_with_retry's own callers use throughout this file.
     all_points: list = []  # list of (collection_name, Record)
     for col in col_list:
@@ -1668,7 +1685,10 @@ async def compact_prune(
     if not all_points:
         return f"No compacts found for project '{project}' — nothing to prune."
 
-    def _parse_date(p) -> Optional[_dt.date]:  # type: ignore[no-untyped-def]
+    # `# type: ignore[no-untyped-def]` (mypy's complaint about `p`'s missing
+    # parameter annotation) is gone as of issue #297 -- confirmed Pyright
+    # doesn't flag this at all, so there's nothing left to suppress here.
+    def _parse_date(p) -> Optional[_dt.date]:
         """Parse the payload date field; return None for unparseable values."""
         try:
             return _dt.date.fromisoformat((p.payload or {}).get("date", ""))
@@ -1705,10 +1725,16 @@ async def compact_prune(
         kept_count = min(keep_last_n, len(parseable)) + unparseable_kept
     else:
         # older_than_days: delete any parseable point whose date is strictly
-        # more than older_than_days days before today.
+        # more than older_than_days days before today. The XOR check above
+        # (`(keep_last_n is None) == (older_than_days is None)`) guarantees
+        # older_than_days is not None here, but a type checker can't narrow
+        # through that separate boolean comparison (issue #297 -- same
+        # limitation this file's chars_limited/max_chars comment describes
+        # elsewhere in this codebase), hence the explicit assert.
+        assert older_than_days is not None
         today = _dt.date.today()
         try:
-            cutoff = today - _dt.timedelta(days=older_than_days)  # type: ignore[arg-type]
+            cutoff = today - _dt.timedelta(days=older_than_days)
         except OverflowError:
             # older_than_days is astronomically large — nothing is that old.
             return (
@@ -1719,8 +1745,9 @@ async def compact_prune(
         to_delete = []
         kept_count = unparseable_kept
         for col, p in parseable:
-            entry_date = _parse_date(p)  # guaranteed non-None (parseable list)
-            if entry_date < cutoff:  # type: ignore[operator]
+            entry_date = _parse_date(p)
+            assert entry_date is not None  # guaranteed non-None (parseable list)
+            if entry_date < cutoff:
                 to_delete.append((col, p))
             else:
                 kept_count += 1
@@ -1732,7 +1759,8 @@ async def compact_prune(
         )
 
     # Build a human-readable summary of what will be (or was) deleted.
-    def _entry_summary(col: str, p) -> str:  # type: ignore[no-untyped-def]
+    # Same as _parse_date above -- no longer needs a `# type: ignore` under Pyright.
+    def _entry_summary(col: str, p) -> str:
         payload = (p.payload or {})
         date = payload.get("date", "?")
         label = payload.get("label", "(no label)")
@@ -1758,7 +1786,9 @@ async def compact_prune(
     # Group deletes by collection to minimise round trips.
     by_col: dict[str, list] = {}
     for col, p in to_delete:
-        by_col.setdefault(col, []).append(p.id)  # type: ignore[attr-defined]
+        # `# type: ignore[attr-defined]` (mypy's complaint about `p.id`) is
+        # gone as of issue #297 -- confirmed Pyright doesn't flag this at all.
+        by_col.setdefault(col, []).append(p.id)
 
     for col, ids in by_col.items():
         call_with_retry(
@@ -1777,6 +1807,7 @@ async def compact_prune(
 def _require_savings_tracking() -> Optional[str]:
     if not _SAVINGS_LEDGER_AVAILABLE:
         return "Error: libs/savings_ledger.py is not available in this install -- the savings tracker requires it."
+    assert savings_ledger is not None  # _SAVINGS_LEDGER_AVAILABLE implies this
     if not savings_ledger.tracking_enabled():
         return (
             "Savings tracking is off (CLAUDE_RUNWAY_TRACK_SAVINGS is not set). "
@@ -1813,6 +1844,7 @@ def savings_summary(project: Optional[str] = None, format: str = "text") -> str:
     err = _require_savings_tracking()
     if err:
         return err
+    assert savings_ledger is not None  # _require_savings_tracking() returning None implies this
     # Validate before any DB access so a bad argument produces a clear input
     # error and never reaches the generic except handler below, which would
     # misleadingly report the issue as database corruption.
@@ -1827,7 +1859,11 @@ def savings_summary(project: Optional[str] = None, format: str = "text") -> str:
         # the zero-value aggregate below (same as the "no live session at
         # all" case) is what keeps the project label below always accurate.
         session_id = savings_ledger.current_session_id(project=project)
-        session_agg = (
+        # Annotated `dict` (not inferred from the ternary's two branches,
+        # whose value types differ -- get_live_session_aggregate() returns a
+        # bare `dict`, the literal fallback is `dict[str, int]`) so the
+        # `session_agg["project"] = project` str assignment below type-checks.
+        session_agg: dict = (
             savings_ledger.get_live_session_aggregate(session_id) if session_id
             else {"credited_saved_tokens": 0, "raw_tokens_sum": 0, "out_tokens_sum": 0, "event_count": 0, "fetch_url_count": 0, "overhead_tokens": savings_ledger.get_schema_overhead_tokens()}
         )
@@ -1869,6 +1905,7 @@ def savings_detail(project: Optional[str] = None, format: str = "text", csv_tabl
     err = _require_savings_tracking()
     if err:
         return err
+    assert savings_ledger is not None  # _require_savings_tracking() returning None implies this
     # Validate both enum parameters before any DB access so bad arguments
     # produce clear input errors rather than silently returning text or
     # hitting the generic except handler below (which would misleadingly
@@ -1882,6 +1919,9 @@ def savings_detail(project: Optional[str] = None, format: str = "text", csv_tabl
         # See savings_summary's identical comment -- project-filtered lookup,
         # issue #35.
         session_id = savings_ledger.current_session_id(project=project)
+        # Annotated `dict` here too (see savings_summary's identical comment)
+        # so the "project" key assignment below type-checks either way.
+        session_agg: dict
         if session_id:
             session_agg = savings_ledger.get_live_session_aggregate(session_id)
             # Sorted by saved_tokens descending -- by_tool.items() is otherwise in
@@ -1948,6 +1988,7 @@ def savings_trend(project: Optional[str] = None, bucket: str = "week", n: int = 
     err = _require_savings_tracking()
     if err:
         return err
+    assert savings_ledger is not None  # _require_savings_tracking() returning None implies this
     if bucket not in ("day", "week"):
         return f"Error: unrecognised bucket {bucket!r}. Valid values: 'day', 'week'."
     if not isinstance(n, int) or n < 1:
@@ -2022,6 +2063,7 @@ def get_metrics(metric_id: str, view: str = "summary", bucket: str = "week", n: 
     """
     if not _METRICS_LIB_AVAILABLE:
         return "Error: libs/metrics_lib.py is not available in this install -- get_metrics requires it."
+    assert metrics_lib is not None  # _METRICS_LIB_AVAILABLE implies this
     if view not in ("summary", "by_event_type", "trend", "detail"):
         return f"Error: unrecognised view {view!r}. Valid values: 'summary', 'by_event_type', 'trend', 'detail'."
     if format not in ("text", "json"):
@@ -2106,6 +2148,7 @@ def record_metric(
     """
     if not _METRICS_LIB_AVAILABLE:
         return "Error: libs/metrics_lib.py is not available in this install -- record_metric requires it."
+    assert metrics_lib is not None  # _METRICS_LIB_AVAILABLE implies this
     import json as _json
     import math as _math
     if not _math.isfinite(value):
