@@ -1,6 +1,6 @@
 ---
 name: my-gh-autowork
-description: "Autonomously work claude-runway's open bug/enhancement backlog end-to-end (plan, code, PR, verified multi-round review-feedback loop, merge) by delegating each ticket to an isolated subagent — zero approval gates, one ticket at a time, stops and reports rather than guessing on anything genuinely ambiguous. Refuses to run at all outside a verified dogfood checkout."
+description: "Autonomously work claude-runway's open ticket backlog end-to-end (plan, code, PR, verified multi-round review-feedback loop, merge) by delegating each ticket to an isolated subagent — zero approval gates, one ticket at a time, stops and reports rather than guessing on anything genuinely ambiguous. Refuses to run at all outside a verified dogfood checkout."
 ---
 
 # Skill: my-gh-autowork
@@ -21,9 +21,9 @@ Project-scoped to this repo (hardcodes `Donelle/claude-runway`, `.venv`-based te
 
 ## Usage
 ```
-/my-gh-autowork              # pick the single highest-priority open bug/enhancement and work it fully
+/my-gh-autowork              # pick the single highest-priority open ticket and work it fully
 /my-gh-autowork 45           # work that specific issue fully
-/my-gh-autowork all          # work the entire open bug/enhancement backlog, one ticket at a time
+/my-gh-autowork all          # work the entire open ticket backlog, one ticket at a time
 ```
 
 ## Steps (orchestrator — runs in the main conversation, kept deliberately thin)
@@ -184,26 +184,26 @@ call out separately).
 ## Step 0 — determine the target ticket
 {ISSUE_NUMBER}                                   <-- orchestrator fills in ONE of these two
 --- OR ---
-Pick the highest-priority open issue on Donelle/claude-runway labeled `bug` OR
-`enhancement` that has no assignee at all, is NOT labeled `blocked` or `theme-design`, and
-whose number is NOT in this already-attempted list this run: {ATTEMPTED_LIST}. The
+Pick the highest-priority open issue on Donelle/claude-runway — of ANY label or
+issue type — that has no assignee at all, is NOT labeled `blocked` or `theme-design`, and
+whose number is NOT in this already-attempted list this run: {ATTEMPTED_LIST}. This is
+deliberately not restricted to `bug`/`enhancement` — any open, unassigned, unblocked,
+non-design ticket is fair game, not just those two labels. The
 `blocked`/`theme-design` exclusion is deliberate: a `blocked` issue is waiting on something
 outside this skill's control (an upstream fix, a human decision), and a `theme-design`
 issue is a pre-implementation design/brainstorm doc, not a ticket with a concrete fix to
 implement — auto-picking either would either stall the run or produce the wrong kind of
 output. IMPORTANT: `gh issue list` silently truncates to 30 results with no `--limit` flag
-— always pass one. Also note two labels do NOT OR together via repeated `--label` flags
-(that ANDs, requiring both labels on the same issue); use `--search` for OR, and GitHub's
-search syntax negates a qualifier with a leading `-` (`-label:X` excludes issues carrying
-that label). `no:assignee` matches only issues with ZERO assignees — not "not assigned to
-me"; any assignee at all, including yourself from an earlier attempt, excludes an issue
-from auto-pick now:
+— always pass one. GitHub's search syntax negates a qualifier with a leading `-`
+(`-label:X` excludes issues carrying that label). `no:assignee` matches only issues with
+ZERO assignees — not "not assigned to me"; any assignee at all, including yourself from an
+earlier attempt, excludes an issue from auto-pick now:
   gh issue list -R Donelle/claude-runway --state open \
-    --search "label:bug,enhancement -label:blocked -label:theme-design no:assignee" \
+    --search "-label:blocked -label:theme-design no:assignee" \
     --limit 200 --json number,title,labels,assignees
 Sort by priority label (priority-p1 > p2 > p3; unlabeled sorts last), then by issue number
-ascending as a tiebreaker; bug and enhancement are not otherwise prioritized relative to
-each other.
+ascending as a tiebreaker; no label or issue type is otherwise prioritized relative to any
+other.
 
 **Then, walking that sorted list in order, skip any candidate that already has a linked
 branch** — an empty `assignees` field alone doesn't prove nobody has started on it; a

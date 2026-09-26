@@ -160,6 +160,24 @@ class AutoPickExclusionContentRequirements(unittest.TestCase):
         self.assertIn("NOT overridden by an", self.content)
         self.assertIn("no:assignee", self.content)
 
+    def test_search_command_has_no_positive_label_restriction(self):
+        # Copilot review on PR #258: the other tests in this class only assert the
+        # negative exclusions (-label:blocked, -label:theme-design) are present --
+        # none of them would fail if a future edit silently restored the old
+        # `label:bug,enhancement` positive restriction alongside them, since that's
+        # an *addition*, not a removal, of pinned text. Extract Step 0's actual
+        # --search command and assert it carries no positive label:X term at all.
+        match = re.search(r'--search "([^"]+)"', self.content)
+        self.assertIsNotNone(match, "Step 0's --search command must be present")
+        search_query = match.group(1)
+        # every label: qualifier in the query must be negated
+        for term in search_query.split():
+            if "label:" in term:
+                self.assertTrue(
+                    term.startswith("-label:"),
+                    f"found a positive label restriction in the search query: {term!r}",
+                )
+
 
 class SettingsTemplateContentRequirements(unittest.TestCase):
     """Pin the new _permissions_note documenting suggested baseline rules."""
