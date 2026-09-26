@@ -298,6 +298,28 @@ class RememberWeightPassthroughTest(unittest.TestCase):
         self.assertIn("weight=2.0", result)
 
 
+class SessionIdDelegatesToSessionIdLibTest(unittest.TestCase):
+    """Issue #214: _SESSION_ID must come from libs/session_id_lib.py's
+    SessionIdStrategy.PROXY (issue #198) rather than this module minting its
+    own uuid.uuid4().hex -- pure dedup, no behavior change. Asserting on the
+    exact cached value (not just "looks like a uuid hex string") is what
+    actually proves delegation happened: session_id_lib's PROXY strategy
+    caches one uuid.uuid4().hex per process (see its own module docstring),
+    so a second call to session_id(PROXY) within this same test process must
+    return the SAME value _mbs._SESSION_ID was set to at import time -- a
+    module that still generated its own independent uuid would fail this
+    even though both values are equally uuid-hex-shaped."""
+
+    def test_session_id_matches_shared_proxy_strategy(self):
+        import session_id_lib as sid
+        self.assertEqual(_mbs._SESSION_ID, sid.session_id(sid.SessionIdStrategy.PROXY))
+
+    def test_session_id_is_a_uuid4_hex_string(self):
+        # Same shape the old uuid.uuid4().hex call produced -- confirms the
+        # switch didn't change what downstream memory_events_lib rows store.
+        self.assertRegex(_mbs._SESSION_ID, r"^[0-9a-f]{32}$")
+
+
 class ToolRegistrationTest(unittest.TestCase):
     def test_registers_exactly_three_tools(self):
         from mcp_tool_introspect import tool_count

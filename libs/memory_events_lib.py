@@ -28,9 +28,11 @@ has NO access to Claude Code's actual session_id -- see
 documents the identical limitation for the local-compress server. A stdio
 MCP server subprocess is spawned fresh per Claude Code session (one process
 per session -- see `libs/qdrant_collection_hints.py`'s docstring for the
-same observation), so the caller generates one process-lifetime UUID at
-import time and passes it in as `session_id` on every call here -- a
-documented proxy for "this session," not Claude Code's own internal id.
+same observation), so the caller resolves one process-lifetime UUID at
+import time via `libs/session_id_lib.py`'s `SessionIdStrategy.PROXY`
+(issue #198/#214, rather than minting its own `uuid.uuid4().hex` inline)
+and passes it in as `session_id` on every call here -- a documented proxy
+for "this session," not Claude Code's own internal id.
 
 `turn` is likewise caller-maintained (a plain in-process counter), not
 computed in this module -- see the caller (`tools/memory_bank_mcp_server.py`)
