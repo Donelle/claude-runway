@@ -39,6 +39,12 @@ def _run_main(stdin_text):
     return buf.getvalue()
 
 
+_SESSION_START_PAYLOAD = json.dumps({
+    "hook_event_name": "SessionStart",
+    "session_id": "sess-1",
+    "cwd": "/repos/my-project",
+})
+
 _POST_TOOL_USE_PAYLOAD = json.dumps({
     "hook_event_name": "PostToolUse",
     "session_id": "sess-1",
@@ -63,6 +69,71 @@ class RecordSessionIdTestCase(unittest.TestCase):
         self._sessions_patch = mock.patch.object(session_id_lib, "_sessions_dir", return_value=self.sessions_dir)
         self._sessions_patch.start()
         self.addCleanup(self._sessions_patch.stop)
+
+
+class SessionStartBehavior(RecordSessionIdTestCase):
+    """SessionStart is the canonical way to write the shadow marker (issue #231).
+    Mirrors PostToolUseBehavior -- same write/sweep logic, different event."""
+
+    def test_writes_no_stdout(self):
+        output = _run_main(_SESSION_START_PAYLOAD)
+        self.assertEqual(output, "")
+
+    def test_writes_shadow_marker(self):
+        _run_main(_SESSION_START_PAYLOAD)
+        marker = session_id_lib._shadow_marker_path("sess-1")
+        self.assertTrue(marker.exists())
+        data = json.loads(marker.read_text(encoding="utf-8").splitlines()[0])
+        self.assertEqual(data["project"], "/repos/my-project")
+
+    def test_all_start_types_write_marker(self):
+        # startup / resume / clear / compact / fork all share the same
+        # hook_event_name field value "SessionStart" -- the start type
+        # itself arrives as a separate field (not part of the dispatch
+        # logic this script handles), so any valid SessionStart payload
+        # writes the marker regardless.
+        for start_type in ("startup", "resume", "clear", "compact", "fork"):
+            payload = json.dumps({
+                "hook_event_name": "SessionStart",
+                "session_id": f"sess-{start_type}",
+                "cwd": "/repos/my-project",
+                "start_type": start_type,
+            })
+            _run_main(payload)
+            marker = session_id_lib._shadow_marker_path(f"sess-{start_type}")
+            self.assertTrue(marker.exists(), f"marker missing for start_type={start_type!r}")
+
+    def test_missing_session_id_is_a_silent_no_op(self):
+        payload = json.dumps({"hook_event_name": "SessionStart", "cwd": "/repos/my-project"})
+        output = _run_main(payload)
+        self.assertEqual(output, "")
+        self.assertFalse(self.sessions_dir.exists() and any(self.sessions_dir.iterdir()))
+
+    def test_missing_cwd_still_exits_cleanly_without_writing_a_marker(self):
+        payload = json.dumps({"hook_event_name": "SessionStart", "session_id": "sess-1"})
+        _run_main(payload)
+        self.assertFalse(session_id_lib._shadow_marker_path("sess-1").exists())
+
+    def test_sweep_runs_when_due(self):
+        with mock.patch.object(session_id_lib, "should_sweep", return_value=True) as ms, \
+             mock.patch.object(session_id_lib, "sweep_stale_shadow_markers") as msweep, \
+             mock.patch.object(session_id_lib, "mark_swept"):
+            _run_main(_SESSION_START_PAYLOAD)
+        ms.assert_called_once()
+        msweep.assert_called_once()
+
+    def test_sweep_skipped_when_not_due(self):
+        with mock.patch.object(session_id_lib, "should_sweep", return_value=False), \
+             mock.patch.object(session_id_lib, "sweep_stale_shadow_markers") as msweep:
+            _run_main(_SESSION_START_PAYLOAD)
+        msweep.assert_not_called()
+
+    def test_own_marker_survives_sweep_triggered_by_same_call(self):
+        with mock.patch.dict(os.environ, {"CLAUDE_RUNWAY_SESSION_MARKER_TTL_HOURS": "0.0001"}):
+            with mock.patch.object(session_id_lib, "should_sweep", return_value=True), \
+                 mock.patch.object(session_id_lib, "mark_swept"):
+                _run_main(_SESSION_START_PAYLOAD)
+        self.assertTrue(session_id_lib._shadow_marker_path("sess-1").exists())
 
 
 class PostToolUseBehavior(RecordSessionIdTestCase):

@@ -332,19 +332,22 @@ class BuildSettingsHooks(unittest.TestCase):
         )
 
     def test_core_hook_present_under_both_events_regardless_of_compress(self):
-        # Issue #198: record_session_id.py is CORE/base install -- present
-        # (and correctly patched) under both PostToolUse and SessionEnd
-        # whether or not local-compress is included.
+        # Issues #198, #231: record_session_id.py is CORE/base install --
+        # present (and correctly patched) under SessionStart and SessionEnd
+        # whether or not local-compress is included.  It is NOT in PostToolUse
+        # (moved from PostToolUse '.*' to SessionStart in issue #231).
         for include_compress in (True, False):
             hooks = self._build(include_compress=include_compress)
             self.assertEqual(
-                _find_block_args(hooks, "PostToolUse", "record_session_id.py"),
+                _find_block_args(hooks, "SessionStart", "record_session_id.py"),
                 ["/home/user/tools/claude-runway/hooks/record_session_id.py"],
             )
             self.assertEqual(
                 _find_block_args(hooks, "SessionEnd", "record_session_id.py"),
                 ["/home/user/tools/claude-runway/hooks/record_session_id.py"],
             )
+            with self.assertRaises(AssertionError):
+                _find_block_args(hooks, "PostToolUse", "record_session_id.py")
 
     def test_include_compress_false_drops_compress_gated_blocks(self):
         hooks = self._build(include_compress=False)
@@ -640,22 +643,24 @@ class RunSetupEndToEnd(unittest.TestCase):
         self.assertIsNone(result.settings_json)
 
     def test_cli_style_qdrant_only_still_writes_core_hooks(self):
-        # Issue #198: the CLI's --qdrant-only keeps include_hooks=True (only
-        # --skip-hooks sets it False) and passes include_compress=False --
-        # record_session_id.py (CORE/base install) must still be written,
-        # while the compress-gated hooks must not.
+        # Issues #198, #231: the CLI's --qdrant-only keeps include_hooks=True
+        # (only --skip-hooks sets it False) and passes include_compress=False
+        # -- record_session_id.py (CORE/base install) must still be written
+        # under SessionStart and SessionEnd, while compress-gated hooks must not.
         result = run_setup(
             self.target_repo, REPO_ROOT, home_dir=Path("/home/user"), include_compress=False, include_hooks=True
         )
         self.assertIsNotNone(result.settings_json)
         self.assertEqual(
-            _find_block_args(result.settings_json["hooks"], "PostToolUse", "record_session_id.py"),
+            _find_block_args(result.settings_json["hooks"], "SessionStart", "record_session_id.py"),
             [f"{REPO_ROOT.as_posix()}/hooks/record_session_id.py"],
         )
         self.assertEqual(
             _find_block_args(result.settings_json["hooks"], "SessionEnd", "record_session_id.py"),
             [f"{REPO_ROOT.as_posix()}/hooks/record_session_id.py"],
         )
+        with self.assertRaises(AssertionError):
+            _find_block_args(result.settings_json["hooks"], "PostToolUse", "record_session_id.py")
         with self.assertRaises(AssertionError):
             _find_block_args(result.settings_json["hooks"], "PostToolUse", "compress_bash_output.py")
         with self.assertRaises(AssertionError):
@@ -678,11 +683,16 @@ class RunSetupEndToEnd(unittest.TestCase):
         second = run_setup(
             self.target_repo, REPO_ROOT, home_dir=Path("/home/user"), include_compress=False, include_hooks=True
         )
-        self.assertEqual(len(second.settings_json["hooks"]["PostToolUse"]), 1)
+        # record_session_id.py moved to SessionStart (issue #231): PostToolUse
+        # loses the '.*' core block, leaving only the (now-stripped) compress
+        # block → empty list. SessionStart has the core record_session_id.py
+        # block. SessionEnd has record_session_id.py only (no savings hook).
+        self.assertEqual(len(second.settings_json["hooks"]["SessionStart"]), 1)
+        self.assertEqual(len(second.settings_json["hooks"]["PostToolUse"]), 0)
         self.assertEqual(second.settings_json["hooks"]["PreToolUse"], [])
         self.assertEqual(len(second.settings_json["hooks"]["SessionEnd"]), 1)
         self.assertEqual(
-            _find_block_args(second.settings_json["hooks"], "PostToolUse", "record_session_id.py"),
+            _find_block_args(second.settings_json["hooks"], "SessionStart", "record_session_id.py"),
             [f"{REPO_ROOT.as_posix()}/hooks/record_session_id.py"],
         )
 
@@ -701,10 +711,13 @@ class RunSetupEndToEnd(unittest.TestCase):
             json.dumps(first.settings_json), encoding="utf-8"
         )
         second = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
-        # PostToolUse/SessionEnd each carry TWO blocks by default (issue #198's
-        # always-on core record_session_id.py block, alongside the
-        # compress-gated one); PreToolUse has no core hook, so still just 1.
-        self.assertEqual(len(second.settings_json["hooks"]["PostToolUse"]), 2)
+        # SessionStart: 1 core block (record_session_id.py, issue #231).
+        # PostToolUse: 1 compress block (compress_bash_output.py only; core
+        #   record_session_id.py moved from PostToolUse to SessionStart in #231).
+        # PreToolUse: 1 block (redirect_webfetch_to_fetch_url.py).
+        # SessionEnd: 2 blocks (record_session_id.py + session_end_savings.py).
+        self.assertEqual(len(second.settings_json["hooks"]["SessionStart"]), 1)
+        self.assertEqual(len(second.settings_json["hooks"]["PostToolUse"]), 1)
         self.assertEqual(len(second.settings_json["hooks"]["PreToolUse"]), 1)
         self.assertEqual(len(second.settings_json["hooks"]["SessionEnd"]), 2)
 
@@ -799,14 +812,19 @@ class RunSetupEndToEnd(unittest.TestCase):
             home_dir=Path("/home/user"),
         )
 
+        # PostToolUse: 1 block (compress_bash_output.py); record_session_id.py
+        # moved to SessionStart in issue #231 -- no longer in PostToolUse.
+        # SessionStart: 1 block (record_session_id.py).
+        # Both must reference the moved tools repo path, not the old one.
         post_hooks = second.settings_json["hooks"]["PostToolUse"]
-        # Two blocks (core record_session_id.py + compress_bash_output.py),
-        # not duplicated -- issue #198 added the second block per event.
-        self.assertEqual(len(post_hooks), 2)
+        self.assertEqual(len(post_hooks), 1)
         for block in post_hooks:
-            # Normalize path separators before comparing: JSON settings may
-            # store paths with forward slashes on Windows for cross-platform
-            # compatibility, while str(Path) uses the OS separator.
+            actual = block["hooks"][0]["args"][0].replace("\\", "/")
+            self.assertIn(moved_tools_repo.as_posix(), actual)
+
+        start_hooks = second.settings_json["hooks"]["SessionStart"]
+        self.assertEqual(len(start_hooks), 1)
+        for block in start_hooks:
             actual = block["hooks"][0]["args"][0].replace("\\", "/")
             self.assertIn(moved_tools_repo.as_posix(), actual)
 

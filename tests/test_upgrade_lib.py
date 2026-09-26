@@ -154,14 +154,14 @@ class RecordSessionIdHooksMissing(unittest.TestCase):
         self.assertTrue(migration.detect({}, settings_json))
 
     def test_detect_false_when_already_present(self):
-        # Both events must be registered for this to count as "already
-        # applied" -- see test_detect_true_when_only_*_is_registered below
-        # for the partial-registration cases this distinction exists for.
+        # Both events (SessionStart + SessionEnd) must be registered for
+        # this to count as "already applied" -- see the partial-registration
+        # tests below for why each event is checked independently.
         migration = _migration("record-session-id-hooks-missing")
         settings_json = {
             "hooks": {
-                "PostToolUse": [
-                    {"matcher": ".*", "hooks": [{"type": "command", "command": "x", "args": ["/x/hooks/record_session_id.py"]}]}
+                "SessionStart": [
+                    {"hooks": [{"type": "command", "command": "x", "args": ["/x/hooks/record_session_id.py"]}]}
                 ],
                 "SessionEnd": [
                     {"hooks": [{"type": "command", "command": "x", "args": ["/x/hooks/record_session_id.py"]}]}
@@ -215,8 +215,8 @@ class RecordSessionIdHooksMissing(unittest.TestCase):
         self.assertEqual(after_settings["hooks"]["PreToolUse"], [existing_pretooluse_block])
 
         # A NEW core block was appended for record_session_id.py under both
-        # PostToolUse and SessionEnd.
-        for event in ("PostToolUse", "SessionEnd"):
+        # SessionStart and SessionEnd.
+        for event in ("SessionStart", "SessionEnd"):
             scripts = [
                 Path(a).name
                 for block in after_settings["hooks"][event]
@@ -226,9 +226,11 @@ class RecordSessionIdHooksMissing(unittest.TestCase):
             self.assertIn("record_session_id.py", scripts)
 
         # The core block's command/args are resolved from THIS MigrationContext.
-        post_hooks = [h for b in after_settings["hooks"]["PostToolUse"] for h in b["hooks"]]
-        core_hook = next(h for h in post_hooks if Path(h["args"][-1]).name == "record_session_id.py")
-        self.assertEqual(core_hook["command"], str(_VENV_PYTHON))
+        start_hooks = [h for b in after_settings["hooks"]["SessionStart"] for h in b["hooks"]]
+        core_hook = next(h for h in start_hooks if Path(h["args"][-1]).name == "record_session_id.py")
+        # build_settings_hooks emits command/args as POSIX strings (.as_posix());
+        # use the same form here to avoid Windows backslash vs forward-slash mismatch.
+        self.assertEqual(core_hook["command"], _VENV_PYTHON.as_posix())
         self.assertTrue(core_hook["args"][-1].endswith("hooks/record_session_id.py"))
 
         # The original dict passed in is never mutated in place.
@@ -239,7 +241,7 @@ class RecordSessionIdHooksMissing(unittest.TestCase):
         _, after_settings = migration.apply({}, {}, _ctx())
         scripts = [
             Path(a).name
-            for block in after_settings["hooks"]["PostToolUse"]
+            for block in after_settings["hooks"]["SessionStart"]
             for hook in block["hooks"]
             for a in hook["args"]
         ]
@@ -249,7 +251,7 @@ class RecordSessionIdHooksMissing(unittest.TestCase):
         # Regression for the finding from Copilot review on PR #227: a
         # single boolean "does record_session_id.py appear ANYWHERE"
         # treated this partially-configured state as already up to date,
-        # even though PostToolUse -- the event that actually creates/
+        # even though SessionStart -- the event that actually creates/
         # refreshes the SHADOW_FILE marker -- is missing.
         migration = _migration("record-session-id-hooks-missing")
         settings_json = {
@@ -261,13 +263,31 @@ class RecordSessionIdHooksMissing(unittest.TestCase):
         }
         self.assertTrue(migration.detect({}, settings_json))
 
-    def test_detect_true_when_only_post_tool_use_is_registered(self):
+    def test_detect_true_when_only_session_start_is_registered(self):
+        # Symmetric case: SessionStart present but SessionEnd absent.
+        migration = _migration("record-session-id-hooks-missing")
+        settings_json = {
+            "hooks": {
+                "SessionStart": [
+                    {"hooks": [{"type": "command", "command": "x", "args": ["/x/hooks/record_session_id.py"]}]}
+                ]
+            }
+        }
+        self.assertTrue(migration.detect({}, settings_json))
+
+    def test_detect_true_when_old_posttooluse_wildcard_present_but_sessionstart_absent(self):
+        # A project configured by issue #198 (old PostToolUse '.*' design)
+        # before issue #231 shipped: has PostToolUse+SessionEnd but not
+        # SessionStart -- both _RECORD_SESSION_ID_EVENTS are still missing.
         migration = _migration("record-session-id-hooks-missing")
         settings_json = {
             "hooks": {
                 "PostToolUse": [
                     {"matcher": ".*", "hooks": [{"type": "command", "command": "x", "args": ["/x/hooks/record_session_id.py"]}]}
-                ]
+                ],
+                "SessionEnd": [
+                    {"hooks": [{"type": "command", "command": "x", "args": ["/x/hooks/record_session_id.py"]}]}
+                ],
             }
         }
         self.assertTrue(migration.detect({}, settings_json))
@@ -283,14 +303,14 @@ class RecordSessionIdHooksMissing(unittest.TestCase):
 
         # SessionEnd is untouched -- still exactly the one pre-existing block.
         self.assertEqual(after_settings["hooks"]["SessionEnd"], [existing_session_end_block])
-        # PostToolUse got the missing core block added.
-        post_scripts = [
+        # SessionStart got the missing core block added.
+        start_scripts = [
             Path(a).name
-            for block in after_settings["hooks"]["PostToolUse"]
+            for block in after_settings["hooks"]["SessionStart"]
             for hook in block["hooks"]
             for a in hook["args"]
         ]
-        self.assertIn("record_session_id.py", post_scripts)
+        self.assertIn("record_session_id.py", start_scripts)
         # detect() now reports this migration as fully applied.
         self.assertFalse(migration.detect({}, after_settings))
 
@@ -323,10 +343,197 @@ class HfHubOfflineMissing(unittest.TestCase):
         self.assertNotIn("HF_HUB_OFFLINE", before["mcpServers"]["qdrant"]["env"])
 
 
+class RecordSessionIdSessionstart(unittest.TestCase):
+    """Tests for the record-session-id-sessionstart migration (issue #231):
+    removes the stale PostToolUse '.*' block for record_session_id.py."""
+
+    def test_detect_true_when_posttooluse_wildcard_present_for_record_session_id(self):
+        migration = _migration("record-session-id-sessionstart")
+        settings_json = {
+            "hooks": {
+                "PostToolUse": [
+                    {"matcher": ".*", "hooks": [{"type": "command", "command": "x", "args": ["/x/hooks/record_session_id.py"]}]}
+                ]
+            }
+        }
+        self.assertTrue(migration.detect({}, settings_json))
+
+    def test_detect_false_when_no_wildcard_posttooluse_block(self):
+        migration = _migration("record-session-id-sessionstart")
+        settings_json = {
+            "hooks": {
+                "PostToolUse": [
+                    {"matcher": "Bash|Grep", "hooks": [{"args": ["/x/hooks/compress_bash_output.py"]}]}
+                ],
+                "SessionStart": [{"hooks": [{"args": ["/x/hooks/record_session_id.py"]}]}],
+                "SessionEnd": [{"hooks": [{"args": ["/x/hooks/record_session_id.py"]}]}],
+            }
+        }
+        self.assertFalse(migration.detect({}, settings_json))
+
+    def test_detect_false_when_wildcard_present_but_for_different_script(self):
+        # A user's own '.*' PostToolUse block for an unrelated script must not
+        # be detected as the stale record_session_id.py block.
+        migration = _migration("record-session-id-sessionstart")
+        settings_json = {
+            "hooks": {
+                "PostToolUse": [
+                    {"matcher": ".*", "hooks": [{"args": ["/user/hooks/custom_hook.py"]}]}
+                ]
+            }
+        }
+        self.assertFalse(migration.detect({}, settings_json))
+
+    def test_detect_false_on_empty_settings(self):
+        migration = _migration("record-session-id-sessionstart")
+        self.assertFalse(migration.detect({}, {}))
+
+    # Helper: a minimal SessionStart block to satisfy the safety guard -- the apply
+    # function requires SessionStart to be present before it removes the PostToolUse
+    # fallback (PR #232 Copilot review finding).
+    _SESSION_START_BLOCK = {"hooks": [{"args": ["/x/hooks/record_session_id.py"]}]}
+
+    def test_apply_removes_only_the_wildcard_record_session_id_block(self):
+        migration = _migration("record-session-id-sessionstart")
+        stale_block = {
+            "matcher": ".*",
+            "hooks": [{"type": "command", "command": "/old/python", "args": ["/old/hooks/record_session_id.py"]}],
+        }
+        compress_block = {
+            "matcher": "Bash|Grep",
+            "hooks": [{"type": "command", "command": "/old/python", "args": ["/old/hooks/compress_bash_output.py"]}],
+        }
+        before_settings = {
+            "hooks": {
+                "SessionStart": [copy.deepcopy(self._SESSION_START_BLOCK)],  # guard requires this
+                "PostToolUse": [copy.deepcopy(stale_block), copy.deepcopy(compress_block)],
+            }
+        }
+        _, after_settings = migration.apply({}, before_settings, _ctx())
+
+        post_blocks = after_settings["hooks"]["PostToolUse"]
+        # The stale '.*' block is gone.
+        self.assertNotIn(stale_block, post_blocks)
+        # The compress block is untouched.
+        self.assertIn(compress_block, post_blocks)
+        # The original dict is never mutated in place.
+        self.assertIn(stale_block, before_settings["hooks"]["PostToolUse"])
+
+    def test_apply_leaves_empty_posttooluse_list_when_only_block_was_stale(self):
+        migration = _migration("record-session-id-sessionstart")
+        before_settings = {
+            "hooks": {
+                "SessionStart": [copy.deepcopy(self._SESSION_START_BLOCK)],
+                "PostToolUse": [
+                    {"matcher": ".*", "hooks": [{"args": ["/x/hooks/record_session_id.py"]}]}
+                ],
+            }
+        }
+        _, after_settings = migration.apply({}, before_settings, _ctx())
+        self.assertEqual(after_settings["hooks"]["PostToolUse"], [])
+
+    def test_apply_does_not_touch_user_wildcard_block_for_other_scripts(self):
+        migration = _migration("record-session-id-sessionstart")
+        user_block = {"matcher": ".*", "hooks": [{"args": ["/user/hooks/my_custom.py"]}]}
+        before_settings = {
+            "hooks": {
+                "SessionStart": [copy.deepcopy(self._SESSION_START_BLOCK)],
+                "PostToolUse": [
+                    {"matcher": ".*", "hooks": [{"args": ["/x/hooks/record_session_id.py"]}]},
+                    copy.deepcopy(user_block),
+                ],
+            }
+        }
+        _, after_settings = migration.apply({}, before_settings, _ctx())
+        self.assertIn(user_block, after_settings["hooks"]["PostToolUse"])
+
+    def test_apply_is_noop_when_sessionstart_absent(self):
+        # Regression guard for the finding from Copilot review on PR #232:
+        # if the user declines record-session-id-hooks-missing (the migration that
+        # adds SessionStart) but accepts this removal, the apply must be a safe
+        # no-op -- leaving the PostToolUse '.*' block in place rather than
+        # producing a config with no SHADOW_FILE recorder at all.
+        migration = _migration("record-session-id-sessionstart")
+        stale_block = {
+            "matcher": ".*",
+            "hooks": [{"args": ["/x/hooks/record_session_id.py"]}],
+        }
+        before_settings = {
+            "hooks": {
+                "PostToolUse": [copy.deepcopy(stale_block)],
+                # No SessionStart -- simulates declining record-session-id-hooks-missing
+            }
+        }
+        _, after_settings = migration.apply({}, before_settings, _ctx())
+
+        # The stale block must still be present -- no-op.
+        self.assertIn(stale_block, after_settings["hooks"]["PostToolUse"])
+        # detect() still returns True (will re-appear when SessionStart is configured).
+        self.assertTrue(migration.detect({}, after_settings))
+
+    def test_apply_preserves_unrelated_inner_hook_in_the_same_wildcard_block(self):
+        # Regression guard for the finding from Copilot review on PR #232: a
+        # user who manually added a second inner hook to the same '.*' block
+        # (sharing it with the toolkit's record_session_id.py entry) must not
+        # have their custom hook silently deleted by this migration.  Only the
+        # record_session_id.py inner hook is removed; the block survives with
+        # the remaining custom hook intact.
+        migration = _migration("record-session-id-sessionstart")
+        user_inner_hook = {"type": "command", "command": "/user/python", "args": ["/user/hooks/my_audit.py"]}
+        before_settings = {
+            "hooks": {
+                "SessionStart": [copy.deepcopy(self._SESSION_START_BLOCK)],  # guard requires this
+                "PostToolUse": [
+                    {
+                        "matcher": ".*",
+                        "hooks": [
+                            {"type": "command", "command": "/x/python", "args": ["/x/hooks/record_session_id.py"]},
+                            copy.deepcopy(user_inner_hook),
+                        ],
+                    }
+                ],
+            }
+        }
+        _, after_settings = migration.apply({}, before_settings, _ctx())
+
+        post_blocks = after_settings["hooks"]["PostToolUse"]
+        # The block survived (not dropped entirely) because the user's hook remains.
+        self.assertEqual(len(post_blocks), 1)
+        remaining_inner = post_blocks[0]["hooks"]
+        # record_session_id.py is gone.
+        self.assertFalse(any(Path(h["args"][-1]).name == "record_session_id.py" for h in remaining_inner))
+        # The user's inner hook is intact.
+        self.assertIn(user_inner_hook, remaining_inner)
+        # The original dict is never mutated in place.
+        self.assertEqual(len(before_settings["hooks"]["PostToolUse"][0]["hooks"]), 2)
+
+    def test_apply_is_idempotent_via_detect(self):
+        migration = _migration("record-session-id-sessionstart")
+        before_settings = {
+            "hooks": {
+                "SessionStart": [copy.deepcopy(self._SESSION_START_BLOCK)],  # guard requires this
+                "PostToolUse": [
+                    {"matcher": ".*", "hooks": [{"args": ["/x/hooks/record_session_id.py"]}]}
+                ],
+            }
+        }
+        _, after_settings = migration.apply({}, before_settings, _ctx())
+        self.assertFalse(migration.detect({}, after_settings))
+
+
 class PendingMigrations(unittest.TestCase):
-    def test_all_three_pending_on_a_fully_stale_project(self):
+    def test_all_pending_on_a_fully_stale_project(self):
+        # A project with the old PostToolUse '.*' block (issue #198 config)
+        # plus no memory-bank / HF_HUB_OFFLINE: all four migrations pending.
         mcp_json = {"mcpServers": {"qdrant": {"env": {}}, "codebase-indexer": {"env": {}}}}
-        pending = pending_migrations(mcp_json, {})
+        settings_json = {
+            "hooks": {
+                "PostToolUse": [
+                    {"matcher": ".*", "hooks": [{"args": ["/x/hooks/record_session_id.py"]}]}
+                ]
+            }
+        }
+        pending = pending_migrations(mcp_json, settings_json)
         self.assertEqual({m.id for m in pending}, {m.id for m in MIGRATIONS})
 
     def test_none_pending_on_a_fully_up_to_date_project(self):
@@ -339,7 +546,7 @@ class PendingMigrations(unittest.TestCase):
         }
         settings_json = {
             "hooks": {
-                "PostToolUse": [{"hooks": [{"args": ["/x/hooks/record_session_id.py"]}]}],
+                "SessionStart": [{"hooks": [{"args": ["/x/hooks/record_session_id.py"]}]}],
                 "SessionEnd": [{"hooks": [{"args": ["/x/hooks/record_session_id.py"]}]}],
             }
         }
@@ -394,9 +601,11 @@ class RunUpgradeEndToEnd(unittest.TestCase):
         self._write_stale_config()
 
     def _write_stale_config(self):
-        # A project configured before #175/#198/#221 all shipped: no
-        # memory-bank server, no record_session_id.py hook, no
-        # HF_HUB_OFFLINE key at all.
+        # A project configured by issues #175/#198/#221 but BEFORE #231:
+        # has memory-bank and HF_HUB_OFFLINE absent (pre-#175/#221), plus
+        # the OLD PostToolUse '.*' registration for record_session_id.py
+        # (issue #198's original design, superseded by SessionStart in #231).
+        # This exercises all four migrations in one end-to-end run.
         (self.target_repo / ".mcp.json").write_text(
             json.dumps(
                 {
@@ -418,6 +627,16 @@ class RunUpgradeEndToEnd(unittest.TestCase):
                     "hooks": {
                         "PostToolUse": [
                             {
+                                "matcher": ".*",  # stale record_session_id.py registration (issue #198)
+                                "hooks": [
+                                    {
+                                        "type": "command",
+                                        "command": "/old/venv/bin/python",
+                                        "args": ["/old/tools-repo/hooks/record_session_id.py"],
+                                    }
+                                ],
+                            },
+                            {
                                 "matcher": "Bash",
                                 "hooks": [
                                     {
@@ -426,8 +645,19 @@ class RunUpgradeEndToEnd(unittest.TestCase):
                                         "args": ["/old/tools-repo/hooks/compress_bash_output.py"],
                                     }
                                 ],
+                            },
+                        ],
+                        "SessionEnd": [
+                            {
+                                "hooks": [
+                                    {
+                                        "type": "command",
+                                        "command": "/old/venv/bin/python",
+                                        "args": ["/old/tools-repo/hooks/record_session_id.py"],
+                                    }
+                                ]
                             }
-                        ]
+                        ],
                     }
                 }
             ),
@@ -446,14 +676,31 @@ class RunUpgradeEndToEnd(unittest.TestCase):
         mcp_json, settings_json = self._read_configs()
         self.assertIn("memory-bank", mcp_json["mcpServers"])
         self.assertEqual(mcp_json["mcpServers"]["qdrant"]["env"]["HF_HUB_OFFLINE"], "")
-        scripts = [
+        # record_session_id.py must now live under SessionStart (not PostToolUse).
+        start_scripts = [
+            Path(a).name
+            for block in settings_json["hooks"]["SessionStart"]
+            for hook in block["hooks"]
+            for a in hook["args"]
+        ]
+        self.assertIn("record_session_id.py", start_scripts)
+        # compress_bash_output.py's PostToolUse block is still intact.
+        post_scripts = [
             Path(a).name
             for block in settings_json["hooks"]["PostToolUse"]
             for hook in block["hooks"]
             for a in hook["args"]
         ]
-        self.assertIn("record_session_id.py", scripts)
-        self.assertIn("compress_bash_output.py", scripts)  # pre-existing hook preserved
+        self.assertIn("compress_bash_output.py", post_scripts)
+        # The stale '.*' PostToolUse block for record_session_id.py was removed.
+        wildcard_scripts = [
+            Path(a).name
+            for block in settings_json["hooks"]["PostToolUse"]
+            for hook in block["hooks"]
+            for a in hook["args"]
+            if block.get("matcher") == ".*"
+        ]
+        self.assertNotIn("record_session_id.py", wildcard_scripts)
 
     def test_idempotent_second_run_has_nothing_pending(self):
         run_upgrade(self.target_repo, REPO_ROOT, _VENV_PYTHON, auto_yes=True)

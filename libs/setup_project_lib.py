@@ -347,11 +347,15 @@ def build_mcp_servers(
 
 
 # (event, script filename) for every hook this toolkit's templates define,
-# split into two groups (issue #198):
+# split into two groups (issue #198, #231):
 #   - _CORE_HOOK_SCRIPTS: written for EVERY project regardless of
 #     --qdrant-only/local-compress config -- today, just record_session_id.py
-#     (registered under both PostToolUse and SessionEnd), which keeps
+#     (registered under SessionStart and SessionEnd), which keeps
 #     libs/session_id_lib.py's SHADOW_FILE strategy actually populated.
+#     SessionStart replaced PostToolUse (issue #231): the '.*' PostToolUse
+#     matcher fired on EVERY tool call (~400ms Python startup × N calls on
+#     Windows), while SessionStart fires exactly once per session lifecycle
+#     event (startup/resume/clear/compact/fork).
 #   - _COMPRESS_HOOK_SCRIPTS: only written when local-compress is configured
 #     (include_compress=True below) -- the pre-existing three hooks.
 # _TOOLKIT_HOOK_SCRIPTS (both groups combined) is the single source of truth
@@ -361,7 +365,7 @@ def build_mcp_servers(
 # what stops them from silently drifting apart if a script is ever renamed
 # or a new hook added.
 _CORE_HOOK_SCRIPTS = (
-    ("PostToolUse", "record_session_id.py"),
+    ("SessionStart", "record_session_id.py"),
     ("SessionEnd", "record_session_id.py"),
 )
 _COMPRESS_HOOK_SCRIPTS = (
@@ -418,8 +422,8 @@ def build_settings_hooks(
     template: dict, *, venv_python: Path, tools_repo_dir: Path, include_compress: bool = True
 ) -> dict:
     """
-    Returns a fresh `hooks` dict (PostToolUse/PreToolUse/SessionEnd) with
-    every REPLACE-WITH-VENV-PYTHON / /absolute/path/to/tools-repo/...
+    Returns a fresh `hooks` dict (SessionStart/PostToolUse/PreToolUse/SessionEnd)
+    with every REPLACE-WITH-VENV-PYTHON / /absolute/path/to/tools-repo/...
     placeholder resolved. Mirrors build_mcp_servers()'s "patch known fields,
     don't blind-replace" approach.
 

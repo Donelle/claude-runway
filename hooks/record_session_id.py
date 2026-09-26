@@ -14,14 +14,22 @@ Registered under TWO separate events in `templates/settings.json.template`
 (see `libs/setup_project_lib.py`'s `_CORE_HOOK_SCRIPTS`), both pointing at
 this SAME script:
 
-  - `PostToolUse` (broad matcher `.*` -- fires often enough that the marker's
-    mtime tracks real recent activity, not just session start): refreshes
-    this session's OWN marker first, then -- rate-limited via a sentinel
-    file, roughly once per hour -- sweeps any marker older than
-    `CLAUDE_RUNWAY_SESSION_MARKER_TTL_HOURS` (default 48). Refreshing self
-    BEFORE sweeping guarantees a live session can never observe its own
-    marker as stale and prune itself, regardless of how long it's been
-    since this session's last tool call relative to the TTL.
+  - `SessionStart` (no matcher -- fires on every start type: startup,
+    resume, clear, compact, fork): writes this session's own marker ONCE,
+    then -- rate-limited via a sentinel file, roughly once per hour --
+    sweeps any marker older than `CLAUDE_RUNWAY_SESSION_MARKER_TTL_HOURS`
+    (default 48). Writing self BEFORE sweeping guarantees a live session
+    can never observe its own marker as stale and prune itself. Firing on
+    ALL start types ensures correctness across the full session lifecycle:
+    `startup`/`fork` create a new marker for a brand-new session_id;
+    `resume`/`clear`/`compact` refresh the mtime for an already-known one.
+    SessionStart replaced the prior PostToolUse `.*` registration
+    (issue #231): the old design paid ~400ms Python subprocess startup
+    overhead on Windows for EVERY tool call; the new one pays it exactly
+    once per session lifecycle event regardless of session length.
+    Existing projects with the old `.*` PostToolUse block still work --
+    `_handle_post_tool_use` is kept for backward compatibility -- but can
+    migrate via `claude-runway-setup upgrade`.
   - `SessionEnd`: Layer 1 graceful cleanup -- deletes this session's own
     marker on normal exit. A sibling delete to, but independent of,
     `savings_ledger.finalize_session()`'s own unlink of its differently
@@ -73,15 +81,37 @@ except ImportError:
     sys.exit(0)
 
 
-def _handle_post_tool_use(payload: dict) -> None:
+def _handle_session_start(payload: dict) -> None:
     raw_session_id = payload.get("session_id")
     if not raw_session_id:
         return
     cwd = payload.get("cwd") or ""
     if cwd:
-        # Refresh THIS session's own marker first, unconditionally, before
-        # any sweep runs below -- see module docstring for why this
-        # ordering is what keeps a live session from ever pruning itself.
+        # Write/refresh THIS session's own marker first, unconditionally,
+        # before any sweep runs below -- same write-then-sweep ordering
+        # the old PostToolUse handler used, for the same reason: a live
+        # session can never observe its own marker as stale and prune itself
+        # regardless of which start type fired (startup/resume/clear/
+        # compact/fork) or how long elapsed since the previous lifecycle
+        # event.
+        session_id_lib.record_shadow_marker(raw_session_id, project=cwd)
+    if session_id_lib.should_sweep():
+        session_id_lib.sweep_stale_shadow_markers()
+        session_id_lib.mark_swept()
+
+
+def _handle_post_tool_use(payload: dict) -> None:
+    # Kept for backward compatibility: existing projects configured before
+    # issue #231 landed still have a PostToolUse '.*' registration that
+    # fires this handler on every tool call.  It is functionally correct
+    # (writing/refreshing the marker is idempotent) but adds unnecessary
+    # latency on Windows (~400ms Python startup per tool call).  New setups
+    # use SessionStart exclusively.  Migrate via 'claude-runway-setup upgrade'.
+    raw_session_id = payload.get("session_id")
+    if not raw_session_id:
+        return
+    cwd = payload.get("cwd") or ""
+    if cwd:
         session_id_lib.record_shadow_marker(raw_session_id, project=cwd)
     if session_id_lib.should_sweep():
         session_id_lib.sweep_stale_shadow_markers()
@@ -97,6 +127,9 @@ def _handle_session_end(payload: dict) -> None:
 
 def _dispatch(payload: dict) -> None:
     event = payload.get("hook_event_name")
+    if event == "SessionStart":
+        _handle_session_start(payload)
+        return
     # Fallback discriminator for a payload shape without hook_event_name:
     # PostToolUse payloads always carry tool_name, SessionEnd payloads never do.
     is_session_end = event == "SessionEnd" or (event is None and "tool_name" not in payload)

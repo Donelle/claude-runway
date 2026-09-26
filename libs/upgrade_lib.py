@@ -180,11 +180,16 @@ def _apply_memory_bank_server_missing(
 # ---------------------------------------------------------------------------
 
 
-# The two events record_session_id.py must be registered under (issue
-# #198): PostToolUse creates/refreshes libs/session_id_lib.py's SHADOW_FILE
-# marker, SessionEnd deletes it on graceful exit. Both matter independently
-# -- see _missing_record_session_id_events below.
-_RECORD_SESSION_ID_EVENTS = ("PostToolUse", "SessionEnd")
+# The two events record_session_id.py must be registered under (issues
+# #198, #231): SessionStart creates/refreshes libs/session_id_lib.py's
+# SHADOW_FILE marker once per session lifecycle event (startup/resume/
+# clear/compact/fork), SessionEnd deletes it on graceful exit.  Both
+# matter independently -- see _missing_record_session_id_events below.
+# PostToolUse was the original event (#198) but was replaced by SessionStart
+# (#231) to eliminate the ~400ms-per-tool-call Python startup overhead on
+# Windows.  Projects still carrying the old PostToolUse '.*' registration
+# are handled by the separate record-session-id-sessionstart migration below.
+_RECORD_SESSION_ID_EVENTS = ("SessionStart", "SessionEnd")
 
 
 def _has_record_session_id_hook_for_event(settings_json: dict, event: str) -> bool:
@@ -204,11 +209,11 @@ def _missing_record_session_id_events(settings_json: dict) -> "list[str]":
     single boolean `_has_record_session_id_hook` treated the migration as
     already-applied the moment EITHER event had the registration, so a
     partially-configured project with only a SessionEnd entry (no
-    PostToolUse) permanently skipped the repair -- PostToolUse is the one
-    that actually creates/refreshes the marker, so that project's
-    SHADOW_FILE strategy would silently never populate at all, forever,
-    since `detect` would keep reporting "nothing to do" on every future
-    `upgrade` run too.
+    SessionStart) permanently skipped the repair -- SessionStart is the one
+    that actually creates/refreshes the marker (issue #231; PostToolUse was
+    the original event from issue #198), so that project's SHADOW_FILE
+    strategy would silently never populate at all, forever, since `detect`
+    would keep reporting "nothing to do" on every future `upgrade` run too.
     """
     return [event for event in _RECORD_SESSION_ID_EVENTS if not _has_record_session_id_hook_for_event(settings_json, event)]
 
@@ -226,7 +231,7 @@ def _apply_record_session_id_hooks_missing(
     and ONLY those event(s) -- to whatever `settings_json` already has.
     Deliberately per-event, not "always both": a partially-configured
     project that already has (say) `SessionEnd`'s registration but not
-    `PostToolUse`'s must get only `PostToolUse` added -- appending BOTH
+    `SessionStart`'s must get only `SessionStart` added -- appending BOTH
     unconditionally would duplicate the one that's already there (see
     `_missing_record_session_id_events`'s own docstring for the real-world
     scenario this fixes, found in Copilot review on PR #227).
@@ -240,24 +245,25 @@ def _apply_record_session_id_hooks_missing(
     every run, but wrong here: this migration's own `detect` fires precisely
     for a project that adopted local-compress BEFORE #198 shipped, i.e. one
     whose PostToolUse already has a REAL `compress_bash_output.py` block and
-    no separate core block at all (the template's own PostToolUse entry for
-    record_session_id.py didn't exist yet when that project was set up).
-    Calling `build_settings_hooks(..., include_compress=False)` and merging
-    the result would treat PostToolUse as "generated -> only the core block"
-    and, via `merge_settings_hooks`'s strip-then-replace logic, silently
-    DELETE that project's real, working `compress_bash_output.py` entry --
-    confirmed by writing that version first and catching it wiping the
-    compress hook out of a fixture that had one, in this file's own tests.
-    A pure append has no such failure mode: it only ever adds the two core
+    no separate CORE block at all (the template's own SessionStart entry for
+    record_session_id.py didn't exist yet when that project was set up --
+    it was originally a PostToolUse entry, replaced by SessionStart in
+    issue #231).  Calling `build_settings_hooks(..., include_compress=False)`
+    and merging the result would treat PostToolUse as "generated -> only the
+    core block" and, via `merge_settings_hooks`'s strip-then-replace logic,
+    silently DELETE that project's real, working `compress_bash_output.py`
+    entry -- confirmed by writing that version first and catching it wiping
+    the compress hook out of a fixture that had one, in this file's own tests.
+    A pure append has no such failure mode: it only ever adds the core
     blocks this migration's `detect` found missing, never inspects or
     touches any other block.
 
     Still reuses `build_settings_hooks` itself (not `merge_settings_hooks`)
-    purely to get the two core blocks' `command`/`args` resolved against
-    THIS `MigrationContext`'s `tools_repo_dir`/`venv_python` -- with
-    `include_compress=False`, its own `PostToolUse`/`SessionEnd` results
-    contain exactly one block each (the core one; the compress-gated block
-    is stripped from the RETURNED dict, not from `settings_json`), so no
+    purely to get the core blocks' `command`/`args` resolved against THIS
+    `MigrationContext`'s `tools_repo_dir`/`venv_python` -- with
+    `include_compress=False`, its `SessionStart`/`SessionEnd` results
+    contain exactly one block each (the core one; any compress-gated blocks
+    are stripped from the RETURNED dict, not from `settings_json`), so no
     filtering is needed on this end either.
     """
     settings_json = copy.deepcopy(settings_json)
@@ -301,6 +307,89 @@ def _apply_hf_hub_offline_missing(mcp_json: dict, settings_json: dict, ctx: Migr
     return mcp_json, settings_json
 
 
+# ---------------------------------------------------------------------------
+# record-session-id-sessionstart (fix: #231)
+# ---------------------------------------------------------------------------
+
+
+def _detect_record_session_id_posttooluse_wildcard(mcp_json: dict, settings_json: dict) -> bool:
+    """
+    True when .claude/settings.json still has the OLD PostToolUse '.*' block
+    for record_session_id.py (issue #198's original registration, superseded
+    by SessionStart in issue #231).  Detects by matcher value AND script name
+    so a user's own unrelated '.*' PostToolUse block isn't falsely flagged.
+    """
+    for block in settings_json.get("hooks", {}).get("PostToolUse", []):
+        if block.get("matcher") != ".*":
+            continue
+        for hook in block.get("hooks", []):
+            if any(Path(a).name == "record_session_id.py" for a in hook.get("args", [])):
+                return True
+    return False
+
+
+def _apply_record_session_id_posttooluse_wildcard(
+    mcp_json: dict, settings_json: dict, ctx: MigrationContext
+) -> "tuple[dict, dict]":
+    """
+    Removes only the record_session_id.py INNER HOOK entry from any PostToolUse
+    block whose matcher is '.*' -- the stale registration that fired a Python
+    subprocess (~400ms on Windows) on every single tool call (issue #231).
+    Operates at INNER-HOOK granularity (same as _strip_toolkit_owned_inner_hooks
+    in setup_project_lib.py), not whole-block: if a user manually added another
+    inner hook to the same '.*' block, only the record_session_id.py entry is
+    removed and the block survives with the remaining content intact (confirmed
+    as the data-loss-safe behaviour by Copilot review on PR #232).  A block
+    that contained ONLY the record_session_id.py entry is dropped entirely,
+    leaving 'PostToolUse: []' rather than removing the key -- consistent with
+    _strip_toolkit_owned_inner_hooks.  An empty PostToolUse array is harmless.
+
+    Safety guard: returns unchanged (no-op) when SessionStart is not yet present,
+    preventing the dangerous state of removing the PostToolUse fallback before
+    its replacement is in place (see inline comment below).  Re-run after
+    record-session-id-hooks-missing has added the SessionStart block.
+    """
+    # Safety guard (PR #232 Copilot review): only remove the stale PostToolUse
+    # '.*' block if a SessionStart registration for record_session_id.py is
+    # ALREADY PRESENT in the current (in-memory) settings_json.  Without this
+    # guard, a user who declines record-session-id-hooks-missing (the migration
+    # that ADDS SessionStart) but accepts this removal would end up with no
+    # SHADOW_FILE recorder at all -- worse than the original state.
+    #
+    # run_upgrade passes each migration the cumulative in-memory result of all
+    # prior applies, so this guard also handles the normal "both pending, both
+    # accepted" case correctly: by the time this apply runs,
+    # record-session-id-hooks-missing has already added SessionStart to the
+    # in-memory settings_json, so the guard passes and the removal proceeds.
+    if not _has_record_session_id_hook_for_event(settings_json, "SessionStart"):
+        return mcp_json, settings_json  # no-op; safe to re-run after SessionStart is configured
+
+    settings_json = copy.deepcopy(settings_json)
+    hooks = settings_json.get("hooks", {})
+    post_blocks = hooks.get("PostToolUse", [])
+    surviving = []
+    for block in post_blocks:
+        if block.get("matcher") == ".*":
+            # Strip at INNER-HOOK granularity (same as _strip_toolkit_owned_inner_hooks
+            # in setup_project_lib.py) so a user who manually added their own hook
+            # to the same '.*' block doesn't lose it.  A whole-block drop would only
+            # be correct if the block contained ONLY the record_session_id.py entry --
+            # confirmed as the real failure mode by Copilot review on PR #232.
+            remaining_inner = [
+                hook for hook in block.get("hooks", [])
+                if not any(Path(a).name == "record_session_id.py" for a in hook.get("args", []))
+            ]
+            if not remaining_inner:
+                continue  # nothing left in this block -- drop it entirely
+            modified = copy.deepcopy(block)
+            modified["hooks"] = remaining_inner
+            surviving.append(modified)
+        else:
+            surviving.append(block)
+    hooks["PostToolUse"] = surviving
+    return mcp_json, settings_json
+
+
 # Ordered oldest-feature-first -- order only affects DISPLAY order when more
 # than one migration is pending; `detect` alone decides whether each one is
 # shown at all.
@@ -326,10 +415,11 @@ MIGRATIONS: "list[Migration]" = [
         title="Add record_session_id.py hooks to .claude/settings.json",
         kind="add",
         description=(
-            "No hook entry in this project's .claude/settings.json references record_session_id.py -- the "
-            "CORE/base-install hook (issue #198) that keeps libs/session_id_lib.py's SHADOW_FILE session-id "
-            "strategy populated isn't running here yet. Adds the PostToolUse + SessionEnd blocks; any other "
-            "existing hooks (including local-compress's own) are left completely untouched."
+            "No hook entry in this project's .claude/settings.json references record_session_id.py for "
+            "SessionStart or SessionEnd -- the CORE/base-install hook (issues #198, #231) that keeps "
+            "libs/session_id_lib.py's SHADOW_FILE session-id strategy populated isn't running here yet. "
+            "Adds the SessionStart + SessionEnd blocks; any other existing hooks (including local-compress's "
+            "own) are left completely untouched."
         ),
         note="",
         detect=_detect_record_session_id_hooks_missing,
@@ -350,6 +440,27 @@ MIGRATIONS: "list[Migration]" = [
         ),
         detect=_detect_hf_hub_offline_missing,
         apply=_apply_hf_hub_offline_missing,
+    ),
+    Migration(
+        id="record-session-id-sessionstart",
+        title="Remove stale PostToolUse '.*' record_session_id.py hook from .claude/settings.json",
+        kind="remove",
+        description=(
+            "This project's .claude/settings.json has the old PostToolUse '.*' registration for "
+            "record_session_id.py (issue #198), which fires a Python subprocess (~400ms on Windows) on "
+            "EVERY tool call. Issue #231 replaced it with a SessionStart hook that fires exactly once per "
+            "session lifecycle event (startup/resume/clear/compact/fork). Removes the stale '.*' block; "
+            "any other PostToolUse hooks are left completely untouched. Run 'claude-runway-setup upgrade' "
+            "first to add the SessionStart block if it isn't present yet."
+        ),
+        note=(
+            "If the record-session-id-hooks-missing migration is also pending in the same run, apply "
+            "it first (it appears earlier in this list, so auto-yes handles ordering automatically). "
+            "If you decline record-session-id-hooks-missing, this migration becomes a safe no-op -- "
+            "it will not remove the PostToolUse fallback until a SessionStart registration is in place."
+        ),
+        detect=_detect_record_session_id_posttooluse_wildcard,
+        apply=_apply_record_session_id_posttooluse_wildcard,
     ),
 ]
 
