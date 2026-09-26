@@ -4,7 +4,7 @@ A generic, cross-tool metrics-recording primitive (issue #208): ONE shared SQLit
 
 **Why one shared tool, not one per domain:** this repo's own tool-count sanity check found 23 tools already riding along in context on every single turn across the four connected MCP servers, regardless of whether they're used that turn (see `EVALUATION.md`'s Track A4/B4/E4). A metrics-reporting design that adds a new MCP tool per future metric domain would directly work against that cost model. A single generic dispatch tool (`get_metrics`) adds a flat, bounded cost no matter how many domains eventually write into this store.
 
-**Status:** `my-gh-autowork`'s per-ticket outcome logging now writes into this store (issue #210) — the first real domain writing into `metrics.db`, using `metric_id="autowork"`. Use `/my-metrics autowork` to see a summary of tickets worked. Pre-cutover history (tickets worked before this PR landed) can be backfilled by running `tools/migrate_autowork_metrics.py` once against your own Qdrant instance (issue #209); a fresh install that has never run any autowork ticket has no autowork data regardless of migration. Migrating `libs/savings_ledger.py`'s `savings.db` or `libs/memory_events_lib.py`'s `memory-events.db` onto this store remains an explicit, separate follow-up (see issue #208's "Explicitly out of scope" section).
+**Status:** `my-gh-autowork`'s per-run outcome logging now writes into this store — the first real domain writing into `metrics.db`, using `metric_id="autowork"`. Use `/my-metrics autowork` to see a summary. A fresh install has no autowork data until at least one run completes. Migrating `libs/savings_ledger.py`'s `savings.db` or `libs/memory_events_lib.py`'s `memory-events.db` onto this store remains an explicit, separate follow-up.
 
 ## Where the data lives
 
@@ -52,7 +52,7 @@ store.detail("autowork", session_id="issue-248-143022")         # same shape, na
 
 `detail()` (issue #249) is the raw, per-event counterpart to `summary()`/`by_event_type()`'s aggregates: it returns individual rows, most-recent first, with each row's `metadata` deserialized back into a dict — the richer per-run detail (e.g. autowork's `model`/`rounds`/`wall_clock_s`/`subagent_tokens`/`tool_calls`/`findings`) that the two aggregate views never surface, since those only ever sum `value`. Deliberately generic: it doesn't hardcode any domain's metadata field names, so any future `metric_id` that stores structured metadata gets this view for free. `limit` caps the number of rows returned (default 12, same default as `trend()`'s bucket count) via SQL `LIMIT`, not a Python-side slice.
 
-`record()` also takes an optional `event_timestamp` override (issue #209) — full ISO 8601 UTC (`"YYYY-MM-DDTHH:MM:SSZ"`), used verbatim instead of the current time. Ordinary callers should never pass this; it exists for backfilling historical events with their own original date (see `tools/migrate_autowork_metrics.py` below) — an invalid format fails open (logged to stderr, nothing written), same as the non-finite `value` guard.
+`record()` also takes an optional `event_timestamp` override — full ISO 8601 UTC (`"YYYY-MM-DDTHH:MM:SSZ"`), used verbatim instead of the current time. Ordinary callers should never pass this; it exists for backfilling historical events with their own original dates — an invalid format fails open (logged to stderr, nothing written), same as the non-finite `value` guard.
 
 Writes (`record`/`increment`/`decrement`) **fail open** — a broken/locked/corrupt metrics database is logged to stderr and swallowed, never raised, since the actual domain operation an event describes has already happened by the time it's logged. Reads (`summary`/`by_event_type`/`trend`) do **not** fail open — they raise, and it's the caller's job to decide whether to surface a friendlier error (the `get_metrics` MCP tool below does exactly that, matching `savings_summary`/`savings_detail`/`savings_trend`'s own try/except pattern).
 
@@ -88,35 +88,6 @@ get_metrics(metric_id, view="summary", bucket="week", n=12, format="text", sessi
 - `session_id` (issue #248, extended to `"detail"` by issue #249): applies to `view="summary"`/`"by_event_type"`/`"detail"` — narrows the result to one specific session (e.g. one `my-gh-autowork` attempt's `issue-<n>-<HHMMSS>` marker). Ignored for `view="trend"` (not supported there — see the `MetricsStore` section above).
 - `format`: `"text"` (default, human-readable) or `"json"`.
 
-## Historical migration (`tools/migrate_autowork_metrics.py`, issue #209)
-
-A one-time, throwaway script — not meant to be run more than once in normal
-operation, though it's idempotent (safe to re-run; already-migrated points
-are detected via a `qdrant_point_id` tag stashed in `metadata` and skipped)
-in case of a partial failure or to pick up points logged after an earlier
-run. It:
-
-1. Reads every point under Qdrant project `claude-runway-autowork-metrics`
-   (resolved via `tools/compress_mcp_server.py`'s own `_collections_for_project`,
-   so it can never drift from what `compact_store`/`compact_find` themselves
-   resolve for that project).
-2. Maps each point's `information` JSON payload into one `metric_id="autowork"`
-   row: `event_type` derived from `outcome` (`"ticket_merged"`/
-   `"ticket_blocked"`/`"ticket_failed"`, or `"ticket_unknown"` for anything
-   else), `value=1.0`, `metadata` set to the full original JSON plus
-   `qdrant_point_id`/`qdrant_collection`, and `event_timestamp` taken from
-   the point's own `date` field (not migration run-time).
-3. Verifies the resulting metrics.db row count matches the Qdrant point
-   count before reporting PASS/FAIL (non-zero exit on a mismatch).
-
-```
-.venv/bin/python tools/migrate_autowork_metrics.py [--dry-run]
-```
-
-`--dry-run` previews the mapping without writing anything. Does NOT touch
-`.claude/skills/my-gh-autowork/SKILL.md` or delete anything from Qdrant —
-live logging now goes through `record_metric` (issue #210's cutover) — new runs write directly into `metrics.db` without any migration step.
-
 ## Using it
 
 **Install the skill first**: `claude-runway-setup init --install-skills` (or `python tools/setup_project.py init --install-skills` from a clone) installs/updates `my-metrics` along with every other product skill — equivalent manual copy: `mkdir -p ~/.claude/skills/my-metrics && cp skills/my-metrics/SKILL.md ~/.claude/skills/my-metrics/SKILL.md`. Product skills are only discovered once installed under `~/.claude/skills/` — the rest of the setup flow (`.mcp.json`/`.claude/settings.json`) doesn't install them for you (same step `docs/savings-tracker.md`'s "Enabling it" section documents for `/my-savings`).
@@ -129,4 +100,4 @@ live logging now goes through `record_metric` (issue #210's cutover) — new run
 - `/my-metrics autowork detail` — the last 12 autowork runs, each with its full `metadata` (model, rounds, wall_clock_s, subagent_tokens, tool_calls, findings) shown (issue #249).
 - `/my-metrics autowork summary issue-248-143022` — summary narrowed to one specific autowork attempt's `session_id` (issue #248). Only supported for `summary`/`by_event_type`/`detail`, not `trend`.
 
-Live data (post-cutover runs) appears immediately with no migration needed. Pre-cutover history (tickets worked before issue #210 landed) requires running `tools/migrate_autowork_metrics.py` once against your own Qdrant instance (issue #209) — it is not automatic, and a fresh install has no history until either the migration runs or at least one post-cutover ticket is worked.
+Live data appears immediately with no migration needed.

@@ -137,10 +137,9 @@ class RecordRoundTrip(MetricsStoreTestCase):
 
 
 class EventTimestampOverride(MetricsStoreTestCase):
-    """Issue #209: record() gained an optional event_timestamp override so
-    tools/migrate_autowork_metrics.py can backfill historical Qdrant-derived
-    events under their OWN original date, instead of every migrated row
-    collapsing onto the migration's own run-time."""
+    """record() accepts an optional event_timestamp override for backfilling
+    historical events under their own original date, so trend()'s day/week
+    bucketing doesn't collapse all prior history into a single "today" bucket."""
 
     def test_explicit_event_timestamp_is_used_verbatim(self):
         self.store.record("autowork", "ticket_merged", event_timestamp="2026-08-15T00:00:00Z")

@@ -213,13 +213,10 @@ class MetricsStore:
         ever aggregate `value`.
 
         `event_timestamp`, if given, overrides the default "stamp with the
-        current time" behavior below -- added for issue #209's one-time
-        migration of `my-gh-autowork`'s pre-existing Qdrant-stored history
-        into this store (`tools/migrate_autowork_metrics.py`), which needs
-        to preserve each migrated event's OWN original date rather than
-        having every historical entry collapse onto the migration's own
-        run-time: `trend()`'s day/week bucketing would otherwise put years
-        of prior history into a single "today" bucket. Must already be full
+        current time" behavior below -- for backfilling historical events
+        with their own original dates so `trend()`'s day/week bucketing
+        doesn't collapse all prior history into a single "today" bucket.
+        Must already be full
         ISO 8601 UTC (`"YYYY-MM-DDTHH:MM:SSZ"`, matching this column's own
         documented format) -- validated via `datetime.strptime` (REAL
         calendar/time validation, e.g. rejects `"2026-99-99T99:99:99Z"`;
