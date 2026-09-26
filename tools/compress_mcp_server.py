@@ -106,7 +106,7 @@ import subprocess
 import sys
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "libs"))
 
@@ -2044,7 +2044,7 @@ def record_metric(
     metric_id: str,
     event_type: str,
     value: float = 1.0,
-    metadata: Optional[str] = None,
+    metadata: Optional[Union[str, dict]] = None,
     session_id: Optional[str] = None,
 ) -> str:
     """
@@ -2060,10 +2060,20 @@ def record_metric(
     value: a signed numeric delta (default 1.0). Must be finite — non-finite
       values (inf/-inf/nan) are rejected by MetricsStore.record() and logged to
       stderr; this tool surfaces that as an "Error:..." return instead.
-    metadata: optional JSON string of domain-specific extra fields (e.g.
-      '{"issue": 42, "pr": 101, "rounds": 2}'). Must be valid JSON if supplied;
-      an invalid JSON string is returned as an "Error:..." string rather than
-      raising.
+    metadata: optional domain-specific extra fields, as either a JSON string
+      (e.g. '{"issue": 42, "pr": 101, "rounds": 2}') or an already-parsed
+      dict — the schema accepts both shapes directly. A string is validated
+      as JSON and must decode to an object; an invalid JSON string, or one
+      that decodes to a non-object (a list/scalar), is returned as an
+      "Error:..." string rather than raising. The dict form exists because,
+      back when this parameter was typed as a plain string, some MCP clients
+      silently coerced a string argument that happened to look like JSON into
+      a native object before this tool ever saw it, bypassing that
+      string-only schema entirely and failing every such call outright
+      (confirmed live: Claude Code itself does this coercion for a
+      JSON-object-shaped string argument). Accepting both shapes now means a
+      call succeeds regardless of which one the calling client actually
+      sends.
     session_id: optional caller-supplied session identifier — stored on the
       row for later per-session filtering via get_metrics(view="summary"/
       "by_event_type"/"detail", session_id=...) (issue #248, extended to
@@ -2084,7 +2094,9 @@ def record_metric(
     if not _math.isfinite(value):
         return f"Error: value must be finite (got {value!r})."
     metadata_dict: Optional[dict] = None
-    if metadata is not None:
+    if isinstance(metadata, dict):
+        metadata_dict = metadata
+    elif metadata is not None:
         try:
             metadata_dict = _json.loads(metadata)
         except (ValueError, TypeError) as e:

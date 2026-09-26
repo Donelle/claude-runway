@@ -1693,6 +1693,64 @@ class CompactPruneTests(unittest.TestCase):
         self.assertNotIn("Deleted", result)
 
 
+class RecordMetricAcceptsDictOrJsonStringMetadata(unittest.TestCase):
+    """record_metric's `metadata` parameter was previously documented and
+    typed as a JSON string only, but some MCP clients (confirmed live:
+    Claude Code itself) silently coerce a string argument that happens to
+    parse as a JSON object into a native dict before this tool ever sees
+    it -- bypassing that declared `string` schema type entirely. The fix
+    below widens the parameter to accept either shape directly, rather than
+    erroring on the coerced-dict case with "metadata must be valid JSON" (a
+    `TypeError` from `json.loads(dict)`, caught and misreported as a
+    JSON-parse failure even though the value was never invalid to begin
+    with)."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._db_path = str(Path(self._tmpdir.name) / "metrics.db")
+        self._env_patch = mock.patch.dict(os.environ, {"CLAUDE_RUNWAY_METRICS_DB": self._db_path})
+        self._env_patch.start()
+
+    def tearDown(self):
+        self._env_patch.stop()
+        self._tmpdir.cleanup()
+
+    def test_metadata_as_json_string_still_works(self):
+        mod = _load_compress_mcp_server()
+        result = mod.record_metric(
+            "autowork", "ticket_merged", metadata='{"issue": 211, "pr": 260}'
+        )
+        self.assertEqual(result, "OK")
+        rows = mod.metrics_lib.MetricsStore().detail("autowork")
+        self.assertEqual(rows[0]["metadata"], {"issue": 211, "pr": 260})
+
+    def test_metadata_as_already_parsed_dict_is_accepted(self):
+        mod = _load_compress_mcp_server()
+        result = mod.record_metric(
+            "autowork", "ticket_merged", metadata={"issue": 211, "pr": 260}
+        )
+        self.assertEqual(result, "OK")
+        rows = mod.metrics_lib.MetricsStore().detail("autowork")
+        self.assertEqual(rows[0]["metadata"], {"issue": 211, "pr": 260})
+
+    def test_metadata_as_list_is_still_rejected(self):
+        mod = _load_compress_mcp_server()
+        result = mod.record_metric("autowork", "ticket_merged", metadata='["not", "a", "dict"]')
+        self.assertTrue(result.startswith("Error:"))
+        self.assertIn("must be a JSON object", result)
+
+    def test_metadata_as_invalid_json_string_is_still_rejected(self):
+        mod = _load_compress_mcp_server()
+        result = mod.record_metric("autowork", "ticket_merged", metadata="{not valid json")
+        self.assertTrue(result.startswith("Error:"))
+        self.assertIn("must be valid JSON", result)
+
+    def test_metadata_omitted_still_works(self):
+        mod = _load_compress_mcp_server()
+        result = mod.record_metric("autowork", "ticket_merged")
+        self.assertEqual(result, "OK")
+
+
 class GetMetricsSessionIdFilter(unittest.TestCase):
     """Issue #248: get_metrics gained an optional session_id passthrough for
     view="summary"/"by_event_type" -- covers the MCP tool surface on top of

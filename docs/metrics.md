@@ -71,7 +71,7 @@ record_metric(metric_id, event_type, value=1.0, metadata=None, session_id=None)
 - `metric_id`: the domain (e.g. `"autowork"`) — caller-defined free-text string.
 - `event_type`: domain-defined event kind (e.g. `"ticket_merged"`, `"ticket_blocked"`).
 - `value`: a signed numeric delta (default `1.0`). Must be finite.
-- `metadata`: optional JSON string of domain-specific extra fields.
+- `metadata`: optional domain-specific extra fields, as either a JSON string or an already-parsed dict — both shapes are accepted directly (a client that coerces a JSON-shaped string argument into a native object before the tool sees it, as Claude Code itself does, still succeeds).
 - `session_id`: optional caller-supplied identifier stored in the raw row — `get_metrics`/`/my-metrics` can filter `view="summary"`/`"by_event_type"` down to one exact `session_id` (issue #248).
 
 Returns `"OK"` on success or an `"Error:..."` string on any failure — including DB write failures (when `MetricsStore.record()` returns `False`). DB write errors are also logged to stderr but not raised, preserving fail-open behavior; the `"Error:"` return is the only surface the caller sees.
