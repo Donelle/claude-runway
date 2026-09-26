@@ -43,6 +43,14 @@ import time
 from pathlib import Path
 from typing import Optional
 
+# Bare-name import, same sibling-libs-module convention
+# libs/memory_bank_lib.py already uses for libs/qdrant_model_check.py --
+# both files live in libs/, which is already on sys.path by the time either
+# is imported (every caller inserts libs/ before importing anything from
+# it). Used by current_session_id() below (issue #213) -- see that
+# function's docstring for exactly what is and isn't delegated.
+import session_id_lib
+
 
 def tracking_enabled() -> bool:
     return os.environ.get("CLAUDE_RUNWAY_TRACK_SAVINGS", "").strip().lower() in ("1", "true", "yes")
@@ -69,6 +77,16 @@ def resolve_db_path() -> Path:
 
 
 def _sessions_dir() -> Path:
+    # Deliberately NOT delegated to session_id_lib._sessions_dir() (issue
+    # #213) even though the two resolve to the identical default path
+    # (Path.home()/".claude"/"claude-runway"/"sessions") -- session_id_lib's
+    # own module docstring frames that overlap as "a directory-CONVENTION
+    # match, not a code dependency" precisely so each module can keep
+    # resolving it independently. This one MUST stay derived from
+    # resolve_db_path(), since record_event()/read_session_events()/
+    # finalize_session() all rely on it moving together with a
+    # CLAUDE_RUNWAY_SAVINGS_DB override (see that env var's docs) -- session_id_lib's
+    # own sessions dir is intentionally fixed and never honors that override.
     return resolve_db_path().parent / "sessions"
 
 
@@ -99,30 +117,50 @@ def current_session_id(project: Optional[str] = None) -> Optional[str]:
     """
     Best-effort guess at the currently-active session, for on-demand /my-savings
     calls made mid-session. Unlike a hook, an MCP tool call has no direct access
-    to Claude Code's session_id -- so this heuristically picks whichever
-    session's transient JSONL was modified most recently, since the active
-    session's ledger is the one being actively appended to. Returns None if no
-    session JSONL files exist yet (e.g. nothing has been compressed this session).
+    to Claude Code's session_id.
 
-    If `project` is given, only considers a candidate session a match when its
-    most recently recorded event was itself tagged with that exact project
-    (see record_event's `project` param) -- among matches, still picks the
-    most-recently-modified file. This is what prevents a live session sitting
-    in a DIFFERENT project/window from being picked just because its JSONL
-    happens to be the most recently touched file in the shared sessions dir
-    (issue #35): without a project match, this returns None rather than
-    substituting an unrelated session, so the caller can show "no live
-    session for this project" instead of someone else's numbers under this
-    project's label. A session JSONL written before this project field
-    existed has no `project` key on its events and so never matches a
-    project-filtered lookup -- fails toward "no live session shown," not
-    toward stale/wrong data.
+    Issue #213: when `project` is given, this delegates entirely to
+    `session_id_lib.session_id(SessionIdStrategy.SHADOW_FILE, project=project)`
+    -- scanning the CORE `hooks/record_session_id.py` hook's own
+    always-populated marker files, rather than this module's own transient
+    event-log JSONLs (which only exist once CLAUDE_RUNWAY_TRACK_SAVINGS is on
+    AND at least one compression has actually happened this session). This is
+    a strict improvement over the old project-filtered mechanism (finds a
+    live session even when nothing has been compressed yet, or when the
+    savings tracker is off entirely) while preserving the exact behavior
+    issue #35 fixed: a live session in a DIFFERENT project is never
+    substituted just because its marker happens to be the most recently
+    touched file -- no match still means None, not someone else's session.
+
+    When `project` is omitted, this KEEPS the old, independent mechanism
+    (scanning this module's own `_sessions_dir()` for the most-recently-
+    modified `*.jsonl`, returning its stem) rather than also delegating --
+    session_id_lib's own docstring is explicit that SHADOW_FILE's `project=None`
+    means "no marker can match" (a marker's basename is never `None`), NOT
+    "most recent regardless of project," and that a caller wanting that
+    different, unfiltered meaning "must implement that itself." Implementing
+    it here, unchanged, is exactly that.
+
+    Known limitation introduced by this split: if `CLAUDE_RUNWAY_SAVINGS_DB`
+    is overridden away from its default location, the project-FILTERED path
+    above targets session_id_lib's own fixed marker directory
+    (~/.claude/claude-runway/sessions, which never honors that override) while
+    the UNFILTERED path below still targets this module's own (overridden)
+    `_sessions_dir()` -- the two can only diverge in that non-default
+    configuration. In the common, unset-override case both directories are
+    identical, so this is a documented edge case, not a real-world regression
+    for the default install.
 
     Still only a best-effort guess when multiple live sessions share the SAME
     project (e.g. two windows open on the same repo) -- picks whichever of
     those was modified most recently. That ambiguity is out of scope here;
-    only the cross-project mislabeling is what this filter fixes.
+    only the cross-project mislabeling is what issue #35's filter fixes.
     """
+    if project is not None:
+        return session_id_lib.session_id(
+            session_id_lib.SessionIdStrategy.SHADOW_FILE, project=project
+        )
+
     d = _sessions_dir()
     if not d.is_dir():
         return None
@@ -142,14 +180,7 @@ def current_session_id(project: Optional[str] = None) -> Optional[str]:
     if not dated:
         return None
     dated.sort(key=lambda pair: pair[0], reverse=True)
-    if project is None:
-        return dated[0][1].stem
-    for _, p in dated:
-        session_id = p.stem
-        events = read_session_events(session_id)
-        if events and events[-1].get("project") == project:
-            return session_id
-    return None
+    return dated[0][1].stem
 
 
 # ---------------------------------------------------------------------------
@@ -163,12 +194,15 @@ def record_event(session_id: str, tool: str, raw_tokens: int, out_tokens: int, c
     honest counterfactual -- WebFetch's own server-side summary -- we don't
     observe) so an uncredited event can never contribute to the headline sum.
 
-    `project` is what current_session_id()'s optional project filter matches
-    against (issue #35) -- the sole writer, hooks/compress_bash_output.py,
-    derives it from the hook payload's own `cwd` field (the same source
-    session_end_savings.py already uses via project_name_from_cwd), so this
-    is never a guess at record time the way current_session_id() has to be
-    when reading the ledger back mid-session.
+    `project` was originally what current_session_id()'s optional project
+    filter matched against (issue #35); as of issue #213, that filtered
+    lookup delegates to session_id_lib's shadow markers instead and no
+    longer reads this per-event field at all -- it's retained here purely
+    as informational/debugging metadata on each transient event, not
+    because anything still resolves a session_id from it. The sole writer,
+    hooks/compress_bash_output.py, derives it from the hook payload's own
+    `cwd` field (the same source session_end_savings.py already uses via
+    project_name_from_cwd).
     """
     saved_tokens = max(0, raw_tokens - out_tokens) if credited else 0
     entry = {

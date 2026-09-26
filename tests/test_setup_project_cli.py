@@ -32,6 +32,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -42,6 +43,36 @@ from unittest import mock
 REPO_ROOT = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, str(REPO_ROOT / "libs"))
 sys.path.insert(0, str(REPO_ROOT / "tools"))
+
+import setup_project_lib  # noqa: E402
+
+_fastembed_warmup_patcher = None
+
+
+def setUpModule():
+    # Issue #221: cmd_init now passes attempt_fastembed_warmup=not
+    # args.dry_run into run_setup, which (when True) calls
+    # setup_project_lib.warm_fastembed_cache -- a REAL fastembed
+    # construction attempt, not something this file's own "no network"
+    # promise (see module docstring) can tolerate. Several tests below
+    # exercise cmd_init with dry_run=False; without this patch they'd
+    # depend on THIS machine's own dogfooded ~/.claude/claude-runway/
+    # fastembed-cache happening to already be warm, and would hang/fail on
+    # a genuinely cold cache with no network (e.g. a fresh CI runner).
+    # Patched once at module scope (not per-TestCase) since
+    # `setup_project_lib` is a real, singleton, sys.modules-cached module --
+    # every `_load_setup_project()` call below re-execs a FRESH copy of
+    # tools/setup_project.py, but its own `from setup_project_lib import
+    # run_setup` reuses that same cached module, so `run_setup`'s internal
+    # free-variable lookup of `warm_fastembed_cache` always resolves through
+    # this one patched attribute regardless of which copy is under test.
+    global _fastembed_warmup_patcher
+    _fastembed_warmup_patcher = mock.patch.object(setup_project_lib, "warm_fastembed_cache", return_value=False)
+    _fastembed_warmup_patcher.start()
+
+
+def tearDownModule():
+    _fastembed_warmup_patcher.stop()
 
 
 def _load_setup_project():
@@ -148,6 +179,8 @@ def _init_args(target_repo, **overrides) -> argparse.Namespace:
         memory_bank_id="",
         qdrant_only=False,
         skip_hooks=False,
+        install_skills=False,
+        skills_dir="",
         dry_run=True,
     )
     defaults.update(overrides)
@@ -384,8 +417,10 @@ class HookEnvReminderShownForSkipHooks(unittest.TestCase):
         self.assertIn("CLAUDE_RUNWAY_TRACK_SAVINGS=1", buf.getvalue())
 
     def test_qdrant_only_with_track_savings_does_not_show_the_reminder(self):
-        # qdrant-only actively removes toolkit hooks (clean_hooks_if_unused),
-        # so there's genuinely nothing left for the reminder to be about.
+        # qdrant-only omits local-compress (and its compress-gated hooks)
+        # entirely -- issue #198's CORE record_session_id.py hook is still
+        # written, but it reads none of --track-savings/--lmstudio-*, so
+        # there's genuinely nothing left for THIS reminder to be about.
         args = _init_args(self.target_repo, qdrant_only=True, track_savings=True)
         buf = io.StringIO()
         with redirect_stdout(buf):
@@ -612,6 +647,46 @@ class PipInstalledLayoutReminder(unittest.TestCase):
         self.assertIn("ingest_to_qdrant.py", output)
 
 
+class FastembedWarmupWiring(unittest.TestCase):
+    """cmd_init passes attempt_fastembed_warmup=not args.dry_run into
+    run_setup (issue #221) -- a preview shouldn't attempt a real
+    network/disk-touching cache warm-up just to show what WOULD happen.
+    Spies on run_setup (the same _capture_run_setup pattern
+    PipInstalledLayoutReminder uses above) rather than mocking it away
+    entirely, so this still exercises the real generated HF_HUB_OFFLINE
+    value -- with setUpModule's module-wide warm_fastembed_cache patch
+    (return_value=False) still in effect, so this stays network-free."""
+
+    def setUp(self):
+        self.mod = _load_setup_project()
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.target_repo = Path(self._tmpdir.name) / "my-project"
+        self.target_repo.mkdir()
+
+    def _capture_kwargs(self):
+        original_run_setup = self.mod.run_setup
+        captured = {}
+
+        def _capture(*args, **kwargs):
+            captured.update(kwargs)
+            return original_run_setup(*args, **kwargs)
+
+        return captured, mock.patch.object(self.mod, "run_setup", side_effect=_capture)
+
+    def test_dry_run_does_not_attempt_warmup(self):
+        captured, patcher = self._capture_kwargs()
+        with patcher:
+            self.mod.cmd_init(_init_args(self.target_repo, dry_run=True))
+        self.assertFalse(captured["attempt_fastembed_warmup"])
+
+    def test_real_run_attempts_warmup(self):
+        captured, patcher = self._capture_kwargs()
+        with patcher:
+            self.mod.cmd_init(_init_args(self.target_repo, dry_run=False))
+        self.assertTrue(captured["attempt_fastembed_warmup"])
+
+
 class MainIsTheConsoleScriptEntryPoint(unittest.TestCase):
     """`main()` (issue #50) is what pyproject.toml's `claude-runway-setup`
     console script points `module:function` at -- pinning that it does
@@ -627,6 +702,269 @@ class MainIsTheConsoleScriptEntryPoint(unittest.TestCase):
             mod.main()
         fake_parse_args.assert_called_once_with()
         fake_func.assert_called_once_with(fake_args)
+
+
+class InstallSkillsFlag(unittest.TestCase):
+    """`--install-skills` (issue #205): fresh install, no-op on identical,
+    update on modified, --dry-run writes nothing, --skills-dir override,
+    skills-only mode (no target_repo) touching no project config, and the
+    now-optional target_repo still being required when --install-skills
+    isn't given."""
+
+    def setUp(self):
+        self.mod = _load_setup_project()
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.target_repo = Path(self._tmpdir.name) / "my-project"
+        self.target_repo.mkdir()
+        self.skills_dir = Path(self._tmpdir.name) / "skills-dest"
+        # A fake tools-repo skills/ layout, independent of this real repo's
+        # own skills/ -- so this test doesn't depend on (or need updating
+        # for) whatever skills happen to actually exist here today.
+        self.fake_tools_repo = Path(self._tmpdir.name) / "fake-tools-repo"
+        (self.fake_tools_repo / "skills" / "my-fake-skill").mkdir(parents=True)
+        (self.fake_tools_repo / "skills" / "my-fake-skill" / "SKILL.md").write_text(
+            "# My Fake Skill\ncontent v1\n", encoding="utf-8"
+        )
+        # cmd_init's normal (non-skills-only) branch still calls run_setup,
+        # which needs a real templates/ dir under whatever TOOLS_REPO_DIR
+        # this test mocks -- copy the real one in so tests combining
+        # --install-skills with a real target_repo exercise the actual
+        # cmd_init path end to end, not just the skills-only branch.
+        shutil.copytree(REPO_ROOT / "templates", self.fake_tools_repo / "templates")
+
+    def _run(self, **overrides):
+        args = _init_args(self.target_repo, install_skills=True, skills_dir=str(self.skills_dir), **overrides)
+        with mock.patch.object(self.mod, "TOOLS_REPO_DIR", self.fake_tools_repo):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                self.mod.cmd_init(args)
+            return buf.getvalue()
+
+    def test_fresh_install_writes_the_skill_file(self):
+        self._run(dry_run=False)
+        written = (self.skills_dir / "my-fake-skill" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertEqual(written, "# My Fake Skill\ncontent v1\n")
+
+    def test_dry_run_writes_nothing(self):
+        output = self._run(dry_run=True)
+        self.assertFalse((self.skills_dir / "my-fake-skill" / "SKILL.md").exists())
+        self.assertIn("Would install my-fake-skill", output)
+
+    def test_rerun_on_identical_content_reports_up_to_date_and_does_not_rewrite(self):
+        self._run(dry_run=False)
+        installed_path = self.skills_dir / "my-fake-skill" / "SKILL.md"
+        mtime_before = installed_path.stat().st_mtime_ns
+        output = self._run(dry_run=False)
+        self.assertIn("my-fake-skill: up to date", output)
+        self.assertEqual(installed_path.stat().st_mtime_ns, mtime_before)
+
+    def test_changed_source_updates_the_existing_file(self):
+        self._run(dry_run=False)
+        (self.fake_tools_repo / "skills" / "my-fake-skill" / "SKILL.md").write_text(
+            "# My Fake Skill\ncontent v2\n", encoding="utf-8"
+        )
+        output = self._run(dry_run=False)
+        self.assertIn("Updating my-fake-skill", output)
+        written = (self.skills_dir / "my-fake-skill" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertEqual(written, "# My Fake Skill\ncontent v2\n")
+
+    def test_combined_with_target_repo_also_writes_mcp_json(self):
+        self._run(dry_run=False)
+        self.assertTrue((self.target_repo / ".mcp.json").exists())
+        self.assertTrue((self.skills_dir / "my-fake-skill" / "SKILL.md").exists())
+
+    def test_skills_only_mode_touches_no_project_config(self):
+        args = argparse.Namespace(
+            target_repo=None,
+            install_skills=True,
+            skills_dir=str(self.skills_dir),
+            dry_run=False,
+        )
+        with mock.patch.object(self.mod, "TOOLS_REPO_DIR", self.fake_tools_repo):
+            self.mod.cmd_init(args)
+        self.assertTrue((self.skills_dir / "my-fake-skill" / "SKILL.md").exists())
+        self.assertFalse((self.target_repo / ".mcp.json").exists())
+        self.assertFalse((self.target_repo / ".claude").exists())
+
+    def test_crlf_source_round_trips_byte_for_byte_and_stays_up_to_date(self):
+        # Regression for Copilot review finding on PR #224: read_text()'s
+        # universal-newline translation on read, combined with a text-mode
+        # write on the way back out, silently converted a CRLF source's
+        # line endings -- lossy on every platform, and on Windows
+        # specifically the root cause of an installed skill perpetually
+        # re-reporting (and rewriting) as "update" even though the shipped
+        # content never changed, since the freshly-written dest's CRLF
+        # bytes never matched a freshly re-read source's own bytes.
+        (self.fake_tools_repo / "skills" / "my-fake-skill" / "SKILL.md").write_bytes(
+            b"# My Fake Skill\r\ncontent v1\r\n"
+        )
+        self._run(dry_run=False)
+        installed_path = self.skills_dir / "my-fake-skill" / "SKILL.md"
+        self.assertEqual(installed_path.read_bytes(), b"# My Fake Skill\r\ncontent v1\r\n")
+
+        output = self._run(dry_run=False)
+        self.assertIn("my-fake-skill: up to date", output)
+
+    def test_my_setup_clauderunway_prints_the_clone_caveat(self):
+        (self.fake_tools_repo / "skills" / "my-setup-clauderunway").mkdir()
+        (self.fake_tools_repo / "skills" / "my-setup-clauderunway" / "SKILL.md").write_text(
+            "# my-setup-clauderunway\n", encoding="utf-8"
+        )
+        output = self._run(dry_run=False)
+        self.assertIn("CLAUDE_RUNWAY_DIR", output)
+
+    def test_my_setup_clauderunway_caveat_is_state_neutral(self):
+        # Regression for Copilot review finding on PR #224: the caveat
+        # previously asserted "was installed/updated too" unconditionally,
+        # which is false during --dry-run (nothing written) and when the
+        # skill is already up to date (nothing changed) -- contradicting
+        # the preceding per-skill status line printed just above it.
+        (self.fake_tools_repo / "skills" / "my-setup-clauderunway").mkdir()
+        (self.fake_tools_repo / "skills" / "my-setup-clauderunway" / "SKILL.md").write_text(
+            "# my-setup-clauderunway\n", encoding="utf-8"
+        )
+        dry_run_output = self._run(dry_run=True)
+        self.assertIn("CLAUDE_RUNWAY_DIR", dry_run_output)
+        self.assertNotIn("was installed/updated", dry_run_output)
+
+        # A real run makes it up to date; a THIRD run (still real) should
+        # print the caveat again even though this round's plan action is
+        # "up_to_date", not "install"/"update".
+        self._run(dry_run=False)
+        up_to_date_output = self._run(dry_run=False)
+        self.assertIn("up to date", up_to_date_output)
+        self.assertIn("CLAUDE_RUNWAY_DIR", up_to_date_output)
+        self.assertNotIn("was installed/updated", up_to_date_output)
+
+    def test_parse_args_requires_target_repo_unless_install_skills_given(self):
+        with mock.patch.object(sys, "argv", ["setup_project.py", "init"]):
+            with self.assertRaises(SystemExit) as ctx:
+                self.mod.parse_args()
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_parse_args_allows_install_skills_alone(self):
+        with mock.patch.object(sys, "argv", ["setup_project.py", "init", "--install-skills"]):
+            parsed = self.mod.parse_args()
+        self.assertIsNone(parsed.target_repo)
+        self.assertTrue(parsed.install_skills)
+
+
+class UpgradeSubcommand(unittest.TestCase):
+    """`upgrade` (issue #225): argument parsing, and cmd_upgrade delegating
+    to upgrade_lib.run_upgrade with the same venv-python resolution cmd_init
+    already uses (_pip_installed_venv_python(), falling back to
+    setup_project_lib.venv_python_path for the documented clone workflow)."""
+
+    def setUp(self):
+        self.mod = _load_setup_project()
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.target_repo = Path(self._tmpdir.name) / "my-project"
+        self.target_repo.mkdir()
+        # is_project_configured (Copilot review, PR #227) now gates
+        # cmd_upgrade before it ever calls run_upgrade -- give this fixture
+        # a minimal, already-configured .mcp.json (a 'qdrant' server block
+        # is the only thing that check looks for) so tests that mock
+        # run_upgrade directly still reach it. test_nonexistent_target_repo_
+        # errors_out and test_unconfigured_target_repo_errors_out below
+        # cover the two refusal paths themselves.
+        (self.target_repo / ".mcp.json").write_text(
+            json.dumps({"mcpServers": {"qdrant": {}}}), encoding="utf-8"
+        )
+
+    def test_parse_args_requires_target_repo(self):
+        with mock.patch.object(sys, "argv", ["setup_project.py", "upgrade"]):
+            with self.assertRaises(SystemExit) as ctx:
+                self.mod.parse_args()
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_parse_args_defaults(self):
+        with mock.patch.object(sys, "argv", ["setup_project.py", "upgrade", str(self.target_repo)]):
+            parsed = self.mod.parse_args()
+        self.assertEqual(parsed.target_repo, str(self.target_repo))
+        self.assertFalse(parsed.dry_run)
+        self.assertFalse(parsed.auto_yes)
+        self.assertIs(parsed.func, self.mod.cmd_upgrade)
+
+    def test_parse_args_accepts_dry_run_and_auto_yes(self):
+        with mock.patch.object(
+            sys, "argv", ["setup_project.py", "upgrade", str(self.target_repo), "--dry-run", "--auto-yes"]
+        ):
+            parsed = self.mod.parse_args()
+        self.assertTrue(parsed.dry_run)
+        self.assertTrue(parsed.auto_yes)
+
+    def test_nonexistent_target_repo_errors_out(self):
+        args = argparse.Namespace(
+            target_repo=str(self.target_repo / "does-not-exist"), dry_run=False, auto_yes=True
+        )
+        with self.assertRaises(SystemExit) as ctx:
+            self.mod.cmd_upgrade(args)
+        self.assertEqual(ctx.exception.code, 1)
+
+    def test_unconfigured_target_repo_errors_out(self):
+        # Regression for the finding from Copilot review on PR #227: a real,
+        # existing directory that was simply never `init`'d (no .mcp.json,
+        # or one with no 'qdrant' server) must be refused with a clear error
+        # and exit code, not silently write a broken partial config.
+        unconfigured = Path(self._tmpdir.name) / "never-init-run"
+        unconfigured.mkdir()
+        args = argparse.Namespace(target_repo=str(unconfigured), dry_run=False, auto_yes=True)
+        with self.assertRaises(SystemExit) as ctx:
+            self.mod.cmd_upgrade(args)
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertFalse((unconfigured / ".mcp.json").exists())
+
+    def test_delegates_to_run_upgrade_with_resolved_venv_python(self):
+        # Explicitly mock _pip_installed_venv_python's None case (the
+        # documented clone workflow) rather than relying on this test
+        # environment's own ambient TOOLS_REPO_DIR/.venv -- confirmed live
+        # that CI's own runner (tests/test_setup_project_cli.py's other
+        # PipInstalledLayoutReminder tests already follow this same pattern)
+        # has no such directory at all, since its own workflow installs
+        # dependencies with a plain `pip install` into the runner's system
+        # Python rather than this repo's Step-15-documented `uv venv`
+        # bootstrap -- asserting on the real, ambient value broke this test
+        # in CI while passing locally.
+        captured = {}
+
+        def _fake_run_upgrade(target_repo, tools_repo_dir, venv_python, *, auto_yes, dry_run):
+            captured.update(
+                target_repo=target_repo, tools_repo_dir=tools_repo_dir, venv_python=venv_python,
+                auto_yes=auto_yes, dry_run=dry_run,
+            )
+            return []
+
+        args = argparse.Namespace(target_repo=str(self.target_repo), dry_run=True, auto_yes=False)
+        with mock.patch.object(self.mod, "_pip_installed_venv_python", return_value=None), \
+             mock.patch.object(self.mod, "run_upgrade", side_effect=_fake_run_upgrade):
+            self.mod.cmd_upgrade(args)
+
+        self.assertEqual(captured["target_repo"], self.target_repo.resolve())
+        self.assertEqual(captured["tools_repo_dir"], self.mod.TOOLS_REPO_DIR)
+        self.assertTrue(captured["dry_run"])
+        self.assertFalse(captured["auto_yes"])
+        # None (the clone workflow) must fall back to
+        # setup_project_lib.venv_python_path -- the same default run_setup
+        # itself would use for `init`.
+        expected = self.mod.venv_python_path(self.mod.TOOLS_REPO_DIR, windows=(os.name == "nt"))
+        self.assertEqual(captured["venv_python"], expected)
+
+    def test_pip_installed_layout_passes_sys_executable_through(self):
+        fake_python = Path("/opt/pipx/venvs/claude-runway/bin/python")
+        captured = {}
+
+        def _fake_run_upgrade(target_repo, tools_repo_dir, venv_python, *, auto_yes, dry_run):
+            captured["venv_python"] = venv_python
+            return []
+
+        args = argparse.Namespace(target_repo=str(self.target_repo), dry_run=False, auto_yes=True)
+        with mock.patch.object(self.mod, "_pip_installed_venv_python", return_value=fake_python), \
+             mock.patch.object(self.mod, "run_upgrade", side_effect=_fake_run_upgrade):
+            self.mod.cmd_upgrade(args)
+
+        self.assertEqual(captured["venv_python"], fake_python)
 
 
 if __name__ == "__main__":

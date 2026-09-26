@@ -21,6 +21,7 @@ that exact failure mode impossible to reintroduce silently again.
 import importlib.util
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -1030,6 +1031,8 @@ class LogFixedOverheadEnumeratesRegisteredTools(unittest.TestCase):
                 "savings_summary",
                 "savings_detail",
                 "savings_trend",
+                "get_metrics",
+                "record_metric",
             },
         )
         self.assertIn("schema_overhead_tokens", captured)
@@ -1688,6 +1691,290 @@ class CompactPruneTests(unittest.TestCase):
         # Must return a string, not raise, and must not claim anything was deleted.
         self.assertIsInstance(result, str)
         self.assertNotIn("Deleted", result)
+
+
+class RecordMetricAcceptsDictOrJsonStringMetadata(unittest.TestCase):
+    """record_metric's `metadata` parameter was previously documented and
+    typed as a JSON string only, but some MCP clients (confirmed live:
+    Claude Code itself) silently coerce a string argument that happens to
+    parse as a JSON object into a native dict before this tool ever sees
+    it -- bypassing that declared `string` schema type entirely. The fix
+    below widens the parameter to accept either shape directly, rather than
+    erroring on the coerced-dict case with "metadata must be valid JSON" (a
+    `TypeError` from `json.loads(dict)`, caught and misreported as a
+    JSON-parse failure even though the value was never invalid to begin
+    with)."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._db_path = str(Path(self._tmpdir.name) / "metrics.db")
+        self._env_patch = mock.patch.dict(os.environ, {"CLAUDE_RUNWAY_METRICS_DB": self._db_path})
+        self._env_patch.start()
+
+    def tearDown(self):
+        self._env_patch.stop()
+        self._tmpdir.cleanup()
+
+    def test_metadata_as_json_string_still_works(self):
+        mod = _load_compress_mcp_server()
+        result = mod.record_metric(
+            "autowork", "ticket_merged", metadata='{"issue": 211, "pr": 260}'
+        )
+        self.assertEqual(result, "OK")
+        rows = mod.metrics_lib.MetricsStore().detail("autowork")
+        self.assertEqual(rows[0]["metadata"], {"issue": 211, "pr": 260})
+
+    def test_metadata_as_already_parsed_dict_is_accepted(self):
+        mod = _load_compress_mcp_server()
+        result = mod.record_metric(
+            "autowork", "ticket_merged", metadata={"issue": 211, "pr": 260}
+        )
+        self.assertEqual(result, "OK")
+        rows = mod.metrics_lib.MetricsStore().detail("autowork")
+        self.assertEqual(rows[0]["metadata"], {"issue": 211, "pr": 260})
+
+    def test_metadata_as_list_is_still_rejected(self):
+        mod = _load_compress_mcp_server()
+        result = mod.record_metric("autowork", "ticket_merged", metadata='["not", "a", "dict"]')
+        self.assertTrue(result.startswith("Error:"))
+        self.assertIn("must be a JSON object", result)
+
+    def test_metadata_as_invalid_json_string_is_still_rejected(self):
+        mod = _load_compress_mcp_server()
+        result = mod.record_metric("autowork", "ticket_merged", metadata="{not valid json")
+        self.assertTrue(result.startswith("Error:"))
+        self.assertIn("must be valid JSON", result)
+
+    def test_metadata_omitted_still_works(self):
+        mod = _load_compress_mcp_server()
+        result = mod.record_metric("autowork", "ticket_merged")
+        self.assertEqual(result, "OK")
+
+
+class GetMetricsSessionIdFilter(unittest.TestCase):
+    """Issue #248: get_metrics gained an optional session_id passthrough for
+    view="summary"/"by_event_type" -- covers the MCP tool surface on top of
+    tests/test_metrics_lib.py's own MetricsStore-level coverage of the
+    underlying filter."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._db_path = str(Path(self._tmpdir.name) / "metrics.db")
+        self._env_patch = mock.patch.dict(os.environ, {"CLAUDE_RUNWAY_METRICS_DB": self._db_path})
+        self._env_patch.start()
+
+    def tearDown(self):
+        self._env_patch.stop()
+        self._tmpdir.cleanup()
+
+    def test_summary_view_narrows_to_session_id(self):
+        mod = _load_compress_mcp_server()
+        store = mod.metrics_lib.MetricsStore()
+        store.record("autowork", "ticket_merged", value=1.0, session_id="issue-248-100000")
+        store.record("autowork", "ticket_merged", value=1.0, session_id="issue-249-110000")
+
+        result = mod.get_metrics("autowork", view="summary", session_id="issue-248-100000", format="json")
+        import json as _json
+        data = _json.loads(result)["data"]
+        self.assertEqual(data["event_count"], 1)
+        self.assertEqual(data["total_value"], 1.0)
+
+    def test_by_event_type_view_narrows_to_session_id(self):
+        mod = _load_compress_mcp_server()
+        store = mod.metrics_lib.MetricsStore()
+        store.record("autowork", "ticket_merged", value=1.0, session_id="issue-248-100000")
+        store.record("autowork", "ticket_blocked", value=1.0, session_id="issue-249-110000")
+
+        result = mod.get_metrics("autowork", view="by_event_type", session_id="issue-248-100000", format="json")
+        import json as _json
+        data = _json.loads(result)["data"]
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data[0]["event_type"], "ticket_merged")
+
+    def test_omitting_session_id_keeps_unfiltered_summary(self):
+        mod = _load_compress_mcp_server()
+        store = mod.metrics_lib.MetricsStore()
+        store.record("autowork", "ticket_merged", value=1.0, session_id="issue-248-100000")
+        store.record("autowork", "ticket_merged", value=1.0, session_id="issue-249-110000")
+
+        result = mod.get_metrics("autowork", view="summary", format="json")
+        import json as _json
+        data = _json.loads(result)["data"]
+        self.assertEqual(data["event_count"], 2)
+
+    def test_trend_view_ignores_session_id_without_erroring(self):
+        # session_id has no effect on trend() (out of scope per issue #248) --
+        # passing it must not raise or otherwise break the trend view.
+        mod = _load_compress_mcp_server()
+        store = mod.metrics_lib.MetricsStore()
+        store.record("autowork", "ticket_merged", value=1.0, session_id="issue-248-100000")
+        store.record("autowork", "ticket_merged", value=1.0, session_id="issue-249-110000")
+
+        result = mod.get_metrics("autowork", view="trend", bucket="day", session_id="issue-248-100000", format="json")
+        import json as _json
+        data = _json.loads(result)["data"]
+        # Both rows count toward the trend regardless of session_id -- it's
+        # simply not applied there.
+        self.assertEqual(sum(r["event_count"] for r in data), 2)
+
+    def test_summary_view_empty_filter_names_the_session_not_the_whole_metric(self):
+        """Copilot review on PR #250 (round 4): a session_id filter that
+        matches nothing must not claim the metric_id as a whole has no
+        events -- it has plenty, just not under this session_id."""
+        mod = _load_compress_mcp_server()
+        store = mod.metrics_lib.MetricsStore()
+        store.record("autowork", "ticket_merged", value=1.0, session_id="issue-249-110000")
+
+        result = mod.get_metrics("autowork", view="summary", session_id="no-such-session", format="text")
+        self.assertIn("no-such-session", result)
+        self.assertNotIn("No events recorded yet for this metric_id.", result)
+
+    def test_by_event_type_view_empty_filter_names_the_session_not_the_whole_metric(self):
+        mod = _load_compress_mcp_server()
+        store = mod.metrics_lib.MetricsStore()
+        store.record("autowork", "ticket_merged", value=1.0, session_id="issue-249-110000")
+
+        result = mod.get_metrics("autowork", view="by_event_type", session_id="no-such-session", format="text")
+        self.assertIn("no-such-session", result)
+        self.assertNotIn("No events recorded yet for this metric_id.", result)
+
+
+class GetMetricsDetailView(unittest.TestCase):
+    """Issue #249: get_metrics gained a "detail" view -- raw per-event rows
+    with deserialized metadata, most recent first. Covers the MCP tool
+    surface on top of tests/test_metrics_lib.py's own MetricsStore-level
+    coverage of the underlying detail()/format_detail_view()."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._db_path = str(Path(self._tmpdir.name) / "metrics.db")
+        self._env_patch = mock.patch.dict(os.environ, {"CLAUDE_RUNWAY_METRICS_DB": self._db_path})
+        self._env_patch.start()
+
+    def tearDown(self):
+        self._env_patch.stop()
+        self._tmpdir.cleanup()
+
+    def test_detail_view_returns_rows_with_metadata(self):
+        mod = _load_compress_mcp_server()
+        store = mod.metrics_lib.MetricsStore()
+        store.record("autowork", "ticket_merged", value=1.0, metadata={"model": "claude-sonnet-5", "rounds": 5})
+
+        result = mod.get_metrics("autowork", view="detail", format="json")
+        import json as _json
+        data = _json.loads(result)["data"]
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data[0]["metadata"], {"model": "claude-sonnet-5", "rounds": 5})
+
+    def test_n_is_reused_as_the_row_limit(self):
+        mod = _load_compress_mcp_server()
+        store = mod.metrics_lib.MetricsStore()
+        for i in range(5):
+            store.record("autowork", "x", value=1.0, event_timestamp=f"2026-09-0{i + 1}T00:00:00Z")
+
+        result = mod.get_metrics("autowork", view="detail", n=2, format="json")
+        import json as _json
+        data = _json.loads(result)["data"]
+        self.assertEqual(len(data), 2)
+        self.assertEqual(data[0]["event_timestamp"], "2026-09-05T00:00:00Z")
+
+    def test_detail_view_narrows_to_session_id(self):
+        mod = _load_compress_mcp_server()
+        store = mod.metrics_lib.MetricsStore()
+        store.record("autowork", "ticket_merged", value=1.0, session_id="issue-249-100000")
+        store.record("autowork", "ticket_merged", value=1.0, session_id="issue-250-110000")
+
+        result = mod.get_metrics("autowork", view="detail", session_id="issue-249-100000", format="json")
+        import json as _json
+        data = _json.loads(result)["data"]
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data[0]["session_id"], "issue-249-100000")
+
+    def test_detail_view_empty_filter_names_the_session_not_the_whole_metric(self):
+        mod = _load_compress_mcp_server()
+        store = mod.metrics_lib.MetricsStore()
+        store.record("autowork", "ticket_merged", value=1.0, session_id="issue-249-110000")
+
+        result = mod.get_metrics("autowork", view="detail", session_id="no-such-session", format="text")
+        self.assertIn("no-such-session", result)
+        self.assertNotIn("No events recorded yet for this metric_id.", result)
+
+    def test_unrecognised_view_error_lists_detail_as_valid(self):
+        mod = _load_compress_mcp_server()
+        result = mod.get_metrics("autowork", view="bogus")
+        self.assertIn("detail", result)
+
+    def test_direct_negative_limit_is_rejected_not_unbounded(self):
+        # get_metrics's own n<1 check already prevents this via the MCP
+        # surface -- this exercises detail()'s own independent guard (see
+        # test_metrics_lib.py's Detail class for the direct-library-call
+        # reproduction this backs).
+        mod = _load_compress_mcp_server()
+        store = mod.metrics_lib.MetricsStore()
+        store.record("autowork", "x", value=1.0)
+        with self.assertRaises(ValueError):
+            store.detail("autowork", limit=-1)
+
+
+class GetMetricsBucketAndNScopedToRelevantViews(unittest.TestCase):
+    """Copilot review on PR #255: bucket/n are documented as "ignored" for
+    views that don't consume them, but were validated unconditionally --
+    an irrelevant bucket="month" or n=0 alongside view="summary" rejected
+    an otherwise-valid call. Scoped so only the views that actually use
+    each argument validate it."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._db_path = str(Path(self._tmpdir.name) / "metrics.db")
+        self._env_patch = mock.patch.dict(os.environ, {"CLAUDE_RUNWAY_METRICS_DB": self._db_path})
+        self._env_patch.start()
+
+    def tearDown(self):
+        self._env_patch.stop()
+        self._tmpdir.cleanup()
+
+    def test_summary_ignores_irrelevant_bad_bucket(self):
+        mod = _load_compress_mcp_server()
+        store = mod.metrics_lib.MetricsStore()
+        store.record("autowork", "ticket_merged", value=1.0)
+        result = mod.get_metrics("autowork", view="summary", bucket="month", format="json")
+        self.assertNotIn("Error:", result)
+
+    def test_summary_ignores_irrelevant_bad_n(self):
+        mod = _load_compress_mcp_server()
+        store = mod.metrics_lib.MetricsStore()
+        store.record("autowork", "ticket_merged", value=1.0)
+        result = mod.get_metrics("autowork", view="summary", n=0, format="json")
+        self.assertNotIn("Error:", result)
+
+    def test_by_event_type_ignores_irrelevant_bad_bucket(self):
+        mod = _load_compress_mcp_server()
+        store = mod.metrics_lib.MetricsStore()
+        store.record("autowork", "ticket_merged", value=1.0)
+        result = mod.get_metrics("autowork", view="by_event_type", bucket="month", format="json")
+        self.assertNotIn("Error:", result)
+
+    def test_detail_ignores_irrelevant_bad_bucket(self):
+        mod = _load_compress_mcp_server()
+        store = mod.metrics_lib.MetricsStore()
+        store.record("autowork", "ticket_merged", value=1.0)
+        result = mod.get_metrics("autowork", view="detail", bucket="month", format="json")
+        self.assertNotIn("Error:", result)
+
+    def test_trend_still_validates_bucket(self):
+        mod = _load_compress_mcp_server()
+        result = mod.get_metrics("autowork", view="trend", bucket="month")
+        self.assertIn("Error:", result)
+
+    def test_trend_still_validates_n(self):
+        mod = _load_compress_mcp_server()
+        result = mod.get_metrics("autowork", view="trend", n=0)
+        self.assertIn("Error:", result)
+
+    def test_detail_still_validates_n_since_n_is_its_row_limit(self):
+        mod = _load_compress_mcp_server()
+        result = mod.get_metrics("autowork", view="detail", n=0)
+        self.assertIn("Error:", result)
 
 
 if __name__ == "__main__":

@@ -75,14 +75,20 @@ Each row records `event_type` (`recall`/`remember`), `point_id`, `repo`,
 `kind`, `summary_created_at` (the memory's own creation time, denormalized at
 log time), `event_timestamp`, `turn` (a per-session call-sequence counter —
 "3rd memory-bank call this session," not a real Claude Code conversation
-turn), `session_id`, and `project`. `session_id` is a process-lifetime UUID
-generated once when the MCP server starts, not Claude Code's own internal
-session id — an MCP server has no access to that (only hooks receive one, via
-their stdin payload); since a stdio server is spawned fresh per Claude Code
-session, this is a documented, practical proxy for "this session," not the
-real thing. Surfacing this data (a query/report tool, a `/my-savings`-style
-summary) is intentionally out of scope for now — this is passive collection
-only.
+turn), `session_id`, and `project`. `session_id` comes from
+`libs/session_id_lib.py`'s `SessionIdStrategy.PROXY` (issue #198/#214) — a
+process-lifetime UUID cached once when the MCP server starts, not Claude
+Code's own internal session id. See that module's docstring for the full
+four-strategy classification (`HOOK_PAYLOAD`/`SHADOW_FILE`/
+`TRANSCRIPT_SCAN`/`PROXY`) of every way this toolkit's MCP-server/hook code
+can get or approximate a session_id; PROXY is the right fit here because an
+MCP server has no hook payload to read a real session id from (only hooks
+receive one, via their stdin payload), and a stable per-process grouping key
+is good enough for this passive log's purposes — since a stdio server is
+spawned fresh per Claude Code session, that proxy is a documented, practical
+stand-in for "this session," not the real thing. Surfacing this data (a
+query/report tool, a `/my-savings`-style summary) is intentionally out of
+scope for now — this is passive collection only.
 
 ## Where the data lives
 
