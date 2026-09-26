@@ -41,7 +41,12 @@ store.decrement("autowork", "open_tickets")   # sugar over record(value=-by)
 store.summary("autowork")          # {"metric_id", "event_count", "total_value", "first_event_at", "last_event_at"}
 store.by_event_type("autowork")    # [{"event_type", "event_count", "total_value"}, ...] sorted by total_value desc
 store.trend("autowork", bucket="week", n=12)  # [{"bucket", "event_count", "total_value"}, ...] oldest first
+
+store.summary("autowork", session_id="issue-248-143022")        # same shape, narrowed to one session
+store.by_event_type("autowork", session_id="issue-248-143022")  # same shape, narrowed to one session
 ```
+
+`summary()`/`by_event_type()` also take an optional `session_id` (issue #248) to narrow the aggregate down to one specific session's rows (e.g. one `my-gh-autowork` attempt's own `issue-<n>-<HHMMSS>` marker from issue #210) instead of the metric_id's entire history. Omitting it keeps the metric_id-only aggregate unchanged. Not available on `trend()` — per-session filtering doesn't compose with time-bucketed grouping (out of scope for #248). The text formatters (`format_summary_view`/`format_by_event_type_view`) are session-aware too: a `session_id`-filtered query with zero matching rows reports "No events recorded yet for this metric_id with session_id=...", not the unqualified "no events for this metric_id" message — that message would be misleading when other sessions under the same metric_id do have data.
 
 `record()` also takes an optional `event_timestamp` override (issue #209) — full ISO 8601 UTC (`"YYYY-MM-DDTHH:MM:SSZ"`), used verbatim instead of the current time. Ordinary callers should never pass this; it exists for backfilling historical events with their own original date (see `tools/migrate_autowork_metrics.py` below) — an invalid format fails open (logged to stderr, nothing written), same as the non-finite `value` guard.
 
@@ -63,18 +68,19 @@ record_metric(metric_id, event_type, value=1.0, metadata=None, session_id=None)
 - `event_type`: domain-defined event kind (e.g. `"ticket_merged"`, `"ticket_blocked"`).
 - `value`: a signed numeric delta (default `1.0`). Must be finite.
 - `metadata`: optional JSON string of domain-specific extra fields.
-- `session_id`: optional caller-supplied identifier stored in the raw row for future per-session filtering (current read tools — `get_metrics`/`/my-metrics` — do not yet expose a `session_id` filter; see issue #248).
+- `session_id`: optional caller-supplied identifier stored in the raw row — `get_metrics`/`/my-metrics` can filter `view="summary"`/`"by_event_type"` down to one exact `session_id` (issue #248).
 
 Returns `"OK"` on success or an `"Error:..."` string on any failure — including DB write failures (when `MetricsStore.record()` returns `False`). DB write errors are also logged to stderr but not raised, preserving fail-open behavior; the `"Error:"` return is the only surface the caller sees.
 
 ### `get_metrics` (read)
 
 ```
-get_metrics(metric_id, view="summary", bucket="week", n=12, format="text")
+get_metrics(metric_id, view="summary", bucket="week", n=12, format="text", session_id=None)
 ```
 
 - `view`: `"summary"` (default, total event count + total value), `"by_event_type"` (per-event_type breakdown), or `"trend"` (day/week-bucketed history).
 - `bucket`/`n`: only apply to `view="trend"`.
+- `session_id` (issue #248): only applies to `view="summary"`/`"by_event_type"` — narrows the result to one specific session (e.g. one `my-gh-autowork` attempt's `issue-<n>-<HHMMSS>` marker). Ignored for `view="trend"` (not supported there — see the `MetricsStore` section above).
 - `format`: `"text"` (default, human-readable) or `"json"`.
 
 ## Historical migration (`tools/migrate_autowork_metrics.py`, issue #209)
@@ -110,10 +116,11 @@ live logging now goes through `record_metric` (issue #210's cutover) — new run
 
 **Install the skill first**: `claude-runway-setup init --install-skills` (or `python tools/setup_project.py init --install-skills` from a clone) installs/updates `my-metrics` along with every other product skill — equivalent manual copy: `mkdir -p ~/.claude/skills/my-metrics && cp skills/my-metrics/SKILL.md ~/.claude/skills/my-metrics/SKILL.md`. Product skills are only discovered once installed under `~/.claude/skills/` — the rest of the setup flow (`.mcp.json`/`.claude/settings.json`) doesn't install them for you (same step `docs/savings-tracker.md`'s "Enabling it" section documents for `/my-savings`).
 
-`/my-metrics <metricId> [view] [bucket]` — thin wrapper matching `/my-savings`'s shape, e.g.:
+`/my-metrics <metricId> [view] [bucket|sessionId]` — thin wrapper matching `/my-savings`'s shape, e.g.:
 
 - `/my-metrics autowork` — summary view (total tickets worked, all outcomes).
 - `/my-metrics autowork by_event_type` — breakdown by outcome type (`ticket_merged`, `ticket_blocked`, `ticket_failed`).
 - `/my-metrics autowork trend day` — daily trend.
+- `/my-metrics autowork summary issue-248-143022` — summary narrowed to one specific autowork attempt's `session_id` (issue #248). Only supported for `summary`/`by_event_type`, not `trend`.
 
 Live data (post-cutover runs) appears immediately with no migration needed. Pre-cutover history (tickets worked before issue #210 landed) requires running `tools/migrate_autowork_metrics.py` once against your own Qdrant instance (issue #209) — it is not automatic, and a fresh install has no history until either the migration runs or at least one post-cutover ticket is worked.

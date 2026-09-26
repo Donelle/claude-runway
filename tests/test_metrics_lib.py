@@ -336,6 +336,67 @@ class ByEventType(MetricsStoreTestCase):
         self.assertEqual(rows[1]["event_count"], 1)
 
 
+class SessionIdFilter(MetricsStoreTestCase):
+    """Issue #248: summary()/by_event_type() gained an optional session_id
+    param so a caller can narrow an aggregate down to one specific session's
+    rows (e.g. one my-gh-autowork attempt's own issue-<n>-<HHMMSS> marker,
+    issue #210) instead of the metric_id's entire history. trend() is
+    explicitly out of scope per the issue -- not covered here."""
+
+    def test_summary_narrows_to_matching_session_id(self):
+        self.store.record("autowork", "ticket_merged", value=1.0, session_id="issue-248-100000")
+        self.store.record("autowork", "ticket_merged", value=1.0, session_id="issue-249-110000")
+        self.store.record("autowork", "ticket_blocked", value=1.0, session_id="issue-248-100000")
+        summary = self.store.summary("autowork", session_id="issue-248-100000")
+        self.assertEqual(summary["event_count"], 2)
+        self.assertEqual(summary["total_value"], 2.0)
+
+    def test_summary_with_unknown_session_id_reports_zero(self):
+        self.store.record("autowork", "ticket_merged", value=1.0, session_id="issue-248-100000")
+        summary = self.store.summary("autowork", session_id="no-such-session")
+        self.assertEqual(summary["event_count"], 0)
+        self.assertEqual(summary["total_value"], 0.0)
+        self.assertIsNone(summary["first_event_at"])
+
+    def test_summary_omitting_session_id_keeps_unfiltered_behavior(self):
+        # No behavior change for existing callers that never pass session_id.
+        self.store.record("autowork", "ticket_merged", value=1.0, session_id="issue-248-100000")
+        self.store.record("autowork", "ticket_merged", value=1.0, session_id="issue-249-110000")
+        summary = self.store.summary("autowork")
+        self.assertEqual(summary["event_count"], 2)
+        self.assertEqual(summary["total_value"], 2.0)
+
+    def test_summary_session_id_does_not_cross_metric_ids(self):
+        # Same session_id reused under a different metric_id must not bleed in --
+        # the filter is metric_id AND session_id, not session_id alone.
+        self.store.record("autowork", "ticket_merged", value=5.0, session_id="shared-session")
+        self.store.record("memory-bank", "recall", value=1.0, session_id="shared-session")
+        summary = self.store.summary("autowork", session_id="shared-session")
+        self.assertEqual(summary["event_count"], 1)
+        self.assertEqual(summary["total_value"], 5.0)
+
+    def test_by_event_type_narrows_to_matching_session_id(self):
+        self.store.record("autowork", "ticket_merged", value=1.0, session_id="issue-248-100000")
+        self.store.record("autowork", "ticket_merged", value=1.0, session_id="issue-248-100000")
+        self.store.record("autowork", "review_round", value=1.0, session_id="issue-248-100000")
+        self.store.record("autowork", "ticket_merged", value=1.0, session_id="issue-249-110000")
+        rows = self.store.by_event_type("autowork", session_id="issue-248-100000")
+        self.assertEqual(len(rows), 2)
+        totals = {r["event_type"]: r["event_count"] for r in rows}
+        self.assertEqual(totals, {"ticket_merged": 2, "review_round": 1})
+
+    def test_by_event_type_with_unknown_session_id_returns_empty_list(self):
+        self.store.record("autowork", "ticket_merged", value=1.0, session_id="issue-248-100000")
+        self.assertEqual(self.store.by_event_type("autowork", session_id="no-such-session"), [])
+
+    def test_by_event_type_omitting_session_id_keeps_unfiltered_behavior(self):
+        self.store.record("autowork", "ticket_merged", value=1.0, session_id="issue-248-100000")
+        self.store.record("autowork", "ticket_merged", value=1.0, session_id="issue-249-110000")
+        rows = self.store.by_event_type("autowork")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["event_count"], 2)
+
+
 class Trend(MetricsStoreTestCase):
     """Mirrors test_savings_ledger.py's QueryTrend test suite -- same
     bucketing semantics (ISO week via datetime.isocalendar(), day via the
@@ -512,6 +573,32 @@ class FormattingHelpers(unittest.TestCase):
     def test_format_by_event_type_view_empty(self):
         text = M.format_by_event_type_view("autowork", [])
         self.assertIn("No events recorded yet", text)
+
+    def test_format_summary_view_empty_with_session_id_names_the_session(self):
+        """Copilot review on PR #250 (round 4): an empty session_id-filtered
+        result must not claim the metric_id itself has no events -- that's
+        false when other sessions have data. The message must identify the
+        specific session_id that came back empty instead."""
+        text = M.format_summary_view(
+            {"metric_id": "autowork", "event_count": 0, "total_value": 0.0, "first_event_at": None, "last_event_at": None},
+            session_id="issue-248-999999",
+        )
+        self.assertIn("issue-248-999999", text)
+        self.assertNotIn("No events recorded yet for this metric_id.", text)
+
+    def test_format_summary_view_empty_without_session_id_keeps_prior_message(self):
+        # No session_id given -- unfiltered behavior must be unchanged.
+        text = M.format_summary_view({"metric_id": "autowork", "event_count": 0, "total_value": 0.0, "first_event_at": None, "last_event_at": None})
+        self.assertIn("No events recorded yet for this metric_id.", text)
+
+    def test_format_by_event_type_view_empty_with_session_id_names_the_session(self):
+        text = M.format_by_event_type_view("autowork", [], session_id="issue-248-999999")
+        self.assertIn("issue-248-999999", text)
+        self.assertNotIn("No events recorded yet for this metric_id.", text)
+
+    def test_format_by_event_type_view_empty_without_session_id_keeps_prior_message(self):
+        text = M.format_by_event_type_view("autowork", [])
+        self.assertIn("No events recorded yet for this metric_id.", text)
 
     def test_format_by_event_type_view_with_rows(self):
         text = M.format_by_event_type_view("autowork", [

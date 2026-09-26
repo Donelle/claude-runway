@@ -110,13 +110,12 @@ Project-scoped to this repo (hardcodes `Donelle/claude-runway`, `.venv`-based te
       SAME issue on the SAME calendar day distinguishable as separate rows.** The shared
       metrics store is append-only, so two calls never collide the way an upsert-on-a-
       fixed-key store would — every call creates a new row regardless; the per-attempt
-      timestamp is stored as `session_id` in the raw table for future per-attempt
-      filtering, though current read tools (`get_metrics`/`/my-metrics`) aggregate by
-      `metric_id` only and do not yet expose a `session_id` filter — that's a separate
-      follow-up. `manual_interventions` counts any `SendMessage` resume THIS orchestrator
-      had to send this same subagent to get a compliant final report (0 for a clean
-      single-call ticket — this field exists because a subagent has stalled mid-run before
-      and needed a manual nudge to produce a compliant final report).
+      timestamp is stored as `session_id` in the raw table, and `get_metrics`/`/my-metrics`
+      can filter `view="summary"`/`"by_event_type"` down to this exact `session_id` to
+      inspect one specific attempt. `manual_interventions` counts any `SendMessage` resume
+      THIS orchestrator had to send this same subagent to get a compliant final report (0
+      for a clean single-call ticket — this field exists because a subagent has stalled
+      mid-run before and needed a manual nudge to produce a compliant final report).
 
       **This logging step is best-effort and additive — it must never change what the
       outer 2b/2c control flow does next, only whether a metrics entry got recorded.**

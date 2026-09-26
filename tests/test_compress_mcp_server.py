@@ -21,6 +21,7 @@ that exact failure mode impossible to reintroduce silently again.
 import importlib.util
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -1690,6 +1691,94 @@ class CompactPruneTests(unittest.TestCase):
         # Must return a string, not raise, and must not claim anything was deleted.
         self.assertIsInstance(result, str)
         self.assertNotIn("Deleted", result)
+
+
+class GetMetricsSessionIdFilter(unittest.TestCase):
+    """Issue #248: get_metrics gained an optional session_id passthrough for
+    view="summary"/"by_event_type" -- covers the MCP tool surface on top of
+    tests/test_metrics_lib.py's own MetricsStore-level coverage of the
+    underlying filter."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._db_path = str(Path(self._tmpdir.name) / "metrics.db")
+        self._env_patch = mock.patch.dict(os.environ, {"CLAUDE_RUNWAY_METRICS_DB": self._db_path})
+        self._env_patch.start()
+
+    def tearDown(self):
+        self._env_patch.stop()
+        self._tmpdir.cleanup()
+
+    def test_summary_view_narrows_to_session_id(self):
+        mod = _load_compress_mcp_server()
+        store = mod.metrics_lib.MetricsStore()
+        store.record("autowork", "ticket_merged", value=1.0, session_id="issue-248-100000")
+        store.record("autowork", "ticket_merged", value=1.0, session_id="issue-249-110000")
+
+        result = mod.get_metrics("autowork", view="summary", session_id="issue-248-100000", format="json")
+        import json as _json
+        data = _json.loads(result)["data"]
+        self.assertEqual(data["event_count"], 1)
+        self.assertEqual(data["total_value"], 1.0)
+
+    def test_by_event_type_view_narrows_to_session_id(self):
+        mod = _load_compress_mcp_server()
+        store = mod.metrics_lib.MetricsStore()
+        store.record("autowork", "ticket_merged", value=1.0, session_id="issue-248-100000")
+        store.record("autowork", "ticket_blocked", value=1.0, session_id="issue-249-110000")
+
+        result = mod.get_metrics("autowork", view="by_event_type", session_id="issue-248-100000", format="json")
+        import json as _json
+        data = _json.loads(result)["data"]
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data[0]["event_type"], "ticket_merged")
+
+    def test_omitting_session_id_keeps_unfiltered_summary(self):
+        mod = _load_compress_mcp_server()
+        store = mod.metrics_lib.MetricsStore()
+        store.record("autowork", "ticket_merged", value=1.0, session_id="issue-248-100000")
+        store.record("autowork", "ticket_merged", value=1.0, session_id="issue-249-110000")
+
+        result = mod.get_metrics("autowork", view="summary", format="json")
+        import json as _json
+        data = _json.loads(result)["data"]
+        self.assertEqual(data["event_count"], 2)
+
+    def test_trend_view_ignores_session_id_without_erroring(self):
+        # session_id has no effect on trend() (out of scope per issue #248) --
+        # passing it must not raise or otherwise break the trend view.
+        mod = _load_compress_mcp_server()
+        store = mod.metrics_lib.MetricsStore()
+        store.record("autowork", "ticket_merged", value=1.0, session_id="issue-248-100000")
+        store.record("autowork", "ticket_merged", value=1.0, session_id="issue-249-110000")
+
+        result = mod.get_metrics("autowork", view="trend", bucket="day", session_id="issue-248-100000", format="json")
+        import json as _json
+        data = _json.loads(result)["data"]
+        # Both rows count toward the trend regardless of session_id -- it's
+        # simply not applied there.
+        self.assertEqual(sum(r["event_count"] for r in data), 2)
+
+    def test_summary_view_empty_filter_names_the_session_not_the_whole_metric(self):
+        """Copilot review on PR #250 (round 4): a session_id filter that
+        matches nothing must not claim the metric_id as a whole has no
+        events -- it has plenty, just not under this session_id."""
+        mod = _load_compress_mcp_server()
+        store = mod.metrics_lib.MetricsStore()
+        store.record("autowork", "ticket_merged", value=1.0, session_id="issue-249-110000")
+
+        result = mod.get_metrics("autowork", view="summary", session_id="no-such-session", format="text")
+        self.assertIn("no-such-session", result)
+        self.assertNotIn("No events recorded yet for this metric_id.", result)
+
+    def test_by_event_type_view_empty_filter_names_the_session_not_the_whole_metric(self):
+        mod = _load_compress_mcp_server()
+        store = mod.metrics_lib.MetricsStore()
+        store.record("autowork", "ticket_merged", value=1.0, session_id="issue-249-110000")
+
+        result = mod.get_metrics("autowork", view="by_event_type", session_id="no-such-session", format="text")
+        self.assertIn("no-such-session", result)
+        self.assertNotIn("No events recorded yet for this metric_id.", result)
 
 
 if __name__ == "__main__":

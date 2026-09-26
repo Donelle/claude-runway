@@ -1946,7 +1946,7 @@ def savings_trend(project: Optional[str] = None, bucket: str = "week", n: int = 
 
 
 @mcp.tool()
-def get_metrics(metric_id: str, view: str = "summary", bucket: str = "week", n: int = 12, format: str = "text") -> str:
+def get_metrics(metric_id: str, view: str = "summary", bucket: str = "week", n: int = 12, format: str = "text", session_id: Optional[str] = None) -> str:
     """
     Reads the shared cross-tool metrics store (issue #208): ONE generic
     SQLite table any domain in this toolkit can write into via
@@ -1975,6 +1975,16 @@ def get_metrics(metric_id: str, view: str = "summary", bucket: str = "week", n: 
     bucket ("day" or "week", default "week") and n (max buckets, default 12)
       only apply to view="trend" — ignored otherwise.
 
+    session_id (issue #248), when given, narrows view="summary"/
+      "by_event_type" down to rows matching this exact session_id AND
+      metric_id — e.g. one specific `my-gh-autowork` attempt's own
+      `f"issue-{n}-{HHMMSS}"` marker (issue #210), instead of that
+      metric_id's entire history. Omitting it (the default) keeps today's
+      metric_id-only aggregate unchanged. Ignored for view="trend" — per-
+      session filtering doesn't compose with time-bucketed grouping (out of
+      scope for issue #248; see that issue for why), so a session_id passed
+      alongside view="trend" has no effect on the result.
+
     format controls the output format:
       "text" (default) — human-readable text.
       "json"            — JSON object with keys "view"/"data".
@@ -1992,11 +2002,11 @@ def get_metrics(metric_id: str, view: str = "summary", bucket: str = "week", n: 
     try:
         store = metrics_lib.MetricsStore()
         if view == "summary":
-            summary_data = store.summary(metric_id)
-            return metrics_lib.format_json("summary", summary_data) if format == "json" else metrics_lib.format_summary_view(summary_data)
+            summary_data = store.summary(metric_id, session_id=session_id)
+            return metrics_lib.format_json("summary", summary_data) if format == "json" else metrics_lib.format_summary_view(summary_data, session_id=session_id)
         if view == "by_event_type":
-            by_type_data = store.by_event_type(metric_id)
-            return metrics_lib.format_json("by_event_type", by_type_data) if format == "json" else metrics_lib.format_by_event_type_view(metric_id, by_type_data)
+            by_type_data = store.by_event_type(metric_id, session_id=session_id)
+            return metrics_lib.format_json("by_event_type", by_type_data) if format == "json" else metrics_lib.format_by_event_type_view(metric_id, by_type_data, session_id=session_id)
         # view == "trend"
         trend_data = store.trend(metric_id, bucket=bucket, n=n)
         return metrics_lib.format_json("trend", trend_data) if format == "json" else metrics_lib.format_trend_view(metric_id, trend_data, bucket=bucket)
@@ -2031,8 +2041,9 @@ def record_metric(
       '{"issue": 42, "pr": 101, "rounds": 2}'). Must be valid JSON if supplied;
       an invalid JSON string is returned as an "Error:..." string rather than
       raising.
-    session_id: optional caller-supplied session identifier for per-session
-      filtering later.
+    session_id: optional caller-supplied session identifier — stored on the
+      row for later per-session filtering via get_metrics(view="summary"/
+      "by_event_type", session_id=...) (issue #248).
 
     Returns "OK" on success, or an "Error:..." string on any failure —
     including input-validation failures (non-finite value, invalid metadata

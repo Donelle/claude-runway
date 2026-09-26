@@ -335,20 +335,28 @@ class MetricsStore:
     # (e.g. tools/compress_mcp_server.py's get_metrics tool).
     # -------------------------------------------------------------------
 
-    def summary(self, metric_id: str) -> dict:
+    def summary(self, metric_id: str, session_id: Optional[str] = None) -> dict:
         """
         Aggregate totals for one metric_id across ALL event types:
         `{"metric_id", "event_count", "total_value", "first_event_at",
         "last_event_at"}`. `first_event_at`/`last_event_at` are `None` when
         the metric_id has no rows yet (never a fabricated timestamp).
+
+        `session_id` (issue #248), when given, narrows the aggregate to rows
+        matching BOTH `metric_id` AND this exact `session_id` -- e.g. one
+        specific `my-gh-autowork` attempt's `f"issue-{n}-{HHMMSS}"` marker
+        (see issue #210) rather than that metric_id's entire history.
+        Omitting it (the default) keeps today's metric_id-only aggregate
+        unchanged -- existing callers see no behavior change.
         """
+        query = "SELECT COUNT(*), COALESCE(SUM(value), 0.0), MIN(event_timestamp), MAX(event_timestamp) FROM metrics WHERE metric_id = ?"
+        params: tuple = (metric_id,)
+        if session_id is not None:
+            query += " AND session_id = ?"
+            params = (metric_id, session_id)
         conn = _connect(self._resolve_path())
         try:
-            row = conn.execute(
-                "SELECT COUNT(*), COALESCE(SUM(value), 0.0), MIN(event_timestamp), MAX(event_timestamp) "
-                "FROM metrics WHERE metric_id = ?",
-                (metric_id,),
-            ).fetchone()
+            row = conn.execute(query, params).fetchone()
         finally:
             conn.close()
         event_count, total_value, first_at, last_at = row
@@ -360,21 +368,27 @@ class MetricsStore:
             "last_event_at": last_at,
         }
 
-    def by_event_type(self, metric_id: str) -> list:
+    def by_event_type(self, metric_id: str, session_id: Optional[str] = None) -> list:
         """
         Per-event_type breakdown for one metric_id, ordered by total_value
         descending (largest contributor first) -- mirrors
         `savings_ledger.query_session_tool_breakdown`'s ordering convention.
         Each row: `{"event_type", "event_count", "total_value"}`.
+
+        `session_id` (issue #248): same optional narrowing as `summary()`
+        above -- when given, only rows matching BOTH `metric_id` and this
+        exact `session_id` are aggregated. Omitting it keeps today's
+        metric_id-only breakdown unchanged.
         """
+        query = "SELECT event_type, COUNT(*), COALESCE(SUM(value), 0.0) FROM metrics WHERE metric_id = ?"
+        params: tuple = (metric_id,)
+        if session_id is not None:
+            query += " AND session_id = ?"
+            params = (metric_id, session_id)
+        query += " GROUP BY event_type ORDER BY 3 DESC"
         conn = _connect(self._resolve_path())
         try:
-            rows = conn.execute(
-                "SELECT event_type, COUNT(*), COALESCE(SUM(value), 0.0) "
-                "FROM metrics WHERE metric_id = ? "
-                "GROUP BY event_type ORDER BY 3 DESC",
-                (metric_id,),
-            ).fetchall()
+            rows = conn.execute(query, params).fetchall()
         finally:
             conn.close()
         return [
@@ -476,7 +490,18 @@ def _fmt_value(v: float) -> str:
     return f"{v:.2f}".rstrip("0").rstrip(".")
 
 
-def format_summary_view(summary: dict) -> str:
+def _no_events_message(session_id: Optional[str] = None) -> str:
+    # Issue #248 (Copilot review, round 4): a session_id-filtered query that
+    # comes back empty must NOT say "No events recorded yet for this
+    # metric_id" -- that's true of the empty FILTERED result, but false (and
+    # misleading for per-attempt forensics) about the metric_id as a whole,
+    # which may well have plenty of history under other session_ids.
+    if session_id is not None:
+        return f"  No events recorded yet for this metric_id with session_id={session_id!r}."
+    return "  No events recorded yet for this metric_id."
+
+
+def format_summary_view(summary: dict, session_id: Optional[str] = None) -> str:
     metric_id = summary.get("metric_id", "")
     event_count = summary.get("event_count", 0)
     total_value = summary.get("total_value", 0.0)
@@ -494,14 +519,14 @@ def format_summary_view(summary: dict) -> str:
         lines.append(f"  Last event    {last_at}")
     if not event_count:
         lines.append("")
-        lines.append("  No events recorded yet for this metric_id.")
+        lines.append(_no_events_message(session_id))
     return "\n".join(lines)
 
 
-def format_by_event_type_view(metric_id: str, rows: list) -> str:
+def format_by_event_type_view(metric_id: str, rows: list, session_id: Optional[str] = None) -> str:
     header = f"ClaudeRunway · Metrics · {metric_id} · By event type"
     if not rows:
-        return f"{header}\n\n  No events recorded yet for this metric_id."
+        return f"{header}\n\n{_no_events_message(session_id)}"
     lines = [
         header,
         "",
