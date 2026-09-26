@@ -43,12 +43,12 @@ Project-scoped to this repo (hardcodes `Donelle/claude-runway`, `.venv`-based te
 
    **Baseline Bash permission preflight — run this ONLY after `DOGFOODING: yes`, before the first `Agent` call.** This does not, and cannot, guarantee the server-side auto mode classifier documented above won't reject the `Agent` call anyway (its reasoning is opaque and the one observed data point doesn't confirm causation) — but a missing baseline permission rule is a known, checkable precondition of the one workaround that has actually worked, so ruling it out first turns a possible opaque classifier denial into an actionable, specific message instead. Claude Code merges `permissions.allow` from BOTH the project's own `.claude/settings.json` and the user's `~/.claude/settings.json` — check both, since the working example that was observed lived only in the user-level file, not a project one:
    ```bash
-   jq -e '(.permissions.allow // []) | any(test("^Bash[(](git|gh|uv)[ :)]|^Bash[(][.]venv/bin/"))' \
+   jq -e '(.permissions.allow // []) | any(test("^Bash[(](git|gh|uv)[ :)]|^Bash[(][.]venv/(bin|Scripts)/"))' \
      .claude/settings.json >/dev/null 2>&1 && echo "PROJECT: yes" || echo "PROJECT: no"
-   jq -e '(.permissions.allow // []) | any(test("^Bash[(](git|gh|uv)[ :)]|^Bash[(][.]venv/bin/"))' \
+   jq -e '(.permissions.allow // []) | any(test("^Bash[(](git|gh|uv)[ :)]|^Bash[(][.]venv/(bin|Scripts)/"))' \
      ~/.claude/settings.json >/dev/null 2>&1 && echo "USER: yes" || echo "USER: no"
    ```
-   The `[ :)]` right after `git`/`gh`/`uv` is load-bearing, not decorative — without it, `test("^Bash\\((git|gh|uv|\\.venv/bin/)")` (an earlier version of this check) matched unrelated tool names that merely start with the same letters, e.g. `Bash(github-cli:*)`, `Bash(ghastly:*)`, `Bash(uvicorn:*)` all false-positived as `yes` (confirmed live against exactly these three), letting the preflight silently proceed with no real `git`/`gh`/`uv` access at all — the opposite of what this check exists to catch. Requiring a space/colon/close-paren immediately after the command name rules those out while still matching `Bash(git fetch:*)`/`Bash(gh pr:*)`/`Bash(uv venv:*)`/etc.
+   The `[ :)]` right after `git`/`gh`/`uv` is load-bearing, not decorative — without it, `test("^Bash\\((git|gh|uv|\\.venv/bin/)")` (an earlier version of this check) matched unrelated tool names that merely start with the same letters, e.g. `Bash(github-cli:*)`, `Bash(ghastly:*)`, `Bash(uvicorn:*)` all false-positived as `yes` (confirmed live against exactly these three), letting the preflight silently proceed with no real `git`/`gh`/`uv` access at all — the opposite of what this check exists to catch. Requiring a space/colon/close-paren immediately after the command name rules those out while still matching `Bash(git fetch:*)`/`Bash(gh pr:*)`/`Bash(uv venv:*)`/etc. The venv pattern matches both `bin/` (Linux/macOS) and `Scripts/` (Windows) — a Windows-only setup using `"Bash(.venv/Scripts/python *)"` would have incorrectly printed `no` with the earlier `.venv/bin/`-only pattern (issue #230).
    If BOTH print `no`, **STOP** — report to the user that no `git`/`gh`/`uv`/`.venv` Bash allow rule was found in either settings file, point them at `templates/settings.json.template`'s `_permissions_note` for the suggested NARROW, per-subcommand patterns to add (`Bash(git fetch:*)`, `Bash(gh pr:*)`, etc. — never a blanket `Bash(git:*)`/`Bash(gh:*)`/`Bash(uv:*)` wildcard, which is an arbitrary-command-execution bypass via git aliases/`uv run`, not just a broader convenience), and do not spawn any subagent yet. This detection regex intentionally accepts either narrow or broad existing rules (it only checks "is there *something* here already," not "is it appropriately scoped") — it's a precondition check, not an endorsement of whatever pattern happens to already be present, and not proof the classifier will allow the call either way.
 
 1. **Track only a minimal `attempted` list of issue numbers** across this run — nothing else about a completed ticket needs to live in this conversation's context. Starts empty.
@@ -363,11 +363,18 @@ under `~/.claude/skills/`, not guaranteed to exist on whichever machine is runni
     uv pip install -r requirements-dev.txt --index-url https://pypi.org/simple
     ```
     (The second/third lines are cheap no-ops if already satisfied, so it's fine to always
-    run them rather than trying to detect exactly what's missing.) Then run and require
-    both clean before proceeding:
+    run them rather than trying to detect exactly what's missing.) After bootstrapping,
+    resolve the interpreter path once — Windows venv uses `Scripts/`, Linux/macOS uses
+    `bin/` (issue #230). Mypy is invoked via `$PYTHON -m mypy` rather than as a direct
+    `$MYPY` binary, so only one allow rule (`.venv/Scripts/python` or `.venv/bin/python`)
+    is needed instead of two:
+    ```bash
+    PYTHON=$(if [ -f .venv/Scripts/python ]; then echo .venv/Scripts/python; else echo .venv/bin/python; fi)
     ```
-    .venv/bin/python -m unittest discover -s tests
-    .venv/bin/mypy libs tools hooks
+    Then run and require both clean before proceeding:
+    ```
+    $PYTHON -m unittest discover -s tests
+    $PYTHON -m mypy libs tools hooks
     ```
     If you cannot get both clean after reasonable effort, report FAILED with what's
     failing and why, rather than committing broken code.
@@ -450,17 +457,26 @@ happens there.
     comment or unrelated bot can't satisfy this either, since it isn't a review at all:
     ```bash
     HEAD_SHA=$(git rev-parse HEAD)
-    for i in $(seq 1 36); do
+    _seen_tmp=$(mktemp)
+    printf '%s\n' $SEEN_IDS | sort -u > "$_seen_tmp"
+    for i in {1..36}; do
       NEW_COPILOT_IDS=$(gh api repos/Donelle/claude-runway/pulls/<PR>/reviews --paginate \
           --jq ".[] | select(.user.login == \"copilot-pull-request-reviewer[bot]\" and .commit_id == \"$HEAD_SHA\") | \"review:\" + (.id|tostring)" 2>/dev/null \
-        | sort -u | comm -23 - <(printf '%s\n' $SEEN_IDS | sort -u))
+        | sort -u | grep -vxFf "$_seen_tmp" || true)
       if [ -n "$NEW_COPILOT_IDS" ]; then
         echo "Copilot review of $HEAD_SHA arrived: $NEW_COPILOT_IDS"
+        rm -f "$_seen_tmp"
         break
       fi
       sleep 15
     done
+    rm -f "$_seen_tmp"
     ```
+    (`{1..36}` brace expansion, not `$(seq 1 36)` — `seq` is absent from Git Bash on
+    Windows; brace expansion is a bash built-in and works cross-platform. `grep -vxFf` with
+    a temp file, not `comm -23 - <(...)` — process substitution `<(...)` is unreliable in
+    Git Bash on Windows; `grep -vxFf tmpfile` achieves the same set-difference without it.
+    `mktemp` IS available in Git Bash. Issue #230.)
     **36 iterations, not 40 — the loop's own sleep budget must leave real headroom under the
     wrapping Bash tool call's hard 600000ms timeout, not just equal it.** 40×15s of pure
     `sleep` alone already totals exactly 600000ms with zero margin left for the 40 `gh api`
@@ -520,7 +536,10 @@ happens there.
       echo "One or more feedback endpoints failed to fetch — do not treat this as a complete picture."
     fi
     ALL_IDS=$(printf '%s\n%s\n%s\n' "$COMMENT_IDS" "$REVIEW_IDS" "$ISSUE_COMMENT_IDS" | sort -u)
-    NEW_IDS=$(comm -23 <(echo "$ALL_IDS") <(printf '%s\n' $SEEN_IDS | sort -u))
+    _seen_tmp=$(mktemp)
+    printf '%s\n' $SEEN_IDS | sort -u > "$_seen_tmp"
+    NEW_IDS=$(printf '%s\n' "$ALL_IDS" | grep -vxFf "$_seen_tmp" || true)
+    rm -f "$_seen_tmp"
     ```
     If `FETCH_FAILED` is 1, report `OUTCOME: FAILED (issue #<N>) — could not reliably fetch
     PR #<PR>'s feedback (one or more of the comments/reviews/issue-comments endpoints

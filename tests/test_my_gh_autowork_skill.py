@@ -26,13 +26,16 @@ SKILL_PATH = os.path.join(REPO_ROOT, ".claude", "skills", "my-gh-autowork", "SKI
 SETTINGS_TEMPLATE_PATH = os.path.join(REPO_ROOT, "templates", "settings.json.template")
 
 # Mirrors the regex embedded in SKILL.md's Step 0 preflight check:
-#   jq -e '(.permissions.allow // []) | any(test("^Bash\\((git|gh|uv)[ :)]|^Bash\\(\\.venv/bin/"))'
+#   jq -e '(.permissions.allow // []) | any(test("^Bash\\((git|gh|uv)[ :)]|^Bash\\(\\.venv/(bin|Scripts)/"))'
 # The `[ :)]` delimiter right after git/gh/uv is required (Copilot review round 2 on
 # PR #196): an earlier version with no delimiter (`^Bash\((git|gh|uv|\.venv/bin/)`)
 # false-positived on unrelated tool names sharing the same leading letters, e.g.
 # `Bash(github-cli:*)`, `Bash(ghastly:*)`, `Bash(uvicorn:*)` -- confirmed live by
 # running this exact regex against those three strings before fixing it.
-_BASELINE_PERMISSION_RE = re.compile(r"^Bash\((git|gh|uv)[ :)]|^Bash\(\.venv/bin/")
+# The venv branch matches both `bin/` (Linux/macOS) and `Scripts/` (Windows), per
+# issue #230 -- a Windows-only setup using `.venv/Scripts/python` would otherwise
+# have incorrectly reported "no" and stopped the preflight unnecessarily.
+_BASELINE_PERMISSION_RE = re.compile(r"^Bash\((git|gh|uv)[ :)]|^Bash\(\.venv/(bin|Scripts)/")
 
 
 def has_baseline_permission(allow_list):
@@ -82,8 +85,10 @@ class SkillContentRequirements(unittest.TestCase):
 
     def test_preflight_stops_on_missing_permissions(self):
         # Must instruct a hard stop, matching the existing dogfood-preflight pattern.
+        # Window is 2500 (was 2000) to accommodate the issue #230 note appended to the
+        # preflight's explanatory paragraph without pushing STOP out of sight.
         section = self.content[self.content.find("Baseline Bash permission preflight"):]
-        self.assertIn("STOP", section[:2000])
+        self.assertIn("STOP", section[:2500])
 
     def test_does_not_overclaim_certainty(self):
         # The causal relationship between the permission fix and the classifier's
@@ -209,6 +214,11 @@ class BaselinePermissionRegexLogic(unittest.TestCase):
 
     def test_matches_venv_rule(self):
         self.assertTrue(has_baseline_permission(["Bash(.venv/bin/python:*)"]))
+
+    def test_matches_venv_scripts_rule(self):
+        # Windows venv uses Scripts/ not bin/ -- the preflight must accept either
+        # form so a Windows-only setup doesn't incorrectly report "no". Issue #230.
+        self.assertTrue(has_baseline_permission(["Bash(.venv/Scripts/python:*)"]))
 
     def test_no_match_on_unrelated_rules(self):
         self.assertFalse(has_baseline_permission(["Bash(dotnet build:*)"]))
