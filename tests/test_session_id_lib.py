@@ -84,60 +84,50 @@ class ShadowFileStrategy(SessionIdLibTestCase):
         self.sessions_dir.mkdir(parents=True)
         self.assertIsNone(L.session_id(L.SessionIdStrategy.SHADOW_FILE))
 
-    def test_omitted_project_falls_back_to_cwd_and_still_filters(self):
-        # Per this module's `project` contract (issue #198), omitting
-        # `project` must fall back to os.getcwd() the same way every other
-        # strategy does -- it must NOT disable filtering. Confirmed live
-        # this used to return the most-recently-modified marker across ALL
-        # projects unfiltered when `project` was omitted.
-        L.record_shadow_marker("sess-old", project="/repos/proj-a")
-        old_path = L._shadow_marker_path("sess-old")
-        os.utime(old_path, (time.time() - 100, time.time() - 100))
-        L.record_shadow_marker("sess-new", project="/repos/proj-b")
-
-        with mock.patch.object(os, "getcwd", return_value="/somewhere/proj-a"):
-            result = L.session_id(L.SessionIdStrategy.SHADOW_FILE)
-
-        self.assertEqual(result, "sess-old")
-
-    def test_omitted_project_with_no_cwd_match_returns_none(self):
+    def test_omitted_project_never_matches(self):
+        # SHADOW_FILE never evaluates `project` as a path and never falls
+        # back to os.getcwd() -- omitting it means there is nothing to
+        # compare a marker's basename against, so it always returns None,
+        # even when a marker exists that an old cwd-fallback would have
+        # matched. (Contrast TRANSCRIPT_SCAN, which still falls back to
+        # os.getcwd() via `_resolve_project` -- see that strategy's own
+        # `test_no_project_falls_back_to_cwd`.)
         L.record_shadow_marker("sess-a", project="/repos/proj-a")
-
-        with mock.patch.object(os, "getcwd", return_value="/somewhere/unrelated"):
-            result = L.session_id(L.SessionIdStrategy.SHADOW_FILE)
-
+        result = L.session_id(L.SessionIdStrategy.SHADOW_FILE)
         self.assertIsNone(result)
 
-    def test_project_filter_matches_by_basename(self):
+    def test_never_calls_getcwd(self):
+        # Regression guard: SHADOW_FILE must never resolve `project` as a
+        # path at all, so os.getcwd() should never be invoked for it, even
+        # when `project` is omitted -- unlike TRANSCRIPT_SCAN.
+        L.record_shadow_marker("sess-a", project="/repos/proj-a")
+        with mock.patch.object(os, "getcwd", side_effect=AssertionError("must not be called")):
+            result = L.session_id(L.SessionIdStrategy.SHADOW_FILE)
+        self.assertIsNone(result)  # project omitted -> never matches, per above
+
+    def test_project_filter_matches_by_bare_name(self):
+        # `project` is compared AS GIVEN (a bare name) against a marker's
+        # own recorded project reduced to its basename -- record_shadow_marker
+        # happens to store an absolute path, but the caller never needs one.
         L.record_shadow_marker("sess-a", project="/repos/proj-a")
         L.record_shadow_marker("sess-b", project="/repos/proj-b")
         # sess-b is more recently modified, but the caller wants proj-a's session.
-        result = L.session_id(L.SessionIdStrategy.SHADOW_FILE, project="/somewhere/proj-a")
+        result = L.session_id(L.SessionIdStrategy.SHADOW_FILE, project="proj-a")
         self.assertEqual(result, "sess-a")
 
     def test_project_filter_with_no_match_returns_none(self):
         L.record_shadow_marker("sess-a", project="/repos/proj-a")
-        result = L.session_id(L.SessionIdStrategy.SHADOW_FILE, project="/repos/proj-nonexistent")
+        result = L.session_id(L.SessionIdStrategy.SHADOW_FILE, project="proj-nonexistent")
         self.assertIsNone(result)
 
-    def test_getcwd_oserror_returns_none_instead_of_raising(self):
-        # This module documents that a recognized strategy never raises --
-        # but the os.getcwd() fallback used when `project` is omitted can
-        # itself raise OSError (e.g. the process's cwd was deleted/renamed
-        # out from under it). Confirmed this used to propagate straight out
-        # instead of failing toward None like every other unresolvable case.
-        with mock.patch.object(os, "getcwd", side_effect=OSError("no such directory")):
-            result = L.session_id(L.SessionIdStrategy.SHADOW_FILE)
-        self.assertIsNone(result)
-
-    def test_relative_project_is_rejected_instead_of_used_unchanged(self):
-        # This module's documented `project` contract requires an absolute
-        # path, never a bare/relative one -- but the contract wasn't
-        # actually enforced: a relative value like "app" used to pass
-        # through unchanged, silently matching an unrelated project that
-        # happens to share that basename. Must fail toward None instead.
-        L.record_shadow_marker("sess-a", project="/repos/app")
-        result = L.session_id(L.SessionIdStrategy.SHADOW_FILE, project="app")
+    def test_full_path_project_no_longer_matches(self):
+        # Deliberate behavior change: since `project` is now compared AS
+        # GIVEN (never reduced), passing a full path instead of the bare
+        # name no longer matches, even though the stored marker's own path
+        # shares that basename -- `project` is a name for this strategy,
+        # not a path, full stop.
+        L.record_shadow_marker("sess-a", project="/repos/proj-a")
+        result = L.session_id(L.SessionIdStrategy.SHADOW_FILE, project="/somewhere/proj-a")
         self.assertIsNone(result)
 
     def test_invalid_utf8_marker_content_fails_open_instead_of_raising(self):

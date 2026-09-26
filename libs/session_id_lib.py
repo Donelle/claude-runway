@@ -26,13 +26,17 @@ Decision rule:
     enough, and you want zero dependency on anything external -> Type 4
     (PROXY).
 
-`project`'s contract is the SAME value for every strategy that uses it -- an
-absolute path, never a bare name -- because the two callers need different
-derivations from it: TRANSCRIPT_SCAN uses the path as-is to compute
-`<slug>`; SHADOW_FILE internally reduces it to `Path(project).name` to
-filter marker files by project. Callers never pass a bare project name
-themselves; passing anything other than an absolute path (or omitting it,
-which falls back to `os.getcwd()`) is a caller error.
+`project`'s contract DIFFERS by strategy, because each derives something
+different from it: TRANSCRIPT_SCAN genuinely needs a real absolute path
+(used as-is to compute `<slug>` -- passing anything else, or omitting it
+without a resolvable `os.getcwd()`, is a caller error). SHADOW_FILE never
+evaluates `project` as a path at all -- it's a bare name, compared AS
+GIVEN (never reduced) against a marker's own recorded project, which IS
+reduced to its basename (see `_session_id_from_shadow_file`'s own
+docstring) -- so passing a full path instead of the bare name no longer
+matches, even though the underlying marker's own path shares that
+basename. `project` is a name for this strategy, full stop, and passing
+`None` never means "no filter" for it either.
 
 This module owns ALL the underlying logic internally (the shadow-sessions
 directory location and filename convention, the `<slug>` derivation for
@@ -120,28 +124,29 @@ def session_id(
 
 def _resolve_project(project: Optional[str]) -> Optional[str]:
     """
-    Shared `project` fallback for SHADOW_FILE and TRANSCRIPT_SCAN (the two
-    strategies whose contract says omitting `project` falls back to
-    `os.getcwd()`): returns `project` unchanged if given AND absolute,
-    otherwise tries `os.getcwd()` -- which can itself raise `OSError` (e.g.
-    this process's current working directory was deleted/renamed out from
-    under it, confirmed a real possibility, not a hypothetical). That would
-    otherwise propagate straight out of a call this module documents as
-    never raising for a recognized strategy, so it's caught here, once,
-    rather than duplicated in each strategy that needs the same fallback.
-    Returns None (not the failing call's exception, and not a value that
-    violates the contract) when even the fallback can't be resolved --
-    callers treat that exactly like any other unresolvable case.
+    `project` fallback for TRANSCRIPT_SCAN only -- the one strategy that
+    genuinely needs a real absolute path, since `_project_slug` derives
+    Claude Code's own `<slug>` directory name from the ENTIRE path, not
+    just its basename. (SHADOW_FILE deliberately does NOT go through this
+    function -- see `_session_id_from_shadow_file`'s own docstring for why
+    it treats `project` as a bare name with no path evaluation at all.)
 
-    This module's own `project` contract (see module docstring) says the
-    value is always an absolute path, never a bare/relative one -- a
-    caller passing something like `"app"` is a caller error, but the
-    contract wasn't actually ENFORCED here: a relative value used to pass
-    through unchanged, silently corrupting SHADOW_FILE's basename filter
-    (matching an unrelated project that happens to share that relative
-    string) and TRANSCRIPT_SCAN's `<slug>` derivation. Rejecting it (fail
-    toward None, same as an unresolvable `os.getcwd()`) instead of
-    accepting it unchanged closes that gap.
+    Returns `project` unchanged if given AND absolute, otherwise tries
+    `os.getcwd()` -- which can itself raise `OSError` (e.g. this process's
+    current working directory was deleted/renamed out from under it,
+    confirmed a real possibility, not a hypothetical). That would
+    otherwise propagate straight out of a call this module documents as
+    never raising for a recognized strategy, so it's caught here. Returns
+    None (not the failing call's exception, and not a value that violates
+    the contract) when even the fallback can't be resolved -- callers
+    treat that exactly like any other unresolvable case.
+
+    This module's own `project` contract (see module docstring) says
+    TRANSCRIPT_SCAN's value is always an absolute path, never a
+    bare/relative one -- a caller passing something like `"app"` is a
+    caller error. Rejecting it (fail toward None, same as an unresolvable
+    `os.getcwd()`) instead of accepting it unchanged and silently
+    corrupting `<slug>` derivation closes that gap.
     """
     if project is not None:
         return project if os.path.isabs(project) else None
@@ -274,27 +279,38 @@ def _strip_marker_prefix(stem: str) -> str:
 def _session_id_from_shadow_file(project: Optional[str]) -> Optional[str]:
     """
     Scans the sessions directory for the most-recently-modified
-    `session_*.jsonl` marker, filtered by project (reduced to
-    `Path(project).name`, matching how `hooks/record_session_id.py` derives
-    the tag it writes into each marker). Per this module's `project`
-    contract (issue #198), omitting `project` falls back to `os.getcwd()`
-    the same way every other strategy that takes a `project` does -- it
-    does NOT disable filtering. Returns None if the directory doesn't
-    exist, is empty, or no marker matches the (given-or-cwd-derived)
-    project -- never substitutes a DIFFERENTLY-NAMED project's session id,
-    the same caution savings_ledger.current_session_id() applies for the
-    identical reason.
+    `session_*.jsonl` marker, filtered by project. Unlike TRANSCRIPT_SCAN,
+    this strategy never evaluates `project` as a path -- `_sessions_dir()`
+    is a fixed, shared location regardless of `project`, and a marker's own
+    recorded project (however it was written -- `record_shadow_marker`
+    happens to store an absolute path today) is reduced to
+    `Path(marker_project).name` before comparing, so only a bare name is
+    ever actually compared against. `project` is therefore accepted AS
+    GIVEN -- a bare name like `"claude-runway"` -- with no `os.path.isabs`
+    requirement and no `os.getcwd()` fallback (contrast with
+    TRANSCRIPT_SCAN/`_resolve_project`, which genuinely need a real
+    absolute path to derive Claude Code's own `<slug>` directory name).
 
-    Known limitation (project-scoping is by directory BASENAME, not full
-    path): two distinct projects that happen to share the same final path
-    component (e.g. `/Users/alice/app` and `/Users/bob/other/app`) are
-    indistinguishable to this filter and can match each other's marker --
-    confirmed live. This mirrors the SAME basename-only derivation the
-    ticket's `project` contract specifies for this strategy (issue #198),
-    so it isn't unique to this function; if this ever needs tightening,
-    do it by having `record_shadow_marker`/this function compare full
-    paths instead, not by reinterpreting `project` differently per
-    strategy.
+    Passing `None` does NOT mean "no filter" here -- a marker's basename
+    can never equal `None`, so an omitted `project` always returns `None`
+    (no match), never "most recent regardless of project." A caller that
+    wants that different, unfiltered meaning (e.g.
+    `savings_ledger.current_session_id(project=None)`'s own "no filter"
+    semantics) must implement that itself rather than relying on this
+    strategy's `None` to mean the same thing.
+
+    Returns None if the directory doesn't exist, is empty, or no marker
+    matches the given project -- never substitutes a DIFFERENTLY-NAMED
+    project's session id, the same caution
+    savings_ledger.current_session_id() applies for the identical reason.
+
+    Known limitation (project-scoping is by BASENAME, not full path): two
+    distinct projects that happen to share the same final path component
+    (e.g. `/Users/alice/app` and `/Users/bob/other/app`, both recorded as
+    `"app"`) are indistinguishable to this filter and can match each
+    other's marker -- confirmed live. If this ever needs tightening, do it
+    by having `record_shadow_marker`/this function compare full paths
+    instead, not by reinterpreting `project` differently per strategy.
     """
     d = _sessions_dir()
     if not d.is_dir():
@@ -309,17 +325,9 @@ def _session_id_from_shadow_file(project: Optional[str]) -> Optional[str]:
         return None
     dated.sort(key=lambda pair: pair[0], reverse=True)
 
-    effective_project = _resolve_project(project)
-    if effective_project is None:
-        # project was omitted AND os.getcwd() itself failed (e.g. this
-        # process's cwd was deleted/renamed out from under it) -- nothing
-        # left to filter by, so fail toward None like every other
-        # unresolvable case rather than letting OSError propagate.
-        return None
-    project_filter = Path(effective_project).name
     for _, p in dated:
         marker_project = _read_shadow_marker_project(p)
-        if marker_project is not None and Path(marker_project).name == project_filter:
+        if marker_project is not None and Path(marker_project).name == project:
             return _strip_marker_prefix(p.stem)
     return None
 
