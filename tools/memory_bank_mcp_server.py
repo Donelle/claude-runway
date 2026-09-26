@@ -170,6 +170,14 @@ async def remember(
     # attempt, not just the ones that end up logged.
     tracking = mev.tracking_enabled()
     turn = _next_turn() if tracking else None
+    if tracking:
+        # Issue #211: a plain per-call-attempt tally into metrics.db,
+        # separate from the rich mev.record_memory_event(...) call below --
+        # fired here, before ANY of the fallible steps that follow (weight
+        # validation, repo resolution, the actual write), so an invalid
+        # weight or a repo-resolution error still counts as a call, matching
+        # `turn`'s own "count every invocation" philosophy just above.
+        mev.record_memory_metric("remember", session_id=_SESSION_ID)
 
     # Rejected here, at the tool boundary, same as recall()'s `limit < 1`
     # check below -- before resolve_repo/QdrantClient/embedding provider, so
@@ -274,6 +282,14 @@ async def recall(
     # though none of them reach the logging branch below.
     tracking = mev.tracking_enabled()
     turn = _next_turn() if tracking else None
+    if tracking:
+        # Issue #211: a plain per-call-attempt tally into metrics.db, fired
+        # unconditionally for every recall() invocation (unlike the per-hit
+        # mev.record_memory_event(...) logging further down, which only
+        # fires when there are actual results) -- a validation error, an
+        # embedding mismatch, or a genuinely empty result set are all still
+        # "a recall call," same as `turn` above already counts them.
+        mev.record_memory_metric("recall", session_id=_SESSION_ID)
 
     collection = DEFAULT_MEMORY_BANK_COLLECTION
     caller_repo, error = mb.resolve_repo(DEFAULT_MEMORY_BANK_ID, general=False)
@@ -373,6 +389,15 @@ def forget(
     count to the user and get explicit confirmation before re-calling with
     confirm=True.
     """
+    if mev.tracking_enabled():
+        # Issue #211: forget() has no existing memory_events_lib tracking at
+        # all (its rich record_memory_event log deliberately excludes
+        # "forget" -- see that module's docstring), so this is the first use
+        # of mev here. Fired before the point_id/wipe_all validation below,
+        # so even that error still counts as a call attempt, matching
+        # remember()/recall()'s own "count every invocation" placement.
+        mev.record_memory_metric("forget", session_id=_SESSION_ID)
+
     if bool(point_id) == bool(wipe_all):
         return "Error: pass exactly one of point_id or wipe_all, not both or neither."
 

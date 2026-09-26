@@ -15,8 +15,11 @@ import asyncio
 import io
 import os
 import sys
+import tempfile
 import unittest
 from contextlib import redirect_stderr
+from pathlib import Path
+from unittest import mock
 from unittest.mock import AsyncMock, MagicMock, patch
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -36,6 +39,39 @@ import memory_bank_lib as _mb  # noqa: E402
 
 def _run(coro):
     return asyncio.run(coro)
+
+
+# Issue #211 (Copilot review): most tests in this module call remember()/
+# recall()/forget() with tracking left at its real default (True) and don't
+# mock mev.record_memory_metric -- only MemoryMetricCounterTest below does.
+# Without this module-wide redirect, every one of those calls falls through
+# to the REAL metrics_lib.MetricsStore(), which resolves CLAUDE_RUNWAY_METRICS_DB
+# via os.environ and, if unset, writes into the DEVELOPER'S OWN real
+# ~/.claude/claude-runway/metrics.db -- confirmed live: running this suite
+# once appended 45 real "memory-bank" rows to that file. setUpModule/
+# tearDownModule redirect the env var to a throwaway temp path for the
+# entire module's test run (not just one test class), so every remember/
+# recall/forget call in this file -- mocked or not -- writes (if it writes
+# at all) into a file nothing else reads, then discards it wholesale on
+# teardown. Same tempfile-per-test-run approach test_memory_events_lib.py
+# already uses for CLAUDE_RUNWAY_MEMORY_EVENTS_DB, just scoped to the whole
+# module here rather than per-test-class, since the risk here is "any test
+# that doesn't explicitly mock record_memory_metric," not one specific class.
+_metrics_db_tmpdir: tempfile.TemporaryDirectory
+_metrics_db_env_patch: "mock._patch_dict"
+
+
+def setUpModule():
+    global _metrics_db_tmpdir, _metrics_db_env_patch
+    _metrics_db_tmpdir = tempfile.TemporaryDirectory()
+    db_path = Path(_metrics_db_tmpdir.name) / "metrics.db"
+    _metrics_db_env_patch = mock.patch.dict(os.environ, {"CLAUDE_RUNWAY_METRICS_DB": str(db_path)})
+    _metrics_db_env_patch.start()
+
+
+def tearDownModule():
+    _metrics_db_env_patch.stop()
+    _metrics_db_tmpdir.cleanup()
 
 
 class ForgetArgumentValidationTest(unittest.TestCase):
@@ -222,6 +258,106 @@ class MemoryEventLoggingTest(unittest.TestCase):
             _run(_mbs.recall(query="anything"))
             turn_after = _mbs._next_turn()
         self.assertEqual(turn_after, turn_before + 2)
+
+
+class MemoryMetricCounterTest(unittest.TestCase):
+    """Issue #211: remember()/recall()/forget() all call
+    mev.record_memory_metric(...) -- a plain per-call-attempt tally into
+    metrics.db, entirely separate from mev.record_memory_event's own rich
+    per-point memory-events.db log covered by MemoryEventLoggingTest above.
+    Counts every call ATTEMPT, including a validation error / embedding
+    mismatch / empty result, not just a successful remember/recall/forget."""
+
+    def test_remember_counts_even_on_invalid_weight(self):
+        # Regression-shaped: an invalid weight returns an Error before any
+        # Qdrant/embedding-provider work, but the call still happened.
+        with patch("memory_bank_mcp_server.QdrantClient") as mock_client_cls, \
+             patch.object(_mbs.mev, "tracking_enabled", return_value=True), \
+             patch.object(_mbs.mev, "record_memory_metric") as mock_metric:
+            result = _run(_mbs.remember(summary="s", description="d", kind="lesson", weight=-1.0))
+        self.assertIn("Error", result)
+        mock_metric.assert_called_once_with("remember", session_id=_mbs._SESSION_ID)
+        mock_client_cls.assert_not_called()
+
+    def test_remember_counts_on_embedding_mismatch(self):
+        with patch("memory_bank_mcp_server.QdrantClient"), \
+             patch("memory_bank_mcp_server.FastEmbedProvider"), \
+             patch.object(_mb, "remember_point", new=AsyncMock(return_value=(None, None, "Error: mismatch"))), \
+             patch.object(_mbs.mev, "tracking_enabled", return_value=True), \
+             patch.object(_mbs.mev, "record_memory_metric") as mock_metric:
+            _run(_mbs.remember(summary="s", description="d", kind="lesson"))
+        mock_metric.assert_called_once_with("remember", session_id=_mbs._SESSION_ID)
+
+    def test_remember_does_not_count_when_tracking_disabled(self):
+        with patch("memory_bank_mcp_server.QdrantClient"), \
+             patch("memory_bank_mcp_server.FastEmbedProvider"), \
+             patch.object(_mb, "remember_point", new=AsyncMock(return_value=("new-id", 1700000000.0, None))), \
+             patch.object(_mbs.mev, "tracking_enabled", return_value=False), \
+             patch.object(_mbs.mev, "record_memory_metric") as mock_metric:
+            _run(_mbs.remember(summary="s", description="d", kind="lesson"))
+        mock_metric.assert_not_called()
+
+    def test_recall_counts_on_missing_collection(self):
+        fake_client = MagicMock()
+        fake_client.collection_exists.return_value = False
+        with patch("memory_bank_mcp_server.QdrantClient", return_value=fake_client), \
+             patch.object(_mbs.mev, "tracking_enabled", return_value=True), \
+             patch.object(_mbs.mev, "record_memory_metric") as mock_metric:
+            result = _run(_mbs.recall(query="anything"))
+        self.assertIn("No memories found", result)
+        mock_metric.assert_called_once_with("recall", session_id=_mbs._SESSION_ID)
+
+    def test_recall_counts_once_even_with_multiple_hits(self):
+        # Unlike record_memory_event (one row per hit), record_memory_metric
+        # is a per-CALL tally -- exactly one call regardless of hit count.
+        results = [
+            {"id": "p1", "summary": "s1", "description": "d1", "kind": "lesson", "repo": "proj-a",
+             "embedding_model": "m", "score": 0.9, "created_at": 111.0},
+            {"id": "p2", "summary": "s2", "description": "d2", "kind": "idea", "repo": "proj-a",
+             "embedding_model": "m", "score": 0.8, "created_at": 222.0},
+        ]
+        fake_client = MagicMock()
+        fake_client.collection_exists.return_value = True
+        with patch("memory_bank_mcp_server.QdrantClient", return_value=fake_client), \
+             patch("memory_bank_mcp_server.check_embedding_model_mismatch", return_value=None), \
+             patch("memory_bank_mcp_server.FastEmbedProvider"), \
+             patch.object(_mb, "recall_points", new=AsyncMock(return_value=results)), \
+             patch.object(_mbs.mev, "tracking_enabled", return_value=True), \
+             patch.object(_mbs.mev, "record_memory_metric") as mock_metric:
+            _run(_mbs.recall(query="anything"))
+        mock_metric.assert_called_once_with("recall", session_id=_mbs._SESSION_ID)
+
+    def test_recall_does_not_count_when_tracking_disabled(self):
+        fake_client = MagicMock()
+        fake_client.collection_exists.return_value = False
+        with patch("memory_bank_mcp_server.QdrantClient", return_value=fake_client), \
+             patch.object(_mbs.mev, "tracking_enabled", return_value=False), \
+             patch.object(_mbs.mev, "record_memory_metric") as mock_metric:
+            _run(_mbs.recall(query="anything"))
+        mock_metric.assert_not_called()
+
+    def test_forget_counts_even_on_validation_error(self):
+        # Neither point_id nor wipe_all -- a validation error, but the call
+        # still happened and must still count.
+        with patch.object(_mbs.mev, "tracking_enabled", return_value=True), \
+             patch.object(_mbs.mev, "record_memory_metric") as mock_metric:
+            result = _mbs.forget()
+        self.assertIn("Error", result)
+        mock_metric.assert_called_once_with("forget", session_id=_mbs._SESSION_ID)
+
+    def test_forget_counts_on_ordinary_call(self):
+        with patch("memory_bank_mcp_server.QdrantClient"), \
+             patch.object(_mb, "forget_point", return_value="Deleted."), \
+             patch.object(_mbs.mev, "tracking_enabled", return_value=True), \
+             patch.object(_mbs.mev, "record_memory_metric") as mock_metric:
+            _mbs.forget(point_id="some-id")
+        mock_metric.assert_called_once_with("forget", session_id=_mbs._SESSION_ID)
+
+    def test_forget_does_not_count_when_tracking_disabled(self):
+        with patch.object(_mbs.mev, "tracking_enabled", return_value=False), \
+             patch.object(_mbs.mev, "record_memory_metric") as mock_metric:
+            _mbs.forget()
+        mock_metric.assert_not_called()
 
 
 class RememberWeightValidationTest(unittest.TestCase):

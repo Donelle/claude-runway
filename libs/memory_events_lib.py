@@ -12,6 +12,20 @@ would only matter alongside an autonomous-removal feature that doesn't exist
 yet; today `forget` always requires explicit human confirm=True, so there's
 nothing passive to observe.
 
+Issue #211 adds a SEPARATE, much simpler counter alongside the above:
+`record_memory_metric()` below writes a plain per-call-attempt tally
+(`metric_id="memory-bank"`, `event_type` in `("recall", "remember",
+"forget")`) into `libs/metrics_lib.py`'s shared, generic `metrics.db` --
+unlike this module's own rich per-point `memory_events` table, it carries no
+`point_id`/`repo`/`kind`/`turn` detail, just "how many times was each tool
+called." This is why `forget` DOES get counted there even though it's
+excluded from `record_memory_event`/`memory-events.db` above: a plain call
+count for `forget` costs nothing extra (no autonomous-removal feature is
+needed to justify it, unlike the rich per-point log this module already
+argues against for `forget`), and answering "how often is forget called"
+is exactly what issue #211 exists to give `/my-metrics`'s `memory-bank`
+branch (#208) real data to read.
+
 Why append-only INSERT, not an in-place counter on the Qdrant point itself:
 mutating a point's payload (read-current-count, increment, write-back) is a
 read-then-write race under concurrent access -- multiple projects/sessions
@@ -54,6 +68,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
+import metrics_lib
+
 
 def tracking_enabled() -> bool:
     """
@@ -93,6 +109,12 @@ def resolve_db_path() -> Path:
 
 
 _VALID_EVENT_TYPES = ("recall", "remember")
+
+# Issue #211: the simple metrics.db counter covers all THREE memory-bank
+# tools (unlike _VALID_EVENT_TYPES above, which deliberately excludes
+# "forget" for the rich memory_events table -- see this module's docstring
+# for why the two lists differ).
+_VALID_METRIC_EVENT_TYPES = ("recall", "remember", "forget")
 
 
 def _connect() -> sqlite3.Connection:
@@ -199,3 +221,56 @@ def record_memory_event(
     finally:
         if conn is not None:
             conn.close()
+
+
+def record_memory_metric(event_type: str, session_id: Optional[str] = None) -> None:
+    """
+    Issue #211: append a plain per-call-attempt tally into `metrics.db` (via
+    `libs/metrics_lib.py`'s shared `MetricsStore`) -- `metric_id="memory-bank"`,
+    this `event_type`, `value=1`, no metadata. Deliberately separate from
+    `record_memory_event`/`memory-events.db` above (see this module's
+    docstring): this is a plain call-count for `/my-metrics`'s `memory-bank`
+    branch (#208) to read, not the rich per-point access log that function
+    already provides.
+
+    event_type must be one of `_VALID_METRIC_EVENT_TYPES` ("recall",
+    "remember", "forget") -- raises ValueError otherwise, same fail-loud-on-
+    caller-bug convention as `record_memory_event`'s own `_VALID_EVENT_TYPES`
+    check (this module is only ever invoked by this repo's own three call
+    sites in tools/memory_bank_mcp_server.py). Note this set is intentionally
+    WIDER than `_VALID_EVENT_TYPES` -- "forget" is valid here even though
+    `record_memory_event` rejects it, because a plain call count carries none
+    of the "autonomous removal" concern that excludes forget from the richer
+    per-point log.
+
+    Counts every CALL ATTEMPT, not just a successful remember/recall/forget
+    -- callers must invoke this unconditionally for every tool invocation
+    (including one that goes on to hit a validation error, an embedding
+    mismatch, or returns zero results), matching the existing `turn`
+    counter's philosophy in tools/memory_bank_mcp_server.py: a counter meant
+    to answer "how often is this called" undercounts if it silently skips
+    failed attempts.
+
+    Does NOT self-gate on `tracking_enabled()` -- same convention
+    `record_memory_event` above already establishes: the caller (which
+    already resolves `tracking_enabled()` once per call, into a local
+    `tracking`/`turn` pair) is responsible for only calling this when
+    tracking is enabled. This is what "shares the existing
+    CLAUDE_RUNWAY_TRACK_MEMORY_EVENTS opt-out, no separate switch" means in
+    practice -- there is no second env var to check here.
+
+    Fails OPEN on any underlying write failure -- `MetricsStore.increment()`
+    (really `MetricsStore.record()`) already catches every write failure
+    itself (unwritable/locked/corrupt db file, non-finite value) and logs to
+    stderr, returning False rather than raising (see libs/metrics_lib.py's
+    own docstring) -- so there is nothing further to catch here; a broken
+    metrics.db must never turn into a reported failure for the actual
+    remember/recall/forget call this tally describes.
+    """
+    if event_type not in _VALID_METRIC_EVENT_TYPES:
+        raise ValueError(
+            f"Unknown event_type {event_type!r}. Valid values: {_VALID_METRIC_EVENT_TYPES}."
+        )
+    metrics_lib.MetricsStore().increment(
+        metric_id="memory-bank", event_type=event_type, session_id=session_id
+    )
