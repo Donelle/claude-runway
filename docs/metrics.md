@@ -4,7 +4,12 @@ A generic, cross-tool metrics-recording primitive (issue #208): ONE shared SQLit
 
 **Why one shared tool, not one per domain:** this repo's own tool-count sanity check found 23 tools already riding along in context on every single turn across the four connected MCP servers, regardless of whether they're used that turn (see `EVALUATION.md`'s Track A4/B4/E4). A metrics-reporting design that adds a new MCP tool per future metric domain would directly work against that cost model. A single generic dispatch tool (`get_metrics`) adds a flat, bounded cost no matter how many domains eventually write into this store.
 
-**Status:** `my-gh-autowork`'s per-run outcome logging now writes into this store — the first real domain writing into `metrics.db`, using `metric_id="autowork"`. Use `/my-metrics autowork` to see a summary. A fresh install has no autowork data until at least one run completes. Migrating `libs/savings_ledger.py`'s `savings.db` or `libs/memory_events_lib.py`'s `memory-events.db` onto this store remains an explicit, separate follow-up.
+**Status:** two domains write into this store today:
+
+- `metric_id="autowork"` — `my-gh-autowork`'s per-run outcome logging. Use `/my-metrics autowork`; a fresh install has no data until at least one run completes.
+- `metric_id="memory-bank"` — a plain per-call-attempt counter for `recall`/`remember`/`forget` (event types of the same names), written by `libs/memory_events_lib.py`'s `record_memory_metric()`. Use `/my-metrics memory-bank`.
+
+That memory-bank counter is in addition to, not a replacement for, memory-bank's detailed per-point `memory-events.db` log, which stays where it is. Migrating that log or `libs/savings_ledger.py`'s `savings.db` onto this store remains a separate follow-up.
 
 ## Where the data lives
 
