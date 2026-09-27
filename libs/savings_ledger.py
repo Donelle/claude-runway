@@ -1028,7 +1028,7 @@ def format_simple_view(session_agg: dict, project_summary: dict) -> str:
 
     lines += [
         "",
-        f"This project · all time",
+        "This project · all time",
         f"  Sessions tracked         {project_summary.get('sessions', 0):>8}",
         f"  Total tokens avoided     {_fmt_tokens(project_summary.get('total_saved_tokens', 0)):>8}",
         f"  Best session             {_fmt_tokens(project_summary.get('best_session_tokens', 0)):>8}",

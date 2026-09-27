@@ -1672,7 +1672,7 @@ class CompactPruneTests(unittest.TestCase):
         # keep_last_n=1 should keep "newest valid" and delete... the bad-date
         # entry is simply preserved outside the quota (not treated as newest),
         # so after pruning we should still have the real one.
-        result = _run(mod.compact_prune(project="proj", keep_last_n=1, dry_run=False))
+        _run(mod.compact_prune(project="proj", keep_last_n=1, dry_run=False))
 
         remaining = list(mod.QdrantClient().collections[canonical_col].values())
         real_dates = [p.payload.get("date") for p in remaining]
@@ -1975,6 +1975,57 @@ class GetMetricsBucketAndNScopedToRelevantViews(unittest.TestCase):
         mod = _load_compress_mcp_server()
         result = mod.get_metrics("autowork", view="detail", n=0)
         self.assertIn("Error:", result)
+
+
+class ListLocalModelsReportsLoadedNotDownloaded(unittest.TestCase):
+    """Issue #296: list_local_models used to report every model
+    /v1/models returned -- every DOWNLOADED model, not just loaded ones
+    (LM Studio's default is JIT loading) -- which is misleading when the
+    output is used directly as a model= value that must name something
+    actually loaded. It now goes through local_compress_lib.fetch_loaded_models,
+    which prefers LM Studio's native /api/v0/models endpoint (true per-model
+    load state) and falls back to /v1/models -- unchanged, same old
+    limitation -- only when /api/v0 isn't available.
+
+    Patches mod.fetch_loaded_models directly (imported into
+    compress_mcp_server's own namespace from local_compress_lib) --
+    fetch_loaded_models' own behavior against real HTTP responses is covered
+    by test_local_compress_lib.py's FetchLoadedModelsTests; this file only
+    needs to confirm list_local_models' own wording built on top of it.
+    """
+
+    def test_reports_loaded_chat_models_via_v0(self):
+        mod = _load_compress_mcp_server()
+        mod.fetch_loaded_models = lambda base_url: (["google/gemma-4-e4b"], "v0")
+        result = mod.list_local_models()
+        self.assertIn("Loaded chat models", result)
+        self.assertIn("google/gemma-4-e4b", result)
+        # Must not claim these are merely "available" -- v0 confirms load state.
+        self.assertNotIn("load state unknown", result)
+
+    def test_v1_fallback_does_not_claim_confirmed_load_state(self):
+        mod = _load_compress_mcp_server()
+        mod.fetch_loaded_models = lambda base_url: (["model-a", "model-b"], "v1")
+        result = mod.list_local_models()
+        self.assertIn("load state unknown", result)
+        self.assertIn("model-a", result)
+        self.assertNotIn("Loaded chat models", result)
+
+    def test_no_loaded_models_reports_none_loaded(self):
+        mod = _load_compress_mcp_server()
+        mod.fetch_loaded_models = lambda base_url: ([], "v0")
+        result = mod.list_local_models()
+        self.assertIn("no model is loaded", result)
+
+    def test_unreachable_reports_could_not_reach(self):
+        mod = _load_compress_mcp_server()
+
+        def _raise(base_url):
+            raise ConnectionError("LM Studio is down")
+
+        mod.fetch_loaded_models = _raise
+        result = mod.list_local_models()
+        self.assertIn("Could not reach LM Studio", result)
 
 
 if __name__ == "__main__":

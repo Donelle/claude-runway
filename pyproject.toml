@@ -70,6 +70,36 @@ dependencies = [
     "pathspec",
 ]
 
+[tool.ruff.lint]
+# Starting narrow (issue #297) -- pyflakes (F) + flake8-bugbear (B). More
+# rule groups get added later, one at a time, each its own reviewed PR per
+# that issue's hard constraint: adopting/expanding the linter must never
+# change runtime behavior on its own.
+select = ["F", "B"]
+
+[tool.pyright]
+# Replaces mypy (issue #297) -- Pyright is also what VS Code's Pylance
+# extension runs under the hood, so the editor and this repo's CI/pre-push
+# gate now report the same findings instead of two type checkers disagreeing.
+typeCheckingMode = "standard"
+pythonVersion = "3.12"
+# Deliberately NOT venvPath/venv here (Copilot review, PR #319): CI
+# (.github/workflows/tests.yml) installs dependencies directly into the
+# actions/setup-python interpreter, never creating a `.venv/` -- a hardcoded
+# venvPath="."/venv=".venv" would make Pyright emit "venv .venv subdirectory
+# not found" there and fall back to resolving third-party imports against
+# nothing, turning every dependency (qdrant_client, openai, ...) into a
+# reportMissingImports error (confirmed live by reproducing this exact
+# scenario). Each caller instead passes `--pythonpath` explicitly, pointing
+# at whichever interpreter actually has the dependencies installed -- see
+# .githooks/pre-push and the CI workflow's "Type check (Pyright)" step.
+# libs/tools/hooks are imported by bare (non-dotted) name after each
+# script's own sys.path setup (see this file's [tool.setuptools] comment
+# below) -- without these, pyright reports ~42 false reportMissingImports
+# for those sibling imports.
+extraPaths = ["libs", "tools", "hooks"]
+include = ["libs", "tools", "hooks"]
+
 [project.scripts]
 # Issue #206: libs/tools/hooks/templates/skills are no longer
 # `[tool.setuptools] packages` (see that section below) -- they ship as
@@ -131,12 +161,18 @@ packages = ["claude_runway"]
 # shim DOES import it by dotted name (`from tools.ingest_to_qdrant import
 # main`, etc.) once <env>/src is added to sys.path -- this works with no
 # __init__.py because Python's PEP 420 implicit-namespace-package support
-# lets a plain directory be imported this way. mypy (`mypy.ini`'s
-# `mypy_path = libs`) is specifically why libs/ must stay import-nameless,
-# though, not tools/ -- adding an __init__.py to libs/ specifically made
-# mypy see libs/qdrant_retry.py under two module identities at once
+# lets a plain directory be imported this way. mypy (`mypy.ini`'s old
+# `mypy_path = libs`) used to be specifically why libs/ had to stay
+# import-nameless, not tools/ -- adding an __init__.py to libs/ specifically
+# made mypy see libs/qdrant_retry.py under two module identities at once
 # (confirmed live in this issue's own testing predecessor, issue #50/PR
-# #136's own history) -- see that repo history for the "Source file found
+# #136's own history; see that repo history for the "Source file found
 # twice under different module names" mypy error an __init__.py there
-# previously caused.
+# previously caused). Issue #297 replaced mypy with Pyright (this file's own
+# [tool.pyright] section, above), which doesn't share that specific
+# duplicate-module-identity failure mode -- but the reasoning right above
+# this paragraph (libs/'s content is resolved via __file__ + sys.path and a
+# bare, non-dotted import, not a real Python package) is a packaging
+# decision independent of whichever type checker is configured, so
+# __init__.py stays out of libs/ regardless.
 

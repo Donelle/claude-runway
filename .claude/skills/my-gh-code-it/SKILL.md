@@ -11,9 +11,9 @@ Project-scoped to this repo on purpose: it hardcodes claude-runway's actual conv
 
 ## Usage
 ```
-/my-gh-code-it 21
-/my-gh-code-it #21
-/my-gh-code-it https://github.com/Donelle/claude-runway/issues/21
+/my-gh-code-it 12345
+/my-gh-code-it #12345
+/my-gh-code-it https://github.com/Donelle/claude-runway/issues/12345
 ```
 
 ## Steps
@@ -29,7 +29,7 @@ Project-scoped to this repo on purpose: it hardcodes claude-runway's actual conv
    - If `state` is `CLOSED`, tell the user and ask whether to proceed anyway (e.g. reopening work on a regression) rather than silently continuing.
    - Read the full `body` — issues filed via the code-review pass already contain **Location**, **Verdict/Confirmed**, and **Suggested fix** sections; treat these as a head start on the plan below, not something to re-derive from scratch.
 
-4. **Check whether this ticket is already being worked on — stop immediately unless you're already on its own branch (issue #240).** This is an absolute check: it doesn't matter WHO the existing assignee is, including yourself from an earlier run — any pre-existing signal below means don't proceed.
+4. **Check whether this ticket is already being worked on — stop immediately unless you're already on its own branch (a past ticket).** This is an absolute check: it doesn't matter WHO the existing assignee is, including yourself from an earlier run — any pre-existing signal below means don't proceed.
    - Determine the ticket's own linked branch, if any:
      ```bash
      gh issue develop {N} -R Donelle/claude-runway --list
@@ -59,7 +59,7 @@ Project-scoped to this repo on purpose: it hardcodes claude-runway's actual conv
 
 7. **GitHub Project board — not configured yet.** This repo doesn't use a Projects v2 board as of this skill's creation, so there is no project-assignment step. If that changes later, add a step here using `gh issue edit {N} --add-project "<title>"` — note this requires `gh auth refresh -s project,read:project` once (the current token lacks both scopes), and confirm the exact project title/number with the user before hardcoding it.
 
-8. **Create and link the branch** using GitHub's native linked-branch feature (shows up on the issue itself, not just a plain `git checkout -b`). Step 4 above already confirmed no linked branch exists yet (otherwise you'd have stopped there, or already be on it) — issue #240 removed the old "check for an existing branch, reuse it" bullet here for exactly that reason: reuse is no longer a case this step can encounter.
+8. **Create and link the branch** using GitHub's native linked-branch feature (shows up on the issue itself, not just a plain `git checkout -b`). Step 4 above already confirmed no linked branch exists yet (otherwise you'd have stopped there, or already be on it) — a past ticket removed the old "check for an existing branch, reuse it" bullet here for exactly that reason: reuse is no longer a case this step can encounter.
    - Derive a branch name from the issue type and title — `fix/<short-kebab-slug>` for Bug, `feature/<short-kebab-slug>` for Feature/Task — matching this repo's actual history (`fix/chunker-defects-found-by-dogfooding`, `feature/session-continuity-skills`, etc.), not a ticket-ID-based name. Keep the slug short (aim for ≤ 6 words) and specific to the actual defect/feature, not a verbatim slugification of the full issue title.
    - **Show the proposed branch name to the user and wait for confirmation** before creating it — same "don't act until approved" discipline as the plan gate below, just lighter-weight since it's one name, not a whole plan.
    - Create, link, and check out in one step:
@@ -82,15 +82,24 @@ Project-scoped to this repo on purpose: it hardcodes claude-runway's actual conv
 
 12. **Write or update unit tests** in the relevant `tests/test_*.py` file, following existing patterns in that file (e.g. `test_local_compress_lib.py`'s stub-injection technique for anything touching LM Studio, so tests don't require a live model).
 
-13. **Run the test suite, then type-check**:
+13. **Run the test suite, then lint and type-check**:
     ```bash
     .venv/bin/python -m unittest discover -s tests
-    .venv/bin/mypy libs tools hooks
+    .venv/bin/ruff check libs tools hooks tests
+    .venv/bin/pyright --pythonpath .venv/bin/python
     ```
-    All tests must pass, including any new ones, and mypy must report no
-    issues. mypy is installed via `requirements-dev.txt` (a separate,
-    dev-only file from `requirements.txt` — see that file's own comment); if
-    it's missing from this repo's venv, install it with
+    **The `--pythonpath` flag is required** (confirmed by a past Copilot review):
+    `pyproject.toml`'s `[tool.pyright]` deliberately has no `venvPath`/`venv`
+    setting (a hardcoded `.venv` broke CI, which never creates one), so
+    without `--pythonpath` Pyright falls back to whatever Python is first on
+    `PATH` and reports every third-party import as missing — confirmed live,
+    even when running `.venv/bin/pyright` itself, not just a bare `pyright`.
+    All tests must pass, including any new ones, and both ruff and Pyright
+    must report no issues (Pyright replaced mypy so the editor's
+    Pylance extension and this gate agree). Both are installed via
+    `requirements-dev.txt` (a separate, dev-only file from
+    `requirements.txt` — see that file's own comment); if either is missing
+    from this repo's venv, install with
     `uv pip install -r requirements-dev.txt --index-url https://pypi.org/simple`
     (not `.venv/bin/pip install` — `uv venv` doesn't seed a `pip` executable
     by default, so that would fail in exactly the recovery case this is

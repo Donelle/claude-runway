@@ -7,9 +7,9 @@ A generic, cross-tool metrics-recording primitive (issue #208): ONE shared SQLit
 **Status:** two domains write into this store today:
 
 - `metric_id="autowork"` — `my-gh-autowork`'s per-run outcome logging. Use `/my-metrics autowork`; a fresh install has no data until at least one run completes.
-- `metric_id="memory-bank"` — a plain per-call-attempt counter for `recall`/`remember`/`forget` (event types of the same names), written by `libs/memory_events_lib.py`'s `record_memory_metric()`. Use `/my-metrics memory-bank`.
+- `metric_id="memory-bank"` — a plain per-call-attempt counter for `recall`/`remember`/`forget` (event types of the same names), written by `libs/memory_events_lib.py`'s `record_memory_metric()`. Use `/my-metrics memory-bank`. It shares the `CLAUDE_RUNWAY_TRACK_MEMORY_EVENTS` opt-out with memory-bank's detailed per-point `memory-events.db` log (see [Memory bank](memory-bank.md)) — there's no separate switch — so a session with tracking disabled writes no rows here either.
 
-That memory-bank counter is in addition to, not a replacement for, memory-bank's detailed per-point `memory-events.db` log, which stays where it is. Migrating that log or `libs/savings_ledger.py`'s `savings.db` onto this store remains a separate follow-up.
+That memory-bank counter is in addition to, not a replacement for, the detailed `memory-events.db` log. Moving that log onto this store was considered and deliberately declined: its indexed `point_id`/`repo` columns support rollups ("most-recalled memories") that this generic, schema-free store can't do without an unindexed `json_extract` scan, so the two stores stay side by side on purpose. Migrating `libs/savings_ledger.py`'s `savings.db` onto this store remains an open, undecided follow-up.
 
 ## Where the data lives
 

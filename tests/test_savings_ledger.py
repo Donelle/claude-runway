@@ -1037,7 +1037,7 @@ class FormatCsv(unittest.TestCase):
         out = L.format_csv(self._SESSION_AGG, self._PROJECT_SUMMARY, [], [], [], table="session")
         rows = self._parse(out)
         header, data = rows[0], rows[1]
-        d = dict(zip(header, data))
+        d = dict(zip(header, data, strict=False))
         self.assertEqual(d["project"], "my-repo")
         self.assertEqual(int(d["credited_saved_tokens"]), 1234)
         self.assertEqual(int(d["project_total_saved_tokens"]), 50000)
@@ -1064,7 +1064,7 @@ class FormatCsv(unittest.TestCase):
         out = L.format_csv(self._SESSION_AGG, self._PROJECT_SUMMARY, breakdown, [], [], table="tools")
         rows = self._parse(out)
         header, data = rows[0], rows[1]
-        d = dict(zip(header, data))
+        d = dict(zip(header, data, strict=False))
         self.assertEqual(d["tool"], "hook:Bash")
         self.assertEqual(int(d["saved_tokens"]), 900)
         self.assertEqual(int(d["credited_event_count"]), 5)
@@ -1089,7 +1089,7 @@ class FormatCsv(unittest.TestCase):
         out = L.format_csv(self._SESSION_AGG, self._PROJECT_SUMMARY, [], [], all_projects, table="projects")
         rows = self._parse(out)
         header, data = rows[0], rows[1]
-        d = dict(zip(header, data))
+        d = dict(zip(header, data, strict=False))
         self.assertEqual(d["best_tool"], "")
         self.assertNotIn("None", out)
 
@@ -1118,7 +1118,7 @@ class FormatCsv(unittest.TestCase):
         ps = dict(self._PROJECT_SUMMARY, project="repo,with,commas")
         out = L.format_csv(agg, ps, [], [], [], table="session")
         rows = self._parse(out)
-        d = dict(zip(rows[0], rows[1]))
+        d = dict(zip(rows[0], rows[1], strict=False))
         self.assertEqual(d["project"], "repo,with,commas")
 
     def test_formula_injection_prefix_on_equals_leading_project(self):
@@ -1128,7 +1128,7 @@ class FormatCsv(unittest.TestCase):
         ps = dict(self._PROJECT_SUMMARY, project="=DANGEROUS()")
         out = L.format_csv(agg, ps, [], [], [], table="session")
         rows = self._parse(out)
-        d = dict(zip(rows[0], rows[1]))
+        d = dict(zip(rows[0], rows[1], strict=False))
         # Apostrophe prefix applied -- the raw cell value now starts with "'".
         self.assertTrue(d["project"].startswith("'"), d["project"])
         self.assertNotEqual(d["project"][0], "=")
@@ -1141,7 +1141,7 @@ class FormatCsv(unittest.TestCase):
         ]
         out = L.format_csv(self._SESSION_AGG, self._PROJECT_SUMMARY, breakdown, [], [], table="tools")
         rows = self._parse(out)
-        d = dict(zip(rows[0], rows[1]))
+        d = dict(zip(rows[0], rows[1], strict=False))
         self.assertTrue(d["tool"].startswith("'"), d["tool"])
 
     def test_safe_str_does_not_modify_normal_values(self):
@@ -1150,7 +1150,7 @@ class FormatCsv(unittest.TestCase):
         ps = dict(self._PROJECT_SUMMARY, project="my-normal-repo")
         out = L.format_csv(agg, ps, [], [], [], table="session")
         rows = self._parse(out)
-        d = dict(zip(rows[0], rows[1]))
+        d = dict(zip(rows[0], rows[1], strict=False))
         self.assertEqual(d["project"], "my-normal-repo")
 
     def test_formula_injection_prefix_on_whitespace_prefixed_formula(self):
@@ -1161,7 +1161,7 @@ class FormatCsv(unittest.TestCase):
         ps = dict(self._PROJECT_SUMMARY, project="\t=FORMULA()")
         out = L.format_csv(agg, ps, [], [], [], table="session")
         rows = self._parse(out)
-        d = dict(zip(rows[0], rows[1]))
+        d = dict(zip(rows[0], rows[1], strict=False))
         # Apostrophe must be prepended even though the first char is \t.
         self.assertTrue(d["project"].startswith("'"), f"Expected apostrophe prefix, got: {d['project']!r}")
 
@@ -1171,7 +1171,7 @@ class FormatCsv(unittest.TestCase):
         ps = dict(self._PROJECT_SUMMARY, project=" +1+1")
         out = L.format_csv(agg, ps, [], [], [], table="session")
         rows = self._parse(out)
-        d = dict(zip(rows[0], rows[1]))
+        d = dict(zip(rows[0], rows[1], strict=False))
         self.assertTrue(d["project"].startswith("'"), f"Expected apostrophe prefix, got: {d['project']!r}")
 
 
@@ -1397,7 +1397,7 @@ class ParseTranscriptTokenCounts(unittest.TestCase):
 
     def _make_transcript(self, entries: list) -> str:
         """Build a JSONL transcript string from a list of raw dicts."""
-        import tempfile, os as _os
+        import tempfile
         f = tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False, encoding="utf-8")
         for entry in entries:
             f.write(json.dumps(entry) + "\n")

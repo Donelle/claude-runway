@@ -255,9 +255,11 @@ def _scope_filter(
     the two states move together instead of a window where one is true and
     not the other.
     """
-    # Bare `list` (not `list[FieldCondition]`) so mypy treats these as
-    # list[Any] -- Filter's must/should accept a broader Condition union,
-    # and list's invariance would otherwise reject a narrower list[FieldCondition].
+    # Bare `list` (not `list[FieldCondition]`) so the type checker (mypy
+    # originally, Pyright since issue #297 -- both treat this the same way)
+    # sees these as list[Any] -- Filter's must/should accept a broader
+    # Condition union, and list's invariance would otherwise reject a
+    # narrower list[FieldCondition].
     must: list = [models.FieldCondition(key=SOURCE_FIELD, match=models.MatchValue(value=MEMORY_BANK_SOURCE))]
     must_not: list = [models.FieldCondition(key=PENDING_FIELD, match=models.MatchValue(value=True))]
     should: Optional[list] = None

@@ -149,7 +149,13 @@ def _report_standalone_qdrant_server() -> tuple:
     # format (name + signature + docstring) so the three reported estimates are
     # computed from comparable subsets.
     blob = "\n".join(
-        f"{t.name}{inspect.signature(t.fn)}\n{t.fn.__doc__ or ''}"
+        # The declared return type of list_tools() is the generic MCP SDK
+        # `Tool`, whose stub has no `.fn` -- but at runtime these are
+        # actually fastmcp `FunctionTool` instances (see the comment above),
+        # which do carry it. Confirmed by this repo's own existing smoke
+        # test (test_report_tool_counts.py) actually running this and
+        # asserting a positive token count -- a stub gap, not a real bug.
+        f"{t.name}{inspect.signature(t.fn)}\n{t.fn.__doc__ or ''}"  # pyright: ignore[reportAttributeAccessIssue]
         for t in tools
     )
     return len(tools), estimate_tokens(blob)
