@@ -25,5 +25,5 @@ Separately from the `skills/` directory (see the [Files](../README.md#files-34) 
 git config core.hooksPath .githooks
 ```
 
-This is a convenience, not the real enforcement — it can be skipped with `git push --no-verify`, and a `/my-gh-autowork` subagent working in a fresh git worktree may never have `core.hooksPath` set at all. CI (`.github/workflows/tests.yml`) runs the identical two checks and is what actually gates a PR.
+This is a convenience, not the real enforcement — it only runs in a clone that has opted in with the command above, and any push can skip it with `git push --no-verify`. Linked worktrees of an opted-in clone, including `/my-gh-autowork`'s, inherit the setting, because `core.hooksPath` lives in the repo-local config that every worktree shares. CI (`.github/workflows/tests.yml`) runs the identical two checks and is what actually gates a PR.
 

@@ -6,11 +6,11 @@
 #
 # This is a CONVENIENCE gate, not the real enforcement -- CI
 # (.github/workflows/tests.yml) runs the identical two checks and is what
-# actually blocks a PR, because this hook can be skipped with
-# `git push --no-verify`, and a /my-gh-autowork subagent working in a fresh
-# git worktree may never have `core.hooksPath` pointed at this directory at
-# all (worktrees don't inherit hook config the way they inherit tracked
-# files). Deliberately does NOT run the unit test suite --
+# actually blocks a PR, because this hook only runs in a clone that has
+# opted in (below) and can be skipped with `git push --no-verify`. Linked
+# worktrees of an opted-in clone (including /my-gh-autowork's) DO run it:
+# `core.hooksPath` lives in the shared repo-local config, which every
+# worktree reads. Deliberately does NOT run the unit test suite --
 # tests/test_pyproject.py builds a real wheel, which is too slow for every
 # push, and CI already covers it.
 #
