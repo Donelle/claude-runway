@@ -223,11 +223,18 @@ except ImportError as e:
     sys.exit(0)
 
 # savings_ledger is optional -- an older checkout without libs/savings_ledger.py
-# should keep working exactly as before, just without ledger logging.
+# should keep working exactly as before, just without ledger logging. The
+# explicit `savings_ledger = None` in the except branch (issue #297, adopting
+# Pyright) keeps the name always bound -- every use below checks
+# _SAVINGS_LEDGER_AVAILABLE first and then asserts it's not None, which is
+# always true at runtime (that's exactly what _SAVINGS_LEDGER_AVAILABLE
+# records) but lets Pyright narrow the type instead of reporting a
+# possibly-unbound error.
 try:
     import savings_ledger
     _SAVINGS_LEDGER_AVAILABLE = True
 except ImportError:
+    savings_ledger = None  # type: ignore[assignment]
     _SAVINGS_LEDGER_AVAILABLE = False
 
 
@@ -240,7 +247,13 @@ def _record_savings_event(session_id, tool, raw_tokens, out_tokens, credited, so
     delegates to session_id_lib's shadow markers instead (populated by the
     separate hooks/record_session_id.py hook, not this one), so this field is
     now informational only -- see savings_ledger.record_event's own docstring."""
-    if not (_SAVINGS_LEDGER_AVAILABLE and session_id and savings_ledger.tracking_enabled()):
+    # Split out of one combined `and` expression (issue #297) so Pyright can
+    # narrow savings_ledger's type via the assert below -- same short-circuit
+    # order and return behavior as the original `if not (A and B and C):`.
+    if not _SAVINGS_LEDGER_AVAILABLE or not session_id:
+        return
+    assert savings_ledger is not None  # _SAVINGS_LEDGER_AVAILABLE implies this
+    if not savings_ledger.tracking_enabled():
         return
     try:
         savings_ledger.record_event(session_id, tool, raw_tokens, out_tokens, credited, source, project=project)
@@ -803,7 +816,11 @@ def _dispatch(payload):
     # that lookup delegates to session_id_lib's shadow markers instead, so
     # this tag is now informational only -- see savings_ledger.record_event's
     # own docstring.
-    project = savings_ledger.project_name_from_cwd(payload.get("cwd", "")) if _SAVINGS_LEDGER_AVAILABLE else None
+    if _SAVINGS_LEDGER_AVAILABLE:
+        assert savings_ledger is not None  # _SAVINGS_LEDGER_AVAILABLE implies this
+        project = savings_ledger.project_name_from_cwd(payload.get("cwd", ""))
+    else:
+        project = None
 
     if tool_name and tool_name.startswith(MCP_SAVINGS_TOOL_PREFIX):
         if tool_response is None:

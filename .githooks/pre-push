@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Local pre-push gate (issue #297): report-only ruff (F, B) + Pyright
+# (standard mode), run from this repo's own .venv -- never `--fix`/
+# `--unsafe-fixes`, since adopting/running the linter must never itself
+# change runtime behavior (see pyproject.toml's [tool.ruff.lint] comment).
+#
+# This is a CONVENIENCE gate, not the real enforcement -- CI
+# (.github/workflows/tests.yml) runs the identical two checks and is what
+# actually blocks a PR, because this hook only runs in a clone that has
+# opted in (below) and can be skipped with `git push --no-verify`. Linked
+# worktrees of an opted-in clone (including /my-gh-autowork's) DO run it:
+# `core.hooksPath` lives in the shared repo-local config, which every
+# worktree reads. Deliberately does NOT run the unit test suite --
+# tests/test_pyproject.py builds a real wheel, which is too slow for every
+# push, and CI already covers it.
+#
+# Not registered automatically -- each clone opts in once with:
+#   git config core.hooksPath .githooks
+# (see docs/development-workflow.md).
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
+
+# Windows venvs use Scripts/ and name every console-script entry point
+# <name>.exe (pip's standard behavior for Windows console_scripts, not just
+# python.exe itself) -- Linux/macOS use bin/ with no suffix. Copilot review
+# (PR #319) caught that an earlier version of this hook found python.exe
+# correctly but then checked/executed extensionless "Scripts/ruff"/
+# "Scripts/pyright", which never exist on Windows, silently blocking every
+# push there.
+if [ -f .venv/Scripts/python.exe ]; then
+    VENV_BIN=".venv/Scripts"
+    EXE_SUFFIX=".exe"
+else
+    VENV_BIN=".venv/bin"
+    EXE_SUFFIX=""
+fi
+PYTHON="$VENV_BIN/python$EXE_SUFFIX"
+RUFF="$VENV_BIN/ruff$EXE_SUFFIX"
+PYRIGHT="$VENV_BIN/pyright$EXE_SUFFIX"
+
+if [ ! -x "$RUFF" ] || [ ! -x "$PYRIGHT" ]; then
+    echo "pre-push: ruff/pyright not found in $VENV_BIN -- install dev tooling first:" >&2
+    echo "  uv pip install -r requirements-dev.txt --index-url https://pypi.org/simple" >&2
+    exit 1
+fi
+
+echo "pre-push: ruff check (F, B)..."
+"$RUFF" check libs tools hooks tests
+
+echo "pre-push: pyright..."
+# --pythonpath explicitly (Copilot review, PR #319): pyproject.toml's
+# [tool.pyright] deliberately has no venvPath/venv (see its own comment) --
+# passing the interpreter directly here is what actually resolves
+# third-party imports against this repo's own .venv, portably regardless of
+# whether Pyright's own undocumented default python-on-PATH fallback would
+# have found the right one.
+"$PYRIGHT" --pythonpath "$PYTHON"
+
+echo "pre-push: OK."

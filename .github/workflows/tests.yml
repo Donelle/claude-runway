@@ -1,7 +1,10 @@
 name: Tests
 
-# Runs the existing unit test suite (tests/test_*.py) and mypy on every PR
-# and on pushes to main. See issue #51.
+# Runs the existing unit test suite (tests/test_*.py), ruff, and Pyright on
+# every PR and on pushes to main. See issue #51 (test suite gate) and issue
+# #297 (ruff + Pyright, replacing an earlier mypy-only type-check step --
+# Pyright is also what VS Code's Pylance extension runs under the hood, so
+# the editor and this gate now agree).
 #
 # The issue's proposal also included a lint step for template/placeholder
 # consistency and EVALUATION.md tool-count drift, gated on "once GROW-01's
@@ -23,9 +26,9 @@ on:
     branches: [main]
 
 # Least-privilege default for the whole workflow: this job only checks out
-# code, installs public PyPI packages, and runs mypy/unittest -- it never
-# needs to write anything back to the repo (no pushes, no PR comments, no
-# releases), so GITHUB_TOKEN gets read-only access instead of inheriting
+# code, installs public PyPI packages, and runs ruff/pyright/unittest -- it
+# never needs to write anything back to the repo (no pushes, no PR comments,
+# no releases), so GITHUB_TOKEN gets read-only access instead of inheriting
 # whatever broader default the repo/org has configured.
 permissions:
   contents: read
@@ -57,8 +60,20 @@ jobs:
           pip install -r requirements.txt --index-url https://pypi.org/simple
           pip install -r requirements-dev.txt --index-url https://pypi.org/simple
 
-      - name: Type check (mypy)
-        run: mypy libs tools hooks
+      - name: Lint (ruff)
+        run: ruff check libs tools hooks tests
+
+      - name: Type check (Pyright)
+        # --pythonpath explicitly (Copilot review, PR #319): this job
+        # installs dependencies directly into actions/setup-python's own
+        # interpreter, never creating a `.venv/` -- pyproject.toml's
+        # [tool.pyright] deliberately has no venvPath/venv (see its own
+        # comment) for exactly this reason, since a hardcoded ".venv" there
+        # made Pyright unable to find qdrant_client/openai/etc. in CI
+        # (confirmed live by reproducing the "venv .venv subdirectory not
+        # found" failure locally). `python` here is the same interpreter the
+        # "Install dependencies" step above just installed into.
+        run: pyright --pythonpath "$(python -c 'import sys; print(sys.executable)')"
 
       - name: Run unit tests
         run: python -m unittest discover -s tests -v
@@ -73,7 +88,7 @@ jobs:
   # scripts must run, and `claude-runway-setup init --dry-run` must
   # generate config whose script/hook paths exist on disk. A separate job
   # (not a step in `test` above) because it needs the OS matrix below --
-  # `test` stays ubuntu-only since mypy/unittest have no OS-specific
+  # `test` stays ubuntu-only since ruff/pyright/unittest have no OS-specific
   # behavior to catch. Replaces the single ubuntu-only
   # "Build & smoke-test pip packaging" step this job used to be inline in
   # `test` (issue #50) -- same checks, now run on all 3 platforms instead

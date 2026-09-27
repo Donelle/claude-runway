@@ -1227,7 +1227,12 @@ class SectionCompressionEndToEnd(unittest.TestCase):
         # is 0 just like a real outage, but no request ever actually failed.
         for empty in ("", "   ", "\n\n"):
             with self.subTest(empty=repr(empty)):
-                out = self._run(lambda *a, **k: empty)
+                # Bind `empty` as a default arg (not a free variable) so the
+                # lambda captures this iteration's value rather than
+                # whatever `empty` is bound to when the lambda is later
+                # called -- harmless here since it's called within the same
+                # iteration, but ruff's B023 flags the pattern regardless.
+                out = self._run(lambda *a, empty=empty, **k: empty)
                 self.assertNotIn(
                     "LM Studio appears unreachable", out,
                     "an empty-but-live response must never look like a request failure",
@@ -1721,6 +1726,323 @@ class ResolveModelStaleEnvCheck(unittest.TestCase):
         model, error = self.L.resolve_model(None, None)
         self.assertIsNone(model)
         self.assertEqual(error, "LMSTUDIO_MODEL is set but no longer read")
+
+
+class FetchLoadedModelsTests(unittest.TestCase):
+    """Issue #296: LM Studio's OpenAI-compatible /v1/models lists every
+    DOWNLOADED model (JIT loading is LM Studio's default), not just loaded
+    ones -- so a bare .models.list() count couldn't distinguish "one loaded,
+    two merely downloaded" from "three actually loaded", and auto-detect
+    refused either way with a misleading "Multiple models are loaded"
+    message. fetch_loaded_models fixes this by preferring LM Studio's native
+    /api/v0/models endpoint (which reports true per-model load state via a
+    `state` field) and only falling back to /v1/models -- unchanged, same
+    old limitation -- when /api/v0 isn't available (404 / older LM Studio /
+    non-LM-Studio OpenAI-compatible server).
+
+    Monkeypatches local_compress_lib's own `_http_get_json`/`client` module
+    globals directly (same style as SectionCompressionEndToEnd above)
+    rather than unittest.mock, to match this file's established pattern.
+    `_http_get_json` (not `requests`, PR #318 review) is a stdlib-only
+    (urllib) GET-and-parse-JSON helper -- see its own docstring for why a
+    third-party HTTP library was deliberately avoided here (both hook files
+    that import this module document a `pip install openai`-only standalone
+    install path).
+    """
+
+    def setUp(self):
+        import local_compress_lib as L
+        self.L = L
+        self._real_http_get_json = L._http_get_json
+        self._real_client = L.client
+
+    def tearDown(self):
+        self.L._http_get_json = self._real_http_get_json
+        self.L.client = self._real_client
+
+    def _v0_returns(self, *entries):
+        payload = {"data": list(entries)}
+        self.L._http_get_json = lambda url, timeout=None: payload
+
+    def _v0_unavailable(self):
+        def _raise(url, timeout=None):
+            raise ConnectionError("404 Not Found (or unreachable)")
+        self.L._http_get_json = _raise
+
+    def _v1_returns(self, *ids):
+        from types import SimpleNamespace
+        models = SimpleNamespace(data=[SimpleNamespace(id=i) for i in ids])
+        # Accepts an optional timeout kwarg (PR #318 review: fetch_loaded_models'
+        # /v1 fallback now threads its own `timeout` param into client()) --
+        # captured so tests can assert it was actually passed through, not
+        # silently dropped.
+        self.L.client = lambda base_url, timeout=None: SimpleNamespace(
+            models=SimpleNamespace(list=lambda: models)
+        )
+
+    def _v1_raises(self, exc):
+        def _client(base_url, timeout=None):
+            raise exc
+        self.L.client = _client
+
+    def test_one_loaded_plus_several_downloaded_resolves_via_v0(self):
+        # The issue's core repro: one loaded chat model, plus other
+        # DOWNLOADED-but-not-loaded models (one of which even reports
+        # type == "llm" despite being an embedding model -- exactly the
+        # jina-embeddings-v5 case from the issue body). Only the genuinely
+        # loaded model should come back.
+        self._v0_returns(
+            {"id": "google/gemma-4-e4b", "state": "loaded", "type": "llm"},
+            {"id": "jina-embeddings-v5-text-small-text-matching", "state": "not-loaded", "type": "llm"},
+            {"id": "text-embedding-nomic-embed-text-v1.5", "state": "not-loaded", "type": "embeddings"},
+        )
+        ids, source = self.L.fetch_loaded_models(None)
+        self.assertEqual(ids, ["google/gemma-4-e4b"])
+        self.assertEqual(source, "v0")
+
+    def test_loaded_embedding_model_is_excluded(self):
+        # A loaded embedding model can never serve a chat completion --
+        # state == "loaded" alone isn't enough, type == "embeddings" must
+        # still exclude it (checked AFTER state, per test above's proof that
+        # type alone is unreliable for excluding a NOT-loaded model).
+        self._v0_returns(
+            {"id": "chat-model", "state": "loaded", "type": "llm"},
+            {"id": "loaded-embedding-model", "state": "loaded", "type": "embeddings"},
+        )
+        ids, source = self.L.fetch_loaded_models(None)
+        self.assertEqual(ids, ["chat-model"])
+        self.assertEqual(source, "v0")
+
+    def test_known_limitation_loaded_embedding_mistyped_as_llm_still_slips_through(self):
+        # PR #318 review: a LOADED embedding model whose OWN `type` field is
+        # (like the issue's confirmed not-loaded jina-embeddings-v5 repro)
+        # misreported as "llm" cannot be excluded here -- `/api/v0/models`
+        # exposes no field beyond `state`/`type` to catch this, and `type`
+        # is the very field the issue proved unreliable. This test pins the
+        # documented residual limitation (fetch_loaded_models' own
+        # docstring) as EXPECTED behavior, not a silent gap -- if a more
+        # reliable signal is ever added, this test should be updated to
+        # assert the model IS excluded, not left accidentally passing.
+        self._v0_returns(
+            {"id": "chat-model", "state": "loaded", "type": "llm"},
+            {"id": "mistyped-loaded-embedding-model", "state": "loaded", "type": "llm"},
+        )
+        ids, source = self.L.fetch_loaded_models(None)
+        self.assertEqual(sorted(ids), ["chat-model", "mistyped-loaded-embedding-model"])
+        self.assertEqual(source, "v0")
+
+    def test_v0_404_falls_back_to_v1_unchanged(self):
+        self._v0_unavailable()
+        self._v1_returns("only-model")
+        ids, source = self.L.fetch_loaded_models(None)
+        self.assertEqual(ids, ["only-model"])
+        self.assertEqual(source, "v1")
+
+    def test_v1_fallback_receives_the_caller_supplied_timeout(self):
+        # PR #318 review: the /v1 fallback used to construct its OpenAI
+        # client via a bare `client(base_url)`, silently dropping whatever
+        # `timeout` the caller passed to fetch_loaded_models -- so a
+        # short-timeout caller (the WebFetch redirect hook, 2s) would fall
+        # through to the OpenAI SDK's own much longer default timeout
+        # whenever /api/v0 was unavailable, defeating the whole point of a
+        # short reachability check. Confirms `timeout` is threaded through
+        # to client() on this path, not just used for the /api/v0 probe.
+        self._v0_unavailable()
+        captured = {}
+
+        def _client(base_url, timeout=None):
+            captured["timeout"] = timeout
+            from types import SimpleNamespace
+            models = SimpleNamespace(data=[SimpleNamespace(id="only-model")])
+            return SimpleNamespace(models=SimpleNamespace(list=lambda: models))
+
+        self.L.client = _client
+        self.L.fetch_loaded_models(None, timeout=2.5)
+        self.assertEqual(captured["timeout"], 2.5)
+
+    def test_two_loaded_chat_models_both_reported(self):
+        # fetch_loaded_models itself doesn't apply the "exactly one" rule --
+        # that's resolve_model's job (see ResolveModelMultipleModelsMessaging
+        # below). This just confirms it reports what's genuinely loaded.
+        self._v0_returns(
+            {"id": "model-a", "state": "loaded", "type": "llm"},
+            {"id": "model-b", "state": "loaded", "type": "llm"},
+        )
+        ids, source = self.L.fetch_loaded_models(None)
+        self.assertEqual(sorted(ids), ["model-a", "model-b"])
+        self.assertEqual(source, "v0")
+
+    def test_both_v0_and_v1_unreachable_raises(self):
+        # LM Studio genuinely down: /api/v0 fails, and the /v1 fallback ALSO
+        # raises -- that exception must propagate, since every existing
+        # caller's except block expects to catch "LM Studio is unreachable"
+        # from this call, the same contract the old bare .models.list() had.
+        self._v0_unavailable()
+        self._v1_raises(ConnectionError("LM Studio is down"))
+        with self.assertRaises(ConnectionError):
+            self.L.fetch_loaded_models(None)
+
+    def test_v0_url_is_derived_from_v1_base_url(self):
+        # The suggested fix's "derived from the /v1 base URL" requirement --
+        # the v0 probe must hit http://localhost:1234/api/v0/models, not
+        # http://localhost:1234/v1/api/v0/models.
+        captured = {}
+
+        def _get(url, timeout=None):
+            captured["url"] = url
+            return {"data": []}
+
+        self.L._http_get_json = _get
+        self.L.fetch_loaded_models("http://localhost:1234/v1")
+        self.assertEqual(captured["url"], "http://localhost:1234/api/v0/models")
+
+    def test_v0_200_with_unexpected_shape_falls_back_to_v1(self):
+        # PR #318 review round 2: a 200 response that ISN'T the real
+        # /api/v0 schema (e.g. a reverse proxy's own JSON error body, or a
+        # non-LM-Studio server that happens to answer this path with
+        # something unrelated) used to silently produce `entries = []` --
+        # reporting "zero loaded models" via source="v0" for a server that
+        # is actually WORKING, instead of falling back to /v1/models the
+        # way a genuinely-missing /api/v0 (a real 404) correctly does.
+        self.L._http_get_json = lambda url, timeout=None: {"error": "no such route"}  # no "data" key at all
+        self._v1_returns("only-model")
+        ids, source = self.L.fetch_loaded_models(None)
+        self.assertEqual(ids, ["only-model"])
+        self.assertEqual(source, "v1")
+
+    def test_v0_200_with_non_list_data_falls_back_to_v1(self):
+        # Same bug, different malformed shape: "data" present but not a list.
+        self.L._http_get_json = lambda url, timeout=None: {"data": "not-a-list"}
+        self._v1_returns("only-model")
+        ids, source = self.L.fetch_loaded_models(None)
+        self.assertEqual(ids, ["only-model"])
+        self.assertEqual(source, "v1")
+
+    def test_http_get_json_is_real_stdlib_over_a_real_socket(self):
+        # PR #318 review: confirms _http_get_json (the requests replacement)
+        # actually works end-to-end against a REAL HTTP server -- not just
+        # mocked out everywhere else in this class -- using only the
+        # standard library on both ends, proving no third-party HTTP
+        # dependency is needed anywhere in this path.
+        import http.server
+        import json
+        import threading
+
+        received_path = {}
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                received_path["path"] = self.path
+                body = json.dumps({"data": [{"id": "real-model", "state": "loaded", "type": "llm"}]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass  # keep test output quiet
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            payload = self.L._http_get_json(f"http://127.0.0.1:{port}/api/v0/models", 5.0)
+            self.assertEqual(payload, {"data": [{"id": "real-model", "state": "loaded", "type": "llm"}]})
+            self.assertEqual(received_path["path"], "/api/v0/models")
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+
+
+class ClientOptionalTimeout(unittest.TestCase):
+    """PR #318 review: client() gained an optional `timeout` param so
+    fetch_loaded_models' /v1 fallback can honor a caller-supplied timeout.
+    These test the REAL client() function (not a stub) against the actual
+    openai.OpenAI constructor, confirming: (a) the existing single-arg call
+    shape every other caller/test stub uses is completely unaffected, and
+    (b) passing timeout actually reaches the constructed client's own
+    .timeout attribute, rather than being silently accepted and dropped."""
+
+    def test_no_timeout_arg_matches_pre_existing_single_arg_behavior(self):
+        import local_compress_lib as L
+        c = L.client("http://localhost:1234/v1")
+        self.assertEqual(str(c.base_url), "http://localhost:1234/v1/")
+
+    def test_explicit_timeout_is_applied_to_the_client(self):
+        import local_compress_lib as L
+        c = L.client("http://localhost:1234/v1", timeout=2.5)
+        # openai.OpenAI stores an explicit `timeout=` constructor arg as a
+        # plain float on `.timeout` (rather than wrapping it in its
+        # httpx.Timeout default), so this is a direct, non-fragile check.
+        self.assertEqual(c.timeout, 2.5)
+
+
+class ResolveModelMultipleModelsMessaging(unittest.TestCase):
+    """Issue #296 item 3: resolve_model's "multiple models" error must not
+    claim models are LOADED when fetch_loaded_models had to fall back to
+    /v1/models (which can't tell loaded from merely-downloaded), and should
+    point at tools/doctor.py, since a misspelled/mismatched env var pin is a
+    common way to land in this exact error (per the issue body's own account
+    of CLAUDE_RUNWAY_LM_STUDIO_MODEL vs. CLAUDE_RUNWAY_LMSTUDIO_MODEL).
+
+    Stubs fetch_loaded_models directly (resolve_model's only network-shaped
+    dependency in the auto-detect branch) -- same monkeypatch-and-restore
+    style as ResolveModelStaleEnvCheck above.
+    """
+
+    def setUp(self):
+        import local_compress_lib as L
+        self.L = L
+        self._real_stale_env_warning = L.stale_env_warning
+        self._real_default_model = L.DEFAULT_MODEL
+        self._real_fetch_loaded_models = L.fetch_loaded_models
+        self.L.stale_env_warning = lambda: None
+        self.L.DEFAULT_MODEL = None
+
+    def tearDown(self):
+        self.L.stale_env_warning = self._real_stale_env_warning
+        self.L.DEFAULT_MODEL = self._real_default_model
+        self.L.fetch_loaded_models = self._real_fetch_loaded_models
+
+    def test_two_loaded_chat_models_still_errors_and_says_loaded(self):
+        self.L.fetch_loaded_models = lambda base_url: (["model-a", "model-b"], "v0")
+        model, error = self.L.resolve_model(None, None)
+        self.assertIsNone(model)
+        self.assertIn("loaded chat models", error)
+        self.assertIn("model-a", error)
+        self.assertIn("model-b", error)
+        self.assertIn("tools/doctor.py", error)
+
+    def test_v1_fallback_does_not_claim_loaded(self):
+        self.L.fetch_loaded_models = lambda base_url: (["model-a", "model-b"], "v1")
+        model, error = self.L.resolve_model(None, None)
+        self.assertIsNone(model)
+        self.assertNotIn("loaded chat models", error)
+        self.assertNotIn("Multiple loaded", error)
+        self.assertIn("/api/v0", error)
+        self.assertIn("model-a", error)
+
+    def test_single_loaded_model_still_resolves(self):
+        self.L.fetch_loaded_models = lambda base_url: (["only-model"], "v0")
+        model, error = self.L.resolve_model(None, None)
+        self.assertEqual(model, "only-model")
+        self.assertIsNone(error)
+
+    def test_no_loaded_models_still_errors_no_model_loaded(self):
+        self.L.fetch_loaded_models = lambda base_url: ([], "v0")
+        model, error = self.L.resolve_model(None, None)
+        self.assertIsNone(model)
+        self.assertIn("no model is loaded", error)
+
+    def test_unreachable_propagates_as_reach_error(self):
+        def _raise(base_url):
+            raise ConnectionError("LM Studio is down")
+        self.L.fetch_loaded_models = _raise
+        model, error = self.L.resolve_model(None, None)
+        self.assertIsNone(model)
+        self.assertIn("Could not reach LM Studio", error)
 
 
 class ConcurrentClassification(unittest.TestCase):

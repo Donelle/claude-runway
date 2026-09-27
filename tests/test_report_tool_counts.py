@@ -47,7 +47,10 @@ class ReportRepoServerReturnsLiveCountsAndTokenEstimates(unittest.TestCase):
         # genuinely has no tools" -- the whole point of this script as a
         # CI smoke check is that an import/enumeration failure must be
         # loud, not swallowed into a misleadingly low number.
-        with self.assertRaises(Exception):
+        # ModuleNotFoundError (not a blind Exception -- ruff B017) is what
+        # _report_repo_server's own __import__(module_name) actually raises
+        # for a nonexistent module.
+        with self.assertRaises(ModuleNotFoundError):
             _rtc._report_repo_server("this_module_does_not_exist_anywhere")
 
 

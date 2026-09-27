@@ -96,6 +96,7 @@ import json
 import os
 import sqlite3
 import sys
+from typing import NoReturn
 
 # Same redundant resolution order as compress_bash_output.py -- see that
 # file's comment for the full bug history this guards against. libs/ under
@@ -109,8 +110,7 @@ for _dir in _candidates:
         sys.path.insert(0, _dir)
 
 try:
-    from local_compress_lib import DEFAULT_BASE_URL, DEFAULT_MODEL, stale_env_warning
-    from openai import OpenAI
+    from local_compress_lib import DEFAULT_MODEL, fetch_loaded_models, stale_env_warning
 except ImportError as e:
     print(
         f"redirect_webfetch_to_fetch_url.py: could not import dependencies ({e}). "
@@ -342,12 +342,23 @@ def _lmstudio_reachable(base_url) -> bool:
          resolves once reachable and non-stale, regardless of how many
          models are loaded -- matching resolve_model, which never checks the
          loaded count in that branch either.
-      4. Otherwise, exactly one loaded model is required to auto-detect --
-         zero or multiple both fail, same as resolve_model.
+      4. Otherwise, exactly one LOADED chat model is required to auto-detect
+         -- zero or multiple both fail, same as resolve_model.
     Steps 2-4 reuse DEFAULT_MODEL/stale_env_warning directly from
     local_compress_lib (not re-derived) so this can't drift from
-    resolve_model's real behavior, and reuse the SAME models.list() response
-    already fetched for step 1 -- no second network round-trip.
+    resolve_model's real behavior, and reuse the SAME fetch_loaded_models
+    call already made for step 1 -- no second network round-trip.
+
+    Step 4 uses local_compress_lib.fetch_loaded_models (issue #296) instead
+    of a raw .models.list() count -- the OpenAI-compatible /v1/models
+    endpoint lists every DOWNLOADED model regardless of whether it's
+    actually loaded (LM Studio's default is JIT loading), so a bare
+    `len(models.data) == 1` check used to report "unresolvable" for a
+    perfectly fine single-loaded-model setup whenever any other model was
+    merely downloaded. fetch_loaded_models tries LM Studio's native
+    /api/v0/models first (which reports true per-model load state) and only
+    falls back to /v1/models -- unchanged, same limitation as before -- when
+    /api/v0 isn't available.
 
     Live check, not cached -- LM Studio can be started/stopped between
     calls, and getting this wrong in the "resolvable" direction would deny
@@ -356,25 +367,21 @@ def _lmstudio_reachable(base_url) -> bool:
     hung/unreachable server doesn't stall every WebFetch call.
     """
     try:
-        models = OpenAI(
-            base_url=base_url or DEFAULT_BASE_URL,
-            api_key="lm-studio",
-            timeout=REACHABILITY_TIMEOUT_SECONDS,
-        ).models.list()
+        ids, _source = fetch_loaded_models(base_url, timeout=REACHABILITY_TIMEOUT_SECONDS)
     except Exception:
         return False
     if stale_env_warning():
         return False
     if DEFAULT_MODEL:
         return True
-    return len(models.data) == 1
+    return len(ids) == 1
 
 
-def _allow():
+def _allow() -> NoReturn:
     sys.exit(0)  # no JSON on stdout -- Claude Code treats this as allow
 
 
-def _deny(reason: str):
+def _deny(reason: str) -> NoReturn:
     print(json.dumps({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",

@@ -86,9 +86,24 @@ MCP server has no hook payload to read a real session id from (only hooks
 receive one, via their stdin payload), and a stable per-process grouping key
 is good enough for this passive log's purposes — since a stdio server is
 spawned fresh per Claude Code session, that proxy is a documented, practical
-stand-in for "this session," not the real thing. Surfacing this data (a
-query/report tool, a `/my-savings`-style summary) is intentionally out of
-scope for now — this is passive collection only.
+stand-in for "this session," not the real thing. Surfacing this data via a dedicated report is intentionally out of scope for
+this table specifically — but a simpler, separate signal already exists:
+issue #211 added `record_memory_metric()` alongside the above, writing a
+plain per-call tally (no `point_id`/`repo`/`kind` detail, just a count) for
+every `recall`/`remember`/`forget` call into [the shared metrics
+store](metrics.md)'s `metrics.db`, under `metric_id="memory-bank"` — gated by
+the same `CLAUDE_RUNWAY_TRACK_MEMORY_EVENTS` opt-out as the rich table above
+(no separate switch), so a session with tracking disabled writes no
+`memory-bank` rows here either. Query it with `/my-metrics memory-bank`
+(e.g. `/my-metrics memory-bank by_event_type` for a
+`recall`/`remember`/`forget` breakdown). Unlike the rich table above,
+`forget` IS counted there — this does mean one additional SQLite `INSERT`
+into `metrics.db` per tracked tool call (not a fixed 1:1 pairing with the
+rich table above: `forget` never writes a rich row at all, an empty/failed
+`recall` writes only the tally, and a `recall` with several hits writes
+several rich rows against that one tally), but a plain tally needs no
+per-point metadata and doesn't need the autonomous-removal feature the rich
+table's own `forget` exclusion reasoning depends on.
 
 ## Where the data lives
 

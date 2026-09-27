@@ -109,6 +109,15 @@ def call_with_retry(fn, *args, **kwargs):
             if not _is_transient(e) or attempt == MAX_ATTEMPTS:
                 raise
             time.sleep(RETRY_BACKOFF_SECONDS)
+    # Unreachable: MAX_ATTEMPTS (a fixed positive constant, see above) means
+    # the loop always executes at least once, and every iteration either
+    # returns `fn(...)`'s result or raises (the last iteration always raises,
+    # since `attempt == MAX_ATTEMPTS` is true on it). Without this, Pyright
+    # infers an implicit `-> ... | None` return type from the "falls off the
+    # end of the loop" path it can't itself prove is dead code (issue #297),
+    # which then infects every caller that expects this to return `fn`'s
+    # actual (non-Optional) return value.
+    raise AssertionError("unreachable: call_with_retry's loop always returns or raises")
 
 
 async def async_call_with_retry(fn, *args, **kwargs):
@@ -121,3 +130,5 @@ async def async_call_with_retry(fn, *args, **kwargs):
             if not _is_transient(e) or attempt == MAX_ATTEMPTS:
                 raise
             await asyncio.sleep(RETRY_BACKOFF_SECONDS)
+    # See call_with_retry's identical comment above.
+    raise AssertionError("unreachable: async_call_with_retry's loop always returns or raises")

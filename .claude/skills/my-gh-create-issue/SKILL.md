@@ -5,7 +5,7 @@ description: "Interactively create a well-structured, verified GitHub issue for 
 
 # Skill: my-gh-create-issue
 
-Interactively create a GitHub issue for claude-runway — the GitHub-issue equivalent of `/my-create-task`. The output must match the format already established across this repo's existing issues (#21–#72), because `/my-gh-code-it` and `/my-gh-pr` both read specific fields out of an issue's body (**Location**, **Suggested fix**/**Proposal**) and its labels (type, `priority-p{0-3}`, `theme-*`) — a differently-shaped issue breaks that chain, not just this skill.
+Interactively create a GitHub issue for claude-runway — the GitHub-issue equivalent of `/my-create-task`. The output must match the format already established across this repo's existing issues, because `/my-gh-code-it` and `/my-gh-pr` both read specific fields out of an issue's body (**Location**, **Suggested fix**/**Proposal**) and its labels (type, `priority-p{0-3}`, `theme-*`) — a differently-shaped issue breaks that chain, not just this skill.
 
 **The format is not just cosmetic.** Every existing issue's specifics (line numbers, "Suggested fix") came from actually reading the code or reproducing the bug first, not from a plausible-sounding guess. Skipping the investigation step and writing a generic-sounding issue defeats the entire point of this skill — see step 3.
 
@@ -24,7 +24,7 @@ Any of `type=`/`theme=`/`priority=` may be omitted — missing ones get inferred
 
 3. **Investigate before writing anything.** This is the step that makes the output trustworthy, and it branches by what kind of claim this is:
    - **Suspected bug** — actually find the relevant code (`Grep`/`Read`, or `qdrant-find` if available) and either reproduce the failure (a small script, a live call, or rigorous step-by-step tracing through the real mechanism — same discipline as `/my-gh-pr-feedback`'s verification step) or confirm the defect by direct code reading with exact file:line citations. If it doesn't reproduce and doesn't hold up on reading, say so and ask the user whether to still file it as an unverified/plausible risk (lower priority, said so explicitly in the body) or drop it — don't silently file an unconfirmed claim as if it were confirmed.
-   - **Feature/enhancement idea** — sanity-check that its premise still holds against current code (e.g. "no caching exists" → actually grep for one first) the same way the growth-opportunity pass in this repo's history did before filing any of #48–#72.
+   - **Feature/enhancement idea** — sanity-check that its premise still holds against current code (e.g. "no caching exists" → actually grep for one first) the same way the growth-opportunity pass in this repo's history did before filing that backlog batch.
    - Record what was actually checked (files read, commands run, repro result) — this becomes the **Location**/**Sanity-checked** line in the body, not a to-do.
 
 4. **Determine the type label** if not given by `type=`:

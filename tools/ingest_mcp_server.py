@@ -286,10 +286,13 @@ async def index_repo(
     force: bool = False,
     # MCPServer injects context by matching the `Context` annotation on a
     # parameter name. `ctx: Context = None` keeps the framework-visible type
-    # annotation while suppressing mypy's "None isn't a valid Context default"
+    # annotation while suppressing a "None isn't a valid Context default"
     # complaint per-line, avoiding the need to widen to Optional[Context].
+    # Confirmed still needed under Pyright (issue #297 -- replaced mypy):
+    # removing the ignore surfaces Pyright's own equivalent
+    # reportArgumentType error here, just phrased differently than mypy's.
     # Same reasoning at sync_repo's ctx param below and throughout
-    # compress_mcp_server.py.
+    # compress_mcp_server.py/memory_bank_mcp_server.py.
     ctx: Context = None,  # type: ignore[assignment]
 ) -> str:
     """

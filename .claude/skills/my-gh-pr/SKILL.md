@@ -11,7 +11,7 @@ Project-scoped to this repo: hardcodes `Donelle/claude-runway`, README.md as the
 
 ## Usage
 ```
-/my-gh-pr 21
+/my-gh-pr 12345
 ```
 The issue number is required — unlike `/my-pr-review-feedback`, there's no reliable way to reverse-lookup "which issue is this branch for" without asking, so don't guess it from the branch name.
 

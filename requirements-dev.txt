@@ -4,9 +4,18 @@
 # after requirements.txt, in the same venv:
 #   uv pip install -r requirements-dev.txt --index-url https://pypi.org/simple
 
-# Type checking -- config lives in mypy.ini. Run with:
-#   .venv/bin/mypy libs tools hooks
-mypy==2.3.1
+# Linting -- config lives in pyproject.toml's [tool.ruff.lint]. Run with:
+#   .venv/bin/ruff check libs tools hooks tests
+ruff==0.16.9
+
+# Type checking -- replaces mypy (issue #297): Pyright is also what VS
+# Code's Pylance extension runs under the hood, so the editor and this
+# repo's CI/pre-push gate now agree. Config lives in pyproject.toml's
+# [tool.pyright] -- deliberately with no venvPath/venv there (see that
+# section's own comment), so --pythonpath is required on every invocation,
+# not optional. Run with:
+#   .venv/bin/pyright --pythonpath .venv/bin/python
+pyright==1.1.414
 pytest
 
 # Issue #206: tests/test_pyproject.py builds a REAL wheel (via `python -m
