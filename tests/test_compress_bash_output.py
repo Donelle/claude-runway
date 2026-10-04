@@ -96,6 +96,20 @@ MUST_SKIP = [
         "the real VAR=$(...) command-substitution shape used by my-gh-autowork's NEW_IDS diffing "
         "-- a start-anchored fix would have missed this",
     ),
+    # --- issue #268: wrappers that used to hide the command from `^` anchoring ---
+    ('FILES=$(git diff --name-only); echo "$FILES"', "VAR=$(cmd) command substitution"),
+    ("HASH=$(git rev-parse HEAD)", "captured hash in a substitution"),
+    ("(git diff) 2>&1", "subshell wrapper"),
+    ("{ git diff; }", "brace group wrapper"),
+    ('echo "$(git rev-parse HEAD)"', "substitution inside double quotes"),
+    ("X=`git rev-parse HEAD`", "backtick substitution"),
+    ("N=$(cat f | wc -l)", "wc inside a substitution"),
+    ("A=1 B=$(sha256sum f)", "leading assignment before a substitution"),
+    ("npm list", "documented alias of npm ls"),
+    ("npm list --depth=0", "npm list with flags"),
+    ("kubectl get pods -o=json", "-o=json spelling"),
+    ("kubectl get pods -ojson", "attached -ojson spelling"),
+    ("kubectl get pods -o=YAML", "case-insensitive value on the = spelling"),
 ]
 
 # Commands that should still be compressed normally.
@@ -125,6 +139,11 @@ MUST_COMPRESS = [
     ("echo \"run git status\"", "exempt name only inside a quoted argument"),
     ("echo hi || dotnet build", "|| must split as one delimiter, not two empties"),
     ("", "empty command"),
+    # --- issue #268 near-misses: new splitting must not expose fake segments ---
+    ('dotnet test --filter "(id=1)"', "mid-segment paren must not split off `id=1`"),
+    ("npm listen", "`npm list` must not match a longer word"),
+    ("tool --foo-ojson x", "-ojson only counts as its own flag"),
+    ("X=$(dotnet build)", "substitution around a non-exempt command"),
     # --- near-misses on the -h / --dry-run additions ---------------------
     ("ls -lh /var/log", "bundled -lh must not read as a standalone -h"),
     ("du -sh .", "same, bundled -sh"),
@@ -490,6 +509,29 @@ class MainFallsBackToGenericForNonFooterMcpTools(unittest.TestCase):
         # existing (unchanged) behavior, distinct from the fallback path's
         # "hook:<tool_name>" naming asserted above.
         self.assertEqual(args[1], "compress_file")
+
+
+class TimeoutErrorFlowsIntoTheWasntCompressedNote(unittest.TestCase):
+    """Issue #368: the hook embeds compress()'s "Error: ..." string verbatim, so
+    a timeout's "may be busy" wording must reach the user, not the misleading
+    "check it's still running"."""
+
+    def test_timeout_wording_is_in_the_note(self):
+        message = (
+            "Error: LM Studio request timed out after 60s (chunk 1/2) -- LM Studio is "
+            "may be busy with other requests or unreachable; see "
+            "CLAUDE_RUNWAY_LMSTUDIO_TIMEOUT_SECONDS."
+        )
+        buf = io.StringIO()
+        with redirect_stdout(buf), self.assertRaises(SystemExit) as cm:
+            hook._finish_compression_outcome(
+                ("error", "x" * 5000, message), "Bash", "Bash", "sess-1", "/repos/my-project",
+            )
+        self.assertEqual(cm.exception.code, 0)
+        note = json.loads(buf.getvalue())["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("wasn't compressed", note)
+        self.assertIn("may be busy", note)
+        self.assertNotIn("check it's still running", note)
 
 
 class CompactFindMultiEntryIsNeverGenericallyCompressed(unittest.TestCase):
