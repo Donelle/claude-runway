@@ -1081,8 +1081,8 @@ def parse_transcript_token_counts(transcript_path) -> Optional[dict]:
                 totals["output"]      += out
                 totals["cache_read"]  += cr
                 totals["cache_write"] += cw
-                # Priced per turn, not from the totals: a model's long-context
-                # tier depends on THIS request's prompt size (model_pricing).
+                # Priced per turn, not from the totals: each turn carries its
+                # own model, and a session can switch models mid-way.
                 cost = model_pricing.turn_cost_usd(
                     message.get("model"), inp, cr, cw, out,
                     fast=usage.get("speed") == "fast",
