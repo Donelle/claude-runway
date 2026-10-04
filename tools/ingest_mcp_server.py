@@ -131,7 +131,7 @@ DEFAULT_COLLECTION_DESCRIPTION = os.environ.get("COLLECTION_DESCRIPTION")
 # memory-bank collection, not to write into it. Defaults to the same
 # "memory-bank" default so the guard still applies out of the box even on a
 # project that hasn't explicitly configured this var.
-DEFAULT_MEMORY_BANK_COLLECTION = os.environ.get("MEMORY_BANK_COLLECTION", "memory-bank")
+DEFAULT_MEMORY_BANK_COLLECTION = os.environ.get("MEMORY_BANK_COLLECTION") or "memory-bank"
 
 
 def _parse_csv_set(value: Optional[str]) -> Optional[set]:
@@ -862,7 +862,7 @@ async def sync_repo(
                     client.count,
                     collection_name=collection,
                     count_filter=models.Filter(
-                        must_not=[models.IsEmptyCondition(is_empty=models.PayloadField(key="metadata.file_path"))]
+                        must=[models.FieldCondition(key="metadata.type", match=models.MatchAny(any=["code", "doc"]))]
                     ),
                     exact=True,
                 ).count

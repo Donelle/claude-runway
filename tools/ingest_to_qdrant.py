@@ -57,7 +57,7 @@ ensure_persistent_fastembed_cache()
 # at import time like the server does; an interactive shell that doesn't
 # export MEMORY_BANK_COLLECTION falls back to the "memory-bank" default,
 # which is the name a stock install uses anyway.
-DEFAULT_MEMORY_BANK_COLLECTION = os.environ.get("MEMORY_BANK_COLLECTION", "memory-bank")
+DEFAULT_MEMORY_BANK_COLLECTION = os.environ.get("MEMORY_BANK_COLLECTION") or "memory-bank"
 
 
 async def ingest(args):

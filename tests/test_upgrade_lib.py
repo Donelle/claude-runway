@@ -156,10 +156,16 @@ class CodebaseIndexerMemoryBankCollectionMissing(unittest.TestCase):
         mcp_json = {"mcpServers": {"codebase-indexer": {}}}
         self.assertTrue(_migration(self._ID).detect(mcp_json, {}))
 
-    def test_detect_false_when_key_present_even_if_blank(self):
-        for value in ("memory-bank", "custom-mb", ""):
+    def test_detect_false_when_key_present_and_set(self):
+        for value in ("memory-bank", "custom-mb"):
             mcp_json = {"mcpServers": {"codebase-indexer": {"env": {"MEMORY_BANK_COLLECTION": value}}}}
             self.assertFalse(_migration(self._ID).detect(mcp_json, {}), value)
+
+    def test_detect_true_when_key_present_but_blank(self):
+        # A blank value is what the template writes by default; it leaves the
+        # memory-bank guard disabled, so it must count as unconfigured.
+        mcp_json = {"mcpServers": {"codebase-indexer": {"env": {"MEMORY_BANK_COLLECTION": ""}}}}
+        self.assertTrue(_migration(self._ID).detect(mcp_json, {}))
 
     def test_detect_false_when_no_codebase_indexer_block(self):
         mcp_json = {"mcpServers": {"qdrant": {"env": {}}, "memory-bank": {"env": {}}}}

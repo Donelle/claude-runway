@@ -191,7 +191,7 @@ def _detect_indexer_memory_bank_collection_missing(mcp_json: dict, settings_json
     indexer = mcp_json.get("mcpServers", {}).get("codebase-indexer")
     if indexer is None:
         return False
-    return "MEMORY_BANK_COLLECTION" not in indexer.get("env", {})
+    return not indexer.get("env", {}).get("MEMORY_BANK_COLLECTION")
 
 
 def _apply_indexer_memory_bank_collection_missing(
@@ -213,7 +213,9 @@ def _apply_indexer_memory_bank_collection_missing(
     servers = mcp_json.setdefault("mcpServers", {})
     memory_bank_env = servers.get("memory-bank", {}).get("env", {})
     value = memory_bank_env.get("MEMORY_BANK_COLLECTION") or "memory-bank"
-    servers["codebase-indexer"].setdefault("env", {})["MEMORY_BANK_COLLECTION"] = value
+    indexer_env = servers["codebase-indexer"].setdefault("env", {})
+    if not indexer_env.get("MEMORY_BANK_COLLECTION"):
+        indexer_env["MEMORY_BANK_COLLECTION"] = value
     return mcp_json, settings_json
 
 
