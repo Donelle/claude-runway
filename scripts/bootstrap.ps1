@@ -31,13 +31,6 @@ function Invoke-BootstrapCommand {
     }
 }
 
-# PowerShell can reject a script before its contents run; the docs also show
-# this recovery command so it is available even when this check cannot run.
-$executionPolicy = Get-ExecutionPolicy
-if ($executionPolicy -eq 'Restricted' -or $executionPolicy -eq 'AllSigned') {
-    Stop-Bootstrap "The current execution policy ($executionPolicy) blocks this local script. Run: Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser"
-}
-
 $gitCommand = Get-Command git -ErrorAction SilentlyContinue
 if (-not $gitCommand) {
     Stop-Bootstrap 'Git was not found. Install Git for Windows and rerun this script.'

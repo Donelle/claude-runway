@@ -23,7 +23,7 @@ It checks for Python 3.12 (through `uv` or the `py -3.12` launcher), creates `.v
 
 **Windows verification (2026-10-04):** On Windows 11 Pro 10.0.26200, a fresh disposable clone completed setup and a second run left its installed package inventory and `.git/config` unchanged; `git config --get core.hooksPath` returned `.githooks`. The fresh-clone and repeat runs used PowerShell 7.6.6. The configured clone also completed a further run under Windows PowerShell 5.1.
 
-If PowerShell reports that script execution is disabled, allow local scripts for the current user and try again. The bootstrap script does not change execution policy:
+PowerShell enforces execution policy before loading a script, so a blocked bootstrap cannot print its own recovery hint. If PowerShell reports that script execution is disabled, run this command in the same PowerShell session, then retry the bootstrap. The bootstrap itself does not change execution policy:
 
 ```powershell
 Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
