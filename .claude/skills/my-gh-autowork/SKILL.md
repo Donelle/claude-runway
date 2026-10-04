@@ -228,7 +228,10 @@ earlier attempt, excludes an issue from auto-pick now:
   gh issue list -R Donelle/claude-runway --state open \
     --search "-label:blocked -label:theme-design no:assignee" \
     --limit 200 --json number,title,labels,assignees
-Sort by priority label (priority-p1 > p2 > p3; unlabeled sorts last), then by issue number
+Sort by priority label (priority-p0 > p1 > p2 > p3, i.e. ascending by the number N in
+`priority-p{N}` so a lower N always comes first; unlabeled sorts last — and ONLY an issue
+with no `priority-p*` label at all counts as unlabeled, so `priority-p0`, the "fix first"
+label, must never fall into that bucket just because a list omitted it), then by issue number
 ascending as a tiebreaker; no label or issue type is otherwise prioritized relative to any
 other.
 
