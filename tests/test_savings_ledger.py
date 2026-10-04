@@ -330,9 +330,12 @@ class MigrationTransactionSafety(SavingsLedgerTestCase):
 
     def test_missing_migration_entry_raises_and_rolls_back_everything(self):
         _old_schema_db_path(self._db_path())
-        with mock.patch.object(L, "SCHEMA_VERSION", 5):
-            # _MIGRATIONS only has entries for versions 1-4 -- version 5
-            # is deliberately left unregistered to exercise the guard.
+        # Derived, not hardcoded: the first version past the last registered
+        # migration (6 once #365 registered v5) is always "unregistered".
+        unregistered = max(L._MIGRATIONS) + 1
+        with mock.patch.object(L, "SCHEMA_VERSION", unregistered):
+            # _MIGRATIONS has no entry for this version -- deliberately left
+            # unregistered to exercise the guard.
             with self.assertRaises(RuntimeError):
                 L.finalize_session("sess1", "myproject")
 
@@ -382,7 +385,9 @@ class MigrationTransactionSafety(SavingsLedgerTestCase):
             return conn
 
         with mock.patch.object(sqlite3, "connect", _capturing_connect):
-            with mock.patch.object(L, "SCHEMA_VERSION", 5):
+            # Derived, not hardcoded: 5 is a registered migration now, so the
+            # first unregistered version is the one past the last entry.
+            with mock.patch.object(L, "SCHEMA_VERSION", max(L._MIGRATIONS) + 1):
                 with self.assertRaises(RuntimeError):
                     L._connect()
 
@@ -1404,10 +1409,11 @@ class ParseTranscriptTokenCounts(unittest.TestCase):
         f.close()
         return f.name
 
-    def _assistant(self, inp=0, out=0, cr=0, cw=0):
+    def _assistant(self, inp=0, out=0, cr=0, cw=0, msg_id=None):
         return {
             "type": "assistant",
             "message": {
+                **({"id": msg_id} if msg_id else {}),
                 "usage": {
                     "input_tokens": inp,
                     "output_tokens": out,
@@ -1435,6 +1441,36 @@ class ParseTranscriptTokenCounts(unittest.TestCase):
             self.assertEqual(result["output"],     13)
             self.assertEqual(result["cache_read"], 150)
             self.assertEqual(result["cache_write"], 20)
+        finally:
+            import os as _os; _os.unlink(path)
+
+    def test_dedups_lines_sharing_a_message_id(self):
+        """#298: one line per content block, all repeating the turn's usage."""
+        path = self._make_transcript([
+            # Turn A: text block + two tool_use blocks = 3 lines, same usage.
+            self._assistant(inp=10, out=5, cr=100, cw=20, msg_id="msg_A"),
+            self._assistant(inp=10, out=5, cr=100, cw=20, msg_id="msg_A"),
+            self._assistant(inp=10, out=5, cr=100, cw=20, msg_id="msg_A"),
+            # Turn B: single line.
+            self._assistant(inp=3, out=8, cr=50, cw=0, msg_id="msg_B"),
+        ])
+        try:
+            result = L.parse_transcript_token_counts(path)
+            self.assertEqual(result, {"input": 13, "output": 13,
+                                      "cache_read": 150, "cache_write": 20})
+        finally:
+            import os as _os; _os.unlink(path)
+
+    def test_lines_without_message_id_are_all_counted(self):
+        """No id means no safe dedup key: count every line, don't merge them."""
+        path = self._make_transcript([
+            self._assistant(inp=4, msg_id=None),
+            self._assistant(inp=4, msg_id=None),
+            self._assistant(inp=1, msg_id="msg_A"),
+            self._assistant(inp=1, msg_id="msg_A"),
+        ])
+        try:
+            self.assertEqual(L.parse_transcript_token_counts(path)["input"], 9)
         finally:
             import os as _os; _os.unlink(path)
 
@@ -1491,6 +1527,356 @@ class ParseTranscriptTokenCounts(unittest.TestCase):
             self.assertIsNone(L.parse_transcript_token_counts(f.name))
         finally:
             _os.unlink(f.name)
+
+
+class ParseSessionTokenCounts(unittest.TestCase):
+    """parse_session_token_counts (#364): main transcript + subagent transcripts.
+
+    Builds the real on-disk layout Claude Code uses --
+    <tmp>/<session_id>.jsonl  and  <tmp>/<session_id>/subagents/agent-<id>.jsonl
+    -- so the directory derivation from the transcript path is exercised, not
+    stubbed.
+    """
+
+    SESSION = "sess-1"
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.main = self.root / f"{self.SESSION}.jsonl"
+        self.sub_dir = self.root / self.SESSION / "subagents"
+
+    @staticmethod
+    def _assistant(inp=0, out=0, cr=0, cw=0, msg_id=None):
+        return {
+            "type": "assistant",
+            "message": {
+                **({"id": msg_id} if msg_id else {}),
+                "usage": {
+                    "input_tokens": inp,
+                    "output_tokens": out,
+                    "cache_read_input_tokens": cr,
+                    "cache_creation_input_tokens": cw,
+                },
+            },
+        }
+
+    def _write(self, path: Path, entries: list) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(json.dumps(e) + "\n" for e in entries), encoding="utf-8")
+
+    def test_none_and_empty_path_return_none(self):
+        self.assertIsNone(L.parse_session_token_counts(None))
+        self.assertIsNone(L.parse_session_token_counts(""))
+
+    def test_main_only_matches_single_file_parser(self):
+        self._write(self.main, [self._assistant(inp=10, out=5, cr=100, cw=20, msg_id="m1")])
+        self.assertEqual(
+            L.parse_session_token_counts(self.main),
+            L.parse_transcript_token_counts(self.main),
+        )
+        self.assertEqual(
+            L.parse_session_token_counts(self.main),
+            {"input": 10, "output": 5, "cache_read": 100, "cache_write": 20},
+        )
+
+    def test_sums_main_and_every_subagent_file(self):
+        self._write(self.main, [self._assistant(inp=1, out=2, cr=100, cw=10, msg_id="m1")])
+        self._write(self.sub_dir / "agent-aaa.jsonl", [self._assistant(inp=3, out=4, cr=200, cw=20, msg_id="a1")])
+        self._write(self.sub_dir / "agent-bbb.jsonl", [self._assistant(inp=5, out=6, cr=300, cw=30, msg_id="b1")])
+        self.assertEqual(
+            L.parse_session_token_counts(self.main),
+            {"input": 9, "output": 12, "cache_read": 600, "cache_write": 60},
+        )
+
+    def test_ignores_non_transcript_files_in_subagents_dir(self):
+        self._write(self.main, [self._assistant(inp=1, msg_id="m1")])
+        self._write(self.sub_dir / "agent-aaa.jsonl", [self._assistant(inp=2, msg_id="a1")])
+        # The real directory also holds a .meta.json per agent; a stray file must
+        # not be parsed as a transcript either.
+        (self.sub_dir / "agent-aaa.meta.json").write_text(
+            json.dumps(self._assistant(inp=9999, msg_id="meta")), encoding="utf-8")
+        (self.sub_dir / "notes.jsonl").write_text(
+            json.dumps(self._assistant(inp=9999, msg_id="stray")) + "\n", encoding="utf-8")
+        self.assertEqual(L.parse_session_token_counts(self.main)["input"], 3)
+
+    def test_unreadable_subagent_file_is_skipped_others_still_count(self):
+        self._write(self.main, [self._assistant(inp=1, msg_id="m1")])
+        self._write(self.sub_dir / "agent-good.jsonl", [self._assistant(inp=2, msg_id="g1")])
+        (self.sub_dir / "agent-bad.jsonl").write_text("not json at all\n\x00\x01\n", encoding="utf-8")
+        self.assertEqual(L.parse_session_token_counts(self.main)["input"], 3)
+
+    def test_missing_main_transcript_still_returns_subagent_totals(self):
+        # Main file absent/unparseable must not discard real subagent usage.
+        self._write(self.sub_dir / "agent-aaa.jsonl", [self._assistant(inp=7, out=1, cr=50, cw=5, msg_id="a1")])
+        self.assertEqual(
+            L.parse_session_token_counts(self.main),
+            {"input": 7, "output": 1, "cache_read": 50, "cache_write": 5},
+        )
+
+    def test_nothing_anywhere_returns_none(self):
+        self.assertIsNone(L.parse_session_token_counts(self.main))
+        self._write(self.sub_dir / "agent-aaa.jsonl", [{"type": "user", "message": {"content": "hi"}}])
+        self.assertIsNone(L.parse_session_token_counts(self.main))
+
+    def test_dedup_is_scoped_per_file_not_across_files(self):
+        # #298 collapses one turn's per-content-block lines WITHIN a file. The same
+        # message.id in two different files is two separate transcripts' turns.
+        self._write(self.main, [
+            self._assistant(inp=10, msg_id="same"),
+            self._assistant(inp=10, msg_id="same"),  # duplicate block line: counted once
+        ])
+        self._write(self.sub_dir / "agent-aaa.jsonl", [self._assistant(inp=10, msg_id="same")])
+        self.assertEqual(L.parse_session_token_counts(self.main)["input"], 20)
+
+    def test_failure_listing_subagents_dir_falls_back_to_main_only(self):
+        self._write(self.main, [self._assistant(inp=4, msg_id="m1")])
+        self._write(self.sub_dir / "agent-aaa.jsonl", [self._assistant(inp=100, msg_id="a1")])
+        with mock.patch.object(Path, "glob", side_effect=OSError("boom")):
+            self.assertEqual(L.parse_session_token_counts(self.main)["input"], 4)
+
+
+class RecordEventAgentFields(SavingsLedgerTestCase):
+    """Issue #365: record_event writes agent_id/agent_type only when present."""
+
+    def test_omitted_when_absent_so_old_shape_is_unchanged(self):
+        L.record_event("s", "hook:Bash", 1000, 100, True, "cmd")
+        event = L.read_session_events("s")[0]
+        self.assertNotIn("agent_id", event)
+        self.assertNotIn("agent_type", event)
+
+    def test_both_written_when_given(self):
+        L.record_event("s", "hook:Bash", 1000, 100, True, "cmd", agent_id="a1", agent_type="Explore")
+        event = L.read_session_events("s")[0]
+        self.assertEqual(event["agent_id"], "a1")
+        self.assertEqual(event["agent_type"], "Explore")
+
+    def test_empty_values_are_treated_as_absent(self):
+        L.record_event("s", "hook:Bash", 1000, 100, True, "cmd", agent_id="", agent_type=None)
+        event = L.read_session_events("s")[0]
+        self.assertNotIn("agent_id", event)
+        self.assertNotIn("agent_type", event)
+
+    def test_agent_type_alone_is_stored(self):
+        # `claude --agent X` main thread: agent_type present, no agent_id.
+        L.record_event("s", "hook:Bash", 1000, 100, True, "cmd", agent_type="my-agent")
+        event = L.read_session_events("s")[0]
+        self.assertEqual(event["agent_type"], "my-agent")
+        self.assertNotIn("agent_id", event)
+
+    def test_overlong_values_are_truncated(self):
+        L.record_event("s", "hook:Bash", 1000, 100, True, "cmd", agent_id="x" * 500, agent_type="y" * 500)
+        event = L.read_session_events("s")[0]
+        self.assertEqual(len(event["agent_id"]), 200)
+        self.assertEqual(len(event["agent_type"]), 200)
+
+
+class AggregateByAgent(unittest.TestCase):
+    """_aggregate_by_agent: grouping, credited-only sums, subagent detection."""
+
+    @staticmethod
+    def _ev(saved=100, raw=200, out=100, credited=True, **agent):
+        return {"tool": "hook:Bash", "raw_tokens": raw, "out_tokens": out,
+                "saved_tokens": saved if credited else 0, "credited": credited, **agent}
+
+    def test_no_agent_fields_lands_in_the_main_row(self):
+        rows = L._aggregate_by_agent([self._ev(), self._ev()])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]["is_subagent"], rows[0]["agent_type"]), (0, ""))
+        self.assertEqual(rows[0]["event_count"], 2)
+        self.assertEqual(rows[0]["saved_tokens"], 200)
+
+    def test_subagent_detected_by_agent_id(self):
+        rows = L._aggregate_by_agent([self._ev(), self._ev(agent_id="a1", agent_type="Explore")])
+        by_key = {(r["is_subagent"], r["agent_type"]): r for r in rows}
+        self.assertEqual(set(by_key), {(0, ""), (1, "Explore")})
+
+    def test_agent_type_without_agent_id_is_not_a_subagent(self):
+        # The `claude --agent X` main-thread case: must NOT be filed as a subagent.
+        rows = L._aggregate_by_agent([self._ev(agent_type="my-agent")])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]["is_subagent"], rows[0]["agent_type"]), (0, "my-agent"))
+
+    def test_main_agent_session_and_same_typed_subagent_do_not_collide(self):
+        rows = L._aggregate_by_agent([
+            self._ev(agent_type="X"),                    # main thread started with --agent X
+            self._ev(agent_id="a1", agent_type="X"),     # a subagent of the same type
+        ])
+        self.assertEqual({(r["is_subagent"], r["agent_type"]) for r in rows}, {(0, "X"), (1, "X")})
+
+    def test_same_type_different_agent_ids_merge_into_one_row(self):
+        rows = L._aggregate_by_agent([
+            self._ev(agent_id="a1", agent_type="Explore"),
+            self._ev(agent_id="a2", agent_type="Explore"),
+        ])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["event_count"], 2)
+        self.assertEqual(rows[0]["saved_tokens"], 200)
+
+    def test_uncredited_events_count_as_events_but_not_savings(self):
+        rows = L._aggregate_by_agent([
+            self._ev(),
+            self._ev(credited=False, raw=999, out=1),
+        ])
+        self.assertEqual(rows[0]["event_count"], 2)
+        self.assertEqual(rows[0]["credited_event_count"], 1)
+        self.assertEqual(rows[0]["saved_tokens"], 100)
+        self.assertEqual(rows[0]["raw_tokens_sum"], 200)  # uncredited raw excluded
+
+    def test_sorted_by_saved_tokens_descending(self):
+        rows = L._aggregate_by_agent([
+            self._ev(saved=10),
+            self._ev(saved=500, agent_id="a1", agent_type="Big"),
+            self._ev(saved=50, agent_id="a2", agent_type="Mid"),
+        ])
+        self.assertEqual([r["agent_type"] for r in rows], ["Big", "Mid", ""])
+
+    def test_empty_events(self):
+        self.assertEqual(L._aggregate_by_agent([]), [])
+
+
+class SessionAgentsRollup(SavingsLedgerTestCase):
+    """Issue #365: finalize_session persists the per-agent split; schema v5."""
+
+    def _mixed_session(self, sid="s1"):
+        L.record_event(sid, "hook:Bash", 1000, 100, True, "main cmd")
+        L.record_event(sid, "hook:Bash", 2000, 200, True, "sub cmd", agent_id="a1", agent_type="general-purpose")
+        L.record_event(sid, "hook:Bash", 3000, 300, True, "sub cmd 2", agent_id="a2", agent_type="general-purpose")
+
+    def test_finalize_writes_main_and_subagent_rows(self):
+        self._mixed_session()
+        agg = L.finalize_session("s1", "proj")
+        self.assertEqual({(r["is_subagent"], r["agent_type"]) for r in agg["by_agent"]},
+                         {(0, ""), (1, "general-purpose")})
+        rows = {(r["is_subagent"], r["agent_type"]): r for r in L.query_session_agent_breakdown("s1")}
+        self.assertEqual(rows[(0, "")]["saved_tokens"], 900)
+        self.assertEqual(rows[(1, "general-purpose")]["saved_tokens"], 1800 + 2700)
+        self.assertEqual(rows[(1, "general-purpose")]["credited_event_count"], 2)
+
+    def test_main_plus_subagent_rows_sum_to_the_session_total(self):
+        self._mixed_session()
+        agg = L.finalize_session("s1", "proj")
+        self.assertEqual(sum(r["saved_tokens"] for r in agg["by_agent"]), agg["credited_saved_tokens"])
+
+    def test_refinalizing_replaces_rather_than_duplicates(self):
+        self._mixed_session()
+        L.finalize_session("s1", "proj", delete_jsonl=False)
+        L.finalize_session("s1", "proj")
+        self.assertEqual(len(L.query_session_agent_breakdown("s1")), 2)
+
+    def test_session_without_events_for_a_given_id_has_no_rows(self):
+        self.assertEqual(L.query_session_agent_breakdown("never-existed"), [])
+
+    def test_live_aggregate_includes_by_agent_without_writing(self):
+        self._mixed_session("live")
+        agg = L.get_live_session_aggregate("live")
+        self.assertEqual(len(agg["by_agent"]), 2)
+        self.assertEqual(L.query_session_agent_breakdown("live"), [])  # read-only
+
+    def test_fresh_db_has_the_table_at_current_version(self):
+        L.finalize_session("fresh", "proj")
+        conn = sqlite3.connect(str(L.resolve_db_path()))
+        self.assertTrue(L._table_exists(conn, "session_agents"))
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], L.SCHEMA_VERSION)
+        conn.close()
+
+    def test_v4_database_migrates_to_v5_with_data_intact(self):
+        db_path = L.resolve_db_path()
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "CREATE TABLE sessions (session_id TEXT PRIMARY KEY, project TEXT NOT NULL, ended_at TEXT NOT NULL, "
+            "credited_saved_tokens INTEGER NOT NULL, raw_tokens_sum INTEGER NOT NULL DEFAULT 0, "
+            "out_tokens_sum INTEGER NOT NULL DEFAULT 0, event_count INTEGER NOT NULL, fetch_url_count INTEGER NOT NULL, "
+            "overhead_tokens INTEGER NOT NULL DEFAULT 0, actual_input_tokens INTEGER NOT NULL DEFAULT 0, "
+            "actual_output_tokens INTEGER NOT NULL DEFAULT 0, actual_cache_read_tokens INTEGER NOT NULL DEFAULT 0, "
+            "actual_cache_write_tokens INTEGER NOT NULL DEFAULT 0)"
+        )
+        conn.execute(
+            "CREATE TABLE session_tools (session_id TEXT NOT NULL, tool TEXT NOT NULL, event_count INTEGER NOT NULL, "
+            "saved_tokens INTEGER NOT NULL, raw_tokens_sum INTEGER NOT NULL DEFAULT 0, "
+            "out_tokens_sum INTEGER NOT NULL DEFAULT 0, credited_event_count INTEGER NOT NULL DEFAULT 0, "
+            "PRIMARY KEY (session_id, tool))"
+        )
+        conn.execute("INSERT INTO sessions (session_id, project, ended_at, credited_saved_tokens, event_count, "
+                     "fetch_url_count) VALUES ('old', 'p', '2026-09-01T00:00:00Z', 42, 3, 0)")
+        conn.execute("PRAGMA user_version = 4")
+        conn.commit()
+        conn.close()
+
+        L.finalize_session("new", "p")  # opens the DB -> runs the v5 migration
+
+        conn = sqlite3.connect(str(db_path))
+        self.assertTrue(L._table_exists(conn, "session_agents"))
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], L.SCHEMA_VERSION)
+        self.assertEqual(
+            conn.execute("SELECT credited_saved_tokens FROM sessions WHERE session_id = 'old'").fetchone()[0], 42)
+        self.assertEqual(L.query_session_agent_breakdown("old"), [])  # no backfill
+        conn.close()
+
+
+class FormatDetailViewByAgent(unittest.TestCase):
+    """Issue #365: the "Main session vs subagents" block in /my-savings detail."""
+
+    _PROJECT_SUMMARY = {"project": "proj"}
+
+    def _render(self, by_agent):
+        agg = {"credited_saved_tokens": 0, "event_count": 0, "raw_tokens_sum": 0,
+               "out_tokens_sum": 0, "project": "proj"}
+        if by_agent is not None:
+            agg["by_agent"] = by_agent
+        return L.format_detail_view(agg, self._PROJECT_SUMMARY, [], [], [])
+
+    @staticmethod
+    def _row(is_sub, agent_type, saved, credited_events):
+        return {"is_subagent": is_sub, "agent_type": agent_type, "event_count": credited_events,
+                "saved_tokens": saved, "raw_tokens_sum": 0, "out_tokens_sum": 0,
+                "credited_event_count": credited_events}
+
+    def test_block_shown_when_a_subagent_earned_savings(self):
+        out = self._render([self._row(1, "Explore", 3000, 4), self._row(0, "", 1000, 2)])
+        self.assertIn("Main session vs subagents", out)
+        main_line = [ln for ln in out.splitlines() if ln.strip().startswith("main session")][0]
+        self.assertIn(L._fmt_tokens(1000), main_line)
+        self.assertIn("2 events", main_line)
+        sub_line = [ln for ln in out.splitlines() if "subagent · Explore" in ln][0]
+        self.assertIn(L._fmt_tokens(3000), sub_line)
+        self.assertIn("4 events", sub_line)
+
+    def test_block_absent_without_subagents(self):
+        self.assertNotIn("Main session vs subagents", self._render([self._row(0, "", 1000, 2)]))
+
+    def test_block_absent_when_by_agent_missing_or_empty(self):
+        # Old-shape aggregates (and every pre-#365 caller) don't carry by_agent.
+        self.assertNotIn("Main session vs subagents", self._render(None))
+        self.assertNotIn("Main session vs subagents", self._render([]))
+
+    def test_main_agent_session_is_not_listed_as_a_subagent(self):
+        out = self._render([self._row(0, "my-agent", 500, 1), self._row(1, "Explore", 100, 1)])
+        self.assertNotIn("subagent · my-agent", out)
+
+    def test_block_absent_when_the_only_subagent_activity_saved_nothing(self):
+        # Regression for the Copilot review on PR #367: a subagent whose only
+        # activity was uncredited (e.g. fetch_url) has a by_agent row with 0
+        # saved / 0 credited events -- that must NOT render a "0 events / 0
+        # tokens" block, even though the main session did earn savings.
+        out = self._render([self._row(0, "", 900, 1), self._row(1, "Explore", 0, 0)])
+        self.assertNotIn("Main session vs subagents", out)
+        self.assertNotIn("subagent · Explore", out)
+
+    def test_zero_savings_subagent_type_is_not_listed_beside_a_productive_one(self):
+        out = self._render([
+            self._row(0, "", 900, 1),
+            self._row(1, "Explore", 3000, 4),
+            self._row(1, "Idle", 0, 0),
+        ])
+        self.assertIn("subagent · Explore", out)
+        self.assertNotIn("subagent · Idle", out)
+
+    def test_subagent_without_a_type_gets_a_plain_label(self):
+        out = self._render([self._row(1, "", 100, 1)])
+        self.assertTrue(any(ln.strip().startswith("subagent ") and "·" not in ln for ln in out.splitlines()))
 
 
 class SchemaMigrationV4(SavingsLedgerTestCase):
@@ -1588,8 +1974,11 @@ class SchemaMigrationV4(SavingsLedgerTestCase):
         self.assertEqual(result["actual_cache_read_tokens"], 200)
         self.assertEqual(result["actual_cache_write_tokens"],  30)
 
-    def test_schema_version_is_4(self):
-        self.assertEqual(L.SCHEMA_VERSION, 4)
+    def test_schema_version_includes_v4(self):
+        # Was `== 4`; every later bump (v5 for #365) would otherwise have to edit
+        # this test just to keep asserting that v4's migration is still present.
+        self.assertGreaterEqual(L.SCHEMA_VERSION, 4)
+        self.assertIn(4, L._MIGRATIONS)
 
 
 class FormatActualTokenBlock(unittest.TestCase):

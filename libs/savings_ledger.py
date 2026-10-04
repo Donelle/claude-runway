@@ -187,7 +187,8 @@ def current_session_id(project: Optional[str] = None) -> Optional[str]:
 # Tier 1: transient per-session JSONL ledger
 # ---------------------------------------------------------------------------
 
-def record_event(session_id: str, tool: str, raw_tokens: int, out_tokens: int, credited: bool, source: str = "", project: Optional[str] = None) -> None:
+def record_event(session_id: str, tool: str, raw_tokens: int, out_tokens: int, credited: bool, source: str = "", project: Optional[str] = None,
+                agent_id: Optional[str] = None, agent_type: Optional[str] = None) -> None:
     """
     Append one compression event to the session's transient JSONL ledger.
     saved_tokens is forced to 0 for uncredited events (e.g. fetch_url, whose
@@ -203,6 +204,17 @@ def record_event(session_id: str, tool: str, raw_tokens: int, out_tokens: int, c
     hooks/compress_bash_output.py, derives it from the hook payload's own
     `cwd` field (the same source session_end_savings.py already uses via
     project_name_from_cwd).
+
+    `agent_id`/`agent_type` (issue #365) identify WHICH agent earned this
+    saving. A tool call made inside a subagent reports the PARENT's
+    session_id, so without these an event is indistinguishable from a
+    main-session one. They're written only when non-empty, so every
+    main-session event -- and every ledger written before this existed -- keeps
+    its exact previous shape. Note `agent_type` alone does NOT mean "subagent":
+    the hooks docs say it's also present on the main thread when the session
+    was started with `claude --agent <name>`; only `agent_id` marks a subagent
+    (see _aggregate_by_agent). `agent_id` lives in this transient ledger only --
+    the SQLite rollup keeps just the subagent flag and `agent_type`.
     """
     saved_tokens = max(0, raw_tokens - out_tokens) if credited else 0
     entry = {
@@ -215,6 +227,10 @@ def record_event(session_id: str, tool: str, raw_tokens: int, out_tokens: int, c
         "source": source[:200] if source else "",
         "project": project,
     }
+    if agent_id:
+        entry["agent_id"] = str(agent_id)[:200]
+    if agent_type:
+        entry["agent_type"] = str(agent_type)[:200]
     path = _session_jsonl_path(session_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     # Explicit UTF-8 rather than the platform default -- json.dumps() already
@@ -253,10 +269,35 @@ def read_session_events(session_id: str) -> list:
 # Tier 2: perpetual SQLite store
 # ---------------------------------------------------------------------------
 
-# Bumped whenever `sessions`/`session_tools`/`meta`'s shape changes.
+# Bumped whenever the shape of ANY persistent table changes: `sessions`,
+# `session_tools`, `session_agents` (added in v5, #365) or `meta`. That includes
+# adding a new table, even though _connect creates it for fresh DBs via CREATE
+# TABLE IF NOT EXISTS -- the bump plus a registered migration is what keeps
+# existing databases on the same versioned path as new ones.
 # _MIGRATIONS below must gain a matching entry for every bump -- see
 # _run_migrations' docstring for how the two stay in sync (issue #30/#69).
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
+
+# Issue #365: per-session savings split by which agent earned them. One DDL
+# string shared by _connect (fresh DBs) and _migrate_to_v5 (existing DBs) so the
+# two can't drift. `is_subagent` is part of the key so a `claude --agent X` main
+# session and a subagent of type X can never collide into one row; '' in
+# agent_type means "no agent_type reported". The raw agent_id is deliberately NOT
+# stored here -- one row per spawned subagent would grow without bound for little
+# analytical value; type + flag answers "main or subagent, and which kind".
+_SESSION_AGENTS_DDL = """
+    CREATE TABLE IF NOT EXISTS session_agents (
+        session_id TEXT NOT NULL,
+        is_subagent INTEGER NOT NULL,
+        agent_type TEXT NOT NULL DEFAULT '',
+        event_count INTEGER NOT NULL,
+        saved_tokens INTEGER NOT NULL,
+        raw_tokens_sum INTEGER NOT NULL DEFAULT 0,
+        out_tokens_sum INTEGER NOT NULL DEFAULT 0,
+        credited_event_count INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (session_id, is_subagent, agent_type)
+    )
+"""
 
 
 def _migrate_to_v1(conn) -> None:
@@ -346,12 +387,25 @@ def _migrate_to_v4(conn) -> None:
             conn.execute(f"ALTER TABLE sessions ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0")
 
 
+def _migrate_to_v5(conn) -> None:
+    """
+    Adds the `session_agents` table (issue #365): savings split by main session
+    vs. subagent, and by agent_type. Purely additive and idempotent
+    (CREATE TABLE IF NOT EXISTS) -- _connect already creates it before migrations
+    run, so this mostly exists so SCHEMA_VERSION and _MIGRATIONS stay in lockstep
+    (the guard in _run_migrations requires an entry for every version). Sessions
+    finalized before this version have no rows here: the agent information was
+    never recorded, so nothing is backfilled.
+    """
+    conn.execute(_SESSION_AGENTS_DDL)
+
+
 # Maps target schema version -> the function that migrates INTO it from the
 # version immediately before. The next schema change adds one more entry here
 # and bumps SCHEMA_VERSION -- _run_migrations doesn't need to change at all,
 # which is the actual "scaffold" issue #69 asked for: a repeatable shape for
 # schema changes, not a one-off patch for this specific set of columns.
-_MIGRATIONS = {1: _migrate_to_v1, 2: _migrate_to_v2, 3: _migrate_to_v3, 4: _migrate_to_v4}
+_MIGRATIONS = {1: _migrate_to_v1, 2: _migrate_to_v2, 3: _migrate_to_v3, 4: _migrate_to_v4, 5: _migrate_to_v5}
 
 
 def _table_exists(conn, name: str) -> bool:
@@ -458,8 +512,9 @@ def _ensure_schema(conn) -> None:
     # Checked BEFORE the CREATE TABLE calls below, specifically so
     # _run_migrations can tell a genuinely fresh DB (nothing to migrate --
     # see its docstring) apart from a pre-existing one that needs its
-    # history replayed. `sessions` specifically, not the other two tables,
-    # since it's the one this migration scaffold actually versions.
+    # history replayed. `sessions` specifically, not the other three tables
+    # (`session_tools`/`session_agents`/`meta`), since it's the one this
+    # migration scaffold actually versions.
     sessions_existed = _table_exists(conn, "sessions")
     # Always the LATEST schema -- a brand-new DB gets every current column
     # in one step and never needs a migration to add anything for it.
@@ -496,11 +551,12 @@ def _ensure_schema(conn) -> None:
         )
         """
     )
+    conn.execute(_SESSION_AGENTS_DDL)
     conn.execute(
         "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
     )
-    # Only after all three tables are guaranteed to exist -- a migration may
-    # assume `sessions`/`session_tools`/`meta` are all already there.
+    # Only after all four tables are guaranteed to exist -- a migration may
+    # assume `sessions`/`session_tools`/`session_agents`/`meta` are all already there.
     _run_migrations(conn, is_new_db=not sessions_existed)
 
 
@@ -530,6 +586,42 @@ def get_schema_overhead_tokens() -> int:
     without recomputing it or importing the MCP server module.
     """
     return int(get_meta("schema_overhead_tokens", "0") or "0")
+
+
+def _aggregate_by_agent(events: list) -> list:
+    """
+    Group a session's events by which agent earned them (issue #365). Returns a
+    list of dicts, one per (is_subagent, agent_type), sorted by saved_tokens
+    descending then deterministically, with the same counters as by_tool and
+    the same credited-only rules (saved/raw/out sums and credited_event_count
+    only count credited events; event_count counts all of them).
+
+    `is_subagent` is decided by `agent_id` alone. `agent_type` is just a label:
+    the hooks docs say it's also present on the MAIN thread when the session
+    was started with `claude --agent <name>`, so keying "subagent" off
+    agent_type would misfile that whole session's savings as subagent work. An
+    event with neither field (every event recorded before #365, and every
+    plain main-session event) lands in the (0, '') row.
+    """
+    groups: dict[tuple[int, str], dict[str, int]] = {}
+    for e in events:
+        key = (1 if e.get("agent_id") else 0, str(e.get("agent_type") or ""))
+        agg = groups.setdefault(key, {
+            "event_count": 0,
+            "saved_tokens": 0,
+            "raw_tokens_sum": 0,
+            "out_tokens_sum": 0,
+            "credited_event_count": 0,
+        })
+        agg["event_count"] += 1
+        if e.get("credited"):
+            agg["saved_tokens"] += e.get("saved_tokens", 0)
+            agg["raw_tokens_sum"] += e.get("raw_tokens", 0)
+            agg["out_tokens_sum"] += e.get("out_tokens", 0)
+            agg["credited_event_count"] += 1
+    rows = [{"is_subagent": k[0], "agent_type": k[1], **v} for k, v in groups.items()]
+    rows.sort(key=lambda r: (-r["saved_tokens"], r["is_subagent"], r["agent_type"]))
+    return rows
 
 
 def finalize_session(session_id: str, project: str, overhead_tokens: int = 0, delete_jsonl: bool = True, actual_tokens: Optional[dict] = None) -> dict:
@@ -577,6 +669,8 @@ def finalize_session(session_id: str, project: str, overhead_tokens: int = 0, de
             agg["out_tokens_sum"] += e.get("out_tokens", 0)
             agg["credited_event_count"] += 1
 
+    by_agent = _aggregate_by_agent(events)
+
     _at = actual_tokens or {}
     actual_inp  = int(_at.get("input",      0) or 0)
     actual_out  = int(_at.get("output",     0) or 0)
@@ -603,6 +697,16 @@ def finalize_session(session_id: str, project: str, overhead_tokens: int = 0, de
                 (session_id, tool, agg["event_count"], agg["saved_tokens"],
                  agg["raw_tokens_sum"], agg["out_tokens_sum"], agg["credited_event_count"]),
             )
+        # Same replace-then-insert shape as session_tools above (issue #365), so
+        # re-finalizing a session can never leave stale per-agent rows behind.
+        conn.execute("DELETE FROM session_agents WHERE session_id = ?", (session_id,))
+        for row in by_agent:
+            conn.execute(
+                "INSERT INTO session_agents (session_id, is_subagent, agent_type, event_count, saved_tokens, "
+                "raw_tokens_sum, out_tokens_sum, credited_event_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (session_id, row["is_subagent"], row["agent_type"], row["event_count"], row["saved_tokens"],
+                 row["raw_tokens_sum"], row["out_tokens_sum"], row["credited_event_count"]),
+            )
     conn.close()
 
     if delete_jsonl:
@@ -621,6 +725,7 @@ def finalize_session(session_id: str, project: str, overhead_tokens: int = 0, de
         "fetch_url_count": fetch_url_count,
         "overhead_tokens": overhead_tokens,
         "by_tool": by_tool,
+        "by_agent": by_agent,
         "actual_input_tokens":      actual_inp,
         "actual_output_tokens":     actual_out,
         "actual_cache_read_tokens": actual_cr,
@@ -661,6 +766,7 @@ def get_live_session_aggregate(session_id: str) -> dict:
         "fetch_url_count": sum(1 for e in events if e.get("tool") == "fetch_url"),
         "overhead_tokens": get_schema_overhead_tokens(),
         "by_tool": by_tool,
+        "by_agent": _aggregate_by_agent(events),
         # Transcript parsing only happens at SessionEnd -- always 0 mid-session.
         "actual_input_tokens":      0,
         "actual_output_tokens":     0,
@@ -860,6 +966,32 @@ def query_session_tool_breakdown(session_id: str) -> list:
     ]
 
 
+def query_session_agent_breakdown(session_id: str) -> list:
+    """Per-agent rows for one finalized session (issue #365), same shape as
+    finalize_session's `by_agent`. Empty for a session finalized before schema v5
+    (nothing was recorded to backfill from)."""
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT is_subagent, agent_type, event_count, saved_tokens, raw_tokens_sum, out_tokens_sum, "
+        "credited_event_count FROM session_agents WHERE session_id = ? "
+        "ORDER BY saved_tokens DESC, is_subagent, agent_type",
+        (session_id,),
+    ).fetchall()
+    conn.close()
+    return [
+        {
+            "is_subagent": r[0],
+            "agent_type": r[1],
+            "event_count": r[2],
+            "saved_tokens": r[3],
+            "raw_tokens_sum": r[4],
+            "out_tokens_sum": r[5],
+            "credited_event_count": r[6],
+        }
+        for r in rows
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Transcript token parsing (opt-in stopgap -- see issue #165)
 # ---------------------------------------------------------------------------
@@ -867,7 +999,8 @@ def query_session_tool_breakdown(session_id: str) -> list:
 def parse_transcript_token_counts(transcript_path) -> Optional[dict]:
     """
     Parse a Claude Code session transcript JSONL and sum the actual token
-    counts from each assistant turn's `message.usage` block. Returns a dict
+    counts from each assistant turn's `message.usage` block (once per distinct
+    `message.id` -- see the dedup note in the loop). Returns a dict
     with keys input/output/cache_read/cache_write, or None when the path is
     absent, the file is unreadable, or no assistant entries with usage data
     were found. Always fails open -- never raises.
@@ -882,6 +1015,14 @@ def parse_transcript_token_counts(transcript_path) -> Optional[dict]:
         return None
     totals: dict = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
     found_any = False
+    # Claude Code writes one JSONL line per content block (text, tool_use, ...)
+    # of an assistant turn. Every line of the same turn shares one message.id
+    # and repeats the SAME whole-turn usage object (not a per-block delta), so
+    # summing per line multiplies each turn's usage by its block count (~1.9x
+    # on real transcripts, #298). Invariant: each distinct message.id is
+    # counted exactly once (first occurrence wins). Lines with no id cannot be
+    # deduplicated, so they are always counted -- never silently dropped.
+    seen_message_ids: set = set()
     try:
         with open(transcript_path, encoding="utf-8") as f:
             for line in f:
@@ -894,9 +1035,15 @@ def parse_transcript_token_counts(transcript_path) -> Optional[dict]:
                     continue
                 if obj.get("type") != "assistant":
                     continue
-                usage = obj.get("message", {}).get("usage", {})
+                message = obj.get("message", {})
+                usage = message.get("usage", {})
                 if not usage:
                     continue
+                message_id = message.get("id")
+                if message_id:
+                    if message_id in seen_message_ids:
+                        continue
+                    seen_message_ids.add(message_id)
                 totals["input"]      += int(usage.get("input_tokens",                   0) or 0)
                 totals["output"]     += int(usage.get("output_tokens",                  0) or 0)
                 totals["cache_read"] += int(usage.get("cache_read_input_tokens",        0) or 0)
@@ -905,6 +1052,58 @@ def parse_transcript_token_counts(transcript_path) -> Optional[dict]:
     except Exception:
         return None
     return totals if found_any else None
+
+
+def parse_session_token_counts(transcript_path) -> Optional[dict]:
+    """
+    Like parse_transcript_token_counts, but for a whole SESSION: the main
+    transcript plus every subagent transcript that belongs to it (#364).
+
+    Why a separate function: the payload's `transcript_path` is only the MAIN
+    session's transcript. Claude Code writes each subagent's turns to its own
+    file, `<projdir>/<session_id>/subagents/agent-<agent_id>.jsonl`, next to the
+    main `<projdir>/<session_id>.jsonl` -- confirmed live: the main transcript
+    had zero `isSidechain` lines, so its totals never included subagent usage
+    and "tokens processed" was understated for any session that delegates work
+    (autowork most of all). parse_transcript_token_counts is left untouched so
+    its contract, and the #298 dedup it implements, stay scoped to one file.
+
+    The subagents directory is derived from the transcript path itself (strip
+    the `.jsonl` suffix, append `/subagents`) rather than from the hook
+    payload's session_id, so it follows whatever layout Claude Code actually
+    used for this transcript. Each file is parsed separately: a `message.id`
+    repeated across two DIFFERENT files is counted in each, because the dedup
+    exists to collapse one turn's per-content-block lines inside one file, not
+    to merge separate files.
+
+    Returns the summed input/output/cache_read/cache_write dict, or None when
+    neither the main transcript nor any subagent file yielded usage data (same
+    contract as parse_transcript_token_counts). Always fails open -- a missing
+    directory or an unreadable/malformed subagent file is skipped, never raised,
+    so a layout change degrades to the previous main-transcript-only behavior.
+
+    Known gap, by design: a subagent still running when the session ends, or a
+    resumed session, may be only partially counted.
+
+    # STOPGAP: remove when #164 is resolved (Stop hook will expose these directly).
+    """
+    if not transcript_path:
+        return None
+    parts = []
+    main = parse_transcript_token_counts(transcript_path)
+    if main:
+        parts.append(main)
+    try:
+        subagents_dir = Path(transcript_path).with_suffix("") / "subagents"
+        for agent_file in sorted(subagents_dir.glob("agent-*.jsonl")):
+            counts = parse_transcript_token_counts(agent_file)
+            if counts:
+                parts.append(counts)
+    except Exception:
+        pass  # keep whatever was gathered before the failure
+    if not parts:
+        return None
+    return {key: sum(p[key] for p in parts) for key in ("input", "output", "cache_read", "cache_write")}
 
 
 # ---------------------------------------------------------------------------
@@ -1082,6 +1281,29 @@ def format_detail_view(session_agg: dict, project_summary: dict, tool_breakdown:
                 lines.append(f"  {t['tool']:<16} {t['event_count']:>3} events  {_fmt_tokens(t['saved_tokens']):>8}  {bar}{pct_str}")
             else:
                 lines.append(f"  {t['tool']:<16} {t['event_count']:>3} calls  {'—':>8}  (not credited)")
+
+    # Issue #365: shown only when at least one subagent earned a POSITIVE saving
+    # this session, so a session with no delegation renders exactly as before.
+    # Gated on saved_tokens > 0, not merely "a subagent row exists": a subagent
+    # whose only activity was uncredited (fetch_url) or whose credited events
+    # saved nothing still gets a row in by_agent, and listing it would print a
+    # misleading "0 events / 0 tokens" line (Copilot review on PR #367). The same
+    # filter applies to the per-type lines below. Counts are credited events,
+    # matching the "N events" headline above (not total calls, which include
+    # uncredited fetch_url activity).
+    by_agent = session_agg.get("by_agent") or []
+    subagent_rows = [a for a in by_agent if a.get("is_subagent") and a.get("saved_tokens", 0) > 0]
+    if subagent_rows:
+        main_rows = [a for a in by_agent if not a.get("is_subagent")]
+        main_saved = sum(a.get("saved_tokens", 0) for a in main_rows)
+        main_events = sum(a.get("credited_event_count", 0) for a in main_rows)
+        lines += ["", "Main session vs subagents",
+                  f"  {'main session':<24} {main_events:>3} events  {_fmt_tokens(main_saved):>8}"]
+        for a in subagent_rows:
+            label = f"subagent · {a['agent_type']}" if a.get("agent_type") else "subagent"
+            lines.append(
+                f"  {label:<24} {a.get('credited_event_count', 0):>3} events  {_fmt_tokens(a.get('saved_tokens', 0)):>8}"
+            )
 
     if last_n:
         values = [s["saved_tokens"] for s in last_n]
