@@ -51,7 +51,7 @@ class OutputShape(unittest.TestCase):
             mock.patch.object(hook.savings_ledger, "read_session_events", return_value=[object()]),
             mock.patch.object(hook.savings_ledger, "project_name_from_cwd", return_value="my-project"),
             mock.patch.object(hook.savings_ledger, "get_schema_overhead_tokens", return_value=0),
-            mock.patch.object(hook.savings_ledger, "finalize_session", return_value={}),
+            mock.patch.object(hook.savings_ledger, "finalize_session", return_value={"event_count": 1}),
             mock.patch.object(hook.savings_ledger, "query_project_summary", return_value={}),
             mock.patch.object(hook.savings_ledger, "format_simple_view", return_value=_SUMMARY),
         ]
@@ -95,6 +95,25 @@ class SilentExitPaths(unittest.TestCase):
         ):
             self.assertEqual(_run_main(), "")
 
+    def test_uncredited_only_session_no_output_but_still_finalized(self):
+        # #307: events exist (e.g. fetch_url, never credited) but none credited
+        # -> finalize_session reports event_count 0. The session must still be
+        # rolled up into the perpetual store, yet nothing may be printed.
+        with (
+            mock.patch.object(hook.savings_ledger, "tracking_enabled", return_value=True),
+            mock.patch.object(hook.savings_ledger, "read_session_events", return_value=[object()]),
+            mock.patch.object(hook.savings_ledger, "project_name_from_cwd", return_value="p"),
+            mock.patch.object(hook.savings_ledger, "get_schema_overhead_tokens", return_value=0),
+            mock.patch.object(
+                hook.savings_ledger, "finalize_session", return_value={"event_count": 0, "fetch_url_count": 2}
+            ) as fin,
+            mock.patch.object(hook.savings_ledger, "query_project_summary", return_value={}),
+            mock.patch.object(hook.savings_ledger, "format_simple_view", return_value=_SUMMARY) as fmt,
+        ):
+            self.assertEqual(_run_main(), "")
+        fin.assert_called_once()
+        fmt.assert_not_called()
+
     def test_invalid_json_stdin_no_output(self):
         # Malformed stdin must not crash the hook — it exits silently.
         self.assertEqual(_run_main("not valid json {{"), "")
@@ -117,7 +136,7 @@ class TranscriptParsing(unittest.TestCase):
 
         def _fake_finalize(session_id, project, overhead_tokens=0, delete_jsonl=True, actual_tokens=None):
             captured["actual_tokens"] = actual_tokens
-            return {}
+            return {"event_count": 1}
 
         # Start from the real environment minus the one var under test, so a
         # developer who exports CLAUDE_RUNWAY_PARSE_TRANSCRIPT_TOKENS in their
@@ -136,8 +155,10 @@ class TranscriptParsing(unittest.TestCase):
             mock.patch.object(hook.savings_ledger, "finalize_session", side_effect=_fake_finalize),
             mock.patch.object(hook.savings_ledger, "query_project_summary", return_value={}),
             mock.patch.object(hook.savings_ledger, "format_simple_view", return_value=_SUMMARY),
+            # #364: the hook calls the session-level parser (main + subagent
+            # transcripts), not the single-file one.
             mock.patch.object(
-                hook.savings_ledger, "parse_transcript_token_counts",
+                hook.savings_ledger, "parse_session_token_counts",
                 return_value=transcript_result
             ),
         ]
@@ -179,6 +200,24 @@ class TranscriptParsing(unittest.TestCase):
             None,  # transcript parse failed
         )
         self.assertIsNone(captured["actual_tokens"])
+
+    def test_hook_passes_transcript_path_to_session_level_parser(self):
+        # #364: the payload's transcript_path is only the MAIN transcript; the
+        # session-level parser derives the subagent transcripts from it, so the
+        # hook must hand it that exact path.
+        with (
+            mock.patch.dict(os.environ, {"CLAUDE_RUNWAY_PARSE_TRANSCRIPT_TOKENS": "1"}),
+            mock.patch.object(hook.savings_ledger, "tracking_enabled", return_value=True),
+            mock.patch.object(hook.savings_ledger, "read_session_events", return_value=[object()]),
+            mock.patch.object(hook.savings_ledger, "project_name_from_cwd", return_value="proj"),
+            mock.patch.object(hook.savings_ledger, "get_schema_overhead_tokens", return_value=0),
+            mock.patch.object(hook.savings_ledger, "finalize_session", return_value={}),
+            mock.patch.object(hook.savings_ledger, "query_project_summary", return_value={}),
+            mock.patch.object(hook.savings_ledger, "format_simple_view", return_value=_SUMMARY),
+            mock.patch.object(hook.savings_ledger, "parse_session_token_counts", return_value=None) as parse,
+        ):
+            _run_main(_PAYLOAD_WITH_TRANSCRIPT)
+        parse.assert_called_once_with("/fake/transcript.jsonl")
 
     def test_parse_transcript_enabled_accepts_true_yes(self):
         for val in ("1", "true", "True", "TRUE", "yes", "YES"):

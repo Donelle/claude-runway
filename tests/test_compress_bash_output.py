@@ -328,6 +328,23 @@ class RecordSavingsEventForwardsProject(unittest.TestCase):
         _, kwargs = self.stub.calls[0]
         self.assertIsNone(kwargs.get("project"))
 
+    def test_forwards_agent_fields_to_record_event(self):
+        # Issue #365: which agent earned the saving rides along on the event.
+        hook._record_savings_event(
+            "sess-1", "hook:Bash", 1000, 100, True, "cmd",
+            project="my-repo", agent_id="agent-1", agent_type="Explore",
+        )
+        _, kwargs = self.stub.calls[0]
+        self.assertEqual(kwargs.get("agent_id"), "agent-1")
+        self.assertEqual(kwargs.get("agent_type"), "Explore")
+
+    def test_agent_fields_default_to_none(self):
+        # A main-session event must be recorded exactly as before #365.
+        hook._record_savings_event("sess-1", "hook:Bash", 1000, 100, True, "cmd")
+        _, kwargs = self.stub.calls[0]
+        self.assertIsNone(kwargs.get("agent_id"))
+        self.assertIsNone(kwargs.get("agent_type"))
+
 
 class MainDerivesProjectFromPayloadCwd(unittest.TestCase):
     """End-to-end through main() itself -- confirms the actual wiring (not
@@ -378,6 +395,105 @@ class MainDerivesProjectFromPayloadCwd(unittest.TestCase):
         self.assertEqual(len(self.stub.calls), 1)
         _, kwargs = self.stub.calls[0]
         self.assertEqual(kwargs.get("project"), "my-actual-project")
+
+
+class MainThreadsAgentFieldsToRecordEvent(unittest.TestCase):
+    """Issue #365: end-to-end through main() -- the payload's agent_id/agent_type
+    reach record_event on EVERY recording path (MCP footer, generic MCP, Bash),
+    not just the one _record_savings_event unit test above covers. Uses the same
+    stub ledger / fake compress as the neighboring classes, so no live model."""
+
+    def setUp(self):
+        self.stub = _StubSavingsLedger()
+        self._real_ledger = hook.savings_ledger
+        self._real_available = hook._SAVINGS_LEDGER_AVAILABLE
+        self._real_compress = hook.compress
+        hook.savings_ledger = self.stub
+        hook._SAVINGS_LEDGER_AVAILABLE = True
+        hook.compress = _fake_compress
+
+    def tearDown(self):
+        hook.savings_ledger = self._real_ledger
+        hook._SAVINGS_LEDGER_AVAILABLE = self._real_available
+        hook.compress = self._real_compress
+
+    def _run_main(self, payload):
+        real_stdin = sys.stdin
+        sys.stdin = io.StringIO(json.dumps(payload))
+        out = io.StringIO()
+        try:
+            with redirect_stdout(out):
+                try:
+                    hook.main()
+                except SystemExit:
+                    pass
+        finally:
+            sys.stdin = real_stdin
+        return out.getvalue()
+
+    def _single_call_kwargs(self):
+        self.assertEqual(len(self.stub.calls), 1)
+        return self.stub.calls[0][1]
+
+    def test_mcp_footer_path(self):
+        footer = json.dumps({"tool": "compress_file", "raw_tokens": 1000, "out_tokens": 100,
+                             "credited": True, "source": "f.log"})
+        self._run_main({
+            "session_id": "s", "cwd": "/repos/p",
+            "agent_id": "agent-9", "agent_type": "general-purpose",
+            "tool_name": "mcp__local-compress__compress_file",
+            "tool_response": f"[compressed 1000 -> 100 chars]\n<!--CLAUDE_RUNWAY_SAVINGS:{footer}-->",
+        })
+        kwargs = self._single_call_kwargs()
+        self.assertEqual(kwargs.get("agent_id"), "agent-9")
+        self.assertEqual(kwargs.get("agent_type"), "general-purpose")
+
+    def test_generic_mcp_path(self):
+        self._run_main({
+            "session_id": "s", "cwd": "/repos/p",
+            "agent_id": "agent-9", "agent_type": "Explore",
+            "tool_name": "mcp__local-compress__compact_find",
+            "tool_response": "STORED COMPACT CONTENT. " * 200,
+        })
+        kwargs = self._single_call_kwargs()
+        self.assertEqual(kwargs.get("agent_id"), "agent-9")
+        self.assertEqual(kwargs.get("agent_type"), "Explore")
+
+    def test_bash_path(self):
+        self._run_main({
+            "session_id": "s", "cwd": "/repos/p",
+            "agent_id": "agent-9", "agent_type": "Explore",
+            "tool_name": "Bash",
+            "tool_input": {"command": "cat big.log"},
+            "tool_response": {"stdout": "LOG LINE. " * 600, "stderr": ""},
+        })
+        kwargs = self._single_call_kwargs()
+        self.assertEqual(kwargs.get("agent_id"), "agent-9")
+        self.assertEqual(kwargs.get("agent_type"), "Explore")
+
+    def test_main_session_payload_without_agent_fields_passes_none(self):
+        self._run_main({
+            "session_id": "s", "cwd": "/repos/p",
+            "tool_name": "Bash",
+            "tool_input": {"command": "cat big.log"},
+            "tool_response": {"stdout": "LOG LINE. " * 600, "stderr": ""},
+        })
+        kwargs = self._single_call_kwargs()
+        self.assertIsNone(kwargs.get("agent_id"))
+        self.assertIsNone(kwargs.get("agent_type"))
+
+    def test_main_thread_started_with_agent_flag_carries_type_without_id(self):
+        # `claude --agent X`: agent_type present, agent_id absent -- forwarded as-is
+        # (the ledger's aggregation, not the hook, decides this is NOT a subagent).
+        self._run_main({
+            "session_id": "s", "cwd": "/repos/p", "agent_type": "my-agent",
+            "tool_name": "Bash",
+            "tool_input": {"command": "cat big.log"},
+            "tool_response": {"stdout": "LOG LINE. " * 600, "stderr": ""},
+        })
+        kwargs = self._single_call_kwargs()
+        self.assertIsNone(kwargs.get("agent_id"))
+        self.assertEqual(kwargs.get("agent_type"), "my-agent")
 
 
 async def _fake_compress(text, skip_if_under_chars=2000, **kwargs):
