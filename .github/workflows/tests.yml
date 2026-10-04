@@ -41,6 +41,12 @@ jobs:
       # runs the exact, audited action code -- a floating tag could move to
       # unreviewed code after this file was last reviewed. v4.4.0.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          # Issue #348: the package version is derived from the commit
+          # history (setuptools-scm), and the unit tests build a real wheel.
+          # A default shallow clone (depth 1) would make every CI build
+          # report a depth-1 version, not the real one.
+          fetch-depth: 0
 
       # Same reasoning, pinned to v5.6.0.
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
@@ -110,6 +116,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0 # full history for setuptools-scm, issue #348
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
@@ -142,7 +150,7 @@ jobs:
           # confirmed live that installing setuptools/wheel/build here, then
           # building with --no-isolation, produces an identical wheel to a
           # fully isolated build.
-          python -m pip install --index-url https://pypi.org/simple "setuptools>=68" wheel build
+          python -m pip install --index-url https://pypi.org/simple "setuptools>=68" "setuptools-scm>=8" wheel build
           python -m build --wheel --no-isolation -o dist
           python -m venv fresh-env
           if [ -f fresh-env/Scripts/python.exe ]; then
@@ -165,6 +173,10 @@ jobs:
           print('OK: libs/tools/hooks/templates/skills all present under <env>/src/')"
 
           "$VENV_BIN/claude-runway-doctor" --help
+          # Issue #348: each CLI reports the installed, git-derived version.
+          "$VENV_BIN/claude-runway-doctor" --version
+          "$VENV_BIN/claude-runway-ingest" --version
+          "$VENV_BIN/claude-runway-setup" --version
           "$VENV_BIN/claude-runway-ingest" --help
           mkdir -p pkgtest-target
           "$VENV_BIN/claude-runway-setup" init "$(pwd)/pkgtest-target" --dry-run

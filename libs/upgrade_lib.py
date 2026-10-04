@@ -128,9 +128,9 @@ def _apply_memory_bank_server_missing(
     `EMBEDDING_MODEL` is likewise taken from the existing `qdrant`/
     `codebase-indexer` block rather than left at whatever
     `build_mcp_servers` bakes in from the CURRENT `mcp.json.template`
-    (`build_mcp_servers` has no `embedding_model` parameter at all -- every
-    server it generates just inherits the template's own hardcoded default
-    verbatim). Found in Copilot review on PR #227 and confirmed by
+    (`build_mcp_servers`'s `embedding_model` parameter, added for issue #279,
+    defaults to blank -- every server it generates then just inherits the
+    template's own default verbatim -- and this migration doesn't pass it). Found in Copilot review on PR #227 and confirmed by
     reproducing it directly: a project whose `qdrant`/`codebase-indexer`
     blocks were hand-customized to a non-default `EMBEDDING_MODEL` (the
     documented, if manual, way to change this -- see README's Known
@@ -682,6 +682,9 @@ def run_upgrade(
     ask = prompt_fn or _console_prompt
     applied: "list[str]" = []
     skipped = 0
+    noop = 0
+    mcp_dirty = False
+    settings_dirty = False
     for index, migration in enumerate(pending, start=1):
         if dry_run:
             print()
@@ -698,24 +701,46 @@ def run_upgrade(
         if not accept:
             skipped += 1
             continue
-        mcp_json, settings_json = migration.apply(mcp_json, settings_json, ctx)
+        new_mcp, new_settings = migration.apply(mcp_json, settings_json, ctx)
+        # Diff each document against its pre-apply value so we know what this
+        # migration ACTUALLY touched (issue #278). Migrations deep-copy before
+        # mutating, so comparing by value is reliable.
+        mcp_changed = new_mcp != mcp_json
+        settings_changed = new_settings != settings_json
+        if not (mcp_changed or settings_changed):
+            # A guarded no-op apply (e.g. record-session-id-sessionstart when
+            # its prerequisite migration was declined) changed nothing: don't
+            # report it as applied -- it is still pending and will be detected
+            # again next run, matching the module docstring's contract.
+            noop += 1
+            continue
         # An apply() can deliberately no-op when its safety guard isn't met
         # (e.g. record-session-id-sessionstart won't remove the PostToolUse
         # fallback while no SessionStart block exists). Only count it as
-        # applied if detect() agrees the gap is actually closed now.
-        if migration.detect(mcp_json, settings_json):
+        # applied if detect() agrees the gap is actually closed now. Checked
+        # before adopting new_mcp/new_settings so a half-applied migration
+        # never leaks into a document another migration later writes.
+        if migration.detect(new_mcp, new_settings):
             print(f"      Not applied: its precondition isn't met yet, so {migration.id} stays pending.")
             skipped += 1
             continue
+        mcp_json, settings_json = new_mcp, new_settings
+        mcp_dirty = mcp_dirty or mcp_changed
+        settings_dirty = settings_dirty or settings_changed
         applied.append(migration.id)
 
     if dry_run:
         print(f"\nDry run: no changes written. {len(pending)} pending upgrade(s) would be applied.")
         return applied
 
-    if applied:
+    # Write only documents some applied migration actually changed (issue #278):
+    # an unconditional both-file write would materialize a settings.json a
+    # --skip-hooks project opted out of, and re-indent an untouched .mcp.json.
+    if mcp_dirty:
         _atomic_write_json(mcp_json_path, mcp_json)
+    if settings_dirty:
         _atomic_write_json(settings_path, settings_json)
 
-    print(f"\nDone. {len(applied)} change(s) applied, {skipped} skipped.")
+    noop_note = f", {noop} had nothing to change (still pending)" if noop else ""
+    print(f"\nDone. {len(applied)} change(s) applied, {skipped} skipped{noop_note}.")
     return applied

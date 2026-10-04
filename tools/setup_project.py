@@ -55,6 +55,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 
 from setup_project_lib import default_skills_dir, plan_skill_installs, run_setup, venv_python_path  # noqa: E402
 from upgrade_lib import is_project_configured, run_upgrade  # noqa: E402
+from version_lib import version_string  # noqa: E402
 
 TOOLS_REPO_DIR = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -341,6 +342,7 @@ def cmd_init(args: argparse.Namespace) -> None:
         compact_collection=args.compact_collection,
         memory_bank_collection=args.memory_bank_collection,
         memory_bank_id=args.memory_bank_id,
+        embedding_model=args.embedding_model,
         include_compress=not args.qdrant_only,
         include_hooks=include_hooks,
         # Issue #221: warm/verify the fastembed cache (and set
@@ -419,6 +421,14 @@ def cmd_init(args: argparse.Namespace) -> None:
         resolved_collection_name,
         "--qdrant-url",
         args.qdrant_url,
+        # ingest_to_qdrant.py's own --embedding-model default is the template
+        # default, so a custom/preserved model (issue #279) MUST be passed
+        # explicitly or the suggested command would index under the wrong
+        # model and mismatch the servers this run just configured. Always
+        # passed (the resolved value from what was generated), not only when
+        # custom, so the reminder never depends on the two defaults agreeing.
+        "--embedding-model",
+        result.generated_mcp_servers["qdrant"]["env"]["EMBEDDING_MODEL"],
     ]
     if args.include_extensions:
         index_argv += ["--include-ext", args.include_extensions]
@@ -570,6 +580,7 @@ def cmd_upgrade(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--version", action="version", version=version_string("claude-runway-setup"))
     sub = p.add_subparsers(dest="command", required=True)
 
     init = sub.add_parser("init", help="Write .mcp.json/.claude/settings.json into a target repo")
@@ -599,6 +610,14 @@ def parse_args() -> argparse.Namespace:
         "to unauthenticated. WARNING: writes the key in PLAINTEXT into .mcp.json -- do not commit that "
         "file as-is if this repo is shared; this script will print a reminder instead of the usual "
         "'commit .mcp.json' instruction when this is set",
+    )
+    init.add_argument(
+        "--embedding-model",
+        default="",
+        help="EMBEDDING_MODEL written into the qdrant/codebase-indexer/memory-bank blocks. Blank (default) "
+        "PRESERVES the model already in the target's existing .mcp.json, falling back to the template "
+        "default for a new project. Passing a value that differs from the existing one prints a warning: "
+        "vectors indexed under the old model are incompatible, so drop the collection and re-index",
     )
     init.add_argument("--collection-description", default="", help="Short one-line hint for list_collections")
     init.add_argument("--include-extensions", default="", help="e.g. '.py,.md' -- blank uses the built-in defaults")

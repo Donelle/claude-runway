@@ -177,6 +177,7 @@ def _init_args(target_repo, **overrides) -> argparse.Namespace:
         compact_collection="",
         memory_bank_collection="",
         memory_bank_id="",
+        embedding_model="",
         qdrant_only=False,
         skip_hooks=False,
         install_skills=False,
@@ -316,6 +317,19 @@ class InitialIndexReminder(unittest.TestCase):
         self.assertIn("--collection custom-collection", output)
         self.assertIn("--qdrant-url http://localhost:9999", output)
         self.assertNotIn("<name>", output)
+
+    def test_reminder_carries_the_resolved_embedding_model(self):
+        # Issue #279 review: ingest_to_qdrant.py defaults --embedding-model to
+        # the template default, so a custom model must be passed explicitly
+        # (both via the flag and when preserved from an existing .mcp.json).
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.mod.cmd_init(_init_args(self.target_repo, embedding_model="BAAI/bge-small-en", dry_run=False))
+        self.assertIn("--embedding-model BAAI/bge-small-en", buf.getvalue())
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.mod.cmd_init(_init_args(self.target_repo, dry_run=False))
+        self.assertIn("--embedding-model BAAI/bge-small-en", buf.getvalue())
 
     def test_default_collection_name_is_the_derived_slug(self):
         args = _init_args(self.target_repo)
@@ -479,6 +493,42 @@ class CompactCollectionFlag(unittest.TestCase):
         self.assertEqual(
             written["mcpServers"]["local-compress"]["env"]["COMPACT_COLLECTION"], "my-custom-compacts"
         )
+
+
+class EmbeddingModelFlag(unittest.TestCase):
+    """Issue #279: `init` preserves an existing customized EMBEDDING_MODEL on
+    a plain re-run, and --embedding-model overrides it explicitly."""
+
+    CUSTOM = "BAAI/bge-small-en"
+
+    def setUp(self):
+        self.mod = _load_setup_project()
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.target_repo = Path(self._tmpdir.name) / "my-project"
+        self.target_repo.mkdir()
+
+    def _written_models(self):
+        written = json.loads((self.target_repo / ".mcp.json").read_text(encoding="utf-8"))
+        return {
+            s: written["mcpServers"][s]["env"]["EMBEDDING_MODEL"]
+            for s in ("qdrant", "codebase-indexer", "memory-bank")
+        }
+
+    def test_flag_is_written_into_all_three_blocks_and_survives_a_plain_rerun(self):
+        self.mod.cmd_init(_init_args(self.target_repo, embedding_model=self.CUSTOM, dry_run=False))
+        self.assertEqual(set(self._written_models().values()), {self.CUSTOM})
+        # A plain re-run (no flag) must not reset it to the template default.
+        self.mod.cmd_init(_init_args(self.target_repo, dry_run=False))
+        self.assertEqual(set(self._written_models().values()), {self.CUSTOM})
+
+    def test_parser_accepts_embedding_model_and_defaults_blank(self):
+        with mock.patch.object(
+            self.mod.sys, "argv", ["setup_project.py", "init", str(self.target_repo), "--embedding-model", self.CUSTOM]
+        ):
+            self.assertEqual(self.mod.parse_args().embedding_model, self.CUSTOM)
+        with mock.patch.object(self.mod.sys, "argv", ["setup_project.py", "init", str(self.target_repo)]):
+            self.assertEqual(self.mod.parse_args().embedding_model, "")
 
 
 class QdrantOnlyAndSkipHooksAreMutuallyExclusive(unittest.TestCase):
