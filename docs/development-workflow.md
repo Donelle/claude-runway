@@ -13,6 +13,35 @@ Separately from the `skills/` directory (see the [Files](../README.md#files-34) 
 
 ## Developer setup (running from a clone)
 
+### macOS and Linux
+
+From a shell in the repository, run the bootstrap script:
+
+```bash
+./scripts/bootstrap.sh
+```
+
+It checks for Python 3.12 (through `uv` or a `python3.12` on `PATH`), creates `.venv` if needed, installs `requirements.txt` and `requirements-dev.txt` plus this checkout's command-line tools, runs `git config core.hooksPath .githooks` (git doesn't let a repo set this for itself, so each clone opts in once), and runs the doctor check. Re-running it is safe: it won't touch a correct `.venv` or an already-set hooks path, and it stops with a message, rather than deleting anything, if an existing `.venv` is the wrong Python version or layout.
+
+Manual fallback:
+
+```bash
+# With uv:
+uv venv --python 3.12
+uv pip install --python .venv/bin/python -r requirements.txt --index-url https://pypi.org/simple
+uv pip install --python .venv/bin/python -r requirements-dev.txt --index-url https://pypi.org/simple
+uv pip install --python .venv/bin/python --no-deps --no-build-isolation .
+
+# Without uv: python3.12 -m venv .venv, then the same installs through .venv/bin/python -m pip.
+
+git config core.hooksPath .githooks
+.venv/bin/claude-runway-doctor .
+```
+
+**Verification:** Linux only (see the PR for #31 for the run details); macOS has not been run. The steps most likely to differ there are the `python3.12` name under Homebrew and the system `git`/`uv` versions.
+
+### Windows
+
 From a Windows PowerShell prompt in the repository, run the bootstrap script:
 
 ```powershell
