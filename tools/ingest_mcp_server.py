@@ -843,8 +843,9 @@ async def sync_repo(
         targets the documented drop-then-sync scenario. Everything else in
         the manifest is checked, failing closed
         on any unknown state: a missing collection, an empty one (no point
-        with metadata.file_path -- preserved memory-bank / qdrant-store
-        points must not mask that), a not-found raised mid-check by a
+        with metadata.type in {code, doc} -- preserved memory-bank /
+        qdrant-store points, which can also carry metadata.file_path,
+        must not mask that), a not-found raised mid-check by a
         concurrent drop, or a manifest file that is unreadable (hash-skipped
         or fails to chunk). The only files ignored are ones proven to be
         nothing to index: removed from disk, or chunking cleanly to zero
