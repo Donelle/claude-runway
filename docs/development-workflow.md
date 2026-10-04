@@ -11,6 +11,50 @@ Separately from the `skills/` directory (see the [Files](../README.md#files-34) 
 | `my-gh-autowork` | `/my-gh-autowork [issue-number\|issue-number issue-number ...\|all]` | Fully autonomous version of the cycle below: delegates each ticket to a subagent that runs plan → code → PR → verified review-feedback loop → merge with no approval gates, stopping and reporting instead of guessing on anything genuinely ambiguous. For use once a human has explicitly authorized working the backlog without per-step check-ins — it packages the other four skills' procedures (plus the merge step none of them do) into one delegated pass per ticket. A specific list of ticket numbers works through exactly those, in the order given, one at a time — stopping immediately on the first `BLOCKED`/`FAILED` rather than skipping ahead to the next one in the list. |
 | `my-gh-load-context` | `/my-gh-load-context` | Loads full project context by reading `README.md`, `docs/`, `EVALUATION.md`, and — when present locally (both are gitignored, so a fresh checkout won't have them) — `CLAUDE.md` and `.plans/`. Checks what it read against the repo's actual current state (skill inventories, `EVALUATION.md` track status, `.plans/` vs. issue closure) and reports mismatches as a TODO instead of trusting the docs, then proposes resuming any clear in-progress work or asks what's next. |
 
+## Developer setup (running from a clone)
+
+From a Windows PowerShell prompt in the repository, run the bootstrap script:
+
+```powershell
+.\scripts\bootstrap.ps1
+```
+
+It checks for Python 3.12 (through `uv` or the `py -3.12` launcher), creates `.venv` if needed, installs `requirements.txt` and `requirements-dev.txt` plus this checkout's command-line tools, enables the repository's pre-push hook, and runs the doctor check. Re-running it is safe.
+
+**Windows verification (2026-10-04):** On Windows 11 Pro 10.0.26200, a fresh disposable clone completed setup and a second run left its installed package inventory and `.git/config` unchanged; `git config --get core.hooksPath` returned `.githooks`. The fresh-clone and repeat runs used PowerShell 7.6.6. The configured clone also completed a further run under Windows PowerShell 5.1.
+
+PowerShell enforces execution policy before loading a script, so a blocked bootstrap cannot print its own recovery hint. If PowerShell reports that script execution is disabled, run this command in the same PowerShell session, then retry the bootstrap. The bootstrap itself does not change execution policy:
+
+```powershell
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+.\scripts\bootstrap.ps1
+```
+
+Manual fallback:
+
+```powershell
+# With uv:
+uv venv --python 3.12
+uv pip install --python .venv\Scripts\python.exe -r requirements.txt --index-url https://pypi.org/simple
+uv pip install --python .venv\Scripts\python.exe -r requirements-dev.txt --index-url https://pypi.org/simple
+uv pip install --python .venv\Scripts\python.exe --no-deps --no-build-isolation .
+```
+
+Without `uv`, use `py -3.12 -m venv .venv`, then install the requirements and checkout with:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt --index-url https://pypi.org/simple
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt --index-url https://pypi.org/simple
+.\.venv\Scripts\python.exe -m pip install --no-deps --no-build-isolation .
+```
+
+After either path, enable the hook and run the final check:
+
+```powershell
+git config core.hooksPath .githooks
+.\.venv\Scripts\claude-runway-doctor.exe .
+```
+
 **Recommended cycle:** `/my-gh-create-issue` to file new work in the same verified, labeled format as the existing backlog → pick an open issue → `/my-gh-code-it {N}` to implement it → `/my-gh-pr {N}` to open the PR and document it against the issue → `/my-gh-pr-feedback` to work through review comments as they come in. This is exactly how the code-review backlog filed against this repo (see `.plans/` locally, or the repo's GitHub issues) is meant to be worked one item at a time — and how new items should keep getting added to it. `/my-gh-autowork` runs this same cycle without stopping between steps, once told to.
 
 **A note on issue and PR numbers in comments and docs:** this repository's own tracker is small (it started in September 2026), but code comments, test docstrings, templates and some docs cite issue and PR numbers well above that range (`#22`, `#175`, and about 70 others). Those come from the upstream repository this one was ported from, and they don't resolve in this tracker: `gh issue view 175` here finds nothing. Treat them as provenance labels rather than links. Where a claim rests on one of them, the surrounding text should carry enough of the rationale to stand alone. For some of them, the upstream number of the PR that shipped the work differs from the issue number: memory-bank (issue `#175`) shipped as PR `#178`. Confirming any individual claim against upstream is a separate task from working on this repo.
@@ -26,4 +70,3 @@ git config core.hooksPath .githooks
 ```
 
 This is a convenience, not the real enforcement — it only runs in a clone that has opted in with the command above, and any push can skip it with `git push --no-verify`. Linked worktrees of an opted-in clone, including `/my-gh-autowork`'s, inherit the setting, because `core.hooksPath` lives in the repo-local config that every worktree shares. CI (`.github/workflows/tests.yml`) runs the identical two checks and is what actually gates a PR.
-
