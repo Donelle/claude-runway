@@ -157,8 +157,12 @@ async def remember(
     true no-op) `recall` uses to re-rank hits instead of raw similarity
     alone -- infinite/NaN/negative values are rejected outright. Use a value
     >1.0 to boost a known-good memory above equally-similar competitors, or
-    0.0 to de-emphasize a stale/superseded one without deleting it. There is
-    no separate "update weight" tool -- to change it later, `forget` the
+    0.0 to de-emphasize a stale/superseded one without deleting it. It is a
+    proportional multiplier on relevance (effective_score = max(0,
+    similarity) * weight): a boost among comparably-relevant hits, never a
+    takeover -- weight=2.0 lets a hit with half the similarity tie a
+    default-weight one, and an irrelevant memory scores 0 at any weight.
+    There is no separate "update weight" tool -- to change it later, `forget` the
     point and `remember` it again.
     """
     # turn is captured HERE, unconditionally, before any of the fallible
@@ -268,11 +272,12 @@ async def recall(
 
     kind narrows further if given. limit caps how many hits come back.
 
-    Results are ranked by `effective_score` (raw similarity rescaled to a
-    nonnegative scale, then multiplied by `weight`), not raw similarity alone
-    (issue #177) -- a memory `remember`ed with a
-    higher `weight` can outrank a more similarly-worded but lower-weight
-    (or stale/superseded) one. Each result includes both `score` (raw
+    Results are ranked by `effective_score` (`max(0, raw similarity) *
+    weight`; ties broken by weight>0 then raw similarity, so weight=0 is last), not raw similarity alone
+    (issue #177) -- a memory `remember`ed with a higher `weight` can outrank
+    a more similarly-worded but lower-weight (or stale/superseded) one, but
+    only proportionally (weight=2.0 lets a hit with half the similarity tie),
+    and never when its similarity is non-positive (issue #272). Each result includes both `score` (raw
     similarity) and `effective_score` (what ranking actually used) so this
     is inspectable, not hidden.
     """
