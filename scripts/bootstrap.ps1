@@ -127,19 +127,17 @@ else {
 }
 
 $doctor = Join-Path $venvPath 'Scripts\claude-runway-doctor.exe'
-if (-not (Test-Path -LiteralPath $doctor)) {
-    if ($uvCommand) {
-        Invoke-BootstrapCommand `
-            -Description 'Install ClaudeRunway command-line tools' `
-            -FilePath $uvCommand.Source `
-            -Arguments @('pip', 'install', '--python', $venvPython, '--no-deps', '--no-build-isolation', $repoRoot)
-    }
-    else {
-        Invoke-BootstrapCommand `
-            -Description 'Install ClaudeRunway command-line tools' `
-            -FilePath $venvPython `
-            -Arguments @('-m', 'pip', 'install', '--no-deps', '--no-build-isolation', $repoRoot)
-    }
+if ($uvCommand) {
+    Invoke-BootstrapCommand `
+        -Description 'Install/update ClaudeRunway command-line tools from this checkout' `
+        -FilePath $uvCommand.Source `
+        -Arguments @('pip', 'install', '--python', $venvPython, '--no-deps', '--no-build-isolation', $repoRoot)
+}
+else {
+    Invoke-BootstrapCommand `
+        -Description 'Install/update ClaudeRunway command-line tools from this checkout' `
+        -FilePath $venvPython `
+        -Arguments @('-m', 'pip', 'install', '--no-deps', '--no-build-isolation', $repoRoot)
 }
 if (-not (Test-Path -LiteralPath $doctor)) {
     Stop-Bootstrap "The doctor command was not installed at '$doctor'."
