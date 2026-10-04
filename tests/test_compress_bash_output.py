@@ -511,6 +511,29 @@ class MainFallsBackToGenericForNonFooterMcpTools(unittest.TestCase):
         self.assertEqual(args[1], "compress_file")
 
 
+class TimeoutErrorFlowsIntoTheWasntCompressedNote(unittest.TestCase):
+    """Issue #368: the hook embeds compress()'s "Error: ..." string verbatim, so
+    a timeout's "may be busy" wording must reach the user, not the misleading
+    "check it's still running"."""
+
+    def test_timeout_wording_is_in_the_note(self):
+        message = (
+            "Error: LM Studio request timed out after 60s (chunk 1/2) -- LM Studio is "
+            "may be busy with other requests or unreachable; see "
+            "CLAUDE_RUNWAY_LMSTUDIO_TIMEOUT_SECONDS."
+        )
+        buf = io.StringIO()
+        with redirect_stdout(buf), self.assertRaises(SystemExit) as cm:
+            hook._finish_compression_outcome(
+                ("error", "x" * 5000, message), "Bash", "Bash", "sess-1", "/repos/my-project",
+            )
+        self.assertEqual(cm.exception.code, 0)
+        note = json.loads(buf.getvalue())["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("wasn't compressed", note)
+        self.assertIn("may be busy", note)
+        self.assertNotIn("check it's still running", note)
+
+
 class CompactFindMultiEntryIsNeverGenericallyCompressed(unittest.TestCase):
     """Issue #193: compact_find's output is structured data /my-resume
     parses for control flow (a "Found {N} compact(s)" header + N discrete

@@ -63,6 +63,11 @@ _AUTO_DETECT_MODEL = "(auto-detect -- no model pinned)"
 #   doctor.py only checks the local-compress env block; flagging a mismatch
 #   for a var that's not a local-compress concern would be misleading.
 # - CLAUDE_RUNWAY_WEBFETCH_FAILED_URL_TTL: hook-only; no .mcp.json counterpart.
+# - CLAUDE_RUNWAY_LMSTUDIO_TIMEOUT_SECONDS: read by both halves via
+#   local_compress_lib.client() (issue #301), but deliberately not declared in
+#   the .mcp.json template: the MCP server inherits the shell value, and an
+#   absent .mcp.json key vs. a shell export is not a real divergence. Same
+#   shell-export-only channel as CLAUDE_RUNWAY_CACHE_DB above.
 DUAL_ENV_VARS = (
     "CLAUDE_RUNWAY_LMSTUDIO_URL",
     "CLAUDE_RUNWAY_LMSTUDIO_MODEL",
