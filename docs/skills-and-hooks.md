@@ -18,14 +18,14 @@ The same "is this output the exact basis for what happens next" question gets as
 | Matched at the **start of a segment** | Matched **anywhere in a segment** |
 |---|---|
 | `git` (except `clone`/`fetch`/`pull`/`push` — progress noise, not state) | `--porcelain`, `--json`, `--version`, `--query`, `--format=` |
-| `wc`, `cksum`, `md5*`, `sha*sum` | `-o json` / `-o tsv` / `-o yaml` |
+| `wc`, `cksum`, `md5*`, `sha*sum` | `-o json` / `-o tsv` / `-o yaml` (also `-o=json`, `-ojson`) |
 | `pwd`, `realpath`, `readlink`, `basename`, `dirname`, `which`, `hostname`, `whoami`, `id` | `\| jq` |
-| `env`, `printenv`, `jq`, `yq`, `pip freeze`, `npm ls`, `base64`, `openssl`, `xxd`, `od` | `grep -c` (and bundled forms like `grep -rc`) |
+| `env`, `printenv`, `jq`, `yq`, `pip freeze`, `npm ls`/`npm list`, `base64`, `openssl`, `xxd`, `od` | `grep -c` (and bundled forms like `grep -rc`) |
 | | `--dry-run` (a preview's output *is* the exact planned action) |
 | | `--help`, standalone `-h` (flag spellings get copied into the next command; bundled `-lh`/`-sh` don't match) |
 | | `gh api` (REST or GraphQL, any flags) — always structured JSON meant to be parsed field-by-field, never prose to skim (issue #190) |
 
-Start-of-segment matching happens after leading `VAR=val` assignments and `sudo`, so `FOO=1 git log` and `sudo git status` are caught while `--message "regit"` is not. *Every* segment of a compound command is checked (split on `||`, `&&`, `;`, `|`, newline), because a pipeline's outputs interleave into one stdout — there's no way to compress only part of it, so one exactness-critical segment protects the whole command.
+Start-of-segment matching happens after leading `VAR=val` assignments and `sudo`, so `FOO=1 git log` and `sudo git status` are caught while `--message "regit"` is not. *Every* segment of a compound command is checked (split on `||`, `&&`, `;`, `|`, newline, `$(` and backtick, with a leading `(`/`{` stripped, so `HASH=$(git rev-parse HEAD)` and `(git diff)` are caught like their bare forms — issue #268), because a pipeline's outputs interleave into one stdout — there's no way to compress only part of it, so one exactness-critical segment protects the whole command.
 
 `gh api` is matched anywhere rather than as a start-of-segment command (unlike `jq`/`yq`) because the real call sites that motivated it wrap the call in shell command substitution (`COMMENT_IDS=$(gh api ... --jq "...")`), which a start-anchored match can't see past — verified directly before picking this approach (issue #190). It's also deliberately broader than gating on `--jq`/`graphql` specifically: a narrower fix would have left plain `gh api ... --paginate` calls (no `--jq`, no `--json`) still exposed.
 
