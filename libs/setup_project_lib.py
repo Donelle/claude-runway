@@ -931,9 +931,11 @@ def run_setup(
     explicit_model_change = bool(embedding_model) and bool(previous_embedding_model) and (
         resolved_embedding_model != previous_embedding_model
     )
-    shared_memory_bank_model = (
-        existing_memory_bank_model if explicit_model_change and existing_memory_bank_model else resolved_embedding_model
-    )
+    # A project with no memory-bank block still shares a collection locked to the
+    # model it was created under, which is the previous code model.
+    shared_memory_bank_model = resolved_embedding_model
+    if explicit_model_change:
+        shared_memory_bank_model = existing_memory_bank_model or previous_embedding_model
 
     # Issue #221: decide -- BEFORE building the qdrant server's env block --
     # whether it's safe to set HF_HUB_OFFLINE=1, so mcp-server-qdrant's own

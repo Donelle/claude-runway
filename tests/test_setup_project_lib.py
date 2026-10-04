@@ -910,6 +910,19 @@ class RunSetupEndToEnd(unittest.TestCase):
         self.assertEqual(models["memory-bank"], self._CUSTOM_MODEL)
         self.assertTrue(any("EMBEDDING_MODEL changed" in c and "WARNING" in c for c in result.changes))
 
+    def test_explicit_model_change_without_memory_bank_block_keeps_previous_shared_model(self):
+        # No memory-bank block: the shared collection is still locked to the old model,
+        # so the newly created server must not take the new one.
+        self._write_customized_existing_config(self._CUSTOM_MODEL)
+        cfg = json.loads((self.target_repo / ".mcp.json").read_text())
+        del cfg["mcpServers"]["memory-bank"]
+        (self.target_repo / ".mcp.json").write_text(json.dumps(cfg))
+        new_model = "sentence-transformers/all-mpnet-base-v2"
+        result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"), embedding_model=new_model)
+        models = self._models(result)
+        self.assertEqual(models["qdrant"], new_model)
+        self.assertEqual(models["memory-bank"], self._CUSTOM_MODEL)
+
     def test_explicit_embedding_model_same_as_existing_does_not_warn(self):
         self._write_customized_existing_config(self._CUSTOM_MODEL)
         result = run_setup(
