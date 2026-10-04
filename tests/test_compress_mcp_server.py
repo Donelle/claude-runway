@@ -1289,10 +1289,15 @@ class _FakeStreamedResponse:
 
     def __init__(
         self, body_chunks, content_length=None, encoding="utf-8", status_ok=True,
-        raise_in_iter=None, apparent_encoding_result="utf-8",
+        raise_in_iter=None, apparent_encoding_result="utf-8", content_type=None,
     ):
         self._body_chunks = body_chunks
         self.headers = {} if content_length is None else {"Content-Length": str(content_length)}
+        # `content_type`, if set, is the raw Content-Type header -- fetch_url
+        # inspects it to tell an EXPLICIT charset parameter apart from the
+        # RFC 2616 ISO-8859-1 default requests reports for bare text/*.
+        if content_type is not None:
+            self.headers["Content-Type"] = content_type
         self.encoding = encoding
         self._status_ok = status_ok
         self._raise_in_iter = raise_in_iter
@@ -1464,6 +1469,47 @@ class FetchUrlEnforcesSizeCap(unittest.TestCase):
         # Confirms fetch_url populated the cache with OUR bytes (bounded by
         # max_response_bytes) rather than trying to re-read the network.
         self.assertEqual(fake_resp._content, body)
+
+    def test_charsetless_text_html_is_not_decoded_as_latin1(self):
+        """Issue #266: for a bare `Content-Type: text/html` (no charset
+        parameter) requests sets resp.encoding to the RFC 2616 legacy default
+        "ISO-8859-1" -- truthy, so the apparent_encoding detection (which
+        only ran for a falsy encoding) was skipped and a UTF-8 page decoded
+        as Latin-1 into mojibake without raising.
+        """
+        mod = _load_compress_mcp_server()
+        body = "<html><body><p>Café — it’s “fine”, naïve résumé.</p></body></html>".encode("utf-8")
+        fake_resp = _FakeStreamedResponse(
+            body_chunks=[body],
+            content_length=len(body),
+            encoding="ISO-8859-1",
+            content_type="text/html",
+            apparent_encoding_result="utf-8",
+        )
+        with mock.patch.object(mod.requests, "get", return_value=fake_resp):
+            result = _run(mod.fetch_url(url="https://example.com/utf8-no-charset"))
+
+        self.assertNotIn("Error fetching", result)
+        self.assertIn("Café", result)
+        self.assertNotIn("Ã©", result)
+
+    def test_explicit_iso_8859_1_charset_is_still_honored(self):
+        """Issue #266: an EXPLICIT `charset=iso-8859-1` is the server's real
+        declaration and must not be overridden by detection."""
+        mod = _load_compress_mcp_server()
+        body = "<html><body><p>Café au lait.</p></body></html>".encode("iso-8859-1")
+        fake_resp = _FakeStreamedResponse(
+            body_chunks=[body],
+            content_length=len(body),
+            encoding="ISO-8859-1",
+            content_type="text/html; charset=iso-8859-1",
+            # Deliberately wrong: if detection wrongly ran, this would win.
+            apparent_encoding_result="utf-8",
+        )
+        with mock.patch.object(mod.requests, "get", return_value=fake_resp):
+            result = _run(mod.fetch_url(url="https://example.com/latin1-explicit"))
+
+        self.assertIn("Café au lait", result)
 
 
 class CompactPruneTests(unittest.TestCase):
