@@ -79,12 +79,14 @@ def main():
         sys.exit(0)  # nothing logged this session -- don't print an empty summary
 
     # Parse actual token counts from the transcript if the opt-in env var is set.
+    # parse_session_token_counts also folds in this session's subagent
+    # transcripts (#364) -- transcript_path alone is only the MAIN session's file.
     # Fails open -- any parse failure leaves actual_tokens as None, and
     # finalize_session stores 0s for the actual_* columns rather than erroring.
     # STOPGAP: remove when #164 is resolved (Stop hook will expose these directly).
     actual_tokens = None
     if _parse_transcript_enabled() and transcript_path:
-        actual_tokens = savings_ledger.parse_transcript_token_counts(transcript_path)
+        actual_tokens = savings_ledger.parse_session_token_counts(transcript_path)
 
     # This hook is meant to be best-effort and fail open, same philosophy as
     # compress_bash_output.py -- a savings-tracker problem (a corrupted DB
@@ -97,6 +99,13 @@ def main():
             session_id, project, overhead_tokens=overhead, actual_tokens=actual_tokens
         )
         session_agg["project"] = project
+        # #307: events existing isn't enough to print -- `event_count` counts
+        # CREDITED events only (see finalize_session), so a fetch_url-only
+        # session (logged but never credited) rolls up into the perpetual
+        # store above but stays silent here instead of printing a "0 tokens
+        # avoided" summary, matching the documented no-op behavior.
+        if not session_agg.get("event_count"):
+            sys.exit(0)
         project_summary = savings_ledger.query_project_summary(project)
         summary = savings_ledger.format_simple_view(session_agg, project_summary)
     except Exception:
