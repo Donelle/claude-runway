@@ -50,6 +50,7 @@ from typing import Optional
 # it). Used by current_session_id() below (issue #213) -- see that
 # function's docstring for exactly what is and isn't delegated.
 import session_id_lib
+import model_pricing
 
 
 def tracking_enabled() -> bool:
@@ -276,7 +277,7 @@ def read_session_events(session_id: str) -> list:
 # existing databases on the same versioned path as new ones.
 # _MIGRATIONS below must gain a matching entry for every bump -- see
 # _run_migrations' docstring for how the two stay in sync (issue #30/#69).
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # Issue #365: per-session savings split by which agent earned them. One DDL
 # string shared by _connect (fresh DBs) and _migrate_to_v5 (existing DBs) so the
@@ -400,12 +401,25 @@ def _migrate_to_v5(conn) -> None:
     conn.execute(_SESSION_AGENTS_DDL)
 
 
+def _migrate_to_v6(conn) -> None:
+    """
+    Adds `sessions.est_cost_usd`: the session's estimated dollar cost, priced
+    per assistant turn from the transcript at libs/model_pricing.py's rates.
+    DEFAULT 0 so sessions finalized before this version read as "no estimate"
+    rather than a fabricated figure -- the per-turn model and usage needed to
+    price them were never stored, so nothing is backfilled.
+    """
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()}
+    if "est_cost_usd" not in existing:
+        conn.execute("ALTER TABLE sessions ADD COLUMN est_cost_usd REAL NOT NULL DEFAULT 0")
+
+
 # Maps target schema version -> the function that migrates INTO it from the
 # version immediately before. The next schema change adds one more entry here
 # and bumps SCHEMA_VERSION -- _run_migrations doesn't need to change at all,
 # which is the actual "scaffold" issue #69 asked for: a repeatable shape for
 # schema changes, not a one-off patch for this specific set of columns.
-_MIGRATIONS = {1: _migrate_to_v1, 2: _migrate_to_v2, 3: _migrate_to_v3, 4: _migrate_to_v4, 5: _migrate_to_v5}
+_MIGRATIONS = {1: _migrate_to_v1, 2: _migrate_to_v2, 3: _migrate_to_v3, 4: _migrate_to_v4, 5: _migrate_to_v5, 6: _migrate_to_v6}
 
 
 def _table_exists(conn, name: str) -> bool:
@@ -533,7 +547,8 @@ def _ensure_schema(conn) -> None:
             actual_input_tokens INTEGER NOT NULL DEFAULT 0,
             actual_output_tokens INTEGER NOT NULL DEFAULT 0,
             actual_cache_read_tokens INTEGER NOT NULL DEFAULT 0,
-            actual_cache_write_tokens INTEGER NOT NULL DEFAULT 0
+            actual_cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+            est_cost_usd REAL NOT NULL DEFAULT 0
         )
         """
     )
@@ -633,8 +648,9 @@ def finalize_session(session_id: str, project: str, overhead_tokens: int = 0, de
 
     actual_tokens: optional dict from parse_transcript_token_counts() with
     keys input/output/cache_read/cache_write -- the real per-turn token counts
-    Anthropic processed this session. When None (opt-in feature disabled or
-    transcript parse failed), the four actual_* columns stay 0.
+    Anthropic processed this session, plus est_cost_usd/unpriced_turns. When
+    None (opt-in feature disabled or transcript parse failed), the four
+    actual_* columns and est_cost_usd stay 0.
     """
     events = read_session_events(session_id)
     credited = [e for e in events if e.get("credited")]
@@ -676,6 +692,8 @@ def finalize_session(session_id: str, project: str, overhead_tokens: int = 0, de
     actual_out  = int(_at.get("output",     0) or 0)
     actual_cr   = int(_at.get("cache_read", 0) or 0)
     actual_cw   = int(_at.get("cache_write",0) or 0)
+    est_cost    = float(_at.get("est_cost_usd", 0) or 0)
+    unpriced    = int(_at.get("unpriced_turns", 0) or 0)
 
     ended_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     conn = _connect()
@@ -684,10 +702,11 @@ def finalize_session(session_id: str, project: str, overhead_tokens: int = 0, de
             "INSERT OR REPLACE INTO sessions "
             "(session_id, project, ended_at, credited_saved_tokens, raw_tokens_sum, out_tokens_sum, "
             " event_count, fetch_url_count, overhead_tokens, "
-            " actual_input_tokens, actual_output_tokens, actual_cache_read_tokens, actual_cache_write_tokens) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " actual_input_tokens, actual_output_tokens, actual_cache_read_tokens, actual_cache_write_tokens, "
+            " est_cost_usd) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (session_id, project, ended_at, credited_saved, raw_sum, out_sum, event_count, fetch_url_count,
-             overhead_tokens, actual_inp, actual_out, actual_cr, actual_cw),
+             overhead_tokens, actual_inp, actual_out, actual_cr, actual_cw, est_cost),
         )
         conn.execute("DELETE FROM session_tools WHERE session_id = ?", (session_id,))
         for tool, agg in by_tool.items():
@@ -730,6 +749,8 @@ def finalize_session(session_id: str, project: str, overhead_tokens: int = 0, de
         "actual_output_tokens":     actual_out,
         "actual_cache_read_tokens": actual_cr,
         "actual_cache_write_tokens": actual_cw,
+        "est_cost_usd":             est_cost,
+        "unpriced_turns":           unpriced,
     }
 
 
@@ -772,6 +793,8 @@ def get_live_session_aggregate(session_id: str) -> dict:
         "actual_output_tokens":     0,
         "actual_cache_read_tokens": 0,
         "actual_cache_write_tokens": 0,
+        "est_cost_usd":             0.0,
+        "unpriced_turns":           0,
     }
 
 
@@ -791,7 +814,8 @@ def query_last_n_sessions(project: str, n: int = 10) -> list:
     conn = _connect()
     rows = conn.execute(
         "SELECT ended_at, credited_saved_tokens, "
-        "actual_input_tokens, actual_output_tokens, actual_cache_read_tokens, actual_cache_write_tokens "
+        "actual_input_tokens, actual_output_tokens, actual_cache_read_tokens, actual_cache_write_tokens, "
+        "est_cost_usd "
         "FROM sessions WHERE project = ? "
         "ORDER BY ended_at DESC LIMIT ?",
         (project, n),
@@ -805,6 +829,7 @@ def query_last_n_sessions(project: str, n: int = 10) -> list:
             "actual_output_tokens": r[3],
             "actual_cache_read_tokens": r[4],
             "actual_cache_write_tokens": r[5],
+            "est_cost_usd": r[6],
         }
         for r in reversed(rows)
     ]
@@ -1001,7 +1026,10 @@ def parse_transcript_token_counts(transcript_path) -> Optional[dict]:
     Parse a Claude Code session transcript JSONL and sum the actual token
     counts from each assistant turn's `message.usage` block (once per distinct
     `message.id` -- see the dedup note in the loop). Returns a dict
-    with keys input/output/cache_read/cache_write, or None when the path is
+    with keys input/output/cache_read/cache_write, plus est_cost_usd (each
+    turn priced at libs/model_pricing.py's rates for that turn's
+    `message.model`) and unpriced_turns (turns whose model has no rate, left
+    out of est_cost_usd rather than guessed at), or None when the path is
     absent, the file is unreadable, or no assistant entries with usage data
     were found. Always fails open -- never raises.
 
@@ -1013,7 +1041,8 @@ def parse_transcript_token_counts(transcript_path) -> Optional[dict]:
     """
     if not transcript_path:
         return None
-    totals: dict = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
+    totals: dict = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0,
+                    "est_cost_usd": 0.0, "unpriced_turns": 0}
     found_any = False
     # Claude Code writes one JSONL line per content block (text, tool_use, ...)
     # of an assistant turn. Every line of the same turn shares one message.id
@@ -1044,10 +1073,24 @@ def parse_transcript_token_counts(transcript_path) -> Optional[dict]:
                     if message_id in seen_message_ids:
                         continue
                     seen_message_ids.add(message_id)
-                totals["input"]      += int(usage.get("input_tokens",                   0) or 0)
-                totals["output"]     += int(usage.get("output_tokens",                  0) or 0)
-                totals["cache_read"] += int(usage.get("cache_read_input_tokens",        0) or 0)
-                totals["cache_write"]+= int(usage.get("cache_creation_input_tokens",    0) or 0)
+                inp = int(usage.get("input_tokens",                0) or 0)
+                out = int(usage.get("output_tokens",               0) or 0)
+                cr  = int(usage.get("cache_read_input_tokens",     0) or 0)
+                cw  = int(usage.get("cache_creation_input_tokens", 0) or 0)
+                totals["input"]       += inp
+                totals["output"]      += out
+                totals["cache_read"]  += cr
+                totals["cache_write"] += cw
+                # Priced per turn, not from the totals: each turn carries its
+                # own model, and a session can switch models mid-way.
+                cost = model_pricing.turn_cost_usd(
+                    message.get("model"), inp, cr, cw, out,
+                    fast=usage.get("speed") == "fast",
+                )
+                if cost is None:
+                    totals["unpriced_turns"] += 1
+                else:
+                    totals["est_cost_usd"] += cost
                 found_any = True
     except Exception:
         return None
@@ -1103,7 +1146,8 @@ def parse_session_token_counts(transcript_path) -> Optional[dict]:
         pass  # keep whatever was gathered before the failure
     if not parts:
         return None
-    return {key: sum(p[key] for p in parts) for key in ("input", "output", "cache_read", "cache_write")}
+    return {key: sum(p[key] for p in parts)
+            for key in ("input", "output", "cache_read", "cache_write", "est_cost_usd", "unpriced_turns")}
 
 
 # ---------------------------------------------------------------------------
@@ -1175,6 +1219,20 @@ def _format_actual_token_block(session_agg: dict, project: str = "") -> list:
     if inp > 0:
         ratio = round(cr / inp)
         lines.append(f"  Cache efficiency           {ratio:>9}×  (reads vs. fresh input — higher is better)")
+
+    # Estimated dollar cost at libs/model_pricing.py's per-token rates. 0 means
+    # no estimate (no priced turn, or a session finalized before schema v6),
+    # so the line is left out rather than shown as "$0.00".
+    cost = session_agg.get("est_cost_usd", 0) or 0
+    if cost > 0:
+        credits = model_pricing.usd_to_ai_credits(cost)
+        lines.append(
+            f"  Est. cost                  {f'${cost:,.2f}':>9}  "
+            f"({credits:,.0f} AI credits at {model_pricing.RATES_SOURCE} rates)"
+        )
+    unpriced = session_agg.get("unpriced_turns", 0) or 0
+    if unpriced:
+        lines.append(f"  Unpriced turns             {unpriced:>9}  (model not in the rate table, left out of the estimate)")
 
     return lines
 
@@ -1336,6 +1394,7 @@ def format_detail_view(session_agg: dict, project_summary: dict, tool_breakdown:
                     "actual_cache_read_tokens": recent["actual_cache_read_tokens"],
                     "actual_cache_write_tokens": recent["actual_cache_write_tokens"],
                     "credited_saved_tokens":    recent["saved_tokens"],
+                    "est_cost_usd":             recent.get("est_cost_usd", 0),
                 }
                 lines += _format_actual_token_block(past_agg, f"{project} · {date}")
                 break  # only the most recent session with data
@@ -1448,6 +1507,7 @@ def format_json(session_agg: dict, project_summary: dict, tool_breakdown: list, 
             "actual_output_tokens":     _int(session_raw.get("actual_output_tokens")),
             "actual_cache_read_tokens": _int(session_raw.get("actual_cache_read_tokens")),
             "actual_cache_write_tokens": _int(session_raw.get("actual_cache_write_tokens")),
+            "est_cost_usd": round(float(session_raw.get("est_cost_usd") or 0), 6),
         },
         "project_summary": {
             "project": project_summary.get("project", ""),
@@ -1474,6 +1534,7 @@ def format_json(session_agg: dict, project_summary: dict, tool_breakdown: list, 
                 "actual_output_tokens":     _int(s.get("actual_output_tokens")),
                 "actual_cache_read_tokens": _int(s.get("actual_cache_read_tokens")),
                 "actual_cache_write_tokens": _int(s.get("actual_cache_write_tokens")),
+                "est_cost_usd": round(float(s.get("est_cost_usd") or 0), 6),
             }
             for s in (last_n or [])
         ],
