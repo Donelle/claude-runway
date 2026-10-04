@@ -21,6 +21,8 @@ From a Windows PowerShell prompt in the repository, run the bootstrap script:
 
 It checks for Python 3.12 (through `uv` or the `py -3.12` launcher), creates `.venv` if needed, installs `requirements.txt` and `requirements-dev.txt` plus this checkout's command-line tools, enables the repository's pre-push hook, and runs the doctor check. Re-running it is safe.
 
+**Windows verification (2026-10-04):** On Windows 11 Pro 10.0.26200, a fresh disposable clone completed setup and a second run left its installed package inventory and `.git/config` unchanged; `git config --get core.hooksPath` returned `.githooks`. The fresh-clone and repeat runs used PowerShell 7.6.6. The configured clone also completed a further run under Windows PowerShell 5.1.
+
 If PowerShell reports that script execution is disabled, allow local scripts for the current user and try again. The bootstrap script does not change execution policy:
 
 ```powershell
@@ -33,8 +35,8 @@ Manual fallback:
 ```powershell
 # With uv:
 uv venv --python 3.12
-uv pip install -r requirements.txt --index-url https://pypi.org/simple
-uv pip install -r requirements-dev.txt --index-url https://pypi.org/simple
+uv pip install --python .venv\Scripts\python.exe -r requirements.txt --index-url https://pypi.org/simple
+uv pip install --python .venv\Scripts\python.exe -r requirements-dev.txt --index-url https://pypi.org/simple
 uv pip install --python .venv\Scripts\python.exe --no-deps --no-build-isolation .
 ```
 
