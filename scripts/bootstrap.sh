@@ -65,6 +65,14 @@ pip_install() {
     fi
 }
 
+# A .venv created by a previous run WITH uv has no pip, so re-running on a
+# machine/shell where uv is no longer on PATH would fail at the first
+# `python -m pip` (PR #41 review). Seed pip into it once instead.
+if [ "$HAVE_UV" -eq 0 ] && ! "$VENV_PYTHON" -m pip --version >/dev/null 2>&1; then
+    step "Seed pip into the existing .venv (it was created by uv, which is not on PATH now)"
+    "$VENV_PYTHON" -m ensurepip --upgrade || die "the existing .venv has no pip and ensurepip failed. Install uv, or remove '$VENV_DIR' and rerun this script."
+fi
+
 step "Install runtime requirements"
 pip_install -r "$REPO_ROOT/requirements.txt" --index-url https://pypi.org/simple
 step "Install developer requirements"
