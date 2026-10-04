@@ -1457,7 +1457,38 @@ class ParseTranscriptTokenCounts(unittest.TestCase):
         try:
             result = L.parse_transcript_token_counts(path)
             self.assertEqual(result, {"input": 13, "output": 13,
-                                      "cache_read": 150, "cache_write": 20})
+                                      "cache_read": 150, "cache_write": 20,
+                                      # No message.model in the fixture: both turns unpriced.
+                                      "est_cost_usd": 0.0, "unpriced_turns": 2})
+        finally:
+            import os as _os; _os.unlink(path)
+
+    def test_priced_turns_add_up_and_unknown_models_are_counted_as_unpriced(self):
+        def turn(model, msg_id, **usage):
+            entry = self._assistant(msg_id=msg_id, **usage)
+            entry["message"]["model"] = model
+            return entry
+        path = self._make_transcript([
+            # $4 in / $0.20 cache read / $5 cache write / $20 out per 1M.
+            turn("claude-opus-5-5", "m1", inp=1_000_000, out=1_000_000, cr=1_000_000, cw=1_000_000),
+            turn("some-unknown-model", "m2", inp=10),
+            turn("<synthetic>", "m3", inp=10),
+        ])
+        try:
+            result = L.parse_transcript_token_counts(path)
+            self.assertAlmostEqual(result["est_cost_usd"], 4.00 + 0.20 + 5.00 + 20.00)
+            self.assertEqual(result["unpriced_turns"], 2)
+            self.assertEqual(result["input"], 1_000_020)
+        finally:
+            import os as _os; _os.unlink(path)
+
+    def test_fast_mode_turn_uses_fast_rate(self):
+        entry = self._assistant(inp=1_000_000, msg_id="f1")
+        entry["message"]["model"] = "claude-opus-4-8"
+        entry["message"]["usage"]["speed"] = "fast"
+        path = self._make_transcript([entry])
+        try:
+            self.assertAlmostEqual(L.parse_transcript_token_counts(path)["est_cost_usd"], 10.00)
         finally:
             import os as _os; _os.unlink(path)
 
@@ -1579,7 +1610,8 @@ class ParseSessionTokenCounts(unittest.TestCase):
         )
         self.assertEqual(
             L.parse_session_token_counts(self.main),
-            {"input": 10, "output": 5, "cache_read": 100, "cache_write": 20},
+            {"input": 10, "output": 5, "cache_read": 100, "cache_write": 20,
+             "est_cost_usd": 0.0, "unpriced_turns": 1},
         )
 
     def test_sums_main_and_every_subagent_file(self):
@@ -1588,7 +1620,8 @@ class ParseSessionTokenCounts(unittest.TestCase):
         self._write(self.sub_dir / "agent-bbb.jsonl", [self._assistant(inp=5, out=6, cr=300, cw=30, msg_id="b1")])
         self.assertEqual(
             L.parse_session_token_counts(self.main),
-            {"input": 9, "output": 12, "cache_read": 600, "cache_write": 60},
+            {"input": 9, "output": 12, "cache_read": 600, "cache_write": 60,
+             "est_cost_usd": 0.0, "unpriced_turns": 3},
         )
 
     def test_ignores_non_transcript_files_in_subagents_dir(self):
@@ -1613,7 +1646,8 @@ class ParseSessionTokenCounts(unittest.TestCase):
         self._write(self.sub_dir / "agent-aaa.jsonl", [self._assistant(inp=7, out=1, cr=50, cw=5, msg_id="a1")])
         self.assertEqual(
             L.parse_session_token_counts(self.main),
-            {"input": 7, "output": 1, "cache_read": 50, "cache_write": 5},
+            {"input": 7, "output": 1, "cache_read": 50, "cache_write": 5,
+             "est_cost_usd": 0.0, "unpriced_turns": 1},
         )
 
     def test_nothing_anywhere_returns_none(self):
@@ -1980,6 +2014,28 @@ class SchemaMigrationV4(SavingsLedgerTestCase):
         self.assertGreaterEqual(L.SCHEMA_VERSION, 4)
         self.assertIn(4, L._MIGRATIONS)
 
+    def test_v6_migration_backfills_est_cost_with_zero(self):
+        self._v3_db()
+        L.finalize_session("new-sess", "proj")
+
+        conn = sqlite3.connect(str(self._db_path()))
+        row = conn.execute("SELECT est_cost_usd FROM sessions WHERE session_id = 'old-sess'").fetchone()
+        conn.close()
+        self.assertEqual(row, (0,))
+
+    def test_finalize_session_stores_and_returns_est_cost(self):
+        actual = {"input": 1, "output": 1, "cache_read": 1, "cache_write": 1,
+                  "est_cost_usd": 1.25, "unpriced_turns": 2}
+        result = L.finalize_session("s-cost", "proj", actual_tokens=actual)
+        self.assertEqual(result["est_cost_usd"], 1.25)
+        self.assertEqual(result["unpriced_turns"], 2)
+
+        conn = L._connect()
+        row = conn.execute("SELECT est_cost_usd FROM sessions WHERE session_id = 's-cost'").fetchone()
+        conn.close()
+        self.assertEqual(row, (1.25,))
+        self.assertEqual(L.query_last_n_sessions("proj")[-1]["est_cost_usd"], 1.25)
+
 
 class FormatActualTokenBlock(unittest.TestCase):
     """_format_actual_token_block: display block for Anthropic-processed token counts."""
@@ -2044,6 +2100,25 @@ class FormatActualTokenBlock(unittest.TestCase):
         lines = L._format_actual_token_block(self._agg(cr=500))
         joined = "\n".join(lines)
         self.assertNotIn("Cache efficiency", joined)
+
+    def test_est_cost_line_shown_with_ai_credits(self):
+        agg = self._agg(inp=100, out=50)
+        agg["est_cost_usd"] = 12.3456
+        joined = "\n".join(L._format_actual_token_block(agg))
+        self.assertIn("Est. cost", joined)
+        self.assertIn("$12.35", joined)
+        self.assertIn("1,235 AI credits", joined)
+
+    def test_est_cost_line_absent_without_estimate(self):
+        joined = "\n".join(L._format_actual_token_block(self._agg(inp=100, out=50)))
+        self.assertNotIn("Est. cost", joined)
+        self.assertNotIn("Unpriced turns", joined)
+
+    def test_unpriced_turns_line_shown(self):
+        agg = self._agg(inp=100)
+        agg["unpriced_turns"] = 3
+        joined = "\n".join(L._format_actual_token_block(agg))
+        self.assertIn("Unpriced turns", joined)
 
     def test_percentages_sum_to_100(self):
         # Verify that the four % values written into the block sum to 100.0%
