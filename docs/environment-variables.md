@@ -27,7 +27,7 @@ LM Studio runs up to **4 requests in parallel** by default (the per-model **Max 
 
 | What happened | What you see |
 | --- | --- |
-| A request timed out (LM Studio reachable, but busy) | `Error: LM Studio request timed out after Ns (...) -- LM Studio is reachable but may be busy with other requests`; with `preserve_sections`, if *every* request timed out, a `[LM Studio timed out on every request ...]` prefix |
+| A request timed out (LM Studio busy or unreachable) | `Error: LM Studio request timed out after Ns (...) -- LM Studio may be busy with other requests or unreachable`; with `preserve_sections`, if *every* request timed out, a `[LM Studio timed out on every request ...]` prefix |
 | Connection refused, model not found, or any other failure | `Error: LM Studio request failed (...) -- check it's still running`; with `preserve_sections`, `[LM Studio appears unreachable ...]` |
 
 To reduce timeouts, in order of preference:

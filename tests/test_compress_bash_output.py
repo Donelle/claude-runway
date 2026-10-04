@@ -519,7 +519,7 @@ class TimeoutErrorFlowsIntoTheWasntCompressedNote(unittest.TestCase):
     def test_timeout_wording_is_in_the_note(self):
         message = (
             "Error: LM Studio request timed out after 60s (chunk 1/2) -- LM Studio is "
-            "reachable but may be busy with other requests; see "
+            "may be busy with other requests or unreachable; see "
             "CLAUDE_RUNWAY_LMSTUDIO_TIMEOUT_SECONDS."
         )
         buf = io.StringIO()

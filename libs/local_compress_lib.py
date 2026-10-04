@@ -1419,7 +1419,7 @@ def _request_failed_message(where: str, kind: Optional[str], base_url: Optional[
     if kind == "timeout":
         return (
             f"Error: LM Studio request timed out after {resolve_request_timeout():g}s "
-            f"{where} -- LM Studio is reachable but may be busy with other requests; "
+            f"{where} -- LM Studio may be busy with other requests or unreachable; "
             f"see CLAUDE_RUNWAY_LMSTUDIO_TIMEOUT_SECONDS."
         )
     return (
@@ -1781,6 +1781,10 @@ async def _compress_each_section(text, focus, oai_client, model, base_url, prese
     # Why each failed request failed (issue #368), so an outage made up ENTIRELY
     # of timeouts (a busy LM Studio) is not reported as "appears unreachable".
     failure_kinds: list = []
+    # A prose run in a mixed section got a live answer (empty or NOT RELEVANT)
+    # that falls back uncounted: it proves LM Studio answered, so the all-timed-out
+    # message must not fire even when a sibling run timed out.
+    live_fallback_seen = False
 
     for i, (heading, body) in enumerate(sections, 1):
         if ctx is not None:
@@ -1825,6 +1829,7 @@ async def _compress_each_section(text, focus, oai_client, model, base_url, prese
                 stripped = raw.strip()
                 if not stripped or "NOT RELEVANT" in stripped.upper():
                     run_parts.append(run_text)
+                    live_fallback_seen = True
                     continue
                 # Preserve any leading blank lines from run_text: they are
                 # structural separators attached to this run by
@@ -1959,13 +1964,14 @@ async def _compress_each_section(text, focus, oai_client, model, base_url, prese
         and not_relevant_count == 0
         and empty_response_count == 0
         and request_failed_count > 0
+        and not live_fallback_seen
     ):
         if failure_kinds and all(k == "timeout" for k in failure_kinds):
             # Every failed request timed out: LM Studio answered but was too
             # busy to finish in time. Not an outage -- and a different prefix
             # (not "appears unreachable") so callers/readers aren't misled.
             result = (
-                f"{_ALL_TIMED_OUT_PREFIX} -- LM Studio is reachable but may be busy; "
+                f"{_ALL_TIMED_OUT_PREFIX} -- LM Studio may be busy or unreachable; "
                 f"no section was compressed; original content preserved]\n\n{result}"
             )
         else:
