@@ -469,24 +469,18 @@ def _hit_point(point_id, score, weight=None):
 
 
 class NormalizeSimilarityTest(unittest.TestCase):
-    """PR #199 review: raw cosine similarity is rescaled to a nonnegative
-    [0, 1] domain BEFORE being multiplied by weight -- multiplying a
-    possibly-negative raw score by weight directly would invert the
-    documented weight semantics (see recall_points' own regression test for
-    the concrete reproduction)."""
+    """Issue #177/#272: raw cosine similarity is floored at 0 (no offset)
+    BEFORE being multiplied by weight -- multiplying a possibly-negative raw
+    score directly would invert the weight semantics, while a (raw+1)/2
+    rescale gives every realistic hit a 0.5 floor that makes weight>=2.0 a
+    ranking takeover."""
 
-    def test_maps_full_cosine_range_to_zero_one(self):
+    def test_floors_negatives_and_passes_nonnegatives_through(self):
         self.assertEqual(mb._normalize_similarity(-1.0), 0.0)
-        self.assertEqual(mb._normalize_similarity(0.0), 0.5)
+        self.assertEqual(mb._normalize_similarity(-0.1), 0.0)
+        self.assertEqual(mb._normalize_similarity(0.0), 0.0)
+        self.assertEqual(mb._normalize_similarity(0.3), 0.3)
         self.assertEqual(mb._normalize_similarity(1.0), 1.0)
-
-    def test_clamps_float_precision_spillover_outside_range(self):
-        # Not an expected Qdrant response shape, just defensive against
-        # float-precision spillover just outside the theoretical [-1, 1]
-        # bound (e.g. 1.0000000002) -- must not produce a value outside
-        # [0, 1] itself.
-        self.assertEqual(mb._normalize_similarity(1.0000000002), 1.0)
-        self.assertEqual(mb._normalize_similarity(-1.0000000002), 0.0)
 
 
 class RecallPointsWeightRerankingTest(_PatchRetryMixin, unittest.TestCase):
@@ -508,7 +502,7 @@ class RecallPointsWeightRerankingTest(_PatchRetryMixin, unittest.TestCase):
     def test_higher_weight_outranks_higher_raw_similarity(self):
         # "b" has the higher RAW similarity (0.9) but weight=1.0; "a" has
         # lower raw similarity (0.5) but a much higher weight (3.0) --
-        # effective_score (normalize(0.5)*3.0=2.25 vs normalize(0.9)*1.0=0.95)
+        # effective_score (0.5*3.0=1.5 vs 0.9*1.0=0.9)
         # must put "a" first, which raw-similarity-only ranking would never do.
         client = MagicMock()
         client.collection_exists.return_value = True
@@ -521,8 +515,8 @@ class RecallPointsWeightRerankingTest(_PatchRetryMixin, unittest.TestCase):
         provider = _make_provider()
         results = _run(mb.recall_points(client, provider, "col", "query", caller_repo="proj-a", limit=5))
         self.assertEqual([r["id"] for r in results], ["a", "b"])
-        self.assertEqual(results[0]["effective_score"], mb._normalize_similarity(0.5) * 3.0)
-        self.assertEqual(results[1]["effective_score"], mb._normalize_similarity(0.9) * 1.0)
+        self.assertEqual(results[0]["effective_score"], 0.5 * 3.0)
+        self.assertEqual(results[1]["effective_score"], 0.9 * 1.0)
 
     def test_missing_weight_on_a_hit_defaults_to_1_0(self):
         # A legacy point with no metadata.weight at all must default to
@@ -546,12 +540,9 @@ class RecallPointsWeightRerankingTest(_PatchRetryMixin, unittest.TestCase):
         # Multiplying a negative raw score directly by weight would let a
         # weight=0 "de-emphasized" hit (score=-0.8 -> -0.8*0=0) rank ABOVE a
         # normal weight=1 hit with a less-negative raw score (score=-0.1 ->
-        # -0.1*1=-0.1) -- exactly backwards from "de-emphasize to the
-        # bottom." Confirmed reproducible with these exact numbers before
-        # this fix. Rescaling to [0, 1] first closes it: weight=0 floors to
-        # EXACTLY 0 regardless of the raw score's sign, and the normal hit's
-        # positive effective_score (from its nonnegative rescaled
-        # similarity) correctly ranks above it.
+        # -0.1*1=-0.1). Flooring at 0 makes both score exactly 0; the tie is
+        # broken by raw score (issue #272), so "normal" (-0.1) still ranks
+        # above "stale-deemphasized" (-0.8).
         client = MagicMock()
         client.collection_exists.return_value = True
         response = MagicMock()
@@ -564,7 +555,87 @@ class RecallPointsWeightRerankingTest(_PatchRetryMixin, unittest.TestCase):
         results = _run(mb.recall_points(client, provider, "col", "query", caller_repo="proj-a"))
         self.assertEqual([r["id"] for r in results], ["normal", "stale-deemphasized"])
         self.assertEqual(results[1]["effective_score"], 0.0)
-        self.assertGreater(results[0]["effective_score"], results[1]["effective_score"])
+
+    def test_weight_zero_ranks_below_positive_similarity_default_hit(self):
+        client = MagicMock()
+        client.collection_exists.return_value = True
+        response = MagicMock()
+        response.points = [
+            _hit_point("stale", score=0.95, weight=0.0),
+            _hit_point("normal", score=0.05, weight=1.0),
+        ]
+        client.query_points.return_value = response
+        results = _run(mb.recall_points(client, _make_provider(), "col", "query", caller_repo="proj-a"))
+        self.assertEqual([r["id"] for r in results], ["normal", "stale"])
+
+    def test_weight_zero_is_last_even_against_negative_similarity_tie(self):
+        # PR #359 review: both score effective 0; raw-score tie-break alone
+        # would put the weight=0 hit (raw 0.95) above the default hit (-0.1).
+        client = MagicMock()
+        client.collection_exists.return_value = True
+        response = MagicMock()
+        response.points = [
+            _hit_point("stale", score=0.95, weight=0.0),
+            _hit_point("neg-default", score=-0.1, weight=1.0),
+        ]
+        client.query_points.return_value = response
+        results = _run(mb.recall_points(client, _make_provider(), "col", "query", caller_repo="proj-a"))
+        self.assertEqual([r["id"] for r in results], ["neg-default", "stale"])
+
+    def test_default_weight_hits_keep_plain_similarity_order_including_negatives(self):
+        # Constraint from #272: default-weight ordering must not shift. All
+        # negative scores floor to effective 0, so the raw-score tie-break
+        # has to preserve their relative order.
+        client = MagicMock()
+        client.collection_exists.return_value = True
+        response = MagicMock()
+        response.points = [
+            _hit_point("neg-low", score=-0.7, weight=None),
+            _hit_point("pos", score=0.2, weight=1.0),
+            _hit_point("neg-high", score=-0.1, weight=1.0),
+        ]
+        client.query_points.return_value = response
+        results = _run(mb.recall_points(client, _make_provider(), "col", "query", caller_repo="proj-a"))
+        self.assertEqual([r["id"] for r in results], ["pos", "neg-high", "neg-low"])
+
+    def test_high_weight_low_similarity_does_not_beat_high_similarity_default(self):
+        # Issue #272 regression: under the old (raw+1)/2 rescale,
+        # weight=2.0/raw=0.1 scored 2.0*0.55=1.1 and beat weight=1.0/raw=0.9
+        # (0.95). Now it is 0.2 vs 0.9.
+        client = MagicMock()
+        client.collection_exists.return_value = True
+        response = MagicMock()
+        response.points = [
+            _hit_point("relevant", score=0.9, weight=1.0),
+            _hit_point("boosted-irrelevant", score=0.1, weight=2.0),
+            _hit_point("unrelated-boosted", score=0.0, weight=2.0),
+        ]
+        client.query_points.return_value = response
+        results = _run(mb.recall_points(client, _make_provider(), "col", "query", caller_repo="proj-a"))
+        self.assertEqual([r["id"] for r in results], ["relevant", "boosted-irrelevant", "unrelated-boosted"])
+        self.assertEqual(results[2]["effective_score"], 0.0)
+
+    def test_weight_is_a_boost_among_comparable_similarity(self):
+        client = MagicMock()
+        client.collection_exists.return_value = True
+        response = MagicMock()
+        response.points = [
+            _hit_point("plain", score=0.80, weight=1.0),
+            _hit_point("boosted", score=0.70, weight=1.5),
+        ]
+        client.query_points.return_value = response
+        results = _run(mb.recall_points(client, _make_provider(), "col", "query", caller_repo="proj-a"))
+        self.assertEqual([r["id"] for r in results], ["boosted", "plain"])
+
+    def test_score_field_stays_raw_similarity(self):
+        client = MagicMock()
+        client.collection_exists.return_value = True
+        response = MagicMock()
+        response.points = [_hit_point("n", score=-0.4, weight=1.0)]
+        client.query_points.return_value = response
+        results = _run(mb.recall_points(client, _make_provider(), "col", "query", caller_repo="proj-a"))
+        self.assertEqual(results[0]["score"], -0.4)
+        self.assertEqual(results[0]["effective_score"], 0.0)
 
     def test_truncates_reranked_results_to_limit(self):
         # More over-fetched candidates than `limit` -- final list must be

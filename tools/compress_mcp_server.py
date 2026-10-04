@@ -120,6 +120,7 @@ from local_compress_lib import (
     DEFAULT_BASE_URL,
     DEFAULT_CHUNK_CHARS,
     DEFAULT_FOCUS,
+    DEFAULT_WEB_FOCUS,  # defined in the lib so _looks_non_selective can see it
     compress as _compress_impl,
     derive_compact_label,
     estimate_tokens,
@@ -176,13 +177,6 @@ COMPACT_COLLECTION = os.environ.get("COMPACT_COLLECTION", "conversation-compacts
 # ("fast-bge-small-en") -- changing either here would silently orphan every
 # previously stored compact rather than erroring.
 COMPACT_EMBEDDING_MODEL = "BAAI/bge-small-en"
-
-DEFAULT_WEB_FOCUS = (
-    "Extract and summarize the information on this page most relevant to "
-    "what was asked. Preserve specific facts, numbers, names, dates, and "
-    "technical details verbatim where possible. Drop navigation, ads, and "
-    "boilerplate."
-)
 
 # Issue #39: fetch_url used to call requests.get() with no stream=True, no
 # Content-Length check, and no size cap of any kind -- resp.text/resp.content
@@ -602,7 +596,24 @@ async def fetch_url(
             raw_bytes = b"".join(chunks)
 
             encoding = resp.encoding
-            if not encoding:
+            # Issue #266: requests derives resp.encoding from the header
+            # alone, and for any text/* Content-Type WITHOUT a charset
+            # parameter it reports the RFC 2616 legacy default "ISO-8859-1"
+            # (confirmed live) rather than None. That is truthy, so the
+            # detection below was skipped for the most common real-world
+            # case -- a UTF-8 page sent as bare `text/html` with the charset
+            # only in <meta> -- and Latin-1 decoding (which never raises)
+            # silently turned every multi-byte sequence into mojibake.
+            # Invariant: the header's ISO-8859-1 is only trusted when the
+            # server EXPLICITLY declared a charset; otherwise it is requests'
+            # placeholder and is treated exactly like "no encoding known".
+            content_type = resp.headers.get("Content-Type", "") or ""
+            implicit_latin1 = (
+                bool(encoding)
+                and encoding.lower() == "iso-8859-1"
+                and "charset" not in content_type.lower()
+            )
+            if not encoding or implicit_latin1:
                 # PR #124 review (Copilot): a response with no Content-Type
                 # charset at all (resp.encoding is None) used to fall back,
                 # via resp.text, to apparent_encoding -- chardet/

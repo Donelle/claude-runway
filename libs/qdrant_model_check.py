@@ -46,8 +46,9 @@ def check_embedding_model_mismatch(
     recall/ensure_collection) is fine proceeding on an inconclusive result.
 
     `fail_closed=True` (PR #178 review, fourth and eighth passes) inverts that
-    for the two callers where it's wrong: `index_repo(reset=True)`'s and
-    `sync_repo`'s pre-delete checks. Each exists specifically to stop a
+    for the three callers where it's wrong: `index_repo(reset=True)`'s,
+    `sync_repo`'s, and `tools/ingest_to_qdrant.py --reset`'s (issue #265)
+    pre-delete checks. Each exists specifically to stop a
     destructive delete before it runs -- fail-open there meant an
     inconclusive check (a transient network error,
     retries exhausted, an unexpected response shape) was silently treated the

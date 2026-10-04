@@ -337,7 +337,7 @@ _EXACT_CMDS = (
     # Requested in a machine-readable form precisely because it gets parsed.
     r"jq|yq",
     # Version pins, where the digits are the entire payload.
-    r"pip\s+freeze|npm\s+ls",
+    r"pip\s+freeze|npm\s+(?:ls|list)",  # `list` is npm ls's documented alias (#268)
     # Encoded/parsed payloads: a summary is not decodable.
     r"base64|openssl|xxd|od",
 )
@@ -361,7 +361,9 @@ _EXACT_CMD_RE = re.compile(
 # them a case variant of help.
 _EXACT_FLAG_RE = re.compile(
     r"--porcelain\b|--json\b|--version\b|--query\b|--format[= ]"
-    r"|-o\s+(?i:json|tsv|yaml)\b|--output[= ](?i:json|tsv|yaml)\b|\|\s*jq\b"
+    # `-o json`, `-o=json` and `-ojson` are all accepted spellings (kubectl,
+    # az, ...) -- issue #268. The lookbehind keeps `--foo-ojson` from matching.
+    r"|(?<![\w-])-o[= ]?\s*(?i:json|tsv|yaml)\b|--output[= ](?i:json|tsv|yaml)\b|\|\s*jq\b"
     # `grep -c` / `grep -rc` etc. -- counting, where the number is the answer.
     r"|\bgrep\b[^|;&]*\s-\w*c(?:\s|$)"
     # A dry run's entire output IS the preview of exactly what would happen --
@@ -471,6 +473,18 @@ def _compile_extra_exact_patterns():
 _EXTRA_EXACT_PATTERNS = _compile_extra_exact_patterns()
 
 
+# Segment boundaries. Beyond the shell's own separators this also splits at
+# `$(` and a backtick (issue #268): `HASH=$(git rev-parse HEAD)` otherwise
+# reads as ONE segment whose leading-assignment sub-pattern swallows
+# `HASH=$(git` as a single token, stranding `rev-parse` at segment start and
+# silently losing the exemption for the most common way a hash gets captured.
+# Splitting there makes the wrapped command start its own segment, so it hits
+# the same start-anchored table as a bare one. Only these openers split -- a
+# bare `(` mid-segment does not, since `--filter "(id=1)"` would then expose a
+# fake `id=1` segment and add false positives.
+_SEGMENT_SPLIT_RE = re.compile(r"\|\||&&|\$\(|`|[;|\n]")
+
+
 def _is_exactness_critical(command: str) -> bool:
     """True if any segment of a (possibly compound) Bash command produces
     output whose value depends on being byte-exact.
@@ -481,8 +495,10 @@ def _is_exactness_critical(command: str) -> bool:
     """
     if not command or _FORCE_COMPRESS_RE.search(command):
         return False
-    for segment in re.split(r"\|\||&&|[;|\n]", command):
-        segment = segment.strip()
+    for segment in _SEGMENT_SPLIT_RE.split(command):
+        # A subshell `(git diff)` or group `{ git diff; }` leaves its opener
+        # glued to the front of the segment, which would defeat `^` anchoring.
+        segment = segment.strip().lstrip("({").strip()
         if not segment:
             continue
         if _EXACT_CMD_RE.match(segment) or _EXACT_FLAG_RE.search(segment):
