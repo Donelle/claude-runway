@@ -116,6 +116,7 @@ from mcp.server.mcpserver import MCPServer, Context
 from mcp_server_qdrant.embeddings.fastembed import FastEmbedProvider
 from qdrant_client import QdrantClient, models as qdrant_models
 
+from qdrant_ingest_lib import ensure_persistent_fastembed_cache
 from local_compress_lib import (
     DEFAULT_BASE_URL,
     DEFAULT_CHUNK_CHARS,
@@ -162,6 +163,11 @@ try:
 except ImportError:
     metrics_lib = None  # type: ignore[assignment]
     _METRICS_LIB_AVAILABLE = False
+
+# Must run before any FastEmbedProvider(...) construction (compact_store/
+# compact_find below) -- fastembed reads FASTEMBED_CACHE_PATH at construction
+# time, and its unset default is a wipeable OS temp dir (issue #77/#283).
+ensure_persistent_fastembed_cache()
 
 COMPACT_QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
 COMPACT_QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY")

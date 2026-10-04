@@ -30,6 +30,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "libs"))
 
 from doctor_lib import DoctorResult, run_doctor  # noqa: E402
+from version_lib import version_string  # noqa: E402
 
 
 def format_report(result: DoctorResult) -> str:
@@ -68,6 +69,7 @@ def format_report(result: DoctorResult) -> str:
 
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--version", action="version", version=version_string("claude-runway-doctor"))
     parser.add_argument("target_repo", help="Path to the project repo whose .mcp.json to check")
     return parser.parse_args(argv)
 

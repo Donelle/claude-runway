@@ -1,10 +1,15 @@
 [build-system]
-requires = ["setuptools>=68"]
+# setuptools-scm (issue #348): the package version is derived from the VCS
+# history instead of a hand-edited number, so every commit gets a distinct,
+# monotonically increasing version with no version-bump commit -- which this
+# repo's PR-only, linear-history ruleset on `main` would not let CI push anyway.
+requires = ["setuptools>=68", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-runway"
-version = "0.1.0"
+# Not hand-edited -- see [tool.setuptools_scm] below (issue #348).
+dynamic = ["version"]
 description = "Local-compute token savings for Claude Code: Qdrant codebase memory + LM Studio local compression."
 readme = "README.md"
 license = { text = "MIT" }
@@ -69,6 +74,18 @@ dependencies = [
     "trafilatura",
     "pathspec",
 ]
+
+[tool.setuptools_scm]
+# Issue #348: the repo carries a `v0.1.0` baseline tag (the last hand-set
+# version), so builds are `0.1.1.dev<commits-since-tag>+g<sha>` -- distinct on
+# every commit, increasing along `main`'s linear history, and above the old
+# static 0.1.0 so upgrade checks see them as newer (Copilot review, PR #372).
+# Do NOT delete that tag: without any tag setuptools-scm falls back to
+# `0.0.1.devN`, which PEP 440 sorts BELOW 0.1.0. Later `vX.Y.Z` tags simply
+# move the baseline forward. `fallback_version` only applies to builds with NO VCS metadata at all (e.g.
+# a source tarball) -- `uv tool install <repo url>` builds from a real clone,
+# so it gets the real derived version.
+fallback_version = "0.0.0+unknown"
 
 [tool.ruff.lint]
 # Starting narrow (issue #297) -- pyflakes (F) + flake8-bugbear (B). More

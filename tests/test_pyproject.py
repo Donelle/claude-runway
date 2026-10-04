@@ -69,6 +69,17 @@ class PyprojectTomlIsWellFormed(unittest.TestCase):
         self.assertEqual(scripts.get("claude-runway-setup"), "claude_runway:setup_main")
         self.assertEqual(scripts.get("claude-runway-doctor"), "claude_runway:doctor_main")
 
+    def test_version_is_derived_from_the_repo_not_hardcoded(self):
+        # Issue #348: a hand-edited `version = "0.1.0"` made all 200+ commits
+        # build as the identical version. Pin that it's dynamic, that
+        # setuptools-scm is what supplies it, and that a no-VCS-metadata
+        # build still gets a (clearly-labelled) fallback instead of failing.
+        project = self.data["project"]
+        self.assertNotIn("version", project)
+        self.assertIn("version", project["dynamic"])
+        self.assertTrue(any(r.startswith("setuptools-scm") for r in self.data["build-system"]["requires"]))
+        self.assertIn("fallback_version", self.data["tool"]["setuptools_scm"])
+
     def test_claude_runway_shim_is_the_only_declared_package(self):
         # Issue #206: libs/tools/templates/hooks/skills moved OUT of
         # `[tool.setuptools] packages` (previously all five, plus this one
@@ -184,6 +195,29 @@ class BuiltWheelHasExpectedDataLayout(unittest.TestCase):
         # "/data/src/" suffix rather than hardcoding the version, so this
         # doesn't need updating every version bump.
         return [n for n in self.names if ".data/data/src/" in n]
+
+    def test_wheel_version_is_derived_not_the_old_hardcoded_0_1_0(self):
+        # Issue #348: the wheel's own filename/metadata carries the
+        # setuptools-scm version. In a checkout it must be the git-derived
+        # one; only a build with no VCS metadata may use the fallback.
+        version = os.path.basename(self.whl_path).split("-")[1]
+        self.assertNotEqual(version, "0.1.0")
+        # Copilot review (PR #372): installs previously reported 0.1.0, and
+        # PEP 440 sorts `0.0.1.devN`/`0.1.devN` BELOW that -- version-based
+        # upgrade checks would treat the first SCM builds as older. The
+        # `v0.1.0` baseline tag on main makes derived versions 0.1.1.devN.
+        try:
+            from packaging.version import Version
+        except ImportError:
+            Version = None
+        if Version is not None and os.path.exists(os.path.join(REPO_ROOT, ".git")) and version != "0.0.0+unknown":
+            self.assertGreater(Version(version), Version("0.1.0"), "derived version must sort above the old static 0.1.0 (is the v0.1.0 baseline tag fetched?)")
+        self.assertTrue(
+            os.path.exists(os.path.join(REPO_ROOT, ".git")) or version == "0.0.0+unknown",
+            f"unexpected version {version!r} for a build without a checkout",
+        )
+        if os.path.exists(os.path.join(REPO_ROOT, ".git")):
+            self.assertNotEqual(version, "0.0.0+unknown", "built in a checkout but got the no-VCS fallback")
 
     def test_claude_runway_shim_ships_as_a_real_package_not_data(self):
         self.assertIn("claude_runway/__init__.py", self.names)

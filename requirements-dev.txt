@@ -27,5 +27,9 @@ pytest
 # creating a fresh isolated env per invocation (which would otherwise need
 # network access on every test run just to re-fetch setuptools).
 setuptools>=68
+# Issue #348: pyproject.toml's version is derived from the repo history by
+# setuptools-scm, so the same `--no-isolation` build needs it installed here
+# too (an isolated build would fetch it itself, but this one cannot).
+setuptools-scm>=8
 wheel
 build
