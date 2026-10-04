@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 
 from local_compress_lib import (  # noqa: E402
     DEFAULT_FOCUS,
+    DEFAULT_WEB_FOCUS,
     _compression_cache,
     _compression_cache_key,
     _find_first_heading_boundary,
@@ -247,6 +248,30 @@ class PositionalFocus(unittest.TestCase):
         for focus in ["how auth works", "chocolate cake recipes", DEFAULT_FOCUS]:
             with self.subTest(focus=focus):
                 self.assertFalse(_looks_positional(focus))
+
+    def test_positional_phrasings_with_verbs_and_doc_nouns(self):
+        for focus in ["Please summarize the abstract.", "Give me the intro",
+                      "summarize the beginning of the document",
+                      "the start of this page", "the lead section of the article",
+                      "the TL;DR"]:
+            with self.subTest(focus=focus):
+                self.assertTrue(_looks_positional(focus))
+
+    def test_topical_focus_containing_positional_word_is_not_positional(self):
+        """Issue #299: substring matching treated these as positional and
+        truncated the document to its first ~4000 chars."""
+        for focus in ["how the abstract base class is used",
+                      "what the introduction of retries changed",
+                      "where the start of the request is logged",
+                      "the intro of the new auth flow and its tokens",
+                      "beginning of", "lead", "the lead", "lead exposure"]:
+            with self.subTest(focus=focus):
+                self.assertFalse(_looks_positional(focus))
+
+    def test_default_web_focus_is_non_selective(self):
+        """Issue #299: fetch_url's own default must skip the classifier too."""
+        self.assertTrue(_looks_non_selective(DEFAULT_WEB_FOCUS))
+        self.assertFalse(_looks_positional(DEFAULT_WEB_FOCUS))
 
     def test_positional_focuses_are_still_selective(self):
         """A positional ask names a specific part, so it must NOT take the
@@ -1979,6 +2004,104 @@ class ClientOptionalTimeout(unittest.TestCase):
         self.assertEqual(c.timeout, 2.5)
 
 
+class ClientIsAlwaysBounded(unittest.TestCase):
+    """Issue #301: client() used to pass neither timeout nor max_retries, so
+    the OpenAI SDK's own defaults (600s read timeout, 2 retries) let a
+    reachable-but-hung LM Studio stall the PostToolUse hook for ~30 minutes.
+    Invariant under test: every client is built with a finite timeout and
+    max_retries=0, whichever way the timeout is supplied."""
+
+    ENV = "CLAUDE_RUNWAY_LMSTUDIO_TIMEOUT_SECONDS"
+
+    def setUp(self):
+        self._saved = os.environ.pop(self.ENV, None)
+
+    def tearDown(self):
+        os.environ.pop(self.ENV, None)
+        if self._saved is not None:
+            os.environ[self.ENV] = self._saved
+
+    def test_default_client_has_bounded_timeout_and_no_retries(self):
+        import local_compress_lib as L
+        c = L.client("http://localhost:1234/v1")
+        self.assertEqual(c.timeout, L.DEFAULT_REQUEST_TIMEOUT_SECONDS)
+        self.assertEqual(c.max_retries, 0)
+        # Guard against silently regressing toward the SDK's 600s default.
+        self.assertLess(c.timeout, 600)
+
+    def test_explicit_timeout_client_also_has_no_retries(self):
+        import local_compress_lib as L
+        c = L.client("http://localhost:1234/v1", timeout=2.5)
+        self.assertEqual(c.timeout, 2.5)
+        self.assertEqual(c.max_retries, 0)
+
+    def test_invalid_explicit_timeout_falls_back_to_bounded_default(self):
+        """PR #361 review: the explicit-arg path must apply the same
+        finite-and-positive rule as the env var, not bypass it."""
+        import local_compress_lib as L
+        for bad in (float("inf"), float("nan"), 0, -1):
+            with self.subTest(value=bad):
+                c = L.client("http://localhost:1234/v1", timeout=bad)
+                self.assertEqual(c.timeout, L.DEFAULT_REQUEST_TIMEOUT_SECONDS)
+                self.assertEqual(c.max_retries, 0)
+
+    def test_env_var_overrides_default_timeout(self):
+        import local_compress_lib as L
+        os.environ[self.ENV] = " 12.5 "
+        self.assertEqual(L.client("http://localhost:1234/v1").timeout, 12.5)
+
+    def test_invalid_env_values_fall_back_to_default(self):
+        import local_compress_lib as L
+        for bad in ("", "abc", "0", "-5", "inf", "nan"):
+            with self.subTest(value=bad):
+                os.environ[self.ENV] = bad
+                self.assertEqual(L.resolve_request_timeout(), L.DEFAULT_REQUEST_TIMEOUT_SECONDS)
+
+    def test_hung_server_fails_within_the_timeout_budget(self):
+        """End to end against a socket that accepts but never responds: the
+        real complete() must return None (fail open) within the configured
+        budget rather than blocking. Bounded by an outer join timeout so a
+        regression fails this test instead of hanging the suite."""
+        import socket
+        import threading
+        import time
+        import local_compress_lib as L
+
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(5)
+        conns = []
+
+        def accept_loop():
+            while True:
+                try:
+                    conns.append(srv.accept()[0])
+                except OSError:
+                    return
+
+        threading.Thread(target=accept_loop, daemon=True).start()
+        os.environ[self.ENV] = "1"
+        result = {}
+
+        def call():
+            start = time.monotonic()
+            result["out"] = L.complete(L.client(f"http://127.0.0.1:{srv.getsockname()[1]}/v1"), "m", "s", "x")
+            result["elapsed"] = time.monotonic() - start
+
+        t = threading.Thread(target=call, daemon=True)
+        try:
+            t.start()
+            t.join(timeout=10)
+            self.assertFalse(t.is_alive(), "complete() hung past the configured timeout")
+            self.assertIsNone(result["out"])
+            # With retries on, 1s x 3 attempts (plus backoff) would exceed this.
+            self.assertLess(result["elapsed"], 3)
+        finally:
+            srv.close()
+            for c in conns:
+                c.close()
+
+
 class ResolveModelMultipleModelsMessaging(unittest.TestCase):
     """Issue #296 item 3: resolve_model's "multiple models" error must not
     claim models are LOADED when fetch_loaded_models had to fall back to
@@ -2863,6 +2986,189 @@ class WholeTxtMapReducePath(unittest.TestCase):
             "[RESULT]", result,
             "the restored line must be tagged so it is distinguishable from model output",
         )
+
+
+class TimeoutVersusConnectionFailureReporting(unittest.TestCase):
+    """Issue #368: a request that TIMED OUT (LM Studio reachable but busy -- it
+    runs a limited number of requests in parallel and queues the rest) must not
+    be reported as "check it's still running", and an outage made up entirely of
+    timeouts must not read as "appears unreachable". Drives the REAL
+    complete()/classify_relevant() against a fake OpenAI client that raises (or
+    returns) on demand, so the failure reason really travels the whole way."""
+
+    def setUp(self):
+        clear_compression_cache()
+
+    def tearDown(self):
+        clear_compression_cache()
+
+    @staticmethod
+    def _timeout():
+        import httpx
+        import openai
+        return openai.APITimeoutError(request=httpx.Request("POST", "http://localhost:1234/v1"))
+
+    @staticmethod
+    def _conn_error():
+        import httpx
+        import openai
+        return openai.APIConnectionError(request=httpx.Request("POST", "http://localhost:1234/v1"))
+
+    @staticmethod
+    def _ok(text="summary"):
+        import types
+        return types.SimpleNamespace(
+            choices=[types.SimpleNamespace(message=types.SimpleNamespace(content=text))]
+        )
+
+    @staticmethod
+    def _fake_client(outcomes):
+        """Client whose Nth create() call yields outcomes[N] (the last one
+        repeats): an Exception instance is raised, anything else is returned."""
+        import threading
+        import types
+        lock = threading.Lock()
+        state = {"n": 0}
+
+        def create(**kwargs):
+            with lock:
+                i = min(state["n"], len(outcomes) - 1)
+                state["n"] += 1
+            outcome = outcomes[i]
+            if callable(outcome):  # decide from the request itself
+                outcome = outcome(kwargs)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        return types.SimpleNamespace(
+            chat=types.SimpleNamespace(completions=types.SimpleNamespace(create=create))
+        )
+
+    def _compress(self, outcomes, text, **kwargs):
+        import asyncio
+        import local_compress_lib as L
+        real_resolve, real_client = L.resolve_model, L.client
+        L.resolve_model = lambda m, b: ("stub-model", None)
+        L.client = lambda b: self._fake_client(outcomes)
+        try:
+            return asyncio.run(L.compress(text, skip_if_under_chars=0, **kwargs))
+        finally:
+            L.resolve_model, L.client = real_resolve, real_client
+
+    # -- complete() / take_failure_kind() ------------------------------------
+
+    def test_complete_records_timeout_vs_other_and_clears_on_read(self):
+        import local_compress_lib as L
+        client = self._fake_client([self._timeout()])
+        self.assertIsNone(L.complete(client, "m", "sys", "content"))
+        self.assertEqual(L.take_failure_kind(), "timeout")
+        self.assertIsNone(L.take_failure_kind(), "reading must clear the reason")
+
+        client = self._fake_client([self._conn_error()])
+        self.assertIsNone(L.complete(client, "m", "sys", "content"))
+        self.assertEqual(
+            L.take_failure_kind(), "other",
+            "APITimeoutError subclasses APIConnectionError; a plain connection "
+            "error must NOT be classified as a timeout",
+        )
+
+    def test_success_clears_a_stale_reason(self):
+        import local_compress_lib as L
+        L.complete(self._fake_client([self._timeout()]), "m", "s", "c")
+        self.assertEqual(L.complete(self._fake_client([self._ok("hi")]), "m", "s", "c"), "hi")
+        self.assertIsNone(L.take_failure_kind())
+
+    # -- the three error messages ---------------------------------------------
+
+    def test_extraction_timeout_message(self):
+        out = self._compress([self._timeout()], "x" * 300, chunk_chars=1000)
+        self.assertTrue(out.startswith("Error:"), out)
+        self.assertIn("timed out after", out)
+        self.assertIn("(chunk 1/1)", out)
+        self.assertIn("may be busy", out)
+        self.assertNotIn("check it's still running", out)
+
+    def test_extraction_connection_error_keeps_original_wording(self):
+        out = self._compress([self._conn_error()], "x" * 300, chunk_chars=1000)
+        self.assertIn("LM Studio request failed (chunk 1/1) -- check it's still running at", out)
+        self.assertNotIn("timed out", out)
+
+    def test_reduce_timeout_and_connection_messages(self):
+        # Every extraction call succeeds; only the combine call fails. Keyed on
+        # the request's own system prompt so it doesn't depend on how many
+        # chunks the splitter happens to produce.
+        text = "A" * 100 + " " + "B" * 100 + " " + "C" * 100
+
+        def fail_on_combine(exc):
+            def outcome(kwargs):
+                system = kwargs["messages"][0]["content"]
+                return exc if "combining partial summaries" in system else self._ok()
+            return outcome
+
+        out = self._compress([fail_on_combine(self._timeout())], text, chunk_chars=100)
+        self.assertIn("timed out after", out)
+        self.assertIn("while combining chunk summaries", out)
+        out = self._compress([fail_on_combine(self._conn_error())], text, chunk_chars=100)
+        self.assertIn(
+            "LM Studio request failed while combining chunk summaries -- check it's still running", out,
+        )
+
+    def test_relevance_timeout_and_connection_messages(self):
+        # A selective focus runs the classifier first, concurrently on worker
+        # threads -- the reason must be captured on those threads.
+        text = "A" * 100 + " " + "B" * 100
+        out = self._compress([self._timeout()], text, focus="chocolate cake recipes", chunk_chars=100)
+        self.assertIn("timed out after", out)
+        self.assertIn("while checking relevance (chunk", out)
+        self.assertNotIn("check it's still running", out)
+        out = self._compress([self._conn_error()], text, focus="chocolate cake recipes", chunk_chars=100)
+        self.assertIn("LM Studio request failed while checking relevance (chunk", out)
+        self.assertIn("check it's still running", out)
+
+    def test_stubbed_complete_with_no_reason_keeps_original_wording(self):
+        import asyncio
+        import local_compress_lib as L
+        real = (L.complete, L.resolve_model, L.client)
+        L.complete = lambda *a, **k: None  # a stub never records a reason
+        L.resolve_model = lambda m, b: ("stub", None)
+        L.client = lambda b: object()
+        try:
+            out = asyncio.run(L.compress("x" * 300, skip_if_under_chars=0))
+        finally:
+            L.complete, L.resolve_model, L.client = real
+        self.assertIn("LM Studio request failed (chunk 1/1) -- check it's still running", out)
+
+    # -- the preserve_sections total-outage prefix ---------------------------
+
+    _SECTIONS = (
+        "## What we were working on\nNarrative prose about the work in progress here.\n\n"
+        "## Current state / progress\nMore narrative prose describing where things stand.\n"
+    )
+
+    def _sections(self, outcomes):
+        return self._compress(outcomes, self._SECTIONS, focus="handoff", preserve_sections=True)
+
+    def test_all_timeouts_is_not_reported_as_unreachable(self):
+        out = self._sections([self._timeout()])
+        self.assertTrue(out.startswith("[LM Studio timed out on every request"), out)
+        self.assertNotIn("appears unreachable", out)
+        self.assertIn("original content preserved", out)
+
+    def test_all_connection_failures_still_reported_as_unreachable(self):
+        out = self._sections([self._conn_error()])
+        self.assertTrue(out.startswith("[LM Studio appears unreachable"), out)
+
+    def test_mixed_timeout_and_connection_failures_stay_unreachable(self):
+        out = self._sections([self._timeout(), self._conn_error()])
+        self.assertTrue(out.startswith("[LM Studio appears unreachable"), out)
+
+    def test_all_timeouts_result_is_not_cached(self):
+        out = self._sections([self._timeout()])
+        self.assertTrue(out.startswith("[LM Studio timed out on every request"), out)
+        # LM Studio recovers: the same input must be retried, not served from cache.
+        out = self._sections([self._ok("compressed prose")])
+        self.assertTrue(out.startswith("[compressed"), out)
 
 
 if __name__ == "__main__":

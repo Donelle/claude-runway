@@ -81,7 +81,7 @@ MUST_SKIP = [
     ("gtk-app --help-all", "--help-all is still help output, so matching it is right"),
     # --- gh api (issue #190): structured REST/GraphQL data, never prose ---
     (
-        "gh api repos/CVNA-SandboxOrg/claude-runway/pulls/190/comments --paginate",
+        "gh api repos/Donelle/claude-runway/pulls/190/comments --paginate",
         "plain gh api call with no --jq/--json at all (my-gh-pr-feedback's shape)",
     ),
     (
@@ -90,7 +90,7 @@ MUST_SKIP = [
         "graphql body-fetch shape",
     ),
     (
-        'COMMENT_IDS=$(gh api repos/CVNA-SandboxOrg/claude-runway/pulls/190/comments '
+        'COMMENT_IDS=$(gh api repos/Donelle/claude-runway/pulls/190/comments '
         '--paginate --jq ".[] | select(.user.login != \\"me\\") | \\"comment:\\" + (.id|tostring)") '
         "|| FETCH_FAILED=1",
         "the real VAR=$(...) command-substitution shape used by my-gh-autowork's NEW_IDS diffing "
@@ -490,6 +490,29 @@ class MainFallsBackToGenericForNonFooterMcpTools(unittest.TestCase):
         # existing (unchanged) behavior, distinct from the fallback path's
         # "hook:<tool_name>" naming asserted above.
         self.assertEqual(args[1], "compress_file")
+
+
+class TimeoutErrorFlowsIntoTheWasntCompressedNote(unittest.TestCase):
+    """Issue #368: the hook embeds compress()'s "Error: ..." string verbatim, so
+    a timeout's "may be busy" wording must reach the user, not the misleading
+    "check it's still running"."""
+
+    def test_timeout_wording_is_in_the_note(self):
+        message = (
+            "Error: LM Studio request timed out after 60s (chunk 1/2) -- LM Studio is "
+            "reachable but may be busy with other requests; see "
+            "CLAUDE_RUNWAY_LMSTUDIO_TIMEOUT_SECONDS."
+        )
+        buf = io.StringIO()
+        with redirect_stdout(buf), self.assertRaises(SystemExit) as cm:
+            hook._finish_compression_outcome(
+                ("error", "x" * 5000, message), "Bash", "Bash", "sess-1", "/repos/my-project",
+            )
+        self.assertEqual(cm.exception.code, 0)
+        note = json.loads(buf.getvalue())["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("wasn't compressed", note)
+        self.assertIn("may be busy", note)
+        self.assertNotIn("check it's still running", note)
 
 
 class CompactFindMultiEntryIsNeverGenericallyCompressed(unittest.TestCase):

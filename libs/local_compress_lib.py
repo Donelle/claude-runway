@@ -13,12 +13,14 @@ when there's no MCP Context available (e.g. from the hook).
 import asyncio
 import hashlib
 import json
+import math
 import os
 import re
+import threading
 import urllib.request
 from typing import Optional, Tuple
 
-from openai import OpenAI
+from openai import APITimeoutError, OpenAI
 
 DEFAULT_BASE_URL = os.environ.get("CLAUDE_RUNWAY_LMSTUDIO_URL", "http://localhost:1234/v1")
 DEFAULT_MODEL = os.environ.get("CLAUDE_RUNWAY_LMSTUDIO_MODEL")  # intentionally no fallback -- see compress_mcp_server.py NOTE 2
@@ -93,6 +95,19 @@ DEFAULT_FOCUS = (
     "repetitive or boilerplate lines."
 )
 
+# fetch_url's own no-focus default. Defined here (not in compress_mcp_server)
+# so _looks_non_selective can recognize it without a circular import.
+DEFAULT_WEB_FOCUS = (
+    "Extract and summarize the information on this page most relevant to "
+    "what was asked. Preserve specific facts, numbers, names, dates, and "
+    "technical details verbatim where possible. Drop navigation, ads, and "
+    "boilerplate."
+)
+
+# Every "caller passed no focus" default. All are non-selective by
+# construction; see _looks_non_selective.
+_DEFAULT_FOCUSES = (DEFAULT_FOCUS, DEFAULT_WEB_FOCUS)
+
 NOT_RELEVANT_MARKER = "[NOT RELEVANT]"
 
 # Keyword-based, deterministic detection for positional focuses ("the lead
@@ -113,17 +128,51 @@ NOT_RELEVANT_MARKER = "[NOT RELEVANT]"
 # rather than hoping it uses position correctly. The position-aware
 # classifier remains in place as a secondary aid for positional phrasings
 # this list doesn't happen to catch.
+#
+# THE RULE FOR CLASSIFYING A FOCUS (one place, two callers: compress() and
+# anything going through it, including fetch_url and the PostToolUse hook):
+#   - non-selective: the whole normalized focus IS a generic/default phrase
+#     ("summarize this", DEFAULT_FOCUS, DEFAULT_WEB_FOCUS, empty). Skip the
+#     classifier; everything is in scope.
+#   - positional: the whole normalized focus IS a request for a named part by
+#     position ("the lead section", "summarize the abstract", "the beginning of
+#     the document"). Auto-truncate to the document's start.
+#   - selective: anything else; the classifier runs and filters.
+# Both "is" tests are WHOLE-STRING matches (after _normalize_focus plus the
+# leading-verb/article strip below), never substring: a positional word is
+# routinely part of a topical query ("how the abstract base class is used",
+# "what the introduction of retries changed") and substring matching silently
+# truncated those to the first ~4000 chars, discarding the answer (issue #299).
+# Same failure direction as _looks_non_selective's own docs describe: a
+# selective focus misread as a special one fails quietly and looks correct.
+# The cost of this strictness is that an unusual positional phrasing falls
+# through to the position-aware classifier, the documented secondary aid.
 _POSITIONAL_FOCUS_HINTS = (
-    "lead section", "lede", "introduction", "intro paragraph", "intro section",
-    "opening paragraph", "opening section", "beginning of", "first paragraph",
+    "lead section", "lede", "introduction", "intro", "intro paragraph",
+    "intro section", "opening paragraph", "opening section", "first paragraph",
     "first section", "first few paragraphs", "abstract", "tl;dr", "tldr",
-    "top of the page", "top of the document", "start of the",
+)
+# Phrases that only make sense with a document noun after them.
+_POSITIONAL_ANCHOR_HINTS = ("beginning", "start", "top")
+_DOC_NOUNS = "document|doc|page|article|file|output|text|log|readme"
+_POSITIONAL_LEADING_VERBS = (
+    r"(?:(?:summari[sz]e|give me|show me|show|extract|return|get|read|just)\s+)*"
+)
+_POSITIONAL_RE = re.compile(
+    r"^" + _POSITIONAL_LEADING_VERBS + r"(?:the\s+)?(?:"
+    + "|".join(re.escape(h) for h in _POSITIONAL_FOCUS_HINTS)
+    + r")(?:\s+(?:of|from|in)\s+(?:the|this)\s+(?:" + _DOC_NOUNS + r"))?$"
+    + r"|^" + _POSITIONAL_LEADING_VERBS + r"(?:the\s+)?(?:"
+    + "|".join(_POSITIONAL_ANCHOR_HINTS)
+    + r")\s+(?:of\s+)?(?:the|this)\s+(?:" + _DOC_NOUNS + r")$"
 )
 
 
 def _looks_positional(focus: str) -> bool:
-    lowered = focus.lower()
-    return any(hint in lowered for hint in _POSITIONAL_FOCUS_HINTS)
+    """True if the WHOLE focus asks for a named part by position. See the rule
+    block above; a topical query merely containing a positional word is not
+    positional."""
+    return bool(_POSITIONAL_RE.match(_normalize_focus(focus)))
 
 
 # Non-selective focuses: "compress all of this," not "find the part about X."
@@ -196,19 +245,24 @@ def _normalize_focus(focus: str) -> str:
     return re.sub(r"^(?:(?:please|just|can you|could you)\s+)+", "", normalized).strip()
 
 
+_NORMALIZED_DEFAULT_FOCUSES = frozenset(_normalize_focus(f) for f in _DEFAULT_FOCUSES)
+
+
 def _looks_non_selective(focus: str) -> bool:
     """True if `focus` asks for the whole thing compressed rather than for a
     specific part of it -- in which case classification is skipped entirely.
 
-    DEFAULT_FOCUS is matched explicitly rather than by phrase, since it's the
-    value every caller gets when they pass no focus at all, it's by
-    construction non-selective, and it's the only focus the PostToolUse hook
-    ever sends -- so the hook path stays covered regardless of how
-    conservative the phrase set below is."""
+    Every default-focus constant (DEFAULT_FOCUS, DEFAULT_WEB_FOCUS) is matched
+    explicitly rather than by phrase, since each is the value a caller gets
+    when they pass no focus at all and is by construction non-selective --
+    so those paths stay covered regardless of how conservative the phrase set
+    is. Any new default focus constant MUST be added to _DEFAULT_FOCUSES
+    (issue #299: DEFAULT_WEB_FOCUS was missed, so every no-focus fetch_url
+    ran the NO-biased classifier)."""
     if not focus or not focus.strip():
         return True
     normalized = _normalize_focus(focus)
-    if normalized == _normalize_focus(DEFAULT_FOCUS):
+    if normalized in _NORMALIZED_DEFAULT_FOCUSES:
         return True
     return normalized in _GENERIC_FOCUS_PHRASES
 
@@ -440,22 +494,72 @@ def section_has_mixed_runs(body: str) -> bool:
     return has_prose and has_bullets
 
 
+# Per-request budget for every LM Studio completion call, in seconds. The
+# OpenAI SDK's own defaults are a 600s read timeout plus 2 automatic retries,
+# i.e. a reachable-but-hung LM Studio (model loaded but stuck) could block one
+# call for ~30 minutes. That matters most for the PostToolUse hook, which runs
+# synchronously in Claude Code's own tool-result path, so a hang there stalls
+# the whole session, not just one tool call (issue #301).
+#
+# The invariant, stated once: every client this module builds is BOUNDED -- a
+# finite timeout and max_retries=0. A non-streaming completion only returns
+# once generation finishes, so `timeout` here is effectively the total budget
+# for one request. Retries are off because a local server that timed out or
+# refused will not be fixed by immediately asking again (it would only
+# multiply the stall), and every caller already fails open on an error.
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 60.0
+REQUEST_TIMEOUT_ENV_VAR = "CLAUDE_RUNWAY_LMSTUDIO_TIMEOUT_SECONDS"
+_CLIENT_MAX_RETRIES = 0
+
+
+def resolve_request_timeout() -> float:
+    """
+    Returns the per-request timeout in seconds: CLAUDE_RUNWAY_LMSTUDIO_TIMEOUT_SECONDS
+    if it parses as a finite number > 0, else DEFAULT_REQUEST_TIMEOUT_SECONDS.
+    Read at call time (not import time) so a test or long-lived MCP server
+    process sees the current environment. An unset, blank, non-numeric,
+    non-finite or non-positive value silently falls back to the default
+    rather than raising: this runs inside the hook, where a bad env value
+    must never crash it (and 0/negative/inf/nan would otherwise mean
+    "no real bound" to the SDK, defeating the point of this setting).
+    """
+    raw = os.environ.get(REQUEST_TIMEOUT_ENV_VAR, "")
+    try:
+        value = float(raw.strip())
+    except ValueError:
+        return DEFAULT_REQUEST_TIMEOUT_SECONDS
+    return value if _is_bounded_timeout(value) else DEFAULT_REQUEST_TIMEOUT_SECONDS
+
+
+def _is_bounded_timeout(value: float) -> bool:
+    """
+    The single definition of a usable timeout, applied to BOTH the env var
+    and an explicit `client(timeout=...)` argument so neither path can
+    smuggle in an unbounded client (PR #361 review): finite and > 0. The
+    SDK would treat inf as no bound, and 0/negative/nan as broken or
+    immediate-fail.
+    """
+    return math.isfinite(value) and value > 0
+
+
 def client(base_url: Optional[str], timeout: Optional[float] = None) -> OpenAI:
     """
-    `timeout` is optional and omitted from the OpenAI() call entirely when
-    not given (rather than passed through as `timeout=None`, which the
-    OpenAI SDK would treat as "wait forever" -- the opposite of "use the
-    SDK's own default"). This keeps every existing single-arg `client(b)`
-    call site (the real compress() completion path, and test stand-ins
-    across this repo that patch `client` with a one-arg lambda) behaved
-    identically; only fetch_loaded_models' /v1 fallback below (PR #318
-    review) passes an explicit timeout, so a short-timeout caller like the
-    WebFetch redirect hook's reachability check doesn't silently fall back
-    to a long-hanging default timeout.
+    Builds the bounded OpenAI client described above. `timeout` overrides
+    the resolved per-request budget for a caller that needs a shorter one
+    (fetch_loaded_models' /v1 fallback, PR #318 review, passes its short
+    probe timeout so the WebFetch redirect hook's reachability check doesn't
+    fall back to a long default); when omitted, resolve_request_timeout()
+    supplies it. An explicit value that isn't finite and > 0 is ignored in
+    favor of the resolved budget (same rule as the env var). max_retries is always 0, including for that short-timeout
+    caller. The one-arg `client(b)` signature stays valid because test
+    stand-ins across this repo patch `client` with a one-arg lambda.
     """
-    if timeout is not None:
-        return OpenAI(base_url=base_url or DEFAULT_BASE_URL, api_key="lm-studio", timeout=timeout)
-    return OpenAI(base_url=base_url or DEFAULT_BASE_URL, api_key="lm-studio")
+    return OpenAI(
+        base_url=base_url or DEFAULT_BASE_URL,
+        api_key="lm-studio",
+        timeout=timeout if timeout is not None and _is_bounded_timeout(timeout) else resolve_request_timeout(),
+        max_retries=_CLIENT_MAX_RETRIES,
+    )
 
 
 def split_sections(text: str):
@@ -1241,13 +1345,45 @@ def append_trailing_summary_if_missing(original: str, summary: str) -> str:
     return f"{summary}\n\n[RESULT] {line}"
 
 
+# Why the most recent complete() call on THIS thread failed ("timeout" or
+# "other"), or None. complete() deliberately keeps its Optional[str] contract
+# (many callers and tests rely on None meaning "the request failed"), so the
+# reason travels on this side channel instead of widening the return type
+# (issue #368). Thread-local because the relevance classifier runs complete()
+# in executor threads concurrently; read it with take_failure_kind() on the
+# same thread that made the call.
+_failure_state = threading.local()
+
+
+def take_failure_kind() -> Optional[str]:
+    """Return and clear why this thread's last complete() call failed.
+
+    "timeout" -- the request exceeded the per-request timeout (LM Studio is
+    reachable but busy, e.g. its parallel-request slots are all taken and the
+    request sat in its queue); "other" -- anything else (connection refused,
+    model not found, ...); None -- no reason was recorded, e.g. complete() was
+    replaced by a test stub, or nothing failed. Callers must treat None as
+    "unknown" and fall back to the generic failure wording. Clearing on read
+    means a stale reason can never leak into a later, unrelated failure.
+    """
+    kind = getattr(_failure_state, "kind", None)
+    _failure_state.kind = None
+    return kind
+
+
 def complete(oai_client: OpenAI, model: str, system: str, content: str) -> Optional[str]:
     """Returns the completion text, or None if the request failed for any reason
     (connection error, model not found, etc.) -- callers must check for None
     rather than assume this always succeeds just because resolve_model did.
     resolve_model only validates connectivity when it has to auto-detect; an
     explicit model= or CLAUDE_RUNWAY_LMSTUDIO_MODEL skips that check entirely, so
-    a dead LM Studio server is only caught here, at the actual request."""
+    a dead LM Studio server is only caught here, at the actual request.
+
+    On failure the reason is also recorded for take_failure_kind() (issue
+    #368): APITimeoutError is a SUBCLASS of APIConnectionError in the openai
+    SDK, so it is tested for explicitly rather than inferred from "not a
+    connection error"."""
+    _failure_state.kind = None
     try:
         response = oai_client.chat.completions.create(
             model=model,
@@ -1257,9 +1393,50 @@ def complete(oai_client: OpenAI, model: str, system: str, content: str) -> Optio
             ],
             temperature=0,
         )
+    except APITimeoutError:
+        _failure_state.kind = "timeout"
+        return None
     except Exception:
+        _failure_state.kind = "other"
         return None
     return response.choices[0].message.content or ""
+
+
+_ALL_TIMED_OUT_PREFIX = "[LM Studio timed out on every request"
+
+
+def _request_failed_message(where: str, kind: Optional[str], base_url: Optional[str]) -> str:
+    """Wording for a failed LM Studio request (issue #368).
+
+    A timeout means LM Studio answered the connection but did not finish in
+    time -- typically because it is busy (it runs a limited number of requests
+    in parallel, 4 by default, and queues the rest) -- so telling the reader to
+    "check it's still running" sends them looking for an outage that isn't
+    there. Anything else, including an unknown reason (kind is None, e.g. a
+    stubbed complete()), keeps the original wording, which is the right advice
+    for a refused connection or a missing model.
+    """
+    if kind == "timeout":
+        return (
+            f"Error: LM Studio request timed out after {resolve_request_timeout():g}s "
+            f"{where} -- LM Studio is reachable but may be busy with other requests; "
+            f"see CLAUDE_RUNWAY_LMSTUDIO_TIMEOUT_SECONDS."
+        )
+    return (
+        f"Error: LM Studio request failed {where} -- check it's still running at "
+        f"{base_url or DEFAULT_BASE_URL}."
+    )
+
+
+def _classify_relevant_with_reason(*args) -> Tuple[Optional[bool], Optional[str]]:
+    """classify_relevant() plus why it failed, read on the SAME worker thread.
+
+    complete()'s failure reason is thread-local, and the relevance requests run
+    in executor threads, so the event-loop thread cannot read it afterwards --
+    it has to be taken here, immediately after the call (issue #368).
+    """
+    result = classify_relevant(*args)
+    return result, (take_failure_kind() if result is None else None)
 
 
 def classify_relevant(
@@ -1601,6 +1778,9 @@ async def _compress_each_section(text, focus, oai_client, model, base_url, prese
     parts = [preamble] if preamble else []
     compressed_count = verbatim_count = 0
     request_failed_count = not_relevant_count = empty_response_count = 0
+    # Why each failed request failed (issue #368), so an outage made up ENTIRELY
+    # of timeouts (a busy LM Studio) is not reported as "appears unreachable".
+    failure_kinds: list = []
 
     for i, (heading, body) in enumerate(sections, 1):
         if ctx is not None:
@@ -1640,6 +1820,7 @@ async def _compress_each_section(text, focus, oai_client, model, base_url, prese
                 if raw is None:
                     run_parts.append(run_text)
                     prose_failed = True
+                    failure_kinds.append(take_failure_kind())
                     continue
                 stripped = raw.strip()
                 if not stripped or "NOT RELEVANT" in stripped.upper():
@@ -1687,6 +1868,7 @@ async def _compress_each_section(text, focus, oai_client, model, base_url, prese
         if raw_summary is None:
             parts.append(f"{heading}\n{body}")
             request_failed_count += 1
+            failure_kinds.append(take_failure_kind())
             continue
         summary = raw_summary.strip()
         # A failed call, an empty/whitespace response, or a NOT_RELEVANT
@@ -1778,10 +1960,19 @@ async def _compress_each_section(text, focus, oai_client, model, base_url, prese
         and empty_response_count == 0
         and request_failed_count > 0
     ):
-        result = (
-            "[LM Studio appears unreachable -- no section was compressed; "
-            f"original content preserved]\n\n{result}"
-        )
+        if failure_kinds and all(k == "timeout" for k in failure_kinds):
+            # Every failed request timed out: LM Studio answered but was too
+            # busy to finish in time. Not an outage -- and a different prefix
+            # (not "appears unreachable") so callers/readers aren't misled.
+            result = (
+                f"{_ALL_TIMED_OUT_PREFIX} -- LM Studio is reachable but may be busy; "
+                f"no section was compressed; original content preserved]\n\n{result}"
+            )
+        else:
+            result = (
+                "[LM Studio appears unreachable -- no section was compressed; "
+                f"original content preserved]\n\n{result}"
+            )
     return result
 
 
@@ -2102,6 +2293,7 @@ async def compress(
             #    those indicate a transient failure worth retrying).
             _is_fully_successful = (
                 not section_result.startswith("[LM Studio appears unreachable")
+                and not section_result.startswith(_ALL_TIMED_OUT_PREFIX)
                 and "kept verbatim after a failed call" not in section_result
             )
             if _is_fully_successful:
@@ -2139,20 +2331,19 @@ async def compress(
         loop = asyncio.get_running_loop()
         futures = [
             loop.run_in_executor(
-                None, classify_relevant,
+                None, _classify_relevant_with_reason,
                 oai_client, model, focus, chunk, i, len(chunks), auto_truncated,
             )
             for i, chunk in enumerate(chunks, 1)
         ]
-        relevance_results = list(await asyncio.gather(*futures))
+        relevance_pairs = list(await asyncio.gather(*futures))
+        relevance_results = [r for r, _kind in relevance_pairs]
         # Check for any None (request failure) before proceeding.
         # Report the first failed chunk index for parity with the old error.
-        for i, result in enumerate(relevance_results, 1):
+        for i, (result, kind) in enumerate(relevance_pairs, 1):
             if result is None:
-                return (
-                    f"Error: LM Studio request failed while checking relevance "
-                    f"(chunk {i}/{len(chunks)}) -- check it's still running at "
-                    f"{base_url or DEFAULT_BASE_URL}."
+                return _request_failed_message(
+                    f"while checking relevance (chunk {i}/{len(chunks)})", kind, base_url,
                 )
 
     # Phase 2: extraction -- sequential, in document order, for relevant chunks.
@@ -2177,7 +2368,7 @@ async def compress(
             chunk,
         )
         if summary is None:
-            return f"Error: LM Studio request failed (chunk {i}/{len(chunks)}) -- check it's still running at {base_url or DEFAULT_BASE_URL}."
+            return _request_failed_message(f"(chunk {i}/{len(chunks)})", take_failure_kind(), base_url)
         summary = summary.strip()
         # Belt-and-suspenders: even a chunk the classifier called relevant
         # can still come back marked NOT_RELEVANT from the extraction call
@@ -2219,7 +2410,9 @@ async def compress(
             combined,
         )
         if compressed is None:
-            return f"Error: LM Studio request failed while combining chunk summaries -- check it's still running at {base_url or DEFAULT_BASE_URL}."
+            return _request_failed_message(
+                "while combining chunk summaries", take_failure_kind(), base_url,
+            )
         compressed = compressed.strip()
     # Both branches above leave `compressed` a plain `str` (the None case
     # already returned early) -- Pyright doesn't merge that narrowing back
