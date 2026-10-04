@@ -81,7 +81,7 @@ MUST_SKIP = [
     ("gtk-app --help-all", "--help-all is still help output, so matching it is right"),
     # --- gh api (issue #190): structured REST/GraphQL data, never prose ---
     (
-        "gh api repos/CVNA-SandboxOrg/claude-runway/pulls/190/comments --paginate",
+        "gh api repos/Donelle/claude-runway/pulls/190/comments --paginate",
         "plain gh api call with no --jq/--json at all (my-gh-pr-feedback's shape)",
     ),
     (
@@ -90,7 +90,7 @@ MUST_SKIP = [
         "graphql body-fetch shape",
     ),
     (
-        'COMMENT_IDS=$(gh api repos/CVNA-SandboxOrg/claude-runway/pulls/190/comments '
+        'COMMENT_IDS=$(gh api repos/Donelle/claude-runway/pulls/190/comments '
         '--paginate --jq ".[] | select(.user.login != \\"me\\") | \\"comment:\\" + (.id|tostring)") '
         "|| FETCH_FAILED=1",
         "the real VAR=$(...) command-substitution shape used by my-gh-autowork's NEW_IDS diffing "

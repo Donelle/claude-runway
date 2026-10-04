@@ -15,7 +15,7 @@ Usage:
 
 Run this once to seed the collection, then re-run periodically (or on a
 schedule) to pick up changes. Re-running without --reset will add duplicate
-chunks; pass --reset to wipe the collection before indexing.
+chunks; pass --reset to wipe the collection's (non-memory-bank) points before indexing.
 
 Project minimum: Python 3.12 (policy floor; the dependency chain supports >=3.10).
 """
@@ -42,14 +42,43 @@ except ImportError:
 
 from qdrant_ingest_lib import build_entries, ensure_persistent_fastembed_cache, validate_chunk_params
 from qdrant_batch_store import store_batch, ensure_file_path_index, FIELD_INDEXES
+from qdrant_model_check import check_embedding_model_mismatch
+from qdrant_retry import call_with_retry
+import memory_bank_lib as mb
 
 # Must run before FastEmbedProvider(...) is constructed in ingest() below --
 # see issue #77 and the function's own docstring for why this can't just be
 # a .mcp.json/shell env value.
 ensure_persistent_fastembed_cache()
 
+# Same env var + default the MCP servers read (tools/ingest_mcp_server.py's
+# DEFAULT_MEMORY_BANK_COLLECTION), so the CLI's --reset guard below agrees
+# with index_repo's about which collection is the shared memory bank. Read
+# at import time like the server does; an interactive shell that doesn't
+# export MEMORY_BANK_COLLECTION falls back to the "memory-bank" default,
+# which is the name a stock install uses anyway.
+DEFAULT_MEMORY_BANK_COLLECTION = os.environ.get("MEMORY_BANK_COLLECTION", "memory-bank")
+
 
 async def ingest(args):
+    # Issue #265: --reset used to be a raw delete_collection with none of
+    # the protections index_repo(reset=True) got in issue #175 / PR #178.
+    # Layer 1 (name refusal), ported from index_repo: pointing --reset at
+    # the shared memory-bank collection would irreversibly destroy every
+    # project's durable memories. Checked BEFORE the dry-run guard and
+    # before any Qdrant client exists, so it needs no network and a
+    # refused command fails fast even when combined with --dry-run.
+    if args.reset and mb.is_memory_bank_collection_name(args.collection, DEFAULT_MEMORY_BANK_COLLECTION):
+        print(
+            f"Error: '{args.collection}' is configured as the shared memory-bank "
+            f"collection (MEMORY_BANK_COLLECTION). Refusing to --reset it -- that "
+            f"would wipe every project's durable memories. Use a different "
+            f"--collection for this project's code index.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    embedding_provider = None
+
     # --dry-run is documented (both in --help and this preview print below)
     # as writing NOTHING to Qdrant -- so all collection maintenance
     # (reset-delete, file_path index backfill) must stay entirely behind
@@ -71,9 +100,37 @@ async def ingest(args):
         # file_path payload-index backfill (issue #54).
         client = QdrantClient(url=args.qdrant_url, api_key=args.qdrant_api_key)
         if args.reset:
-            if client.collection_exists(args.collection):
-                client.delete_collection(args.collection)
-                print(f"Reset: deleted existing collection '{args.collection}'.")
+            if call_with_retry(client.collection_exists, args.collection):
+                embedding_provider = FastEmbedProvider(args.embedding_model)
+                # Layer 3 (issue #265), ported from index_repo: validate the
+                # embedding model BEFORE deleting anything. Otherwise a
+                # model change (or an unnamed-vector legacy collection)
+                # would wipe the old index first and only then fail on the
+                # store below, leaving nothing. fail_closed=True because
+                # this is a pre-delete safety check -- an inconclusive
+                # result must block the delete, not count as "compatible."
+                mismatch = check_embedding_model_mismatch(
+                    client, args.collection, embedding_provider, fail_closed=True
+                )
+                if mismatch:
+                    print(mismatch, file=sys.stderr)
+                    sys.exit(1)
+                # Layer 2 (issue #265), ported from index_repo: ALWAYS a
+                # filtered delete, never delete_collection, so any
+                # metadata.source == "memory-bank" points survive even if
+                # this collection somehow holds them. Unconditional (no
+                # count-then-act) to avoid the race documented in
+                # index_repo: a remember() landing between a count and a
+                # delete_collection would be destroyed anyway.
+                call_with_retry(
+                    client.delete,
+                    collection_name=args.collection,
+                    points_selector=mb.memory_bank_exclusion_filter(),
+                )
+                print(
+                    f"Reset: deleted existing non-memory-bank points from '{args.collection}' "
+                    f"(the collection itself and any memory-bank points are kept)."
+                )
         elif client.collection_exists(args.collection):
             # FIELD_INDEXES below only takes effect when QdrantConnector's
             # own _ensure_collection_exists() creates a BRAND NEW
@@ -84,7 +141,8 @@ async def ingest(args):
             if ensure_file_path_index(client, args.collection):
                 print(f"Backfilled the metadata.file_path payload index on '{args.collection}'.")
 
-    embedding_provider = FastEmbedProvider(args.embedding_model)
+    if embedding_provider is None:
+        embedding_provider = FastEmbedProvider(args.embedding_model)
     connector = QdrantConnector(
         qdrant_url=args.qdrant_url,
         qdrant_api_key=args.qdrant_api_key,
@@ -154,7 +212,12 @@ def parse_args():
     p.add_argument("--chunk-lines", type=int, default=50)
     p.add_argument("--overlap", type=int, default=10)
     p.add_argument("--dry-run", action="store_true", help="Preview chunks without writing to Qdrant")
-    p.add_argument("--reset", action="store_true", help="Delete the collection before indexing (avoids duplicate chunks on re-runs)")
+    p.add_argument("--reset", action="store_true", help="Delete the collection's existing points before indexing (avoids duplicate chunks on re-runs). "
+                         "Like index_repo(reset=True) (issue #175), this is a filtered delete that keeps the "
+                         "collection itself and any memory-bank points, refuses the configured "
+                         "MEMORY_BANK_COLLECTION outright, and aborts before deleting on an embedding-model "
+                         "mismatch -- so it can no longer rebuild a collection's vector schema after an "
+                         "EMBEDDING_MODEL change (drop the collection manually for that)")
     args = p.parse_args()
     # See validate_chunk_params's docstring (issue #26) -- overlap >=
     # chunk_lines silently multiplies chunk count by roughly chunk_lines,

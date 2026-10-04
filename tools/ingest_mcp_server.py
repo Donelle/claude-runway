@@ -447,8 +447,9 @@ async def index_repo(
             # error, not a confirmed match) must block the destructive delete
             # below, not silently be treated as "compatible." Every other
             # caller of this function keeps the default fail-open behavior;
-            # this and sync_repo's own pre-delete check below are the only
-            # two destructive call sites where that default is actively
+            # this, sync_repo's own pre-delete check below, and
+            # ingest_to_qdrant.py's --reset (issue #265) are the only
+            # three destructive call sites where that default is actively
             # wrong.
             mismatch = check_embedding_model_mismatch(client, collection, embedding_provider, fail_closed=True)
             if mismatch:
@@ -808,6 +809,105 @@ async def sync_repo(
     removed = files_removed_since_last_sync(manifest, current_hashes, [rel for rel, _ in hash_skipped])
     unchanged_count = len(current_hashes) - len(changed)
 
+    # Constructed before the "no changes" early return below (issue #303) so
+    # the index-consistency check can run ahead of it.
+    client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
+
+    async def _check_index_invariant(will_be_indexed):
+        """Issue #303 (bug 2), as ONE invariant: "every manifest file that
+        would produce chunks is either (a) present in the Qdrant collection
+        or (b) proven to be (re)indexed during THIS sync". Returns
+        (error_or_None, collection_present). Run at EVERY collection-existence
+        check in sync_repo (the early one and the one before the delete/store
+        phase), and the caller must use the returned collection_present
+        rather than asking Qdrant again, so there is no gap between check and
+        use.
+
+        The manifest is a local file that knows nothing about Qdrant. The
+        documented EMBEDDING_MODEL remedy (drop the collection by hand)
+        leaves it claiming everything is indexed, so without this the "no
+        changes" return, or a changed-files-only re-index into a brand new
+        collection, silently masks the mismatch.
+
+        `will_be_indexed` is the set of paths proven indexed by this sync:
+        the early call passes every changed path (nothing has been chunked
+        yet); the later call passes only files whose chunking
+        completed without raising (a clean zero-chunk result counts: it
+        proves there is nothing to index), so a changed file whose chunking
+        failed is NOT exempt. Presence is verified at collection granularity (the
+        collection holds at least one file chunk), NOT per file: a per-file
+        check would cost a Qdrant query per manifest file on every sync,
+        defeating the incremental design, and no check made before
+        store_batch can be atomic with it anyway -- a collection dropped
+        mid-write by a concurrent actor is outside what this guards. It
+        targets the documented drop-then-sync scenario. Everything else in
+        the manifest is checked, failing closed
+        on any unknown state: a missing collection, an empty one (no point
+        with metadata.file_path -- preserved memory-bank / qdrant-store
+        points must not mask that), a not-found raised mid-check by a
+        concurrent drop, or a manifest file that is unreadable (hash-skipped
+        or fails to chunk). The only files ignored are ones proven to be
+        nothing to index: removed from disk, or chunking cleanly to zero
+        chunks (empty/whitespace-only), which never create a point.
+
+        An empty manifest is a legitimate first sync: never an error.
+        """
+        collection_present = call_with_retry(client.collection_exists, collection)
+        if not manifest:
+            return None, collection_present
+        indexed_chunk_count = 0
+        if collection_present:
+            try:
+                indexed_chunk_count = call_with_retry(
+                    client.count,
+                    collection_name=collection,
+                    count_filter=models.Filter(
+                        must_not=[models.IsEmptyCondition(is_empty=models.PayloadField(key="metadata.file_path"))]
+                    ),
+                    exact=True,
+                ).count
+            except Exception:
+                # exists and count are separate requests: a concurrent drop
+                # between them surfaces as not-found from count. Treat it as
+                # missing only if a follow-up check confirms; re-raise
+                # anything else (a real failure must not be swallowed).
+                if call_with_retry(client.collection_exists, collection):
+                    raise
+                collection_present = False
+        if indexed_chunk_count > 0:
+            return None, collection_present
+
+        proven_indexed = set(will_be_indexed)
+        hash_skipped_paths = {rel for rel, _ in hash_skipped}
+
+        def _some_manifest_file_should_be_indexed():
+            for rel in manifest:
+                if rel in hash_skipped_paths:
+                    return True  # unreadable = unknown, fail closed (issue #27)
+                if rel not in current_hashes or rel in proven_indexed:
+                    continue
+                try:
+                    if next(iter(chunk_file(repo / rel, rel, chunk_lines, overlap)), None) is not None:
+                        return True
+                except OSError:
+                    return True  # unreadable = unknown, fail closed
+            return False
+
+        if await asyncio.to_thread(_some_manifest_file_should_be_indexed):
+            state = "does not exist" if not collection_present else "has no indexed file chunks"
+            return (
+                f"Error: the sync manifest says {len(manifest)} files are already indexed, but collection "
+                f"'{collection}' {state} in Qdrant, so an incremental sync would silently leave those files "
+                f"unindexed. Run index_repo(reset=True) to rebuild it from scratch (and re-sync the manifest).",
+                collection_present,
+            )
+        return None, collection_present
+
+    if manifest:
+        early_error, _ = await _check_index_invariant(changed)
+        if early_error:
+            return early_error
+
     if not changed and not removed:
         return (
             f"No changes since last sync. {unchanged_count} files already up to date in '{collection}'."
@@ -847,7 +947,6 @@ async def sync_repo(
     # "re-indexed" and "skipped" (PR #90 review, Copilot).
     successfully_changed = [f for f in changed if f not in chunk_skipped_paths]
 
-    client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
     # Constructed here (moved up from just before the embed/store loop) so
     # the schema check below can validate BEFORE the delete loop runs --
     # same reasoning as index_repo's own pre-delete check, and the exact
@@ -855,13 +954,18 @@ async def sync_repo(
     # already established for this function's chunk-before-delete ordering.
     embedding_provider = FastEmbedProvider(embedding_model)
 
-    # Retry once on a transient dropped connection -- see issue #75/#76 /
-    # libs/qdrant_retry.py. This specific call is the one confirmed to
-    # actually trigger the bug in practice: it's the first Qdrant request
-    # after compute_file_hashes (above) has just spent several seconds
-    # synchronously hashing every file in a large repo, which is long enough
-    # for Docker Desktop's vpnkit to reap an idle connection.
-    if call_with_retry(client.collection_exists, collection):
+    # Qdrant calls here go through call_with_retry (transient dropped
+    # connections -- see issue #75/#76 / libs/qdrant_retry.py for the attempt
+    # count).
+    # Re-run the same invariant now that chunking is done (the collection can
+    # be dropped in the seconds since the early check, and store_batch would
+    # recreate it holding only the changed files), with the exemption narrowed
+    # to files whose chunking completed without raising. Its collection_present
+    # answer drives the branch below -- no separate existence request.
+    late_error, collection_present = await _check_index_invariant(successfully_changed)
+    if late_error:
+        return late_error
+    if collection_present:
         # Found in PR #178 review (issue #175): without this, a changed
         # EMBEDDING_MODEL would still delete each changed/removed file's old
         # chunks below and only discover the mismatch later, once the
