@@ -178,6 +178,15 @@ class AutoPickExclusionContentRequirements(unittest.TestCase):
                     f"found a positive label restriction in the search query: {term!r}",
                 )
 
+    def test_priority_sort_includes_p0_first(self):
+        # Issue #285: the sort rule once read "priority-p1 > p2 > p3", so a literal
+        # reading filed priority-p0 (the "fix first" label) under "unlabeled sorts last".
+        idx = self.content.find("Sort by priority label")
+        self.assertNotEqual(idx, -1, "auto-pick sort rule must exist")
+        rule = self.content[idx : idx + 400]
+        self.assertIn("priority-p0 > p1 > p2 > p3", rule)
+        self.assertIn("priority-p{N}", rule)
+
 
 class SettingsTemplateContentRequirements(unittest.TestCase):
     """Pin the new _permissions_note documenting suggested baseline rules."""
