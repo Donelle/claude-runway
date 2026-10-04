@@ -11,7 +11,7 @@ Each piece works independently — you don't need LM Studio to use the Qdrant me
 
 ## Table of contents
 
-- [Files (41)](#files-41)
+- [Files (44)](#files-44)
 - [Prerequisites](docs/prerequisites.md)
   - [Windows GPU setup for LM Studio](docs/windows-setup.md)
 - [Installation](docs/installation.md)
@@ -29,7 +29,7 @@ Each piece works independently — you don't need LM Studio to use the Qdrant me
 - [EVALUATION.md](EVALUATION.md) — measuring whether this actually reduces token usage
 - [Known limitations](#known-limitations)
 
-## Files (41)
+## Files (44)
 
 | File                              | Purpose                                                                                                                                                                                                                   |
 | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -73,6 +73,9 @@ Each piece works independently — you don't need LM Studio to use the Qdrant me
 | `skills/my-metrics/SKILL.md`      | Slash command that shows a view of the shared cross-tool metrics store for a given `metricId` (`/my-metrics <metricId> [view] [bucket]`). See [Shared metrics store](docs/metrics.md). |
 | `skills/my-setup-clauderunway/SKILL.md` | Slash command that interactively configures a target project for ClaudeRunway — runs `setup_project.py` with guided options and also handles the `CLAUDE.md` update step that the CLI doesn't do. Requires `CLAUDE_RUNWAY_DIR` to be exported. Install to `~/.claude/skills/` and run `/my-setup-clauderunway` from any project you want to configure. |
 | `tests/test_compress_bash_output.py` | Table tests for the Bash exactness-critical exempt list (see [Exactness-critical commands](docs/skills-and-hooks.md#exactness-critical-commands-bash-only)). Stdlib `unittest`, no network — run with `.venv/bin/python -m unittest discover -s tests`. The exempt list is the one place here where a regex mistake is silent in *both* directions (a false positive forfeits savings unnoticed; a false negative reintroduces the lossy-`git` bug), so the cases are pinned rather than reasoned about. |
+| `scripts/bootstrap.sh`            | Developer bootstrap for macOS/Linux: finds Python 3.12, creates `.venv`, installs runtime + dev requirements and this checkout's console scripts, sets `core.hooksPath` to `.githooks`, then runs `claude-runway-doctor`. Idempotent. See [Development workflow](docs/development-workflow.md). |
+| `scripts/bootstrap.ps1`           | The Windows PowerShell equivalent of the script above. |
+| `tests/test_bootstrap_sh.py`      | Static checks for `scripts/bootstrap.sh` (committed executable bit, bash shebang, `bash -n` parses) — the install itself isn't unit-testable without network. |
 | `EVALUATION.md`                   | A plan for measuring whether this actually reduces token usage, rather than assuming it does — covers both the Qdrant memory piece and the local-compress piece as separate tracks, plus Track C for the session continuity skills, plus hard-won lessons on measuring `/usage` cleanly. |
 
 ## Known limitations
