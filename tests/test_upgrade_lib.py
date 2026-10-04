@@ -815,5 +815,77 @@ class RunUpgradeEndToEnd(unittest.TestCase):
         self.assertEqual((self.target_repo / ".claude" / "settings.json").stat().st_mtime_ns, settings_mtime)
 
 
+class RunUpgradeWritesOnlyChangedFiles(unittest.TestCase):
+    """Issue #278: run_upgrade must write only the documents an applied
+    migration actually changed, and must not report a no-op apply as applied."""
+
+    _MCP_COMPACT = '{"mcpServers":{"qdrant":{"command":"/x","env":{"COLLECTION_NAME":"p"}}}}'
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.target_repo = Path(self._tmpdir.name) / "proj"
+        self.target_repo.mkdir()
+        self.mcp_path = self.target_repo / ".mcp.json"
+        self.settings_path = self.target_repo / ".claude" / "settings.json"
+        # Deliberately NOT indent-2, so a re-serialization is detectable as a byte change.
+        self.mcp_path.write_text(self._MCP_COMPACT, encoding="utf-8")
+
+    def test_mcp_only_migration_does_not_create_settings_json(self):
+        # A --skip-hooks project: no .claude/settings.json at all.
+        self.assertFalse(self.settings_path.exists())
+
+        applied = run_upgrade(
+            self.target_repo,
+            REPO_ROOT,
+            _VENV_PYTHON,
+            prompt_fn=lambda m, i, t: m.id == "hf-hub-offline-missing",
+        )
+        self.assertEqual(applied, ["hf-hub-offline-missing"])
+        self.assertFalse(self.settings_path.exists(), "settings.json must not be materialized")
+        written = json.loads(self.mcp_path.read_text(encoding="utf-8"))
+        self.assertIn("HF_HUB_OFFLINE", written["mcpServers"]["qdrant"]["env"])
+
+    def test_settings_only_migration_leaves_mcp_json_bytes_untouched(self):
+        self.settings_path.parent.mkdir()
+        self.settings_path.write_text("{}", encoding="utf-8")
+
+        applied = run_upgrade(
+            self.target_repo,
+            REPO_ROOT,
+            _VENV_PYTHON,
+            prompt_fn=lambda m, i, t: m.id == "record-session-id-hooks-missing",
+        )
+        self.assertEqual(applied, ["record-session-id-hooks-missing"])
+        self.assertEqual(self.mcp_path.read_text(encoding="utf-8"), self._MCP_COMPACT)
+        self.assertIn("hooks", json.loads(self.settings_path.read_text(encoding="utf-8")))
+
+    def test_noop_apply_after_declined_prerequisite_is_not_reported_or_written(self):
+        # Only the stale PostToolUse '.*' block is present; the prerequisite
+        # (record-session-id-hooks-missing) is declined, so the sessionstart
+        # migration's guard makes its apply a no-op.
+        self.settings_path.parent.mkdir()
+        settings_text = json.dumps(
+            {
+                "hooks": {
+                    "PostToolUse": [
+                        {"matcher": ".*", "hooks": [{"type": "command", "args": ["/x/hooks/record_session_id.py"]}]}
+                    ]
+                }
+            }
+        )
+        self.settings_path.write_text(settings_text, encoding="utf-8")
+
+        applied = run_upgrade(
+            self.target_repo,
+            REPO_ROOT,
+            _VENV_PYTHON,
+            prompt_fn=lambda m, i, t: m.id == "record-session-id-sessionstart",
+        )
+        self.assertEqual(applied, [])
+        self.assertEqual(self.settings_path.read_text(encoding="utf-8"), settings_text)
+        self.assertEqual(self.mcp_path.read_text(encoding="utf-8"), self._MCP_COMPACT)
+
+
 if __name__ == "__main__":
     unittest.main()

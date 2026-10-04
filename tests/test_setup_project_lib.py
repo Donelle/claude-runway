@@ -871,6 +871,98 @@ class RunSetupEndToEnd(unittest.TestCase):
         self.assertEqual(result.mcp_json["mcpServers"]["qdrant"]["env"]["HF_HUB_OFFLINE"], "")
         self.assertTrue(any("Could not confirm" in c for c in result.changes))
 
+    # --- Issue #279: init re-run must not reset a customized EMBEDDING_MODEL ---
+
+    _EMBED_SERVERS = ("qdrant", "codebase-indexer", "memory-bank")
+    _CUSTOM_MODEL = "BAAI/bge-small-en"
+
+    def _models(self, result):
+        return {s: result.mcp_json["mcpServers"][s]["env"]["EMBEDDING_MODEL"] for s in self._EMBED_SERVERS}
+
+    def _write_customized_existing_config(self, model):
+        first = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
+        cfg = first.mcp_json
+        for s in self._EMBED_SERVERS:
+            cfg["mcpServers"][s]["env"]["EMBEDDING_MODEL"] = model
+        (self.target_repo / ".mcp.json").write_text(json.dumps(cfg))
+
+    def test_fresh_target_uses_template_default_embedding_model(self):
+        default = MCP_TEMPLATE["mcpServers"]["qdrant"]["env"]["EMBEDDING_MODEL"]
+        result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
+        self.assertEqual(set(self._models(result).values()), {default})
+
+    def test_rerun_preserves_customized_embedding_model_in_all_blocks(self):
+        self._write_customized_existing_config(self._CUSTOM_MODEL)
+        result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
+        self.assertEqual(set(self._models(result).values()), {self._CUSTOM_MODEL})
+        self.assertTrue(any("Preserved the existing EMBEDDING_MODEL" in c for c in result.changes))
+        self.assertFalse(any("WARNING" in c for c in result.changes))
+
+    def test_explicit_embedding_model_overrides_existing_and_warns(self):
+        self._write_customized_existing_config(self._CUSTOM_MODEL)
+        new_model = "sentence-transformers/all-mpnet-base-v2"
+        result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"), embedding_model=new_model)
+        self.assertEqual(set(self._models(result).values()), {new_model})
+        self.assertTrue(any("EMBEDDING_MODEL changed" in c and "WARNING" in c for c in result.changes))
+
+    def test_explicit_embedding_model_same_as_existing_does_not_warn(self):
+        self._write_customized_existing_config(self._CUSTOM_MODEL)
+        result = run_setup(
+            self.target_repo, REPO_ROOT, home_dir=Path("/home/user"), embedding_model=self._CUSTOM_MODEL
+        )
+        self.assertEqual(set(self._models(result).values()), {self._CUSTOM_MODEL})
+        self.assertFalse(any("WARNING" in c for c in result.changes))
+
+    def test_explicit_embedding_model_on_fresh_target_does_not_warn(self):
+        result = run_setup(
+            self.target_repo, REPO_ROOT, home_dir=Path("/home/user"), embedding_model=self._CUSTOM_MODEL
+        )
+        self.assertEqual(set(self._models(result).values()), {self._CUSTOM_MODEL})
+        self.assertFalse(any("WARNING" in c for c in result.changes))
+
+    def test_existing_config_without_embedding_model_falls_back_to_template(self):
+        default = MCP_TEMPLATE["mcpServers"]["qdrant"]["env"]["EMBEDDING_MODEL"]
+        (self.target_repo / ".mcp.json").write_text(json.dumps({"mcpServers": {"qdrant": {"env": {}}}}))
+        result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
+        self.assertEqual(set(self._models(result).values()), {default})
+
+    def test_existing_model_falls_back_to_another_block_when_qdrant_has_none(self):
+        # The qdrant block's value wins when present (the issue's stated
+        # source of truth); a missing/blank key there falls through to the
+        # next toolkit block rather than to the template default.
+        first = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
+        cfg = first.mcp_json
+        del cfg["mcpServers"]["qdrant"]["env"]["EMBEDDING_MODEL"]
+        cfg["mcpServers"]["codebase-indexer"]["env"]["EMBEDDING_MODEL"] = self._CUSTOM_MODEL
+        (self.target_repo / ".mcp.json").write_text(json.dumps(cfg))
+        result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
+        self.assertEqual(set(self._models(result).values()), {self._CUSTOM_MODEL})
+
+    def test_warmup_uses_the_preserved_embedding_model(self):
+        # The cache warm-up must warm the model that is actually written,
+        # not the template's default.
+        self._write_customized_existing_config(self._CUSTOM_MODEL)
+        calls = []
+
+        def _fake_warmup(model_name, cache_dir):
+            calls.append(model_name)
+            return True
+
+        run_setup(
+            self.target_repo, REPO_ROOT, home_dir=Path("/home/user"),
+            attempt_fastembed_warmup=True, fastembed_warmup_fn=_fake_warmup,
+        )
+        self.assertEqual(calls, [self._CUSTOM_MODEL])
+
+    def test_build_mcp_servers_embedding_model_blank_keeps_template_default(self):
+        default = MCP_TEMPLATE["mcpServers"]["qdrant"]["env"]["EMBEDDING_MODEL"]
+        servers = build_mcp_servers(
+            MCP_TEMPLATE, collection_name="c", venv_python=Path("/v/bin/python"),
+            tools_repo_dir=REPO_ROOT, home_dir=Path("/home/user"),
+        )
+        for s in self._EMBED_SERVERS:
+            self.assertEqual(servers[s]["env"]["EMBEDDING_MODEL"], default)
+
 
 class DefaultSkillsDir(unittest.TestCase):
     def test_is_dot_claude_skills_under_home(self):

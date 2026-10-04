@@ -28,6 +28,16 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "libs"))
 
+from version_lib import version_string  # noqa: E402
+
+# Issue #348 (Copilot review): answer --version BEFORE the dependency imports
+# below. Those exit(1) on a missing/broken mcp_server_qdrant/qdrant_client --
+# exactly the half-broken environment where someone most needs to report which
+# version they have. parse_args() still declares the flag (so --help lists it).
+if len(sys.argv) == 2 and sys.argv[1] == "--version":
+    print(version_string("claude-runway-ingest"))
+    sys.exit(0)
+
 try:
     from mcp_server_qdrant.qdrant import QdrantConnector, Entry
     from mcp_server_qdrant.embeddings.fastembed import FastEmbedProvider
@@ -134,6 +144,7 @@ async def ingest(args):
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--version", action="version", version=version_string("claude-runway-ingest"))
     p.add_argument("--repo-path", required=True, help="Path to the repo to index")
     p.add_argument("--collection", required=True, help="Qdrant collection name (must match your MCP server's COLLECTION_NAME)")
     p.add_argument("--qdrant-url", default="http://localhost:6333")

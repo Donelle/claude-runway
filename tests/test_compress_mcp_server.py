@@ -2028,5 +2028,25 @@ class ListLocalModelsReportsLoadedNotDownloaded(unittest.TestCase):
         self.assertIn("Could not reach LM Studio", result)
 
 
+class FastembedCachePersistenceTests(unittest.TestCase):
+    """Issue #283: module init must pin FASTEMBED_CACHE_PATH before any
+    FastEmbedProvider is constructed, or compact tools fall back to a
+    wipeable OS temp dir (issue #77)."""
+
+    def test_module_load_sets_persistent_cache_when_unset(self):
+        env = {k: v for k, v in os.environ.items() if k != "FASTEMBED_CACHE_PATH"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            _load_compress_mcp_server()
+            self.assertEqual(
+                os.environ["FASTEMBED_CACHE_PATH"],
+                str(Path.home() / ".claude" / "claude-runway" / "fastembed-cache"),
+            )
+
+    def test_module_load_respects_existing_value(self):
+        with mock.patch.dict(os.environ, {"FASTEMBED_CACHE_PATH": "/custom/cache"}):
+            _load_compress_mcp_server()
+            self.assertEqual(os.environ["FASTEMBED_CACHE_PATH"], "/custom/cache")
+
+
 if __name__ == "__main__":
     unittest.main()
