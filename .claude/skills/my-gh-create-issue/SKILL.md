@@ -78,8 +78,9 @@ Any of `type=`/`theme=`/`priority=` may be omitted — missing ones get inferred
 
 8. **Check for duplicates** before filing:
    ```bash
-   gh issue list -R Donelle/claude-runway --search "{key terms from the title}" --state all
+   gh issue list -R Donelle/claude-runway --search "{key terms from the title}" --state all --limit 300
    ```
+   Always pass `--limit`: `gh issue list` silently truncates to the 30 newest results without it, so an older matching issue can be dropped and a duplicate filed (this is how #345 duplicated #295).
    If a close match exists, show it to the user and ask whether to link/comment on that one instead of filing a new one.
 
 9. **Save a draft** to `.plans/{slug}.md` (kebab-case slug from the title) — same "draft before publish" step as `/my-create-task`, and gives the user something concrete to review before it becomes a public issue.
