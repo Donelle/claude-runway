@@ -178,6 +178,7 @@ def build_mcp_servers(
     include_compress: bool = True,
     hf_hub_offline: bool = False,
     embedding_model: str = "",
+    memory_bank_embedding_model: str = "",
 ) -> dict:
     """
     Returns a fresh `mcpServers` dict (deep-copied from `template`, never
@@ -340,9 +341,15 @@ def build_mcp_servers(
     memory_bank["env"]["MEMORY_BANK_ID"] = resolved_memory_bank_id
     memory_bank["env"]["MEMORY_BANK_COLLECTION"] = resolved_memory_bank_collection
 
+    # The memory-bank collection is ONE shared collection locked to the model
+    # that first created it, so its server keeps that model even when an
+    # explicit --embedding-model changes the per-project code collections.
     if embedding_model:
-        for block in (qdrant, indexer, memory_bank):
+        for block in (qdrant, indexer):
             block["env"]["EMBEDDING_MODEL"] = embedding_model
+    shared_model = memory_bank_embedding_model or embedding_model
+    if shared_model:
+        memory_bank["env"]["EMBEDDING_MODEL"] = shared_model
 
     if include_compress:
         compress = servers["local-compress"]
@@ -916,6 +923,17 @@ def run_setup(
     template_embedding_model = mcp_template["mcpServers"]["qdrant"]["env"]["EMBEDDING_MODEL"]
     previous_embedding_model = existing_embedding_model(existing_mcp)
     resolved_embedding_model = resolve_embedding_model(embedding_model, existing_mcp, template_embedding_model)
+    existing_memory_bank_model = (
+        (existing_mcp.get("mcpServers", {}).get("memory-bank", {}).get("env", {}) or {}).get("EMBEDDING_MODEL") or ""
+    )
+    # Only an explicit change of model (the drop-and-reindex case) keeps the shared
+    # memory-bank server on its locked model; a plain re-run is unchanged.
+    explicit_model_change = bool(embedding_model) and bool(previous_embedding_model) and (
+        resolved_embedding_model != previous_embedding_model
+    )
+    shared_memory_bank_model = (
+        existing_memory_bank_model if explicit_model_change and existing_memory_bank_model else resolved_embedding_model
+    )
 
     # Issue #221: decide -- BEFORE building the qdrant server's env block --
     # whether it's safe to set HF_HUB_OFFLINE=1, so mcp-server-qdrant's own
@@ -952,6 +970,7 @@ def run_setup(
         include_compress=include_compress,
         hf_hub_offline=hf_hub_offline,
         embedding_model=resolved_embedding_model,
+        memory_bank_embedding_model=shared_memory_bank_model,
     )
     unresolved = find_unresolved_placeholders(generated_servers)
     if unresolved:
@@ -968,8 +987,8 @@ def run_setup(
             f"WARNING: EMBEDDING_MODEL changed from '{previous_embedding_model}' to "
             f"'{resolved_embedding_model}'. Vectors already indexed under the old model are "
             f"incompatible: drop the project's collection (directly in Qdrant) and re-run "
-            f"index_repo, and note the shared memory-bank collection stays locked to whichever "
-            f"model created it."
+            f"index_repo. The shared memory-bank server keeps '{shared_memory_bank_model}', "
+            f"the model its collection is locked to; this run does not change it."
         )
     elif previous_embedding_model and previous_embedding_model != template_embedding_model:
         changes.append(

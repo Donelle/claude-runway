@@ -902,7 +902,12 @@ class RunSetupEndToEnd(unittest.TestCase):
         self._write_customized_existing_config(self._CUSTOM_MODEL)
         new_model = "sentence-transformers/all-mpnet-base-v2"
         result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"), embedding_model=new_model)
-        self.assertEqual(set(self._models(result).values()), {new_model})
+        models = self._models(result)
+        # Per-project code collections move to the new model; the shared memory-bank
+        # server stays on the model its collection is locked to.
+        self.assertEqual(models["qdrant"], new_model)
+        self.assertEqual(models["codebase-indexer"], new_model)
+        self.assertEqual(models["memory-bank"], self._CUSTOM_MODEL)
         self.assertTrue(any("EMBEDDING_MODEL changed" in c and "WARNING" in c for c in result.changes))
 
     def test_explicit_embedding_model_same_as_existing_does_not_warn(self):
