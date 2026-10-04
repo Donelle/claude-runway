@@ -277,5 +277,168 @@ class SyncRepoDeleteFilterTest(unittest.TestCase):
         client.delete.assert_not_called()
 
 
+class SyncRepoMissingCollectionTest(unittest.TestCase):
+    """Issue #303 (bug 2): sync_repo's manifest-diff "no changes" early return
+    used to run before any collection_exists check, so a manifest claiming
+    every file was indexed masked a dropped/empty collection -- which is
+    exactly the state the documented EMBEDDING_MODEL-change remediation
+    (manually drop the collection) leaves behind."""
+
+    def setUp(self):
+        for target, kwargs in (
+            ("call_with_retry", {"side_effect": lambda fn, *a, **kw: fn(*a, **kw)}),
+            ("compute_file_hashes", {"return_value": ({"a.py": "h1", "b.py": "h2"}, [])}),
+            ("_save_manifest", {}),
+            # Every file yields one chunk by default; individual tests override.
+            ("chunk_file", {"side_effect": lambda *a, **kw: iter([("content", {"file_path": "x"})])}),
+            ("ensure_file_path_index", {}),
+        ):
+            patcher = patch.object(_ims, target, **kwargs)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        for target, kwargs in (
+            ("ingest_mcp_server.FastEmbedProvider", {}),
+            ("ingest_mcp_server.QdrantConnector", {}),
+            ("ingest_mcp_server.store_batch", {"new_callable": AsyncMock}),
+        ):
+            patcher = patch(target, **kwargs)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _sync(self, client, manifest):
+        with patch.object(_ims, "_load_manifest", return_value=manifest), \
+             patch("ingest_mcp_server.QdrantClient", return_value=client):
+            return _run(_ims.sync_repo(repo_path=REPO_ROOT, collection="test-collection"))
+
+    def _client(self, exists: bool, points: int = 5) -> MagicMock:
+        client = MagicMock()
+        client.collection_exists.return_value = exists
+        client.count.return_value = MagicMock(count=points)
+        return client
+
+    def test_up_to_date_manifest_against_missing_collection_is_reported(self):
+        # The exact repro from the issue: manifest fully up to date, collection gone.
+        result = self._sync(self._client(exists=False), {"a.py": "h1", "b.py": "h2"})
+        self.assertNotIn("No changes since last sync", result)
+        self.assertIn("Error", result)
+        self.assertIn("test-collection", result)
+        self.assertIn("index_repo", result)
+
+    def test_up_to_date_manifest_against_empty_collection_is_reported(self):
+        result = self._sync(self._client(exists=True, points=0), {"a.py": "h1", "b.py": "h2"})
+        self.assertNotIn("No changes since last sync", result)
+        self.assertIn("Error", result)
+
+    def test_up_to_date_manifest_against_populated_collection_still_reports_no_changes(self):
+        result = self._sync(self._client(exists=True, points=5), {"a.py": "h1", "b.py": "h2"})
+        self.assertIn("No changes since last sync", result)
+
+    def test_changed_files_with_stale_manifest_and_missing_collection_is_reported(self):
+        # Without the check this would silently index only the changed file
+        # into a brand new collection, leaving the "unchanged" file absent.
+        result = self._sync(self._client(exists=False), {"a.py": "h1", "b.py": "old"})
+        self.assertIn("Error", result)
+        _ims.store_batch.assert_not_called()
+
+    def test_count_ignores_points_without_a_file_path(self):
+        # PR #350 review: preserved memory-bank / qdrant-store points must not
+        # make an otherwise chunk-less collection look populated. The fake
+        # count honors the filter the way Qdrant would.
+        client = MagicMock()
+        client.collection_exists.return_value = True
+
+        def fake_count(collection_name, count_filter=None, exact=True):
+            return MagicMock(count=1 if count_filter is None else 0)
+
+        client.count.side_effect = fake_count
+        result = self._sync(client, {"a.py": "h1", "b.py": "h2"})
+        self.assertIn("Error", result)
+        self.assertIn("no indexed file chunks", result)
+
+    def test_manifest_of_only_zero_chunk_files_is_not_an_error(self):
+        # PR #350 review: a file that hashes but chunks to nothing (empty /
+        # whitespace-only) is in the manifest yet never creates a point.
+        with patch.object(_ims, "chunk_file", side_effect=lambda *a, **kw: iter([])):
+            result = self._sync(self._client(exists=False), {"a.py": "h1", "b.py": "h2"})
+        self.assertIn("No changes since last sync", result)
+
+    def test_full_rebuild_where_every_tracked_file_changed_is_not_rejected(self):
+        # PR #350 review: every manifest entry is changed, so this sync will
+        # index all of them itself -- nothing unchanged is missing.
+        result = self._sync(self._client(exists=False), {"a.py": "old1", "b.py": "old2"})
+        self.assertNotIn("Error", result)
+        _ims.store_batch.assert_called_once()
+
+    def test_collection_dropped_between_early_and_later_check_is_reported(self):
+        # PR #350 review: exists at the early check, dropped before the
+        # later one -- store_batch must not recreate a partial index.
+        client = self._client(exists=True, points=5)
+        client.collection_exists.side_effect = [True, False]
+        result = self._sync(client, {"a.py": "h1", "b.py": "old"})
+        self.assertIn("Error", result)
+        _ims.store_batch.assert_not_called()
+
+    def test_chunk_failed_changed_file_is_not_exempt_from_the_guard(self):
+        # PR #350 review: every tracked file changed and the collection is
+        # missing, but chunking one of them just failed -- store_batch must
+        # not build a partial collection while the manifest keeps its old hash.
+        def flaky_chunk_file(path, rel, *a, **kw):
+            if rel == "b.py":
+                raise OSError("transient")
+            return iter([("content", {"file_path": rel})])
+
+        with patch.object(_ims, "chunk_file", side_effect=flaky_chunk_file):
+            result = self._sync(self._client(exists=False), {"a.py": "old1", "b.py": "old2"})
+        self.assertIn("Error", result)
+        _ims.store_batch.assert_not_called()
+
+    def test_existing_empty_collection_plus_chunk_failure_is_not_a_partial_index(self):
+        # Round 6 (a): collection exists but holds no file chunks; every
+        # tracked file changed (early check exempts them all), then one fails
+        # chunking. The late check must still run and fail closed.
+        def flaky_chunk_file(path, rel, *a, **kw):
+            if rel == "b.py":
+                raise OSError("transient")
+            return iter([("content", {"file_path": rel})])
+
+        with patch.object(_ims, "chunk_file", side_effect=flaky_chunk_file):
+            result = self._sync(self._client(exists=True, points=0), {"a.py": "old1", "b.py": "old2"})
+        self.assertIn("Error", result)
+        _ims.store_batch.assert_not_called()
+
+    def test_count_not_found_after_concurrent_drop_is_reported_as_missing(self):
+        # Round 6 (b): exists() says yes, the collection is dropped, count()
+        # raises not-found; a follow-up exists() confirms the drop.
+        client = self._client(exists=True)
+        client.collection_exists.side_effect = [True, False]
+        client.count.side_effect = RuntimeError("Not found: Collection doesn't exist")
+        result = self._sync(client, {"a.py": "h1", "b.py": "h2"})
+        self.assertIn("Error", result)
+        self.assertIn("does not exist", result)
+
+    def test_count_failure_with_collection_still_present_is_reraised(self):
+        client = self._client(exists=True)
+        client.count.side_effect = RuntimeError("boom")
+        with self.assertRaises(RuntimeError):
+            self._sync(client, {"a.py": "h1", "b.py": "h2"})
+
+    def test_unreadable_manifest_files_fail_closed(self):
+        # PR #350 review: a hash-skipped or re-chunk-unreadable entry is
+        # unknown, not a proven zero-chunk file, so it must not permit the
+        # zero-chunk exception.
+        with patch.object(_ims, "compute_file_hashes", return_value=({"a.py": "h1"}, [("b.py", "boom")])), \
+             patch.object(_ims, "chunk_file", side_effect=lambda *a, **kw: iter([])):
+            result = self._sync(self._client(exists=False), {"a.py": "h1", "b.py": "h2"})
+        self.assertIn("Error", result)
+        with patch.object(_ims, "chunk_file", side_effect=OSError("transient")):
+            result = self._sync(self._client(exists=False), {"a.py": "h1", "b.py": "h2"})
+        self.assertIn("Error", result)
+
+    def test_empty_manifest_with_missing_collection_is_a_normal_first_sync(self):
+        result = self._sync(self._client(exists=False), {})
+        self.assertNotIn("Error", result)
+        _ims.store_batch.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

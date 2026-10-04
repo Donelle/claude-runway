@@ -81,20 +81,17 @@ MEMORY_BANK_SOURCE = "memory-bank"
 # Default weight for a point with no metadata.weight at all (issue #177) --
 # either a point written before this field existed, or one explicitly
 # remembered with weight=1.0 (the default). Multiplicative against
-# NORMALIZED similarity (see _normalize_similarity below, PR #199 review --
-# the multiplier is applied to a rescaled [0, 1] value, not the raw score
-# directly), so this value is specifically chosen to be a true no-op:
-# 1.0 preserves today's plain-similarity ORDERING exactly (it's a constant
-# scale factor across every hit), though NOT the raw score's numeric value --
-# effective_score is normalized_similarity * weight, never equal to the raw
-# score itself, even at weight=1.0.
+# FLOORED similarity (see _normalize_similarity below -- effective_score =
+# max(0, raw) * weight, issue #272), so this value is specifically chosen to
+# be a true no-op: 1.0 preserves plain-similarity ORDERING exactly (a
+# constant scale factor across every hit, with negative-similarity ties
+# broken by raw score in recall_points).
 DEFAULT_WEIGHT = 1.0
 
 # recall_points over-fetches this many times `limit` from query_points BEFORE
 # applying the weight multiplier and truncating (issue #177) -- re-ranking by
-# effective_score = normalize_similarity(raw_score) * weight (PR #199
-# review -- NOT raw_score * weight directly, see _normalize_similarity's
-# docstring for why) has to happen against a wider raw-similarity pool than
+# effective_score = max(0, raw_score) * weight (see _normalize_similarity's
+# docstring for the full semantics and why) has to happen against a wider raw-similarity pool than
 # the final `limit`, or a genuinely high-weight but lower-raw-similarity
 # match could get cut by Qdrant's own similarity-only ordering before
 # re-ranking ever sees it. 3x is a fixed implementation choice (the ticket
@@ -105,34 +102,45 @@ _RECALL_OVERFETCH_MULTIPLIER = 3
 
 def _normalize_similarity(raw_score: float) -> float:
     """
-    Rescales a raw cosine similarity (mathematically ranged [-1, 1], though
-    Qdrant's own configured Distance.COSINE metric is what recall_points
-    actually queries against) to a nonnegative [0, 1] scale BEFORE it's
-    multiplied by `weight` (PR #199 review, issue #177's own implementation).
+    Floors a raw cosine similarity at 0 (`max(0.0, raw_score)`, no offset, no
+    rescale) BEFORE it's multiplied by `weight`. FINAL WEIGHT SEMANTICS
+    (issue #272; the contract a future `reweight_point`, #341, builds on):
 
-    Cosine similarity is not restricted to nonnegative values -- multiplying
-    a NEGATIVE raw score by `weight` directly would invert the documented
-    weight semantics: a `weight=0` memory (meant to be de-emphasized to the
-    bottom) with a negative raw score (e.g. score=-0.8) would compute
-    effective_score=(-0.8 * 0)=0, which can rank ABOVE a normal `weight=1`
-    memory with a LESS-negative raw score (e.g. score=-0.1,
-    effective_score=-0.1*1=-0.1) -- exactly backwards from "de-emphasized."
-    The same inversion applies to `weight>1`: it would DEMOTE (push more
-    negative) rather than boost a negative-score hit. Confirmed reproducible
-    with exactly these numbers, not just a theoretical concern.
+        effective_score = max(0, raw_similarity) * weight
 
-    Rescaling to [0, 1] first closes both: `weight=0` now always floors to
-    EXACTLY 0 regardless of the raw score's sign, and `weight>1` always
-    boosts (never demotes) since the rescaled value is never negative.
-    `min`/`max`-clamped defensively against float-precision spillover just
-    outside [-1, 1] (e.g. a raw score of 1.0000000002), not because Qdrant is
-    expected to return one.
+    i.e. `weight` is a PROPORTIONAL relevance multiplier. A hit's
+    effective_score is always proportional to its own relevance, so:
+      * a zero-or-negative-similarity hit scores exactly 0 at ANY weight --
+        weight can never rescue an irrelevant memory (nor, for a finite
+        weight, turn it into a top hit);
+      * `weight=1.0` (the default, and any point with no `metadata.weight`)
+        is a true no-op for ORDERING: effective_score equals max(0, raw), a
+        monotonic function of raw similarity;
+      * `weight=0` floors to exactly 0, the bottom of the ranking;
+      * `weight=w>1` lets a hit beat a default-weight competitor iff
+        `w * raw_w > raw_d`, e.g. weight=2.0 makes a hit with half the
+        similarity TIE a default-weight one and beat any equally-similar
+        one -- a boost among comparably-relevant hits, never a takeover.
+    Hits that tie at effective_score 0 (all non-positive similarities, or
+    weight=0) are ordered weight>0 hits first, then by raw similarity
+    descending (see recall_points), so default-weight ordering is exactly
+    plain-similarity ordering even in the negative range, and weight=0 hits
+    always sit at the very bottom.
+
+    History: issue #177 first multiplied the RAW score, which inverted for
+    NEGATIVE similarities (weight=0 on score=-0.8 gave 0, ranking ABOVE a
+    weight=1 hit at -0.1; weight>1 demoted). PR #199 fixed the sign with a
+    `(raw+1)/2` rescale into [0, 1], but that put every realistic hit
+    (raw>=0) in [0.5, 1.0]: weight=2.0 on raw=0.0 scored 1.0 and beat a
+    default-weight raw=0.99 (0.995) -- an unconditional takeover, issue #272.
+    Flooring at 0 with no offset keeps both sign fixes and removes the 0.5
+    floor.
 
     This is an internal ranking mechanism only -- the `score` field in a
-    recall_points hit dict stays the RAW, un-rescaled similarity Qdrant
+    recall_points hit dict stays the RAW, un-floored similarity Qdrant
     returned (unchanged meaning, see recall_points' own docstring for why).
     """
-    return max(0.0, min(1.0, (raw_score + 1.0) / 2.0))
+    return max(0.0, raw_score)
 
 # Reserved metadata.repo value for knowledge that isn't tied to any one
 # project -- set via remember(general=True). Collides, in principle, with a
@@ -358,11 +366,13 @@ async def remember_point(
     tool-set `source`/`repo`/`embedding_model` metadata.
 
     `weight` (issue #177) is a static, caller-supplied quality multiplier --
-    `recall_points` re-ranks by `effective_score = normalized_similarity *
-    weight` (see `_normalize_similarity`'s docstring for why raw similarity
-    is rescaled to a nonnegative domain first, not multiplied directly)
-    instead of raw similarity alone, so a stale or superseded memory doesn't
-    outrank a more trustworthy one purely by having more similar wording.
+    `recall_points` re-ranks by `effective_score = max(0, raw_similarity) *
+    weight` (see `_normalize_similarity`'s docstring for the exact semantics
+    and why) instead of raw similarity alone, so a stale or superseded memory
+    doesn't outrank a more trustworthy one purely by having more similar
+    wording. weight is proportional: it never lifts an irrelevant memory
+    (raw similarity <= 0 scores 0 at any weight), and weight=2.0 only lets
+    a hit with half the similarity tie a default-weight one.
     Stored verbatim in `metadata.weight`; a point with no such field at all
     (written before this change) is treated as `weight=1.0` at read time by
     `recall_points` -- a true no-op, not a behavior change for existing data.
@@ -518,22 +528,21 @@ async def recall_points(
     and truncation actually use, so raw similarity alone can't tell "most
     trustworthy" from "most similar wording." A point with no `metadata.weight`
     (written before this field existed) is treated as `weight=1.0`, a true
-    no-op for ORDERING purposes among other default-weight hits (PR #199
-    review, third pass: NOT a no-op against the raw score's own numeric
-    value -- `effective_score` is always `_normalize_similarity(score) *
-    weight`, below, so it never literally equals the raw `score`, even at
-    weight=1.0; only the relative ranking among equally-weighted hits is
-    preserved, since rescaling is monotonic). `query_points` itself is asked
-    for `limit * _RECALL_OVERFETCH_MULTIPLIER` candidates, not just `limit`
-    -- re-ranking against only `limit` raw-similarity hits could never let a
-    high-weight-but-lower-raw-similarity match rise above one Qdrant's own
-    similarity-only ordering already cut before re-ranking saw it.
+    no-op for ORDERING purposes among other default-weight hits:
+    `effective_score = max(0, score) * weight` (issue #272; see
+    `_normalize_similarity` for the full semantics), so at weight=1.0 it
+    equals max(0, score) -- same ordering as raw similarity, though a
+    negative `score` reports effective_score 0. `query_points` itself is
+    asked for `limit * _RECALL_OVERFETCH_MULTIPLIER` candidates, not just
+    `limit` -- re-ranking against only `limit` raw-similarity hits could
+    never let a high-weight-but-lower-raw-similarity match rise above one
+    Qdrant's own similarity-only ordering already cut before re-ranking saw
+    it.
 
-    `effective_score` is computed from `_normalize_similarity(score) * weight`,
-    NOT `score * weight` directly (PR #199 review) -- see that function's
-    docstring for why multiplying a possibly-negative raw cosine similarity
-    by `weight` directly would invert the documented weight semantics
-    (a `weight=0` memory could rank ABOVE a normal one).
+    Ties on `effective_score` (all non-positive-similarity hits score 0, as
+    do weight=0 hits) are broken by weight>0 first (weight=0 is always last),
+    then raw `score` descending, so default-weight ordering stays exactly
+    plain-similarity ordering in the negative range.
     """
     if not call_with_retry(client.collection_exists, collection):
         return []
@@ -572,7 +581,13 @@ async def recall_points(
                 "created_at": meta.get("created_at"),
             }
         )
-    results.sort(key=lambda r: r["effective_score"], reverse=True)
+    # Sort key: effective_score, then weight>0, then raw score (all
+    # descending). The raw-score tie-break keeps default-weight ordering equal
+    # to plain-similarity ordering among all-negative hits (which all floor to
+    # effective 0). The `weight > 0` middle term keeps weight=0 a true bottom:
+    # without it a weight=0 hit with raw 0.95 would out-tie a default-weight
+    # hit at raw -0.1 (both effective 0) on raw score alone (PR #359 review).
+    results.sort(key=lambda r: (r["effective_score"], r["weight"] > 0, r["score"]), reverse=True)
     return results[:limit]
 
 

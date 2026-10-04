@@ -1415,6 +1415,9 @@ class SyncRepoPreservesEmbeddingsOnChunkAndHashFailures(unittest.TestCase):
 
             fake_client = MagicMock()
             fake_client.collection_exists.return_value = True
+            # sync_repo's index-consistency check (issue #303) counts file
+            # chunks; this fixture models a populated collection.
+            fake_client.count.return_value = mock.MagicMock(count=10)
 
             with mock.patch.object(Path, "read_bytes", flaky_read_bytes), \
                  mock.patch.object(Path, "read_text", flaky_read_text), \

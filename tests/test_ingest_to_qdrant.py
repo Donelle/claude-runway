@@ -15,7 +15,7 @@ import io
 import os
 import sys
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -116,16 +116,81 @@ class NonDryRunStillPerformsCollectionMaintenance(unittest.TestCase):
                 _run(mod.ingest(_args(dry_run=False, reset=False)))
         fake_ensure.assert_called_once_with(fake_client, "test-collection")
 
-    def test_non_dry_run_reset_still_deletes_the_real_collection(self):
+    def _run_reset(self, fake_client, collection="test-collection", mismatch=None):
+        with mock.patch.object(mod, "QdrantClient", return_value=fake_client), \
+             mock.patch.object(mod, "FastEmbedProvider"), \
+             mock.patch.object(mod, "QdrantConnector"), \
+             mock.patch.object(mod, "check_embedding_model_mismatch", return_value=mismatch) as fake_check, \
+             mock.patch.object(mod, "store_batch", new=mock.AsyncMock(return_value=0)):
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                _run(mod.ingest(_args(dry_run=False, reset=True, collection=collection)))
+        return fake_check
+
+    def test_non_dry_run_reset_uses_filtered_delete_never_delete_collection(self):
+        """Issue #265: pins the index_repo-style filtered delete (this used
+        to pin a raw delete_collection)."""
         fake_client = mock.MagicMock()
         fake_client.collection_exists.return_value = True
+        fake_check = self._run_reset(fake_client)
+        fake_client.delete_collection.assert_not_called()
+        fake_client.delete.assert_called_once()
+        kwargs = fake_client.delete.call_args.kwargs
+        self.assertEqual(kwargs["collection_name"], "test-collection")
+        self.assertEqual(kwargs["points_selector"], mod.mb.memory_bank_exclusion_filter())
+        # fail_closed=True is what makes an inconclusive check block the delete.
+        self.assertTrue(fake_check.call_args.kwargs["fail_closed"])
+
+    def test_reset_on_missing_collection_deletes_nothing(self):
+        fake_client = mock.MagicMock()
+        fake_client.collection_exists.return_value = False
+        self._run_reset(fake_client)
+        fake_client.delete.assert_not_called()
+        fake_client.delete_collection.assert_not_called()
+
+    def test_model_mismatch_blocks_reset_before_any_delete(self):
+        fake_client = mock.MagicMock()
+        fake_client.collection_exists.return_value = True
+        with self.assertRaises(SystemExit) as cm:
+            self._run_reset(fake_client, mismatch="Error: embedding model mismatch")
+        self.assertEqual(cm.exception.code, 1)
+        fake_client.delete.assert_not_called()
+        fake_client.delete_collection.assert_not_called()
+
+
+class ResetRefusesMemoryBankCollection(unittest.TestCase):
+    """Issue #265: --reset against the configured memory-bank collection is
+    refused outright, before any Qdrant client is even constructed."""
+
+    def _assert_refused(self, **overrides):
+        fake_client_cls = mock.MagicMock()
+        err = io.StringIO()
+        with mock.patch.object(mod, "QdrantClient", fake_client_cls), \
+             mock.patch.object(mod, "DEFAULT_MEMORY_BANK_COLLECTION", "my-shared-bank"), \
+             mock.patch.object(mod, "FastEmbedProvider"), \
+             mock.patch.object(mod, "QdrantConnector"):
+            with redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+                _run(mod.ingest(_args(collection="my-shared-bank", reset=True, **overrides)))
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn("memory-bank", err.getvalue())
+        fake_client_cls.assert_not_called()
+
+    def test_reset_of_memory_bank_collection_is_refused(self):
+        self._assert_refused(dry_run=False)
+
+    def test_refusal_also_applies_alongside_dry_run(self):
+        self._assert_refused(dry_run=True)
+
+    def test_non_reset_ingest_into_memory_bank_name_is_not_this_guards_concern(self):
+        """Scope pin: only --reset is guarded here (issue #265)."""
+        fake_client = mock.MagicMock()
+        fake_client.collection_exists.return_value = False
         with mock.patch.object(mod, "QdrantClient", return_value=fake_client), \
+             mock.patch.object(mod, "DEFAULT_MEMORY_BANK_COLLECTION", "my-shared-bank"), \
              mock.patch.object(mod, "FastEmbedProvider"), \
              mock.patch.object(mod, "QdrantConnector"), \
              mock.patch.object(mod, "store_batch", new=mock.AsyncMock(return_value=0)):
             with redirect_stdout(io.StringIO()):
-                _run(mod.ingest(_args(dry_run=False, reset=True)))
-        fake_client.delete_collection.assert_called_once_with("test-collection")
+                _run(mod.ingest(_args(collection="my-shared-bank", reset=False)))
 
 
 class MainIsTheConsoleScriptEntryPoint(unittest.TestCase):
