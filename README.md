@@ -14,6 +14,7 @@ Each piece works independently — you don't need LM Studio to use the Qdrant me
 - [Files (41)](#files-41)
 - [Prerequisites](docs/prerequisites.md)
   - [Windows GPU setup for LM Studio](docs/windows-setup.md)
+- [Local workstation and model guide](docs/workstation-guide.md) — compression configurations and planning for future development model routing
 - [Installation](docs/installation.md)
 - [Environment variables](docs/environment-variables.md) — **must be set in two places and kept in sync**
 - [Verifying it's working](docs/verifying-its-working.md)
