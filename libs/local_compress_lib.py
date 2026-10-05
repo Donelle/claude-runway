@@ -1358,9 +1358,10 @@ _failure_state = threading.local()
 def take_failure_kind() -> Optional[str]:
     """Return and clear why this thread's last complete() call failed.
 
-    "timeout" -- the request exceeded the per-request timeout (LM Studio is
-    reachable but busy, e.g. its parallel-request slots are all taken and the
-    request sat in its queue); "other" -- anything else (connection refused,
+    "timeout" -- the request exceeded the per-request timeout (LM Studio may
+    be busy, e.g. its parallel-request slots are all taken and the request sat
+    in its queue, or unreachable: the SDK's timeout error also covers a
+    connection that never got established); "other" -- anything else (connection refused,
     model not found, ...); None -- no reason was recorded, e.g. complete() was
     replaced by a test stub, or nothing failed. Callers must treat None as
     "unknown" and fall back to the generic failure wording. Clearing on read
@@ -1408,11 +1409,12 @@ _ALL_TIMED_OUT_PREFIX = "[LM Studio timed out on every request"
 def _request_failed_message(where: str, kind: Optional[str], base_url: Optional[str]) -> str:
     """Wording for a failed LM Studio request (issue #368).
 
-    A timeout means LM Studio answered the connection but did not finish in
-    time -- typically because it is busy (it runs a limited number of requests
-    in parallel, 4 by default, and queues the rest) -- so telling the reader to
-    "check it's still running" sends them looking for an outage that isn't
-    there. Anything else, including an unknown reason (kind is None, e.g. a
+    A timeout means the request did not finish in time -- typically because
+    LM Studio is busy (it runs a limited number of requests in parallel, 4 by
+    default, and queues the rest), but the SDK's timeout error also covers a
+    connection that never got established, so it does not prove LM Studio was
+    reached. The wording therefore names both causes instead of telling the
+    reader to "check it's still running". Anything else, including an unknown reason (kind is None, e.g. a
     stubbed complete()), keeps the original wording, which is the right advice
     for a refused connection or a missing model.
     """
@@ -1779,7 +1781,9 @@ async def _compress_each_section(text, focus, oai_client, model, base_url, prese
     compressed_count = verbatim_count = 0
     request_failed_count = not_relevant_count = empty_response_count = 0
     # Why each failed request failed (issue #368), so an outage made up ENTIRELY
-    # of timeouts (a busy LM Studio) is not reported as "appears unreachable".
+    # of timeouts (usually a busy LM Studio, though a timeout can also mean it
+    # was unreachable) gets the neutral "timed out" wording, not the
+    # connection-refused "appears unreachable" one.
     failure_kinds: list = []
     # A prose run in a mixed section got a live answer (empty or NOT RELEVANT)
     # that falls back uncounted: it proves LM Studio answered, so the all-timed-out
@@ -1967,9 +1971,10 @@ async def _compress_each_section(text, focus, oai_client, model, base_url, prese
         and not live_fallback_seen
     ):
         if failure_kinds and all(k == "timeout" for k in failure_kinds):
-            # Every failed request timed out: LM Studio answered but was too
-            # busy to finish in time. Not an outage -- and a different prefix
-            # (not "appears unreachable") so callers/readers aren't misled.
+            # Every failed request timed out: usually LM Studio was too busy
+            # to finish in time, but a timeout can also mean it was
+            # unreachable, so the wording names both. A different prefix from
+            # "appears unreachable" so callers can tell the two apart.
             result = (
                 f"{_ALL_TIMED_OUT_PREFIX} -- LM Studio may be busy or unreachable; "
                 f"no section was compressed; original content preserved]\n\n{result}"
