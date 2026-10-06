@@ -30,6 +30,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 import compress_bash_output as hook  # noqa: E402
 from compress_bash_output import _is_exactness_critical  # noqa: E402
 
+# The other three stdin-reading hooks, imported for the issue #263 stdin-encoding
+# regression tests at the bottom of this file. Each is a standalone script with
+# its own main(); none does network I/O on import.
+import record_session_id as record_session_id_hook  # noqa: E402
+import redirect_webfetch_to_fetch_url as redirect_hook  # noqa: E402
+import session_end_savings as session_end_hook  # noqa: E402
+
 
 # Commands whose output must reach Claude byte-exact (hook skips compression).
 MUST_SKIP = [
@@ -1127,6 +1134,141 @@ class MainHandlesGenericMcpTools(unittest.TestCase):
         # Footer path tags the event with the footer's own tool name, not
         # "hook:mcp__local-compress__compress_file" -- unchanged behavior.
         self.assertEqual(args[1], "compress_file")
+
+
+def _windows_style_stdin(payload_bytes):
+    """Return a text stream that mimics how Python opens stdin on a Western
+    Windows install: a TextIOWrapper over the raw payload bytes whose encoding
+    is cp1252, NOT utf-8 (issue #263). Building it explicitly (rather than
+    relying on the test runner actually being Windows) makes these tests
+    deterministic on all three CI OSes -- cp1252 is a built-in codec
+    everywhere. A hook's main() is expected to reconfigure this stream to
+    utf-8 before reading it; these tests verify it does."""
+    return io.TextIOWrapper(io.BytesIO(payload_bytes), encoding="cp1252", newline="")
+
+
+def _utf8_stdin_bytes(payload):
+    """Serialize a payload the way Claude Code actually writes it to a hook's
+    stdin: raw UTF-8 JSON with non-ASCII left as literal multi-byte sequences
+    (ensure_ascii=False), NOT backslash-uXXXX-escaped ASCII. The escaped form
+    would make every byte ASCII and hide the encoding bug entirely (json.dumps
+    defaults to ensure_ascii=True)."""
+    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+
+# A sentinel exercising BOTH failure modes the issue describes at once:
+#   - multi-byte UTF-8 that cp1252 silently mojibakes: U+00E9 (e-acute) and
+#     U+2192 (right arrow) -- routine in build logs / fetched pages; and
+#   - U+0081, whose UTF-8 encoding is 0xC2 0x81. 0x81 is one of cp1252's five
+#     unmapped bytes, so reading these bytes as cp1252 raises UnicodeDecodeError
+#     on the 0x81, while a correct utf-8 read keeps it. That unmapped byte is
+#     what makes the cp1252-vs-utf-8 difference an observable RAISE, not merely
+#     cosmetic mojibake. All three chars are written as \u escapes so no
+#     editor/terminal round-trip can silently drop them.
+_E_ACUTE = "é"
+_ARROW = "→"
+_CTRL_0081 = ""  # UTF-8: C2 81 -> 0x81 unmapped in cp1252
+_UTF8_SENTINEL = "caf" + _E_ACUTE + " " + _ARROW + " " + _CTRL_0081 + " end"
+
+
+class HooksReconfigureStdinToUtf8(unittest.TestCase):
+    """Issue #263: all four stdin-reading hooks must force stdin to utf-8
+    before json.load, because Windows Python defaults stdin to the locale
+    codepage (cp1252). Left unfixed, multi-byte UTF-8 decodes as mojibake
+    (which compress_bash_output would then splice back as the tool's output)
+    and cp1252-unmapped bytes raise UnicodeDecodeError that the fail-open
+    json.load guard swallows -- silently skipping compression / marker writes
+    for exactly the riskiest payloads. These tests feed a simulated
+    Windows-cp1252 stdin carrying real UTF-8 bytes and confirm each hook
+    decodes them correctly rather than corrupting or dropping the payload."""
+
+    def test_vehicle_is_real_cp1252_would_raise(self):
+        # Guards the test itself: prove the simulated stdin genuinely misbehaves
+        # under cp1252 the way the bug describes, so a passing per-hook test
+        # below means the reconfigure actually fired rather than the vehicle
+        # being a no-op. The 0xC2 0x81 (U+0081) sequence is valid utf-8 but
+        # 0x81 is unmapped in cp1252 -- reading the stream as cp1252 raises.
+        raw = _utf8_stdin_bytes({"x": _UTF8_SENTINEL})
+        with self.assertRaises(UnicodeDecodeError):
+            _windows_style_stdin(raw).read()
+
+    def _run_hook_main(self, main_callable, payload):
+        """Drive a hook's main() with a Windows-cp1252 stdin carrying `payload`
+        as real UTF-8 bytes. Re-raises anything that isn't SystemExit, so a
+        hook that crashes on the UTF-8 payload (the pre-fix behavior) fails the
+        test loudly instead of silently."""
+        raw = _utf8_stdin_bytes(payload)
+        real_stdin = sys.stdin
+        sys.stdin = _windows_style_stdin(raw)
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with redirect_stdout(out), redirect_stderr(err):
+                try:
+                    main_callable()
+                except SystemExit:
+                    pass  # hooks exit(0) on their fail-open / no-op paths
+        finally:
+            sys.stdin = real_stdin
+        return out.getvalue()
+
+    def test_compress_hook_decodes_utf8_and_does_not_mojibake(self):
+        # The highest-stakes hook: it compresses tool_response and can splice
+        # the result back as Claude's view of the output. Capture what reaches
+        # the compress call and assert it's the real UTF-8 text, not mojibake.
+        seen = {}
+
+        async def _capture_compress(text, *a, **k):
+            seen["text"] = text
+            return "[compressed %d -> 4 chars across 1 chunk(s), ~99%% smaller]\nGIST" % len(text)
+
+        real_compress = hook.compress
+        hook.compress = _capture_compress
+        try:
+            payload = {
+                "session_id": "s",
+                "cwd": "/repos/p",
+                "tool_name": "Bash",
+                "tool_input": {"command": "run-build"},
+                # _handle_bash expects the {stdout, stderr} dict shape. Pad
+                # stdout past the compression threshold so it actually calls
+                # compress() rather than taking the under-threshold short-circuit.
+                "tool_response": {
+                    "stdout": _UTF8_SENTINEL + ("x" * (hook.THRESHOLD + 100)),
+                    "stderr": "",
+                },
+            }
+            self._run_hook_main(hook.main, payload)
+        finally:
+            hook.compress = real_compress
+        self.assertIn("text", seen, "compress() was never reached -- payload failed to parse")
+        # The decoded text must contain the real UTF-8 chars, never their
+        # cp1252 mojibake (e.g. 'caf' + mojibake for the e-acute).
+        self.assertIn(_E_ACUTE, seen["text"])
+        self.assertIn(_ARROW, seen["text"])
+        self.assertNotIn("Ã©", seen["text"])  # 'Ã©', the cp1252 mojibake of é
+
+    def test_record_session_id_hook_parses_utf8_payload_without_crashing(self):
+        # A SessionEnd payload (no tool_name) whose cwd carries non-ASCII.
+        # Under the bug this raised UnicodeDecodeError, swallowed into a silent
+        # skip of the shadow-marker write; after the fix it parses and
+        # dispatches cleanly. The hook is fail-open by design, so a clean
+        # (non-raising) run through main() is the observable success here.
+        payload = {"hook_event_name": "SessionEnd", "session_id": "s", "cwd": "/repos/" + _UTF8_SENTINEL}
+        self._run_hook_main(record_session_id_hook.main, payload)
+
+    def test_redirect_hook_parses_utf8_payload_without_crashing(self):
+        # A non-WebFetch payload: the hook parses it, sees tool_name != WebFetch,
+        # and allows. The point is that the parse itself survives the UTF-8 bytes
+        # on a cp1252-default stdin rather than raising into fail-open.
+        payload = {"tool_name": "Bash", "tool_input": {"command": _UTF8_SENTINEL}}
+        self._run_hook_main(redirect_hook.main, payload)
+
+    def test_session_end_savings_hook_parses_utf8_payload_without_crashing(self):
+        # Tracking is off by default, so main() parses then no-ops at the
+        # tracking_enabled() gate -- but it must REACH that gate, i.e. the UTF-8
+        # payload must parse under the cp1252-default stdin first.
+        payload = {"session_id": "s", "cwd": "/repos/" + _UTF8_SENTINEL, "transcript_path": None}
+        self._run_hook_main(session_end_hook.main, payload)
 
 
 if __name__ == "__main__":

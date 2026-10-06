@@ -141,6 +141,20 @@ def _dispatch(payload: dict) -> None:
 
 
 def main() -> None:
+    # Force UTF-8 on stdin before the read: Claude Code sends the payload as
+    # UTF-8, but Windows Python defaults stdin to the locale codepage
+    # (cp1252), under which a cp1252-unmappable byte raises UnicodeDecodeError
+    # -- a ValueError the guard below swallows into a silent fail-open, which
+    # would skip this session's shadow-marker write for exactly those payloads
+    # (issue #263). Guarded because a non-reconfigurable stream (e.g.
+    # io.StringIO in the unit tests) has no reconfigure(); fail open rather
+    # than crash.
+    _reconfigure = getattr(sys.stdin, "reconfigure", None)
+    if _reconfigure is not None:
+        try:
+            _reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass  # already-consumed/detached stream -- fail open
     try:
         payload = json.load(sys.stdin)
     except (json.JSONDecodeError, ValueError):

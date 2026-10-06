@@ -949,6 +949,25 @@ def _dispatch(payload):
 
 
 def main():
+    # Claude Code writes the hook payload to stdin as UTF-8, but on Windows
+    # Python opens stdin with the locale codepage (cp1252 on a US/Western
+    # install), not UTF-8 (issue #263). Left unfixed that has two silent,
+    # wrong-result failure modes here: (1) multi-byte UTF-8 in tool_response
+    # (routine in build logs/fetched pages) decodes as mojibake, which this
+    # hook would then compress and splice back in via updatedToolOutput --
+    # Claude reads a summary of garbage as if it were the real output; and
+    # (2) bytes with no cp1252 mapping (0x81/0x8D/0x8F/0x90/0x9D) raise
+    # UnicodeDecodeError -- a ValueError subclass the json.load guard below
+    # swallows -- so compression silently dies for exactly the riskiest
+    # outputs. Force UTF-8 with errors="replace" before the read. Guarded
+    # because a non-reconfigurable stream (e.g. io.StringIO in the unit
+    # tests) has no reconfigure(); fail open rather than crash the hook.
+    _reconfigure = getattr(sys.stdin, "reconfigure", None)
+    if _reconfigure is not None:
+        try:
+            _reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass  # already-consumed/detached stream -- fail open
     try:
         payload = json.load(sys.stdin)
     except (json.JSONDecodeError, ValueError):
