@@ -99,6 +99,7 @@ silently picking an answer, since this is meant to be iterated on:
      compress_command_output already are.
 """
 
+import codecs
 import json
 import os
 import re
@@ -344,6 +345,28 @@ async def _compress(
     )
 
 
+def _decode_file_bytes(data: bytes) -> str:
+    """Decode a file's raw bytes without silently corrupting them (issue #267).
+
+    The old read, `read_text(encoding="utf-8", errors="ignore")`, pinned the
+    encoding but still dropped every byte it couldn't decode, so the model
+    summarized subtly corrupted input with nothing to notice: a cp1252/latin-1
+    file lost every accented character, and a UTF-16LE file (Windows
+    PowerShell 5.1's `>` default) arrived NUL-interleaved because NUL is
+    valid UTF-8. Honor a BOM first (stdlib codecs strip it, so it never
+    reaches the model), then decode as UTF-8 with errors="replace" so any
+    remaining undecodable byte shows up as a visible U+FFFD marker instead of
+    vanishing.
+    """
+    # UTF-32 BOMs must be tested before UTF-16's: UTF-32LE's BOM
+    # (FF FE 00 00) begins with UTF-16LE's (FF FE).
+    if data.startswith((codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)):
+        return data.decode("utf-32", errors="replace")
+    if data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        return data.decode("utf-16", errors="replace")
+    return data.decode("utf-8-sig", errors="replace")
+
+
 @mcp.tool()
 async def compress_file(
     file_path: str,
@@ -393,10 +416,7 @@ async def compress_file(
     path = Path(file_path)
     if not path.is_file():
         return f"Error: {path} is not a file."
-    # Explicit encoding: otherwise a non-ASCII file decodes per the platform
-    # locale and errors="ignore" silently drops the bytes it can't handle, so
-    # the model summarizes subtly corrupted input and reports nothing wrong.
-    text = path.read_text(encoding="utf-8", errors="ignore")
+    text = _decode_file_bytes(path.read_bytes())
     result = await _compress(text, focus, skip_if_under_chars, chunk_chars, max_total_chars, model, base_url, ctx, max_chars)
     return _append_savings_footer(result, result, tool="compress_file", raw_text=text, credited=True, source=file_path)
 

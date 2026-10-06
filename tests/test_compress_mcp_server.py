@@ -18,6 +18,7 @@ point of test_new_tool_is_picked_up_without_code_changes below is to make
 that exact failure mode impossible to reintroduce silently again.
 """
 
+import codecs
 import importlib.util
 import os
 import sys
@@ -1328,6 +1329,56 @@ class _FakeStreamedResponse:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
         return False
+
+
+class CompressFileDecodesWithoutSilentCorruption(unittest.TestCase):
+    """Regression coverage for issue #267: compress_file read files with
+    errors="ignore", silently dropping non-UTF-8 bytes (cp1252 accents) and
+    letting UTF-16 arrive NUL-interleaved."""
+
+    def _compress_file_text(self, data: bytes) -> str:
+        """Run compress_file on `data` and return the exact text handed to
+        _compress (stubbed, so no LM Studio is needed)."""
+        mod = _load_compress_mcp_server()
+        seen = {}
+
+        async def fake_compress(text, *args, **kwargs):
+            seen["text"] = text
+            return "summary"
+
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "f.log"
+            path.write_bytes(data)
+            with mock.patch.object(mod, "_compress", fake_compress):
+                _run(mod.compress_file(file_path=str(path)))
+        return seen["text"]
+
+    def test_cp1252_bytes_are_visible_replacements_not_dropped(self):
+        text = self._compress_file_text("caf\u00e9 \u201cquoted\u201d".encode("cp1252"))
+        self.assertIn("\ufffd", text)
+        self.assertTrue(text.startswith("caf"))
+        # The ASCII around each bad byte survives, and nothing was deleted:
+        # 1 char per undecodable byte (3 bad bytes: e-acute and two quotes).
+        self.assertEqual(text.count("\ufffd"), 3)
+        self.assertIn("quoted", text)
+
+    def test_utf16le_with_bom_decodes_cleanly(self):
+        text = self._compress_file_text("hello wor\u00e9ld".encode("utf-16"))
+        self.assertEqual(text, "hello wor\u00e9ld")
+        self.assertNotIn("\x00", text)
+
+    def test_utf16be_with_bom_decodes_cleanly(self):
+        data = codecs.BOM_UTF16_BE + "abc\u00e9".encode("utf-16-be")
+        self.assertEqual(self._compress_file_text(data), "abc\u00e9")
+
+    def test_utf32_with_bom_is_not_mistaken_for_utf16(self):
+        self.assertEqual(self._compress_file_text("abc".encode("utf-32")), "abc")
+
+    def test_utf8_bom_is_stripped(self):
+        self.assertEqual(self._compress_file_text(codecs.BOM_UTF8 + b"plain"), "plain")
+
+    def test_plain_utf8_is_unchanged(self):
+        self.assertEqual(self._compress_file_text("na\u00efve \u2713".encode("utf-8")), "na\u00efve \u2713")
 
 
 class FetchUrlEnforcesSizeCap(unittest.TestCase):
