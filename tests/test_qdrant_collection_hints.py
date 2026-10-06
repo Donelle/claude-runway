@@ -378,5 +378,23 @@ class ConnectionHygiene(_TempCacheDb):
             real.close()
 
 
+class ComputeSearchLimitTests(unittest.TestCase):
+    """compute_search_limit (issue #330): pure tier lookup, boundaries exclusive."""
+
+    def test_each_tier_and_boundary(self):
+        cases = [
+            (0, 10), (1, 10), (999, 10),
+            (1_000, 15), (4_999, 15),
+            (5_000, 25), (14_999, 25),
+            (15_000, 40), (1_000_000, 40),
+        ]
+        for count, expected in cases:
+            with self.subTest(point_count=count):
+                self.assertEqual(qdrant_collection_hints.compute_search_limit(count), expected)
+
+    def test_negative_count_uses_smallest_tier(self):
+        self.assertEqual(qdrant_collection_hints.compute_search_limit(-5), 10)
+
+
 if __name__ == "__main__":
     unittest.main()

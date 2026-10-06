@@ -360,3 +360,27 @@ def get_cached_search_limits(qdrant_url: str, collections: list) -> dict:
 def get_cached_search_limit(qdrant_url: str, collection: str) -> Optional[int]:
     """Single-collection convenience wrapper; returns None on a miss."""
     return get_cached_search_limits(qdrant_url, [collection]).get(collection)
+
+
+# Tier boundaries for compute_search_limit (issue #330, part of #326). Kept as
+# a module-level table rather than inline if-chains so retuning is a data edit.
+# Each entry is (exclusive upper bound on point_count, limit); anything at or
+# above the last bound gets _SEARCH_LIMIT_MAX. A starting point calibrated
+# against this Qdrant instance's collection sizes -- expect to retune.
+_SEARCH_LIMIT_TIERS = ((1_000, 10), (5_000, 15), (15_000, 25))
+_SEARCH_LIMIT_MAX = 40
+
+
+def compute_search_limit(point_count: int) -> int:
+    """
+    Maps a collection's point count to a default search limit: bigger
+    collections need more results per query to surface the right chunk.
+    Pure -- no Qdrant/DB access -- so it is trivially unit-testable; callers
+    fetch the count and cache the result via set_cached_search_limit.
+    Bounds are exclusive (999 -> 10, 1000 -> 15), and a negative count (never
+    valid from Qdrant) falls into the smallest tier rather than raising.
+    """
+    for upper_bound, limit in _SEARCH_LIMIT_TIERS:
+        if point_count < upper_bound:
+            return limit
+    return _SEARCH_LIMIT_MAX
