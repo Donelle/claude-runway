@@ -117,6 +117,52 @@ MUST_SKIP = [
     ("kubectl get pods -o=json", "-o=json spelling"),
     ("kubectl get pods -ojson", "attached -ojson spelling"),
     ("kubectl get pods -o=YAML", "case-insensitive value on the = spelling"),
+    # --- issue #269: the exemptions that must SURVIVE the false-positive fixes ---
+    ("env", "bare env listing"),
+    ("env | sort", "env piped -- still a variable listing"),
+    ("env -i FOO=1 git status", "env launching an exempt command"),
+    ("env -u HOME pwd", "env with -u NAME before an exempt command"),
+    ("cat <<EOF | jq .\n{}\nEOF", "heredoc opener line still carries its own pipeline"),
+    ("cat <<EOF\nbody\nEOF\ngit status", "exempt command AFTER a heredoc terminator"),
+    ("kubectl get pods -o json | tee x.txt", "-o json as a real flag"),
+    ('git status "x y"', "quoted arg must not hide a command-start exemption"),
+    # --- review round 1 on PR #390: forms the first fix wrongly un-exempted ---
+    ("env --unset HOME git diff", "env option with a separate operand (--unset)"),
+    ("env -C /tmp git diff", "env -C DIR operand"),
+    ("env --chdir /tmp git diff", "env --chdir DIR operand"),
+    ("env -- git status", "-- ends env's options"),
+    ("env FOO=1 env BAR=2 git diff", "nested env wrappers"),
+    ("cat <<EOF\n$(git diff)\nEOF", "unquoted heredoc: substitution in the body executes"),
+    ("cat <<EOF\n`git diff`\nEOF", "unquoted heredoc: backtick in the body executes"),
+    ("bash <<'EOF'\ngit diff\nEOF", "heredoc body fed to a shell interpreter is a script"),
+    ("bash -c 'gh api repos/x/y/issues --paginate'", "gh api inside a quoted payload still executes"),
+    ("cat <<EOF\nEOF\ngit diff\ncat <<EOF\nnotes\nEOF", "empty heredoc must end at its FIRST terminator"),
+    # --- review round 2 on PR #390 ---
+    ("cat <<EOF\n$(\ngit diff\n)\nEOF", "multiline substitution in an unquoted heredoc"),
+    ("cat <<EOF\n`\ngit diff\n`\nEOF", "multiline backtick substitution"),
+    ("cat <<'EOF' | bash\ngit diff\nEOF", "heredoc piped into an interpreter on the opener line"),
+    ("env -S 'git diff' HEAD", "env -S command string: uncertain parse keeps the exemption"),
+    ("bash -c 'kubectl get pods -o json'", "quoted shell payload with a real -o json"),
+    ("bash -c 'aws s3api list-buckets --output json'", "quoted shell payload with --output json"),
+    ("bash -c 'git diff'", "quoted shell payload is itself an exempt command"),
+    # --- review round 3 on PR #390 ---
+    ('echo "<<EOF"\ngit diff\ncat <<EOF\nnotes\nEOF', "quoted << is not a heredoc opener"),
+    ("echo hi # <<EOF\ngit diff\ncat <<EOF\nnotes\nEOF", "<< inside a comment is not an opener"),
+    ("cat <<EOF-ONE\ngit diff\nEOF\nnotes\nEOF", "delimiter must be a complete token"),
+    ("ssh host <<'EOF'\ngit diff\nEOF", "ssh feeds the heredoc to a remote shell"),
+    ("cat <<'EOF' \\\n| bash\ngit diff\nEOF", "backslash-continued opener"),
+    ('env PATH="$PATH":/opt/bin git diff', "composite env assignment value"),
+    ("env 'FOO=a b' git diff", "fully quoted env assignment word"),
+    ('env CI=1 "git" diff', "quoted launched executable"),
+    ('env GIT_CONFIG_GLOBAL="$(printf /dev/null)" git diff', "assignment value split at $("),
+    # --- review round 4 on PR #390 ---
+    ('env NOTE="say \\"hello world\\" now" git diff', "escaped quotes in an assignment value"),
+    ("env LABEL=a\\ b git diff", "backslash-escaped space in an assignment value"),
+    ("cat <<'DOC-TEXT'\nexample <<EOF\nDOC-TEXT\ngit diff\ncat <<EOF\nnotes\nEOF", "non-word delimiter"),
+    ("bash \\\n<<'EOF'\ngit diff\nEOF", "interpreter on a continued preceding line"),
+    ('echo "\n<<EOF\n"\ngit diff\ncat <<EOF\nnotes\nEOF', "quote state carried across lines"),
+    ('env -C "$PWD"/. git diff', "adjacent quoted/unquoted env operand"),
+    ("env CI=1 /usr/bin/git diff", "launched executable given by path"),
 ]
 
 # Commands that should still be compressed normally.
@@ -162,6 +208,22 @@ MUST_COMPRESS = [
     # --- gh, but not `gh api`: unaffected by the issue #190 addition ---
     ('gh pr comment 190 --body "thanks!"', "gh subcommand other than api stays compressible"),
     ("gh pr view 190 -R x/y", "no --json, no api subcommand -- ordinary human-readable text"),
+    # --- issue #269: false positives that used to forfeit compression ---
+    ("env CI=1 npm test", "env as a launcher, not a listing"),
+    ("env -i PATH=/bin dotnet build", "env with options launching a non-exempt command"),
+    ("cat <<EOF\nfoo\ngit status is a verification\nEOF", "heredoc body line starting with an exempt word"),
+    ("cat <<'EOF' > f.sh\nenv\nwc -l x\nEOF", "quoted-delimiter heredoc, several exempt-looking body lines"),
+    ("cat <<-EOF\n\tgit log\n\tEOF", "<<- heredoc with indented terminator"),
+    ('echo "try --json here" && dotnet build', "flag text inside a quoted argument"),
+    ("echo 'use --porcelain' && npm test", "flag text inside single quotes"),
+    ("curl -o json.txt https://example.com", "-o with a filename that starts with json"),
+    ("curl --output yaml.out https://example.com", "--output with a yaml-prefixed filename"),
+    ("echo $((1<<3)) && dotnet build", "arithmetic << is not a heredoc"),
+    ("env -C /tmp npm test", "env with an operand option launching a non-exempt command"),
+    ("env FOO=1 env BAR=2 npm test", "nested env launching a non-exempt command"),
+    ("cat <<EOF\nEOF\ndotnet build", "empty heredoc followed by a non-exempt command"),
+    ("bash -c 'dotnet build'", "quoted shell payload that is not exempt"),
+    ("cat <<EOF\n$HOME git status\nEOF", "unquoted heredoc without a substitution is data"),
 ]
 
 
@@ -181,6 +243,19 @@ class ExactnessCritical(unittest.TestCase):
                     _is_exactness_critical(command),
                     f"{command!r} should still be compressed ({why})",
                 )
+
+
+class ExactnessCriticalIsLinearTime(unittest.TestCase):
+    def test_adversarial_assignment_prefix_does_not_backtrack_exponentially(self):
+        # `0="" 0="" ...` made the old `\S*`-based assignment prefix exponential
+        # (CodeQL flagged the env twin of it on PR #390); 30 words took many
+        # seconds before, and is instant now. Bound is generous to avoid flakes.
+        import time
+
+        for cmd in ("0=" + '"" 0=' * 30, "env " + '0="" ' * 30 + "x"):
+            start = time.monotonic()
+            _is_exactness_critical(cmd)
+            self.assertLess(time.monotonic() - start, 2.0, cmd[:40])
 
 
 class CompileExtraExactPatterns(unittest.TestCase):

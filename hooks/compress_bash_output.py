@@ -180,6 +180,7 @@ import asyncio
 import json
 import os
 import re
+import shlex
 import sys
 
 # local_compress_lib.py lives in the tools repo under libs/, NOT inside
@@ -357,7 +358,10 @@ _EXACT_CMDS = (
     r"wc|cksum|md5|md5sum|sha1sum|sha256sum|sha512sum|shasum",
     # Exact identifiers, typically substituted straight into a follow-up call.
     r"pwd|realpath|readlink|basename|dirname|which|hostname|whoami|id",
-    r"env|printenv",
+    # Bare `env` is NOT here: `env VAR=x npm test` is the standard idiom for
+    # RUNNING a command, so a start-anchored `env` exempted the whole launched
+    # command (issue #269). It's handled by _ENV_RE below instead.
+    r"printenv",
     # Requested in a machine-readable form precisely because it gets parsed.
     r"jq|yq",
     # Version pins, where the digits are the entire payload.
@@ -369,8 +373,15 @@ _EXACT_CMDS = (
 # the first space and would leave `FOO="a b" git status` unmatched -- silently
 # dropping the exemption for a genuinely exactness-critical command. Quoted
 # alternatives come first so `\S*` can't grab a bare `"a` and strand the rest.
+# One assignment WORD: composite values (`PATH="$PATH":/opt/bin`) and a fully
+# quoted word (`'FOO=a b'`) both count. Each alternative starts with a distinct
+# character class (single chars for the bare part), so the `*` is unambiguous.
+_ASSIGN_WORD = r"""(?:\w+=(?:"[^"]*"|'[^']*'|[^\s"'])*|"\w+=[^"]*"|'\w+=[^']*')"""
+# `\S*` for the bare part used to make this prefix exponential on input like
+# `0="" 0="" 0="" ...` (a bare `\S*` can also swallow a quoted value, so the
+# repetition had many ways to match); _ASSIGN_WORD has exactly one.
 _EXACT_CMD_RE = re.compile(
-    r"^(?:\w+=(?:\"[^\"]*\"|'[^']*'|\S*)\s+)*(?:sudo\s+)?(?:" + "|".join(_EXACT_CMDS) + r")\b"
+    r"^(?:" + _ASSIGN_WORD + r"\s+)*(?:sudo\s+)?(?:" + "|".join(_EXACT_CMDS) + r")\b"
 )
 
 # Matched ANYWHERE in a segment: these flags are how a caller says "give me
@@ -387,7 +398,9 @@ _EXACT_FLAG_RE = re.compile(
     r"--porcelain\b|--json\b|--version\b|--query\b|--format[= ]"
     # `-o json`, `-o=json` and `-ojson` are all accepted spellings (kubectl,
     # az, ...) -- issue #268. The lookbehind keeps `--foo-ojson` from matching.
-    r"|(?<![\w-])-o[= ]?\s*(?i:json|tsv|yaml)\b|--output[= ](?i:json|tsv|yaml)\b|\|\s*jq\b"
+    # The trailing `(?![\w.-])` (not `\b`) keeps `-o json.txt` -- an output
+    # FILENAME -- from reading as a format value (issue #269).
+    r"|(?<![\w-])-o[= ]?\s*(?i:json|tsv|yaml)(?![\w.-])|--output[= ](?i:json|tsv|yaml)(?![\w.-])|\|\s*jq\b"
     # `grep -c` / `grep -rc` etc. -- counting, where the number is the answer.
     r"|\bgrep\b[^|;&]*\s-\w*c(?:\s|$)"
     # A dry run's entire output IS the preview of exactly what would happen --
@@ -426,8 +439,13 @@ _EXACT_FLAG_RE = re.compile(
     # narrower fix would have left that skill's primary feedback-fetch step
     # exactly as exposed as before. One `gh api` match covers all three real
     # shapes (plain, `--jq`-filtered, and `graphql`) plus any future one.
-    r"|\bgh\s+api\b"
 )
+
+# `gh api` lives in its own pattern, NOT in _EXACT_FLAG_RE above: that one runs
+# on quote-stripped text (issue #269), but `bash -c 'gh api ...'` executes its
+# quoted payload and returns structured JSON, so this one must see the raw
+# segment. See the `gh api` rationale in the comment block above.
+_EXACT_ANYWHERE_RE = re.compile(r"\bgh\s+api\b")
 
 # Escape hatch: a genuinely large exempt output (a 5MB `git diff`) can opt back
 # in with a trailing `# compress-ok` comment, so this list never becomes a
@@ -509,6 +527,140 @@ _EXTRA_EXACT_PATTERNS = _compile_extra_exact_patterns()
 _SEGMENT_SPLIT_RE = re.compile(r"\|\||&&|\$\(|`|[;|\n]")
 
 
+# Heredoc bodies are data, not commands (issue #269). Splitting on `\n` would
+# otherwise put each body line at segment start, so a commit message or
+# generated script with a line beginning `git`/`wc`/`env` exempted the whole
+# command. The body is dropped but the `<<WORD ...` line itself (which can
+# carry `| jq`, `> file`, ...) is kept. Only TERMINATED heredocs are removed:
+# an unterminated match is more likely `$((1<<3))` than a real heredoc.
+# `(?<!<)`/`(?!<)` skip the `<<<` here-string. The body group is lazily
+# optional (`??`) so an EMPTY heredoc ends at its first terminator instead of
+# swallowing everything up to a later heredoc's terminator.
+_HEREDOC_RE = re.compile(
+    r"(?<!<)<<(?!<)-?[ \t]*(['\"]?)(\w+)\1(?![^\s;|&<>()])([^\n]*)\n(?:(.*?)\n)??[ \t]*\2[ \t]*(?=\n|\Z)",
+    re.DOTALL,
+)
+# A heredoc fed to a shell interpreter (incl. `ssh`, whose remote shell runs
+# it) is a SCRIPT, not data -- keep its body.
+# The guards keep a FILENAME like `f.sh` (`> f.sh`) from reading as `sh`.
+_SHELL_INTERP_RE = re.compile(r"(?<![\w.-])(?:ba|z|da|k|c|s)?sh(?![\w.-])|\bsource\b|\beval\b")
+# In an UNQUOTED heredoc, `$(...)`/backticks in the body still execute, and a
+# substitution can span lines (`$(\ngit diff\n)`), so everything from the first
+# marker on is kept -- conservative: it may scan some trailing literal text.
+_SUBSTITUTION_RE = re.compile(r"\$\(|`")
+
+
+_HEREDOC_MARK_RE = re.compile(r"(?<!<)<<(?!<)")
+
+
+def _strip_heredoc_bodies(command):
+    """Apply _heredoc_replacement, but only when EVERY `<<` is accounted for.
+
+    A `<<` that is neither a parsed opener nor inside a parsed body (a
+    non-word delimiter like `<<'DOC-TEXT'`, `$((1<<3))`) means the command is
+    not understood well enough to delete anything from it safely.
+    """
+    spans = [(m.start(), m.end()) for m in _HEREDOC_RE.finditer(command)]
+    for mark in _HEREDOC_MARK_RE.finditer(command):
+        if not any(start <= mark.start() < end for start, end in spans):
+            return command
+    return _HEREDOC_RE.sub(_heredoc_replacement, command)
+
+
+def _heredoc_replacement(m):
+    delim_quote, word, rest, body = m.group(1), m.group(2), m.group(3), m.group(4) or ""
+    line_start = m.string.rfind("\n", 0, m.start()) + 1
+    prefix = m.string[line_start:m.start()]
+    # Uncertain spans stay UNCHANGED (so nothing real is deleted). Judged on
+    # EVERYTHING before the opener, not just its own line, since quote state,
+    # comments and `\`-continuations all carry across lines: an odd quote
+    # count means this `<<` may sit inside a quoted argument, a `#` may make it
+    # a comment, and a backslash may continue an earlier line that names the
+    # interpreter (`bash \\\n<<EOF`).
+    before = m.string[:m.start()]
+    if before.count('"') % 2 or before.count("'") % 2 or "#" in before or "\\" in before:
+        return m.group(0)
+    if rest.rstrip().endswith("\\"):
+        return m.group(0)
+    # Whole opener line, both sides of `<<`: `cat <<EOF | bash` pipes the body
+    # into an interpreter just as `bash <<EOF` does.
+    opener = prefix + rest
+    if _SHELL_INTERP_RE.search(opener):
+        kept = body
+    elif delim_quote:
+        kept = ""
+    else:
+        sub = _SUBSTITUTION_RE.search(body)
+        kept = body[sub.start():] if sub else ""
+    return "<<" + word + rest + ("\n" + kept if kept else "")
+
+# Quoted spans are text, not flags: `echo "try --json here"`. Stripped before
+# the ANYWHERE flag patterns run (not the start-anchored command table, whose
+# assignment sub-pattern needs the quotes, nor _EXACT_ANYWHERE_RE). A real
+# quoted `--porcelain` losing its exemption is the safe direction --
+# `# compress-ok` is the opt-in for the other way round, and a wrongly-exempt
+# command is the silent error.
+_QUOTED_RE = re.compile(r"\"(?:\\.|[^\"\\])*\"|'[^']*'")
+
+# `env` is exempt only as a bare listing, or when the command it launches is
+# itself exempt (`env FOO=1 git status`) -- mirrors the VAR=val/sudo prefix
+# stripping in _EXACT_CMD_RE, in reverse (issue #269).
+#
+# Parsed with shlex (real shell word rules: escapes, adjacent quoted/unquoted
+# pieces, quoted executables) rather than regexes -- three review rounds on
+# PR #390 each found another quoting form a regex parser got wrong, and shlex
+# has no backtracking to attack. Anything shlex can't parse is UNCERTAIN, and
+# uncertain keeps the exemption (the benign direction for a lone `env` word).
+_ASSIGNMENT_TOKEN_RE = re.compile(r"\w+=.*", re.DOTALL)
+_ENV_OPTS_WITH_OPERAND = ("-u", "-C", "--unset", "--chdir")
+
+
+def _env_tokens_exempt(tokens):
+    """None if `tokens` isn't an `env` invocation; else whether it's exempt."""
+    i = 0
+    while i < len(tokens) and _ASSIGNMENT_TOKEN_RE.fullmatch(tokens[i]):
+        i += 1
+    if i < len(tokens) and tokens[i] == "sudo":
+        i += 1
+    if i >= len(tokens) or tokens[i] != "env":
+        return None
+    j = i + 1
+    while j < len(tokens):
+        tok = tokens[j]
+        if tok == "--":
+            j += 1
+            break
+        if tok.startswith(("-S", "--split-string")):
+            return True  # operand is command WORDS we don't parse: keep the exemption
+        if tok in _ENV_OPTS_WITH_OPERAND:
+            j += 2
+        elif tok.startswith("-") or _ASSIGNMENT_TOKEN_RE.fullmatch(tok):
+            j += 1
+        else:
+            break
+    rest = tokens[j:]
+    if not rest:
+        return True
+    nested = _env_tokens_exempt(rest)
+    if nested is not None:
+        return nested
+    # `env CI=1 /usr/bin/git diff`: judge the executable by its basename.
+    return bool(_EXACT_CMD_RE.match(" ".join([os.path.basename(rest[0])] + rest[1:])))
+
+
+def _env_segment_is_exempt(segment):
+    """None if `segment` isn't an `env` invocation; else whether it's exempt."""
+    try:
+        tokens = shlex.split(segment)
+    except ValueError:
+        # Unbalanced quote: usually _SEGMENT_SPLIT_RE cut inside a value at a
+        # `$(` (`env X="$(cmd)" git diff`). Re-walk with plain whitespace
+        # tokens just to learn whether this IS an env invocation; if so the
+        # parse is uncertain, so keep the exemption.
+        return True if _env_tokens_exempt(segment.split()) is not None else None
+    return _env_tokens_exempt(tokens)
+
+
 def _is_exactness_critical(command: str) -> bool:
     """True if any segment of a (possibly compound) Bash command produces
     output whose value depends on being byte-exact.
@@ -519,13 +671,27 @@ def _is_exactness_critical(command: str) -> bool:
     """
     if not command or _FORCE_COMPRESS_RE.search(command):
         return False
+    command = _strip_heredoc_bodies(command)
     for segment in _SEGMENT_SPLIT_RE.split(command):
         # A subshell `(git diff)` or group `{ git diff; }` leaves its opener
         # glued to the front of the segment, which would defeat `^` anchoring.
         segment = segment.strip().lstrip("({").strip()
         if not segment:
             continue
-        if _EXACT_CMD_RE.match(segment) or _EXACT_FLAG_RE.search(segment):
+        env_exempt = _env_segment_is_exempt(segment)
+        if env_exempt:
+            return True
+        if env_exempt is None and _EXACT_CMD_RE.match(segment):
+            return True
+        if _EXACT_ANYWHERE_RE.search(segment):
+            return True
+        if _EXACT_FLAG_RE.search(_QUOTED_RE.sub('""', segment)):
+            return True
+        # `bash -c '...'`/`eval '...'` EXECUTE their quoted payload, so it is a
+        # command, not argument text: judge each quoted span as a command too.
+        if _SHELL_INTERP_RE.search(segment) and any(
+            _is_exactness_critical(q.group(0)[1:-1]) for q in _QUOTED_RE.finditer(segment)
+        ):
             return True
         if any(extra.search(segment) for extra in _EXTRA_EXACT_PATTERNS):
             return True
