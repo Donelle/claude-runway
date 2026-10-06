@@ -6,7 +6,7 @@
 
 # Linting -- config lives in pyproject.toml's [tool.ruff.lint]. Run with:
 #   .venv/bin/ruff check libs tools hooks tests
-ruff==0.16.9
+ruff==0.16.10
 
 # Type checking -- replaces mypy (issue #297): Pyright is also what VS
 # Code's Pylance extension runs under the hood, so the editor and this
