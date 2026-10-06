@@ -805,6 +805,7 @@ def _compression_cache_key(
     chunk_chars: int = DEFAULT_CHUNK_CHARS,
     auto_truncated: bool = False,
     effective_url: str = DEFAULT_BASE_URL,
+    was_truncated: bool = False,
 ) -> str:
     """
     SHA-256 hex digest of the arguments that fully determine compress()'s
@@ -826,6 +827,11 @@ def _compression_cache_key(
       auto-detected call adds a "[note: focus looked positional...]" suffix
       while an explicit call adds a "[note: max_chars=N truncated...]" suffix
       (or none at all if the limit wasn't reached).
+    - was_truncated (issue #300, Copilot review): the positional truncation
+      note is gated on it, and by the time the key is built `text` is already
+      the sliced window. An N-char positional input (nothing dropped) and a
+      longer input whose first N chars are identical hash the same
+      text/max_chars/auto_truncated but need different notes.
     - preserve_identifiers and preserve_sections gate identifier-repair and
       redaction.
     - chunk_chars determines chunk boundaries, which changes what each LM
@@ -847,7 +853,7 @@ def _compression_cache_key(
     blob = (
         f"{text}\x00{focus}\x00{model or ''}\x00{max_chars}\x00"
         f"{preserve_identifiers}\x00{preserve_sections}\x00{chunk_chars}\x00"
-        f"{auto_truncated}\x00{effective_url}"
+        f"{auto_truncated}\x00{effective_url}\x00{was_truncated}"
     )
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
@@ -2259,6 +2265,7 @@ async def compress(
     cache_key = _compression_cache_key(
         text, focus, model, max_chars, preserve_identifiers, preserve_sections,
         chunk_chars, auto_truncated, base_url or DEFAULT_BASE_URL,
+        was_truncated,
     )
     cached = _cache_get(cache_key)
     if cached is not None:
@@ -2397,7 +2404,7 @@ async def compress(
             "source were considered (auto-truncated) -- this error means nothing relevant was "
             "found WITHIN that truncated portion, not that the whole document was searched. "
             "Pass a larger max_chars explicitly if the target content might be further in."
-            if auto_truncated else ""
+            if auto_truncated and was_truncated else ""
         )
         return (
             f"Error: none of the {len(chunks)} chunk(s) contained content relevant to the "
@@ -2472,7 +2479,7 @@ async def compress(
     truncate_note = (
         f" [note: focus looked positional, so only the first {original_len} chars of the "
         "source were considered -- pass max_chars explicitly to override this]"
-        if auto_truncated else ""
+        if auto_truncated and was_truncated else ""
     )
     result = f"[compressed {original_len} -> {len(compressed)} chars across {len(chunks)} chunk(s){skip_note}, ~{ratio}% smaller]{truncate_note}\n\n{compressed}"
     _cache_put(cache_key, result)
