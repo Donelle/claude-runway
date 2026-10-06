@@ -12,7 +12,7 @@ Four strategies exist:
 |------|-----------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------|----------|------|
 | 1    | HOOK_PAYLOAD    | Claude Code hands every hook `session_id`/`transcript_path` directly on stdin -- trivial extraction.        | Yes (hook only) | Yes -- authoritative | None |
 | 2    | SHADOW_FILE     | `hooks/record_session_id.py` writes a small presence marker (`session_<id>.jsonl`) into the sessions directory `savings_ledger.py` also uses (own filename prefix, no shared format); an MCP tool call scans for the most-recently-modified marker, optionally filtered by project. | Conditionally No — swept-marker fallback (PR #254) reaches TRANSCRIPT_SCAN only if the sessions directory exists; stale-marker fallback (PR #252) additionally requires a prior hook run to have written the marker | Yes — hook marker on primary path; TRANSCRIPT_SCAN result on fallback paths | Primary path: hook required. Stale-marker fallback: TRANSCRIPT_SCAN layout risk only (cwd-independent; uses marker's recorded path). Swept-marker fallback: cwd-sensitive + TRANSCRIPT_SCAN layout risk. |
-| 3    | TRANSCRIPT_SCAN | Claude Code itself continuously writes `~/.claude/projects/<slug>/<session-id>.jsonl` for every session, hook or no hook. `<slug>` is the project's absolute path with every `/` replaced by `-`. Picks the most-recently-modified file's stem. | No | Yes -- zero hook dependency | Depends on an undocumented, empirically-observed internal convention (macOS-verified only) |
+| 3    | TRANSCRIPT_SCAN | Claude Code itself continuously writes `~/.claude/projects/<slug>/<session-id>.jsonl` for every session, hook or no hook. `<slug>` is the project's absolute path with every path separator (and, on Windows, the drive colon) replaced by `-`. Picks the most-recently-modified file's stem. | No | Yes -- zero hook dependency | Depends on an undocumented, empirically-observed internal convention (verified on macOS and Windows) |
 | 4    | PROXY           | One `uuid.uuid4().hex` generated once per process and cached, reused for every event that process logs.     | No | No -- proxy, spans the whole process | None -- pure in-memory |
 
 Decision rule:
@@ -562,14 +562,24 @@ def _transcript_projects_dir() -> Path:
 def _project_slug(project: Optional[str]) -> Optional[str]:
     """
     Claude Code's own (undocumented, empirically observed) convention:
-    `<slug>` is the project's absolute path with every `/` replaced by `-`.
-    Verified directly against this machine's own `~/.claude/projects/`
-    (macOS). NOT supported on Windows: `str(Path(...))` on Windows produces
-    backslashes (`\\`) rather than forward slashes, so the `/`→`-`
-    replacement leaves them unchanged -- the slug would be
-    `\\repos\\my-project` instead of `-repos-my-project`, making
-    TRANSCRIPT_SCAN effectively broken for Windows-resident projects until
-    this is addressed.
+    `<slug>` is the project's absolute path with every path separator (and,
+    on Windows, the drive-letter colon) replaced by `-`. Verified directly
+    against this machine's own `~/.claude/projects/` on both macOS
+    (`/Users/dev/repo` -> `-Users-dev-repo`) and Windows
+    (`C:\\Repos\\...\\claude-runway` -> `C--Repos-...-claude-runway`: the
+    drive colon AND each backslash each map to a single `-`, so `C:\\` -> `C--`).
+
+    Windows was previously unsupported here (issue #264): `str(Path(...))` on
+    Windows produces backslashes and a drive colon, and a `/`-only replacement
+    left both unchanged -- so the "slug" was still an absolute Windows path.
+    That did NOT fail safe the way this docstring once claimed: joining an
+    absolute segment onto `_transcript_projects_dir()` makes pathlib discard
+    the left side entirely, resolving to the project directory ITSELF, where a
+    stray root-level `.jsonl` would be returned as a wrong-but-plausible
+    session id (strictly worse than None). Replacing `\\` and `:` alongside
+    `/` fixes the slug; `_session_id_from_transcript_scan` adds a containment
+    guard so any future convention miss fails safe rather than scanning
+    outside the transcripts dir.
 
     Returns None (rather than raising) if `project` is omitted and
     `os.getcwd()` itself fails -- see `_resolve_project`.
@@ -577,7 +587,14 @@ def _project_slug(project: Optional[str]) -> Optional[str]:
     p = _resolve_project(project)
     if p is None:
         return None
-    return str(p).replace("/", "-")
+    # Replace every separator Claude Code's slug convention collapses to `-`:
+    # forward slash (POSIX), backslash (Windows), and the Windows drive-letter
+    # colon. Each maps to a single `-` independently, so a drive root like
+    # `C:\\` becomes `C--` -- matching the real layout under ~/.claude/projects/.
+    slug = str(p)
+    for sep in ("/", "\\", ":"):
+        slug = slug.replace(sep, "-")
+    return slug
 
 
 def _session_id_from_transcript_scan(project: Optional[str]) -> Optional[str]:
@@ -592,7 +609,31 @@ def _session_id_from_transcript_scan(project: Optional[str]) -> Optional[str]:
     slug = _project_slug(project)
     if slug is None:
         return None
-    d = _transcript_projects_dir() / slug
+    projects_dir = _transcript_projects_dir()
+    d = projects_dir / slug
+    # Defensive containment guard (issue #264): if a slug-convention miss ever
+    # produces an absolute or `..`-escaping segment, `projects_dir / slug` can
+    # resolve OUTSIDE the transcripts dir (on Windows an absolute slug made
+    # pathlib discard `projects_dir` entirely, landing on the project root).
+    # Globbing there returns a wrong-but-plausible id, strictly worse than None,
+    # so require the resolved dir to actually sit under the transcripts dir
+    # before scanning. Resolve both sides so symlinks/relative parts compare
+    # on equal footing; fail safe to None on any resolution error. Catch
+    # OSError, RuntimeError, AND ValueError -- Path.resolve() raises all three
+    # on different malformed/cyclic inputs on Python 3.10-3.12 (OSError for
+    # missing/permission cases, RuntimeError for a symlink loop, ValueError for
+    # an embedded NUL in the path, e.g. a malformed marker's stored project
+    # that passed earlier validation). Letting any escape would violate
+    # session_id()'s documented never-raises/fail-open contract (Copilot review,
+    # PR #388) -- before this guard existed, is_dir() simply returned False for
+    # all of these, so the guard must not newly introduce a raising path.
+    try:
+        resolved = d.resolve()
+        base = projects_dir.resolve()
+        if base != resolved and base not in resolved.parents:
+            return None
+    except (OSError, RuntimeError, ValueError):
+        return None
     if not d.is_dir():
         return None
     dated = []
