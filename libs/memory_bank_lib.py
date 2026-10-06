@@ -603,6 +603,90 @@ async def recall_points(
     return results[:limit]
 
 
+# Page size for scroll_collection (issue #335). Qdrant's own scroll default is
+# 10; 1000 matches wipe_memory_bank's page size, keeping round trips low on a
+# large legacy collection without one enormous response.
+_SCROLL_BATCH_SIZE = 1000
+
+
+def scroll_collection(client: "QdrantClient", source: str, batch_size: int = _SCROLL_BATCH_SIZE) -> tuple:
+    """
+    Read-only, COMPLETE-for-an-unchanged-collection enumeration of every point
+    in `source` (issue #335, part of #327) -- for reading a foreign/legacy
+    collection (e.g. one that predates the shared memory-bank collection) so
+    its points can be audited or migrated. Loops `client.scroll` following
+    `next_offset` until Qdrant returns None, so unlike `recall_points` it is
+    a full walk rather than semantic top-k search, never silently capped at
+    a top-k: no query text and no embedding provider are involved at all.
+    Vectors are never fetched.
+
+    Completeness caveat (PR #382 review): `scroll()` has no cross-page
+    consistency guarantee (see wipe_memory_bank's docstring), so if points
+    are inserted or deleted WHILE this runs, the result is not a snapshot --
+    a concurrent insert can be missed or a concurrent delete still seen. The
+    full-enumeration guarantee therefore holds only for a collection nothing
+    is writing to (the normal case for a legacy/foreign source being
+    audited or migrated); callers needing more must quiesce writers first.
+
+    Returns `(points, errors)`:
+      * `points`: one dict per well-shaped point -- id, summary (the
+        `document` field), description, kind, repo, embedding_model,
+        created_at, weight (DEFAULT_WEIGHT when absent) -- the same field
+        names `recall_points` returns, minus the similarity scores.
+      * `errors`: one `{"id": ..., "error": "..."}` per point that is NOT
+        memory-bank-shaped (payload/metadata not a dict, or `metadata.repo`
+        missing). Such a point is reported and skipped rather than crashing
+        the whole scroll, since `source` may be any collection at all. A
+        missing collection yields `([], [{"id": None, "error": ...}])`.
+
+    Deliberately applies NO source/pending filter: the point is to see
+    everything in `source`, and callers decide what to do with each point.
+    """
+    if not call_with_retry(client.collection_exists, source):
+        return [], [{"id": None, "error": f"collection '{source}' does not exist."}]
+    points: list = []
+    errors: list = []
+    offset = None
+    while True:
+        records, offset = call_with_retry(
+            client.scroll,
+            collection_name=source,
+            limit=batch_size,
+            offset=offset,
+            with_payload=True,
+            with_vectors=False,
+        )
+        for record in records:
+            payload = record.payload
+            if not isinstance(payload, dict):
+                errors.append({"id": record.id, "error": "payload is missing or not an object."})
+                continue
+            meta = payload.get("metadata")
+            if not isinstance(meta, dict):
+                errors.append({"id": record.id, "error": "payload has no 'metadata' object."})
+                continue
+            repo = meta.get("repo")
+            if not repo:
+                errors.append({"id": record.id, "error": "metadata.repo is missing."})
+                continue
+            weight = meta.get("weight")
+            points.append(
+                {
+                    "id": record.id,
+                    "summary": payload.get("document", ""),
+                    "description": meta.get("description", ""),
+                    "kind": meta.get("kind"),
+                    "repo": repo,
+                    "embedding_model": meta.get("embedding_model"),
+                    "weight": DEFAULT_WEIGHT if weight is None else weight,
+                    "created_at": meta.get("created_at"),
+                }
+            )
+        if offset is None:
+            break
+    return points, errors
+
+
 def count_memory_bank_points(client: "QdrantClient", collection: str, repo: Optional[str] = None) -> int:
     """
     Counts memory-bank points in `collection`, optionally scoped to `repo`.

@@ -918,5 +918,74 @@ class WipeMemoryBankTest(_PatchRetryMixin, unittest.TestCase):
         self.assertEqual(cond.match.value, True)
 
 
+class ScrollCollectionTest(_PatchRetryMixin, unittest.TestCase):
+    @staticmethod
+    def _rec(pid, payload):
+        r = MagicMock()
+        r.id = pid
+        r.payload = payload
+        return r
+
+    @staticmethod
+    def _good(repo="proj-a", **extra):
+        return {"document": "sum", "metadata": {"repo": repo, "description": "d", "kind": "lesson", **extra}}
+
+    def test_missing_collection_reports_error_and_never_scrolls(self):
+        client = MagicMock()
+        client.collection_exists.return_value = False
+        points, errors = mb.scroll_collection(client, "gone")
+        self.assertEqual(points, [])
+        self.assertEqual(len(errors), 1)
+        client.scroll.assert_not_called()
+
+    def test_follows_next_offset_until_none(self):
+        client = MagicMock()
+        client.collection_exists.return_value = True
+        client.scroll.side_effect = [
+            ([self._rec("a", self._good())], "off1"),
+            ([self._rec("b", self._good())], "off2"),
+            ([self._rec("c", self._good())], None),
+        ]
+        points, errors = mb.scroll_collection(client, "col", batch_size=1)
+        self.assertEqual([p["id"] for p in points], ["a", "b", "c"])
+        self.assertEqual(errors, [])
+        offsets = [c.kwargs["offset"] for c in client.scroll.call_args_list]
+        self.assertEqual(offsets, [None, "off1", "off2"])
+        for c in client.scroll.call_args_list:
+            self.assertEqual(c.kwargs["limit"], 1)
+            self.assertIs(c.kwargs["with_payload"], True)
+            self.assertIs(c.kwargs["with_vectors"], False)
+            self.assertNotIn("scroll_filter", c.kwargs)
+
+    def test_non_memory_bank_shaped_points_are_errors_not_crashes(self):
+        client = MagicMock()
+        client.collection_exists.return_value = True
+        client.scroll.return_value = (
+            [
+                self._rec("ok", self._good()),
+                self._rec("no-repo", {"document": "x", "metadata": {"kind": "lesson"}}),
+                self._rec("no-meta", {"document": "x"}),
+                self._rec("no-payload", None),
+            ],
+            None,
+        )
+        points, errors = mb.scroll_collection(client, "col")
+        self.assertEqual([p["id"] for p in points], ["ok"])
+        self.assertEqual({e["id"] for e in errors}, {"no-repo", "no-meta", "no-payload"})
+
+    def test_weight_defaults_when_absent_and_fields_mapped(self):
+        client = MagicMock()
+        client.collection_exists.return_value = True
+        client.scroll.return_value = (
+            [self._rec("a", self._good(weight=0.0, created_at=5.0)), self._rec("b", self._good())],
+            None,
+        )
+        points, _ = mb.scroll_collection(client, "col")
+        self.assertEqual(points[0]["weight"], 0.0)
+        self.assertEqual(points[0]["created_at"], 5.0)
+        self.assertEqual(points[0]["summary"], "sum")
+        self.assertEqual(points[1]["weight"], mb.DEFAULT_WEIGHT)
+
+
 if __name__ == "__main__":
     unittest.main()
