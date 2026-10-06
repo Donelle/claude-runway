@@ -1271,5 +1271,44 @@ class HooksReconfigureStdinToUtf8(unittest.TestCase):
         self._run_hook_main(session_end_hook.main, payload)
 
 
+class InvalidThresholdEnvTests(unittest.TestCase):
+    """Issue #270: a malformed CLAUDE_RUNWAY_COMPRESS_THRESHOLD_CHARS used to
+    raise ValueError at import time, killing the hook on every matched call.
+    Run in a real subprocess because the crash happens at module import."""
+
+    HOOK = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hooks", "compress_bash_output.py")
+
+    def _run(self, env_value):
+        import subprocess
+
+        env = dict(os.environ, CLAUDE_RUNWAY_COMPRESS_THRESHOLD_CHARS=env_value)
+        payload = {"tool_name": "Bash", "tool_input": {"command": "echo hi"},
+                   "tool_response": {"stdout": "hi", "stderr": ""}}
+        return subprocess.run([sys.executable, self.HOOK], input=json.dumps(payload),
+                              capture_output=True, text=True, env=env, timeout=60)
+
+    def test_non_numeric_values_fall_back_with_stderr_warning(self):
+        for bad in ("4,000", "2k", "abc", ""):
+            with self.subTest(value=bad):
+                r = self._run(bad)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertNotIn("Traceback", r.stderr)
+                self.assertIn("invalid CLAUDE_RUNWAY_COMPRESS_THRESHOLD_CHARS", r.stderr)
+
+    def test_parse_threshold_function(self):
+        old = os.environ.get("CLAUDE_RUNWAY_COMPRESS_THRESHOLD_CHARS")
+        try:
+            os.environ["CLAUDE_RUNWAY_COMPRESS_THRESHOLD_CHARS"] = "4,000"
+            with redirect_stderr(io.StringIO()):
+                self.assertEqual(hook._parse_threshold(), hook._DEFAULT_THRESHOLD)
+            os.environ["CLAUDE_RUNWAY_COMPRESS_THRESHOLD_CHARS"] = " 4000 "
+            self.assertEqual(hook._parse_threshold(), 4000)
+        finally:
+            if old is None:
+                os.environ.pop("CLAUDE_RUNWAY_COMPRESS_THRESHOLD_CHARS", None)
+            else:
+                os.environ["CLAUDE_RUNWAY_COMPRESS_THRESHOLD_CHARS"] = old
+
+
 if __name__ == "__main__":
     unittest.main()

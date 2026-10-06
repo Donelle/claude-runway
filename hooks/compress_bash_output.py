@@ -270,7 +270,31 @@ def _record_savings_event(session_id, tool, raw_tokens, out_tokens, credited, so
         pass
 
 
-THRESHOLD = int(os.environ.get("CLAUDE_RUNWAY_COMPRESS_THRESHOLD_CHARS", "2000"))
+_DEFAULT_THRESHOLD = 2000
+
+
+def _parse_threshold() -> int:
+    """Issue #270: this runs at import time, before main()'s fail-open guards
+    exist, so a malformed env value ("4,000", "2k", ...) used to raise
+    ValueError on every matched tool call and kill compression with a bare
+    traceback. Fall back to the default and warn on stderr instead -- the same
+    stderr-not-additionalContext precedent as _STALE_ENV below, and the same
+    parse-failure fallback _failed_url_ttl() uses."""
+    raw = os.environ.get("CLAUDE_RUNWAY_COMPRESS_THRESHOLD_CHARS")
+    if raw is None:
+        return _DEFAULT_THRESHOLD
+    try:
+        return int(raw)
+    except ValueError:
+        print(
+            f"compress_bash_output.py: invalid CLAUDE_RUNWAY_COMPRESS_THRESHOLD_CHARS={raw!r} "
+            f"(not an integer); using default {_DEFAULT_THRESHOLD}",
+            file=sys.stderr,
+        )
+        return _DEFAULT_THRESHOLD
+
+
+THRESHOLD = _parse_threshold()
 
 # Reported on stderr rather than as additionalContext, following the same
 # precedent as the ImportError handler above: stdout is reserved for the
