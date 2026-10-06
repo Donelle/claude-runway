@@ -359,6 +359,7 @@ async def remember_point(
     repo: str,
     embedding_model: str,
     weight: float = DEFAULT_WEIGHT,
+    point_id: str | None = None,
 ) -> tuple:
     """
     Embeds `summary` (the only text actually searched) and stores it
@@ -376,6 +377,16 @@ async def remember_point(
     Stored verbatim in `metadata.weight`; a point with no such field at all
     (written before this change) is treated as `weight=1.0` at read time by
     `recall_points` -- a true no-op, not a behavior change for existing data.
+
+    `point_id` (issue #334, part of #327) is optional. When omitted (the
+    default, and what `remember()`'s MCP tool always does) a fresh random
+    `uuid.uuid4().hex` is minted exactly as before -- behavior is unchanged
+    for every existing caller. When provided, that exact ID is used for the
+    upsert instead, so a caller that needs deterministic per-source IDs (the
+    legacy-collection transfer tool's idempotency, see #327) can get them.
+    This function itself does NO check-before-write: upserting an existing ID
+    overwrites it and re-stamps `created_at`/re-cycles `pending`, so a caller
+    that wants a re-run to leave unchanged points alone must check first.
 
     Returns `(point_id, created_at, None)` on success, or
     `(None, None, error_message)` if `ensure_collection` finds this
@@ -420,7 +431,8 @@ async def remember_point(
     ensure_memory_bank_indexes(client, collection)
     vector_name = embedding_provider.get_vector_name()
     embeddings = await embedding_provider.embed_documents([summary])
-    point_id = uuid.uuid4().hex
+    if point_id is None:
+        point_id = uuid.uuid4().hex
     # pending=True is written in this SAME atomic upsert that creates the
     # point -- there is no window where the point exists without it, unlike
     # created_at (stamped in a separate follow-up call below). wipe_memory_bank

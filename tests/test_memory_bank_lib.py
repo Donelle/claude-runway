@@ -292,6 +292,38 @@ class RememberPointTest(_PatchRetryMixin, unittest.TestCase):
         meta = kwargs["points"][0].payload["metadata"]
         self.assertEqual(meta["weight"], 2.5)
 
+    def _remember(self, **extra):
+        client = MagicMock()
+        client.collection_exists.return_value = True
+        client.get_collection.return_value = _matching_collection_info(vector_name="fast-x", dim=4)
+        provider = _make_provider(vector_name="fast-x", dim=4)
+        result = _run(
+            mb.remember_point(
+                client, provider, "col",
+                summary="s", description="d", kind="lesson",
+                repo="my-project", embedding_model="model-x", **extra,
+            )
+        )
+        return client, result
+
+    def test_explicit_point_id_is_used_for_upsert_and_returned(self):
+        # Issue #334: a caller-supplied ID must be used verbatim for both the
+        # upsert and the follow-up set_payload, and returned unchanged.
+        client, (point_id, _, error) = self._remember(point_id="deterministic-id")
+        self.assertIsNone(error)
+        self.assertEqual(point_id, "deterministic-id")
+        _, kwargs = client.upsert.call_args
+        self.assertEqual(kwargs["points"][0].id, "deterministic-id")
+        _, sp = client.set_payload.call_args
+        self.assertEqual(sp["points"], ["deterministic-id"])
+
+    def test_omitted_point_id_still_generates_random_uuid_hex(self):
+        # Issue #334: default behavior unchanged -- fresh random hex IDs.
+        _, (id1, _, _) = self._remember()
+        _, (id2, _, _) = self._remember()
+        self.assertRegex(id1, r"^[0-9a-f]{32}$")
+        self.assertNotEqual(id1, id2)
+
     def test_schema_mismatch_returns_error_without_upserting(self):
         client = MagicMock()
         client.collection_exists.return_value = True
