@@ -66,7 +66,13 @@ from qdrant_ingest_lib import (
 )
 from qdrant_retry import call_with_retry, async_call_with_retry
 from qdrant_batch_store import store_batch, ensure_file_path_index, FIELD_INDEXES, UPSERT_BATCH_SIZE
-from qdrant_collection_hints import get_cached_descriptions, set_cached_description
+from qdrant_collection_hints import (
+    compute_search_limit,
+    get_cached_descriptions,
+    get_cached_search_limit,
+    set_cached_description,
+    set_cached_search_limit,
+)
 from qdrant_model_check import check_embedding_model_mismatch
 from mcp_tool_introspect import tool_count
 import memory_bank_lib as mb
@@ -229,6 +235,52 @@ def _sync_static_collection_description(collection: Optional[str], qdrant_url: s
         print(f"[claude-runway] synced COLLECTION_DESCRIPTION for '{collection}'", file=sys.stderr)
     except Exception as e:
         print(f"[claude-runway] could not sync COLLECTION_DESCRIPTION for '{collection}': {e}", file=sys.stderr)
+
+
+def _recompute_search_limit(collection: Optional[str], qdrant_url: str, qdrant_api_key: Optional[str]) -> None:
+    """
+    Recomputes the collection's default search limit from its current point
+    count and writes it through to BOTH Qdrant collection metadata
+    (`search_limit`, the source of truth) and the local hint cache -- but
+    each only if it actually differs (issue #331, part of #326). Shared by
+    index_repo and sync_repo: a fresh index is often the single biggest
+    point-count jump a collection sees (0 -> N), and sync_repo covers
+    incremental drift.
+
+    Unlike _sync_static_collection_description, this is NOT guarded to this
+    project's own default collection: any collection these tools index has a
+    point count that should drive its limit.
+
+    Fails open: catches everything, logs to stderr, never raises, so a
+    search_limit hiccup can never turn an otherwise-successful sync/index
+    into a reported failure. The metadata write sends ONLY the search_limit
+    key: Qdrant merges metadata patches (same contract as
+    set_collection_description), and resending a read-back snapshot would
+    risk overwriting a concurrent change to another key (PR #383 review).
+
+    The two stores are compared independently: Qdrant metadata is compared
+    against the new value on its own, and the cache against it on its own, so
+    a stale or missing cache row self-heals without a needless network write
+    (and vice versa). No-ops if the collection doesn't exist (e.g.
+    store_batch skipped creating it for an empty entry list).
+    """
+    if not collection:
+        return
+    try:
+        client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
+        if not call_with_retry(client.collection_exists, collection):
+            return
+        info = call_with_retry(client.get_collection, collection)
+        new_limit = compute_search_limit(info.points_count or 0)
+        if (info.config.metadata or {}).get("search_limit") != new_limit:
+            call_with_retry(
+                client.update_collection, collection_name=collection, metadata={"search_limit": new_limit}
+            )
+            print(f"[claude-runway] search_limit for '{collection}' set to {new_limit}", file=sys.stderr)
+        if get_cached_search_limit(qdrant_url, collection) != new_limit:
+            set_cached_search_limit(qdrant_url, collection, new_limit)
+    except Exception as e:
+        print(f"[claude-runway] could not recompute search_limit for '{collection}': {e}", file=sys.stderr)
 
 
 mcp = MCPServer("codebase-indexer")
@@ -698,6 +750,9 @@ async def index_repo(
     if collection == DEFAULT_COLLECTION and qdrant_url == DEFAULT_QDRANT_URL:
         _sync_static_collection_description(collection, qdrant_url, qdrant_api_key)
 
+    # Fail-open (never raises) -- see _recompute_search_limit (issue #331).
+    _recompute_search_limit(collection, qdrant_url, qdrant_api_key)
+
     return (
         f"Indexed {total} chunks from {repo} into collection '{collection}' "
         f"({code_count} code chunks, {doc_count} doc chunks). "
@@ -1066,6 +1121,10 @@ async def sync_repo(
 
     all_skipped = hash_skipped + chunk_skipped
     _save_manifest(repo, current_hashes)
+
+    # After the manifest save, so a (fail-open) recompute can never precede or
+    # interfere with it. Not reached on the "no changes" early return (issue #331).
+    _recompute_search_limit(collection, qdrant_url, qdrant_api_key)
 
     return (
         f"Synced '{collection}': {len(successfully_changed)} file(s) re-indexed ({new_chunk_count} chunks), "
