@@ -283,6 +283,46 @@ def _recompute_search_limit(collection: Optional[str], qdrant_url: str, qdrant_a
         print(f"[claude-runway] could not recompute search_limit for '{collection}': {e}", file=sys.stderr)
 
 
+# Hardcoded last-resort search limit for find_in_collection when the caller
+# passes none and no per-collection value is stored anywhere (issue #332).
+DEFAULT_SEARCH_LIMIT = 10
+
+
+def _valid_search_limit(value: object) -> Optional[int]:
+    """A stored limit is usable only if it's a real positive int (bool is an
+    int subclass, so it's excluded explicitly)."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return None
+    return value
+
+
+def _resolve_search_limit(client: QdrantClient, collection: str, qdrant_url: str) -> int:
+    """
+    Resolves find_in_collection's limit when the caller passed none (issue
+    #332, part of #326): local cache first, then live Qdrant collection
+    metadata (`search_limit`, the source of truth written by
+    _recompute_search_limit), then DEFAULT_SEARCH_LIMIT. A live hit
+    backfills the cache; a miss deliberately does not (same "cache only
+    genuine values" rule as descriptions), so a limit written later is picked
+    up on the next call.
+
+    Fails open to the default on any error: a limit-lookup hiccup must never
+    block an otherwise-valid query.
+    """
+    try:
+        cached = _valid_search_limit(get_cached_search_limit(qdrant_url, collection))
+        if cached is not None:
+            return cached
+        info = call_with_retry(client.get_collection, collection)
+        live = _valid_search_limit((info.config.metadata or {}).get("search_limit"))
+        if live is not None:
+            set_cached_search_limit(qdrant_url, collection, live)
+            return live
+    except Exception as e:
+        print(f"[claude-runway] could not resolve search_limit for '{collection}': {e}", file=sys.stderr)
+    return DEFAULT_SEARCH_LIMIT
+
+
 mcp = MCPServer("codebase-indexer")
 
 
@@ -1211,7 +1251,7 @@ def get_collection_info(
 async def find_in_collection(
     query: str,
     collection: str,
-    limit: int = 10,
+    limit: Optional[int] = None,
     qdrant_url: Optional[str] = None,
     qdrant_api_key: Optional[str] = None,
     embedding_model: Optional[str] = None,
@@ -1238,10 +1278,15 @@ async def find_in_collection(
     querying and returns an actionable error rather than silently returning
     irrelevant results; the check fails open on network errors so a transient
     Qdrant hiccup never blocks a valid query.
+
+    limit is how many results to return. Leave it unset to use the
+    collection's own stored search_limit (scaled to its size by
+    index_repo/sync_repo, issue #326), falling back to 10 if none is stored;
+    an explicit limit always wins outright.
     """
     if not collection:
         return "Error: collection is required -- call list_collections to see what's available."
-    if limit < 1:
+    if limit is not None and limit < 1:
         return f"Error: limit must be 1 or greater (got {limit})."
 
     qdrant_url = qdrant_url or DEFAULT_QDRANT_URL
@@ -1268,6 +1313,9 @@ async def find_in_collection(
     mismatch_error = check_embedding_model_mismatch(client, collection, embedding_provider)
     if mismatch_error:
         return mismatch_error
+
+    if limit is None:
+        limit = _resolve_search_limit(client, collection, qdrant_url)
 
     connector = QdrantConnector(
         qdrant_url=qdrant_url,
