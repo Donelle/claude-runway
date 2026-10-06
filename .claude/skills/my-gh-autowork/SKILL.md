@@ -397,19 +397,23 @@ under `~/.claude/skills/`, not guaranteed to exist on whichever machine is runni
     a stale-but-present one:
     ```bash
     test -d .venv || uv venv --python 3.12
-    uv pip install -r requirements.txt --index-url https://pypi.org/simple
-    uv pip install -r requirements-dev.txt --index-url https://pypi.org/simple
+    PYTHON=$(if [ -f .venv/Scripts/python ]; then echo .venv/Scripts/python; else echo .venv/bin/python; fi)
+    uv pip install --python "$PYTHON" -r requirements.txt --index-url https://pypi.org/simple
+    uv pip install --python "$PYTHON" -r requirements-dev.txt --index-url https://pypi.org/simple
     ```
-    (The second/third lines are cheap no-ops if already satisfied, so it's fine to always
-    run them rather than trying to detect exactly what's missing.) After bootstrapping,
-    resolve the interpreter path once — Windows venv uses `Scripts/`, Linux/macOS uses
+    **`--python "$PYTHON"` on every `uv pip install` is required, not optional.**
+    Confirmed live (issue #332's run, 2026-10-06): without it, `uv pip install` run from
+    inside a worktree resolved to the PRIMARY checkout's `.venv` instead of this
+    worktree's own, so the install was a no-op against the wrong venv and ruff and
+    Pyright were then missing from the worktree's own venv. (The second/third lines are
+    cheap no-ops if already satisfied, so it's fine to always run them rather than trying
+    to detect exactly what's missing.) The interpreter path is resolved once, in the same
+    block, right after the venv exists — Windows venv uses `Scripts/`, Linux/macOS uses
     `bin/`. ruff and Pyright (issue #297 — replaces mypy so the editor's Pylance
     extension and this gate agree) are each invoked via `$PYTHON -m ruff`/`$PYTHON -m
     pyright` rather than as direct `$RUFF`/`$PYRIGHT` binaries, so only one allow rule
-    (`.venv/Scripts/python` or `.venv/bin/python`) is needed instead of three:
-    ```bash
-    PYTHON=$(if [ -f .venv/Scripts/python ]; then echo .venv/Scripts/python; else echo .venv/bin/python; fi)
-    ```
+    (`.venv/Scripts/python` or `.venv/bin/python`) is needed instead of three.
+
     Then run and require all three clean before proceeding. **`--pythonpath
     $PYTHON` on the Pyright call is required, not optional** (Copilot review,
     PR #319): `pyproject.toml`'s `[tool.pyright]` deliberately has no
