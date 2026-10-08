@@ -49,22 +49,19 @@ def _load_compress_mcp_server():
     return mod
 
 
-class SanitizeProjectAvoidsPunctuationCollisions(unittest.TestCase):
-    """Regression coverage for issue #45: _sanitize_project used to collapse
-    "my.project" / "my project" / "my@project" / "my-project" into the
-    identical sanitized string, so distinct projects could land in the same
-    Qdrant collection. The fix appends a hash suffix derived from the
-    ORIGINAL (pre-sanitization) string, which still differs even when the
-    sanitized-into-hyphens portion doesn't.
+class SanitizeProjectCollectionName(unittest.TestCase):
+    """_sanitize_project maps a project string to a stable, valid Qdrant
+    collection-name segment. It deliberately appends NO hash suffix (issue #45's
+    hash was dropped so the name stays readable and one project string always
+    maps to the same plain collection name), so punctuation variants collapse
+    together.
     """
 
-    def test_punctuation_variants_no_longer_collide(self):
+    def test_punctuation_variants_collapse_to_the_same_name(self):
         mod = _load_compress_mcp_server()
         variants = ["my.project", "my project", "my@project", "my-project"]
-        sanitized = [mod._sanitize_project(v) for v in variants]
-        # Every pairwise result must be distinct -- this is the actual
-        # reported bug: all four used to sanitize to the same "my-project".
-        self.assertEqual(len(sanitized), len(set(sanitized)))
+        sanitized = {mod._sanitize_project(v) for v in variants}
+        self.assertEqual(sanitized, {"my-project"})
 
     def test_deterministic_across_calls(self):
         # compact_store and compact_find each call _sanitize_project
@@ -82,18 +79,13 @@ class SanitizeProjectAvoidsPunctuationCollisions(unittest.TestCase):
             result = mod._sanitize_project(project)
             self.assertRegex(result, r"^[a-zA-Z0-9_-]+$")
 
-    def test_plain_alphanumeric_name_keeps_readable_prefix(self):
-        # The common case (no sanitization needed) should still read as
-        # "<original>-<hash>", not become unrecognizable.
+    def test_plain_alphanumeric_name_is_unchanged_with_no_suffix(self):
         mod = _load_compress_mcp_server()
-        result = mod._sanitize_project("myproject")
-        self.assertTrue(result.startswith("myproject-"))
-        suffix = result[len("myproject-"):]
-        self.assertEqual(len(suffix), 8)
+        self.assertEqual(mod._sanitize_project("myproject"), "myproject")
+        self.assertEqual(mod._sanitize_project("claude-runway"), "claude-runway")
 
     def test_casing_variants_collapse_to_the_same_collection(self):
-        # Regression coverage for issue #37: unlike the punctuation variants
-        # above (deliberately kept DISTINCT), casing variants of the exact
+        # Regression coverage for issue #37: casing variants of the exact
         # same project string must sanitize IDENTICALLY, or a casing drift
         # between /my-compact and /my-resume points at a nonexistent
         # collection.

@@ -42,50 +42,14 @@ Setup:
        values, for hooks/*.py to see them -- a hook entry in .claude/settings.json
        has no `env` field of its own. Setting only one side is the single most
        common misconfiguration here; see the README's "Environment variables"
-       section, and local_compress_lib.stale_env_warning for the guard against
-       the pre-rename names (LMSTUDIO_BASE_URL / LMSTUDIO_MODEL /
-       HOOK_COMPRESS_THRESHOLD_CHARS), which are no longer read.
+       section. The pre-rename names (LMSTUDIO_BASE_URL / LMSTUDIO_MODEL /
+       HOOK_COMPRESS_THRESHOLD_CHARS) are no longer read.
            }
          }
        }
 
-OPEN DESIGN QUESTIONS (marked NOTE: inline) -- flagging these rather than
-silently picking an answer, since this is meant to be iterated on:
-  1. RESOLVED: inputs under skip_if_under_chars return silently unchanged.
-     The compressed path always self-documents via the "[compressed X -> Y
-     chars]" prefix, so a caller can already tell skip vs. compress just by
-     checking for that prefix -- no separate flag needed.
-  2. RESOLVED: model resolves in this order -- explicit model= param, then
-     CLAUDE_RUNWAY_LMSTUDIO_MODEL env var, then auto-detect IF exactly one model is
-     loaded in LM Studio. Auto-detect refuses to guess (clear error instead)
-     when zero or multiple models are loaded, since silently picking "the
-     first one" could quietly use the wrong model. Re-checked live on every
-     call rather than cached, since you can swap models in LM Studio without
-     restarting this server.
-  3. RESOLVED: large inputs are chunked and summarized piece-by-piece
-     (map-reduce), not truncated. Truncation was a real bug, not just a
-     simplification -- logs put failures at the END, so cutting the tail is
-     exactly wrong for the content this tool targets. Every chunk gets
-     summarized; if there's more than one chunk, a final reduce pass
-     combines the per-chunk summaries into one coherent result. Costs more
-     local time/compute for huge inputs, which is the correct tradeoff since
-     local compute is free against the actual budget (Claude tokens).
-     A max_total_chars safety ceiling still exists, but it REFUSES with a
-     clear error rather than silently dropping content.
-  4. RESOLVED (with a bigger fix than expected): compress_text(text=...)
-     requires Claude to already hold the raw content to pass it as an
-     argument -- meaning the token cost was already paid (input to read it
-     in, output to re-emit it as the argument) BEFORE compress_text ever
-     runs. That's strictly worse than doing nothing, for the exact case this
-     tool targets. Fixed by adding compress_file and compress_command_output,
-     which read the file / run the command server-side -- the raw content
-     never has to pass through Claude at all, only the compressed result
-     does. compress_text is kept only for the narrower case of compressing
-     content Claude already legitimately holds (e.g. its own long draft)
-     -- it does NOT save tokens if the input had to be read into context
-     first just to call it. Usage guidance (this same item) now points
-     Claude at compress_file/compress_command_output as the default choice.
-  5. ADDED: fetch_url, for the same reason compress_command_output exists
+DESIGN DECISIONS:
+  1. fetch_url, for the same reason compress_command_output exists
      instead of "run Bash then compress_text the output" -- Claude Code's
      built-in WebFetch tool already runs its own extraction/summarization,
      but that step happens on ANTHROPIC's infrastructure, not locally, with
@@ -775,53 +739,28 @@ def _normalize_project(project: str) -> str:
 
 def _sanitize_project(project: str) -> str:
     """
-    Replace characters not valid in Qdrant collection names with hyphens,
-    then append a short hash suffix derived from the ORIGINAL (unsanitized,
-    but already case-folded -- see below) project string.
+    Replace characters not valid in Qdrant collection names with hyphens.
+    No hash suffix is appended: this helper derives the same, readable
+    canonical name for the same project string. It only DERIVES that name;
+    compact_store still reuses an existing collection that already holds the
+    project's history (see _collections_for_project, which can be a legacy-named
+    one) and falls back to this canonical name only for a brand-new project.
 
-    The suffix exists to close a real collision: two distinct project
-    strings that differ only in punctuation/whitespace -- "my.project" and
-    "my-project", or "my project", or "my@project" -- all sanitize to the
-    identical "my-project" without it, since every disallowed character
-    independently collapses to the same hyphen. That would put two distinct
-    projects' /my-compact entries in the same underlying Qdrant collection
-    (issue #45). Hashing the pre-sanitization string (not the lossy
-    sanitized one) makes that specific punctuation/whitespace-driven
-    collision extremely unlikely in practice, because the hash input still
-    carries the distinction the sanitization step just threw away -- but
-    this is NOT an absolute guarantee: the suffix is only the first 8 hex
-    chars of a SHA-256 digest, a 32-bit (~4.3 billion value) space, so two
-    different original strings can still coincidentally share the same
-    truncated hash (verified directly: brute-forcing "project-<n>" strings
-    hits a real collision by n=161010, in line with the ~2^16 birthday-bound
-    expectation for a 32-bit space). Don't reason about this as
-    collision-proof isolation; it only defends against the one collapse
-    class described above, not against 32-bit hash birthday collisions in
-    general.
-
-    Case-folds `project` FIRST (issue #37), before either the hyphen
-    substitution or the hash, so "MyProject" and "myproject" -- unlike the
-    punctuation variants above, which are deliberately kept distinct --
-    collapse onto the identical sanitized string AND hash. This is the
-    opposite of the punctuation case on purpose: punctuation differences
-    are treated as different projects, casing differences are treated as
-    the same project. Without this, a casing drift between /my-compact and
+    Case-folds `project` FIRST (issue #37), before the hyphen substitution,
+    so "MyProject" and "myproject" collapse onto the identical sanitized
+    string. Without this, a casing drift between /my-compact and
     /my-resume (different terminal profile, a renamed directory recreated
     with different casing, etc.) pointed at an entirely different,
     nonexistent collection, producing a misleading "no collection found"
     message instead of just finding the right one.
 
     Deterministic (same input -> same output every call) is required here:
-    compact_store and compact_find each call this independently and must
-    land on the same collection name for the same project, or /my-resume
-    would never find what /my-compact just stored.
+    compact_store and compact_find each derive the canonical name
+    independently and must agree on it for the same project, so a brand-new
+    project's /my-resume finds what /my-compact just stored.
     """
-    import hashlib as _hashlib
     import re as _re
-    normalized = _normalize_project(project)
-    sanitized = _re.sub(r"[^a-zA-Z0-9_-]", "-", normalized)
-    suffix = _hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:8]
-    return f"{sanitized}-{suffix}"
+    return _re.sub(r"[^a-zA-Z0-9_-]", "-", _normalize_project(project))
 
 
 def _collections_for_project(client: QdrantClient, project: str) -> list:
@@ -884,10 +823,10 @@ def _collections_for_project(client: QdrantClient, project: str) -> list:
     candidate collection here also propagates rather than being silently
     treated as "this collection doesn't match."
 
-    Returns collection names only. The canonical name is trusted by
-    construction (deterministic, hash-suffixed, one project = one name --
-    the same isolation guarantee the pre-issue-#37 design always relied
-    on). Every OTHER returned name is only PROBABLY project-exclusive --
+    Returns collection names only. The canonical name is deterministic for a
+    given project string, but NOT guaranteed project-exclusive: names that
+    differ only in punctuation/whitespace sanitize to the same collection, so
+    callers must still filter entries by their `project` payload. Every OTHER returned name is only PROBABLY project-exclusive --
     proven only by containing AT LEAST ONE matching point (one match
     proves containment, not exclusivity: the rest of that collection's
     points could still belong to other projects entirely, e.g. an
@@ -1058,20 +997,16 @@ async def compact_store(
     """
     Store a conversation compact in a dedicated Qdrant collection, isolated
     from the codebase index. The collection defaults to
-    '<COMPACT_COLLECTION>-<sanitized-project>-<hash8>' (e.g.
-    'conversation-compacts-Acme-Support-TicketsApi-3f9a2b1c'), giving each
-    project its own collection so compact_find never sees another project's
-    entries. Non-alphanumeric characters in the project name (dots, spaces,
-    etc.) are replaced with hyphens to satisfy Qdrant naming rules, and an
-    8-char hash of the original (pre-sanitization) project string is
-    appended so that two distinct project names differing only in
-    punctuation/whitespace (e.g. "my.project" vs "my-project") are extremely
-    unlikely to collapse onto the same collection (issue #45) -- not an
-    absolute guarantee, since the suffix is only a 32-bit truncated hash;
-    see _sanitize_project's docstring for why. `project` is also case-folded
-    before any of the above (issue #37), so "MyProject" and "myproject" are
-    treated as the SAME project (the opposite of the punctuation case,
-    which treats near-identical strings as different projects) for any
+    '<COMPACT_COLLECTION>-<sanitized-project>' (e.g.
+    'conversation-compacts-Acme-Support-TicketsApi'), giving each
+    project its own collection by default; isolation between projects whose
+    names sanitize identically comes from compact_find's `project` payload
+    filter, not from the collection name. Non-alphanumeric characters in the project name (dots, spaces,
+    etc.) are replaced with hyphens to satisfy Qdrant naming rules, so two
+    names differing only in punctuation/whitespace (e.g. "my.project" vs
+    "my-project") map to the SAME collection; there is no hash suffix.
+    `project` is also case-folded before any of the above (issue #37), so
+    "MyProject" and "myproject" are treated as the SAME project for any
     BRAND-NEW project. If a collection already exists for this project
     under ANY casing (checked by reading a stored entry's own `project`
     payload field case-insensitively, not by re-deriving a name), writes
@@ -1358,11 +1293,12 @@ async def compact_find(
 ) -> str:
     """
     Retrieve conversation compacts for a project from its dedicated Qdrant
-    collection ('<COMPACT_COLLECTION>-<sanitized-project>-<hash8>' by
-    default -- see compact_store / _sanitize_project for why the hash suffix
-    is there). The collection is project-scoped so results are already
-    isolated; the payload filter on 'project' is an additional safeguard if
-    a shared collection is passed explicitly via the collection param.
+    collection ('<COMPACT_COLLECTION>-<sanitized-project>' by default --
+    see compact_store / _sanitize_project). The collection name is a shared base
+    prefix plus the sanitized project, which can collide for names differing
+    only in punctuation/whitespace; the payload filter on 'project' is what
+    isolates one project's entries from another's, including when a shared
+    collection is passed explicitly via the collection param.
 
     Called by /my-resume instead of qdrant-find. Returns compacts sorted by
     date descending (most recent first), each with its date, label, and full
@@ -1595,8 +1531,7 @@ async def compact_find(
 
     lines = [f"Found {len(entries)} compact(s) for project '{project}':\n"]
     for i, (point_id, date, label, information) in enumerate(entries, 1):
-        # Short disambiguator, not the full id -- mirrors _sanitize_project's
-        # existing hash8-suffix convention elsewhere in this file. Strip
+        # Short disambiguator, not the full id. Strip
         # dashes first so the 8 chars taken are hex digits, not separators.
         id_suffix = str(point_id).replace("-", "")[:8]
         lines.append(f"--- {i}. {date or '?'} — {label or '(no label)'} (id: {id_suffix}) ---")

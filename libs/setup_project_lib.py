@@ -64,14 +64,13 @@ def default_collection_name(repo_path: Path) -> str:
     Derive a Qdrant collection name suggestion from the target repo's own
     directory name, e.g. "My Cool App!" -> "my-cool-app".
 
-    This is only a convenience DEFAULT, not a collision-proofed identifier
-    the way tools/compress_mcp_server.py's `_sanitize_project` is (that one
-    hashes the original string to guard against a *silent* same-name
-    collision for the auto-managed conversation-compacts collection, since
-    nothing else would ever surface that collision to a human). Here, by
-    contrast, the collection name is a one-time, visible choice a human
-    reviews in the generated `.mcp.json` before ever committing it -- so a
-    plain, readable slug is more useful than an opaque hash suffix. Pass
+    This is only a convenience DEFAULT, not a collision-proofed identifier.
+    tools/compress_mcp_server.py's `_sanitize_project` is not one either: it
+    appends no hash, so names differing only in punctuation/whitespace map to
+    the same conversation-compacts collection, and per-project isolation there
+    comes from payload filtering on read/prune. Here the collection name is a
+    one-time, visible choice a human reviews in the generated `.mcp.json`
+    before ever committing it -- so a plain, readable slug is what we want. Pass
     `--collection-name` explicitly if this default would collide with an
     already-indexed project's collection on the same Qdrant instance.
     """
@@ -189,9 +188,10 @@ def build_mcp_servers(
 
     `compact_collection`, if blank, defaults to the template's own historical
     "conversation-compacts" -- a single bucket shared by every project on
-    the machine, with per-project isolation coming entirely from
-    compress_mcp_server.py's own `_sanitize_project`+hash suffix at runtime
-    (see `_collections_for_project`'s sibling-scan there, which finds other
+    the machine. This is a shared base prefix: compress_mcp_server.py
+    appends the sanitized project name at runtime, and per-project isolation
+    comes from its payload filtering on read/prune, not from the name being
+    unique (see `_collections_for_project`'s sibling-scan there, which finds other
     collections for the same project by matching this exact prefix).
     Deliberately NOT derived from `collection_name` here the way
     `COLLECTION_NAME` on the qdrant/codebase-indexer servers is: found in
@@ -225,7 +225,7 @@ def build_mcp_servers(
     fallback only fires when the key is genuinely ABSENT, not when it's
     present-but-empty -- an explicit `.mcp.json` env entry set to `""`
     would otherwise build a collection name with a leading stray hyphen
-    (`-<sanitized-project>-<hash8>`).
+    (`-<sanitized-project>`).
 
     `memory_bank_collection`, if blank, defaults to the template's own
     literal `"memory-bank"` -- the ONE collection every project's

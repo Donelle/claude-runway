@@ -666,9 +666,10 @@ def parse_args() -> argparse.Namespace:
         "conversation-compact history from compact lookup. Repeat the same --compact-collection value on every "
         "re-run for such a project, or go through /my-setup-clauderunway instead, which extracts and re-passes "
         "the current value automatically. compress_mcp_server.py still appends its own "
-        "-<sanitized-project>-<hash8> suffix on top of whichever base this resolves to, at runtime, for "
-        "per-project isolation -- so the final on-disk collection name is "
-        "'<compact-collection>-<sanitized-project>-<hash8>'.",
+        "-<sanitized-project> suffix on top of whichever base this resolves to, at runtime "
+        "(this base is a shared prefix; per-project isolation comes from payload filtering, not name uniqueness) "
+        "-- so the final on-disk collection name is "
+        "'<compact-collection>-<sanitized-project>'.",
     )
     # Mutually exclusive: their settings.json semantics genuinely conflict.
     # --qdrant-only actively REMOVES this toolkit's local-compress-dependent
