@@ -73,6 +73,7 @@ from qdrant_collection_hints import (
     set_cached_description,
     set_cached_search_limit,
 )
+from qdrant_compact_marker import collection_is_marked_compact, is_marked_compact
 from qdrant_model_check import check_embedding_model_mismatch
 from mcp_tool_introspect import tool_count
 import memory_bank_lib as mb
@@ -1303,6 +1304,16 @@ async def find_in_collection(
             "Call list_collections to see what's available."
         )
 
+    # Issue #397: conversation-compact collections hold saved session summaries
+    # read back only through compact_find, never by semantic search. Answer
+    # exactly as a genuinely empty search would -- an error or special message
+    # would prompt the calling model to react and go off track. Checked BEFORE
+    # the model-mismatch guard below, whose misleading error (compacts use a
+    # different embedding model than the project default) was the only thing
+    # keeping callers out of these collections until now. Fails open.
+    if collection_is_marked_compact(client, collection):
+        return f"No results found in collection '{collection}' for query '{query}'."
+
     embedding_provider = FastEmbedProvider(embedding_model)
 
     # Guard against silently-meaningless results from an embedding model
@@ -1399,10 +1410,11 @@ def list_collections(
     find_in_collection, or to sanity-check this project's own collection
     exists.
 
-    include_counts (default true) additionally fetches each collection's
-    point count, at the cost of one extra Qdrant request per collection --
-    set false for a fast names-only listing if the instance has many
-    collections and you don't need counts.
+    include_counts (default true) additionally shows each collection's
+    point count. Every collection's metadata is fetched (one Qdrant request
+    per collection) regardless, to skip internal conversation-compact
+    collections (issue #397), which are never search targets and are not
+    listed.
 
     include_descriptions (default true) surfaces each collection's stored
     hint (set via set_collection_description), so you can often pick the
@@ -1437,12 +1449,19 @@ def list_collections(
     descriptions = get_cached_descriptions(qdrant_url, names) if include_descriptions else {}
 
     lines = [f"Collections at {qdrant_url}:"]
+    listed = 0
     for name in names:
         marker = " (this project's own)" if name == DEFAULT_COLLECTION else ""
         needs_description_fetch = include_descriptions and name not in descriptions
-        info = None
-        if include_counts or needs_description_fetch:
-            info = call_with_retry(client.get_collection, name)
+        # Issue #397: every collection's metadata is read so conversation-
+        # compact collections (marked by compact_store) can be skipped
+        # entirely -- they're internal, not search targets. This is the same
+        # request include_counts/the description fetch already made, so it
+        # only adds requests when neither of those needed one.
+        info = call_with_retry(client.get_collection, name)
+        if is_marked_compact(info.config.metadata):
+            continue
+        listed += 1
         description = descriptions.get(name, "")
         if needs_description_fetch:
             description = (info.config.metadata or {}).get("description", "") if info else ""
@@ -1467,6 +1486,8 @@ def list_collections(
             lines.append(f"- {name}: {info.points_count} points{marker}{hint}")
         else:
             lines.append(f"- {name}{marker}{hint}")
+    if not listed:
+        return f"No collections found at {qdrant_url}."
     return "\n".join(lines)
 
 

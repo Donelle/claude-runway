@@ -81,7 +81,9 @@ from mcp.server.mcpserver import MCPServer, Context
 from mcp_server_qdrant.embeddings.fastembed import FastEmbedProvider
 from qdrant_client import QdrantClient, models as qdrant_models
 
+from qdrant_compact_marker import mark_compact_collection
 from qdrant_ingest_lib import ensure_persistent_fastembed_cache
+from qdrant_model_check import check_embedding_model_mismatch
 from local_compress_lib import (
     DEFAULT_BASE_URL,
     DEFAULT_CHUNK_CHARS,
@@ -139,16 +141,35 @@ COMPACT_QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
 COMPACT_QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY")
 COMPACT_COLLECTION = os.environ.get("COMPACT_COLLECTION", "conversation-compacts")
 
-# Historical default from qdrant-client's QdrantFastembedMixin (the
-# QdrantClient.add()/.query() convenience methods compact_store/compact_find
-# used to call directly -- deprecated since ~1.7, actually removed in 1.19.0,
-# which is what broke this repo's own new CI on its first run: see issue
-# #51's PR). Neither tool ever called set_model(), so every compact stored
-# before this fix was embedded with exactly this model, under the vector
-# name FastEmbedProvider.get_vector_name() derives from it
-# ("fast-bge-small-en") -- changing either here would silently orphan every
-# previously stored compact rather than erroring.
-COMPACT_EMBEDDING_MODEL = "BAAI/bge-small-en"
+# Fallback when EMBEDDING_MODEL is unset (issue #397): the historical default
+# from qdrant-client's QdrantFastembedMixin (the QdrantClient.add()/.query()
+# convenience methods compact_store/compact_find used to call directly --
+# deprecated since ~1.7, actually removed in 1.19.0, which is what broke this
+# repo's own new CI on its first run: see issue #51's PR). Neither tool ever
+# called set_model(), so every compact stored before this fix was embedded
+# with exactly this model, under the vector name
+# FastEmbedProvider.get_vector_name() derives from it ("fast-bge-small-en").
+# Keeping it as the unset-fallback means nobody who sets nothing sees any
+# change; `upgrade` pins it explicitly for existing installs.
+LEGACY_COMPACT_EMBEDDING_MODEL = "BAAI/bge-small-en"
+
+# Same variable the other MCP servers read (issue #397), set in this server's
+# .mcp.json env block. CHANGING it for an existing install orphans that
+# install's compacts: points live under a model-named vector, so a collection
+# created under one model is unreadable under another. compact_store/
+# compact_find now run check_embedding_model_mismatch so that fails loudly
+# instead of silently creating a second vector or missing existing points.
+COMPACT_EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL") or LEGACY_COMPACT_EMBEDDING_MODEL
+
+# Replaces the shared check's default find_in_collection-oriented advice
+# ("check the other repo's .mcp.json"), which is wrong for compacts.
+COMPACT_MODEL_MISMATCH_HINT = (
+    "Compacts are stored under the embedding model that created their collection, so this "
+    "server's EMBEDDING_MODEL (local-compress env block in .mcp.json) must match it. Set "
+    "EMBEDDING_MODEL back to the model the collection was created with (BAAI/bge-small-en for "
+    "installs that predate this setting). Changing the model for an existing collection is not "
+    "supported: it orphans the stored compacts."
+)
 
 # Issue #39: fetch_url used to call requests.get() with no stream=True, no
 # Content-Length check, and no size cap of any kind -- resp.text/resp.content
@@ -1092,6 +1113,22 @@ async def compact_store(
                 )
             },
         )
+    else:
+        # Issue #397: an existing collection created under a different model
+        # would otherwise get a SECOND vector name added by the upsert below
+        # (or fail opaquely), leaving the old points unsearchable by this
+        # model. Fails open on an inconclusive check, like find_in_collection.
+        mismatch = check_embedding_model_mismatch(
+            client, col, embedding_provider, recovery_hint=COMPACT_MODEL_MISMATCH_HINT
+        )
+        if mismatch:
+            return mismatch
+    # Issue #397: mark the collection internal on EVERY write (idempotent), so
+    # find_in_collection/list_collections can tell it isn't a search target.
+    # Done on every write rather than only at creation so a legacy collection
+    # gets marked on its next /my-compact. Fails open: a failed mark must not
+    # lose the user's compact.
+    mark_compact_collection(client, col)
     [embedding] = await embedding_provider.embed_documents([information])
     # Deterministic, not random (issue #36) -- see _compact_point_id's
     # docstring for why this is what makes a retry an overwrite instead of
@@ -1417,6 +1454,15 @@ async def compact_find(
     if query:
         # Semantic search — preserve relevance order, do not date-sort.
         embedding_provider = FastEmbedProvider(COMPACT_EMBEDDING_MODEL)
+        # Issue #397: a collection stored under another model has no vector
+        # of this name, so the query below would fail opaquely or silently
+        # miss everything. Report it clearly instead (fails open).
+        for col in col_list:
+            mismatch = check_embedding_model_mismatch(
+                client, col, embedding_provider, recovery_hint=COMPACT_MODEL_MISMATCH_HINT
+            )
+            if mismatch:
+                return mismatch
         query_vector = await embedding_provider.embed_query(query)
         raw = []
         for col in col_list:

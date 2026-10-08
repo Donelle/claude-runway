@@ -1071,5 +1071,44 @@ class PlanSkillInstalls(unittest.TestCase):
         self.assertEqual(by_name["skill-b"].action, "install")
 
 
+class CompactEmbeddingModelOnInit(unittest.TestCase):
+    """Issue #397: local-compress's EMBEDDING_MODEL is sticky -- an `init`
+    re-run must never move an existing install's compacts onto another model."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.target_repo = Path(self._tmpdir.name) / "proj"
+        self.target_repo.mkdir()
+
+    def _model(self, result):
+        return result.mcp_json["mcpServers"]["local-compress"]["env"]["EMBEDDING_MODEL"]
+
+    def _rerun(self, local_compress_env):
+        (self.target_repo / ".mcp.json").write_text(
+            json.dumps({"mcpServers": {"qdrant": {"env": {}}, "local-compress": {"env": local_compress_env}}}),
+            encoding="utf-8",
+        )
+        return run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
+
+    def test_brand_new_install_uses_the_project_model(self):
+        result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
+        self.assertEqual(self._model(result), "sentence-transformers/all-MiniLM-L6-v2")
+
+    def test_existing_block_without_the_key_is_pinned_to_the_legacy_model(self):
+        result = self._rerun({"COMPACT_COLLECTION": "conversation-compacts"})
+        self.assertEqual(self._model(result), "BAAI/bge-small-en")
+
+    def test_existing_value_is_kept_even_with_an_explicit_project_model_change(self):
+        (self.target_repo / ".mcp.json").write_text(
+            json.dumps({"mcpServers": {"qdrant": {"env": {"EMBEDDING_MODEL": "a/b"}},
+                                       "local-compress": {"env": {"EMBEDDING_MODEL": "BAAI/bge-small-en"}}}}),
+            encoding="utf-8",
+        )
+        result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"), embedding_model="c/d")
+        self.assertEqual(self._model(result), "BAAI/bge-small-en")
+        self.assertEqual(result.mcp_json["mcpServers"]["qdrant"]["env"]["EMBEDDING_MODEL"], "c/d")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -592,11 +592,58 @@ class RecordSessionIdSessionstart(unittest.TestCase):
         self.assertFalse(migration.detect({}, after_settings))
 
 
+class LocalCompressEmbeddingModelMissing(unittest.TestCase):
+    """Issue #397: existing installs stored compacts with BAAI/bge-small-en
+    (the server used to hardcode it), so the migration must pin THAT, never
+    the new template default, or their compact history is orphaned."""
+
+    def _migration(self):
+        return _migration("local-compress-embedding-model-missing")
+
+    def test_detect_true_when_env_lacks_embedding_model(self):
+        mcp_json = {"mcpServers": {"local-compress": {"env": {"COMPACT_COLLECTION": "c"}}}}
+        self.assertTrue(self._migration().detect(mcp_json, {}))
+
+    def test_detect_true_when_embedding_model_is_blank(self):
+        mcp_json = {"mcpServers": {"local-compress": {"env": {"EMBEDDING_MODEL": "  "}}}}
+        self.assertTrue(self._migration().detect(mcp_json, {}))
+
+    def test_detect_false_when_set(self):
+        mcp_json = {"mcpServers": {"local-compress": {"env": {"EMBEDDING_MODEL": "x/y"}}}}
+        self.assertFalse(self._migration().detect(mcp_json, {}))
+
+    def test_detect_false_without_a_local_compress_block(self):
+        self.assertFalse(self._migration().detect({"mcpServers": {"qdrant": {}}}, {}))
+
+    def test_apply_pins_the_legacy_model_and_touches_nothing_else(self):
+        before = {
+            "mcpServers": {
+                "qdrant": {"env": {"EMBEDDING_MODEL": "sentence-transformers/all-MiniLM-L6-v2"}},
+                "local-compress": {"env": {"COMPACT_COLLECTION": "custom-prefix"}},
+            }
+        }
+        snapshot = copy.deepcopy(before)
+        after_mcp, after_settings = self._migration().apply(before, {}, _ctx())
+        env = after_mcp["mcpServers"]["local-compress"]["env"]
+        self.assertEqual(env["EMBEDDING_MODEL"], "BAAI/bge-small-en")
+        self.assertEqual(env["COMPACT_COLLECTION"], "custom-prefix")
+        self.assertEqual(after_mcp["mcpServers"]["qdrant"], before["mcpServers"]["qdrant"])
+        self.assertEqual(after_settings, {})
+        self.assertEqual(before, snapshot)  # never mutated in place
+        self.assertFalse(self._migration().detect(after_mcp, {}))
+
+
 class PendingMigrations(unittest.TestCase):
     def test_all_pending_on_a_fully_stale_project(self):
         # A project with the old PostToolUse '.*' block (issue #198 config)
         # plus no memory-bank / HF_HUB_OFFLINE: all four migrations pending.
-        mcp_json = {"mcpServers": {"qdrant": {"env": {}}, "codebase-indexer": {"env": {}}}}
+        mcp_json = {
+            "mcpServers": {
+                "qdrant": {"env": {}},
+                "codebase-indexer": {"env": {}},
+                "local-compress": {"env": {}},
+            }
+        }
         settings_json = {
             "hooks": {
                 "PostToolUse": [
@@ -686,6 +733,8 @@ class RunUpgradeEndToEnd(unittest.TestCase):
                             "env": {"QDRANT_URL": "http://localhost:6333", "COLLECTION_NAME": "my-target-project"},
                         },
                         "codebase-indexer": {"env": {"COLLECTION_NAME": "my-target-project"}},
+                        # Pre-#397: no EMBEDDING_MODEL in the local-compress env.
+                        "local-compress": {"env": {"COMPACT_COLLECTION": "conversation-compacts"}},
                     }
                 }
             ),

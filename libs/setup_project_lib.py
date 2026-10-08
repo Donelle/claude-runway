@@ -178,6 +178,7 @@ def build_mcp_servers(
     hf_hub_offline: bool = False,
     embedding_model: str = "",
     memory_bank_embedding_model: str = "",
+    compact_embedding_model: str = "",
 ) -> dict:
     """
     Returns a fresh `mcpServers` dict (deep-copied from `template`, never
@@ -289,6 +290,12 @@ def build_mcp_servers(
     `CLAUDE_RUNWAY_TRACK_SAVINGS`/`compact_collection`/etc. above) --
     `False` writes an explicit empty string, not a missing key.
 
+    `compact_embedding_model` (issue #397) is the `local-compress` block's own
+    `EMBEDDING_MODEL`, deliberately separate from `embedding_model`: compacts
+    are stored under a model-named vector, so changing it orphans an existing
+    install's compacts. Blank leaves the template default. `run_setup` decides
+    what to pass (see `resolve_compact_embedding_model`).
+
     `embedding_model` (issue #279), if blank, leaves the template's own
     `EMBEDDING_MODEL` default in place; otherwise it is written into every
     Qdrant-talking block that carries the key (`qdrant`, `codebase-indexer`,
@@ -362,6 +369,11 @@ def build_mcp_servers(
         compress["env"]["CLAUDE_RUNWAY_TRACK_SAVINGS"] = "1" if track_savings else ""
         compress["env"]["CLAUDE_RUNWAY_SAVINGS_DB"] = savings_db
         compress["env"]["COMPACT_COLLECTION"] = compact_collection or "conversation-compacts"
+        # Issue #397: the compact embedding model is its own value, never
+        # blindly the template's -- changing it orphans existing compacts.
+        # Blank leaves the template default (a brand-new install).
+        if compact_embedding_model:
+            compress["env"]["EMBEDDING_MODEL"] = compact_embedding_model
     else:
         del servers["local-compress"]
 
@@ -408,6 +420,35 @@ def resolve_embedding_model(explicit: str, existing_mcp: dict, template_default:
     collection.
     """
     return (explicit or "").strip() or existing_embedding_model(existing_mcp) or template_default
+
+
+# What an install that predates the local-compress `EMBEDDING_MODEL` setting
+# (issue #397) actually stored its compacts with -- must match
+# `compress_mcp_server.LEGACY_COMPACT_EMBEDDING_MODEL`. Full model id, never
+# the short name.
+LEGACY_COMPACT_EMBEDDING_MODEL = "BAAI/bge-small-en"
+
+
+def resolve_compact_embedding_model(existing_mcp: dict, project_model: str) -> str:
+    """
+    Which `EMBEDDING_MODEL` a (re-)run of `init` writes into `local-compress`
+    (issue #397). Unlike the code-index model there is no explicit-override
+    flag: changing it only ever orphans stored compacts, so a re-run must
+    never do that on its own:
+      1. an existing `local-compress` block's own non-blank value is kept;
+      2. an existing block WITHOUT one predates the setting, so its compacts
+         were stored under the legacy model -- pin that;
+      3. no block at all (a brand-new install) uses the project model.
+    """
+    servers = existing_mcp.get("mcpServers") if isinstance(existing_mcp, dict) else None
+    block = servers.get("local-compress") if isinstance(servers, dict) else None
+    if not isinstance(block, dict):
+        return project_model
+    env = block.get("env")
+    value = env.get("EMBEDDING_MODEL") if isinstance(env, dict) else None
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return LEGACY_COMPACT_EMBEDDING_MODEL
 
 
 # (event, script filename) for every hook this toolkit's templates define,
@@ -973,6 +1014,7 @@ def run_setup(
         hf_hub_offline=hf_hub_offline,
         embedding_model=resolved_embedding_model,
         memory_bank_embedding_model=shared_memory_bank_model,
+        compact_embedding_model=resolve_compact_embedding_model(existing_mcp, resolved_embedding_model),
     )
     unresolved = find_unresolved_placeholders(generated_servers)
     if unresolved:

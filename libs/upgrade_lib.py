@@ -45,7 +45,7 @@ from typing import Callable, Optional
 # Flat import, matching every other libs/*.py module's own convention (see
 # setup_project_lib.py's module docstring for why: libs/ is added to
 # sys.path directly by callers, not treated as a real Python package).
-from setup_project_lib import build_mcp_servers, build_settings_hooks, load_json
+from setup_project_lib import LEGACY_COMPACT_EMBEDDING_MODEL, build_mcp_servers, build_settings_hooks, load_json
 
 
 @dataclass
@@ -352,6 +352,38 @@ def _apply_hf_hub_offline_missing(mcp_json: dict, settings_json: dict, ctx: Migr
 
 
 # ---------------------------------------------------------------------------
+# local-compress-embedding-model-missing (feature: #397)
+# ---------------------------------------------------------------------------
+
+
+def _detect_compress_embedding_model_missing(mcp_json: dict, settings_json: dict) -> bool:
+    """True only when a `local-compress` server EXISTS and its env has no
+    non-blank EMBEDDING_MODEL. No local-compress block (a `--qdrant-only`
+    project) has nothing to fix."""
+    block = mcp_json.get("mcpServers", {}).get("local-compress")
+    if block is None:
+        return False
+    value = block.get("env", {}).get("EMBEDDING_MODEL")
+    return not (isinstance(value, str) and value.strip())
+
+
+def _apply_compress_embedding_model_missing(
+    mcp_json: dict, settings_json: dict, ctx: MigrationContext
+) -> "tuple[dict, dict]":
+    """
+    Pins `EMBEDDING_MODEL` in the `local-compress` env to `BAAI/bge-small-en`
+    -- the model every existing install's compacts were actually stored with
+    (the server used to hardcode it) -- NEVER the new template default, which
+    would orphan that compact history (issue #397). Full model id, not the
+    short name. Only this one key is written.
+    """
+    mcp_json = copy.deepcopy(mcp_json)
+    env = mcp_json["mcpServers"]["local-compress"].setdefault("env", {})
+    env["EMBEDDING_MODEL"] = LEGACY_COMPACT_EMBEDDING_MODEL
+    return mcp_json, settings_json
+
+
+# ---------------------------------------------------------------------------
 # record-session-id-sessionstart (fix: #231)
 # ---------------------------------------------------------------------------
 
@@ -503,6 +535,23 @@ MIGRATIONS: "list[Migration]" = [
         ),
         detect=_detect_hf_hub_offline_missing,
         apply=_apply_hf_hub_offline_missing,
+    ),
+    Migration(
+        id="local-compress-embedding-model-missing",
+        title="Pin EMBEDDING_MODEL in local-compress server env",
+        kind="add",
+        description=(
+            "The local-compress server now reads EMBEDDING_MODEL (like the other MCP servers) to choose the "
+            "model conversation compacts are embedded with (issue #397); until now it was hardcoded. Adds "
+            '"EMBEDDING_MODEL": "BAAI/bge-small-en" to .mcp.json local-compress.env -- the model your '
+            "existing compacts were stored with, so none are orphaned."
+        ),
+        note=(
+            "Do NOT change this to another model once you have saved compacts: they are stored under a "
+            "model-named vector and would become unreadable. Set it in the .mcp.json env block, not a shell export."
+        ),
+        detect=_detect_compress_embedding_model_missing,
+        apply=_apply_compress_embedding_model_missing,
     ),
     Migration(
         id="record-session-id-sessionstart",

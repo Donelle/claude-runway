@@ -43,6 +43,9 @@ class FindInCollectionLimitTest(unittest.TestCase):
             "provider": patch.object(_ims, "FastEmbedProvider"),
             "connector": patch.object(_ims, "QdrantConnector"),
             "mismatch": patch.object(_ims, "check_embedding_model_mismatch", return_value=None),
+            # Issue #397's compact-marker read legitimately calls get_collection;
+            # stubbed out so these tests keep asserting only about the LIMIT lookup.
+            "compact_marker": patch.object(_ims, "collection_is_marked_compact", return_value=False),
         }
         self.m = {}
         for name, p in patches.items():
