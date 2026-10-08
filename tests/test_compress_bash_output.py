@@ -591,10 +591,13 @@ async def _fake_compress(text, skip_if_under_chars=2000, **kwargs):
 
 class MainFallsBackToGenericForNonFooterMcpTools(unittest.TestCase):
     """Issue #25: an mcp__local-compress__* tool call that carries NO savings
-    footer (compact_find, compact_store, list_local_models,
-    savings_summary/detail -- none of these ever call
-    _append_savings_footer) must still get the same size-based compression
-    every other matched tool gets, not a silent no-op regardless of size."""
+    footer (compact_find, compact_store, list_local_models -- none of these
+    ever call _append_savings_footer) must still get the same size-based
+    compression every other matched tool gets, not a silent no-op regardless
+    of size. Exception (issue #302): the exact-output tools in
+    hook._EXACT_OUTPUT_MCP_TOOLS (savings_summary/detail/trend, get_metrics,
+    compact_prune) are deliberately a no-op at any size, since their numbers
+    must be read verbatim."""
 
     def setUp(self):
         self.stub = _StubSavingsLedger()
@@ -680,6 +683,26 @@ class MainFallsBackToGenericForNonFooterMcpTools(unittest.TestCase):
                     "cwd": "/repos/my-project",
                     "tool_name": f"mcp__local-compress__{bare_name}",
                     "tool_response": already_compressed,
+                }
+                printed = self._run_main(payload)
+                self.assertEqual(printed, "", f"{bare_name} must be a true no-op here")
+                self.assertEqual(len(self.stub.calls), 0)
+
+    def test_exact_output_tools_are_never_generically_compressed(self):
+        # Issue #302: savings/metrics/prune reports are exact numeric output
+        # read verbatim; they must pass through untouched however large.
+        big = "row 1234567 tokens 89.5%\n" * 400
+        self.assertGreater(len(big), hook.THRESHOLD)
+        expected = {"savings_summary", "savings_detail", "savings_trend", "get_metrics", "compact_prune"}
+        self.assertEqual(hook._EXACT_OUTPUT_MCP_TOOLS, expected)
+        for bare_name in sorted(expected):
+            with self.subTest(tool=bare_name):
+                self.stub.calls.clear()
+                payload = {
+                    "session_id": "sess-1",
+                    "cwd": "/repos/my-project",
+                    "tool_name": f"mcp__local-compress__{bare_name}",
+                    "tool_response": big,
                 }
                 printed = self._run_main(payload)
                 self.assertEqual(printed, "", f"{bare_name} must be a true no-op here")

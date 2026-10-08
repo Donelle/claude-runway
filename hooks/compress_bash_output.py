@@ -323,6 +323,14 @@ MCP_SAVINGS_TOOL_PREFIX = "mcp__local-compress__"
 # first pass was told to preserve (PR #88 review: this is /my-compact's own
 # real usage, which sets preserve_identifiers=preserve_sections=True).
 _SELF_COMPRESSING_MCP_TOOLS = {"compress_file", "compress_command_output", "fetch_url", "compress_text"}
+# Tool names (without the prefix) whose output is an exact numeric/structured
+# report meant to be read verbatim -- a savings breakdown table, a metrics
+# trend, a list of pruned compact ids (issue #302). Same failure class as the
+# Bash `grep -c` exemption: running them through the lossy local-model path
+# once the response passes THRESHOLD could silently drop or alter a specific
+# number. Distinct from _SELF_COMPRESSING_MCP_TOOLS: these never compress
+# anything themselves, they're just exempt from the generic fallback.
+_EXACT_OUTPUT_MCP_TOOLS = {"savings_summary", "savings_detail", "savings_trend", "get_metrics", "compact_prune"}
 SAVINGS_FOOTER_RE = re.compile(r"\n?<!--CLAUDE_RUNWAY_SAVINGS:(\{.*?\})-->\s*\Z", re.DOTALL)
 # Below this length, a string is assumed to be metadata (a URL, a file
 # count, a status word) rather than content worth compressing or blanking --
@@ -1062,7 +1070,7 @@ def _dispatch(payload):
         # would discard exactly what that first pass was told to preserve.
         # Otherwise, this is one of the local-compress tools that never
         # compresses anything itself (compact_find, compact_store,
-        # list_local_models, savings_summary/detail) -- fall back to the
+        # list_local_models) -- fall back to the
         # same size-based compression every other matched tool gets,
         # otherwise every one of THOSE calls is a complete no-op regardless
         # of size, the opposite of what this hook exists to do (issue #25).
@@ -1070,6 +1078,9 @@ def _dispatch(payload):
         # conversation compacts.
         bare_tool_name = tool_name[len(MCP_SAVINGS_TOOL_PREFIX):]
         if bare_tool_name in _SELF_COMPRESSING_MCP_TOOLS:
+            sys.exit(0)
+        # Exact-output reports: pass through untouched regardless of size (#302).
+        if bare_tool_name in _EXACT_OUTPUT_MCP_TOOLS:
             sys.exit(0)
         # compact_find's output is structured data /my-resume parses for
         # control flow (issue #193), not prose to skim: a "Found {N}
