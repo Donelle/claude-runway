@@ -15,7 +15,7 @@ local model is actually reachable right now. That's enough to enforce
 deterministically, unlike "should this have been qdrant-find" which has no
 equivalent signal.
 
-Mechanism: unlike the compress_bash_output.py PostToolUse hook (which can
+Mechanism: unlike the compress_output.py PostToolUse hook (which can
 only rewrite output after the fact), this is a PreToolUse hook -- it can
 outright prevent the WebFetch call from running at all via
 `permissionDecision: "deny"`, with `permissionDecisionReason` fed back to
@@ -98,7 +98,7 @@ import sqlite3
 import sys
 from typing import NoReturn
 
-# Same redundant resolution order as compress_bash_output.py -- see that
+# Same redundant resolution order as compress_output.py -- see that
 # file's comment for the full bug history this guards against. libs/ under
 # the repo root is checked first (real layout); repo root itself is kept as
 # a fallback for backward compatibility.

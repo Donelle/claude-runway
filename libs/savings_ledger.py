@@ -1,6 +1,6 @@
 """
 Storage + formatting for ClaudeRunway's opt-in savings tracker. Used by:
-  - hooks/compress_bash_output.py   (sole ledger WRITER -- see below for why)
+  - hooks/compress_output.py   (sole ledger WRITER -- see below for why)
   - hooks/session_end_savings.py    (rolls a session's ledger into SQLite, emits a summary)
   - compress_mcp_server.py          (writes the fixed schema-overhead estimate at startup;
                                       the 3 credited tools themselves do NOT import this module --
@@ -201,7 +201,7 @@ def record_event(session_id: str, tool: str, raw_tokens: int, out_tokens: int, c
     longer reads this per-event field at all -- it's retained here purely
     as informational/debugging metadata on each transient event, not
     because anything still resolves a session_id from it. The sole writer,
-    hooks/compress_bash_output.py, derives it from the hook payload's own
+    hooks/compress_output.py, derives it from the hook payload's own
     `cwd` field (the same source session_end_savings.py already uses via
     project_name_from_cwd).
 

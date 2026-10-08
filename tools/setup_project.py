@@ -205,7 +205,7 @@ def _hook_env_reminders(args: argparse.Namespace) -> list:
     """
     --track-savings/--lmstudio-model/--lmstudio-url/--savings-db only reach
     the local-compress MCP server's env block in the generated .mcp.json --
-    they do NOT reach compress_bash_output.py/session_end_savings.py, the
+    they do NOT reach compress_output.py/session_end_savings.py, the
     hook scripts written into .claude/settings.json, since Claude Code hook
     entries have no env field of their own and instead inherit the shell's
     environment unfiltered (see README's "Environment variables" section).

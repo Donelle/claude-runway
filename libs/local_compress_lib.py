@@ -1,7 +1,7 @@
 """
 Shared, MCP-independent compression logic used by both:
   - compress_mcp_server.py     (MCP server exposing compress_file/compress_command_output/etc.)
-  - hooks/compress_bash_output.py  (PostToolUse hook that compresses ANY large Bash output)
+  - hooks/compress_output.py  (PostToolUse hook that compresses ANY large tool output)
 
 Kept free of the `mcp` package dependency on purpose -- the hook script only
 needs `openai`, not the full MCP SDK, since it's invoked as a plain command
@@ -49,7 +49,7 @@ LM_STUDIO_V0_TIMEOUT_SECONDS = 5.0
 # and the hooks attach it via additionalContext (they must fail open).
 # The third element is where the NEW name actually has to be set, which is not
 # uniform and must not be described as if it were: CLAUDE_RUNWAY_COMPRESS_THRESHOLD_CHARS
-# is read ONLY by hooks/compress_bash_output.py, so an .mcp.json entry for it is
+# is read ONLY by hooks/compress_output.py, so an .mcp.json entry for it is
 # inert and telling someone to add one sends them to the wrong file. The other two
 # are read via this module, which BOTH the MCP server and the compress hook import.
 _BOTH = ("set it in both .mcp.json's env block (for the MCP server) and as a shell "
@@ -1566,7 +1566,7 @@ def _http_get_json(url: str, timeout: float):
     """
     Minimal stdlib-only GET-and-parse-JSON helper for fetch_loaded_models'
     /api/v0/models probe below -- deliberately NOT `requests` (PR #318
-    review, high severity): both hooks/compress_bash_output.py and
+    review, high severity): both hooks/compress_output.py and
     hooks/redirect_webfetch_to_fetch_url.py document a standalone install
     path of `pip install openai` ONLY, and both import this module directly
     (not through compress_mcp_server.py's own requirements.txt, which does

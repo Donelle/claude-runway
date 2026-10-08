@@ -385,7 +385,7 @@ under `~/.claude/skills/`, not guaranteed to exist on whichever machine is runni
     explaining *why*, not just *what* — this codebase's established density).
 14. Write or update unit tests in the matching `tests/test_*.py`, following that file's
     existing patterns (e.g. the `hook.compress = _fake_compress` monkeypatch style already
-    used in `tests/test_compress_bash_output.py` for anything touching LM Studio, so tests
+    used in `tests/test_compress_output.py` for anything touching LM Studio, so tests
     need no live model). If sizing test fixtures relative to a threshold constant, read the
     constant from the module dynamically (e.g. `hook.THRESHOLD`) rather than hardcoding its
     documented default — this repo's own dogfood shell overrides

@@ -2,9 +2,10 @@
 """
 PostToolUse hook that compresses ANY large tool output via a local LM Studio
 model, replacing what Claude actually sees with the compressed version.
-Filename is legacy (this started Bash-only) -- it now also covers Grep,
-WebFetch, Glob, and WebSearch, and is written to extend to further tools
-without code changes per-tool where possible. Unlike a PreToolUse hook,
+(Formerly compress_bash_output.py -- renamed in issue #395 because it started
+Bash-only but now also covers Grep, WebFetch, Glob, and WebSearch; existing
+installs are migrated by `upgrade`'s compress-hook-renamed migration.)
+It is written to extend to further tools without code changes per-tool where possible. Unlike a PreToolUse hook,
 this doesn't need to guess in advance which calls will produce large
 output -- it acts on the REAL, measured size after the tool has already
 run.
@@ -133,7 +134,7 @@ comments below):
           {
             "type": "command",
             "command": "python3",
-            "args": ["/absolute/path/to/tools-repo/hooks/compress_bash_output.py"]
+            "args": ["/absolute/path/to/tools-repo/hooks/compress_output.py"]
           }
         ]
       }
@@ -216,7 +217,7 @@ except ImportError as e:
     # Claude Code's hook debug output instead of behaving identically to
     # "nothing needed compressing."
     print(
-        f"compress_bash_output.py: could not import local_compress_lib ({e}). "
+        f"compress_output.py: could not import local_compress_lib ({e}). "
         f"Checked: {[d for d in _candidates if d]}. Set TOOLS_REPO_DIR if the "
         "tools repo isn't where this script's parent directory implies.",
         file=sys.stderr,
@@ -288,7 +289,7 @@ def _parse_threshold() -> int:
         return int(raw)
     except ValueError:
         print(
-            f"compress_bash_output.py: invalid CLAUDE_RUNWAY_COMPRESS_THRESHOLD_CHARS={raw!r} "
+            f"compress_output.py: invalid CLAUDE_RUNWAY_COMPRESS_THRESHOLD_CHARS={raw!r} "
             f"(not an integer); using default {_DEFAULT_THRESHOLD}",
             file=sys.stderr,
         )
@@ -305,7 +306,7 @@ THRESHOLD = _parse_threshold()
 # The user-visible path is the fail-open note in main() -- see below.
 _STALE_ENV = stale_env_warning()
 if _STALE_ENV:
-    print(f"compress_bash_output.py: {_STALE_ENV}", file=sys.stderr)
+    print(f"compress_output.py: {_STALE_ENV}", file=sys.stderr)
 SUPPORTED_TOOLS = {"Bash", "Grep", "WebFetch", "Glob", "WebSearch"}
 # MCP tools whose credited compression the server itself performs -- this hook's
 # job for these is only to strip the machine-readable savings footer
@@ -469,7 +470,7 @@ _FORCE_COMPRESS_RE = re.compile(r"#\s*compress-ok\s*\Z")
 
 # --- Project-level extra exactness-critical patterns (issue #192) ----------
 #
-# hooks/compress_bash_output.py is shared across every project that installs
+# hooks/compress_output.py is shared across every project that installs
 # this toolkit -- each project's .claude/settings.json points at the SAME
 # cloned copy by absolute path (see docs/installation.md). A project with its
 # own domain-specific command whose output must stay byte-exact (an internal
@@ -513,7 +514,7 @@ def _compile_extra_exact_patterns():
             compiled.append(re.compile(pattern))
         except re.error as e:
             print(
-                f"compress_bash_output.py: skipping invalid "
+                f"compress_output.py: skipping invalid "
                 f"CLAUDE_RUNWAY_EXTRA_EXACT_PATTERNS entry {pattern!r}: {e}",
                 file=sys.stderr,
             )

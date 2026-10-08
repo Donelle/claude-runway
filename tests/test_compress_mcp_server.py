@@ -1225,7 +1225,7 @@ class SavingsFooterRedactsSourceCredentials(unittest.TestCase):
     `curl -H 'Authorization: Bearer ghp_...'` still leaked its embedded
     credential via that field even though the compressed BODY the command
     produced was properly redacted. That footer gets persisted into the
-    savings ledger by hooks/compress_bash_output.py, turning a transient
+    savings ledger by hooks/compress_output.py, turning a transient
     secret in a command line into a durable one in that database.
     """
 

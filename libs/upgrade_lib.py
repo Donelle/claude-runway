@@ -25,7 +25,7 @@ two functions are RESYNC primitives (built for `init`, which regenerates and
 re-merges every toolkit-owned field on every run) and their "strip every
 toolkit-owned entry for this event, then re-add only what this run
 generated" semantics silently DELETE an unrelated toolkit hook (e.g. an
-existing `compress_bash_output.py` PostToolUse block) that a narrower,
+existing `compress_output.py` PostToolUse block) that a narrower,
 single-migration apply never intended to touch. A migration's `apply` only
 ever ADDS the one thing its `detect` found missing -- confirmed by writing
 the naive merge-based version first and catching it deleting a pre-existing
@@ -45,7 +45,14 @@ from typing import Callable, Optional
 # Flat import, matching every other libs/*.py module's own convention (see
 # setup_project_lib.py's module docstring for why: libs/ is added to
 # sys.path directly by callers, not treated as a real Python package).
-from setup_project_lib import LEGACY_COMPACT_EMBEDDING_MODEL, build_mcp_servers, build_settings_hooks, load_json
+from setup_project_lib import (
+    COMPRESS_HOOK_SCRIPT,
+    LEGACY_COMPACT_EMBEDDING_MODEL,
+    LEGACY_COMPRESS_HOOK_SCRIPT,
+    build_mcp_servers,
+    build_settings_hooks,
+    load_json,
+)
 
 
 @dataclass
@@ -288,14 +295,14 @@ def _apply_record_session_id_hooks_missing(
     exactly right for `init`, which regenerates every toolkit-owned block on
     every run, but wrong here: this migration's own `detect` fires precisely
     for a project that adopted local-compress BEFORE #198 shipped, i.e. one
-    whose PostToolUse already has a REAL `compress_bash_output.py` block and
+    whose PostToolUse already has a REAL `compress_output.py` block and
     no separate CORE block at all (the template's own SessionStart entry for
     record_session_id.py didn't exist yet when that project was set up --
     it was originally a PostToolUse entry, replaced by SessionStart in
     issue #231).  Calling `build_settings_hooks(..., include_compress=False)`
     and merging the result would treat PostToolUse as "generated -> only the
     core block" and, via `merge_settings_hooks`'s strip-then-replace logic,
-    silently DELETE that project's real, working `compress_bash_output.py`
+    silently DELETE that project's real, working `compress_output.py`
     entry -- confirmed by writing that version first and catching it wiping
     the compress hook out of a fixture that had one, in this file's own tests.
     A pure append has no such failure mode: it only ever adds the core
@@ -466,6 +473,76 @@ def _apply_record_session_id_posttooluse_wildcard(
     return mcp_json, settings_json
 
 
+# ---------------------------------------------------------------------------
+# compress-hook-renamed (refactor: #395)
+# ---------------------------------------------------------------------------
+
+
+def _is_script_hook(hook: dict, script_name: str) -> bool:
+    return any(Path(a).name == script_name for a in hook.get("args", []))
+
+
+def _detect_compress_hook_renamed(mcp_json: dict, settings_json: dict) -> bool:
+    """True when ANY hook, under any event, still invokes the pre-#395
+    `compress_bash_output.py` -- a path that no longer exists in the toolkit
+    repo, so that hook now fails on every tool call."""
+    for blocks in settings_json.get("hooks", {}).values():
+        for block in blocks:
+            if any(_is_script_hook(h, LEGACY_COMPRESS_HOOK_SCRIPT) for h in block.get("hooks", [])):
+                return True
+    return False
+
+
+def _apply_compress_hook_renamed(mcp_json: dict, settings_json: dict, ctx: MigrationContext) -> "tuple[dict, dict]":
+    """
+    Rewrites ONLY the script filename in each legacy hook's args
+    (`.../hooks/compress_bash_output.py` -> `.../hooks/compress_output.py`),
+    keeping the directory, the command/venv, the matcher, and every sibling
+    inner hook exactly as they were -- the same "never delete a working
+    block" discipline as record-session-id-hooks-missing (see its docstring
+    for why a regenerate-and-merge would be wrong here: it would clobber a
+    project's own matcher/path customizations).
+
+    One guarded exception: if the SAME event AND MATCHER already has a hook
+    invoking the new name (hand-added, or from a partial earlier run),
+    rewriting would leave two compress hooks double-compressing every call
+    matching it, so the stale legacy inner hook is dropped instead (the
+    block itself survives if it still holds anything else). Scoped to the
+    matcher, not the whole event: a legacy `Bash` block beside a new-named
+    `Grep` block is NOT a duplicate -- dropping it would silently disable
+    Bash compression (Copilot review, PR #402).
+    """
+    settings_json = copy.deepcopy(settings_json)
+    for blocks in settings_json.get("hooks", {}).values():
+        new_matchers = {
+            b.get("matcher")
+            for b in blocks
+            if any(_is_script_hook(h, COMPRESS_HOOK_SCRIPT) for h in b.get("hooks", []))
+        }
+        surviving = []
+        for block in blocks:
+            has_new = block.get("matcher") in new_matchers
+            inner = []
+            for hook in block.get("hooks", []):
+                if _is_script_hook(hook, LEGACY_COMPRESS_HOOK_SCRIPT):
+                    if has_new:
+                        continue  # the new-named hook is already registered; drop the stale duplicate
+                    hook["args"] = [
+                        a[: -len(LEGACY_COMPRESS_HOOK_SCRIPT)] + COMPRESS_HOOK_SCRIPT
+                        if Path(a).name == LEGACY_COMPRESS_HOOK_SCRIPT
+                        else a
+                        for a in hook.get("args", [])
+                    ]
+                inner.append(hook)
+            if block.get("hooks") and not inner:
+                continue  # block held only the stale duplicate
+            if "hooks" in block:
+                block["hooks"] = inner
+            surviving.append(block)
+        blocks[:] = surviving
+    return mcp_json, settings_json
+
+
 # Ordered oldest-feature-first -- order only affects DISPLAY order when more
 # than one migration is pending; `detect` alone decides whether each one is
 # shown at all.
@@ -573,6 +650,20 @@ MIGRATIONS: "list[Migration]" = [
         ),
         detect=_detect_record_session_id_posttooluse_wildcard,
         apply=_apply_record_session_id_posttooluse_wildcard,
+    ),
+    Migration(
+        id="compress-hook-renamed",
+        title="Point the compress hook at hooks/compress_output.py",
+        kind="update",
+        description=(
+            "This project's .claude/settings.json still runs hooks/compress_bash_output.py, which was "
+            "renamed to hooks/compress_output.py (issue #395) -- the old path no longer exists, so "
+            "output compression silently stops working. Rewrites just the script filename in each such "
+            "hook; the venv path, tools-repo directory, matcher, and every other hook are left untouched."
+        ),
+        note="",
+        detect=_detect_compress_hook_renamed,
+        apply=_apply_compress_hook_renamed,
     ),
 ]
 

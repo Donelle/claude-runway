@@ -474,11 +474,21 @@ _CORE_HOOK_SCRIPTS = (
     ("SessionEnd", "record_session_id.py"),
 )
 _COMPRESS_HOOK_SCRIPTS = (
-    ("PostToolUse", "compress_bash_output.py"),
+    ("PostToolUse", "compress_output.py"),
     ("PreToolUse", "redirect_webfetch_to_fetch_url.py"),
     ("SessionEnd", "session_end_savings.py"),
 )
 _TOOLKIT_HOOK_SCRIPTS = _CORE_HOOK_SCRIPTS + _COMPRESS_HOOK_SCRIPTS
+
+# The compress hook's pre-#395 filename. Existing installs' settings.json
+# still reference it, so it must stay RECOGNIZED as toolkit-owned (otherwise
+# `init` would treat that block as a user's own hook and append a second,
+# new-named block beside it, double-compressing every tool call). It is
+# deliberately NOT in _COMPRESS_HOOK_SCRIPTS: nothing generates it anymore.
+# Shared with upgrade_lib (the rename migration) and doctor_lib (the stale-
+# registration check) so the three can't disagree about the old name.
+LEGACY_COMPRESS_HOOK_SCRIPT = "compress_bash_output.py"
+COMPRESS_HOOK_SCRIPT = "compress_output.py"
 
 
 def _find_and_patch_block(blocks: list, script_name: str, *, command: str, args: list) -> bool:
@@ -609,7 +619,7 @@ def merge_mcp_json(existing: dict, generated_servers: dict, *, owned_keys: tuple
 
 # Every script filename (basename, not full path) this toolkit's hooks
 # generate -- used by _is_toolkit_owned_hook below.
-_TOOLKIT_HOOK_SCRIPT_NAMES = frozenset(name for _, name in _TOOLKIT_HOOK_SCRIPTS)
+_TOOLKIT_HOOK_SCRIPT_NAMES = frozenset(name for _, name in _TOOLKIT_HOOK_SCRIPTS) | {LEGACY_COMPRESS_HOOK_SCRIPT}
 
 
 def _is_toolkit_owned_hook(hook: dict) -> bool:
@@ -640,7 +650,7 @@ def _strip_toolkit_owned_inner_hooks(block: dict) -> Optional[dict]:
     Operates at INNER-HOOK granularity, not whole-BLOCK granularity, because
     a single block's "hooks" list can hold more than one entry sharing the
     same matcher -- e.g. a user manually adding their own custom hook
-    alongside this toolkit's `compress_bash_output.py` entry in the SAME
+    alongside this toolkit's `compress_output.py` entry in the SAME
     block object, rather than as a separate top-level block. Found in PR
     #113 review and confirmed by reproducing it directly: an earlier
     whole-block check discarded that entire block -- including the user's
@@ -702,7 +712,7 @@ def strip_toolkit_hooks(existing: dict) -> dict:
     correctly omitted `local-compress` from the generated `.mcp.json` (see
     merge_mcp_json), but previously left settings.json completely untouched
     either way, so a repo that had a prior FULL setup (local-compress +
-    hooks) still had compress_bash_output.py/session_end_savings.py firing
+    hooks) still had compress_output.py/session_end_savings.py firing
     on every matching event, and the PreToolUse hook still denying WebFetch
     and redirecting to a `fetch_url` tool that's no longer configured --
     both silently broken rather than genuinely "qdrant only".

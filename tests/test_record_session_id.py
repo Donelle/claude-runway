@@ -244,7 +244,7 @@ class UnexpectedErrorsFailOpen(unittest.TestCase):
     the sessions directory, etc.) must never surface as a broken tool call
     or a broken session shutdown -- main()'s top-level guard swallows it and
     still exits 0 with no stdout, the same fail-open philosophy
-    compress_bash_output.py's own top-level guard uses."""
+    compress_output.py's own top-level guard uses."""
 
     def test_record_shadow_marker_raising_still_exits_silently(self):
         with mock.patch.object(hook.session_id_lib, "record_shadow_marker", side_effect=OSError("disk full")):

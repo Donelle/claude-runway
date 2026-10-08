@@ -201,7 +201,7 @@ def _append_savings_footer(outer_text: str, inner_result: str, tool: str, raw_te
     footer is appended there, and out_tokens is measured on it, since that's
     what Claude will actually see.
 
-    hooks/compress_bash_output.py is the one that STRIPS this footer before
+    hooks/compress_output.py is the one that STRIPS this footer before
     Claude ever reads it and logs the numbers to the savings ledger -- this
     MCP server can't write the ledger itself because (unlike a hook) it has
     no access to Claude Code's session_id. When tracking is off, this is a
@@ -214,7 +214,7 @@ def _append_savings_footer(outer_text: str, inner_result: str, tool: str, raw_te
     itself carry a credential (e.g. `curl -H 'Authorization: Bearer ghp_...'`)
     even when the compressed BODY the command produced is properly
     redacted. This footer gets persisted into the savings ledger by
-    hooks/compress_bash_output.py, so an unredacted `source` would turn a
+    hooks/compress_output.py, so an unredacted `source` would turn a
     transient secret in a command line into a durable one in that database
     -- same class of problem redact_and_disclose() already exists to
     prevent for compressed content itself. Redacted over the FULL source
@@ -1838,7 +1838,7 @@ def _require_savings_tracking() -> Optional[str]:
             "Savings tracking is off (CLAUDE_RUNWAY_TRACK_SAVINGS is not set). "
             "Set CLAUDE_RUNWAY_TRACK_SAVINGS=1 in this server's env (in .mcp.json) and export it in the shell "
             "environment that launches `claude` too (hook entries in .claude/settings.json have no env field "
-            "of their own, so that's the only way compress_bash_output.py sees it)."
+            "of their own, so that's the only way compress_output.py sees it)."
         )
     return None
 

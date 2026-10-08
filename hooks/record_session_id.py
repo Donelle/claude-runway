@@ -5,7 +5,7 @@ Keeps `libs/session_id_lib.py`'s Type-2 (SHADOW_FILE) shadow marker fresh
 actually-populated, permanent strategy, rather than inert scanning logic
 pointed at a directory nothing writes to. Before this hook existed, the
 sessions directory was only ever populated as a side effect of the opt-in
-savings tracker (`hooks/compress_bash_output.py`, itself gated behind
+savings tracker (`hooks/compress_output.py`, itself gated behind
 `CLAUDE_RUNWAY_TRACK_SAVINGS`) -- this hook is part of the CORE/base
 install, so every project gets a working SHADOW_FILE strategy regardless of
 whether local-compress/the savings tracker is configured at all.
@@ -61,9 +61,9 @@ import json
 import os
 import sys
 
-# Same redundant path-resolution order as compress_bash_output.py/
+# Same redundant path-resolution order as compress_output.py/
 # session_end_savings.py, so this script also works if copied standalone or
-# if the repo layout shifts -- see compress_bash_output.py's comment for the
+# if the repo layout shifts -- see compress_output.py's comment for the
 # full rationale.
 _here = os.path.dirname(os.path.abspath(__file__))
 _root = os.path.dirname(_here)
@@ -76,7 +76,7 @@ try:
     import session_id_lib
 except ImportError:
     # Fail open, silently -- this hook has no output contract to preserve
-    # (unlike compress_bash_output.py, which must report why on stderr since
+    # (unlike compress_output.py, which must report why on stderr since
     # a broken import there silently drops real compression); a missing
     # libs/session_id_lib.py just means Type 2 isn't populated this run.
     sys.exit(0)
@@ -164,7 +164,7 @@ def main() -> None:
         _dispatch(payload)
     except Exception:
         # Unconditional fail-open (issue #198, same philosophy as
-        # compress_bash_output.py's top-level guard) -- this hook's job is a
+        # compress_output.py's top-level guard) -- this hook's job is a
         # pure side effect; a bug here must never surface as a broken tool
         # call or a broken session shutdown.
         pass

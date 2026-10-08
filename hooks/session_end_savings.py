@@ -2,7 +2,7 @@
 """
 SessionEnd hook for ClaudeRunway's opt-in savings tracker. Rolls the current
 session's transient JSONL ledger (written during the session by
-compress_bash_output.py -- see libs/savings_ledger.py) into one row of the
+compress_output.py -- see libs/savings_ledger.py) into one row of the
 perpetual SQLite store, then surfaces a short summary to the user via
 `systemMessage` in this hook's JSON output.
 
@@ -39,7 +39,7 @@ import json
 import os
 import sys
 
-# Same redundant path-resolution order as compress_bash_output.py, so this
+# Same redundant path-resolution order as compress_output.py, so this
 # script also works if copied standalone or if the repo layout shifts --
 # see that file's comment for the full rationale.
 _here = os.path.dirname(os.path.abspath(__file__))
@@ -101,7 +101,7 @@ def main():
         actual_tokens = savings_ledger.parse_session_token_counts(transcript_path)
 
     # This hook is meant to be best-effort and fail open, same philosophy as
-    # compress_bash_output.py -- a savings-tracker problem (a corrupted DB
+    # compress_output.py -- a savings-tracker problem (a corrupted DB
     # file, a disk error, a locked SQLite connection) must never surface as a
     # crashed hook or a missing systemMessage at normal session shutdown.
     try:

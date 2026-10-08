@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Table tests for hooks/compress_bash_output.py's exactness-critical skipping.
+"""Table tests for hooks/compress_output.py's exactness-critical skipping.
 
 Stdlib-only (unittest, no pytest) and no network -- `_is_exactness_critical`
 is pure regex over a command string, so this needs neither LM Studio nor
@@ -27,8 +27,8 @@ from contextlib import redirect_stderr, redirect_stdout
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hooks"))
 
-import compress_bash_output as hook  # noqa: E402
-from compress_bash_output import _is_exactness_critical  # noqa: E402
+import compress_output as hook  # noqa: E402
+from compress_output import _is_exactness_critical  # noqa: E402
 
 # The other three stdin-reading hooks, imported for the issue #263 stdin-encoding
 # regression tests at the bottom of this file. Each is a standalone script with
@@ -373,7 +373,7 @@ class _StubSavingsLedger:
 
 
 class RecordSavingsEventForwardsProject(unittest.TestCase):
-    """Issue #35: hooks/compress_bash_output.py is savings_ledger's SOLE
+    """Issue #35: hooks/compress_output.py is savings_ledger's SOLE
     writer, so _record_savings_event forwarding its `project` argument
     through to record_event is what tags each transient event with its
     project. Originally (issue #35) this is what let current_session_id()'s
@@ -1273,7 +1273,7 @@ class HooksReconfigureStdinToUtf8(unittest.TestCase):
     """Issue #263: all four stdin-reading hooks must force stdin to utf-8
     before json.load, because Windows Python defaults stdin to the locale
     codepage (cp1252). Left unfixed, multi-byte UTF-8 decodes as mojibake
-    (which compress_bash_output would then splice back as the tool's output)
+    (which compress_output would then splice back as the tool's output)
     and cp1252-unmapped bytes raise UnicodeDecodeError that the fail-open
     json.load guard swallows -- silently skipping compression / marker writes
     for exactly the riskiest payloads. These tests feed a simulated
@@ -1374,7 +1374,7 @@ class InvalidThresholdEnvTests(unittest.TestCase):
     raise ValueError at import time, killing the hook on every matched call.
     Run in a real subprocess because the crash happens at module import."""
 
-    HOOK = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hooks", "compress_bash_output.py")
+    HOOK = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hooks", "compress_output.py")
 
     def _run(self, env_value):
         import subprocess
