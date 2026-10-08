@@ -15,7 +15,7 @@ Usage:
 
 Run this once to seed the collection, then re-run periodically (or on a
 schedule) to pick up changes. Re-running without --reset will add duplicate
-chunks; pass --reset to wipe the collection's (non-memory-bank) points before indexing.
+chunks; pass --reset to wipe the collection's unprotected points (everything except memory-bank points and compacts carrying the issue #282 source marker) before indexing.
 
 Project minimum: Python 3.12 (policy floor; the dependency chain supports >=3.10).
 """
@@ -127,7 +127,7 @@ async def ingest(args):
                     sys.exit(1)
                 # Layer 2 (issue #265), ported from index_repo: ALWAYS a
                 # filtered delete, never delete_collection, so any
-                # metadata.source == "memory-bank" points survive even if
+                # metadata.source == "memory-bank" / "conversation-compact" (issue #282) points survive even if
                 # this collection somehow holds them. Unconditional (no
                 # count-then-act) to avoid the race documented in
                 # index_repo: a remember() landing between a count and a
@@ -138,8 +138,9 @@ async def ingest(args):
                     points_selector=mb.memory_bank_exclusion_filter(),
                 )
                 print(
-                    f"Reset: deleted existing non-memory-bank points from '{args.collection}' "
-                    f"(the collection itself and any memory-bank points are kept)."
+                    f"Reset: deleted existing points from '{args.collection}' except protected ones "
+                    f"(the collection itself, memory-bank points and marked conversation compacts are kept; "
+                    f"compacts stored before issue #282 carry no marker and were deleted)."
                 )
         elif client.collection_exists(args.collection):
             # FIELD_INDEXES below only takes effect when QdrantConnector's
@@ -225,7 +226,7 @@ def parse_args():
     p.add_argument("--dry-run", action="store_true", help="Preview chunks without writing to Qdrant")
     p.add_argument("--reset", action="store_true", help="Delete the collection's existing points before indexing (avoids duplicate chunks on re-runs). "
                          "Like index_repo(reset=True) (issue #175), this is a filtered delete that keeps the "
-                         "collection itself and any memory-bank points, refuses the configured "
+                         "collection itself, any memory-bank points and marked (issue #282) conversation compacts, refuses the configured "
                          "MEMORY_BANK_COLLECTION outright, and aborts before deleting on an embedding-model "
                          "mismatch -- so it can no longer rebuild a collection's vector schema after an "
                          "EMBEDDING_MODEL change (drop the collection manually for that)")

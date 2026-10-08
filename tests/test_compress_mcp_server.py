@@ -288,6 +288,19 @@ class CompactStoreIsIdempotent(unittest.TestCase):
         [point] = list(col.values())
         self.assertEqual(point.payload["information"], "retried content (should overwrite, not duplicate)")
 
+    def test_payload_carries_compact_source_marker(self):
+        # Issue #282: the indexer's reset/delete guard excludes on
+        # metadata.source, so compact points must carry the shared constant.
+        mod, client_cls = self._patched_module()
+        _run(mod.compact_store(information="x", project="my-project", label="l", date="2026-08-27"))
+        col = next(iter(client_cls().collections.values()))
+        [point] = list(col.values())
+        self.assertEqual(point.payload["metadata"]["source"], mod.COMPACT_SOURCE)
+        # Writer and guard must agree: the exclusion filter names this value.
+        import memory_bank_lib
+        excluded = {c.match.value for c in memory_bank_lib.memory_bank_exclusion_filter().must_not}
+        self.assertIn(point.payload["metadata"]["source"], excluded)
+
     def test_different_label_does_not_collide(self):
         mod, client_cls = self._patched_module()
 

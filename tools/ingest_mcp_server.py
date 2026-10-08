@@ -410,13 +410,15 @@ async def index_repo(
     qdrant-find/qdrant-store MCP server, or search relevance will silently
     break (different models produce incompatible vector spaces).
 
-    Set reset=true to delete all existing NON-memory-bank entries in the
-    collection first -- otherwise re-running this on an already-indexed repo
+    Set reset=true to delete all existing UNPROTECTED entries (everything
+    except the protected sources listed below) in the collection first -- otherwise re-running this on an already-indexed repo
     creates duplicate chunks. memory-bank points (metadata.source ==
-    "memory-bank") are always preserved regardless (issue #175) -- but do NOT
-    set reset=true if the collection is shared with OTHER non-code data (e.g.
-    qdrant-store notes, conversation-compacts) you don't want wiped; those
-    still get deleted. Note this means reset=true no longer recreates the
+    "memory-bank") and conversation compacts stored since issue #282
+    (metadata.source == "conversation-compact") are always preserved
+    regardless -- but do NOT set reset=true if the collection is shared with
+    OTHER non-code data (e.g. qdrant-store notes, or conversation-compacts
+    stored before #282, which carry no source marker) you don't want wiped;
+    those still get deleted. Note this means reset=true no longer recreates the
     collection's underlying vector SCHEMA either (PR #178 review -- an
     earlier version did, via a full delete_collection, whenever no
     memory-bank points existed at check-time, but that check-then-act was
@@ -563,10 +565,11 @@ async def index_repo(
                 f"reset=True may add duplicate chunks on top of those. "
                 f"Options: (1) use sync_repo instead for an incremental update "
                 f"that avoids duplicates (preferred for most cases), "
-                f"(2) re-run with reset=True to wipe non-memory-bank collection "
+                f"(2) re-run with reset=True to wipe unprotected collection "
                 f"data and re-index cleanly (caution: wipes any other non-code "
                 f"data stored there, e.g. qdrant-store notes or conversation-"
-                f"compacts -- memory-bank points are always preserved), "
+                f"compacts stored before issue #282 -- memory-bank points and "
+                f"newer conversation compacts are always preserved), "
                 f"or (3) re-run with force=True to add content "
                 f"to the existing index deliberately."
             )
@@ -1107,11 +1110,9 @@ async def sync_repo(
                     # metadata.file_path on a memory-bank point, so this isn't
                     # fixing a live bug -- just closing the gap structurally in
                     # case a future schema change reintroduces overlap.
-                    must_not=[
-                        models.FieldCondition(
-                            key=mb.SOURCE_FIELD, match=models.MatchValue(value=mb.MEMORY_BANK_SOURCE)
-                        )
-                    ],
+                    # Issue #282: same shared fragment as the reset path, so
+                    # conversation compacts are protected here too.
+                    must_not=mb.memory_bank_exclusion_filter().must_not,
                 ),
             )
 

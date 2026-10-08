@@ -78,6 +78,12 @@ WEIGHT_FIELD = "metadata.weight"
 
 MEMORY_BANK_SOURCE = "memory-bank"
 
+# metadata.source value compress_mcp_server.compact_store stamps on every
+# conversation-compact point (issue #282). Lives here beside
+# MEMORY_BANK_SOURCE so the writer and the indexer's delete guard
+# (memory_bank_exclusion_filter) share one constant and can't drift apart.
+COMPACT_SOURCE = "conversation-compact"
+
 # Default weight for a point with no metadata.weight at all (issue #177) --
 # either a point written before this field existed, or one explicitly
 # remembered with weight=1.0 (the default). Multiplicative against
@@ -224,15 +230,21 @@ def is_memory_bank_collection_name(collection: str, memory_bank_collection: str)
 
 def memory_bank_exclusion_filter() -> models.Filter:
     """
-    The reusable `must_not: metadata.source == "memory-bank"` fragment
-    index_repo/sync_repo fold into their own delete filters, so a collection
-    that ever ends up holding both code chunks and memory-bank points (it
-    shouldn't, given is_memory_bank_collection_name's guard, but this stays
-    as defense-in-depth per issue #175) never has its memory-bank points
-    caught by an unrelated delete.
+    The reusable `must_not` fragment index_repo/sync_repo fold into their own
+    delete filters, so a collection that ever ends up holding both code
+    chunks and protected points (it shouldn't, given
+    is_memory_bank_collection_name's guard, but this stays as
+    defense-in-depth per issue #175) never has them caught by an unrelated
+    delete. Protects memory-bank points (metadata.source == "memory-bank")
+    and, since issue #282, conversation compacts (metadata.source ==
+    "conversation-compact"). Compacts stored before #282 carry no
+    metadata.source and stay unprotected until backfilled.
     """
     return models.Filter(
-        must_not=[models.FieldCondition(key=SOURCE_FIELD, match=models.MatchValue(value=MEMORY_BANK_SOURCE))]
+        must_not=[
+            models.FieldCondition(key=SOURCE_FIELD, match=models.MatchValue(value=MEMORY_BANK_SOURCE)),
+            models.FieldCondition(key=SOURCE_FIELD, match=models.MatchValue(value=COMPACT_SOURCE)),
+        ]
     )
 
 

@@ -93,6 +93,7 @@ from local_compress_lib import (
     fetch_loaded_models,
     redact_credentials,
 )
+from memory_bank_lib import COMPACT_SOURCE
 from mcp_tool_introspect import describe_tools, tool_count
 from qdrant_retry import call_with_retry
 
@@ -1125,7 +1126,13 @@ async def compact_store(
                 # per-entry filter was added). The exact literal value is
                 # also useful as a human-readable record of what this
                 # specific call actually passed.
-                payload={"document": information, "project": project, "label": label, "date": date, "information": information},
+                # metadata.source (issue #282) is what index_repo/sync_repo's
+                # delete filters exclude on (mb.memory_bank_exclusion_filter),
+                # so a reset pointed at a compact collection can't wipe these.
+                payload={
+                    "document": information, "project": project, "label": label, "date": date,
+                    "information": information, "metadata": {"source": COMPACT_SOURCE},
+                },
             )
         ],
     )

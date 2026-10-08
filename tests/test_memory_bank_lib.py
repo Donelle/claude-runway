@@ -92,10 +92,13 @@ class IsMemoryBankCollectionNameTest(unittest.TestCase):
 class MemoryBankExclusionFilterTest(unittest.TestCase):
     def test_excludes_memory_bank_source(self):
         f = mb.memory_bank_exclusion_filter()
-        self.assertEqual(len(f.must_not), 1)
-        cond = f.must_not[0]
-        self.assertEqual(cond.key, mb.SOURCE_FIELD)
-        self.assertEqual(cond.match.value, mb.MEMORY_BANK_SOURCE)
+        # Issue #282: conversation compacts are protected by the same fragment.
+        self.assertEqual(len(f.must_not), 2)
+        for cond in f.must_not:
+            self.assertEqual(cond.key, mb.SOURCE_FIELD)
+        self.assertEqual(
+            {c.match.value for c in f.must_not}, {mb.MEMORY_BANK_SOURCE, mb.COMPACT_SOURCE}
+        )
 
 
 def _matching_collection_info(vector_name="fast-test-model", dim=4):
