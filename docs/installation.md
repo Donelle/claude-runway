@@ -7,7 +7,7 @@ Docker Engine (Linux), then save this Compose configuration as `compose.yml`:
 ```yml
 services:
   qdrant:
-    image: qdrant/qdrant:v1.10.0  # Replace with your target version
+    image: qdrant/qdrant:v1.19.2  # Pinned on purpose; change it deliberately to upgrade (see "Upgrading Qdrant")
     container_name: qdrant
     ports:
       # Bound to 127.0.0.1 deliberately. Qdrant runs unauthenticated here and
@@ -34,8 +34,12 @@ docker compose up -d
 Alternatively, start the same setup directly with Docker:
 ```bash
 docker volume create qdrant_storage
-docker run -d --name qdrant --restart unless-stopped -p 127.0.0.1:6333:6333 -v qdrant_storage:/qdrant/storage qdrant/qdrant
+docker run -d --name qdrant --restart unless-stopped -p 127.0.0.1:6333:6333 -v qdrant_storage:/qdrant/storage qdrant/qdrant:v1.19.2
 ```
+Pin the tag in `docker run` too: an unpinned `qdrant/qdrant` means `latest`, so
+after a `docker pull` the next time the container is recreated it can silently
+come up on a newer, unreviewed version.
+
 The named volume keeps your indexes when the container is stopped or recreated.
 Binding the port to `127.0.0.1` keeps this unauthenticated development instance
 accessible only from your machine. Confirm that Qdrant is running:
@@ -53,13 +57,49 @@ docker compose stop      # stop it
 docker compose start     # start it again without losing indexed data
 docker compose logs      # inspect startup or runtime errors
 ```
-Run Compose commands from the directory containing `compose.yml`.
+Run Compose commands from the directory containing `compose.yml` so Compose
+finds it and keeps the same project name (see "Upgrading Qdrant" below).
 If you used the direct `docker run` command instead, use `docker stop qdrant`,
 `docker start qdrant`, and `docker logs qdrant`.
+
 For remote or production deployments, configure authentication and TLS rather
 than exposing this default unauthenticated container. See Qdrant's
 [local quickstart](https://qdrant.tech/documentation/quick-start/) and
 [security guide](https://qdrant.tech/documentation/security/).
+
+### Upgrading Qdrant
+Your data lives in the named volume, so these points decide whether it survives:
+- **Which volume Compose uses depends on the project name.** Compose prefixes
+  the volume name with the project name, which defaults to the name of the
+  directory containing the Compose file (a `compose.yml` in `~/Docker` creates
+  `docker_qdrant_storage`). Copying the file to a differently named directory, or using
+  a different `-p`, `COMPOSE_PROJECT_NAME`, or top-level `name:`, creates a new,
+  empty volume. Your collections look gone, but the old volume is intact; switch
+  back to the original project name to see it again. List volumes with
+  `docker volume ls`. See Docker's
+  [project name docs](https://docs.docker.com/compose/how-tos/project-name/).
+- **What deletes data:** `docker compose down -v` (removes the named volumes
+  declared in the file) and `docker volume rm`. Plain `docker compose down`,
+  `stop`, and recreating the container keep the volume.
+- **Back up first.** Take a [snapshot](https://qdrant.tech/documentation/snapshots/)
+  or, with Qdrant stopped (`docker compose stop`; a raw copy of a running
+  instance's files may be inconsistent), copy the volume before upgrading. Qdrant's upgrade guide does not describe
+  downgrading, so treat it as unsupported: your backup is the way back. Code
+  collections can be rebuilt with `index_repo(reset=True)` (`sync_repo` refuses
+  when its local manifest still lists files the empty collection lacks), but conversation
+  compacts (`compact_store`) and the shared memory-bank entries (`remember`)
+  cannot, so they are what the backup protects most.
+- **Upgrade:** edit the `image:` tag, then run `docker compose pull` and
+  `docker compose up -d`. No `down` is needed; Compose recreates the container on
+  the same volume. Qdrant says to upgrade to the latest patch of each
+  intermediate minor version first (for example 1.17 to 1.19 goes via 1.18.x),
+  and read the release notes for breaking changes. For the direct `docker run`
+  form, `docker stop qdrant && docker rm qdrant`, then re-run the command with the
+  new tag and the same `-v qdrant_storage:/qdrant/storage`.
+- **Verify:** `curl http://localhost:6333` shows the new version, and
+  `curl http://localhost:6333/collections` lists your collections.
+
+The authoritative rules are in Qdrant's [upgrade guide](https://qdrant.tech/documentation/upgrades/).
 
 **1. Install uv** (if not already installed)
 
