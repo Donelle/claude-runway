@@ -243,7 +243,7 @@ Report two numbers per scenario set, not one — averaging only over successes o
 
 ### Step E4: Measure the fixed overhead
 
-Same pattern as Step A4/B4 — and already wired up rather than something this track still needs to add: `tools/report_tool_counts.py`'s server loop already includes `memory-bank` (`memory_bank_mcp_server`) alongside `local-compress` and `codebase-indexer`, so its 3 tools' (`remember`/`recall`/`forget`) schema-token cost goes through the same shared `libs/mcp_tool_introspect.py` utility as the other two servers. Run `python tools/report_tool_counts.py` for the current live number rather than hand-typing one here — same discipline Step A4/B4 already established, for the same reason: issues #22/#23 are exactly what happens when a schema-token count gets hand-typed into this doc instead of read live.
+Same pattern as Step A4/B4 — and already wired up rather than something this track still needs to add: `tools/report_tool_counts.py`'s server loop already includes `memory-bank` (`memory_bank_mcp_server`) alongside `local-compress` and `codebase-indexer`, so its tools' (`remember`/`recall`/`forget`/`transfer_memories`) schema-token cost goes through the same shared `libs/mcp_tool_introspect.py` utility as the other two servers. Run `python tools/report_tool_counts.py` for the current live number rather than hand-typing one here — same discipline Step A4/B4 already established, for the same reason: issues #22/#23 are exactly what happens when a schema-token count gets hand-typed into this doc instead of read live.
 
 ### Step E5: remember:recall ratio (diagnostic only)
 

@@ -456,10 +456,85 @@ class SessionIdDelegatesToSessionIdLibTest(unittest.TestCase):
         self.assertRegex(_mbs._SESSION_ID, r"^[0-9a-f]{32}$")
 
 
+class TransferMemoriesToolTest(unittest.TestCase):
+    """Issue #336: transfer_memories' tool-layer wiring. The transfer logic
+    itself is covered by test_memory_bank_lib.py's TransferPointsTest."""
+
+    def _fake_report(self, dry_run=True):
+        bucket = "would_migrate" if dry_run else "migrated"
+        return {"source_collection": "legacy", "target_collection": "memory-bank", "dry_run": dry_run,
+                bucket: {"general": 0, "project": 0}, "skipped_foreign_repo": {},
+                "already_present": 0, "errors": []}
+
+    def test_dry_run_is_the_default_and_builds_no_embedding_provider(self):
+        with patch("memory_bank_mcp_server.QdrantClient"), \
+             patch("memory_bank_mcp_server.FastEmbedProvider") as mock_provider_cls, \
+             patch.object(_mb, "transfer_points", new=AsyncMock(return_value=self._fake_report())) as mock_transfer:
+            result = _run(_mbs.transfer_memories(source_collection="legacy"))
+        mock_provider_cls.assert_not_called()
+        kwargs = mock_transfer.call_args.kwargs
+        self.assertIs(kwargs["dry_run"], True)
+        self.assertEqual(kwargs["source"], "legacy")
+        self.assertEqual(kwargs["target"], _mbs.DEFAULT_MEMORY_BANK_COLLECTION)
+        self.assertEqual(kwargs["caller_repo"], _mbs.DEFAULT_MEMORY_BANK_ID)
+        self.assertIsNone(mock_transfer.call_args.args[1])
+        report = __import__("json").loads(result)
+        self.assertEqual(report["caller_repo"], _mbs.DEFAULT_MEMORY_BANK_ID)
+        self.assertIn("would_migrate", report)
+
+    def test_real_run_builds_embedding_provider(self):
+        with patch("memory_bank_mcp_server.QdrantClient"), \
+             patch("memory_bank_mcp_server.FastEmbedProvider") as mock_provider_cls, \
+             patch.object(_mb, "transfer_points", new=AsyncMock(return_value=self._fake_report(False))) as mock_transfer:
+            _run(_mbs.transfer_memories(source_collection="legacy", dry_run=False))
+        mock_provider_cls.assert_called_once_with(_mbs.DEFAULT_EMBEDDING_MODEL)
+        self.assertIs(mock_transfer.call_args.kwargs["dry_run"], False)
+
+    def test_connection_overrides_reach_the_client(self):
+        with patch("memory_bank_mcp_server.QdrantClient") as mock_client_cls, \
+             patch.object(_mb, "transfer_points", new=AsyncMock(return_value=self._fake_report())):
+            _run(_mbs.transfer_memories(source_collection="legacy", qdrant_url="http://other:6333", qdrant_api_key="k"))
+        mock_client_cls.assert_called_once_with(url="http://other:6333", api_key="k")
+
+    def test_default_key_not_sent_to_an_overridden_url(self):
+        # PR #422 review: qdrant_url is tool input, so the configured key must
+        # not follow it to another host.
+        with patch.object(_mbs, "DEFAULT_QDRANT_API_KEY", "secret"), \
+             patch("memory_bank_mcp_server.QdrantClient") as mock_client_cls, \
+             patch.object(_mb, "transfer_points", new=AsyncMock(return_value=self._fake_report())):
+            _run(_mbs.transfer_memories(source_collection="legacy", qdrant_url="http://elsewhere:6333"))
+        mock_client_cls.assert_called_once_with(url="http://elsewhere:6333", api_key=None)
+
+    def test_default_key_used_for_the_default_url(self):
+        with patch.object(_mbs, "DEFAULT_QDRANT_API_KEY", "secret"), \
+             patch("memory_bank_mcp_server.QdrantClient") as mock_client_cls, \
+             patch.object(_mb, "transfer_points", new=AsyncMock(return_value=self._fake_report())):
+            _run(_mbs.transfer_memories(source_collection="legacy"))
+            _run(_mbs.transfer_memories(source_collection="legacy", qdrant_url=_mbs.DEFAULT_QDRANT_URL))
+        for c in mock_client_cls.call_args_list:
+            self.assertEqual(c.kwargs, {"url": _mbs.DEFAULT_QDRANT_URL, "api_key": "secret"})
+
+    def test_misconfigured_memory_bank_id_returns_error_before_any_client(self):
+        with patch.object(_mbs, "DEFAULT_MEMORY_BANK_ID", None), \
+             patch("memory_bank_mcp_server.QdrantClient") as mock_client_cls, \
+             patch.object(_mb, "transfer_points", new=AsyncMock()) as mock_transfer:
+            result = _run(_mbs.transfer_memories(source_collection="legacy", dry_run=False))
+        # JSON like every other outcome (PR #422 review), not bare text.
+        report = __import__("json").loads(result)
+        self.assertIn("MEMORY_BANK_ID", report["error"])
+        self.assertEqual(report["source_collection"], "legacy")
+        mock_client_cls.assert_not_called()
+        mock_transfer.assert_not_called()
+
+    def test_source_collection_is_required(self):
+        with self.assertRaises(TypeError):
+            _mbs.transfer_memories()  # type: ignore[call-arg]
+
+
 class ToolRegistrationTest(unittest.TestCase):
-    def test_registers_exactly_three_tools(self):
+    def test_registers_exactly_four_tools(self):
         from mcp_tool_introspect import tool_count
-        self.assertEqual(tool_count(_mbs.mcp), 3)
+        self.assertEqual(tool_count(_mbs.mcp), 4)
 
     def test_logs_tool_count_to_stderr_not_stdout(self):
         captured_err = io.StringIO()
@@ -468,7 +543,7 @@ class ToolRegistrationTest(unittest.TestCase):
         with redirect_stderr(captured_err), contextlib.redirect_stdout(captured_out):
             _mbs._log_registered_tool_count()
         self.assertIn("memory-bank", captured_err.getvalue())
-        self.assertIn("3", captured_err.getvalue())
+        self.assertIn("4", captured_err.getvalue())
         self.assertEqual(captured_out.getvalue(), "")
 
 
