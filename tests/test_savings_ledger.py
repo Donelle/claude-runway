@@ -186,6 +186,54 @@ class SessionIdDelegatesToSessionIdLibTest(SavingsLedgerTestCase):
         self.assertEqual(L.current_session_id(project="claude-runway"), expected)
 
 
+class ShadowMarkersAreNeverLedgers(SavingsLedgerTestCase):
+    """Issue #273: session_id_lib's `session_<id>.jsonl` shadow markers share
+    the default sessions dir with this module's `<id>.jsonl` ledgers (the
+    base class points both modules at the same temp dir, as in a default
+    install). The unfiltered current_session_id() used to return the newest
+    `*.jsonl`'s stem -- very often a marker, since markers are refreshed on
+    every lifecycle event -- and get_live_session_aggregate() would then parse
+    the marker as an event log."""
+
+    def _ledger_then_fresher_marker(self):
+        L.record_event("sess-real", "compress_file", 1000, 100, True, project="claude-runway")
+        session_id_lib.record_shadow_marker("sess-real", project="/repos/claude-runway")
+        ledger = L._session_jsonl_path("sess-real")
+        marker = session_id_lib._shadow_marker_path("sess-real")
+        self.assertEqual(ledger.parent, marker.parent)  # sanity: one shared dir
+        os.utime(ledger, (1000, 1000))
+        os.utime(marker, (2000, 2000))  # the marker is the newest *.jsonl
+        return marker
+
+    def test_unfiltered_lookup_skips_a_fresher_marker(self):
+        self._ledger_then_fresher_marker()
+        self.assertEqual(L.current_session_id(), "sess-real")
+
+    def test_unfiltered_lookup_with_only_markers_returns_none(self):
+        session_id_lib.record_shadow_marker("sess-a", project="/repos/claude-runway")
+        self.assertIsNone(L.current_session_id())
+
+    def test_marker_stem_is_never_parsed_as_an_event_log(self):
+        marker = self._ledger_then_fresher_marker()
+        self.assertTrue(marker.exists())  # sanity: there IS a file to misread
+        stem = marker.stem
+        self.assertEqual(L.read_session_events(stem), [])
+        agg = L.get_live_session_aggregate(stem)
+        self.assertEqual(agg["by_tool"], {})
+        self.assertEqual(agg["event_count"], 0)
+        # The real ledger next to it is unaffected.
+        self.assertEqual(len(L.read_session_events("sess-real")), 1)
+
+    def test_prefix_is_the_one_the_marker_writer_uses(self):
+        # Writer and readers share session_id_lib.SESSION_MARKER_PREFIX, so a
+        # change to the marker filename can't silently reopen this bug.
+        marker = session_id_lib._shadow_marker_path("sess-x")
+        self.assertTrue(marker.name.startswith(session_id_lib.SESSION_MARKER_PREFIX))
+        self.assertTrue(L._is_shadow_marker_name(marker.name))
+        self.assertIsNone(L._artifact_session_id(marker.name))
+        self.assertFalse(L._is_shadow_marker_name(L._session_jsonl_path("sess-x").name))
+
+
 def _old_schema_db_path(db_path: Path) -> None:
     """Builds a `sessions` table matching the schema from before
     raw_tokens_sum/out_tokens_sum/overhead_tokens existed, plus one

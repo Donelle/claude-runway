@@ -191,7 +191,15 @@ def _session_id_from_hook_payload(hook_payload: Optional[dict]) -> Optional[str]
 # literal here (not imported) so this module never depends on
 # savings_ledger's own CLAUDE_RUNWAY_SAVINGS_DB override or db-path logic.
 # See module docstring: same directory CONVENTION, not a code dependency.
-_MARKER_FILENAME_PREFIX = "session_"
+#
+# Public (issue #273) because the directory is shared: savings_ledger.py's
+# own per-session ledgers are bare `<session_id>.jsonl` files in the same
+# place by default, so its readers must skip markers by this exact prefix.
+# Exporting it from the writer's module keeps writer and readers from
+# drifting apart (the dependency still only runs savings_ledger ->
+# session_id_lib, never the reverse).
+SESSION_MARKER_PREFIX = "session_"
+_MARKER_FILENAME_PREFIX = SESSION_MARKER_PREFIX
 
 
 def _sessions_dir() -> Path:

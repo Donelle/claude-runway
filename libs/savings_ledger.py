@@ -111,6 +111,17 @@ def _session_jsonl_path(session_id: str) -> Path:
     return _sessions_dir() / f"{_sanitize_session_id(session_id)}.jsonl"
 
 
+def _is_shadow_marker_name(name: str) -> bool:
+    """True if a sessions-dir filename (or a ledger stem) is one of
+    session_id_lib's shadow markers (`session_<id>.jsonl`) rather than one of
+    this module's own `<session_id>.jsonl` ledgers. Both file families share
+    the default sessions dir, and a marker is never a ledger (issue #273), so
+    every reader here that enumerates or opens ledgers by name checks this.
+    The prefix comes from session_id_lib, the marker's writer, so the two
+    can't drift apart."""
+    return name.startswith(session_id_lib.SESSION_MARKER_PREFIX)
+
+
 def project_name_from_cwd(cwd: str) -> str:
     return Path(cwd).name if cwd else "unknown"
 
@@ -141,7 +152,12 @@ def current_session_id(project: Optional[str] = None) -> Optional[str]:
     means "no marker can match" (a marker's basename is never `None`), NOT
     "most recent regardless of project," and that a caller wanting that
     different, unfiltered meaning "must implement that itself." Implementing
-    it here, unchanged, is exactly that.
+    it here is exactly that -- with one change since the original (issue
+    #273): session_id_lib's `session_<id>.jsonl` shadow markers share this
+    directory by default and are refreshed on every lifecycle event, far
+    more often than a ledger is written, so the newest `*.jsonl` was often a
+    marker and its stem (`"session_<id>"`) came back as a session id. Markers
+    are skipped; only real ledgers are candidates.
 
     Known limitation introduced by this split: if `CLAUDE_RUNWAY_SAVINGS_DB`
     is overridden away from its default location, the project-FILTERED path
@@ -175,6 +191,8 @@ def current_session_id(project: Optional[str] = None) -> Optional[str]:
     # session.
     dated = []
     for p in d.glob("*.jsonl"):
+        if _is_shadow_marker_name(p.name):
+            continue  # a session_id_lib marker, never a ledger (issue #273)
         try:
             dated.append((p.stat().st_mtime, p))
         except OSError:
@@ -250,6 +268,12 @@ def read_session_events(session_id: str) -> list:
     # between the check and the open (confirmed directly). Opening straight
     # away and catching OSError closes that window instead of narrowing it.
     path = _session_jsonl_path(session_id)
+    # A marker's stem (e.g. from an older current_session_id(), or any caller
+    # passing one through) maps onto the marker file itself. Never parse a
+    # marker as an event log (issue #273) -- its `{"project": ...}` line would
+    # otherwise be counted as one event under tool "unknown".
+    if _is_shadow_marker_name(path.name):
+        return []
     try:
         f = open(path, encoding="utf-8")
     except OSError:
@@ -855,7 +879,7 @@ def _artifact_session_id(name: str) -> Optional[str]:
     """The session a sessions-dir file belongs to if it's a ledger or a claim
     of one; None for anything else, including session_id_lib's shadow markers
     (`session_*.jsonl`, same directory by default -- never a ledger)."""
-    if name.startswith("session_"):
+    if _is_shadow_marker_name(name):
         return None
     if name.endswith(".jsonl"):
         return name[: -len(".jsonl")]
