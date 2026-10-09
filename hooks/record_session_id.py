@@ -53,8 +53,9 @@ Setup: see templates/settings.json.template's core SessionStart/SessionEnd
 blocks -- nothing needs to be copied into a target project, same convention
 as every other hook in this repo.
 
-Env vars: `CLAUDE_RUNWAY_SESSION_MARKER_TTL_HOURS` (shell-only, default 168h;
-see libs/session_id_lib.py's `_ttl_hours()`).
+Env vars: `CLAUDE_RUNWAY_SESSION_MARKER_TTL_HOURS` (default 168h; the hook reads
+the shell export, but the local-compress MCP server also reads it via
+libs/session_id_lib.py's `_ttl_hours()` -- see docs/environment-variables.md).
 """
 
 import json
