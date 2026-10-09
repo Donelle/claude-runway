@@ -13,6 +13,11 @@ Usage:
         --qdrant-url http://localhost:6333 \
         --embedding-model sentence-transformers/all-MiniLM-L6-v2
 
+--qdrant-url/--qdrant-api-key/--embedding-model/--include-ext/--exclude-dirs
+fall back to the same QDRANT_URL/QDRANT_API_KEY/EMBEDDING_MODEL/
+INDEX_INCLUDE_EXTENSIONS/INDEX_EXCLUDE_DIRS env vars the codebase-indexer MCP
+server reads, read from this shell's environment (not from .mcp.json).
+
 Run this once to seed the collection, then re-run periodically (or on a
 schedule) to pick up changes. Re-running without --reset will add duplicate
 chunks; pass --reset to wipe the collection's unprotected points (everything except memory-bank points and compacts carrying the issue #282 source marker) before indexing.
@@ -50,7 +55,14 @@ except ImportError:
     )
     sys.exit(1)
 
-from qdrant_ingest_lib import build_entries, ensure_persistent_fastembed_cache, validate_chunk_params
+from qdrant_ingest_lib import (
+    MANIFEST_FILENAME,
+    build_entries,
+    ensure_persistent_fastembed_cache,
+    ingest_env_defaults,
+    parse_csv_set,
+    validate_chunk_params,
+)
 from qdrant_batch_store import store_batch, ensure_file_path_index, FIELD_INDEXES
 from qdrant_model_check import check_embedding_model_mismatch
 from qdrant_retry import call_with_retry
@@ -62,12 +74,13 @@ import memory_bank_lib as mb
 ensure_persistent_fastembed_cache()
 
 # Same env var + default the MCP servers read (tools/ingest_mcp_server.py's
-# DEFAULT_MEMORY_BANK_COLLECTION), so the CLI's --reset guard below agrees
-# with index_repo's about which collection is the shared memory bank. Read
-# at import time like the server does; an interactive shell that doesn't
-# export MEMORY_BANK_COLLECTION falls back to the "memory-bank" default,
-# which is the name a stock install uses anyway.
-DEFAULT_MEMORY_BANK_COLLECTION = os.environ.get("MEMORY_BANK_COLLECTION") or "memory-bank"
+# DEFAULT_MEMORY_BANK_COLLECTION, both via ingest_env_defaults), so the CLI's
+# --reset guard below agrees with index_repo's about which collection is the
+# shared memory bank. Read at import time like the server does; an
+# interactive shell that doesn't export MEMORY_BANK_COLLECTION falls back to
+# the "memory-bank" default, which is the name a stock install uses anyway
+# (a custom name that lives only in .mcp.json is issue #352).
+DEFAULT_MEMORY_BANK_COLLECTION = ingest_env_defaults()["memory_bank_collection"]
 
 
 async def ingest(args):
@@ -163,13 +176,22 @@ async def ingest(args):
     )
 
     repo_path = Path(args.repo_path).resolve()
-    include_extensions = set(args.include_ext.split(",")) if args.include_ext else None
-    extra_exclude_dirs = set(args.exclude_dirs.split(",")) if args.exclude_dirs else None
+    # parse_csv_set strips each entry and drops blanks (issue #276) -- a bare
+    # split(",") turned "--include-ext '.py, .md'" into {".py", " .md"}, which
+    # normalizes to ". .md" and silently indexed no markdown at all.
+    include_extensions = parse_csv_set(args.include_ext)
+    extra_exclude_dirs = parse_csv_set(args.exclude_dirs)
     raw_entries, skipped = build_entries(
         repo_path, args.scope, args.chunk_lines, args.overlap,
         include_extensions=include_extensions,
         extra_exclude_dirs=extra_exclude_dirs,
         respect_gitignore=not args.no_gitignore,
+        # Issue #276: sync_repo's manifest is a .json file at the repo root,
+        # so without this the CLI embeds it whenever a repo previously
+        # maintained by sync_repo doesn't gitignore it -- the exact bug #91
+        # fixed for the server's three build_entries/compute_file_hashes
+        # call sites.
+        extra_exclude_files={MANIFEST_FILENAME},
     )
     entries = [Entry(content=content, metadata=metadata) for content, metadata in raw_entries]
 
@@ -202,22 +224,38 @@ async def ingest(args):
 
 
 def parse_args():
+    # Issue #276: every default below used to be hardcoded, so the CLI
+    # ignored the QDRANT_URL/QDRANT_API_KEY/EMBEDDING_MODEL/
+    # INDEX_INCLUDE_EXTENSIONS/INDEX_EXCLUDE_DIRS the MCP server honors. Both
+    # now resolve them through the same ingest_env_defaults(). Precedence: an
+    # explicit flag, then the env var, then the built-in default. Resolved
+    # here (not at import) so it reflects the environment at parse time.
+    # The help strings deliberately never interpolate %(default)s: the API
+    # key's default can be a real secret from the environment.
+    env = ingest_env_defaults()
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--version", action="version", version=version_string("claude-runway-ingest"))
     p.add_argument("--repo-path", required=True, help="Path to the repo to index")
     p.add_argument("--collection", required=True, help="Qdrant collection name (must match your MCP server's COLLECTION_NAME)")
-    p.add_argument("--qdrant-url", default="http://localhost:6333")
-    p.add_argument("--qdrant-api-key", default=None)
-    p.add_argument("--embedding-model", default="sentence-transformers/all-MiniLM-L6-v2",
-                    help="Must match your MCP server's EMBEDDING_MODEL exactly")
+    p.add_argument("--qdrant-url", default=env["qdrant_url"],
+                    help="Default: $QDRANT_URL if set, else http://localhost:6333")
+    p.add_argument("--qdrant-api-key", default=env["qdrant_api_key"],
+                    help="Default: $QDRANT_API_KEY if set, else none (unauthenticated)")
+    p.add_argument("--embedding-model", default=env["embedding_model"],
+                    help="Must match your MCP server's EMBEDDING_MODEL exactly. Default: $EMBEDDING_MODEL "
+                         "if set, else sentence-transformers/all-MiniLM-L6-v2. Only the shell environment "
+                         "is read, not .mcp.json -- pass this flag (or export the var) when the project's "
+                         ".mcp.json sets a different model")
     p.add_argument("--scope", choices=["code", "docs", "both"], default="both",
-                    help="Ignored if --include-ext is given")
-    p.add_argument("--include-ext", default=None,
+                    help="Ignored if --include-ext (or $INDEX_INCLUDE_EXTENSIONS) is given")
+    p.add_argument("--include-ext", default=env["include_extensions"],
                     help="Comma-separated file extensions to ingest, overriding --scope entirely, "
-                         "e.g. '.py,.md,.proto' (leading dot optional)")
-    p.add_argument("--exclude-dirs", default=None,
+                         "e.g. '.py,.md,.proto' (leading dot optional, spaces around commas are fine). "
+                         "Default: $INDEX_INCLUDE_EXTENSIONS if set")
+    p.add_argument("--exclude-dirs", default=env["exclude_dirs"],
                     help="Comma-separated folder names to skip, IN ADDITION TO the built-in defaults "
-                         "(.git, node_modules, venv, dist, build, etc.) -- e.g. 'fixtures,generated'")
+                         "(.git, node_modules, venv, dist, build, etc.) -- e.g. 'fixtures,generated'. "
+                         "Default: $INDEX_EXCLUDE_DIRS if set")
     p.add_argument("--no-gitignore", action="store_true",
                     help="Don't apply the repo's own .gitignore on top of the exclude rules above "
                          "(gitignore is respected by default if the optional 'pathspec' package is installed)")

@@ -14,8 +14,10 @@ import asyncio
 import io
 import os
 import sys
+import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
 from unittest import mock
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -191,6 +193,133 @@ class ResetRefusesMemoryBankCollection(unittest.TestCase):
              mock.patch.object(mod, "store_batch", new=mock.AsyncMock(return_value=0)):
             with redirect_stdout(io.StringIO()):
                 _run(mod.ingest(_args(collection="my-shared-bank", reset=False)))
+
+
+def _dry_run_indexed_paths(args) -> set:
+    """Runs a real --dry-run ingest() over args.repo_path (no Qdrant, no
+    embedding model -- both mocked) and returns the set of file_path values
+    build_entries actually produced, plus the kwargs it was called with."""
+    captured = {}
+    real_build_entries = mod.build_entries
+
+    def _recording_build_entries(*a, **kw):
+        captured["kwargs"] = kw
+        entries, skipped = real_build_entries(*a, **kw)
+        captured["paths"] = {m["file_path"] for _, m in entries}
+        return entries, skipped
+
+    with mock.patch.object(mod, "QdrantClient"), \
+         mock.patch.object(mod, "FastEmbedProvider"), \
+         mock.patch.object(mod, "QdrantConnector"), \
+         mock.patch.object(mod, "build_entries", side_effect=_recording_build_entries):
+        with redirect_stdout(io.StringIO()):
+            _run(mod.ingest(argparse.Namespace(**{**vars(args), "dry_run": True})))
+    return captured
+
+
+class CliParityWithMcpServer(unittest.TestCase):
+    """Issue #276: three ways the CLI had drifted from ingest_mcp_server.py.
+    The csv, manifest and env-fallback tests failed on main before the fix;
+    the flags-win, no-env-defaults and --help tests are guards on the new
+    defaults (precedence, unchanged built-ins, no secret echoed in help)."""
+
+    # --- 1. csv parsing --------------------------------------------------
+
+    def test_include_ext_with_spaces_still_indexes_every_listed_extension(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d)
+            (repo / "a.py").write_text("x = 1\n")
+            (repo / "b.md").write_text("# Title\n\nbody\n")
+            captured = _dry_run_indexed_paths(
+                _args(repo_path=d, include_ext=".py, .md", no_gitignore=True)
+            )
+        self.assertEqual(captured["paths"], {"a.py", "b.md"})
+
+    def test_exclude_dirs_with_spaces_still_excludes_every_listed_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d)
+            for sub in ("keep", "fixtures", "generated"):
+                (repo / sub).mkdir()
+                (repo / sub / "m.py").write_text("x = 1\n")
+            captured = _dry_run_indexed_paths(
+                _args(repo_path=d, include_ext=".py", exclude_dirs="fixtures, generated")
+            )
+        self.assertEqual(captured["paths"], {os.path.join("keep", "m.py")})
+
+    # --- 2. manifest self-indexing (#91) ---------------------------------
+
+    def test_cli_never_indexes_the_sync_manifest(self):
+        """Mirrors test_qdrant_ingest_lib.ManifestSelfIndex for the CLI path:
+        a repo previously maintained by sync_repo has the manifest at its
+        root, and .json is in CODE_EXTENSIONS."""
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d)
+            (repo / "main.py").write_text("x = 1\n")
+            (repo / "config.json").write_text('{"k": "v"}\n')
+            (repo / ".qdrant_index_manifest.json").write_text('{"main.py": "h"}\n')
+            captured = _dry_run_indexed_paths(
+                _args(repo_path=d, include_ext=None, scope="code", no_gitignore=True)
+            )
+        self.assertIn("main.py", captured["paths"])
+        self.assertIn("config.json", captured["paths"])
+        self.assertNotIn(".qdrant_index_manifest.json", captured["paths"])
+
+    # --- 3. env var defaults ---------------------------------------------
+
+    def _parse(self, argv, env):
+        with mock.patch.dict(os.environ, env, clear=True), \
+             mock.patch.object(sys, "argv", ["ingest_to_qdrant.py", *argv]):
+            return mod.parse_args()
+
+    BASE_ARGV = ["--repo-path", "/tmp/repo", "--collection", "c"]
+
+    def test_parse_args_falls_back_to_every_env_var_the_server_reads(self):
+        args = self._parse(self.BASE_ARGV, {
+            "QDRANT_URL": "http://remote:6333",
+            "QDRANT_API_KEY": "secret",
+            "EMBEDDING_MODEL": "BAAI/bge-small-en",
+            "INDEX_INCLUDE_EXTENSIONS": ".py,.md",
+            "INDEX_EXCLUDE_DIRS": "fixtures",
+        })
+        self.assertEqual(args.qdrant_url, "http://remote:6333")
+        self.assertEqual(args.qdrant_api_key, "secret")
+        self.assertEqual(args.embedding_model, "BAAI/bge-small-en")
+        self.assertEqual(args.include_ext, ".py,.md")
+        self.assertEqual(args.exclude_dirs, "fixtures")
+
+    def test_parse_args_flags_win_over_env(self):
+        args = self._parse(self.BASE_ARGV + [
+            "--qdrant-url", "http://flag:6333",
+            "--qdrant-api-key", "flag-key",
+            "--embedding-model", "flag/model",
+            "--include-ext", ".rs",
+            "--exclude-dirs", "flagdir",
+        ], {
+            "QDRANT_URL": "http://remote:6333",
+            "QDRANT_API_KEY": "secret",
+            "EMBEDDING_MODEL": "BAAI/bge-small-en",
+            "INDEX_INCLUDE_EXTENSIONS": ".py,.md",
+            "INDEX_EXCLUDE_DIRS": "fixtures",
+        })
+        self.assertEqual(args.qdrant_url, "http://flag:6333")
+        self.assertEqual(args.qdrant_api_key, "flag-key")
+        self.assertEqual(args.embedding_model, "flag/model")
+        self.assertEqual(args.include_ext, ".rs")
+        self.assertEqual(args.exclude_dirs, "flagdir")
+
+    def test_parse_args_built_in_defaults_with_no_env(self):
+        args = self._parse(self.BASE_ARGV, {})
+        self.assertEqual(args.qdrant_url, "http://localhost:6333")
+        self.assertIsNone(args.qdrant_api_key)
+        self.assertEqual(args.embedding_model, "sentence-transformers/all-MiniLM-L6-v2")
+        self.assertIsNone(args.include_ext)
+        self.assertIsNone(args.exclude_dirs)
+
+    def test_help_never_prints_the_env_api_key(self):
+        out = io.StringIO()
+        with self.assertRaises(SystemExit), redirect_stdout(out):
+            self._parse(["--help"], {"QDRANT_API_KEY": "super-secret-key"})
+        self.assertNotIn("super-secret-key", out.getvalue())
 
 
 class MainIsTheConsoleScriptEntryPoint(unittest.TestCase):

@@ -282,7 +282,7 @@ This is what makes memory automatically project-scoped: opening Claude Code in a
 - `INDEX_INCLUDE_EXTENSIONS`: comma-separated extensions (e.g. `".py,.md"`) — overrides the built-in list entirely, so only these get ingested.
 - `INDEX_EXCLUDE_DIRS`: comma-separated folder names (e.g. `"fixtures,generated"`) — adds to (not replaces) the built-in excludes.
 
-Same options exist as `--include-ext`/`--exclude-dirs`/`--no-gitignore` flags on `ingest_to_qdrant.py`, and as `include_extensions`/`exclude_dirs`/`respect_gitignore` parameters on the `index_repo`/`sync_repo`/`preview_index` tools if you want to override the env defaults for a one-off run. Use `preview_index` first to confirm the filtering is doing what you expect before running a real index.
+Same options exist as `--include-ext`/`--exclude-dirs`/`--no-gitignore` flags on `ingest_to_qdrant.py` (which falls back to `INDEX_INCLUDE_EXTENSIONS`/`INDEX_EXCLUDE_DIRS` too, but only from the shell it runs in, never from `.mcp.json` — see step 6), and as `include_extensions`/`exclude_dirs`/`respect_gitignore` parameters on the `index_repo`/`sync_repo`/`preview_index` tools if you want to override the env defaults for a one-off run. Use `preview_index` first to confirm the filtering is doing what you expect before running a real index.
 
 **4b. If also using local-compress**, add this server to the same `.mcp.json`:
 
@@ -317,10 +317,12 @@ If also using the PostToolUse / PreToolUse hooks from `templates/settings.json.t
 ```bash
 # Run from inside the tools repo with the venv activated, or use the venv Python directly:
 source ~/tools/claude-runway/.venv/bin/activate
-python tools/ingest_to_qdrant.py --repo-path /path/to/project --collection <project-collection-name> --dry-run
+python tools/ingest_to_qdrant.py --repo-path /path/to/project --collection <project-collection-name> --embedding-model <same EMBEDDING_MODEL as .mcp.json> --dry-run
 # check the preview, then run for real:
-python tools/ingest_to_qdrant.py --repo-path /path/to/project --collection <project-collection-name>
+python tools/ingest_to_qdrant.py --repo-path /path/to/project --collection <project-collection-name> --embedding-model <same EMBEDDING_MODEL as .mcp.json>
 ```
+
+The CLI can't read `.mcp.json`. For `--qdrant-url`, `--qdrant-api-key`, `--embedding-model`, `--include-ext` and `--exclude-dirs`, it falls back to the `QDRANT_URL`/`QDRANT_API_KEY`/`EMBEDDING_MODEL`/`INDEX_INCLUDE_EXTENSIONS`/`INDEX_EXCLUDE_DIRS` exported in your shell. If none is exported, it uses the built-in default (`http://localhost:6333`, no key, `sentence-transformers/all-MiniLM-L6-v2`, the built-in extension list). A flag always wins. If the project's `.mcp.json` sets any of these to something else, pass the flag or export the variable, or the initial index won't match what `sync_repo` later expects. A wrong embedding model surfaces later as a model-mismatch error. A different include/exclude filter leaves chunks for files `sync_repo` doesn't track, so `sync_repo` can never remove them.
 
 Or ask Claude to run it via the `index_repo` tool once `.mcp.json` is set up.
 

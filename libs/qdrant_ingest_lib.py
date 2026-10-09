@@ -53,6 +53,73 @@ EXCLUDE_DIRS = {
 }
 
 
+# sync_repo's bookkeeping file at the repo root. Lives here rather than in
+# ingest_mcp_server.py (issue #276) so the CLI can exclude it too: .json is in
+# CODE_EXTENSIONS, so every build_entries/compute_file_hashes caller has to
+# pass extra_exclude_files={MANIFEST_FILENAME} or it embeds the manifest
+# itself (issue #91) -- the CLI was the one caller that didn't.
+MANIFEST_FILENAME = ".qdrant_index_manifest.json"
+
+# Built-in fallbacks for ingest_env_defaults() below -- what both the MCP
+# server and the CLI use when the matching env var is unset or blank.
+FALLBACK_QDRANT_URL = "http://localhost:6333"
+FALLBACK_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+FALLBACK_MEMORY_BANK_COLLECTION = "memory-bank"
+
+
+def parse_csv_set(value: Optional[str]) -> Optional[set]:
+    """
+    Parses a comma-separated list (INDEX_INCLUDE_EXTENSIONS, --include-ext,
+    an index_repo include_extensions argument, ...) into a set, stripping
+    whitespace around each entry and dropping empty ones. Returns None for
+    a None/empty value or one with no non-blank entries, so callers can
+    write `parse_csv_set(x) or default`.
+
+    Shared by ingest_mcp_server.py and ingest_to_qdrant.py (issue #276):
+    the CLI used to do a bare split(","), so ".py, .md" became
+    {".py", " .md"} -> normalize_extensions -> {".py", ". .md"} and every
+    .md file was silently skipped.
+    """
+    if not value:
+        return None
+    return {v.strip() for v in value.split(",") if v.strip()} or None
+
+
+def ingest_env_defaults(environ=None) -> dict:
+    """
+    The env-var-backed defaults every ingestion entry point shares, resolved
+    in one place so the MCP server and the CLI can't disagree about them
+    again (issue #276 -- the CLI used to hardcode every one of these and
+    ignore the env entirely). Keys: qdrant_url, qdrant_api_key,
+    embedding_model, include_extensions, exclude_dirs,
+    memory_bank_collection.
+
+    Reads the same env var names mcp-server-qdrant and memory_bank_mcp_server
+    read (QDRANT_URL, QDRANT_API_KEY, EMBEDDING_MODEL, MEMORY_BANK_COLLECTION)
+    plus this repo's INDEX_INCLUDE_EXTENSIONS/INDEX_EXCLUDE_DIRS. A blank
+    value counts as unset -- the rule MEMORY_BANK_COLLECTION already had --
+    since templates/mcp.json.template declares several of these as "" and a
+    blank URL or model name is never a usable value (a blank API key means
+    "no key", i.e. None). include_extensions/exclude_dirs are returned RAW
+    (the comma-separated string, or None) so the CLI can use them directly as
+    argparse defaults; run them through parse_csv_set to get sets.
+
+    Only reads the process environment. For the MCP server that is its
+    .mcp.json env block plus whatever it inherited; for the CLI it is the
+    shell it was run from, which normally does NOT carry .mcp.json's values
+    (see issue #352 for the memory-bank-collection case of that gap).
+    """
+    env = os.environ if environ is None else environ
+    return {
+        "qdrant_url": env.get("QDRANT_URL") or FALLBACK_QDRANT_URL,
+        "qdrant_api_key": env.get("QDRANT_API_KEY") or None,
+        "embedding_model": env.get("EMBEDDING_MODEL") or FALLBACK_EMBEDDING_MODEL,
+        "include_extensions": env.get("INDEX_INCLUDE_EXTENSIONS") or None,
+        "exclude_dirs": env.get("INDEX_EXCLUDE_DIRS") or None,
+        "memory_bank_collection": env.get("MEMORY_BANK_COLLECTION") or FALLBACK_MEMORY_BANK_COLLECTION,
+    }
+
+
 def normalize_extensions(extensions) -> set:
     """Accepts extensions with or without a leading dot, case-insensitive."""
     return {e.lower() if e.startswith(".") else f".{e.lower()}" for e in extensions}

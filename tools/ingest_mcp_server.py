@@ -55,13 +55,16 @@ from mcp_server_qdrant.embeddings.fastembed import FastEmbedProvider
 from qdrant_client import QdrantClient, models
 
 from qdrant_ingest_lib import (
+    MANIFEST_FILENAME,
     batched,
     build_entries,
     chunk_file,
     compute_file_hashes,
     ensure_persistent_fastembed_cache,
     files_removed_since_last_sync,
+    ingest_env_defaults,
     iter_entries,
+    parse_csv_set,
     validate_chunk_params,
 )
 from qdrant_retry import call_with_retry, async_call_with_retry
@@ -83,7 +86,8 @@ import memory_bank_lib as mb
 # function's own docstring for why this can't just be a .mcp.json env value.
 ensure_persistent_fastembed_cache()
 
-MANIFEST_FILENAME = ".qdrant_index_manifest.json"
+# MANIFEST_FILENAME is imported from qdrant_ingest_lib (issue #276) so
+# ingest_to_qdrant.py excludes the same file -- see its comment there.
 
 # sync_repo batches its per-file delete filter into chunks of this size
 # instead of one client.delete() call per changed/removed file (issue #75/
@@ -122,10 +126,14 @@ def _save_manifest(repo: Path, manifest: dict) -> None:
 
 # Same env var names mcp-server-qdrant reads, so a single project .mcp.json
 # config keeps this server and the qdrant-find/qdrant-store server aligned.
-DEFAULT_QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
-DEFAULT_QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY")
+# Resolved through qdrant_ingest_lib.ingest_env_defaults (issue #276) -- the
+# same helper ingest_to_qdrant.py's argparse defaults come from, so the two
+# entry points can't drift apart on these again.
+_ENV_DEFAULTS = ingest_env_defaults()
+DEFAULT_QDRANT_URL = _ENV_DEFAULTS["qdrant_url"]
+DEFAULT_QDRANT_API_KEY = _ENV_DEFAULTS["qdrant_api_key"]
 DEFAULT_COLLECTION = os.environ.get("COLLECTION_NAME")
-DEFAULT_EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+DEFAULT_EMBEDDING_MODEL = _ENV_DEFAULTS["embedding_model"]
 
 # Optional, this repo's own -- not read by mcp-server-qdrant. Declared once
 # alongside COLLECTION_NAME so a project's description doesn't require a
@@ -138,11 +146,7 @@ DEFAULT_COLLECTION_DESCRIPTION = os.environ.get("COLLECTION_DESCRIPTION")
 # memory-bank collection, not to write into it. Defaults to the same
 # "memory-bank" default so the guard still applies out of the box even on a
 # project that hasn't explicitly configured this var.
-DEFAULT_MEMORY_BANK_COLLECTION = os.environ.get("MEMORY_BANK_COLLECTION") or "memory-bank"
-
-
-def _parse_csv_set(value: Optional[str]) -> Optional[set]:
-    return {v.strip() for v in value.split(",") if v.strip()} if value else None
+DEFAULT_MEMORY_BANK_COLLECTION = _ENV_DEFAULTS["memory_bank_collection"]
 
 
 def _skipped_summary(skipped: list) -> str:
@@ -160,8 +164,8 @@ def _skipped_summary(skipped: list) -> str:
 
 # Project-specific file filtering, settable once via .mcp.json so every tool
 # call picks it up without repeating it per call.
-DEFAULT_INCLUDE_EXTENSIONS = _parse_csv_set(os.environ.get("INDEX_INCLUDE_EXTENSIONS"))
-DEFAULT_EXTRA_EXCLUDE_DIRS = _parse_csv_set(os.environ.get("INDEX_EXCLUDE_DIRS"))
+DEFAULT_INCLUDE_EXTENSIONS = parse_csv_set(_ENV_DEFAULTS["include_extensions"])
+DEFAULT_EXTRA_EXCLUDE_DIRS = parse_csv_set(_ENV_DEFAULTS["exclude_dirs"])
 
 
 def _sync_static_collection_description(collection: Optional[str], qdrant_url: str, qdrant_api_key: Optional[str]) -> None:
@@ -624,8 +628,8 @@ async def index_repo(
     # Errors from iter_entries() arrive as (None, (rel, err)) tuples (the
     # same sentinel contract as the generator itself) and are collected into
     # `skipped` without interrupting the drain.
-    resolved_include_extensions = _parse_csv_set(include_extensions) or DEFAULT_INCLUDE_EXTENSIONS
-    resolved_exclude_dirs = _parse_csv_set(exclude_dirs) or DEFAULT_EXTRA_EXCLUDE_DIRS
+    resolved_include_extensions = parse_csv_set(include_extensions) or DEFAULT_INCLUDE_EXTENSIONS
+    resolved_exclude_dirs = parse_csv_set(exclude_dirs) or DEFAULT_EXTRA_EXCLUDE_DIRS
 
     _DONE = object()  # sentinel -- never equals any real chunk tuple
     # Caps how many items can sit in the queue at once. Note: a chunk is a
@@ -877,8 +881,8 @@ async def sync_repo(
     qdrant_api_key = qdrant_api_key or DEFAULT_QDRANT_API_KEY
     embedding_model = embedding_model or DEFAULT_EMBEDDING_MODEL
 
-    resolved_include_extensions = _parse_csv_set(include_extensions) or DEFAULT_INCLUDE_EXTENSIONS
-    resolved_exclude_dirs = _parse_csv_set(exclude_dirs) or DEFAULT_EXTRA_EXCLUDE_DIRS
+    resolved_include_extensions = parse_csv_set(include_extensions) or DEFAULT_INCLUDE_EXTENSIONS
+    resolved_exclude_dirs = parse_csv_set(exclude_dirs) or DEFAULT_EXTRA_EXCLUDE_DIRS
 
     manifest = _load_manifest(repo)
     # Run off the event loop -- this is a synchronous scan that can take
@@ -1205,8 +1209,8 @@ def preview_index(
 
     entries, skipped = build_entries(
         repo, scope, chunk_lines, overlap,
-        include_extensions=_parse_csv_set(include_extensions) or DEFAULT_INCLUDE_EXTENSIONS,
-        extra_exclude_dirs=_parse_csv_set(exclude_dirs) or DEFAULT_EXTRA_EXCLUDE_DIRS,
+        include_extensions=parse_csv_set(include_extensions) or DEFAULT_INCLUDE_EXTENSIONS,
+        extra_exclude_dirs=parse_csv_set(exclude_dirs) or DEFAULT_EXTRA_EXCLUDE_DIRS,
         respect_gitignore=respect_gitignore,
         # Same as index_repo -- the manifest must never appear in preview
         # results (issue #91).
