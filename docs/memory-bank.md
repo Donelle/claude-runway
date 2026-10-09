@@ -51,9 +51,11 @@ For the exact usage guidance Claude should follow when deciding whether to call 
 validating the reuse thesis behind this feature (are stored memories actually
 getting recalled later, by which projects, how soon after creation) without
 relying entirely on manually-run scenarios. `forget` is deliberately NOT logged
-here — tracking it would only be meaningful alongside an autonomous-removal
-feature that doesn't exist yet, since `forget` today always requires explicit
-human `confirm=True`.
+in this per-point table (it IS counted in the separate `metrics.db` tally
+described below) — tracking it would only be meaningful alongside an autonomous-removal
+feature that doesn't exist yet, since `forget` today is always a deliberate,
+human-directed call (only cross-repo point deletion and bulk `wipe_all` also
+require `confirm=True`; a same-repo point delete does not).
 
 This is a SEPARATE file from `libs/savings_ledger.py`'s `savings.db` on purpose:
 that file tracks session-level token-savings aggregates, a different concern
