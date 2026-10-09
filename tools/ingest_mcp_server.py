@@ -69,6 +69,7 @@ from qdrant_ingest_lib import (
 )
 from qdrant_retry import call_with_retry, async_call_with_retry
 from qdrant_batch_store import store_batch, ensure_file_path_index, FIELD_INDEXES, UPSERT_BATCH_SIZE
+from qdrant_index_prep import prepare_collection_for_index
 from qdrant_collection_hints import (
     compute_search_limit,
     get_cached_descriptions,
@@ -498,92 +499,60 @@ async def index_repo(
     qdrant_api_key = qdrant_api_key or DEFAULT_QDRANT_API_KEY
     embedding_model = embedding_model or DEFAULT_EMBEDDING_MODEL
 
-    # Retry once on a transient dropped connection -- see issue #75/#76 /
+    # Retry on a transient dropped connection -- see issue #75/#76 /
     # libs/qdrant_retry.py. Every QdrantClient/QdrantConnector call in this
     # server is wrapped, not just the ones directly after a known CPU-bound
     # gap -- this is a long-running MCP server process, so any call can be
     # the first one after an arbitrarily long idle period since the
-    # previous tool invocation. Constructed unconditionally now (not just
-    # inside `if reset:`) since the non-reset branch below also needs it
-    # for the file_path payload-index backfill (issue #54).
+    # previous tool invocation.
     client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
-    # Only constructed here, inside `if reset:`, not unconditionally before
-    # it -- the elif branch below has its own early-return (the "collection
-    # already contains N points" warning) that must NOT pay for a model
-    # load just to return that warning, same reasoning as the recall() fix
-    # earlier in this review. Reused below (not reconstructed) once we reach
-    # the shared embed/store setup.
-    embedding_provider = None
-    if reset:
-        if call_with_retry(client.collection_exists, collection):
-            embedding_provider = FastEmbedProvider(embedding_model)
-            # Issue #175 / PR #178 review: this ALWAYS takes the filtered
-            # delete (preserving memory-bank points), never a real
-            # delete_collection. An earlier version counted memory-bank
-            # points first and only fell back to the filtered path when the
-            # count was nonzero -- but that count and this delete are two
-            # SEPARATE Qdrant requests with no transaction spanning them, so
-            # a remember() call landing in between could insert a point that
-            # a zero-count-based delete_collection would then destroy anyway,
-            # count notwithstanding. Removing the count-based branch removes
-            # the race entirely instead of trying to narrow it. Tradeoff:
-            # reset=True can no longer fully recreate a collection's vector
-            # schema (needed only when EMBEDDING_MODEL changes -- see
-            # README's Known Limitations) -- is_memory_bank_collection_name's
-            # guard above means this should never actually collide with the
-            # shared memory-bank collection in normal use regardless.
-            #
-            # Found in PR #178 review (third pass): without a check here,
-            # a genuine EMBEDDING_MODEL change (or an unnamed-vector legacy
-            # collection) would still hit this filtered delete FIRST -- wiping
-            # the existing non-memory-bank index -- and only THEN fail on the
-            # embed/store loop below once the schema mismatch surfaces via a
-            # raw Qdrant upsert error, having already destroyed the old index
-            # with nothing successfully re-indexed to replace it. Validating
-            # BEFORE deleting turns that into a clean, non-destructive error.
-            # fail_closed=True (PR #178 review, fourth pass): this is a
-            # PRE-DELETE safety check -- an inconclusive result (a transient
-            # error, not a confirmed match) must block the destructive delete
-            # below, not silently be treated as "compatible." Every other
-            # caller of this function keeps the default fail-open behavior;
-            # this, sync_repo's own pre-delete check below, and
-            # ingest_to_qdrant.py's --reset (issue #265) are the only
-            # three destructive call sites where that default is actively
-            # wrong.
-            mismatch = check_embedding_model_mismatch(client, collection, embedding_provider, fail_closed=True)
-            if mismatch:
-                return mismatch
-            call_with_retry(
-                client.delete, collection_name=collection, points_selector=mb.memory_bank_exclusion_filter()
-            )
-    elif call_with_retry(client.collection_exists, collection):
-        # Check existing point count BEFORE starting the expensive embedding
-        # work (issue #58) -- surface the duplicate-risk warning up front so
-        # the user can cancel/reset/use sync_repo instead of discovering it
-        # after the full embed-and-store loop has already run.
-        _existing_info = call_with_retry(client.get_collection, collection)
-        _existing_count = _existing_info.points_count or 0
-        if _existing_count > 0 and not force:
-            return (
-                f"Warning: collection '{collection}' already contains "
-                f"{_existing_count} points. Re-running index_repo without "
-                f"reset=True may add duplicate chunks on top of those. "
-                f"Options: (1) use sync_repo instead for an incremental update "
-                f"that avoids duplicates (preferred for most cases), "
-                f"(2) re-run with reset=True to wipe unprotected collection "
-                f"data and re-index cleanly (caution: wipes any other non-code "
-                f"data stored there, e.g. qdrant-store notes or conversation-"
-                f"compacts stored before issue #282 -- memory-bank points and "
-                f"newer conversation compacts are always preserved), "
-                f"or (3) re-run with force=True to add content "
-                f"to the existing index deliberately."
-            )
-        # FIELD_INDEXES below only takes effect when QdrantConnector's own
-        # _ensure_collection_exists() creates a BRAND NEW collection -- an
-        # already-existing collection (any repo indexed before this fix, or
-        # simply re-run with reset=false) never hits that branch again, so
-        # it needs this explicit backfill instead (issue #54).
-        call_with_retry(ensure_file_path_index, client, collection)
+
+    def _duplicate_risk_warning(existing_count: int) -> Optional[str]:
+        # Checked BEFORE the expensive embedding work (issue #58) -- surface
+        # the duplicate-risk warning up front so the user can cancel/reset/
+        # use sync_repo instead of discovering it after the full
+        # embed-and-store loop has already run.
+        if existing_count == 0 or force:
+            return None
+        return (
+            f"Warning: collection '{collection}' already contains "
+            f"{existing_count} points. Re-running index_repo without "
+            f"reset=True may add duplicate chunks on top of those. "
+            f"Options: (1) use sync_repo instead for an incremental update "
+            f"that avoids duplicates (preferred for most cases), "
+            f"(2) re-run with reset=True to wipe unprotected collection "
+            f"data and re-index cleanly (caution: wipes any other non-code "
+            f"data stored there, e.g. qdrant-store notes or conversation-"
+            f"compacts stored before issue #282 -- memory-bank points and "
+            f"newer conversation compacts are always preserved), "
+            f"or (3) re-run with force=True to add content "
+            f"to the existing index deliberately."
+        )
+
+    # Shared with tools/ingest_to_qdrant.py (issue #304) -- see
+    # libs/qdrant_index_prep.py for the full reset (pre-delete model check,
+    # then an always-filtered, memory-bank-preserving delete -- issue #175 /
+    # PR #178) and non-reset (issue #58 guard above, then the issue #54
+    # file_path payload-index backfill) sequence. This module's own
+    # FastEmbedProvider/call_with_retry/check_embedding_model_mismatch/
+    # ensure_file_path_index are passed in so they stay the patch point
+    # this server's tests use. The provider is only built inside the reset
+    # branch, so the guard's early return never pays for a model load; it's
+    # reused (not reconstructed) below.
+    prep = prepare_collection_for_index(
+        client,
+        collection,
+        embedding_model,
+        reset=reset,
+        provider_factory=FastEmbedProvider,
+        existing_points_guard=_duplicate_risk_warning,
+        retry=call_with_retry,
+        model_check=check_embedding_model_mismatch,
+        backfill=ensure_file_path_index,
+    )
+    if prep.error:
+        return prep.error
+    embedding_provider = prep.embedding_provider
 
     if embedding_provider is None:
         embedding_provider = FastEmbedProvider(embedding_model)

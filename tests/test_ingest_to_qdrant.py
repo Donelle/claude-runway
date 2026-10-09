@@ -159,6 +159,81 @@ class NonDryRunStillPerformsCollectionMaintenance(unittest.TestCase):
         fake_client.delete_collection.assert_not_called()
 
 
+def _transient_drop():
+    """The shape a real vpnkit drop actually reaches callers in: qdrant-client
+    wraps the raw httpx error in ResponseHandlingException (see
+    libs/qdrant_retry.py's docstring)."""
+    import httpx
+    from qdrant_client.http.exceptions import ResponseHandlingException
+    return ResponseHandlingException(httpx.RemoteProtocolError("Server disconnected"))
+
+
+class SharedPreparationWithIndexRepo(unittest.TestCase):
+    """Issue #304: the CLI now runs index_repo's shared preparation
+    (libs/qdrant_index_prep.py). These failed on main before the fix: a
+    --dry-run loaded the embedding model, and the non-reset path's
+    collection_exists/ensure_file_path_index weren't retry-wrapped, so one
+    dropped connection aborted the whole run."""
+
+    def setUp(self):
+        # No real sleeps between retry attempts.
+        patcher = mock.patch("qdrant_retry.RETRY_BACKOFF_SECONDS", 0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_dry_run_never_constructs_the_embedding_provider(self):
+        for reset in (False, True):
+            with self.subTest(reset=reset), \
+                 mock.patch.object(mod, "QdrantClient"), \
+                 mock.patch.object(mod, "FastEmbedProvider") as fake_provider_cls, \
+                 mock.patch.object(mod, "QdrantConnector") as fake_connector_cls:
+                with redirect_stdout(io.StringIO()):
+                    _run(mod.ingest(_args(dry_run=True, reset=reset)))
+                fake_provider_cls.assert_not_called()
+                fake_connector_cls.assert_not_called()
+
+    def _run_non_reset(self, fake_client):
+        with mock.patch.object(mod, "QdrantClient", return_value=fake_client), \
+             mock.patch.object(mod, "FastEmbedProvider"), \
+             mock.patch.object(mod, "QdrantConnector"), \
+             mock.patch.object(mod, "store_batch", new=mock.AsyncMock(return_value=0)) as fake_store:
+            with redirect_stdout(io.StringIO()):
+                _run(mod.ingest(_args(dry_run=False, reset=False)))
+        return fake_store
+
+    def test_transient_drop_on_collection_exists_is_retried(self):
+        fake_client = mock.MagicMock()
+        fake_client.collection_exists.side_effect = [_transient_drop(), False]
+        fake_store = self._run_non_reset(fake_client)
+        self.assertEqual(fake_client.collection_exists.call_count, 2)
+        fake_store.assert_awaited_once()
+
+    def test_transient_drop_inside_the_index_backfill_is_retried(self):
+        fake_client = mock.MagicMock()
+        fake_client.collection_exists.return_value = True
+        info = mock.MagicMock()
+        info.payload_schema = {}
+        fake_client.get_collection.side_effect = [_transient_drop(), info]
+        fake_store = self._run_non_reset(fake_client)
+        fake_client.create_payload_index.assert_called_once()
+        fake_store.assert_awaited_once()
+
+    def test_reset_reuses_the_model_checks_provider_instead_of_loading_twice(self):
+        fake_client = mock.MagicMock()
+        fake_client.collection_exists.return_value = True
+        with mock.patch.object(mod, "QdrantClient", return_value=fake_client), \
+             mock.patch.object(mod, "FastEmbedProvider") as fake_provider_cls, \
+             mock.patch.object(mod, "QdrantConnector") as fake_connector_cls, \
+             mock.patch.object(mod, "check_embedding_model_mismatch", return_value=None), \
+             mock.patch.object(mod, "store_batch", new=mock.AsyncMock(return_value=0)):
+            with redirect_stdout(io.StringIO()):
+                _run(mod.ingest(_args(dry_run=False, reset=True)))
+        fake_provider_cls.assert_called_once()
+        self.assertIs(
+            fake_connector_cls.call_args.kwargs["embedding_provider"], fake_provider_cls.return_value
+        )
+
+
 class ResetRefusesMemoryBankCollection(unittest.TestCase):
     """Issue #265: --reset against the configured memory-bank collection is
     refused outright, before any Qdrant client is even constructed."""

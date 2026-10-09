@@ -64,6 +64,7 @@ from qdrant_ingest_lib import (
     validate_chunk_params,
 )
 from qdrant_batch_store import store_batch, ensure_file_path_index, FIELD_INDEXES
+from qdrant_index_prep import prepare_collection_for_index
 from qdrant_model_check import check_embedding_model_mismatch
 from qdrant_retry import call_with_retry
 import memory_bank_lib as mb
@@ -100,8 +101,6 @@ async def ingest(args):
             file=sys.stderr,
         )
         sys.exit(1)
-    embedding_provider = None
-
     # --dry-run is documented (both in --help and this preview print below)
     # as writing NOTHING to Qdrant -- so all collection maintenance
     # (reset-delete, file_path index backfill) must stay entirely behind
@@ -110,70 +109,42 @@ async def ingest(args):
     # QdrantClient and called collection_exists/ensure_file_path_index
     # unconditionally, which broke an offline dry run outright and, for an
     # online one, silently created a real payload index despite the
-    # "preview only" contract -- confirmed by reproducing it directly
-    # (mocking QdrantClient showed collection_exists/get_collection/
-    # create_payload_index all firing with dry_run=True). This also fixes
-    # a narrower, pre-existing version of the same bug: `--reset
-    # --dry-run` already deleted the real collection before this PR, for
-    # the same reason (the old code's `if args.reset:` block ran before
-    # the dry_run check too).
+    # "preview only" contract. `--reset --dry-run` likewise must not delete.
+    embedding_provider = None
     if not args.dry_run:
-        # Constructed unconditionally (not just inside `if args.reset:`)
-        # since the non-reset branch below also needs it for the
-        # file_path payload-index backfill (issue #54).
         client = QdrantClient(url=args.qdrant_url, api_key=args.qdrant_api_key)
-        if args.reset:
-            if call_with_retry(client.collection_exists, args.collection):
-                embedding_provider = FastEmbedProvider(args.embedding_model)
-                # Layer 3 (issue #265), ported from index_repo: validate the
-                # embedding model BEFORE deleting anything. Otherwise a
-                # model change (or an unnamed-vector legacy collection)
-                # would wipe the old index first and only then fail on the
-                # store below, leaving nothing. fail_closed=True because
-                # this is a pre-delete safety check -- an inconclusive
-                # result must block the delete, not count as "compatible."
-                mismatch = check_embedding_model_mismatch(
-                    client, args.collection, embedding_provider, fail_closed=True
-                )
-                if mismatch:
-                    print(mismatch, file=sys.stderr)
-                    sys.exit(1)
-                # Layer 2 (issue #265), ported from index_repo: ALWAYS a
-                # filtered delete, never delete_collection, so any
-                # metadata.source == "memory-bank" / "conversation-compact" (issue #282) points survive even if
-                # this collection somehow holds them. Unconditional (no
-                # count-then-act) to avoid the race documented in
-                # index_repo: a remember() landing between a count and a
-                # delete_collection would be destroyed anyway.
-                call_with_retry(
-                    client.delete,
-                    collection_name=args.collection,
-                    points_selector=mb.memory_bank_exclusion_filter(),
-                )
-                print(
-                    f"Reset: deleted existing points from '{args.collection}' except protected ones "
-                    f"(the collection itself, memory-bank points and marked conversation compacts are kept; "
-                    f"compacts stored before issue #282 carry no marker and were deleted)."
-                )
-        elif client.collection_exists(args.collection):
-            # FIELD_INDEXES below only takes effect when QdrantConnector's
-            # own _ensure_collection_exists() creates a BRAND NEW
-            # collection -- an already-existing collection (any repo
-            # indexed before this fix, or simply re-run without --reset)
-            # never hits that branch again, so it needs this explicit
-            # backfill instead (issue #54).
-            if ensure_file_path_index(client, args.collection):
-                print(f"Backfilled the metadata.file_path payload index on '{args.collection}'.")
-
-    if embedding_provider is None:
-        embedding_provider = FastEmbedProvider(args.embedding_model)
-    connector = QdrantConnector(
-        qdrant_url=args.qdrant_url,
-        qdrant_api_key=args.qdrant_api_key,
-        collection_name=args.collection,
-        embedding_provider=embedding_provider,
-        field_indexes=FIELD_INDEXES,
-    )
+        # Issue #304: the same preparation index_repo runs (libs/
+        # qdrant_index_prep.py) -- --reset's pre-delete model check (Layer 3,
+        # issue #265, fail_closed) and always-filtered delete (Layer 2), or
+        # the issue #54 file_path index backfill -- with EVERY Qdrant call
+        # retry-wrapped. This copy used to skip call_with_retry on the
+        # non-reset collection_exists/ensure_file_path_index, so one vpnkit
+        # dropped connection (README's Known limitations) aborted the
+        # first-big-index run docs/installation.md recommends. No
+        # existing_points_guard: the CLI has never refused to index into a
+        # non-empty collection (its docstring documents --reset instead).
+        prep = prepare_collection_for_index(
+            client,
+            args.collection,
+            args.embedding_model,
+            reset=args.reset,
+            provider_factory=FastEmbedProvider,
+            retry=call_with_retry,
+            model_check=check_embedding_model_mismatch,
+            backfill=ensure_file_path_index,
+        )
+        if prep.error:
+            print(prep.error, file=sys.stderr)
+            sys.exit(1)
+        embedding_provider = prep.embedding_provider
+        if prep.reset_deleted:
+            print(
+                f"Reset: deleted existing points from '{args.collection}' except protected ones "
+                f"(the collection itself, memory-bank points and marked conversation compacts are kept; "
+                f"compacts stored before issue #282 carry no marker and were deleted)."
+            )
+        if prep.backfilled:
+            print(f"Backfilled the metadata.file_path payload index on '{args.collection}'.")
 
     repo_path = Path(args.repo_path).resolve()
     # parse_csv_set strips each entry and drops blanks (issue #276) -- a bare
@@ -207,6 +178,21 @@ async def ingest(args):
             print(e.content[:200])
         print(f"... dry run, not storing. ({len(entries)} total)")
         return
+
+    # Issue #304: built only AFTER the --dry-run return above. Constructing
+    # FastEmbedProvider loads (and on a cold cache downloads) the embedding
+    # model, which a preview never uses -- the MCP preview_index tool never
+    # loads it either. Reuses the provider --reset's model check already
+    # built, rather than loading the model twice.
+    if embedding_provider is None:
+        embedding_provider = FastEmbedProvider(args.embedding_model)
+    connector = QdrantConnector(
+        qdrant_url=args.qdrant_url,
+        qdrant_api_key=args.qdrant_api_key,
+        collection_name=args.collection,
+        embedding_provider=embedding_provider,
+        field_indexes=FIELD_INDEXES,
+    )
 
     async def _print_progress(stored, total):
         print(f"  stored {stored}/{total}")
