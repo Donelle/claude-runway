@@ -346,8 +346,21 @@ def ensure_memory_bank_indexes(client: "QdrantClient", collection: str) -> None:
     mirrors qdrant_batch_store.ensure_file_path_index's "check current
     payload_schema before creating" pattern so re-running this doesn't
     reissue a full-collection-scanning create_payload_index call every time.
-    Without these, every recall/count/wipe filter on a collection shared
-    across every project full-scans it as it grows.
+    These two cover the `source` match clause that every recall/count/wipe
+    filter has, and the `repo` match clause wherever one is applied (not
+    always: `_scope_filter` omits it for `all_repos=True`, and
+    `count_memory_bank_points` omits it when `repo` is None), so those
+    clauses no longer full-scan a collection shared across every project as
+    it grows.
+
+    They do NOT cover the other clauses: `metadata.pending` (the
+    `must_not` exclusion in `_scope_filter`, `count_memory_bank_points` and
+    `_own_repo_filter`), `metadata.kind` (`_scope_filter`'s optional `kind`
+    match) and `metadata.created_at` (`_own_repo_filter`'s range /
+    is-empty `created_before` clause) have no payload index, so Qdrant
+    evaluates them per point. Those filters are therefore only partly
+    index-assisted, not fully so; adding indexes for them is a separate,
+    unmade decision (issue #310).
     """
     info = call_with_retry(client.get_collection, collection)
     existing = info.payload_schema or {}
