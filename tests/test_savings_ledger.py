@@ -37,6 +37,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -2201,6 +2202,393 @@ class ActualTokensReadPath(SavingsLedgerTestCase):
         for key in ("actual_input_tokens", "actual_output_tokens",
                     "actual_cache_read_tokens", "actual_cache_write_tokens"):
             self.assertEqual(row[key], 0, f"{key} should be 0 for old-shape entry")
+
+
+class OrphanedLedgerRecovery(SavingsLedgerTestCase):
+    """Issue #306: a session that never reached a graceful SessionEnd (crash,
+    force-kill) left its <session_id>.jsonl ledger behind forever -- its
+    credited savings never reached savings.db and nothing deleted the file.
+    recover_orphaned_sessions() rolls up and deletes any ledger older than the
+    shadow-marker TTL. The TTL env var is cleared/pinned per test so a
+    developer shell's own CLAUDE_RUNWAY_SESSION_MARKER_TTL_HOURS can't leak in."""
+
+    def setUp(self):
+        super().setUp()
+        ttl_patch = mock.patch.dict(os.environ, {"CLAUDE_RUNWAY_SESSION_MARKER_TTL_HOURS": ""})
+        ttl_patch.start()
+        self.addCleanup(ttl_patch.stop)
+        self.now = time.time()
+        # Derived from the module, never hardcoded -- the default may change.
+        self.ttl_seconds = session_id_lib._ttl_hours() * 3600
+
+    def _age(self, session_id, seconds):
+        path = L._session_jsonl_path(session_id)
+        ts = self.now - seconds
+        os.utime(path, (ts, ts))
+        return path, ts
+
+    def _claims(self):
+        return sorted(L._sessions_dir().glob("*.jsonl.claimed-*"))
+
+    def _session_row(self, session_id):
+        conn = L._connect()  # creates the schema if no roll-up ever ran
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
+        conn.close()
+        return row
+
+    def test_stale_orphan_is_rolled_up_and_deleted(self):
+        # The regression: on main this ledger was never rolled up or removed.
+        L.record_event("crashed", "compress_file", 1000, 100, True, project="proj")
+        L.record_event("crashed", "compress_file", 400, 100, True, project="proj")
+        path, _ = self._age("crashed", self.ttl_seconds + 60)
+
+        self.assertEqual(L.recover_orphaned_sessions(now=self.now), 1)
+
+        self.assertFalse(path.exists())
+        row = self._session_row("crashed")
+        self.assertIsNotNone(row)
+        self.assertEqual(row["credited_saved_tokens"], 1200)
+        self.assertEqual(row["event_count"], 2)
+        self.assertEqual(row["project"], "proj")
+        self.assertEqual(L.query_project_summary("proj")["total_saved_tokens"], 1200)
+
+    def test_ended_at_is_the_ledgers_last_write_not_now(self):
+        L.record_event("crashed", "compress_file", 1000, 100, True, project="proj")
+        _, ts = self._age("crashed", self.ttl_seconds * 4)
+        L.recover_orphaned_sessions(now=self.now)
+        self.assertEqual(
+            self._session_row("crashed")["ended_at"],
+            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts)),
+        )
+
+    def test_fresh_ledger_is_left_alone(self):
+        L.record_event("live", "compress_file", 1000, 100, True, project="proj")
+        path, _ = self._age("live", self.ttl_seconds - 60)
+        self.assertEqual(L.recover_orphaned_sessions(now=self.now), 0)
+        self.assertTrue(path.exists())
+        self.assertIsNone(self._session_row("live"))
+
+    def test_excluded_session_is_never_recovered(self):
+        # The SessionEnd hook excludes the session that is ending -- it's
+        # finalized by the normal path, with its own cwd-derived project.
+        L.record_event("ending", "compress_file", 1000, 100, True, project="proj")
+        path, _ = self._age("ending", self.ttl_seconds + 60)
+        self.assertEqual(L.recover_orphaned_sessions(exclude_session_id="ending", now=self.now), 0)
+        self.assertTrue(path.exists())
+        self.assertIsNone(self._session_row("ending"))
+
+    def test_shadow_markers_are_never_touched(self):
+        # session_id_lib's markers share this directory by default.
+        session_id_lib.record_shadow_marker("other", project="/x/proj")
+        marker = session_id_lib._shadow_marker_path("other")
+        self.assertEqual(marker.parent, L._sessions_dir())  # same dir, so the skip is really exercised
+        ts = self.now - self.ttl_seconds * 2
+        os.utime(marker, (ts, ts))
+        self.assertEqual(L.recover_orphaned_sessions(now=self.now), 0)
+        self.assertTrue(marker.exists())
+        self.assertIsNone(self._session_row("session_other"))
+
+    def test_project_falls_back_to_unknown(self):
+        L.record_event("crashed", "compress_file", 1000, 100, True)  # project=None
+        self._age("crashed", self.ttl_seconds + 60)
+        L.recover_orphaned_sessions(now=self.now)
+        self.assertEqual(self._session_row("crashed")["project"], "unknown")
+
+    def test_empty_ledger_is_deleted_without_a_row(self):
+        path = L._session_jsonl_path("empty")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("not json\n", encoding="utf-8")
+        self._age("empty", self.ttl_seconds + 60)
+        self.assertEqual(L.recover_orphaned_sessions(now=self.now), 1)
+        self.assertFalse(path.exists())
+        self.assertIsNone(self._session_row("empty"))
+
+    def test_ttl_env_override_is_honored(self):
+        L.record_event("crashed", "compress_file", 1000, 100, True, project="proj")
+        path, _ = self._age("crashed", 2 * 3600)  # 2h old: fresh under the default
+        self.assertEqual(L.recover_orphaned_sessions(now=self.now), 0)
+        with mock.patch.dict(os.environ, {"CLAUDE_RUNWAY_SESSION_MARKER_TTL_HOURS": "1"}):
+            self.assertEqual(L.recover_orphaned_sessions(now=self.now), 1)
+        self.assertFalse(path.exists())
+
+    def _leave_claim(self, session_id):
+        """What a roll-up that failed or died leaves behind: the ledger renamed
+        to a claim (rename keeps its mtime)."""
+        path = L._session_jsonl_path(session_id)
+        claim = path.with_name(path.name + ".claimed-" + "ab" * 16)
+        os.rename(path, claim)
+        return claim
+
+    def test_append_after_claim_survives_in_a_fresh_ledger(self):
+        # PR #412 review (round 1): an append racing the recovery used to be
+        # deleted with the file. The ledger is renamed to a claim before it's
+        # read, so the append lands in a NEW ledger at the old path.
+        L.record_event("busy", "compress_file", 1000, 100, True, project="proj")
+        path, _ = self._age("busy", self.ttl_seconds + 60)
+        real_write = L._write_session_rows
+
+        def append_then_write(*args, **kwargs):
+            L.record_event("busy", "compress_file", 300, 100, True, project="proj")
+            return real_write(*args, **kwargs)
+
+        with mock.patch.object(L, "_write_session_rows", side_effect=append_then_write):
+            self.assertEqual(L.recover_orphaned_sessions(now=self.now), 1)
+        self.assertEqual(self._session_row("busy")["credited_saved_tokens"], 900)
+        self.assertTrue(path.exists())
+        self.assertEqual([e["raw_tokens"] for e in L.read_session_events("busy")], [300])
+        self.assertEqual(self._claims(), [])
+
+    def test_finalize_session_aggregates_a_given_snapshot_without_rereading(self):
+        L.record_event("snap", "compress_file", 1000, 100, True, project="proj")
+        snapshot = L.read_session_events("snap")
+        L._session_jsonl_path("snap").unlink()  # gone, as after a concurrent recovery
+        agg = L.finalize_session("snap", "proj", events=snapshot)
+        self.assertEqual(agg["credited_saved_tokens"], 900)
+        self.assertEqual(self._session_row("snap")["credited_saved_tokens"], 900)
+
+    def test_second_owner_finds_nothing_and_leaves_the_row_alone(self):
+        # PR #412 review (round 1): a second finalizer re-reading a ledger the
+        # first had already consumed wrote an all-zero row over it.
+        L.record_event("x", "compress_file", 1000, 100, True, project="proj")
+        self._age("x", self.ttl_seconds + 60)
+        self.assertEqual(L.recover_orphaned_sessions(now=self.now), 1)  # owner A
+        self.assertIsNone(L.finalize_owned_session("x", stale_before=self.now))  # owner B
+        self.assertIsNone(L.finalize_owned_session("x", "proj"))  # or the session's own end
+        row = self._session_row("x")
+        self.assertEqual((row["credited_saved_tokens"], row["event_count"]), (900, 1))
+
+    def test_finalizers_are_serialized_on_the_db_write_lock(self):
+        # PR #412 review (round 3): per-file claims let two workers each own
+        # part of one session. Ownership is now savings.db's write lock: while
+        # another finalizer holds it, nobody can take this session's files.
+        L.record_event("x", "compress_file", 1000, 100, True, project="proj")
+        path, _ = self._age("x", self.ttl_seconds + 60)
+        holder = L._connect()
+        holder.execute("BEGIN IMMEDIATE")
+        real_connect = sqlite3.connect
+        try:
+            with mock.patch.object(sqlite3, "connect", side_effect=lambda *a, **k: real_connect(*a, timeout=0.05)):
+                with self.assertRaises(sqlite3.OperationalError):
+                    L.finalize_owned_session("x", stale_before=self.now)
+                self.assertEqual(L.recover_orphaned_sessions(now=self.now), 0)
+        finally:
+            holder.execute("ROLLBACK")
+            holder.close()
+        self.assertTrue(path.exists())  # untouched -- not claimed, not read
+        self.assertEqual(self._claims(), [])
+        self.assertEqual(L.recover_orphaned_sessions(now=self.now), 1)  # once the lock is free
+
+    def test_leftover_claim_and_later_ledger_roll_up_together(self):
+        # PR #412 review (round 2): a roll-up dies after claiming, the session
+        # then writes a fresh ledger, and later both are stale. Rolled up one
+        # file at a time, INSERT OR REPLACE kept only the last file's events.
+        L.record_event("s", "compress_file", 1000, 100, True, project="proj")  # saves 900
+        self._age("s", self.ttl_seconds * 3)
+        self._leave_claim("s")
+        L.record_event("s", "compress_file", 500, 100, True, project="proj")   # saves 400
+        path, _ = self._age("s", self.ttl_seconds * 2)
+        self.assertEqual(L.recover_orphaned_sessions(now=self.now), 1)
+        row = self._session_row("s")
+        self.assertEqual((row["credited_saved_tokens"], row["event_count"]), (1300, 2))
+        self.assertEqual(self._claims(), [])
+        self.assertFalse(path.exists())
+
+    def test_graceful_end_includes_its_own_leftover_claim(self):
+        # PR #412 review (round 3): the SessionEnd hook excludes its own
+        # session from recovery, so it must roll up that session's leftover
+        # claim itself -- otherwise a later sweep finalized the old claim on
+        # its own and replaced the newer row with the older subset.
+        L.record_event("s", "compress_file", 1000, 100, True, project="proj")
+        self._age("s", self.ttl_seconds * 3)
+        self._leave_claim("s")
+        L.record_event("s", "compress_file", 500, 100, True, project="proj")  # resumed, fresh
+        self.assertEqual(L.recover_orphaned_sessions(exclude_session_id="s", now=self.now), 0)
+        agg = L.finalize_owned_session("s", "proj")
+        self.assertEqual(agg["credited_saved_tokens"], 1300)
+        self.assertEqual(L.recover_orphaned_sessions(now=self.now + self.ttl_seconds * 2), 0)
+        row = self._session_row("s")
+        self.assertEqual((row["credited_saved_tokens"], row["event_count"]), (1300, 2))
+        self.assertEqual(L._session_artifacts("s"), [])
+
+    def test_failed_roll_up_leaves_everything_for_the_next_owner(self):
+        L.record_event("f", "compress_file", 1000, 100, True, project="proj")
+        self._age("f", self.ttl_seconds + 60)
+        with mock.patch.object(L, "_write_session_rows", side_effect=sqlite3.OperationalError("disk I/O error")):
+            self.assertEqual(L.recover_orphaned_sessions(now=self.now), 0)
+        self.assertIsNone(self._session_row("f"))
+        self.assertEqual(len(self._claims()), 1)  # rolled back, events kept
+        self.assertEqual(L.recover_orphaned_sessions(now=self.now), 1)
+        self.assertEqual(self._session_row("f")["credited_saved_tokens"], 900)
+        self.assertEqual(self._claims(), [])
+
+    def test_roll_up_that_died_after_commit_is_redone_idempotently(self):
+        # Committed but never got to delete its files: the next owner's
+        # combined snapshot is the same set, so the row comes out the same.
+        L.record_event("d", "compress_file", 1000, 100, True, project="proj")
+        self._age("d", self.ttl_seconds + 60)
+        with mock.patch.object(Path, "unlink", lambda self, missing_ok=False: None):
+            self.assertEqual(L.recover_orphaned_sessions(now=self.now), 1)
+        self.assertEqual(len(self._claims()), 1)
+        self.assertEqual(L.recover_orphaned_sessions(now=self.now), 1)
+        row = self._session_row("d")
+        self.assertEqual((row["credited_saved_tokens"], row["event_count"]), (900, 1))
+        self.assertEqual(self._claims(), [])
+
+    def _actual(self, session_id):
+        row = self._session_row(session_id)
+        return (row["actual_input_tokens"], row["actual_output_tokens"],
+                row["actual_cache_read_tokens"], row["actual_cache_write_tokens"])
+
+    def test_recovered_then_resumed_session_accumulates(self):
+        # PR #412 review (round 5): a crashed session is recovered (900), later
+        # resumed, and its next clean end used to REPLACE the row with only
+        # the resumed events (200) -- the recovered savings were lost again.
+        L.record_event("s", "compress_file", 1000, 100, True, project="proj")
+        self._age("s", self.ttl_seconds + 60)
+        self.assertEqual(L.recover_orphaned_sessions(now=self.now), 1)
+        L.record_event("s", "compress_file", 300, 100, True, project="proj")   # resumed
+        L.record_event("s", "fetch_url", 50, 10, False, project="proj")
+        agg = L.finalize_owned_session("s", "proj")
+        self.assertEqual(agg["credited_saved_tokens"], 200)  # the summary: this run
+        row = self._session_row("s")
+        self.assertEqual(
+            (row["credited_saved_tokens"], row["raw_tokens_sum"], row["out_tokens_sum"],
+             row["event_count"], row["fetch_url_count"]),
+            (1100, 1300, 200, 2, 1),
+        )
+        tools = {t["tool"]: t for t in L.query_session_tool_breakdown("s")}
+        self.assertEqual(tools["compress_file"]["saved_tokens"], 1100)
+        self.assertEqual(L.query_project_summary("proj")["total_saved_tokens"], 1100)
+        conn = L._connect()
+        agents = conn.execute(
+            "SELECT event_count, saved_tokens FROM session_agents WHERE session_id = 's'"
+        ).fetchall()
+        conn.close()
+        self.assertEqual(agents, [(3, 1100)])
+
+    def test_session_ending_once_writes_the_same_row_as_before(self):
+        # The accumulate path must not change a normal, single-end session.
+        for sid in ("plain", "owned"):
+            L.record_event(sid, "compress_file", 1000, 100, True, project="proj")
+            L.record_event(sid, "fetch_url", 50, 10, False, project="proj")
+        counts = {"input": 1, "output": 2, "cache_read": 3, "cache_write": 4}
+        L.finalize_session("plain", "proj", overhead_tokens=7, actual_tokens=counts)
+        L.finalize_owned_session("owned", "proj", overhead_tokens=7, actual_tokens=counts)
+        skip = {"session_id", "ended_at"}
+        plain, owned = self._session_row("plain"), self._session_row("owned")
+        self.assertEqual({k: plain[k] for k in plain.keys() if k not in skip},
+                         {k: owned[k] for k in owned.keys() if k not in skip})
+        strip = lambda rows: [{k: v for k, v in r.items() if k != "session_id"} for r in rows]  # noqa: E731
+        self.assertEqual(strip(L.query_session_tool_breakdown("plain")),
+                         strip(L.query_session_tool_breakdown("owned")))
+
+    def test_resumed_session_transcript_counts(self):
+        # A resumed session reuses its transcript, so a later parse covers the
+        # whole session and replaces earlier counts; no parse (None) keeps the
+        # counts already recorded for this session rather than zeroing them.
+        L.record_event("r", "compress_file", 1000, 100, True, project="proj")
+        L.finalize_owned_session("r", "proj", actual_tokens={"input": 11, "output": 22, "cache_read": 33, "cache_write": 44})
+        L.record_event("r", "compress_file", 500, 100, True, project="proj")
+        L.finalize_owned_session("r", "proj", actual_tokens=None)
+        self.assertEqual(self._session_row("r")["credited_saved_tokens"], 1300)
+        self.assertEqual(self._actual("r"), (11, 22, 33, 44))
+        L.record_event("r", "compress_file", 200, 100, True, project="proj")
+        L.finalize_owned_session("r", "proj", actual_tokens={"input": 50, "output": 60, "cache_read": 70, "cache_write": 80})
+        self.assertEqual(self._session_row("r")["credited_saved_tokens"], 1400)
+        self.assertEqual(self._actual("r"), (50, 60, 70, 80))
+
+    def test_redo_after_commit_never_counts_a_claim_twice(self):
+        # Accumulating must not double-count a claim whose roll-up committed
+        # but died before deleting it -- even with an existing row and a new
+        # ledger alongside it.
+        L.record_event("d", "compress_file", 1000, 100, True, project="proj")
+        L.finalize_owned_session("d", "proj")                                    # 900, first run
+        L.record_event("d", "compress_file", 500, 100, True, project="proj")
+        with mock.patch.object(Path, "unlink", lambda self, missing_ok=False: None):
+            L.finalize_owned_session("d", "proj")                                # +400, died before delete
+        self.assertEqual(len(self._claims()), 1)
+        L.record_event("d", "compress_file", 300, 100, True, project="proj")    # +200, resumed again
+        L.finalize_owned_session("d", "proj")
+        row = self._session_row("d")
+        self.assertEqual((row["credited_saved_tokens"], row["event_count"]), (1500, 3))
+        self.assertEqual(self._claims(), [])
+        self.assertEqual(L.get_meta("consumed_claim:" + "x", None), None)
+        conn = L._connect()
+        leftover = conn.execute("SELECT COUNT(*) FROM meta WHERE key LIKE 'consumed_claim:%'").fetchone()[0]
+        conn.close()
+        self.assertEqual(leftover, 0)  # bookkeeping cleaned up once the files are gone
+
+    def test_recovered_project_is_the_newest_events_not_the_last_file_read(self):
+        # PR #412 review (round 6): artifacts are listed by filename, so the
+        # ledger "s.jsonl" is read before the older "s.jsonl.claimed-*", and
+        # taking the last event in list order filed the row under the OLD
+        # claim's project after the resumed session moved projects.
+        old = {"ts": "2026-01-01T00:00:00Z", "tool": "compress_file", "credited": True,
+               "raw_tokens": 1000, "out_tokens": 100, "saved_tokens": 900, "project": "old-proj"}
+        new = dict(old, ts="2026-01-02T00:00:00Z", project="new-proj")
+        path = L._session_jsonl_path("s")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(old) + "\n", encoding="utf-8")
+        self._age("s", self.ttl_seconds * 3)
+        self._leave_claim("s")
+        path.write_text(json.dumps(new) + "\n", encoding="utf-8")
+        self._age("s", self.ttl_seconds * 2)
+        self.assertEqual(L.recover_orphaned_sessions(now=self.now), 1)
+        self.assertEqual(self._session_row("s")["project"], "new-proj")
+
+    def test_orphan_project_ties_and_missing_ts(self):
+        self.assertEqual(L._orphan_project([]), "unknown")
+        self.assertEqual(L._orphan_project([{"project": "a"}, {"project": "b"}]), "b")  # no ts: position
+        same = "2026-01-01T00:00:00Z"
+        self.assertEqual(L._orphan_project([{"ts": same, "project": "a"}, {"ts": same, "project": "b"}]), "b")
+        self.assertEqual(L._orphan_project([{"ts": "2026-01-02T00:00:00Z", "project": "a"},
+                                            {"ts": "2026-01-01T00:00:00Z", "project": "b"},
+                                            {"ts": "2026-01-03T00:00:00Z", "project": ""}]), "a")
+
+    def test_claim_only_session_counts_as_having_artifacts(self):
+        # PR #412 review (round 4): the SessionEnd hook checked only the
+        # ledger, so a session whose only artifact was a leftover claim exited
+        # before its own finalize (and recovery skips the ending session).
+        L.record_event("c", "compress_file", 1000, 100, True, project="proj")
+        self._leave_claim("c")
+        self.assertEqual(L.read_session_events("c"), [])
+        self.assertTrue(L.has_session_artifacts("c"))
+        self.assertEqual(L.finalize_owned_session("c", "proj")["credited_saved_tokens"], 900)
+        self.assertFalse(L.has_session_artifacts("c"))
+
+    def test_live_again_by_the_time_the_lock_is_held_is_skipped(self):
+        L.record_event("l", "compress_file", 1000, 100, True, project="proj")
+        path = L._session_jsonl_path("l")  # fresh mtime: written just now
+        self.assertIsNone(L.finalize_owned_session("l", stale_before=self.now - self.ttl_seconds))
+        self.assertTrue(path.exists())
+        self.assertIsNone(self._session_row("l"))
+
+    def test_claims_are_invisible_to_current_session_id(self):
+        L.record_event("c", "compress_file", 1000, 100, True, project="proj")
+        self._leave_claim("c")
+        self.assertIsNone(L.current_session_id())
+
+    def test_one_bad_ledger_does_not_block_the_rest(self):
+        for sid in ("a", "b"):
+            L.record_event(sid, "compress_file", 1000, 100, True, project="proj")
+            self._age(sid, self.ttl_seconds + 60)
+        real_write = L._write_session_rows
+
+        def fail_for_a(conn, session_id, *args, **kwargs):
+            if session_id == "a":
+                raise sqlite3.OperationalError("disk I/O error")
+            return real_write(conn, session_id, *args, **kwargs)
+
+        with mock.patch.object(L, "_write_session_rows", side_effect=fail_for_a):
+            self.assertEqual(L.recover_orphaned_sessions(now=self.now), 1)
+        self.assertEqual(len(L._session_artifacts("a")), 1)  # kept for a later retry
+        self.assertIsNone(self._session_row("a"))
+        self.assertIsNotNone(self._session_row("b"))
+
+    def test_missing_sessions_dir_is_a_noop(self):
+        self.assertFalse(L._sessions_dir().exists())
+        self.assertEqual(L.recover_orphaned_sessions(now=self.now), 0)
 
 
 if __name__ == "__main__":

@@ -33,7 +33,7 @@ this SAME script:
     migrate via `claude-runway-setup upgrade`.
   - `SessionEnd`: Layer 1 graceful cleanup -- deletes this session's own
     marker on normal exit. A sibling delete to, but independent of,
-    `savings_ledger.finalize_session()`'s own unlink of its differently
+    `savings_ledger.finalize_owned_session()`'s own unlink of its differently
     named `<session_id>.jsonl` file.
 
 The two payload shapes are told apart via `hook_event_name`, which Claude

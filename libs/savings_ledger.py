@@ -39,7 +39,9 @@ import csv
 import io
 import json
 import os
+import re
 import time
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -248,20 +250,26 @@ def read_session_events(session_id: str) -> list:
     # between the check and the open (confirmed directly). Opening straight
     # away and catching OSError closes that window instead of narrowing it.
     path = _session_jsonl_path(session_id)
-    events = []
     try:
         f = open(path, encoding="utf-8")
     except OSError:
         return []
     with f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                events.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue  # a corrupted line shouldn't sink the whole session's tally
+        return _parse_event_lines(f)
+
+
+def _parse_event_lines(lines) -> list:
+    """Shared by read_session_events() and recover_orphaned_sessions() (issue
+    #306), which parses a claimed ledger under a different filename."""
+    events = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue  # a corrupted line shouldn't sink the whole session's tally
     return events
 
 
@@ -624,19 +632,31 @@ def _aggregate_by_agent(events: list) -> list:
     return rows
 
 
-def finalize_session(session_id: str, project: str, overhead_tokens: int = 0, delete_jsonl: bool = True, actual_tokens: Optional[dict] = None) -> dict:
+def _write_session_rows(conn, session_id: str, project: str, events: list, overhead_tokens: int,
+                        actual_tokens: Optional[dict], ended_at: str, accumulate: bool = False) -> dict:
     """
-    Aggregate a session's transient JSONL into one SQLite row (+ per-tool
-    rows), then delete the JSONL (its job is done once rolled up). Returns
-    the aggregate dict, used both for the DB write and to format the
-    SessionEnd summary directly without a second read.
+    Aggregate `events` and write them as `session_id`'s rows on `conn`, inside
+    whatever transaction the caller holds. Shared by finalize_session() and
+    finalize_owned_session() so the two can't drift. Returns the aggregate of
+    `events` alone (what the SessionEnd summary reports as "this session").
 
-    actual_tokens: optional dict from parse_transcript_token_counts() with
-    keys input/output/cache_read/cache_write -- the real per-turn token counts
-    Anthropic processed this session. When None (opt-in feature disabled or
-    transcript parse failed), the four actual_* columns stay 0.
+    accumulate=False (finalize_session): one `sessions` row INSERT OR REPLACE,
+    `session_tools`/`session_agents` delete-then-insert -- the row is exactly
+    these events.
+
+    accumulate=True (finalize_owned_session, issue #306 / PR #412 round 5):
+    these events are ADDED to whatever the session already has. A session's
+    events can reach savings.db in more than one roll-up -- recovered as an
+    orphan, then resumed and ended cleanly; or ended, resumed, ended again --
+    and replacing threw away every earlier part. With no existing row this
+    writes exactly what the replace path writes, so a session that ends once
+    is unchanged. Counters add; project/ended_at/overhead take the newest
+    roll-up's value; actual_* take the new transcript counts when there are
+    any (a resumed session reuses its transcript, so a later parse covers the
+    whole session) and otherwise keep the counts already recorded. Adding is
+    only correct if no event is ever rolled up twice -- finalize_owned_session
+    guarantees that, see its docstring.
     """
-    events = read_session_events(session_id)
     credited = [e for e in events if e.get("credited")]
     credited_saved = sum(e.get("saved_tokens", 0) for e in credited)
     raw_sum = sum(e.get("raw_tokens", 0) for e in credited)
@@ -677,43 +697,60 @@ def finalize_session(session_id: str, project: str, overhead_tokens: int = 0, de
     actual_cr   = int(_at.get("cache_read", 0) or 0)
     actual_cw   = int(_at.get("cache_write",0) or 0)
 
-    ended_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    conn = _connect()
-    with conn:
+    session_values = (session_id, project, ended_at, credited_saved, raw_sum, out_sum, event_count,
+                      fetch_url_count, overhead_tokens, actual_inp, actual_out, actual_cr, actual_cw)
+    session_columns = (
+        "(session_id, project, ended_at, credited_saved_tokens, raw_tokens_sum, out_tokens_sum, "
+        " event_count, fetch_url_count, overhead_tokens, "
+        " actual_input_tokens, actual_output_tokens, actual_cache_read_tokens, actual_cache_write_tokens) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+    # Per-key counter columns shared by session_tools and session_agents.
+    counters = ("event_count", "saved_tokens", "raw_tokens_sum", "out_tokens_sum", "credited_event_count")
+    add_counters = ", ".join(f"{c} = {c} + excluded.{c}" for c in counters)
+    if accumulate:
+        # SQLite UPSERT (3.24+): with no existing row this is a plain INSERT
+        # of the same values the replace path writes.
+        keep_actual = "excluded.{0}" if actual_tokens else "{0}"
+        actual_cols = ("actual_input_tokens", "actual_output_tokens",
+                       "actual_cache_read_tokens", "actual_cache_write_tokens")
         conn.execute(
-            "INSERT OR REPLACE INTO sessions "
-            "(session_id, project, ended_at, credited_saved_tokens, raw_tokens_sum, out_tokens_sum, "
-            " event_count, fetch_url_count, overhead_tokens, "
-            " actual_input_tokens, actual_output_tokens, actual_cache_read_tokens, actual_cache_write_tokens) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (session_id, project, ended_at, credited_saved, raw_sum, out_sum, event_count, fetch_url_count,
-             overhead_tokens, actual_inp, actual_out, actual_cr, actual_cw),
+            "INSERT INTO sessions " + session_columns + " ON CONFLICT(session_id) DO UPDATE SET "
+            "project = excluded.project, ended_at = excluded.ended_at, "
+            "credited_saved_tokens = credited_saved_tokens + excluded.credited_saved_tokens, "
+            "raw_tokens_sum = raw_tokens_sum + excluded.raw_tokens_sum, "
+            "out_tokens_sum = out_tokens_sum + excluded.out_tokens_sum, "
+            "event_count = event_count + excluded.event_count, "
+            "fetch_url_count = fetch_url_count + excluded.fetch_url_count, "
+            "overhead_tokens = excluded.overhead_tokens, "
+            + ", ".join(f"{c} = {keep_actual.format(c)}" for c in actual_cols),
+            session_values,
         )
+        tools_conflict = f" ON CONFLICT(session_id, tool) DO UPDATE SET {add_counters}"
+        agents_conflict = f" ON CONFLICT(session_id, is_subagent, agent_type) DO UPDATE SET {add_counters}"
+    else:
+        conn.execute("INSERT OR REPLACE INTO sessions " + session_columns, session_values)
         conn.execute("DELETE FROM session_tools WHERE session_id = ?", (session_id,))
-        for tool, agg in by_tool.items():
-            conn.execute(
-                "INSERT INTO session_tools (session_id, tool, event_count, saved_tokens, "
-                "raw_tokens_sum, out_tokens_sum, credited_event_count) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (session_id, tool, agg["event_count"], agg["saved_tokens"],
-                 agg["raw_tokens_sum"], agg["out_tokens_sum"], agg["credited_event_count"]),
-            )
-        # Same replace-then-insert shape as session_tools above (issue #365), so
+        # Same replace-then-insert shape as session_tools (issue #365), so
         # re-finalizing a session can never leave stale per-agent rows behind.
         conn.execute("DELETE FROM session_agents WHERE session_id = ?", (session_id,))
-        for row in by_agent:
-            conn.execute(
-                "INSERT INTO session_agents (session_id, is_subagent, agent_type, event_count, saved_tokens, "
-                "raw_tokens_sum, out_tokens_sum, credited_event_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (session_id, row["is_subagent"], row["agent_type"], row["event_count"], row["saved_tokens"],
-                 row["raw_tokens_sum"], row["out_tokens_sum"], row["credited_event_count"]),
-            )
-    conn.close()
-
-    if delete_jsonl:
-        try:
-            _session_jsonl_path(session_id).unlink(missing_ok=True)
-        except OSError:
-            pass
+        tools_conflict = agents_conflict = ""
+    for tool, agg in by_tool.items():
+        conn.execute(
+            "INSERT INTO session_tools (session_id, tool, event_count, saved_tokens, "
+            "raw_tokens_sum, out_tokens_sum, credited_event_count) VALUES (?, ?, ?, ?, ?, ?, ?)"
+            + tools_conflict,
+            (session_id, tool, agg["event_count"], agg["saved_tokens"],
+             agg["raw_tokens_sum"], agg["out_tokens_sum"], agg["credited_event_count"]),
+        )
+    for row in by_agent:
+        conn.execute(
+            "INSERT INTO session_agents (session_id, is_subagent, agent_type, event_count, saved_tokens, "
+            "raw_tokens_sum, out_tokens_sum, credited_event_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            + agents_conflict,
+            (session_id, row["is_subagent"], row["agent_type"], row["event_count"], row["saved_tokens"],
+             row["raw_tokens_sum"], row["out_tokens_sum"], row["credited_event_count"]),
+        )
 
     return {
         "session_id": session_id,
@@ -731,6 +768,342 @@ def finalize_session(session_id: str, project: str, overhead_tokens: int = 0, de
         "actual_cache_read_tokens": actual_cr,
         "actual_cache_write_tokens": actual_cw,
     }
+
+
+def finalize_session(session_id: str, project: str, overhead_tokens: int = 0, delete_jsonl: bool = True, actual_tokens: Optional[dict] = None,
+                     ended_at: Optional[str] = None, events: Optional[list] = None) -> dict:
+    """
+    Aggregate a session's transient JSONL into one SQLite row (+ per-tool
+    rows), then delete the JSONL (its job is done once rolled up). Returns
+    the aggregate dict, used both for the DB write and to format the
+    SessionEnd summary directly without a second read.
+
+    The SessionEnd hook and orphan recovery use finalize_owned_session()
+    instead (issue #306), which adds the cross-process ownership this simple
+    read-write-delete doesn't have; this stays the plain primitive.
+
+    actual_tokens: optional dict from parse_transcript_token_counts() with
+    keys input/output/cache_read/cache_write -- the real per-turn token counts
+    Anthropic processed this session. When None (opt-in feature disabled or
+    transcript parse failed), the four actual_* columns stay 0.
+
+    ended_at: optional "%Y-%m-%dT%H:%M:%SZ" timestamp to record instead of
+    "now". events: optional, already-read events to aggregate instead of
+    re-reading the ledger.
+    """
+    if events is None:
+        events = read_session_events(session_id)
+    if ended_at is None:
+        ended_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    conn = _connect()
+    with conn:
+        result = _write_session_rows(conn, session_id, project, events, overhead_tokens, actual_tokens, ended_at)
+    conn.close()
+
+    if delete_jsonl:
+        try:
+            _session_jsonl_path(session_id).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    return result
+
+
+def _orphan_project(events: list) -> str:
+    """
+    The project to file a recovered orphan under (issue #306). An orphan has
+    no SessionEnd payload, so there's no `cwd` to derive it from the way
+    hooks/session_end_savings.py does -- but every event the sole writer
+    (hooks/compress_output.py) records carries `project`, derived from that
+    same `cwd` via project_name_from_cwd(), so it's the same value a graceful
+    SessionEnd would have used. The most recent non-empty one wins; "unknown"
+    (project_name_from_cwd's own fallback for a missing cwd) when none has it,
+    e.g. a ledger written before the field existed (issue #35).
+
+    "Most recent" is by each event's own `ts`, not list position (PR #412
+    review): `events` can combine several artifacts of one session (a
+    leftover claim plus the ledger written after it), and a resumed session
+    can have moved to another project in between. `ts` is a fixed-width
+    UTC "%Y-%m-%dT%H:%M:%SZ" string, so it sorts chronologically as text; an
+    event without one sorts first. Ties (same second) fall back to list
+    position, which finalize_owned_session orders oldest artifact first.
+    """
+    best: Optional[tuple] = None
+    for i, e in enumerate(events):
+        project = e.get("project") if isinstance(e, dict) else None
+        if not (isinstance(project, str) and project):
+            continue
+        ts = e.get("ts")
+        key = (ts if isinstance(ts, str) else "", i)
+        if best is None or key > best[0]:
+            best = (key, project)
+    return best[1] if best else "unknown"
+
+
+# Issue #306: while a session's events are being rolled up, its ledger is
+# renamed to "<session_id>.jsonl.claimed-<hex>". That name never matches the
+# "*.jsonl" glob current_session_id() scans, and a record_event() call after
+# the rename starts a fresh ledger instead of writing into the file about to
+# be deleted. A claim normally lives only inside finalize_owned_session(); one
+# found later was left by a roll-up that failed or died, and is simply rolled
+# up again together with the session's other artifacts.
+_CLAIM_MARKER = ".claimed-"
+_CLAIM_RE = re.compile(r"\A(.+)\.jsonl\.claimed-[0-9a-f]+\Z")
+
+
+def _artifact_session_id(name: str) -> Optional[str]:
+    """The session a sessions-dir file belongs to if it's a ledger or a claim
+    of one; None for anything else, including session_id_lib's shadow markers
+    (`session_*.jsonl`, same directory by default -- never a ledger)."""
+    if name.startswith("session_"):
+        return None
+    if name.endswith(".jsonl"):
+        return name[: -len(".jsonl")]
+    m = _CLAIM_RE.match(name)
+    return m.group(1) if m else None
+
+
+def _session_artifacts(session_id: str) -> list:
+    """Every file currently holding events for `session_id`: its ledger (if
+    present) and any claims of it."""
+    sid = _sanitize_session_id(session_id)
+    d = _sessions_dir()
+    if not d.is_dir():
+        return []
+    return sorted(p for p in d.glob(f"{sid}.jsonl*") if _artifact_session_id(p.name) == sid)
+
+
+def _mtime_or_zero(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _consumed_claim_key(claim: Path) -> str:
+    """`meta` key recording that a claim's events are already in savings.db
+    (see finalize_owned_session). Keyed by the claim's own unique filename."""
+    return "consumed_claim:" + claim.name
+
+
+def has_session_artifacts(session_id: str) -> bool:
+    """True if `session_id` has anything left to roll up: its ledger, or a
+    claim of it left by a roll-up that failed or died (issue #306). The
+    SessionEnd hook's cheap "anything logged?" check -- checking the ledger
+    alone would skip a session whose only artifact is such a claim."""
+    return bool(_session_artifacts(session_id))
+
+
+def finalize_owned_session(session_id: str, project: Optional[str] = None, overhead_tokens: int = 0,
+                           actual_tokens: Optional[dict] = None,
+                           stale_before: Optional[float] = None) -> Optional[dict]:
+    """
+    Roll ALL of a session's event artifacts (its ledger plus any leftover
+    claims) into savings.db as ONE snapshot, then delete them -- the single
+    ownership protocol both the SessionEnd hook and orphan recovery go
+    through (issue #306). Returns the aggregate dict, {} if the artifacts held
+    no readable events (they're still deleted; no row is written, matching
+    the hook's "nothing logged -> nothing finalized" rule), or None if there
+    was nothing to take or `stale_before` said the session is live after all.
+
+    Why one protocol, and why this shape (each piece fixes a race found and
+    reproduced in PR #412's review):
+      - Ownership is SQLite's own write lock: everything below runs inside
+        BEGIN IMMEDIATE on savings.db, so any two finalizers -- two
+        recoveries, or a recovery and a session's own SessionEnd -- run one
+        after the other, never interleaved. The second one finds the files
+        already consumed and returns None. (Per-file rename claims alone let
+        two workers each own part of one session and overwrite each other's
+        subset; a re-read inside a plain finalize let a vanished file write
+        an all-zero row.) It's the same lock _run_migrations already relies
+        on, portable to Windows, and released by SQLite itself if the process
+        dies -- no lock file that can be orphaned.
+      - Events are ADDED to the session's existing row, never replace it
+        (round 5): a session's events can arrive in several roll-ups --
+        recovered as an orphan, then resumed and ended; or ended, resumed,
+        ended again -- and replacing kept only the last one. A session that
+        ends once writes exactly the row it always did (see
+        _write_session_rows).
+      - Adding requires exactly-once: every claim's unique name is recorded
+        in `meta` in the same transaction that adds its events. A roll-up
+        that committed but died before deleting its claims leaves them, and
+        their keys, in place; the next owner sees the key, skips those
+        events, and deletes the file. Keys are dropped once their files are
+        verifiably gone, so `meta` stays bounded. No schema change: `meta` is
+        the existing key/value table.
+      - The ledger is renamed to a claim before it's read, so an event
+        appended after that point lands in a fresh ledger rather than being
+        deleted unread. Residual, documented rather than locked away: a
+        record_event() that opened the ledger just before the rename and
+        writes just after the read (microseconds). Closing that would need a
+        lock in record_event(), which runs on every compressed tool call.
+
+    project: the caller's project (the hook derives it from `cwd`); None means
+    "an orphan -- take it from the events" (see _orphan_project).
+    actual_tokens: the transcript counts for this session. Given, they
+    replace the row's counts (a resumed session reuses its transcript, so the
+    latest parse covers all of it); None keeps whatever counts the row
+    already has (0 for a new row), since the row now spans every roll-up of
+    the session.
+    stale_before: recovery only -- an epoch time; if any artifact was written
+    after it, the session is live again, so nothing is taken. Checked under
+    the lock, closing the gap between recovery's directory scan and here.
+    ended_at is "now" for a graceful end, and the newest artifact's last
+    write for a recovery, so /my-savings trend buckets a session that
+    crashed weeks ago into the week it actually ran.
+    """
+    sid = _sanitize_session_id(session_id)
+    conn = _connect()
+    claimed = []
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            artifacts = _session_artifacts(sid)
+            mtimes = []
+            for p in artifacts:
+                try:
+                    mtimes.append(p.stat().st_mtime)
+                except OSError:
+                    continue
+            if not mtimes or (stale_before is not None and max(mtimes) > stale_before):
+                conn.execute("ROLLBACK")
+                return None
+            for p in artifacts:
+                if p.name.endswith(".jsonl"):
+                    target = p.with_name(f"{p.name}{_CLAIM_MARKER}{uuid.uuid4().hex}")
+                    try:
+                        os.rename(p, target)
+                    except FileNotFoundError:
+                        continue
+                    # Any other OSError (e.g. Windows refusing to rename a file
+                    # another process holds open) propagates: nothing is
+                    # written, and a later SessionEnd retries.
+                    claimed.append(target)
+                else:
+                    claimed.append(p)
+            # Oldest artifact first (rename keeps mtime), so events read below
+            # are in roughly chronological order -- _orphan_project's tie-break
+            # for events sharing a one-second `ts`.
+            claimed.sort(key=_mtime_or_zero)
+            # Exactly-once guard for accumulating: each claim's id is recorded
+            # in `meta` in the SAME transaction that adds its events. A claim
+            # whose id is already there was added by a roll-up that committed
+            # but died before deleting it -- skip its events (they're in the
+            # row), just delete the file below.
+            events = []
+            for p in claimed:
+                key = _consumed_claim_key(p)
+                if conn.execute("SELECT 1 FROM meta WHERE key = ?", (key,)).fetchone():
+                    continue
+                with open(p, encoding="utf-8", errors="replace") as f:
+                    events.extend(_parse_event_lines(f))
+                conn.execute("INSERT INTO meta (key, value) VALUES (?, ?)", (key, sid))
+            result: dict = {}
+            if events:
+                if stale_before is not None:
+                    ended_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(max(mtimes)))
+                else:
+                    ended_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                result = _write_session_rows(
+                    conn, sid, project or _orphan_project(events), events,
+                    overhead_tokens, actual_tokens, ended_at, accumulate=True,
+                )
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+    finally:
+        conn.close()
+    # Only after COMMIT: a crash before this point leaves the claims (and
+    # their consumed-claim keys) for the next owner, who deletes them without
+    # counting them again. Each key is dropped once its file is gone, so the
+    # bookkeeping in `meta` stays bounded; a failure here only leaves a stale
+    # key behind, which is harmless (claim names are random, never reused).
+    gone = []
+    for p in claimed:
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            pass
+        # Drop the key only once the file is verifiably gone -- a key without
+        # its file is harmless, a file without its key would count twice.
+        if not p.exists():
+            gone.append(_consumed_claim_key(p))
+    if gone:
+        try:
+            conn = _connect()
+            with conn:
+                conn.executemany("DELETE FROM meta WHERE key = ?", [(k,) for k in gone])
+            conn.close()
+        except Exception:
+            pass
+    return result
+
+
+def recover_orphaned_sessions(exclude_session_id: Optional[str] = None, now: Optional[float] = None) -> int:
+    """
+    Roll up, then delete, the event artifacts of every session that never
+    reached a graceful SessionEnd -- a crash, a force-kill, a closed terminal
+    (issue #306). The SessionEnd hook is otherwise the ONLY path from a ledger
+    into savings.db, so without this an orphan's credited savings never reach
+    /my-savings and its JSONL is never cleaned up. Returns how many sessions
+    were consumed.
+
+    "Orphaned" means none of the session's artifacts has been written for
+    longer than the SAME TTL session_id_lib.sweep_stale_shadow_markers()
+    applies to shadow markers (CLAUDE_RUNWAY_SESSION_MARKER_TTL_HOURS, default
+    168h), read through that module's own _ttl_hours() so one knob governs
+    both sweeps and both get the same positive/NaN validation. A ledger is
+    appended on every credited compression, so its mtime is "last activity":
+    a week with none is this toolkit's existing convention for "treat as
+    dead". Still a heuristic -- a live session idle longer than the TTL looks
+    the same as a dead one, exactly as for shadow markers (#233); its
+    recovered events are in savings.db either way, and a later finalize of
+    the same id adds to that row (see finalize_owned_session()).
+
+    This lives here as a SIBLING of session_id_lib's marker sweep rather than
+    as part of it: session_id_lib deliberately never imports this module, and
+    this module's sessions dir follows a CLAUDE_RUNWAY_SAVINGS_DB override
+    while session_id_lib's does not (issue #408), so only this module knows
+    where its own ledgers actually are.
+
+    `exclude_session_id` is the caller's own session (the SessionEnd hook
+    passes the session that is ending), which that hook finalizes itself --
+    through the same finalize_owned_session(), so its own leftover claims are
+    included there rather than here. All the concurrency handling lives in
+    finalize_owned_session(); this is only the scan. Per-session failures are
+    skipped, never raised, so one bad ledger can't block the rest.
+    """
+    now = time.time() if now is None else now
+    stale_before = now - session_id_lib._ttl_hours() * 3600
+    d = _sessions_dir()
+    if not d.is_dir():
+        return 0
+    excluded = _sanitize_session_id(exclude_session_id) if exclude_session_id else None
+    newest: dict[str, float] = {}
+    for p in list(d.iterdir()):
+        sid = _artifact_session_id(p.name)
+        if sid is None or sid == excluded:
+            continue
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            continue  # vanished mid-scan
+        newest[sid] = max(mtime, newest.get(sid, mtime))
+
+    overhead: Optional[int] = None
+    recovered = 0
+    for sid, mtime in newest.items():
+        if mtime > stale_before:
+            continue  # live, or written to recently
+        try:
+            if overhead is None:
+                overhead = get_schema_overhead_tokens()
+            if finalize_owned_session(sid, overhead_tokens=overhead, stale_before=stale_before) is not None:
+                recovered += 1
+        except Exception:
+            continue
+    return recovered
 
 
 def get_live_session_aggregate(session_id: str) -> dict:

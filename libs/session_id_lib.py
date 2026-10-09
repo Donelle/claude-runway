@@ -492,7 +492,10 @@ def sweep_stale_shadow_markers(now: Optional[float] = None) -> int:
     a bare `<session_id>.jsonl` file, since those belong to
     `savings_ledger`'s own event log (present in the same directory for
     tracking-enabled sessions) and are cleaned up separately by that
-    module's own `finalize_session()` at SessionEnd.
+    module's own `finalize_owned_session()` at SessionEnd, or -- for a
+    session that never reached SessionEnd -- by its
+    `recover_orphaned_sessions()` (issue #306), which goes through the same
+    function and reuses this module's `_ttl_hours()`.
 
     Safe by construction ONLY if the caller refreshes its own marker first
     (see `hooks/record_session_id.py`): a live session refreshes its

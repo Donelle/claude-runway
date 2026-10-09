@@ -15,7 +15,9 @@ Track D covers that distinction).
 
 No-op (silent, zero output) when CLAUDE_RUNWAY_TRACK_SAVINGS is off, or when
 this session logged no credited compression events -- an empty summary isn't
-worth printing every time a session ends.
+worth printing every time a session ends. Either way (tracking on), it first
+silently rolls up any OTHER session's ledger orphaned by a crash (issue #306,
+see savings_ledger.recover_orphaned_sessions) -- that never prints anything.
 
 Setup: register in .claude/settings.json (see settings.json.template):
 {
@@ -86,15 +88,39 @@ def main():
     if not session_id:
         sys.exit(0)
 
-    events = savings_ledger.read_session_events(session_id)
-    if not events:
+    # Issue #306: roll up any OTHER session's ledger that was orphaned by a
+    # crash/force-kill (it never got a SessionEnd of its own, so this hook is
+    # the only chance it has of reaching savings.db). Runs before the
+    # "nothing logged this session" exit below on purpose -- recovery mustn't
+    # depend on whether the session that happens to be ending compressed
+    # anything. This session is excluded: it's finalized by the normal path
+    # below (which also picks up any leftover claim of it). Separately guarded so a recovery failure can never cost this
+    # session its own roll-up or summary.
+    try:
+        savings_ledger.recover_orphaned_sessions(exclude_session_id=session_id)
+    except Exception:
+        pass
+
+    # Any artifact, not just the ledger (#306): a roll-up of this session that
+    # failed or died can have left only a claim of it, which recovery skips
+    # for the session that is ending -- so this hook must still take it.
+    # Guarded like the rest of this hook: any error here fails open (exit 0,
+    # no output) and leaves the files for a later roll-up, never a traceback
+    # at session shutdown.
+    try:
+        has_artifacts = savings_ledger.has_session_artifacts(session_id)
+    except Exception:
+        sys.exit(0)
+    if not has_artifacts:
         sys.exit(0)  # nothing logged this session -- don't print an empty summary
 
     # Parse actual token counts from the transcript if the opt-in env var is set.
     # parse_session_token_counts also folds in this session's subagent
     # transcripts (#364) -- transcript_path alone is only the MAIN session's file.
-    # Fails open -- any parse failure leaves actual_tokens as None, and
-    # finalize_session stores 0s for the actual_* columns rather than erroring.
+    # Fails open -- any parse failure leaves actual_tokens as None. None means
+    # "no new counts": finalize_owned_session writes 0s for a session with no
+    # row yet, and keeps the counts an existing row already has (a resumed
+    # session's earlier roll-up) rather than zeroing them.
     # STOPGAP: remove when #164 is resolved (Stop hook will expose these directly).
     actual_tokens = None
     if _parse_transcript_enabled() and transcript_path:
@@ -107,12 +133,20 @@ def main():
     try:
         project = savings_ledger.project_name_from_cwd(cwd)
         overhead = savings_ledger.get_schema_overhead_tokens()
-        session_agg = savings_ledger.finalize_session(
-            session_id, project, overhead_tokens=overhead, actual_tokens=actual_tokens
+        # finalize_owned_session, not finalize_session (#306): the same
+        # ownership protocol orphan recovery uses -- serialized on savings.db's
+        # write lock, and rolling up this session's ledger TOGETHER with any
+        # claim of it a failed/dead recovery left behind, since rolling them
+        # up separately would let one overwrite the other. None means another
+        # process already consumed this session's events; that roll-up stands.
+        session_agg = savings_ledger.finalize_owned_session(
+            session_id, project, overhead_tokens=overhead, actual_tokens=actual_tokens,
         )
+        if not session_agg:
+            sys.exit(0)
         session_agg["project"] = project
         # #307: events existing isn't enough to print -- `event_count` counts
-        # CREDITED events only (see finalize_session), so a fetch_url-only
+        # CREDITED events only (see _write_session_rows), so a fetch_url-only
         # session (logged but never credited) rolls up into the perpetual
         # store above but stays silent here instead of printing a "0 tokens
         # avoided" summary, matching the documented no-op behavior.

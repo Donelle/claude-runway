@@ -24,6 +24,7 @@ import re
 import sys
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hooks"))
 
@@ -1365,8 +1366,12 @@ class HooksReconfigureStdinToUtf8(unittest.TestCase):
         # Tracking is off by default, so main() parses then no-ops at the
         # tracking_enabled() gate -- but it must REACH that gate, i.e. the UTF-8
         # payload must parse under the cp1252-default stdin first.
+        # Pinned off rather than assumed: with tracking on (e.g. a dogfood
+        # shell exporting CLAUDE_RUNWAY_TRACK_SAVINGS=1), main() would go on to
+        # recover orphaned ledgers (issue #306) in the REAL sessions directory.
         payload = {"session_id": "s", "cwd": "/repos/" + _UTF8_SENTINEL, "transcript_path": None}
-        self._run_hook_main(session_end_hook.main, payload)
+        with mock.patch.dict(os.environ, {"CLAUDE_RUNWAY_TRACK_SAVINGS": ""}):
+            self._run_hook_main(session_end_hook.main, payload)
 
 
 class InvalidThresholdEnvTests(unittest.TestCase):
