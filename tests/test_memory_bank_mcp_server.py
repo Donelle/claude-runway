@@ -62,16 +62,37 @@ _metrics_db_env_patch: "mock._patch_dict"
 
 
 def setUpModule():
+    # Issue #338: CLAUDE_RUNWAY_MEMORY_EVENTS_DB is redirected here too, for
+    # the same reason as metrics.db above. Tests that patch tracking_enabled
+    # to True without also mocking mev.record_memory_event (e.g.
+    # MemoryMetricCounterTest) fall through to the REAL rich-event writer --
+    # confirmed live: ~790 fake "test-collection"/"proj-a" rows had piled up
+    # in a dogfood machine's real memory-events.db, about 70% of it,
+    # skewing the very baseline report (tools/memory_bank_report.py) that
+    # reads that file.
     global _metrics_db_tmpdir, _metrics_db_env_patch
     _metrics_db_tmpdir = tempfile.TemporaryDirectory()
     db_path = Path(_metrics_db_tmpdir.name) / "metrics.db"
-    _metrics_db_env_patch = mock.patch.dict(os.environ, {"CLAUDE_RUNWAY_METRICS_DB": str(db_path)})
+    events_db_path = Path(_metrics_db_tmpdir.name) / "memory-events.db"
+    _metrics_db_env_patch = mock.patch.dict(
+        os.environ,
+        {"CLAUDE_RUNWAY_METRICS_DB": str(db_path), "CLAUDE_RUNWAY_MEMORY_EVENTS_DB": str(events_db_path)},
+    )
     _metrics_db_env_patch.start()
 
 
 def tearDownModule():
     _metrics_db_env_patch.stop()
     _metrics_db_tmpdir.cleanup()
+
+
+class ModuleDbRedirectTest(unittest.TestCase):
+    def test_memory_events_db_is_redirected_away_from_the_real_file(self):
+        # Issue #338 regression: without this redirect, unmocked tracking
+        # calls in this module wrote into the developer's real
+        # ~/.claude/claude-runway/memory-events.db.
+        resolved = _mbs.mev.resolve_db_path()
+        self.assertTrue(str(resolved).startswith(_metrics_db_tmpdir.name), resolved)
 
 
 class ForgetArgumentValidationTest(unittest.TestCase):

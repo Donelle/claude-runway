@@ -101,8 +101,9 @@ MCP server has no hook payload to read a real session id from (only hooks
 receive one, via their stdin payload), and a stable per-process grouping key
 is good enough for this passive log's purposes — since a stdio server is
 spawned fresh per Claude Code session, that proxy is a documented, practical
-stand-in for "this session," not the real thing. Surfacing this data via a dedicated report is intentionally out of scope for
-this table specifically — but a simpler, separate signal already exists:
+stand-in for "this session," not the real thing. A read-only report over this
+table now exists — see [Baseline staleness report](#baseline-staleness-report)
+below. A simpler, separate signal also exists:
 issue #211 added `record_memory_metric()` alongside the above, writing a
 plain per-call tally (no `point_id`/`repo`/`kind` detail, just a count) for
 every `recall`/`remember`/`forget` call into [the shared metrics
@@ -119,6 +120,33 @@ rich table above: `forget` never writes a rich row at all, an empty/failed
 several rich rows against that one tally), but a plain tally needs no
 per-point metadata and doesn't need the autonomous-removal feature the rich
 table's own `forget` exclusion reasoning depends on.
+
+### Baseline staleness report
+
+`python tools/memory_bank_report.py` (issue #338, Batch A of #328) reads
+`memory-events.db` read-only (it never creates or writes the file) and prints:
+
+- **Dead-memory ratio** — of distinct remembered `point_id`s, the share with no
+  `recall` hit at or after the time they were remembered, overall and per `repo`
+  tag. `--min-age-days N` only counts memories at least N days old, since a
+  memory written today can't have been recalled yet. A forgotten memory also
+  counts as dead; the table can't tell the two apart.
+- **Recall payload trend** — per `--bucket week` (default) or `month`, overall
+  and per calling `project`: calls, hits, and average hits per call. A call is
+  one `(session_id, turn)` group of recall rows, so this is per NON-EMPTY call
+  (an empty recall writes no row here) and in hits, not bytes (response size
+  isn't logged).
+- **Score trend** — reported as unavailable: no score is logged per hit, and
+  adding one is a schema change outside this baseline's existing-data scope.
+
+`--json` prints the same report as JSON. Rows logged by project
+`test-collection` are excluded by default (`--no-default-excludes` to keep
+them, `--exclude-project P` to drop more): that is the id the test suite uses,
+and before #338 `tests/test_memory_bank_mcp_server.py` wrote those rows into
+the real file. The report also matches a memory's remember and recall rows
+whether the id was logged with dashes or without (remember logs
+`uuid4().hex`, recall logs the dashed form Qdrant returns), which a plain id
+comparison would miss.
 
 ## Where the data lives
 
