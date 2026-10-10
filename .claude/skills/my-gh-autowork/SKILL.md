@@ -208,6 +208,18 @@ always be one of the four OUTCOME line shapes from the Final report section at t
 (three from that section directly, plus the `DONE` case Step 0 and that section both
 call out separately).
 
+**Do NOT skip any numbered step below because the change looks small, and do not skip a
+step because it is "just a git command."** Confirmed live across the 2026-10-05/06 run
+(issues #329-#331, #334, #335): one subagent skipped Step 1's full README read and its
+`sync_repo` call ("the change was small and self-contained"), and another skipped Step 29's
+final `git fetch origin main && git log origin/main -1` confirmation because it was a git
+command. Both steps exist for reasons stated where they appear (a stale index, an
+unconfirmed merge); a small diff doesn't make either reason go away. If the sandbox refuses
+a compound Bash command (git/gh combined with a loop, `$(...)`, or a heredoc — confirmed to
+happen in worktree-isolated subagents), split it into separate simple commands, or put the
+logic in a script file under your scratchpad directory and run it with `bash <script>`;
+that is a workaround for the refusal, never a reason to skip the step.
+
 ## Step 0 — determine the target ticket
 {ISSUE_NUMBER}                                   <-- orchestrator fills in ONE of these two
 --- OR ---
@@ -373,7 +385,7 @@ under `~/.claude/skills/`, not guaranteed to exist on whichever machine is runni
     explaining *why*, not just *what* — this codebase's established density).
 14. Write or update unit tests in the matching `tests/test_*.py`, following that file's
     existing patterns (e.g. the `hook.compress = _fake_compress` monkeypatch style already
-    used in `tests/test_compress_bash_output.py` for anything touching LM Studio, so tests
+    used in `tests/test_compress_output.py` for anything touching LM Studio, so tests
     need no live model). If sizing test fixtures relative to a threshold constant, read the
     constant from the module dynamically (e.g. `hook.THRESHOLD`) rather than hardcoding its
     documented default — this repo's own dogfood shell overrides
@@ -385,19 +397,23 @@ under `~/.claude/skills/`, not guaranteed to exist on whichever machine is runni
     a stale-but-present one:
     ```bash
     test -d .venv || uv venv --python 3.12
-    uv pip install -r requirements.txt --index-url https://pypi.org/simple
-    uv pip install -r requirements-dev.txt --index-url https://pypi.org/simple
+    PYTHON=$(if [ -f .venv/Scripts/python ]; then echo .venv/Scripts/python; else echo .venv/bin/python; fi)
+    uv pip install --python "$PYTHON" -r requirements.txt --index-url https://pypi.org/simple
+    uv pip install --python "$PYTHON" -r requirements-dev.txt --index-url https://pypi.org/simple
     ```
-    (The second/third lines are cheap no-ops if already satisfied, so it's fine to always
-    run them rather than trying to detect exactly what's missing.) After bootstrapping,
-    resolve the interpreter path once — Windows venv uses `Scripts/`, Linux/macOS uses
+    **`--python "$PYTHON"` on every `uv pip install` is required, not optional.**
+    Confirmed live (issue #332's run, 2026-10-06): without it, `uv pip install` run from
+    inside a worktree resolved to the PRIMARY checkout's `.venv` instead of this
+    worktree's own, so the install was a no-op against the wrong venv and ruff and
+    Pyright were then missing from the worktree's own venv. (The second/third lines are
+    cheap no-ops if already satisfied, so it's fine to always run them rather than trying
+    to detect exactly what's missing.) The interpreter path is resolved once, in the same
+    block, right after the venv exists — Windows venv uses `Scripts/`, Linux/macOS uses
     `bin/`. ruff and Pyright (issue #297 — replaces mypy so the editor's Pylance
     extension and this gate agree) are each invoked via `$PYTHON -m ruff`/`$PYTHON -m
     pyright` rather than as direct `$RUFF`/`$PYRIGHT` binaries, so only one allow rule
-    (`.venv/Scripts/python` or `.venv/bin/python`) is needed instead of three:
-    ```bash
-    PYTHON=$(if [ -f .venv/Scripts/python ]; then echo .venv/Scripts/python; else echo .venv/bin/python; fi)
-    ```
+    (`.venv/Scripts/python` or `.venv/bin/python`) is needed instead of three.
+
     Then run and require all three clean before proceeding. **`--pythonpath
     $PYTHON` on the Pyright call is required, not optional** (Copilot review,
     PR #319): `pyproject.toml`'s `[tool.pyright]` deliberately has no

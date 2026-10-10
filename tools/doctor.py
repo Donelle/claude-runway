@@ -6,7 +6,7 @@ shell environment for each variable README's "Environment variables" table
 marks "both" (`CLAUDE_RUNWAY_LMSTUDIO_URL`/`_MODEL`/`_TRACK_SAVINGS`/
 `_SAVINGS_DB`), flagging any mismatch instead of relying on a human to
 notice that the MCP-server side (`compress_file`/`fetch_url`) and the
-hook side (`compress_bash_output.py`/`session_end_savings.py`) have quietly
+hook side (`compress_output.py`/`session_end_savings.py`) have quietly
 drifted apart (issue #49, GROW-02 in `.plans/code-review-2026-08-18.md`).
 
 Usage:
@@ -16,7 +16,10 @@ Run this from the SAME shell (or an equivalent one with the same exports)
 that launches `claude` for that project -- it reads `os.environ` from
 whatever process runs it, matching the README's own "set both" advice.
 
-Exit code is 1 if any mismatch is found, 0 otherwise (including when
+Also flags a .claude/settings.json still running the renamed-away
+`compress_bash_output.py` hook (issue #395; `upgrade` fixes it).
+
+Exit code is 1 if any mismatch (or stale hook) is found, 0 otherwise (including when
 `local-compress` isn't configured at all -- e.g. a `--qdrant-only` setup --
 which is a valid state, not a misconfiguration) -- usable as a CI/
 pre-flight gate, not just an interactive report.
@@ -33,7 +36,25 @@ from doctor_lib import DoctorResult, run_doctor  # noqa: E402
 from version_lib import version_string  # noqa: E402
 
 
+def _legacy_hook_note(result: DoctorResult) -> str:
+    """Extra section for a settings.json still running the pre-#395
+    compress_bash_output.py -- empty string when there's nothing to flag."""
+    if not result.legacy_compress_hook_events:
+        return ""
+    events = ", ".join(result.legacy_compress_hook_events)
+    return (
+        "\n\nStale hook: .claude/settings.json still runs hooks/compress_bash_output.py "
+        f"(under {events}), which was renamed to hooks/compress_output.py (issue #395) -- the old path "
+        "no longer exists, so output compression is silently not running. Fix: "
+        "`claude-runway-setup upgrade <target_repo>` (migration compress-hook-renamed)."
+    )
+
+
 def format_report(result: DoctorResult) -> str:
+    return _format_env_report(result) + _legacy_hook_note(result)
+
+
+def _format_env_report(result: DoctorResult) -> str:
     if result.config_error:
         # Distinct from "no local-compress configured" below -- this means
         # .mcp.json itself is malformed/unreadable, not a valid config that
@@ -90,7 +111,7 @@ def main(argv=None) -> int:
 
     result = run_doctor(target_repo, shell_env=os.environ)
     print(format_report(result))
-    return 1 if (result.config_error or result.mismatches) else 0
+    return 1 if (result.config_error or result.mismatches or result.legacy_compress_hook_events) else 0
 
 
 if __name__ == "__main__":

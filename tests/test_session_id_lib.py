@@ -386,6 +386,94 @@ class TranscriptScanStrategy(SessionIdLibTestCase):
         result = L.session_id(L.SessionIdStrategy.TRANSCRIPT_SCAN, project="my-project")
         self.assertIsNone(result)
 
+    def test_windows_slug_replaces_backslashes_and_drive_colon(self):
+        # Issue #264: a Windows absolute path must collapse every backslash AND
+        # the drive-letter colon to `-`, matching the real layout verified live
+        # under ~/.claude/projects/ on this machine
+        # (C:\Repos\CVNA-Github\SandboxOrg\claude-runway ->
+        #  C--Repos-CVNA-Github-SandboxOrg-claude-runway). The drive root `C:\`
+        # produces `C--` (colon + backslash, each -> one `-`).
+        #
+        # Stub _resolve_project (Copilot review PR #388): _project_slug routes
+        # through it, and its native os.path.isabs rejects a Windows-style string
+        # on a POSIX host -- so without the stub this slug-string assertion would
+        # fail on the Linux/macOS CI runner. Stubbing it to return the path
+        # unchanged tests the slug transform independently of the host OS without
+        # weakening production's absolute-path validation.
+        with mock.patch.object(L, "_resolve_project", side_effect=lambda p: p):
+            self.assertEqual(
+                L._project_slug(r"C:\Repos\CVNA-Github\SandboxOrg\claude-runway"),
+                "C--Repos-CVNA-Github-SandboxOrg-claude-runway",
+            )
+            self.assertEqual(L._project_slug(r"D:\dev\app"), "D--dev-app")
+
+    def test_posix_slug_unaffected_by_windows_separator_handling(self):
+        # Issue #264 regression guard: adding `\`/`:` to the replacement set
+        # must not change the POSIX slug (no backslash or colon present there).
+        self.assertEqual(L._project_slug("/Users/dev/repos/my-project"), "-Users-dev-repos-my-project")
+
+    def test_windows_transcript_scan_finds_the_right_slug_dir(self):
+        # Issue #264 end-to-end: before the fix, a Windows path slug was left as
+        # an absolute path, so `projects_dir / slug` discarded projects_dir and
+        # scanned the project root itself. With the fix the slug is a plain
+        # directory name that correctly nests under the (mocked) projects dir.
+        #
+        # Stub _resolve_project (Copilot review PR #388) for the whole test: its
+        # native os.path.isabs would reject this Windows-style path on a POSIX
+        # host, yielding a None slug -- which fails `projects_dir / slug` during
+        # fixture setup AND the scan. Keep the stub active through both the slug
+        # computation and the session_id() call so the test runs cross-platform
+        # without changing production validation.
+        win_project = r"C:\Repos\CVNA-Github\SandboxOrg\claude-runway"
+        with mock.patch.object(L, "_resolve_project", side_effect=lambda p: p):
+            slug = L._project_slug(win_project)
+            project_dir = self.projects_dir / slug
+            project_dir.mkdir(parents=True)
+            (project_dir / "win-session-id.jsonl").write_text("{}\n", encoding="utf-8")
+
+            result = L.session_id(L.SessionIdStrategy.TRANSCRIPT_SCAN, project=win_project)
+        self.assertEqual(result, "win-session-id")
+
+    def test_containment_guard_rejects_slug_escaping_projects_dir(self):
+        # Issue #264 defense-in-depth: even if a future slug-convention miss
+        # yielded an absolute or `..`-escaping segment, the scan must fail safe
+        # to None rather than globbing outside the transcripts dir. Simulate the
+        # miss by patching _project_slug to return an absolute path (the exact
+        # pre-fix Windows failure mode) and asserting None despite a real
+        # `.jsonl` sitting at that escaped location.
+        escape_dir = Path(self._tmpdir.name) / "elsewhere"
+        escape_dir.mkdir(parents=True)
+        (escape_dir / "stray.jsonl").write_text("{}\n", encoding="utf-8")
+        with mock.patch.object(L, "_project_slug", return_value=str(escape_dir)):
+            result = L.session_id(L.SessionIdStrategy.TRANSCRIPT_SCAN, project="/repos/my-project")
+        self.assertIsNone(result)
+
+    def test_containment_guard_symlink_loop_runtimeerror_returns_none(self):
+        # Issue #264 / Copilot review PR #388: on Python 3.10-3.12 Path.resolve()
+        # raises RuntimeError (NOT OSError) on a symlink loop. The containment
+        # guard added for this issue must catch that too, or it would newly
+        # violate session_id()'s never-raises contract (before the guard,
+        # is_dir() just returned False for this case). Verified live that a real
+        # symlink loop raises RuntimeError; here we force it deterministically.
+        slug = L._project_slug("/repos/my-project")
+        (self.projects_dir / slug).mkdir(parents=True)
+        with mock.patch.object(L.Path, "resolve", side_effect=RuntimeError("Symlink loop")):
+            result = L.session_id(L.SessionIdStrategy.TRANSCRIPT_SCAN, project="/repos/my-project")
+        self.assertIsNone(result)
+
+    def test_containment_guard_embedded_nul_valueerror_returns_none(self):
+        # Issue #264 / Copilot review PR #388: Path.resolve() raises ValueError
+        # (not OSError/RuntimeError) for an embedded NUL in the path, e.g. a
+        # malformed marker whose stored absolute `project` passed earlier
+        # validation. The containment guard must catch that too to preserve
+        # session_id()'s documented fail-open behavior (before the guard,
+        # is_dir() returned False for such a path). Verified live that a real
+        # NUL-containing path raises ValueError from resolve(); exercise the end
+        # -to-end scan path here with a real NUL-bearing project string rather
+        # than a mock, so the test pins the actual reachable failure mode.
+        result = L.session_id(L.SessionIdStrategy.TRANSCRIPT_SCAN, project="/repos/\x00/my-project")
+        self.assertIsNone(result)
+
 
 class ProxyStrategy(SessionIdLibTestCase):
     def test_returns_a_string(self):

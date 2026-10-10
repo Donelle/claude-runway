@@ -96,6 +96,22 @@ class DoctorCli(unittest.TestCase):
         self.assertIn("http://localhost:9999/v1", output)
         self.assertIn("http://localhost:1234/v1", output)
 
+    def test_stale_legacy_compress_hook_exits_one_and_points_at_upgrade(self):
+        # Issue #395: compress_bash_output.py was renamed; a settings.json
+        # still pointing at it must fail the doctor even with no env mismatch.
+        self._write_mcp_json(local_compress_env=None)
+        (self.target_repo / ".claude").mkdir()
+        (self.target_repo / ".claude" / "settings.json").write_text(
+            json.dumps({"hooks": {"PostToolUse": [{"hooks": [{"args": ["/t/hooks/compress_bash_output.py"]}]}]}}),
+            encoding="utf-8",
+        )
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            exit_code = self.mod.main([str(self.target_repo)])
+        self.assertEqual(exit_code, 1)
+        self.assertIn("compress_bash_output.py", buf.getvalue())
+        self.assertIn("upgrade", buf.getvalue())
+
     def test_target_repo_argument_is_required(self):
         with self.assertRaises(SystemExit) as ctx:
             self.mod.parse_args([])

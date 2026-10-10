@@ -100,8 +100,10 @@ Project-scoped to this repo on purpose: it hardcodes claude-runway's actual conv
     `requirements-dev.txt` (a separate, dev-only file from
     `requirements.txt` — see that file's own comment); if either is missing
     from this repo's venv, install with
-    `uv pip install -r requirements-dev.txt --index-url https://pypi.org/simple`
-    (not `.venv/bin/pip install` — `uv venv` doesn't seed a `pip` executable
+    `uv pip install --python .venv/bin/python -r requirements-dev.txt --index-url https://pypi.org/simple`
+    (the explicit `--python` matters when run from a git worktree: without it `uv`
+    can resolve to the primary checkout's venv instead of this one — use
+    `.venv/Scripts/python` on Windows; and not `.venv/bin/pip install` — `uv venv` doesn't seed a `pip` executable
     by default, so that would fail in exactly the recovery case this is
     for) rather than skipping the check.
 

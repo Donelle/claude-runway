@@ -18,6 +18,7 @@ point of test_new_tool_is_picked_up_without_code_changes below is to make
 that exact failure mode impossible to reintroduce silently again.
 """
 
+import codecs
 import importlib.util
 import os
 import sys
@@ -48,22 +49,19 @@ def _load_compress_mcp_server():
     return mod
 
 
-class SanitizeProjectAvoidsPunctuationCollisions(unittest.TestCase):
-    """Regression coverage for issue #45: _sanitize_project used to collapse
-    "my.project" / "my project" / "my@project" / "my-project" into the
-    identical sanitized string, so distinct projects could land in the same
-    Qdrant collection. The fix appends a hash suffix derived from the
-    ORIGINAL (pre-sanitization) string, which still differs even when the
-    sanitized-into-hyphens portion doesn't.
+class SanitizeProjectCollectionName(unittest.TestCase):
+    """_sanitize_project maps a project string to a stable, valid Qdrant
+    collection-name segment. It deliberately appends NO hash suffix (issue #45's
+    hash was dropped so the name stays readable and one project string always
+    maps to the same plain collection name), so punctuation variants collapse
+    together.
     """
 
-    def test_punctuation_variants_no_longer_collide(self):
+    def test_punctuation_variants_collapse_to_the_same_name(self):
         mod = _load_compress_mcp_server()
         variants = ["my.project", "my project", "my@project", "my-project"]
-        sanitized = [mod._sanitize_project(v) for v in variants]
-        # Every pairwise result must be distinct -- this is the actual
-        # reported bug: all four used to sanitize to the same "my-project".
-        self.assertEqual(len(sanitized), len(set(sanitized)))
+        sanitized = {mod._sanitize_project(v) for v in variants}
+        self.assertEqual(sanitized, {"my-project"})
 
     def test_deterministic_across_calls(self):
         # compact_store and compact_find each call _sanitize_project
@@ -81,18 +79,13 @@ class SanitizeProjectAvoidsPunctuationCollisions(unittest.TestCase):
             result = mod._sanitize_project(project)
             self.assertRegex(result, r"^[a-zA-Z0-9_-]+$")
 
-    def test_plain_alphanumeric_name_keeps_readable_prefix(self):
-        # The common case (no sanitization needed) should still read as
-        # "<original>-<hash>", not become unrecognizable.
+    def test_plain_alphanumeric_name_is_unchanged_with_no_suffix(self):
         mod = _load_compress_mcp_server()
-        result = mod._sanitize_project("myproject")
-        self.assertTrue(result.startswith("myproject-"))
-        suffix = result[len("myproject-"):]
-        self.assertEqual(len(suffix), 8)
+        self.assertEqual(mod._sanitize_project("myproject"), "myproject")
+        self.assertEqual(mod._sanitize_project("claude-runway"), "claude-runway")
 
     def test_casing_variants_collapse_to_the_same_collection(self):
-        # Regression coverage for issue #37: unlike the punctuation variants
-        # above (deliberately kept DISTINCT), casing variants of the exact
+        # Regression coverage for issue #37: casing variants of the exact
         # same project string must sanitize IDENTICALLY, or a casing drift
         # between /my-compact and /my-resume points at a nonexistent
         # collection.
@@ -294,6 +287,19 @@ class CompactStoreIsIdempotent(unittest.TestCase):
         self.assertEqual(len(col), 1)
         [point] = list(col.values())
         self.assertEqual(point.payload["information"], "retried content (should overwrite, not duplicate)")
+
+    def test_payload_carries_compact_source_marker(self):
+        # Issue #282: the indexer's reset/delete guard excludes on
+        # metadata.source, so compact points must carry the shared constant.
+        mod, client_cls = self._patched_module()
+        _run(mod.compact_store(information="x", project="my-project", label="l", date="2026-08-27"))
+        col = next(iter(client_cls().collections.values()))
+        [point] = list(col.values())
+        self.assertEqual(point.payload["metadata"]["source"], mod.COMPACT_SOURCE)
+        # Writer and guard must agree: the exclusion filter names this value.
+        import memory_bank_lib
+        excluded = {c.match.value for c in memory_bank_lib.memory_bank_exclusion_filter().must_not}
+        self.assertIn(point.payload["metadata"]["source"], excluded)
 
     def test_different_label_does_not_collide(self):
         mod, client_cls = self._patched_module()
@@ -1219,7 +1225,7 @@ class SavingsFooterRedactsSourceCredentials(unittest.TestCase):
     `curl -H 'Authorization: Bearer ghp_...'` still leaked its embedded
     credential via that field even though the compressed BODY the command
     produced was properly redacted. That footer gets persisted into the
-    savings ledger by hooks/compress_bash_output.py, turning a transient
+    savings ledger by hooks/compress_output.py, turning a transient
     secret in a command line into a durable one in that database.
     """
 
@@ -1328,6 +1334,56 @@ class _FakeStreamedResponse:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
         return False
+
+
+class CompressFileDecodesWithoutSilentCorruption(unittest.TestCase):
+    """Regression coverage for issue #267: compress_file read files with
+    errors="ignore", silently dropping non-UTF-8 bytes (cp1252 accents) and
+    letting UTF-16 arrive NUL-interleaved."""
+
+    def _compress_file_text(self, data: bytes) -> str:
+        """Run compress_file on `data` and return the exact text handed to
+        _compress (stubbed, so no LM Studio is needed)."""
+        mod = _load_compress_mcp_server()
+        seen = {}
+
+        async def fake_compress(text, *args, **kwargs):
+            seen["text"] = text
+            return "summary"
+
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "f.log"
+            path.write_bytes(data)
+            with mock.patch.object(mod, "_compress", fake_compress):
+                _run(mod.compress_file(file_path=str(path)))
+        return seen["text"]
+
+    def test_cp1252_bytes_are_visible_replacements_not_dropped(self):
+        text = self._compress_file_text("caf\u00e9 \u201cquoted\u201d".encode("cp1252"))
+        self.assertIn("\ufffd", text)
+        self.assertTrue(text.startswith("caf"))
+        # The ASCII around each bad byte survives, and nothing was deleted:
+        # 1 char per undecodable byte (3 bad bytes: e-acute and two quotes).
+        self.assertEqual(text.count("\ufffd"), 3)
+        self.assertIn("quoted", text)
+
+    def test_utf16le_with_bom_decodes_cleanly(self):
+        text = self._compress_file_text("hello wor\u00e9ld".encode("utf-16"))
+        self.assertEqual(text, "hello wor\u00e9ld")
+        self.assertNotIn("\x00", text)
+
+    def test_utf16be_with_bom_decodes_cleanly(self):
+        data = codecs.BOM_UTF16_BE + "abc\u00e9".encode("utf-16-be")
+        self.assertEqual(self._compress_file_text(data), "abc\u00e9")
+
+    def test_utf32_with_bom_is_not_mistaken_for_utf16(self):
+        self.assertEqual(self._compress_file_text("abc".encode("utf-32")), "abc")
+
+    def test_utf8_bom_is_stripped(self):
+        self.assertEqual(self._compress_file_text(codecs.BOM_UTF8 + b"plain"), "plain")
+
+    def test_plain_utf8_is_unchanged(self):
+        self.assertEqual(self._compress_file_text("na\u00efve \u2713".encode("utf-8")), "na\u00efve \u2713")
 
 
 class FetchUrlEnforcesSizeCap(unittest.TestCase):
