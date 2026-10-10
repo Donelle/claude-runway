@@ -126,8 +126,8 @@ class IndexRepoResetGuardTest(unittest.TestCase):
         _, kwargs = client.delete.call_args
         self.assertEqual(kwargs["collection_name"], "test-collection")
         must_not = kwargs["points_selector"].must_not
-        self.assertEqual(len(must_not), 1)
-        self.assertEqual(must_not[0].match.value, mb.MEMORY_BANK_SOURCE)
+        # Memory-bank points AND (issue #282) conversation compacts.
+        self.assertEqual({c.match.value for c in must_not}, {mb.MEMORY_BANK_SOURCE, mb.COMPACT_SOURCE})
 
     def test_collection_not_existing_skips_both_delete_paths(self):
         client = self._make_client(exists=False)
@@ -236,9 +236,8 @@ class SyncRepoDeleteFilterTest(unittest.TestCase):
         client.delete.assert_called_once()
         _, kwargs = client.delete.call_args
         must_not = kwargs["points_selector"].must_not
-        self.assertEqual(len(must_not), 1)
-        self.assertEqual(must_not[0].key, mb.SOURCE_FIELD)
-        self.assertEqual(must_not[0].match.value, mb.MEMORY_BANK_SOURCE)
+        self.assertEqual({c.key for c in must_not}, {mb.SOURCE_FIELD})
+        self.assertEqual({c.match.value for c in must_not}, {mb.MEMORY_BANK_SOURCE, mb.COMPACT_SOURCE})
         # The existing should=[file_path...] behavior must be unaffected.
         should = kwargs["points_selector"].should
         self.assertEqual({c.match.value for c in should}, {"changed_file.py"})

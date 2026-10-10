@@ -42,6 +42,19 @@ The script warns (rather than silently allowing) two collisions:
 - `remember(summary, description, kind, general=False, weight=1.0, ...)` — `summary` is the only field actually searched, so write it the way a future query would be phrased; put the full verbatim detail in `description`. Set `general=True` only when the user explicitly signals the memory applies across every project. `weight` (issue #177) is a static, FINITE, NONNEGATIVE quality multiplier stored as `metadata.weight` (a negative, infinite, or NaN value is rejected with an error): `1.0` (default) is a true no-op against plain-similarity ranking, `>1.0` boosts a known-good memory above equally-similar competitors, `0.0` de-emphasizes a stale/superseded one without deleting it. `weight` is a proportional relevance multiplier (`effective_score = max(0, similarity) * weight`): a hit with weight `w` beats a default-weight hit only if `w * its_similarity` exceeds the other's similarity, so `2.0` lets a hit with half the similarity tie a default one, and a zero-similarity memory scores 0 at any weight — it is a boost among comparably-relevant hits, never a takeover. A point written before this field existed is treated as `weight=1.0` at read time. There's no separate "update weight" tool — `forget` the point and `remember` it again to change it.
 - `forget(...)` — requires explicit user confirmation before calling with `confirm=True`; show what would be deleted first.
 
+## Migrating a legacy collection
+
+`transfer_memories(source_collection, dry_run=True, qdrant_url=None, qdrant_api_key=None)` (issue #336) copies memories from an older Qdrant collection into the shared memory-bank collection. The source has to look like a memory-bank export: a `document` payload field plus a `metadata` object with `repo`, `kind`, `description` and (optionally) `weight`.
+
+- **Name the source exactly.** There is no auto-discovery; use codebase-indexer's `list_collections` if unsure. The memory-bank collection itself is refused as a source, including through a Qdrant alias.
+- **Dry run by default.** With `dry_run=True` nothing is written or embedded; the report shows `would_migrate`. Pass `dry_run=False` to write.
+- **Every point is read.** The source is walked with a full Qdrant scroll, not a top-k search. As with `scroll_collection`, this is only complete if nothing writes to the source during the run.
+- **Only your own and general memories move.** A point tagged with this project's `MEMORY_BANK_ID` is written project-scoped, and one tagged `general` is written as general. Any other tag is skipped and counted under `skipped_foreign_repo` by tag. Run the tool from a session in that project to move those. This is the same rule `remember` enforces: no tool can write under another project's tag.
+- **Re-runs are safe.** Each source point maps to a fixed target id (`uuid5` of the source collection and source point id). The target is checked first, and points that are already there are counted under `already_present` and left alone, keeping their original `created_at`. A point an earlier run started but didn't finish (still `pending`) is written again rather than counted as present. This only recognizes points this tool wrote. A memory copied over earlier by hand with `remember` has a random id, so the tool sees it as new and would write a second copy. Check the dry-run counts against what you already migrated before passing `dry_run=False`.
+- **Migrated points are new points.** Each one is re-embedded with this project's `EMBEDDING_MODEL` and gets a fresh `created_at`. The source's vectors and timestamps are not copied.
+- **Bad points don't stop the run.** A point missing `metadata.repo`, with an empty summary, a missing `kind`, or a weight that is negative, infinite or not a number goes into `errors`, as does a point whose write fails. An embedding-model mismatch on the target applies to the whole collection, so it stops the run and is returned as `error`. A dry run cannot detect that mismatch.
+- **The source is never changed.** There is no delete option. Removing a legacy collection is a separate, manual step.
+
 For the exact usage guidance Claude should follow when deciding whether to call these tools, see `templates/CLAUDE.md.template`'s "Durable memory (memory-bank MCP)" section — copy it into a project's `CLAUDE.md` alongside the Qdrant/local-compress sections it already documents.
 
 ## Usage event logging
@@ -51,9 +64,11 @@ For the exact usage guidance Claude should follow when deciding whether to call 
 validating the reuse thesis behind this feature (are stored memories actually
 getting recalled later, by which projects, how soon after creation) without
 relying entirely on manually-run scenarios. `forget` is deliberately NOT logged
-here — tracking it would only be meaningful alongside an autonomous-removal
-feature that doesn't exist yet, since `forget` today always requires explicit
-human `confirm=True`.
+in this per-point table (it IS counted in the separate `metrics.db` tally
+described below) — tracking it would only be meaningful alongside an autonomous-removal
+feature that doesn't exist yet, since `forget` today is always a deliberate,
+human-directed call (only cross-repo point deletion and bulk `wipe_all` also
+require `confirm=True`; a same-repo point delete does not).
 
 This is a SEPARATE file from `libs/savings_ledger.py`'s `savings.db` on purpose:
 that file tracks session-level token-savings aggregates, a different concern
@@ -86,8 +101,9 @@ MCP server has no hook payload to read a real session id from (only hooks
 receive one, via their stdin payload), and a stable per-process grouping key
 is good enough for this passive log's purposes — since a stdio server is
 spawned fresh per Claude Code session, that proxy is a documented, practical
-stand-in for "this session," not the real thing. Surfacing this data via a dedicated report is intentionally out of scope for
-this table specifically — but a simpler, separate signal already exists:
+stand-in for "this session," not the real thing. A read-only report over this
+table now exists — see [Baseline staleness report](#baseline-staleness-report)
+below. A simpler, separate signal also exists:
 issue #211 added `record_memory_metric()` alongside the above, writing a
 plain per-call tally (no `point_id`/`repo`/`kind` detail, just a count) for
 every `recall`/`remember`/`forget` call into [the shared metrics
@@ -104,6 +120,33 @@ rich table above: `forget` never writes a rich row at all, an empty/failed
 several rich rows against that one tally), but a plain tally needs no
 per-point metadata and doesn't need the autonomous-removal feature the rich
 table's own `forget` exclusion reasoning depends on.
+
+### Baseline staleness report
+
+`python tools/memory_bank_report.py` (issue #338, Batch A of #328) reads
+`memory-events.db` read-only (it never creates or writes the file) and prints:
+
+- **Dead-memory ratio** — of distinct remembered `point_id`s, the share with no
+  `recall` hit at or after the time they were remembered, overall and per `repo`
+  tag. `--min-age-days N` only counts memories at least N days old, since a
+  memory written today can't have been recalled yet. A forgotten memory also
+  counts as dead; the table can't tell the two apart.
+- **Recall payload trend** — per `--bucket week` (default) or `month`, overall
+  and per calling `project`: calls, hits, and average hits per call. A call is
+  one `(session_id, turn)` group of recall rows, so this is per NON-EMPTY call
+  (an empty recall writes no row here) and in hits, not bytes (response size
+  isn't logged).
+- **Score trend** — reported as unavailable: no score is logged per hit, and
+  adding one is a schema change outside this baseline's existing-data scope.
+
+`--json` prints the same report as JSON. Rows logged by project
+`test-collection` are excluded by default (`--no-default-excludes` to keep
+them, `--exclude-project P` to drop more): that is the id the test suite uses,
+and before #338 `tests/test_memory_bank_mcp_server.py` wrote those rows into
+the real file. The report also matches a memory's remember and recall rows
+whether the id was logged with dashes or without (remember logs
+`uuid4().hex`, recall logs the dashed form Qdrant returns), which a plain id
+comparison would miss.
 
 ## Where the data lives
 

@@ -1,7 +1,7 @@
 """
 Shared, MCP-independent compression logic used by both:
   - compress_mcp_server.py     (MCP server exposing compress_file/compress_command_output/etc.)
-  - hooks/compress_bash_output.py  (PostToolUse hook that compresses ANY large Bash output)
+  - hooks/compress_output.py  (PostToolUse hook that compresses ANY large tool output)
 
 Kept free of the `mcp` package dependency on purpose -- the hook script only
 needs `openai`, not the full MCP SDK, since it's invoked as a plain command
@@ -49,7 +49,7 @@ LM_STUDIO_V0_TIMEOUT_SECONDS = 5.0
 # and the hooks attach it via additionalContext (they must fail open).
 # The third element is where the NEW name actually has to be set, which is not
 # uniform and must not be described as if it were: CLAUDE_RUNWAY_COMPRESS_THRESHOLD_CHARS
-# is read ONLY by hooks/compress_bash_output.py, so an .mcp.json entry for it is
+# is read ONLY by hooks/compress_output.py, so an .mcp.json entry for it is
 # inert and telling someone to add one sends them to the wrong file. The other two
 # are read via this module, which BOTH the MCP server and the compress hook import.
 _BOTH = ("set it in both .mcp.json's env block (for the MCP server) and as a shell "
@@ -805,6 +805,7 @@ def _compression_cache_key(
     chunk_chars: int = DEFAULT_CHUNK_CHARS,
     auto_truncated: bool = False,
     effective_url: str = DEFAULT_BASE_URL,
+    was_truncated: bool = False,
 ) -> str:
     """
     SHA-256 hex digest of the arguments that fully determine compress()'s
@@ -826,6 +827,11 @@ def _compression_cache_key(
       auto-detected call adds a "[note: focus looked positional...]" suffix
       while an explicit call adds a "[note: max_chars=N truncated...]" suffix
       (or none at all if the limit wasn't reached).
+    - was_truncated (issue #300, Copilot review): the positional truncation
+      note is gated on it, and by the time the key is built `text` is already
+      the sliced window. An N-char positional input (nothing dropped) and a
+      longer input whose first N chars are identical hash the same
+      text/max_chars/auto_truncated but need different notes.
     - preserve_identifiers and preserve_sections gate identifier-repair and
       redaction.
     - chunk_chars determines chunk boundaries, which changes what each LM
@@ -847,7 +853,7 @@ def _compression_cache_key(
     blob = (
         f"{text}\x00{focus}\x00{model or ''}\x00{max_chars}\x00"
         f"{preserve_identifiers}\x00{preserve_sections}\x00{chunk_chars}\x00"
-        f"{auto_truncated}\x00{effective_url}"
+        f"{auto_truncated}\x00{effective_url}\x00{was_truncated}"
     )
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
@@ -1358,9 +1364,10 @@ _failure_state = threading.local()
 def take_failure_kind() -> Optional[str]:
     """Return and clear why this thread's last complete() call failed.
 
-    "timeout" -- the request exceeded the per-request timeout (LM Studio is
-    reachable but busy, e.g. its parallel-request slots are all taken and the
-    request sat in its queue); "other" -- anything else (connection refused,
+    "timeout" -- the request exceeded the per-request timeout (LM Studio may
+    be busy, e.g. its parallel-request slots are all taken and the request sat
+    in its queue, or unreachable: the SDK's timeout error also covers a
+    connection that never got established); "other" -- anything else (connection refused,
     model not found, ...); None -- no reason was recorded, e.g. complete() was
     replaced by a test stub, or nothing failed. Callers must treat None as
     "unknown" and fall back to the generic failure wording. Clearing on read
@@ -1408,11 +1415,12 @@ _ALL_TIMED_OUT_PREFIX = "[LM Studio timed out on every request"
 def _request_failed_message(where: str, kind: Optional[str], base_url: Optional[str]) -> str:
     """Wording for a failed LM Studio request (issue #368).
 
-    A timeout means LM Studio answered the connection but did not finish in
-    time -- typically because it is busy (it runs a limited number of requests
-    in parallel, 4 by default, and queues the rest) -- so telling the reader to
-    "check it's still running" sends them looking for an outage that isn't
-    there. Anything else, including an unknown reason (kind is None, e.g. a
+    A timeout means the request did not finish in time -- typically because
+    LM Studio is busy (it runs a limited number of requests in parallel, 4 by
+    default, and queues the rest), but the SDK's timeout error also covers a
+    connection that never got established, so it does not prove LM Studio was
+    reached. The wording therefore names both causes instead of telling the
+    reader to "check it's still running". Anything else, including an unknown reason (kind is None, e.g. a
     stubbed complete()), keeps the original wording, which is the right advice
     for a refused connection or a missing model.
     """
@@ -1558,7 +1566,7 @@ def _http_get_json(url: str, timeout: float):
     """
     Minimal stdlib-only GET-and-parse-JSON helper for fetch_loaded_models'
     /api/v0/models probe below -- deliberately NOT `requests` (PR #318
-    review, high severity): both hooks/compress_bash_output.py and
+    review, high severity): both hooks/compress_output.py and
     hooks/redirect_webfetch_to_fetch_url.py document a standalone install
     path of `pip install openai` ONLY, and both import this module directly
     (not through compress_mcp_server.py's own requirements.txt, which does
@@ -1779,7 +1787,9 @@ async def _compress_each_section(text, focus, oai_client, model, base_url, prese
     compressed_count = verbatim_count = 0
     request_failed_count = not_relevant_count = empty_response_count = 0
     # Why each failed request failed (issue #368), so an outage made up ENTIRELY
-    # of timeouts (a busy LM Studio) is not reported as "appears unreachable".
+    # of timeouts (usually a busy LM Studio, though a timeout can also mean it
+    # was unreachable) gets the neutral "timed out" wording, not the
+    # connection-refused "appears unreachable" one.
     failure_kinds: list = []
     # A prose run in a mixed section got a live answer (empty or NOT RELEVANT)
     # that falls back uncounted: it proves LM Studio answered, so the all-timed-out
@@ -1967,9 +1977,10 @@ async def _compress_each_section(text, focus, oai_client, model, base_url, prese
         and not live_fallback_seen
     ):
         if failure_kinds and all(k == "timeout" for k in failure_kinds):
-            # Every failed request timed out: LM Studio answered but was too
-            # busy to finish in time. Not an outage -- and a different prefix
-            # (not "appears unreachable") so callers/readers aren't misled.
+            # Every failed request timed out: usually LM Studio was too busy
+            # to finish in time, but a timeout can also mean it was
+            # unreachable, so the wording names both. A different prefix from
+            # "appears unreachable" so callers can tell the two apart.
             result = (
                 f"{_ALL_TIMED_OUT_PREFIX} -- LM Studio may be busy or unreachable; "
                 f"no section was compressed; original content preserved]\n\n{result}"
@@ -2254,6 +2265,7 @@ async def compress(
     cache_key = _compression_cache_key(
         text, focus, model, max_chars, preserve_identifiers, preserve_sections,
         chunk_chars, auto_truncated, base_url or DEFAULT_BASE_URL,
+        was_truncated,
     )
     cached = _cache_get(cache_key)
     if cached is not None:
@@ -2392,7 +2404,7 @@ async def compress(
             "source were considered (auto-truncated) -- this error means nothing relevant was "
             "found WITHIN that truncated portion, not that the whole document was searched. "
             "Pass a larger max_chars explicitly if the target content might be further in."
-            if auto_truncated else ""
+            if auto_truncated and was_truncated else ""
         )
         return (
             f"Error: none of the {len(chunks)} chunk(s) contained content relevant to the "
@@ -2467,7 +2479,7 @@ async def compress(
     truncate_note = (
         f" [note: focus looked positional, so only the first {original_len} chars of the "
         "source were considered -- pass max_chars explicitly to override this]"
-        if auto_truncated else ""
+        if auto_truncated and was_truncated else ""
     )
     result = f"[compressed {original_len} -> {len(compressed)} chars across {len(chunks)} chunk(s){skip_note}, ~{ratio}% smaller]{truncate_note}\n\n{compressed}"
     _cache_put(cache_key, result)

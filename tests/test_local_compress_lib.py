@@ -1408,6 +1408,65 @@ class SectionCompressionEndToEnd(unittest.TestCase):
         self.assertIn("-dev suffix", out)
 
 
+class MainPathTruncationNoteGatesOnWasTruncated(unittest.TestCase):
+    """Issue #300: the main (over-threshold) whole-text path's two truncation
+    notes (the success footer and the no-relevant-chunks error) gated on
+    auto_truncated, which only means a positional limit was SELECTED. A
+    positional-focus input shorter than that limit is sliced as a no-op, so
+    the "only the first N chars were considered" claim was false. PR #85
+    fixed the same class of bug on the under-threshold early return only."""
+
+    def setUp(self):
+        clear_compression_cache()
+
+    def tearDown(self):
+        clear_compression_cache()
+
+    def _run(self, text, complete_fn=lambda *a, **k: "compressed prose"):
+        import asyncio
+        import local_compress_lib as L
+        real = (L.complete, L.resolve_model, L.client)
+        L.complete = complete_fn
+        L.resolve_model = lambda m, b: ("stub", None)
+        L.client = lambda b: object()
+        try:
+            return asyncio.run(L.compress(
+                text, focus="summarize the lead section", skip_if_under_chars=100,
+            ))
+        finally:
+            L.complete, L.resolve_model, L.client = real
+
+    def test_no_false_note_when_positional_limit_not_reached(self):
+        import local_compress_lib as L
+        text = "word " * 100  # 500 chars: over skip threshold, far under the auto limit
+        self.assertLess(len(text), L._AUTO_POSITIONAL_CHARS)
+        out = self._run(text)
+        self.assertTrue(out.startswith("[compressed"))
+        self.assertNotIn("focus looked positional", out)
+
+    def test_note_still_present_when_positional_limit_really_truncates(self):
+        import local_compress_lib as L
+        text = "word " * ((L._AUTO_POSITIONAL_CHARS // 5) + 2000)
+        self.assertGreater(len(text), L._AUTO_POSITIONAL_CHARS)
+        out = self._run(text)
+        self.assertIn("focus looked positional", out)
+
+    def test_cache_does_not_leak_note_between_truncated_and_untruncated_inputs(self):
+        # Copilot review on PR #393: the cache key is built from the already-
+        # sliced text, so a longer input and a window-sized input with the
+        # same first N chars used to share a key. Run the truncated one first
+        # (no cache clear in between) and the untruncated one must still get
+        # no note, and vice versa.
+        import local_compress_lib as L
+        long_text = "word " * ((L._AUTO_POSITIONAL_CHARS // 5) + 2000)
+        window = long_text[:L._AUTO_POSITIONAL_CHARS]
+        self.assertIn("focus looked positional", self._run(long_text))
+        self.assertNotIn("focus looked positional", self._run(window))
+        clear_compression_cache()
+        self.assertNotIn("focus looked positional", self._run(window))
+        self.assertIn("focus looked positional", self._run(long_text))
+
+
 class WholeTextFallbackRedactsWithEitherPreservationFlag(unittest.TestCase):
     """Regression coverage for PR #135 review, round 4 (Copilot):
     preserve_sections=True falls through to the ORDINARY whole-text

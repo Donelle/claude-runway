@@ -339,6 +339,49 @@ class MetricsLoggingContentRequirements(unittest.TestCase):
         self.assertIn("HHMMSS", self.content)
 
 
+class WorktreeVenvInstallContentRequirements(unittest.TestCase):
+    """Pin Step 15's worktree-venv invariant (PR #387). Run from a git worktree,
+    `uv pip install` without `--python` resolved to the PRIMARY checkout's
+    `.venv`, so the install was a no-op there and ruff/Pyright were then missing
+    from the worktree's own venv. The fix lives entirely in the skill's prose,
+    so without this the suite would stay green if a later edit dropped the flag
+    from either install line and reintroduced the wrong-venv behavior."""
+
+    # Allows flags (e.g. --python "$PYTHON") between `install` and `-r`, so the
+    # pattern matches both the fixed lines and the pre-#387 form.
+    INSTALL_LINE = re.compile(r"^\s*uv pip install\b.* -r .*$", re.MULTILINE)
+
+    def setUp(self):
+        with open(SKILL_PATH, encoding="utf-8") as f:
+            self.content = f.read()
+        self.installs = list(self.INSTALL_LINE.finditer(self.content))
+
+    def test_both_requirements_installs_present(self):
+        # Guards the other assertions against passing vacuously if the regex
+        # stops matching (e.g. the lines get reworded) -- exactly one install
+        # per requirements file is what Step 15 documents.
+        self.assertEqual(
+            [m.group(0).split("-r ")[1].split()[0] for m in self.installs],
+            ["requirements.txt", "requirements-dev.txt"],
+        )
+
+    def test_every_install_targets_the_resolved_worktree_python(self):
+        for m in self.installs:
+            self.assertIn(
+                '--python "$PYTHON"',
+                m.group(0),
+                f"uv pip install without --python \"$PYTHON\": {m.group(0).strip()}",
+            )
+
+    def test_python_is_resolved_before_the_first_install(self):
+        # The flag is only meaningful if $PYTHON already exists when the
+        # install runs -- resolving it after (the pre-#387 order) would pass
+        # an empty string to --python.
+        assignment = self.content.find("PYTHON=$(")
+        self.assertNotEqual(assignment, -1, "PYTHON= assignment not found")
+        self.assertLess(assignment, self.installs[0].start())
+
+
 def dedupe_preserve_order(numbers):
     """Reference implementation of the Step 1 remaining-queue de-dup rule:
     build the queue from a raw invocation list, keeping only each number's

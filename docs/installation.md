@@ -7,7 +7,7 @@ Docker Engine (Linux), then save this Compose configuration as `compose.yml`:
 ```yml
 services:
   qdrant:
-    image: qdrant/qdrant:v1.10.0  # Replace with your target version
+    image: qdrant/qdrant:v1.19.2  # Pinned on purpose; change it deliberately to upgrade (see "Upgrading Qdrant")
     container_name: qdrant
     ports:
       # Bound to 127.0.0.1 deliberately. Qdrant runs unauthenticated here and
@@ -34,8 +34,12 @@ docker compose up -d
 Alternatively, start the same setup directly with Docker:
 ```bash
 docker volume create qdrant_storage
-docker run -d --name qdrant --restart unless-stopped -p 127.0.0.1:6333:6333 -v qdrant_storage:/qdrant/storage qdrant/qdrant
+docker run -d --name qdrant --restart unless-stopped -p 127.0.0.1:6333:6333 -v qdrant_storage:/qdrant/storage qdrant/qdrant:v1.19.2
 ```
+Pin the tag in `docker run` too: an unpinned `qdrant/qdrant` means `latest`, so
+after a `docker pull` the next time the container is recreated it can silently
+come up on a newer, unreviewed version.
+
 The named volume keeps your indexes when the container is stopped or recreated.
 Binding the port to `127.0.0.1` keeps this unauthenticated development instance
 accessible only from your machine. Confirm that Qdrant is running:
@@ -53,13 +57,49 @@ docker compose stop      # stop it
 docker compose start     # start it again without losing indexed data
 docker compose logs      # inspect startup or runtime errors
 ```
-Run Compose commands from the directory containing `compose.yml`.
+Run Compose commands from the directory containing `compose.yml` so Compose
+finds it and keeps the same project name (see "Upgrading Qdrant" below).
 If you used the direct `docker run` command instead, use `docker stop qdrant`,
 `docker start qdrant`, and `docker logs qdrant`.
+
 For remote or production deployments, configure authentication and TLS rather
 than exposing this default unauthenticated container. See Qdrant's
 [local quickstart](https://qdrant.tech/documentation/quick-start/) and
 [security guide](https://qdrant.tech/documentation/security/).
+
+### Upgrading Qdrant
+Your data lives in the named volume, so these points decide whether it survives:
+- **Which volume Compose uses depends on the project name.** Compose prefixes
+  the volume name with the project name, which defaults to the name of the
+  directory containing the Compose file (a `compose.yml` in `~/Docker` creates
+  `docker_qdrant_storage`). Copying the file to a differently named directory, or using
+  a different `-p`, `COMPOSE_PROJECT_NAME`, or top-level `name:`, creates a new,
+  empty volume. Your collections look gone, but the old volume is intact; switch
+  back to the original project name to see it again. List volumes with
+  `docker volume ls`. See Docker's
+  [project name docs](https://docs.docker.com/compose/how-tos/project-name/).
+- **What deletes data:** `docker compose down -v` (removes the named volumes
+  declared in the file) and `docker volume rm`. Plain `docker compose down`,
+  `stop`, and recreating the container keep the volume.
+- **Back up first.** Take a [snapshot](https://qdrant.tech/documentation/snapshots/)
+  or, with Qdrant stopped (`docker compose stop`; a raw copy of a running
+  instance's files may be inconsistent), copy the volume before upgrading. Qdrant's upgrade guide does not describe
+  downgrading, so treat it as unsupported: your backup is the way back. Code
+  collections can be rebuilt with `index_repo(reset=True)` (`sync_repo` refuses
+  when its local manifest still lists files the empty collection lacks), but conversation
+  compacts (`compact_store`) and the shared memory-bank entries (`remember`)
+  cannot, so they are what the backup protects most.
+- **Upgrade:** edit the `image:` tag, then run `docker compose pull` and
+  `docker compose up -d`. No `down` is needed; Compose recreates the container on
+  the same volume. Qdrant says to upgrade to the latest patch of each
+  intermediate minor version first (for example 1.17 to 1.19 goes via 1.18.x),
+  and read the release notes for breaking changes. For the direct `docker run`
+  form, `docker stop qdrant && docker rm qdrant`, then re-run the command with the
+  new tag and the same `-v qdrant_storage:/qdrant/storage`.
+- **Verify:** `curl http://localhost:6333` shows the new version, and
+  `curl http://localhost:6333/collections` lists your collections.
+
+The authoritative rules are in Qdrant's [upgrade guide](https://qdrant.tech/documentation/upgrades/).
 
 **1. Install uv** (if not already installed)
 
@@ -174,13 +214,13 @@ uv pip install pathspec --index-url https://pypi.org/simple
 
 **4. Per project you want memory for:**
 
-**Recommended: run the setup script instead of hand-editing the steps below.** `tools/setup_project.py` reads `templates/mcp.json.template` (and, unless `--skip-hooks` is passed, `templates/settings.json.template`) and writes a target project's `.mcp.json`/`.claude/settings.json` with every placeholder below filled in automatically — venv Python path, collection name (defaulted from the target repo's directory name), absolute script paths, home directory — instead of hand-typing them, some of which are required to match exactly across files. Safe to re-run: it merges into (rather than clobbers) any existing `.mcp.json`/`.claude/settings.json` content this toolkit doesn't own, and won't duplicate a hook block it already added. **`--qdrant-only` no longer skips `templates/settings.json.template` entirely** (issue #198): it only omits the local-compress-dependent hook entries (`compress_bash_output.py`, `redirect_webfetch_to_fetch_url.py`, `session_end_savings.py`) — the CORE `record_session_id.py` hook is written either way, since it's base install now, not local-compress-gated. Only `--skip-hooks` (a full opt-out of touching `.claude/settings.json` at all) omits everything, including the core hook.
+**Recommended: run the setup script instead of hand-editing the steps below.** `tools/setup_project.py` reads `templates/mcp.json.template` (and, unless `--skip-hooks` is passed, `templates/settings.json.template`) and writes a target project's `.mcp.json`/`.claude/settings.json` with every placeholder below filled in automatically — venv Python path, collection name (defaulted from the target repo's directory name), absolute script paths, home directory — instead of hand-typing them, some of which are required to match exactly across files. Safe to re-run: it merges into (rather than clobbers) any existing `.mcp.json`/`.claude/settings.json` content this toolkit doesn't own, and won't duplicate a hook block it already added. **`--qdrant-only` no longer skips `templates/settings.json.template` entirely** (issue #198): it only omits the local-compress-dependent hook entries (`compress_output.py`, `redirect_webfetch_to_fetch_url.py`, `session_end_savings.py`) — the CORE `record_session_id.py` hook is written either way, since it's base install now, not local-compress-gated. Only `--skip-hooks` (a full opt-out of touching `.claude/settings.json` at all) omits everything, including the core hook.
 
 > **If you received or copied an existing `.mcp.json` from somewhere else (another project, a teammate, a doc example, or even this repo's own `templates/mcp.json.template`) instead of generating it via this script — this isn't only about convenience.** Skipping `init`, or never having run it at all against this specific project ON THIS MACHINE, means the project silently never gets issue upstream #221's fastembed-cache/`HF_HUB_OFFLINE` fix confirmed correct for this machine's own cache. `HF_HUB_OFFLINE` can be **absent** or **present but blank** (`""` — the template's own default, and also what `upgrade` writes) — both behave identically, keeping every launch on the live huggingface.co round-trip indefinitely — or **present as `"1"`** copied from a project that ran `init` successfully on a DIFFERENT machine, which is worse, not better: the fastembed cache path is local per-machine, so startup fails outright instead of merely risking the timeout (see README's Known limitations for the full mechanism and exact code references). Running `init` once against the project on THIS machine, with whatever custom flags it was originally configured with re-passed (collection name, `QDRANT_URL`/API key, memory-bank IDs, local-compress options, …), is the complete fix for all three states — but only once its live warm-up actually succeeds: it can fail (offline, a flaky connection, `fastembed` failing to import), in which case `HF_HUB_OFFLINE` is deliberately left blank and the CLI reports the setup is safe to re-run later to retry (the warm-up-outcome `changes` entry in `run_setup`, `libs/setup_project_lib.py`) rather than silently claiming success — check the CLI's own output (or the resulting `.mcp.json` value) and re-run if it couldn't confirm the cache is warm. `/my-setup-clauderunway` wraps this same path but refuses outright and points you to the raw CLI instead whenever a real `QDRANT_API_KEY` is already configured — it can't safely read/re-pass a credential (see `skills/my-setup-clauderunway/SKILL.md`'s API-key check); use `setup_project.py init`/`claude-runway-setup init` directly with `--qdrant-api-key` re-passed in that case. `merge_mcp_json` overwrites the toolkit-owned server blocks (`qdrant` among them) even against a `.mcp.json` this toolkit never generated. A BARE rerun with no flags instead regenerates every OTHER value in those blocks back to defaults, so re-passing your existing options matters here. **`EMBEDDING_MODEL` is preserved across a re-run** (upstream #279): `init` reuses the model already in the project's existing `.mcp.json` (written to all three blocks, and the cache warm-up targets that same model), so a hand-customized model survives. Pass `--embedding-model <model>` only to change it deliberately — `init` then prints a WARNING, because vectors already indexed under the old model are incompatible (drop the collection in Qdrant and re-index; see README's `EMBEDDING_MODEL` bullets). `upgrade` (below) only detects and fixes the fully-absent-key case (not blank, not copied-`"1"`) by adding the placeholder, and still needs a follow-up `init` to actually warm the cache and set the value.
 
-> **If you installed via pipx/`uv tool install` and just upgraded claude-runway itself** (`pipx upgrade claude-runway` / `uv tool upgrade claude-runway`), re-run `init` (NOT `upgrade` — see below) for every project you'd previously configured — don't just assume the "safe to re-run" merge behavior above means an old config still works untouched. A packaging change moved `libs`/`tools`/`hooks`/`templates` out of site-packages into `<env>/src/{libs,tools,hooks,templates}`: any `.mcp.json`/`.claude/settings.json` an OLDER install's `init` generated hardcodes absolute paths into the old site-packages location, which no longer exists after upgrading past this change — those entries would point at files that were never written there in the new layout, not files that merely moved. `upgrade` (a few paragraphs below) is NOT a substitute here (Copilot review, PR #228): it only applies its own fixed, named list of config gaps (currently: the `memory-bank` server, `record_session_id.py`'s hooks, `HF_HUB_OFFLINE`) — none of them rewrites an existing MCP-server/hook path, so it would leave every stale site-packages path untouched. This is a one-time gotcha for the specific upgrade that crosses issue #206 landing, not a general re-run risk.
+> **If you installed via pipx/`uv tool install` and just upgraded claude-runway itself** (`pipx upgrade claude-runway` / `uv tool upgrade claude-runway`), re-run `init` (NOT `upgrade` — see below) for every project you'd previously configured — don't just assume the "safe to re-run" merge behavior above means an old config still works untouched. A packaging change moved `libs`/`tools`/`hooks`/`templates` out of site-packages into `<env>/src/{libs,tools,hooks,templates}`: any `.mcp.json`/`.claude/settings.json` an OLDER install's `init` generated hardcodes absolute paths into the old site-packages location, which no longer exists after upgrading past this change — those entries would point at files that were never written there in the new layout, not files that merely moved. `upgrade` (a few paragraphs below) is NOT a substitute here (Copilot review, PR #228): it only applies its own fixed, named list of config gaps (see `upgrade --dry-run` or `MIGRATIONS` in `libs/upgrade_lib.py` for the live list) — none of them rewrites an existing MCP-server/hook path, so it would leave every stale site-packages path untouched. This is a one-time gotcha for the specific upgrade that crosses issue #206 landing, not a general re-run risk.
 
-**Alternatively, use the `/my-setup-clauderunway` Claude Code skill** (see `skills/my-setup-clauderunway/SKILL.md`): install it once to `~/.claude/skills/`, export `CLAUDE_RUNWAY_DIR` in your shell profile pointing at this tools repo, then run `/my-setup-clauderunway` from any project you want to configure. It wraps `setup_project.py` with a guided question flow and also handles the `CLAUDE.md` update step that the CLI doesn't do.
+**Alternatively, use the `/my-setup-clauderunway` Claude Code skill** (see `skills/my-setup-clauderunway/SKILL.md`): install it once to `~/.claude/skills/`, export `CLAUDE_RUNWAY_DIR` in your shell profile pointing at this tools repo, then run `/my-setup-clauderunway` from any project you want to configure. It wraps `setup_project.py` with a guided question flow and also handles the `CLAUDE.md` update step that the CLI doesn't do. It is also the supported **init-and-upgrade** route for anyone who cannot install the `claude-runway-*` console scripts (issue #403): on an already-configured project it offers `upgrade` (a `--dry-run` preview, then all pending migrations applied at once, since a skill cannot answer the CLI's per-migration prompts; run the CLI directly for per-migration control), and it works even when a real `QDRANT_API_KEY` is configured, because `upgrade` never takes or prints the key. It runs the checkout's own `tools/setup_project.py`, so it sees every migration in that checkout, unlike a stale `claude-runway-setup` install, which silently skips newer ones. Restart Claude Code afterwards and confirm with `doctor`.
 
 **If you installed via pipx/`uv tool install`** (the "Alternative" callout
 above) instead of cloning: replace `python tools/setup_project.py init`
@@ -230,9 +270,9 @@ The manual steps below still apply if you'd rather hand-edit (or need to underst
 - Keep `QDRANT_URL`, `COLLECTION_NAME` and `EMBEDDING_MODEL` identical everywhere they appear: `claude-runway-setup init` writes them aligned, but a hand edit must change every block that carries the value (`COLLECTION_NAME` is in the `qdrant` and `codebase-indexer` blocks; `EMBEDDING_MODEL` is also in `memory-bank`). A mismatched `EMBEDDING_MODEL` is usually caught and returned as an actionable error (different models produce different vector names or dimensions), but the check fails open when it can't reach Qdrant or the result is inconclusive, and then searches quietly return irrelevant results instead.
 - Optionally set `COLLECTION_DESCRIPTION` to a short one-line description of what this collection contains — applied automatically to the collection (no manual `set_collection_description` call needed) at server startup and after `index_repo`/`sync_repo` write, so `list_collections` from a *different* project's session can surface it. Leave blank (`""`) for no static hint.
 - Replace `/absolute/path/to/tools/ingest_mcp_server.py` with the real path from step 2.
-- Replace every `REPLACE-WITH-VENV-PYTHON` with the absolute venv Python path from step 3. All three MCP servers use the same venv, so it's the same path in each block — **except** the `qdrant` server's `command`: that field is the literal text `REPLACE-WITH-VENV-PYTHON/bin/mcp-server-qdrant`, which is POSIX-only and wrong on either platform if you substitute only the placeholder token and leave the rest as-is. `mcp-server-qdrant` (hyphenated — this is pip's registered console-script name; `mcp_server_qdrant`, underscored, is only the Python *import* package name and never exists as a file on disk) is installed as a *sibling* of `python` in the same directory as the interpreter — **on macOS/Linux**, replace the ENTIRE `REPLACE-WITH-VENV-PYTHON/bin/mcp-server-qdrant` segment with `<venv-root>/bin/mcp-server-qdrant` (e.g. `/home/youruser/tools/claude-runway/.venv/bin/mcp-server-qdrant`); **on Windows**, the template's hardcoded `/bin/` suffix doesn't apply at all — replace that same segment with `<venv-root>/Scripts/mcp-server-qdrant.exe` instead (e.g. `C:/Users/youruser/tools/claude-runway/.venv/Scripts/mcp-server-qdrant.exe` — use forward slashes here even on Windows, since this value goes into a JSON string: a single backslash like `C:\Users\...` is not a valid JSON escape sequence and will fail to parse, and forward slashes work identically to backslashes in Windows file paths). (`tools/setup_project.py` gets both the correct name and both platforms right automatically — see above — this gotcha only bites the hand-edited path.)
+- Replace every `REPLACE-WITH-VENV-PYTHON` with the absolute venv Python path from step 3. All four MCP servers use the same venv, so it's the same path in each block — **except** the `qdrant` server's `command`: that field is the literal text `REPLACE-WITH-VENV-PYTHON/bin/mcp-server-qdrant`, which is POSIX-only and wrong on either platform if you substitute only the placeholder token and leave the rest as-is. `mcp-server-qdrant` (hyphenated — this is pip's registered console-script name; `mcp_server_qdrant`, underscored, is only the Python *import* package name and never exists as a file on disk) is installed as a *sibling* of `python` in the same directory as the interpreter — **on macOS/Linux**, replace the ENTIRE `REPLACE-WITH-VENV-PYTHON/bin/mcp-server-qdrant` segment with `<venv-root>/bin/mcp-server-qdrant` (e.g. `/home/youruser/tools/claude-runway/.venv/bin/mcp-server-qdrant`); **on Windows**, the template's hardcoded `/bin/` suffix doesn't apply at all — replace that same segment with `<venv-root>/Scripts/mcp-server-qdrant.exe` instead (e.g. `C:/Users/youruser/tools/claude-runway/.venv/Scripts/mcp-server-qdrant.exe` — use forward slashes here even on Windows, since this value goes into a JSON string: a single backslash like `C:\Users\...` is not a valid JSON escape sequence and will fail to parse, and forward slashes work identically to backslashes in Windows file paths). (`tools/setup_project.py` gets both the correct name and both platforms right automatically — see above — this gotcha only bites the hand-edited path.)
 - Replace `REPLACE-WITH-YOUR-HOME-DIR` (in the `qdrant` server's `FASTEMBED_CACHE_PATH`) with your actual absolute home directory (e.g. `/home/youruser` or `/Users/youruser`) — **not** a literal `~`, which `fastembed`'s cache-dir resolution doesn't expand (see [Environment variables](environment-variables.md)). Same value on every project's `.mcp.json` on a given machine.
-- Leave `QDRANT_API_KEY` (present in all three servers' `env` blocks) blank for an unauthenticated local Qdrant instance, or set it to your API key for an authenticated remote one — same variable name `mcp-server-qdrant`/`ingest_mcp_server.py`/`compress_mcp_server.py` all read, so one value keeps every Qdrant-talking server in this file aligned. **If you set a real key, do not commit `.mcp.json` with it inlined** — there's no built-in mechanism here for loading it from an untracked source instead, so either keep `.mcp.json` itself out of version control for this project (add it to `.gitignore`) or manage the key through your own separate, untracked process.
+- Leave `QDRANT_API_KEY` (present in all four servers' `env` blocks) blank for an unauthenticated local Qdrant instance, or set it to your API key for an authenticated remote one — same variable name `mcp-server-qdrant`/`ingest_mcp_server.py`/`memory_bank_mcp_server.py`/`compress_mcp_server.py` all read, so one value keeps every Qdrant-talking server in this file aligned. **If you set a real key, do not commit `.mcp.json` with it inlined** — there's no built-in mechanism here for loading it from an untracked source instead, so either keep `.mcp.json` itself out of version control for this project (add it to `.gitignore`) or manage the key through your own separate, untracked process.
 - Commit `.mcp.json` to the repo — **unless** you just set a real `QDRANT_API_KEY` above, in which case committing it publishes that credential in plaintext to anyone with repo access (permanently, since git history retains it even after a later edit); see the caveat on that bullet.
 
 This is what makes memory automatically project-scoped: opening Claude Code in a project loads that project's `.mcp.json`, which points at that project's collection. Opening a different project uses a different collection automatically — no manual switching.
@@ -242,7 +282,7 @@ This is what makes memory automatically project-scoped: opening Claude Code in a
 - `INDEX_INCLUDE_EXTENSIONS`: comma-separated extensions (e.g. `".py,.md"`) — overrides the built-in list entirely, so only these get ingested.
 - `INDEX_EXCLUDE_DIRS`: comma-separated folder names (e.g. `"fixtures,generated"`) — adds to (not replaces) the built-in excludes.
 
-Same options exist as `--include-ext`/`--exclude-dirs`/`--no-gitignore` flags on `ingest_to_qdrant.py`, and as `include_extensions`/`exclude_dirs`/`respect_gitignore` parameters on the `index_repo`/`sync_repo`/`preview_index` tools if you want to override the env defaults for a one-off run. Use `preview_index` first to confirm the filtering is doing what you expect before running a real index.
+Same options exist as `--include-ext`/`--exclude-dirs`/`--no-gitignore` flags on `ingest_to_qdrant.py` (which falls back to `INDEX_INCLUDE_EXTENSIONS`/`INDEX_EXCLUDE_DIRS` too, but only from the shell it runs in, never from `.mcp.json` — see step 6), and as `include_extensions`/`exclude_dirs`/`respect_gitignore` parameters on the `index_repo`/`sync_repo`/`preview_index` tools if you want to override the env defaults for a one-off run. Use `preview_index` first to confirm the filtering is doing what you expect before running a real index.
 
 **4b. If also using local-compress**, add this server to the same `.mcp.json`:
 
@@ -277,10 +317,12 @@ If also using the PostToolUse / PreToolUse hooks from `templates/settings.json.t
 ```bash
 # Run from inside the tools repo with the venv activated, or use the venv Python directly:
 source ~/tools/claude-runway/.venv/bin/activate
-python tools/ingest_to_qdrant.py --repo-path /path/to/project --collection <project-collection-name> --dry-run
+python tools/ingest_to_qdrant.py --repo-path /path/to/project --collection <project-collection-name> --embedding-model <same EMBEDDING_MODEL as .mcp.json> --dry-run
 # check the preview, then run for real:
-python tools/ingest_to_qdrant.py --repo-path /path/to/project --collection <project-collection-name>
+python tools/ingest_to_qdrant.py --repo-path /path/to/project --collection <project-collection-name> --embedding-model <same EMBEDDING_MODEL as .mcp.json>
 ```
+
+The CLI can't read `.mcp.json`. For `--qdrant-url`, `--qdrant-api-key`, `--embedding-model`, `--include-ext` and `--exclude-dirs`, it falls back to the `QDRANT_URL`/`QDRANT_API_KEY`/`EMBEDDING_MODEL`/`INDEX_INCLUDE_EXTENSIONS`/`INDEX_EXCLUDE_DIRS` exported in your shell. If none is exported, it uses the built-in default (`http://localhost:6333`, no key, `sentence-transformers/all-MiniLM-L6-v2`, the built-in extension list). A flag always wins. If the project's `.mcp.json` sets any of these to something else, pass the flag or export the variable, or the initial index won't match what `sync_repo` later expects. A wrong embedding model surfaces later as a model-mismatch error. A different include/exclude filter leaves chunks for files `sync_repo` doesn't track, so `sync_repo` can never remove them.
 
 Or ask Claude to run it via the `index_repo` tool once `.mcp.json` is set up.
 
@@ -323,9 +365,9 @@ There is no single uninstall command. A full removal touches the places below; e
 
 - **Note any custom data locations before deleting any of the config below.** `CLAUDE_RUNWAY_SAVINGS_DB`, `CLAUDE_RUNWAY_METRICS_DB`, `CLAUDE_RUNWAY_MEMORY_EVENTS_DB`, `CLAUDE_RUNWAY_CACHE_DB`, and `FASTEMBED_CACHE_PATH` can each move a file out of `~/.claude/claude-runway/`. If you set any of them (in `.mcp.json`, `.claude/settings.json`, or your shell profile), write down the paths first so step 4 can remove them too.
 - In `.mcp.json`, delete the server blocks this toolkit added: `qdrant`, `codebase-indexer`, `memory-bank`, and (if you used it) `local-compress`. Leave any other servers alone. If the file then has no servers left, delete it.
-- In `.claude/settings.json`, delete the hook entries whose commands point at this toolkit's scripts: `record_session_id.py`, `compress_bash_output.py`, `redirect_webfetch_to_fetch_url.py`, and `session_end_savings.py`.
+- In `.claude/settings.json`, delete the hook entries whose commands point at this toolkit's scripts: `record_session_id.py`, `compress_output.py` (or `compress_bash_output.py`, its name before issue #395, if you never ran `upgrade`), `redirect_webfetch_to_fetch_url.py`, and `session_end_savings.py`.
 - Remove the claude-runway sections you added to the project's `CLAUDE.md` (from `templates/CLAUDE.md.template`).
-- Optionally delete the project's Qdrant collections (via the Qdrant dashboard at <http://localhost:6333/dashboard> or its API) if you want the stored data gone too. These are separate collections and each needs its own deletion: the code index (`COLLECTION_NAME` in the `codebase-indexer` block), the project's conversation compacts (named `<COMPACT_COLLECTION>-<project>-<hash>`, `conversation-compacts-...` by default; find it with `list_collections`). The `memory-bank` collection is different: it is shared by every project on this Qdrant instance (see [Memory bank](memory-bank.md)), so deleting it erases other projects' durable memories too. Leave it alone unless you are removing claude-runway from every project.
+- Optionally delete the project's Qdrant collections (via the Qdrant dashboard at <http://localhost:6333/dashboard> or its API) if you want the stored data gone too. These are separate collections and each needs its own deletion: the code index (`COLLECTION_NAME` in the `codebase-indexer` block), the project's conversation compacts (named `<COMPACT_COLLECTION>-<project>`, `conversation-compacts-...` by default; find it with `list_collections`). Before deleting a compact collection, check that it holds only this project's compacts: project names that differ only in punctuation or whitespace (e.g. `my.project` and `my-project`) share one collection, so deleting it wholesale can erase another project's history. If it contains other projects' points, delete only the points whose `project` payload matches this project instead. The `memory-bank` collection is different: it is shared by every project on this Qdrant instance (see [Memory bank](memory-bank.md)), so deleting it erases other projects' durable memories too. Leave it alone unless you are removing claude-runway from every project.
 
 **2. Remove the installed product skills** from `~/.claude/skills/`:
 
