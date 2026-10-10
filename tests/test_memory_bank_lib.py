@@ -92,10 +92,13 @@ class IsMemoryBankCollectionNameTest(unittest.TestCase):
 class MemoryBankExclusionFilterTest(unittest.TestCase):
     def test_excludes_memory_bank_source(self):
         f = mb.memory_bank_exclusion_filter()
-        self.assertEqual(len(f.must_not), 1)
-        cond = f.must_not[0]
-        self.assertEqual(cond.key, mb.SOURCE_FIELD)
-        self.assertEqual(cond.match.value, mb.MEMORY_BANK_SOURCE)
+        # Issue #282: conversation compacts are protected by the same fragment.
+        self.assertEqual(len(f.must_not), 2)
+        for cond in f.must_not:
+            self.assertEqual(cond.key, mb.SOURCE_FIELD)
+        self.assertEqual(
+            {c.match.value for c in f.must_not}, {mb.MEMORY_BANK_SOURCE, mb.COMPACT_SOURCE}
+        )
 
 
 def _matching_collection_info(vector_name="fast-test-model", dim=4):
@@ -291,6 +294,38 @@ class RememberPointTest(_PatchRetryMixin, unittest.TestCase):
         _, kwargs = client.upsert.call_args
         meta = kwargs["points"][0].payload["metadata"]
         self.assertEqual(meta["weight"], 2.5)
+
+    def _remember(self, **extra):
+        client = MagicMock()
+        client.collection_exists.return_value = True
+        client.get_collection.return_value = _matching_collection_info(vector_name="fast-x", dim=4)
+        provider = _make_provider(vector_name="fast-x", dim=4)
+        result = _run(
+            mb.remember_point(
+                client, provider, "col",
+                summary="s", description="d", kind="lesson",
+                repo="my-project", embedding_model="model-x", **extra,
+            )
+        )
+        return client, result
+
+    def test_explicit_point_id_is_used_for_upsert_and_returned(self):
+        # Issue #334: a caller-supplied ID must be used verbatim for both the
+        # upsert and the follow-up set_payload, and returned unchanged.
+        client, (point_id, _, error) = self._remember(point_id="deterministic-id")
+        self.assertIsNone(error)
+        self.assertEqual(point_id, "deterministic-id")
+        _, kwargs = client.upsert.call_args
+        self.assertEqual(kwargs["points"][0].id, "deterministic-id")
+        _, sp = client.set_payload.call_args
+        self.assertEqual(sp["points"], ["deterministic-id"])
+
+    def test_omitted_point_id_still_generates_random_uuid_hex(self):
+        # Issue #334: default behavior unchanged -- fresh random hex IDs.
+        _, (id1, _, _) = self._remember()
+        _, (id2, _, _) = self._remember()
+        self.assertRegex(id1, r"^[0-9a-f]{32}$")
+        self.assertNotEqual(id1, id2)
 
     def test_schema_mismatch_returns_error_without_upserting(self):
         client = MagicMock()
@@ -884,6 +919,370 @@ class WipeMemoryBankTest(_PatchRetryMixin, unittest.TestCase):
         cond = scroll_filter.must_not[0]
         self.assertEqual(cond.key, mb.PENDING_FIELD)
         self.assertEqual(cond.match.value, True)
+
+
+class ScrollCollectionTest(_PatchRetryMixin, unittest.TestCase):
+    @staticmethod
+    def _rec(pid, payload):
+        r = MagicMock()
+        r.id = pid
+        r.payload = payload
+        return r
+
+    @staticmethod
+    def _good(repo="proj-a", **extra):
+        return {"document": "sum", "metadata": {"repo": repo, "description": "d", "kind": "lesson", **extra}}
+
+    def test_missing_collection_reports_error_and_never_scrolls(self):
+        client = MagicMock()
+        client.collection_exists.return_value = False
+        points, errors = mb.scroll_collection(client, "gone")
+        self.assertEqual(points, [])
+        self.assertEqual(len(errors), 1)
+        client.scroll.assert_not_called()
+
+    def test_follows_next_offset_until_none(self):
+        client = MagicMock()
+        client.collection_exists.return_value = True
+        client.scroll.side_effect = [
+            ([self._rec("a", self._good())], "off1"),
+            ([self._rec("b", self._good())], "off2"),
+            ([self._rec("c", self._good())], None),
+        ]
+        points, errors = mb.scroll_collection(client, "col", batch_size=1)
+        self.assertEqual([p["id"] for p in points], ["a", "b", "c"])
+        self.assertEqual(errors, [])
+        offsets = [c.kwargs["offset"] for c in client.scroll.call_args_list]
+        self.assertEqual(offsets, [None, "off1", "off2"])
+        for c in client.scroll.call_args_list:
+            self.assertEqual(c.kwargs["limit"], 1)
+            self.assertIs(c.kwargs["with_payload"], True)
+            self.assertIs(c.kwargs["with_vectors"], False)
+            self.assertNotIn("scroll_filter", c.kwargs)
+
+    def test_non_memory_bank_shaped_points_are_errors_not_crashes(self):
+        client = MagicMock()
+        client.collection_exists.return_value = True
+        client.scroll.return_value = (
+            [
+                self._rec("ok", self._good()),
+                self._rec("no-repo", {"document": "x", "metadata": {"kind": "lesson"}}),
+                self._rec("no-meta", {"document": "x"}),
+                self._rec("no-payload", None),
+            ],
+            None,
+        )
+        points, errors = mb.scroll_collection(client, "col")
+        self.assertEqual([p["id"] for p in points], ["ok"])
+        self.assertEqual({e["id"] for e in errors}, {"no-repo", "no-meta", "no-payload"})
+
+    def test_weight_defaults_when_absent_and_fields_mapped(self):
+        client = MagicMock()
+        client.collection_exists.return_value = True
+        client.scroll.return_value = (
+            [self._rec("a", self._good(weight=0.0, created_at=5.0)), self._rec("b", self._good())],
+            None,
+        )
+        points, _ = mb.scroll_collection(client, "col")
+        self.assertEqual(points[0]["weight"], 0.0)
+        self.assertEqual(points[0]["created_at"], 5.0)
+        self.assertEqual(points[0]["summary"], "sum")
+        self.assertEqual(points[1]["weight"], mb.DEFAULT_WEIGHT)
+
+
+class TransferPointIdTest(unittest.TestCase):
+    def test_deterministic_and_source_specific(self):
+        a = mb.transfer_point_id("legacy", "p1")
+        self.assertEqual(a, mb.transfer_point_id("legacy", "p1"))
+        self.assertNotEqual(a, mb.transfer_point_id("legacy", "p2"))
+        self.assertNotEqual(a, mb.transfer_point_id("other-legacy", "p1"))
+
+    def test_is_a_valid_uuid_string(self):
+        import uuid
+        value = mb.transfer_point_id("legacy", 42)
+        self.assertEqual(str(uuid.UUID(value)), value)
+
+    def test_namespace_is_pinned(self):
+        # Changing the namespace would make every earlier transfer look new on
+        # a re-run and duplicate it -- pin one concrete derived value.
+        self.assertEqual(
+            mb.transfer_point_id("legacy", "p1"),
+            str(__import__("uuid").uuid5(mb.TRANSFER_ID_NAMESPACE, "legacy:p1")),
+        )
+        self.assertEqual(str(mb.TRANSFER_ID_NAMESPACE), "6f1c2b7e-4d3a-5e8f-9a0b-1c2d3e4f5a6b")
+
+
+class TransferPointsTest(_PatchRetryMixin, unittest.TestCase):
+    """Issue #336: transfer_points' repo boundary, check-before-write dedup,
+    dry-run, and per-point error handling. remember_point is mocked -- its own
+    write behavior is covered by RememberPointTest above."""
+
+    SOURCE = "legacy-memory-bank"
+    TARGET = "memory-bank"
+    ME = "proj-a"
+
+    @staticmethod
+    def _rec(pid, repo, **meta):
+        r = MagicMock()
+        r.id = pid
+        doc = meta.pop("document", "sum-" + str(pid))
+        r.payload = {"document": doc, "metadata": {"repo": repo, "description": "d", "kind": "lesson", **meta}}
+        return r
+
+    def _client(self, records, target_exists=True, present_source_ids=(), source_exists=True):
+        client = MagicMock()
+        client.collection_exists.side_effect = lambda name: source_exists if name == self.SOURCE else target_exists
+        client.scroll.return_value = (records, None)
+        present = {mb.transfer_point_id(self.SOURCE, sid) for sid in present_source_ids}
+
+        def _retrieve(collection_name, ids, **kw):
+            out = []
+            for i in ids:
+                if i in present:
+                    r = MagicMock()
+                    r.id = i
+                    out.append(r)
+            return out
+
+        client.retrieve.side_effect = _retrieve
+        return client
+
+    def _transfer(self, client, dry_run, remember=None):
+        remember = remember or AsyncMock(return_value=("id", 1.0, None))
+        with patch.object(mb, "remember_point", new=remember):
+            report = _run(mb.transfer_points(
+                client, _make_provider(), self.SOURCE, self.TARGET,
+                caller_repo=self.ME, embedding_model="m", dry_run=dry_run,
+            ))
+        return report, remember
+
+    def test_repo_mapping_buckets(self):
+        records = [
+            self._rec("own1", self.ME), self._rec("own2", self.ME),
+            self._rec("gen1", mb.GENERAL_REPO),
+            self._rec("f1", "proj-b"), self._rec("f2", "proj-b"), self._rec("f3", "proj-c"),
+        ]
+        report, remember = self._transfer(self._client(records), dry_run=False)
+        self.assertEqual(report["migrated"], {"general": 1, "project": 2})
+        self.assertEqual(report["skipped_foreign_repo"], {"proj-b": 2, "proj-c": 1})
+        self.assertEqual(report["errors"], [])
+        self.assertNotIn("error", report)
+        written_repos = sorted(c.kwargs["repo"] for c in remember.call_args_list)
+        self.assertEqual(written_repos, [mb.GENERAL_REPO, self.ME, self.ME])
+
+    def test_foreign_points_are_never_written_or_looked_up(self):
+        client = self._client([self._rec("f1", "proj-b")])
+        report, remember = self._transfer(client, dry_run=False)
+        remember.assert_not_called()
+        client.retrieve.assert_not_called()
+        self.assertEqual(report["migrated"], {"general": 0, "project": 0})
+
+    def test_dry_run_writes_nothing_and_reports_would_migrate(self):
+        records = [self._rec("own1", self.ME), self._rec("gen1", mb.GENERAL_REPO)]
+        report, remember = self._transfer(self._client(records), dry_run=True)
+        remember.assert_not_called()
+        self.assertEqual(report["would_migrate"], {"general": 1, "project": 1})
+        self.assertNotIn("migrated", report)
+        self.assertIs(report["dry_run"], True)
+
+    def test_dry_run_needs_no_embedding_provider(self):
+        report = _run(mb.transfer_points(
+            self._client([self._rec("own1", self.ME)]), None, self.SOURCE, self.TARGET,
+            caller_repo=self.ME, embedding_model="m", dry_run=True,
+        ))
+        self.assertEqual(report["would_migrate"]["project"], 1)
+
+    def test_already_present_points_are_skipped_not_rewritten(self):
+        records = [self._rec("own1", self.ME), self._rec("own2", self.ME)]
+        client = self._client(records, present_source_ids=["own1"])
+        report, remember = self._transfer(client, dry_run=False)
+        self.assertEqual(report["already_present"], 1)
+        self.assertEqual(report["migrated"]["project"], 1)
+        remember.assert_called_once()
+        self.assertEqual(remember.call_args.kwargs["point_id"], mb.transfer_point_id(self.SOURCE, "own2"))
+
+    def test_dry_run_also_reports_already_present(self):
+        client = self._client([self._rec("own1", self.ME)], present_source_ids=["own1"])
+        report, _ = self._transfer(client, dry_run=True)
+        self.assertEqual(report["already_present"], 1)
+        self.assertEqual(report["would_migrate"]["project"], 0)
+
+    def test_missing_target_skips_retrieve(self):
+        client = self._client([self._rec("own1", self.ME)], target_exists=False)
+        report, _ = self._transfer(client, dry_run=False)
+        client.retrieve.assert_not_called()
+        self.assertEqual(report["migrated"]["project"], 1)
+
+    def test_written_fields_come_from_the_source_point(self):
+        records = [self._rec("own1", self.ME, document="the summary", description="the desc", kind="decision", weight=2.0)]
+        _, remember = self._transfer(self._client(records), dry_run=False)
+        kw = remember.call_args.kwargs
+        self.assertEqual(kw["summary"], "the summary")
+        self.assertEqual(kw["description"], "the desc")
+        self.assertEqual(kw["kind"], "decision")
+        self.assertEqual(kw["weight"], 2.0)
+        self.assertEqual(kw["embedding_model"], "m")
+        self.assertEqual(remember.call_args.args[2], self.TARGET)
+
+    def test_invalid_fields_go_to_errors_not_the_target(self):
+        records = [
+            self._rec("empty-summary", self.ME, document="  "),
+            self._rec("no-kind", self.ME, kind=None),
+            self._rec("bad-desc", self.ME, description=5),
+            self._rec("neg-weight", self.ME, weight=-1),
+            self._rec("nan-weight", self.ME, weight=float("nan")),
+            self._rec("str-weight", self.ME, weight="2"),
+            self._rec("bool-weight", self.ME, weight=True),
+            self._rec("ok", self.ME),
+        ]
+        report, remember = self._transfer(self._client(records), dry_run=False)
+        self.assertEqual(
+            {e["id"] for e in report["errors"]},
+            {"empty-summary", "no-kind", "bad-desc", "neg-weight", "nan-weight", "str-weight", "bool-weight"},
+        )
+        self.assertEqual(report["migrated"]["project"], 1)
+        remember.assert_called_once()
+
+    def test_scroll_errors_are_reported(self):
+        bad = MagicMock()
+        bad.id = "no-meta"
+        bad.payload = {"document": "x"}
+        report, _ = self._transfer(self._client([bad, self._rec("own1", self.ME)]), dry_run=False)
+        self.assertEqual([e["id"] for e in report["errors"]], ["no-meta"])
+        self.assertEqual(report["migrated"]["project"], 1)
+
+    def test_one_failing_write_does_not_abort_the_run(self):
+        records = [self._rec("own1", self.ME), self._rec("own2", self.ME)]
+        remember = AsyncMock(side_effect=[RuntimeError("boom"), ("id", 1.0, None)])
+        report, _ = self._transfer(self._client(records), dry_run=False, remember=remember)
+        self.assertEqual(report["migrated"]["project"], 1)
+        self.assertEqual(len(report["errors"]), 1)
+        self.assertIn("boom", report["errors"][0]["error"])
+
+    def test_embedding_mismatch_stops_the_run(self):
+        records = [self._rec("own1", self.ME), self._rec("own2", self.ME)]
+        remember = AsyncMock(return_value=(None, None, "Error: mismatch"))
+        report, _ = self._transfer(self._client(records), dry_run=False, remember=remember)
+        self.assertEqual(report["error"], "Error: mismatch")
+        self.assertEqual(remember.call_count, 1)
+        self.assertEqual(report["migrated"]["project"], 0)
+
+    def test_missing_source_reports_error_without_scrolling(self):
+        client = self._client([], source_exists=False)
+        report, remember = self._transfer(client, dry_run=False)
+        self.assertIn("does not exist", report["error"])
+        client.scroll.assert_not_called()
+        remember.assert_not_called()
+
+    def test_source_equal_to_target_is_refused(self):
+        client = self._client([])
+        with patch.object(mb, "remember_point", new=AsyncMock()) as remember:
+            report = _run(mb.transfer_points(
+                client, _make_provider(), self.TARGET, self.TARGET,
+                caller_repo=self.ME, embedding_model="m", dry_run=False,
+            ))
+        self.assertIn("error", report)
+        client.scroll.assert_not_called()
+        remember.assert_not_called()
+
+    @staticmethod
+    def _aliases(mapping):
+        resp = MagicMock()
+        resp.aliases = [MagicMock(alias_name=a, collection_name=c) for a, c in mapping.items()]
+        return resp
+
+    def test_source_alias_of_target_is_refused(self):
+        # PR #422 review: Qdrant resolves an alias anywhere a collection name
+        # goes, so an alias of memory-bank must not pass the self-transfer guard.
+        client = self._client([self._rec("own1", self.ME)])
+        client.get_aliases.return_value = self._aliases({self.SOURCE: self.TARGET})
+        report, remember = self._transfer(client, dry_run=False)
+        self.assertIn("alias", report["error"])
+        client.scroll.assert_not_called()
+        remember.assert_not_called()
+
+    def test_target_alias_of_source_is_refused(self):
+        client = self._client([self._rec("own1", self.ME)])
+        client.get_aliases.return_value = self._aliases({self.TARGET: self.SOURCE})
+        report, remember = self._transfer(client, dry_run=False)
+        self.assertIn("error", report)
+        client.scroll.assert_not_called()
+        remember.assert_not_called()
+
+    def test_unrelated_aliases_do_not_block(self):
+        client = self._client([self._rec("own1", self.ME)])
+        client.get_aliases.return_value = self._aliases({"something": "else", self.SOURCE: "legacy-v2"})
+        report, _ = self._transfer(client, dry_run=False)
+        self.assertNotIn("error", report)
+        self.assertEqual(report["migrated"]["project"], 1)
+
+    def test_all_operations_use_resolved_backing_collections(self):
+        # PR #422 review (second pass): after the alias check, every Qdrant
+        # call must use the resolved backing names, so repointing an alias
+        # mid-run can't redirect the scroll or the writes.
+        client = self._client([self._rec("own1", self.ME)])
+        client.collection_exists.side_effect = lambda name: True
+        client.get_aliases.return_value = self._aliases({self.SOURCE: "legacy-v1", self.TARGET: "memory-bank-v2"})
+        report, remember = self._transfer(client, dry_run=False)
+        self.assertNotIn("error", report)
+        self.assertEqual(client.scroll.call_args.kwargs["collection_name"], "legacy-v1")
+        self.assertEqual(client.retrieve.call_args.kwargs["collection_name"], "memory-bank-v2")
+        self.assertEqual(remember.call_args.args[2], "memory-bank-v2")
+        exists_names = {c.args[0] for c in client.collection_exists.call_args_list}
+        self.assertEqual(exists_names, {"legacy-v1", "memory-bank-v2"})
+        # Ids still hash the REQUESTED source name, so they don't change with
+        # whichever backing collection an alias happens to point at.
+        self.assertEqual(remember.call_args.kwargs["point_id"], mb.transfer_point_id(self.SOURCE, "own1"))
+
+    def test_pending_point_in_target_is_rewritten_not_counted_present(self):
+        # PR #422 review (second pass): an id left pending=True by a run whose
+        # set_payload failed must be finished on the next run, not counted as
+        # already_present forever (pending points are hidden from recall).
+        client = self._client([self._rec("own1", self.ME), self._rec("own2", self.ME)])
+        stuck_id = mb.transfer_point_id(self.SOURCE, "own1")
+        done_id = mb.transfer_point_id(self.SOURCE, "own2")
+        client.retrieve.side_effect = lambda collection_name, ids, **kw: [
+            MagicMock(id=stuck_id, payload={"metadata": {"pending": True}}),
+            MagicMock(id=done_id, payload={"metadata": {"pending": False}}),
+        ]
+        report, remember = self._transfer(client, dry_run=False)
+        self.assertEqual(report["already_present"], 1)
+        self.assertEqual(report["migrated"]["project"], 1)
+        remember.assert_called_once()
+        self.assertEqual(remember.call_args.kwargs["point_id"], stuck_id)
+        self.assertEqual(client.retrieve.call_args.kwargs["with_payload"], [mb.PENDING_FIELD])
+
+    def test_unreadable_aliases_fail_closed(self):
+        client = self._client([self._rec("own1", self.ME)])
+        client.get_aliases.side_effect = RuntimeError("down")
+        report, remember = self._transfer(client, dry_run=False)
+        self.assertIn("aliases", report["error"])
+        client.scroll.assert_not_called()
+        remember.assert_not_called()
+
+    def test_never_writes_to_or_deletes_from_the_source(self):
+        records = [self._rec("own1", self.ME)]
+        client = self._client(records)
+        _, remember = self._transfer(client, dry_run=False)
+        for call in remember.call_args_list:
+            self.assertNotEqual(call.args[2], self.SOURCE)
+        client.delete.assert_not_called()
+        client.delete_collection.assert_not_called()
+        client.upsert.assert_not_called()
+
+    def test_rerun_after_success_writes_nothing(self):
+        # End-to-end idempotency: ids the first run wrote are what the second
+        # run's retrieve finds, so a second real run is all already_present.
+        records = [self._rec("own1", self.ME), self._rec("gen1", mb.GENERAL_REPO)]
+        _, first = self._transfer(self._client(records), dry_run=False)
+        written = [c.kwargs["point_id"] for c in first.call_args_list]
+        client = self._client(records)
+        client.retrieve.side_effect = lambda collection_name, ids, **kw: [
+            MagicMock(id=i) for i in ids if i in written
+        ]
+        report, second = self._transfer(client, dry_run=False)
+        second.assert_not_called()
+        self.assertEqual(report["already_present"], 2)
 
 
 if __name__ == "__main__":

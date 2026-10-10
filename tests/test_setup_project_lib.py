@@ -319,8 +319,8 @@ class BuildSettingsHooks(unittest.TestCase):
     def test_each_hook_points_at_its_own_script(self):
         hooks = self._build()
         self.assertEqual(
-            _find_block_args(hooks, "PostToolUse", "compress_bash_output.py"),
-            ["/home/user/tools/claude-runway/hooks/compress_bash_output.py"],
+            _find_block_args(hooks, "PostToolUse", "compress_output.py"),
+            ["/home/user/tools/claude-runway/hooks/compress_output.py"],
         )
         self.assertEqual(
             _find_block_args(hooks, "PreToolUse", "redirect_webfetch_to_fetch_url.py"),
@@ -352,7 +352,7 @@ class BuildSettingsHooks(unittest.TestCase):
     def test_include_compress_false_drops_compress_gated_blocks(self):
         hooks = self._build(include_compress=False)
         with self.assertRaises(AssertionError):
-            _find_block_args(hooks, "PostToolUse", "compress_bash_output.py")
+            _find_block_args(hooks, "PostToolUse", "compress_output.py")
         with self.assertRaises(AssertionError):
             _find_block_args(hooks, "PreToolUse", "redirect_webfetch_to_fetch_url.py")
         with self.assertRaises(AssertionError):
@@ -413,7 +413,7 @@ class MergeSettingsHooks(unittest.TestCase):
     def test_rerunning_does_not_duplicate_the_same_block(self):
         generated = {
             "PostToolUse": [
-                {"matcher": "Bash", "hooks": [{"command": "x", "args": ["/tools/hooks/compress_bash_output.py"]}]}
+                {"matcher": "Bash", "hooks": [{"command": "x", "args": ["/tools/hooks/compress_output.py"]}]}
             ]
         }
         once = merge_settings_hooks({}, generated)
@@ -429,7 +429,7 @@ class MergeSettingsHooks(unittest.TestCase):
             "PostToolUse": [
                 {
                     "matcher": "Bash",
-                    "hooks": [{"command": "/old/.venv/bin/python", "args": ["/old/hooks/compress_bash_output.py"]}],
+                    "hooks": [{"command": "/old/.venv/bin/python", "args": ["/old/hooks/compress_output.py"]}],
                 }
             ]
         }
@@ -439,7 +439,7 @@ class MergeSettingsHooks(unittest.TestCase):
             "PostToolUse": [
                 {
                     "matcher": "Bash",
-                    "hooks": [{"command": "/new/.venv/bin/python", "args": ["/new/hooks/compress_bash_output.py"]}],
+                    "hooks": [{"command": "/new/.venv/bin/python", "args": ["/new/hooks/compress_output.py"]}],
                 }
             ]
         }
@@ -461,7 +461,7 @@ class MergeSettingsHooks(unittest.TestCase):
                     {
                         "matcher": "Bash|Grep|WebFetch|Glob|WebSearch|mcp__local-compress__.*",
                         "hooks": [
-                            {"command": "/old/venv/python", "args": ["/old/hooks/compress_bash_output.py"]},
+                            {"command": "/old/venv/python", "args": ["/old/hooks/compress_output.py"]},
                             {"command": "my-custom-tool", "args": ["my_custom_hook.py"]},
                         ],
                     }
@@ -472,7 +472,7 @@ class MergeSettingsHooks(unittest.TestCase):
             "PostToolUse": [
                 {
                     "matcher": "Bash|Grep|WebFetch|Glob|WebSearch|mcp__local-compress__.*",
-                    "hooks": [{"command": "/new/venv/python", "args": ["/new/hooks/compress_bash_output.py"]}],
+                    "hooks": [{"command": "/new/venv/python", "args": ["/new/hooks/compress_output.py"]}],
                 }
             ]
         }
@@ -490,7 +490,7 @@ class StripToolkitHooks(unittest.TestCase):
             "hooks": {
                 "PostToolUse": [
                     {"matcher": "MyOwnTool", "hooks": [{"command": "custom", "args": ["my_own.py"]}]},
-                    {"matcher": "Bash", "hooks": [{"command": "x", "args": ["/tools/hooks/compress_bash_output.py"]}]},
+                    {"matcher": "Bash", "hooks": [{"command": "x", "args": ["/tools/hooks/compress_output.py"]}]},
                 ],
                 "PreToolUse": [
                     {"matcher": "WebFetch", "hooks": [{"command": "x", "args": ["/tools/hooks/redirect_webfetch_to_fetch_url.py"]}]}
@@ -520,7 +520,7 @@ class StripToolkitHooks(unittest.TestCase):
                     {
                         "matcher": "Bash|Grep|WebFetch|Glob|WebSearch|mcp__local-compress__.*",
                         "hooks": [
-                            {"command": "/old/venv/python", "args": ["/old/hooks/compress_bash_output.py"]},
+                            {"command": "/old/venv/python", "args": ["/old/hooks/compress_output.py"]},
                             {"command": "my-custom-tool", "args": ["my_custom_hook.py"]},
                         ],
                     }
@@ -662,7 +662,7 @@ class RunSetupEndToEnd(unittest.TestCase):
         with self.assertRaises(AssertionError):
             _find_block_args(result.settings_json["hooks"], "PostToolUse", "record_session_id.py")
         with self.assertRaises(AssertionError):
-            _find_block_args(result.settings_json["hooks"], "PostToolUse", "compress_bash_output.py")
+            _find_block_args(result.settings_json["hooks"], "PostToolUse", "compress_output.py")
         with self.assertRaises(AssertionError):
             _find_block_args(result.settings_json["hooks"], "PreToolUse", "redirect_webfetch_to_fetch_url.py")
         with self.assertRaises(AssertionError):
@@ -712,7 +712,7 @@ class RunSetupEndToEnd(unittest.TestCase):
         )
         second = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
         # SessionStart: 1 core block (record_session_id.py, issue #231).
-        # PostToolUse: 1 compress block (compress_bash_output.py only; core
+        # PostToolUse: 1 compress block (compress_output.py only; core
         #   record_session_id.py moved from PostToolUse to SessionStart in #231).
         # PreToolUse: 1 block (redirect_webfetch_to_fetch_url.py).
         # SessionEnd: 2 blocks (record_session_id.py + session_end_savings.py).
@@ -812,7 +812,7 @@ class RunSetupEndToEnd(unittest.TestCase):
             home_dir=Path("/home/user"),
         )
 
-        # PostToolUse: 1 block (compress_bash_output.py); record_session_id.py
+        # PostToolUse: 1 block (compress_output.py); record_session_id.py
         # moved to SessionStart in issue #231 -- no longer in PostToolUse.
         # SessionStart: 1 block (record_session_id.py).
         # Both must reference the moved tools repo path, not the old one.
@@ -1069,6 +1069,45 @@ class PlanSkillInstalls(unittest.TestCase):
         by_name = {p.name: p for p in plans}
         self.assertEqual(by_name["skill-a"].action, "update")
         self.assertEqual(by_name["skill-b"].action, "install")
+
+
+class CompactEmbeddingModelOnInit(unittest.TestCase):
+    """Issue #397: local-compress's EMBEDDING_MODEL is sticky -- an `init`
+    re-run must never move an existing install's compacts onto another model."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.target_repo = Path(self._tmpdir.name) / "proj"
+        self.target_repo.mkdir()
+
+    def _model(self, result):
+        return result.mcp_json["mcpServers"]["local-compress"]["env"]["EMBEDDING_MODEL"]
+
+    def _rerun(self, local_compress_env):
+        (self.target_repo / ".mcp.json").write_text(
+            json.dumps({"mcpServers": {"qdrant": {"env": {}}, "local-compress": {"env": local_compress_env}}}),
+            encoding="utf-8",
+        )
+        return run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
+
+    def test_brand_new_install_uses_the_project_model(self):
+        result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
+        self.assertEqual(self._model(result), "sentence-transformers/all-MiniLM-L6-v2")
+
+    def test_existing_block_without_the_key_is_pinned_to_the_legacy_model(self):
+        result = self._rerun({"COMPACT_COLLECTION": "conversation-compacts"})
+        self.assertEqual(self._model(result), "BAAI/bge-small-en")
+
+    def test_existing_value_is_kept_even_with_an_explicit_project_model_change(self):
+        (self.target_repo / ".mcp.json").write_text(
+            json.dumps({"mcpServers": {"qdrant": {"env": {"EMBEDDING_MODEL": "a/b"}},
+                                       "local-compress": {"env": {"EMBEDDING_MODEL": "BAAI/bge-small-en"}}}}),
+            encoding="utf-8",
+        )
+        result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"), embedding_model="c/d")
+        self.assertEqual(self._model(result), "BAAI/bge-small-en")
+        self.assertEqual(result.mcp_json["mcpServers"]["qdrant"]["env"]["EMBEDDING_MODEL"], "c/d")
 
 
 if __name__ == "__main__":

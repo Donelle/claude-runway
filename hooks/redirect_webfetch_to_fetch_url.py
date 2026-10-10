@@ -15,7 +15,7 @@ local model is actually reachable right now. That's enough to enforce
 deterministically, unlike "should this have been qdrant-find" which has no
 equivalent signal.
 
-Mechanism: unlike the compress_bash_output.py PostToolUse hook (which can
+Mechanism: unlike the compress_output.py PostToolUse hook (which can
 only rewrite output after the fact), this is a PreToolUse hook -- it can
 outright prevent the WebFetch call from running at all via
 `permissionDecision: "deny"`, with `permissionDecisionReason` fed back to
@@ -98,7 +98,7 @@ import sqlite3
 import sys
 from typing import NoReturn
 
-# Same redundant resolution order as compress_bash_output.py -- see that
+# Same redundant resolution order as compress_output.py -- see that
 # file's comment for the full bug history this guards against. libs/ under
 # the repo root is checked first (real layout); repo root itself is kept as
 # a fallback for backward compatibility.
@@ -393,6 +393,19 @@ def _deny(reason: str) -> NoReturn:
 
 
 def main():
+    # Force UTF-8 on stdin before the read: Claude Code sends the payload as
+    # UTF-8, but Windows Python defaults stdin to the locale codepage
+    # (cp1252), under which a cp1252-unmappable byte raises UnicodeDecodeError
+    # -- a ValueError the guard below swallows into a silent fail-open, so the
+    # WebFetch redirect would stop firing for exactly those payloads (issue
+    # #263). Guarded because a non-reconfigurable stream (e.g. io.StringIO in
+    # the unit tests) has no reconfigure(); fail open rather than crash.
+    _reconfigure = getattr(sys.stdin, "reconfigure", None)
+    if _reconfigure is not None:
+        try:
+            _reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass  # already-consumed/detached stream -- fail open
     try:
         payload = json.load(sys.stdin)
     except (json.JSONDecodeError, ValueError):

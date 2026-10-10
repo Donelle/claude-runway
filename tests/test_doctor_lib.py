@@ -353,5 +353,39 @@ class RunDoctor(unittest.TestCase):
         self.assertTrue(result.mismatches[0].shell_value.endswith("savings.db"))
 
 
+class LegacyCompressHook(unittest.TestCase):
+    """Issue #395: doctor flags a settings.json still on compress_bash_output.py."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.repo = Path(self._tmpdir.name)
+
+    def _settings(self, raw):
+        (self.repo / ".claude").mkdir(exist_ok=True)
+        text = raw if isinstance(raw, str) else json.dumps(raw)
+        (self.repo / ".claude" / "settings.json").write_text(text, encoding="utf-8")
+
+    def test_flags_old_name_with_its_event(self):
+        self._settings({"hooks": {"PostToolUse": [{"hooks": [{"args": ["/t/hooks/compress_bash_output.py"]}]}]}})
+        self.assertEqual(doctor_lib.find_legacy_compress_hook_events(self.repo), ["PostToolUse"])
+
+    def test_clean_for_new_name_missing_file_and_garbage(self):
+        self.assertEqual(doctor_lib.find_legacy_compress_hook_events(self.repo), [])
+        self._settings({"hooks": {"PostToolUse": [{"hooks": [{"args": ["/t/hooks/compress_output.py"]}]}]}})
+        self.assertEqual(doctor_lib.find_legacy_compress_hook_events(self.repo), [])
+        self._settings("not json")
+        self.assertEqual(doctor_lib.find_legacy_compress_hook_events(self.repo), [])
+        self._settings('{"hooks": [1]}')
+        self.assertEqual(doctor_lib.find_legacy_compress_hook_events(self.repo), [])
+
+    def test_run_doctor_reports_it_even_without_local_compress(self):
+        (self.repo / ".mcp.json").write_text(json.dumps({"mcpServers": {"qdrant": {}}}), encoding="utf-8")
+        self._settings({"hooks": {"PostToolUse": [{"hooks": [{"args": ["/t/hooks/compress_bash_output.py"]}]}]}})
+        result = doctor_lib.run_doctor(self.repo, shell_env={}, home_dir=Path("/home/x"))
+        self.assertFalse(result.local_compress_configured)
+        self.assertEqual(result.legacy_compress_hook_events, ["PostToolUse"])
+
+
 if __name__ == "__main__":
     unittest.main()
