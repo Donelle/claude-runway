@@ -61,7 +61,7 @@ Work it now only if ALL of these hold:
 - It doesn't need a design decision only the user can make.
 - It doesn't conflict with work in progress on the same files.
 
-If all hold, run `/my-gh-code-it <issue>`, then `/my-gh-pr`.
+If all hold, run `/my-gh-code-it <issue>`, then `/my-gh-pr <issue>` (it requires the issue number).
 
 If any fails, leave the ticket in the backlog and tell the user in one line which condition failed and what would unblock it.
 
