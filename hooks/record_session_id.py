@@ -5,7 +5,7 @@ Keeps `libs/session_id_lib.py`'s Type-2 (SHADOW_FILE) shadow marker fresh
 actually-populated, permanent strategy, rather than inert scanning logic
 pointed at a directory nothing writes to. Before this hook existed, the
 sessions directory was only ever populated as a side effect of the opt-in
-savings tracker (`hooks/compress_bash_output.py`, itself gated behind
+savings tracker (`hooks/compress_output.py`, itself gated behind
 `CLAUDE_RUNWAY_TRACK_SAVINGS`) -- this hook is part of the CORE/base
 install, so every project gets a working SHADOW_FILE strategy regardless of
 whether local-compress/the savings tracker is configured at all.
@@ -33,7 +33,7 @@ this SAME script:
     migrate via `claude-runway-setup upgrade`.
   - `SessionEnd`: Layer 1 graceful cleanup -- deletes this session's own
     marker on normal exit. A sibling delete to, but independent of,
-    `savings_ledger.finalize_session()`'s own unlink of its differently
+    `savings_ledger.finalize_owned_session()`'s own unlink of its differently
     named `<session_id>.jsonl` file.
 
 The two payload shapes are told apart via `hook_event_name`, which Claude
@@ -53,17 +53,18 @@ Setup: see templates/settings.json.template's core SessionStart/SessionEnd
 blocks -- nothing needs to be copied into a target project, same convention
 as every other hook in this repo.
 
-Env vars: `CLAUDE_RUNWAY_SESSION_MARKER_TTL_HOURS` (shell-only, default 168h;
-see libs/session_id_lib.py's `_ttl_hours()`).
+Env vars: `CLAUDE_RUNWAY_SESSION_MARKER_TTL_HOURS` (default 168h; the hook reads
+the shell export, but the local-compress MCP server also reads it via
+libs/session_id_lib.py's `_ttl_hours()` -- see docs/environment-variables.md).
 """
 
 import json
 import os
 import sys
 
-# Same redundant path-resolution order as compress_bash_output.py/
+# Same redundant path-resolution order as compress_output.py/
 # session_end_savings.py, so this script also works if copied standalone or
-# if the repo layout shifts -- see compress_bash_output.py's comment for the
+# if the repo layout shifts -- see compress_output.py's comment for the
 # full rationale.
 _here = os.path.dirname(os.path.abspath(__file__))
 _root = os.path.dirname(_here)
@@ -76,7 +77,7 @@ try:
     import session_id_lib
 except ImportError:
     # Fail open, silently -- this hook has no output contract to preserve
-    # (unlike compress_bash_output.py, which must report why on stderr since
+    # (unlike compress_output.py, which must report why on stderr since
     # a broken import there silently drops real compression); a missing
     # libs/session_id_lib.py just means Type 2 isn't populated this run.
     sys.exit(0)
@@ -141,6 +142,20 @@ def _dispatch(payload: dict) -> None:
 
 
 def main() -> None:
+    # Force UTF-8 on stdin before the read: Claude Code sends the payload as
+    # UTF-8, but Windows Python defaults stdin to the locale codepage
+    # (cp1252), under which a cp1252-unmappable byte raises UnicodeDecodeError
+    # -- a ValueError the guard below swallows into a silent fail-open, which
+    # would skip this session's shadow-marker write for exactly those payloads
+    # (issue #263). Guarded because a non-reconfigurable stream (e.g.
+    # io.StringIO in the unit tests) has no reconfigure(); fail open rather
+    # than crash.
+    _reconfigure = getattr(sys.stdin, "reconfigure", None)
+    if _reconfigure is not None:
+        try:
+            _reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass  # already-consumed/detached stream -- fail open
     try:
         payload = json.load(sys.stdin)
     except (json.JSONDecodeError, ValueError):
@@ -150,7 +165,7 @@ def main() -> None:
         _dispatch(payload)
     except Exception:
         # Unconditional fail-open (issue #198, same philosophy as
-        # compress_bash_output.py's top-level guard) -- this hook's job is a
+        # compress_output.py's top-level guard) -- this hook's job is a
         # pure side effect; a bug here must never surface as a broken tool
         # call or a broken session shutdown.
         pass

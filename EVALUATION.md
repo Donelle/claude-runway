@@ -125,7 +125,7 @@ Token-count all `local-compress` tool schemas — paid every turn regardless of 
 - **`CLAUDE_RUNWAY_TRACK_SAVINGS` on**: the server computes this figure itself at every startup and stores it as `schema_overhead_tokens`, surfaced via the plain `/my-savings` simple view's "Tool overhead" line (`format_detail_view()` doesn't currently repeat this annotation -- `format_simple_view()` is the one that emits it; see that function's own definition in `libs/savings_ledger.py`, not a line number pinned here, since line numbers shift and go stale silently) -- read that number instead of re-deriving it here.
 - **Either way, or if the tracker is off**: run `python tools/report_tool_counts.py`, which imports the server module directly and reports both its live tool count AND an estimated schema-token cost (the same `schema_overhead_tokens` figure, computed the same way) without needing `CLAUDE_RUNWAY_TRACK_SAVINGS` on at all -- a tool count alone isn't enough here, since Step B4/the "Compute the result" section below need an actual token number, not just "how many tools."
 
-Hooks (`compress_bash_output.py`, `redirect_webfetch_to_fetch_url.py`) do NOT add this kind of fixed cost — they're not tools Claude sees in its schema list, they intercept transparently, so they should be near-zero fixed overhead by design. Worth spot-checking this assumption once rather than just asserting it.
+Hooks (`compress_output.py`, `redirect_webfetch_to_fetch_url.py`) do NOT add this kind of fixed cost — they're not tools Claude sees in its schema list, they intercept transparently, so they should be near-zero fixed overhead by design. Worth spot-checking this assumption once rather than just asserting it.
 
 ### Step B5: What this track can't tell you
 
@@ -189,7 +189,7 @@ Tracks A–C all follow the same rigorous shape: run a task, run it again under 
 
 > `saved ≈ tokens(raw content that was compressed) − tokens(the compressed result actually used)`
 
-This is directly observable for local-compression events only (`compress_file`/`compress_command_output`/`fetch_url`'s server-side compression, plus the `compress_bash_output.py` hook), because the tool holds both sides of the comparison in hand — it read the raw content and produced the compressed result itself, so nothing about that specific delta is guessed. That's exactly why Track A's Qdrant piece is NOT part of this tracker: the counterfactual for `qdrant-find` (what Grep+Read would have cost instead) isn't observable the same way, so the tracker deliberately never labels Qdrant activity as "savings" — see "Measuring cleanly" above and the README's own qdrant-find-vs-Grep discussion for why that gap can't be closed by a heuristic.
+This is directly observable for local-compression events only (`compress_file`/`compress_command_output`/`fetch_url`'s server-side compression, plus the `compress_output.py` hook), because the tool holds both sides of the comparison in hand — it read the raw content and produced the compressed result itself, so nothing about that specific delta is guessed. That's exactly why Track A's Qdrant piece is NOT part of this tracker: the counterfactual for `qdrant-find` (what Grep+Read would have cost instead) isn't observable the same way, so the tracker deliberately never labels Qdrant activity as "savings" — see "Measuring cleanly" above and the README's own qdrant-find-vs-Grep discussion for why that gap can't be closed by a heuristic.
 
 Other differences from Tracks A–C worth being explicit about:
 
@@ -243,7 +243,7 @@ Report two numbers per scenario set, not one — averaging only over successes o
 
 ### Step E4: Measure the fixed overhead
 
-Same pattern as Step A4/B4 — and already wired up rather than something this track still needs to add: `tools/report_tool_counts.py`'s server loop already includes `memory-bank` (`memory_bank_mcp_server`) alongside `local-compress` and `codebase-indexer`, so its 3 tools' (`remember`/`recall`/`forget`) schema-token cost goes through the same shared `libs/mcp_tool_introspect.py` utility as the other two servers. Run `python tools/report_tool_counts.py` for the current live number rather than hand-typing one here — same discipline Step A4/B4 already established, for the same reason: issues #22/#23 are exactly what happens when a schema-token count gets hand-typed into this doc instead of read live.
+Same pattern as Step A4/B4 — and already wired up rather than something this track still needs to add: `tools/report_tool_counts.py`'s server loop already includes `memory-bank` (`memory_bank_mcp_server`) alongside `local-compress` and `codebase-indexer`, so its tools' (`remember`/`recall`/`forget`/`transfer_memories`) schema-token cost goes through the same shared `libs/mcp_tool_introspect.py` utility as the other two servers. Run `python tools/report_tool_counts.py` for the current live number rather than hand-typing one here — same discipline Step A4/B4 already established, for the same reason: issues #22/#23 are exactly what happens when a schema-token count gets hand-typed into this doc instead of read live.
 
 ### Step E5: remember:recall ratio (diagnostic only)
 

@@ -229,7 +229,7 @@ class BuiltWheelHasExpectedDataLayout(unittest.TestCase):
             ("tools", "setup_project.py"),
             ("tools", "doctor.py"),
             ("tools", "ingest_to_qdrant.py"),
-            ("hooks", "compress_bash_output.py"),
+            ("hooks", "compress_output.py"),
             ("hooks", "redirect_webfetch_to_fetch_url.py"),
             ("hooks", "record_session_id.py"),
             ("templates", "mcp.json.template"),

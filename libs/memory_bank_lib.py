@@ -44,6 +44,7 @@ calling model's own judgment:
 
 from __future__ import annotations
 
+import math
 import time
 import uuid
 from typing import Optional
@@ -77,6 +78,12 @@ PENDING_FIELD = "metadata.pending"
 WEIGHT_FIELD = "metadata.weight"
 
 MEMORY_BANK_SOURCE = "memory-bank"
+
+# metadata.source value compress_mcp_server.compact_store stamps on every
+# conversation-compact point (issue #282). Lives here beside
+# MEMORY_BANK_SOURCE so the writer and the indexer's delete guard
+# (memory_bank_exclusion_filter) share one constant and can't drift apart.
+COMPACT_SOURCE = "conversation-compact"
 
 # Default weight for a point with no metadata.weight at all (issue #177) --
 # either a point written before this field existed, or one explicitly
@@ -224,15 +231,21 @@ def is_memory_bank_collection_name(collection: str, memory_bank_collection: str)
 
 def memory_bank_exclusion_filter() -> models.Filter:
     """
-    The reusable `must_not: metadata.source == "memory-bank"` fragment
-    index_repo/sync_repo fold into their own delete filters, so a collection
-    that ever ends up holding both code chunks and memory-bank points (it
-    shouldn't, given is_memory_bank_collection_name's guard, but this stays
-    as defense-in-depth per issue #175) never has its memory-bank points
-    caught by an unrelated delete.
+    The reusable `must_not` fragment index_repo/sync_repo fold into their own
+    delete filters, so a collection that ever ends up holding both code
+    chunks and protected points (it shouldn't, given
+    is_memory_bank_collection_name's guard, but this stays as
+    defense-in-depth per issue #175) never has them caught by an unrelated
+    delete. Protects memory-bank points (metadata.source == "memory-bank")
+    and, since issue #282, conversation compacts (metadata.source ==
+    "conversation-compact"). Compacts stored before #282 carry no
+    metadata.source and stay unprotected until backfilled.
     """
     return models.Filter(
-        must_not=[models.FieldCondition(key=SOURCE_FIELD, match=models.MatchValue(value=MEMORY_BANK_SOURCE))]
+        must_not=[
+            models.FieldCondition(key=SOURCE_FIELD, match=models.MatchValue(value=MEMORY_BANK_SOURCE)),
+            models.FieldCondition(key=SOURCE_FIELD, match=models.MatchValue(value=COMPACT_SOURCE)),
+        ]
     )
 
 
@@ -334,8 +347,21 @@ def ensure_memory_bank_indexes(client: "QdrantClient", collection: str) -> None:
     mirrors qdrant_batch_store.ensure_file_path_index's "check current
     payload_schema before creating" pattern so re-running this doesn't
     reissue a full-collection-scanning create_payload_index call every time.
-    Without these, every recall/count/wipe filter on a collection shared
-    across every project full-scans it as it grows.
+    These two cover the `source` match clause that every recall/count/wipe
+    filter has, and the `repo` match clause wherever one is applied (not
+    always: `_scope_filter` omits it for `all_repos=True`, and
+    `count_memory_bank_points` omits it when `repo` is None), so those
+    clauses no longer full-scan a collection shared across every project as
+    it grows.
+
+    They do NOT cover the other clauses: `metadata.pending` (the
+    `must_not` exclusion in `_scope_filter`, `count_memory_bank_points` and
+    `_own_repo_filter`), `metadata.kind` (`_scope_filter`'s optional `kind`
+    match) and `metadata.created_at` (`_own_repo_filter`'s range /
+    is-empty `created_before` clause) have no payload index, so Qdrant
+    evaluates them per point. Those filters are therefore only partly
+    index-assisted, not fully so; adding indexes for them is a separate,
+    unmade decision (issue #310).
     """
     info = call_with_retry(client.get_collection, collection)
     existing = info.payload_schema or {}
@@ -359,6 +385,7 @@ async def remember_point(
     repo: str,
     embedding_model: str,
     weight: float = DEFAULT_WEIGHT,
+    point_id: str | None = None,
 ) -> tuple:
     """
     Embeds `summary` (the only text actually searched) and stores it
@@ -376,6 +403,16 @@ async def remember_point(
     Stored verbatim in `metadata.weight`; a point with no such field at all
     (written before this change) is treated as `weight=1.0` at read time by
     `recall_points` -- a true no-op, not a behavior change for existing data.
+
+    `point_id` (issue #334, part of #327) is optional. When omitted (the
+    default, and what `remember()`'s MCP tool always does) a fresh random
+    `uuid.uuid4().hex` is minted exactly as before -- behavior is unchanged
+    for every existing caller. When provided, that exact ID is used for the
+    upsert instead, so a caller that needs deterministic per-source IDs (the
+    legacy-collection transfer tool's idempotency, see #327) can get them.
+    This function itself does NO check-before-write: upserting an existing ID
+    overwrites it and re-stamps `created_at`/re-cycles `pending`, so a caller
+    that wants a re-run to leave unchanged points alone must check first.
 
     Returns `(point_id, created_at, None)` on success, or
     `(None, None, error_message)` if `ensure_collection` finds this
@@ -420,7 +457,8 @@ async def remember_point(
     ensure_memory_bank_indexes(client, collection)
     vector_name = embedding_provider.get_vector_name()
     embeddings = await embedding_provider.embed_documents([summary])
-    point_id = uuid.uuid4().hex
+    if point_id is None:
+        point_id = uuid.uuid4().hex
     # pending=True is written in this SAME atomic upsert that creates the
     # point -- there is no window where the point exists without it, unlike
     # created_at (stamped in a separate follow-up call below). wipe_memory_bank
@@ -589,6 +627,315 @@ async def recall_points(
     # hit at raw -0.1 (both effective 0) on raw score alone (PR #359 review).
     results.sort(key=lambda r: (r["effective_score"], r["weight"] > 0, r["score"]), reverse=True)
     return results[:limit]
+
+
+# Page size for scroll_collection (issue #335). Qdrant's own scroll default is
+# 10; 1000 matches wipe_memory_bank's page size, keeping round trips low on a
+# large legacy collection without one enormous response.
+_SCROLL_BATCH_SIZE = 1000
+
+
+def scroll_collection(client: "QdrantClient", source: str, batch_size: int = _SCROLL_BATCH_SIZE) -> tuple:
+    """
+    Read-only, COMPLETE-for-an-unchanged-collection enumeration of every point
+    in `source` (issue #335, part of #327) -- for reading a foreign/legacy
+    collection (e.g. one that predates the shared memory-bank collection) so
+    its points can be audited or migrated. Loops `client.scroll` following
+    `next_offset` until Qdrant returns None, so unlike `recall_points` it is
+    a full walk rather than semantic top-k search, never silently capped at
+    a top-k: no query text and no embedding provider are involved at all.
+    Vectors are never fetched.
+
+    Completeness caveat (PR #382 review): `scroll()` has no cross-page
+    consistency guarantee (see wipe_memory_bank's docstring), so if points
+    are inserted or deleted WHILE this runs, the result is not a snapshot --
+    a concurrent insert can be missed or a concurrent delete still seen. The
+    full-enumeration guarantee therefore holds only for a collection nothing
+    is writing to (the normal case for a legacy/foreign source being
+    audited or migrated); callers needing more must quiesce writers first.
+
+    Returns `(points, errors)`:
+      * `points`: one dict per well-shaped point -- id, summary (the
+        `document` field), description, kind, repo, embedding_model,
+        created_at, weight (DEFAULT_WEIGHT when absent) -- the same field
+        names `recall_points` returns, minus the similarity scores.
+      * `errors`: one `{"id": ..., "error": "..."}` per point that is NOT
+        memory-bank-shaped (payload/metadata not a dict, or `metadata.repo`
+        missing). Such a point is reported and skipped rather than crashing
+        the whole scroll, since `source` may be any collection at all. A
+        missing collection yields `([], [{"id": None, "error": ...}])`.
+
+    Deliberately applies NO source/pending filter: the point is to see
+    everything in `source`, and callers decide what to do with each point.
+    """
+    if not call_with_retry(client.collection_exists, source):
+        return [], [{"id": None, "error": f"collection '{source}' does not exist."}]
+    points: list = []
+    errors: list = []
+    offset = None
+    while True:
+        records, offset = call_with_retry(
+            client.scroll,
+            collection_name=source,
+            limit=batch_size,
+            offset=offset,
+            with_payload=True,
+            with_vectors=False,
+        )
+        for record in records:
+            payload = record.payload
+            if not isinstance(payload, dict):
+                errors.append({"id": record.id, "error": "payload is missing or not an object."})
+                continue
+            meta = payload.get("metadata")
+            if not isinstance(meta, dict):
+                errors.append({"id": record.id, "error": "payload has no 'metadata' object."})
+                continue
+            repo = meta.get("repo")
+            if not repo:
+                errors.append({"id": record.id, "error": "metadata.repo is missing."})
+                continue
+            weight = meta.get("weight")
+            points.append(
+                {
+                    "id": record.id,
+                    "summary": payload.get("document", ""),
+                    "description": meta.get("description", ""),
+                    "kind": meta.get("kind"),
+                    "repo": repo,
+                    "embedding_model": meta.get("embedding_model"),
+                    "weight": DEFAULT_WEIGHT if weight is None else weight,
+                    "created_at": meta.get("created_at"),
+                }
+            )
+        if offset is None:
+            break
+    return points, errors
+
+
+# Fixed namespace for transfer_point_id (issue #336). Never change it: every
+# id a past transfer_points run wrote was derived from this exact value, so a
+# new namespace would make a re-run see none of them as already present and
+# write every point a second time under a fresh id.
+TRANSFER_ID_NAMESPACE = uuid.UUID("6f1c2b7e-4d3a-5e8f-9a0b-1c2d3e4f5a6b")
+
+
+def transfer_point_id(source: str, source_point_id) -> str:
+    """
+    Deterministic target id for one source point (issue #336, see #327):
+    `uuid5(TRANSFER_ID_NAMESPACE, "<source>:<source_point_id>")`. The same
+    source point always maps to the same target id, so a re-run of
+    `transfer_points` can tell "already migrated" apart from "new" with a
+    plain `retrieve` instead of duplicating every point under a fresh random
+    id. Qdrant ids are either unsigned ints or UUIDs, so an int id `5` and a
+    UUID string can never format to the same `<source>:<id>` text.
+    """
+    return str(uuid.uuid5(TRANSFER_ID_NAMESPACE, f"{source}:{source_point_id}"))
+
+
+def _transfer_field_error(point: dict) -> Optional[str]:
+    """
+    Checks the fields `remember_point` will write for one scrolled point, so a
+    legacy point that is memory-bank-shaped enough to have a `repo` (which is
+    all `scroll_collection` checks) but not enough to be written lands in the
+    report's `errors` bucket, not in the shared collection. Same weight rule
+    `remember()` enforces at its own tool boundary (finite, >= 0): an `inf`/
+    `nan`/negative weight copied verbatim would break `recall_points`'
+    ranking for every project sharing the collection.
+    """
+    summary = point.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        return "summary (payload 'document') is missing or empty -- nothing to embed."
+    if not isinstance(point.get("kind"), str) or not point["kind"]:
+        return "metadata.kind is missing or not a string."
+    if not isinstance(point.get("description"), str):
+        return "metadata.description is not a string."
+    weight = point.get("weight")
+    if isinstance(weight, bool) or not isinstance(weight, (int, float)):
+        return f"metadata.weight is not a number (got {weight!r})."
+    if not math.isfinite(weight) or weight < 0:
+        return f"metadata.weight must be a finite number 0 or greater (got {weight})."
+    return None
+
+
+async def transfer_points(
+    client: "QdrantClient",
+    embedding_provider,
+    source: str,
+    target: str,
+    caller_repo: str,
+    embedding_model: str,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Migrates the in-scope points of a legacy/foreign collection `source` into
+    the shared memory-bank collection `target` (issue #336, part 3 of #327's
+    design). Returns a report dict; never raises for a per-point problem.
+
+    Repo-tag mapping, per point -- the same boundary `resolve_repo` enforces
+    for a single `remember()` call, applied point by point, with no bypass:
+      * `metadata.repo == caller_repo` -> written project-scoped (repo=caller_repo).
+      * `metadata.repo == GENERAL_REPO` -> written as general.
+      * anything else -> NOT written, counted in `skipped_foreign_repo` by tag,
+        so the user can run this same tool from a session in that repo.
+    A point is never written under a tag other than the one it already had.
+
+    Idempotency is check-before-write, not blind re-upsert: each point's
+    target id comes from `transfer_point_id`, the target is `retrieve`d for
+    those ids first, and only ids not already there are written. Re-upserting
+    an existing id would re-stamp `created_at` and re-cycle `pending` on a
+    point that hasn't changed (see `remember_point`'s docstring), so already
+    present points are counted in `already_present` and left alone. Each new
+    point gets a fresh `created_at` (the time of migration) and is re-embedded
+    with this project's `embedding_provider`; the source's own vectors and
+    timestamps are not copied. Dedup only recognizes ids this function
+    derived: a memory copied over earlier by hand via `remember()` has a
+    random id and is NOT detected (no content matching is attempted), so a
+    real run would write a second copy of it -- the dry-run report is how a
+    caller checks for that before writing.
+
+    `dry_run=True` (the default) does everything except the write and reports
+    `would_migrate` instead of `migrated`; it never embeds, so
+    `embedding_provider` may be None there. A dry run cannot detect an
+    embedding-model mismatch on the target, which only shows up when the
+    first real write calls `ensure_collection`; that mismatch is
+    collection-wide, so it stops the run and is returned as `error` (with the
+    counts reached so far), rather than being repeated once per point.
+
+    Read-only against `source`: nothing here ever writes to or deletes from
+    it. Deleting a legacy collection stays a separate, manual action.
+
+    Report keys: source_collection, target_collection, dry_run,
+    `would_migrate` or `migrated` ({"general": n, "project": n}),
+    skipped_foreign_repo ({tag: n}), already_present (n), errors (list of
+    {"id", "error"}), and `error` (str, only when the run stopped early).
+    """
+    bucket = "would_migrate" if dry_run else "migrated"
+    report: dict = {
+        "source_collection": source,
+        "target_collection": target,
+        "dry_run": dry_run,
+        bucket: {"general": 0, "project": 0},
+        "skipped_foreign_repo": {},
+        "already_present": 0,
+        "errors": [],
+    }
+    # Compared by BACKING collection, not by name (PR #422 review): Qdrant
+    # accepts an alias anywhere a collection name goes (collection_exists and
+    # scroll both resolve it -- confirmed live), so an alias of the memory-bank
+    # collection would pass a plain name check, scroll memory-bank itself, and
+    # write copies of its points back into it under new ids; each later run
+    # would then copy those copies again. Fails closed: if the alias list
+    # can't be read, nothing is scrolled or written.
+    #
+    # Every Qdrant call below then uses these RESOLVED backing names, never
+    # the requested ones (PR #422 review, second pass): an alias can be
+    # repointed atomically at any moment, so checking resolved names but then
+    # scrolling/writing through the alias would leave a window where the
+    # check passes and the alias is switched to memory-bank (copying it into
+    # itself) or the target alias is switched to the source (writing into the
+    # supposedly read-only source). The requested `source` name is still
+    # what transfer_point_id hashes, so ids stay stable across runs however
+    # the source is reached.
+    try:
+        aliases = {
+            a.alias_name: a.collection_name
+            for a in call_with_retry(client.get_aliases).aliases
+        }
+    except Exception as e:
+        report["error"] = f"could not read Qdrant collection aliases to check source vs. target: {e}"
+        return report
+    source_backing = aliases.get(source, source)
+    target_backing = aliases.get(target, target)
+    if source_backing == target_backing:
+        report["error"] = (
+            f"source_collection '{source}' is the memory-bank collection itself "
+            f"(directly or through an alias) -- name the legacy collection to transfer from."
+        )
+        return report
+    if not call_with_retry(client.collection_exists, source_backing):
+        report["error"] = (
+            f"collection '{source}' does not exist. Name it exactly "
+            f"(codebase-indexer's list_collections shows what exists)."
+        )
+        return report
+
+    points, scroll_errors = scroll_collection(client, source_backing)
+    report["errors"].extend(scroll_errors)
+
+    # (target_id, scope, point) for every point that passes the repo boundary
+    # and field checks -- foreign-tagged points never get this far, so they
+    # are never even looked up in the target.
+    candidates: list = []
+    for point in points:
+        repo = point["repo"]
+        if repo == GENERAL_REPO:
+            scope = "general"
+        elif repo == caller_repo:
+            scope = "project"
+        else:
+            tag = str(repo)
+            report["skipped_foreign_repo"][tag] = report["skipped_foreign_repo"].get(tag, 0) + 1
+            continue
+        field_error = _transfer_field_error(point)
+        if field_error:
+            report["errors"].append({"id": point["id"], "error": field_error})
+            continue
+        candidates.append((transfer_point_id(source, point["id"]), scope, point))
+
+    # One retrieve per batch instead of one per point. A target that doesn't
+    # exist yet holds nothing, so there is nothing to look up.
+    #
+    # Only a FINISHED write counts as present (PR #422 review, second pass):
+    # remember_point upserts with pending=True and clears it in a second
+    # call, so a run whose second call failed leaves the id in the target
+    # with pending=True -- hidden from recall and wipe (see _scope_filter /
+    # _own_repo_filter). Counting that as already_present would make it
+    # permanent; leaving it out lets the next run rewrite the same id and
+    # finish it. Hence payload is fetched (the pending flag only).
+    present: set = set()
+    if candidates and call_with_retry(client.collection_exists, target_backing):
+        ids = [c[0] for c in candidates]
+        for start in range(0, len(ids), _SCROLL_BATCH_SIZE):
+            found = call_with_retry(
+                client.retrieve,
+                collection_name=target_backing,
+                ids=ids[start:start + _SCROLL_BATCH_SIZE],
+                with_payload=[PENDING_FIELD],
+                with_vectors=False,
+            )
+            for record in found:
+                meta = (record.payload or {}).get("metadata")
+                if isinstance(meta, dict) and meta.get("pending") is True:
+                    continue
+                present.add(str(record.id))
+
+    for target_id, scope, point in candidates:
+        if target_id in present:
+            report["already_present"] += 1
+            continue
+        if dry_run:
+            report[bucket][scope] += 1
+            continue
+        try:
+            _, _, mismatch = await remember_point(
+                client, embedding_provider, target_backing,
+                summary=point["summary"],
+                description=point["description"],
+                kind=point["kind"],
+                repo=GENERAL_REPO if scope == "general" else caller_repo,
+                embedding_model=embedding_model,
+                weight=point["weight"],
+                point_id=target_id,
+            )
+        except Exception as e:  # one bad point must not abort the whole run
+            report["errors"].append({"id": point["id"], "error": f"write failed: {e}"})
+            continue
+        if mismatch:
+            report["error"] = mismatch
+            return report
+        report[bucket][scope] += 1
+    return report
 
 
 def count_memory_bank_points(client: "QdrantClient", collection: str, repo: Optional[str] = None) -> int:

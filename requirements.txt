@@ -22,7 +22,7 @@ qdrant-client
 fastembed
 pydantic_settings
 
-# Local-compress piece (compress_mcp_server.py, hooks/compress_bash_output.py,
+# Local-compress piece (compress_mcp_server.py, hooks/compress_output.py,
 # hooks/redirect_webfetch_to_fetch_url.py) -- only needed if you're using that
 # piece. If compress_mcp_server.py fails to start with "MCP error -32000:
 # Connection closed" in Claude Code, run it directly
