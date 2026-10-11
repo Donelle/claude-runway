@@ -15,7 +15,7 @@ local model is actually reachable right now. That's enough to enforce
 deterministically, unlike "should this have been qdrant-find" which has no
 equivalent signal.
 
-Mechanism: unlike the compress_bash_output.py PostToolUse hook (which can
+Mechanism: unlike the compress_output.py PostToolUse hook (which can
 only rewrite output after the fact), this is a PreToolUse hook -- it can
 outright prevent the WebFetch call from running at all via
 `permissionDecision: "deny"`, with `permissionDecisionReason` fed back to
@@ -98,7 +98,7 @@ import sqlite3
 import sys
 from typing import NoReturn
 
-# Same redundant resolution order as compress_bash_output.py -- see that
+# Same redundant resolution order as compress_output.py -- see that
 # file's comment for the full bug history this guards against. libs/ under
 # the repo root is checked first (real layout); repo root itself is kept as
 # a fallback for backward compatibility.
@@ -392,7 +392,52 @@ def _deny(reason: str) -> NoReturn:
     sys.exit(0)
 
 
+def _deny_reason(url: str, prompt: str) -> str:
+    """
+    The message Claude (and the user, in the transcript) sees on a deny.
+
+    Says plainly that this is claude-runway's own routing rule, not a block
+    on this particular site: the earlier "unavailable for this URL by
+    policy" wording read like a site-specific security policy, when the hook
+    actually denies every WebFetch while LM Studio is up.
+
+    The fallback covers ANY fetch_url failure, not just the auth/JS/cookie
+    cases the earlier wording listed -- a 403 from a bot-blocking site, a
+    timeout or an empty extraction leaves Claude with nothing either, and
+    the one-shot retry skip in main() allows WebFetch through regardless of
+    why fetch_url failed. It also covers a caller that has no fetch_url
+    tool at all (a subagent with a restricted tool list), which otherwise
+    has no way forward except retrying WebFetch, and the verbatim-text case
+    fetch_url's own docstring already sends back to WebFetch.
+    """
+    return (
+        "claude-runway routes web fetches through the local model while LM Studio is "
+        "running, so this WebFetch call was redirected (this is not a block on this site). "
+        "Call the fetch_url tool from the local-compress MCP server now, without asking the "
+        f"user first. Use url={url!r} and pass the same intent via its `focus` parameter "
+        f"(e.g. focus={prompt!r} if that captures what you're looking for). Retry the "
+        "original WebFetch call for this URL instead, and it will be allowed through, if "
+        "any of these hold: fetch_url returns an error of any kind (HTTP error, timeout, "
+        "nothing extracted, or a page needing authentication, JavaScript rendering, or "
+        "cookies); fetch_url is not in your tool list; or you need the page's exact text "
+        "verbatim. Do not stop and ask the user; just proceed."
+    )
+
+
 def main():
+    # Force UTF-8 on stdin before the read: Claude Code sends the payload as
+    # UTF-8, but Windows Python defaults stdin to the locale codepage
+    # (cp1252), under which a cp1252-unmappable byte raises UnicodeDecodeError
+    # -- a ValueError the guard below swallows into a silent fail-open, so the
+    # WebFetch redirect would stop firing for exactly those payloads (issue
+    # #263). Guarded because a non-reconfigurable stream (e.g. io.StringIO in
+    # the unit tests) has no reconfigure(); fail open rather than crash.
+    _reconfigure = getattr(sys.stdin, "reconfigure", None)
+    if _reconfigure is not None:
+        try:
+            _reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass  # already-consumed/detached stream -- fail open
     try:
         payload = json.load(sys.stdin)
     except (json.JSONDecodeError, ValueError):
@@ -430,16 +475,7 @@ def main():
     if not _denied_url_cache.record_denied(url):
         _allow()
 
-    _deny(
-        f"WebFetch is unavailable for this URL by policy. Immediately call the fetch_url tool "
-        f"from the local-compress MCP server instead -- do NOT ask the user for confirmation "
-        f"first, just call it now. Use url={url!r} and pass the same intent via its `focus` "
-        f"parameter (e.g. focus={prompt!r} if that captures what you're looking for). If "
-        "fetch_url itself then errors because the page needs authentication, JavaScript "
-        "rendering, or session/cookie handling, immediately retry the original WebFetch call "
-        "for this URL -- the hook will allow it through on that retry. Do NOT stop and ask the "
-        "user; just proceed: fetch_url first, and if that errors, WebFetch next."
-    )
+    _deny(_deny_reason(url, prompt))
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@ declined migration reappearing on the next run.
 
 Also pins the specific real-world regression `_apply_record_session_id_
 hooks_missing`'s own docstring describes: a project that adopted
-local-compress BEFORE #198 shipped has a REAL `compress_bash_output.py`
+local-compress BEFORE #198 shipped has a REAL `compress_output.py`
 PostToolUse block and no core block at all -- applying this migration must
 ADD the core block without touching that existing one.
 """
@@ -218,7 +218,7 @@ class RecordSessionIdHooksMissing(unittest.TestCase):
         settings_json = {
             "hooks": {
                 "PostToolUse": [
-                    {"matcher": "Bash", "hooks": [{"type": "command", "command": "x", "args": ["/x/hooks/compress_bash_output.py"]}]}
+                    {"matcher": "Bash", "hooks": [{"type": "command", "command": "x", "args": ["/x/hooks/compress_output.py"]}]}
                 ]
             }
         }
@@ -248,7 +248,7 @@ class RecordSessionIdHooksMissing(unittest.TestCase):
     def test_apply_adds_core_blocks_without_touching_existing_compress_hook(self):
         # Regression guard for the exact scenario _apply_record_session_id_
         # hooks_missing's own docstring describes: a pre-#198 project with a
-        # REAL compress_bash_output.py PostToolUse block and NO core block.
+        # REAL compress_output.py PostToolUse block and NO core block.
         # A naive merge_settings_hooks-based apply would delete this block --
         # this must not happen.
         migration = _migration("record-session-id-hooks-missing")
@@ -258,7 +258,7 @@ class RecordSessionIdHooksMissing(unittest.TestCase):
                 {
                     "type": "command",
                     "command": "/old/venv/bin/python",
-                    "args": ["/old/tools-repo/hooks/compress_bash_output.py"],
+                    "args": ["/old/tools-repo/hooks/compress_output.py"],
                 }
             ],
         }
@@ -434,7 +434,7 @@ class RecordSessionIdSessionstart(unittest.TestCase):
         settings_json = {
             "hooks": {
                 "PostToolUse": [
-                    {"matcher": "Bash|Grep", "hooks": [{"args": ["/x/hooks/compress_bash_output.py"]}]}
+                    {"matcher": "Bash|Grep", "hooks": [{"args": ["/x/hooks/compress_output.py"]}]}
                 ],
                 "SessionStart": [{"hooks": [{"args": ["/x/hooks/record_session_id.py"]}]}],
                 "SessionEnd": [{"hooks": [{"args": ["/x/hooks/record_session_id.py"]}]}],
@@ -472,7 +472,7 @@ class RecordSessionIdSessionstart(unittest.TestCase):
         }
         compress_block = {
             "matcher": "Bash|Grep",
-            "hooks": [{"type": "command", "command": "/old/python", "args": ["/old/hooks/compress_bash_output.py"]}],
+            "hooks": [{"type": "command", "command": "/old/python", "args": ["/old/hooks/compress_output.py"]}],
         }
         before_settings = {
             "hooks": {
@@ -592,15 +592,63 @@ class RecordSessionIdSessionstart(unittest.TestCase):
         self.assertFalse(migration.detect({}, after_settings))
 
 
+class LocalCompressEmbeddingModelMissing(unittest.TestCase):
+    """Issue #397: existing installs stored compacts with BAAI/bge-small-en
+    (the server used to hardcode it), so the migration must pin THAT, never
+    the new template default, or their compact history is orphaned."""
+
+    def _migration(self):
+        return _migration("local-compress-embedding-model-missing")
+
+    def test_detect_true_when_env_lacks_embedding_model(self):
+        mcp_json = {"mcpServers": {"local-compress": {"env": {"COMPACT_COLLECTION": "c"}}}}
+        self.assertTrue(self._migration().detect(mcp_json, {}))
+
+    def test_detect_true_when_embedding_model_is_blank(self):
+        mcp_json = {"mcpServers": {"local-compress": {"env": {"EMBEDDING_MODEL": "  "}}}}
+        self.assertTrue(self._migration().detect(mcp_json, {}))
+
+    def test_detect_false_when_set(self):
+        mcp_json = {"mcpServers": {"local-compress": {"env": {"EMBEDDING_MODEL": "x/y"}}}}
+        self.assertFalse(self._migration().detect(mcp_json, {}))
+
+    def test_detect_false_without_a_local_compress_block(self):
+        self.assertFalse(self._migration().detect({"mcpServers": {"qdrant": {}}}, {}))
+
+    def test_apply_pins_the_legacy_model_and_touches_nothing_else(self):
+        before = {
+            "mcpServers": {
+                "qdrant": {"env": {"EMBEDDING_MODEL": "sentence-transformers/all-MiniLM-L6-v2"}},
+                "local-compress": {"env": {"COMPACT_COLLECTION": "custom-prefix"}},
+            }
+        }
+        snapshot = copy.deepcopy(before)
+        after_mcp, after_settings = self._migration().apply(before, {}, _ctx())
+        env = after_mcp["mcpServers"]["local-compress"]["env"]
+        self.assertEqual(env["EMBEDDING_MODEL"], "BAAI/bge-small-en")
+        self.assertEqual(env["COMPACT_COLLECTION"], "custom-prefix")
+        self.assertEqual(after_mcp["mcpServers"]["qdrant"], before["mcpServers"]["qdrant"])
+        self.assertEqual(after_settings, {})
+        self.assertEqual(before, snapshot)  # never mutated in place
+        self.assertFalse(self._migration().detect(after_mcp, {}))
+
+
 class PendingMigrations(unittest.TestCase):
     def test_all_pending_on_a_fully_stale_project(self):
         # A project with the old PostToolUse '.*' block (issue #198 config)
         # plus no memory-bank / HF_HUB_OFFLINE: all four migrations pending.
-        mcp_json = {"mcpServers": {"qdrant": {"env": {}}, "codebase-indexer": {"env": {}}}}
+        mcp_json = {
+            "mcpServers": {
+                "qdrant": {"env": {}},
+                "codebase-indexer": {"env": {}},
+                "local-compress": {"env": {}},
+            }
+        }
         settings_json = {
             "hooks": {
                 "PostToolUse": [
-                    {"matcher": ".*", "hooks": [{"args": ["/x/hooks/record_session_id.py"]}]}
+                    {"matcher": ".*", "hooks": [{"args": ["/x/hooks/record_session_id.py"]}]},
+                    {"matcher": "Bash", "hooks": [{"args": ["/x/hooks/compress_bash_output.py"]}]},
                 ]
             }
         }
@@ -686,6 +734,8 @@ class RunUpgradeEndToEnd(unittest.TestCase):
                             "env": {"QDRANT_URL": "http://localhost:6333", "COLLECTION_NAME": "my-target-project"},
                         },
                         "codebase-indexer": {"env": {"COLLECTION_NAME": "my-target-project"}},
+                        # Pre-#397: no EMBEDDING_MODEL in the local-compress env.
+                        "local-compress": {"env": {"COMPACT_COLLECTION": "conversation-compacts"}},
                     }
                 }
             ),
@@ -755,14 +805,14 @@ class RunUpgradeEndToEnd(unittest.TestCase):
             for a in hook["args"]
         ]
         self.assertIn("record_session_id.py", start_scripts)
-        # compress_bash_output.py's PostToolUse block is still intact.
+        # compress_output.py's PostToolUse block is still intact.
         post_scripts = [
             Path(a).name
             for block in settings_json["hooks"]["PostToolUse"]
             for hook in block["hooks"]
             for a in hook["args"]
         ]
-        self.assertIn("compress_bash_output.py", post_scripts)
+        self.assertIn("compress_output.py", post_scripts)
         # The stale '.*' PostToolUse block for record_session_id.py was removed.
         wildcard_scripts = [
             Path(a).name
@@ -956,6 +1006,111 @@ class RunUpgradeWritesOnlyChangedFiles(unittest.TestCase):
         self.assertEqual(applied, [])
         self.assertEqual(self.settings_path.read_text(encoding="utf-8"), settings_text)
         self.assertEqual(self.mcp_path.read_text(encoding="utf-8"), self._MCP_COMPACT)
+
+
+class CompressHookRenamed(unittest.TestCase):
+    """Issue #395: compress_bash_output.py -> compress_output.py."""
+
+    OLD = "/old/tools-repo/hooks/compress_bash_output.py"
+    NEW = "/old/tools-repo/hooks/compress_output.py"
+
+    def _settings(self, blocks):
+        return {"hooks": {"PostToolUse": blocks}}
+
+    def test_detect_true_for_old_name_false_for_new(self):
+        m = _migration("compress-hook-renamed")
+        old = self._settings([{"matcher": "Bash", "hooks": [{"command": "py", "args": [self.OLD]}]}])
+        new = self._settings([{"matcher": "Bash", "hooks": [{"command": "py", "args": [self.NEW]}]}])
+        self.assertTrue(m.detect({}, old))
+        self.assertFalse(m.detect({}, new))
+        self.assertFalse(m.detect({}, {}))
+
+    def test_apply_rewrites_only_the_filename_keeping_everything_else(self):
+        m = _migration("compress-hook-renamed")
+        block = {
+            "matcher": "Bash|Grep|custom",
+            "hooks": [
+                {"type": "command", "command": "/v/python", "args": [self.OLD]},
+                {"type": "command", "command": "mine", "args": ["--flag"]},
+            ],
+        }
+        settings = self._settings([block])
+        before = copy.deepcopy(settings)
+        _, out = m.apply({}, settings, _ctx())
+        self.assertEqual(settings, before, "apply must not mutate its input")
+        got = out["hooks"]["PostToolUse"]
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["matcher"], "Bash|Grep|custom")
+        self.assertEqual(got[0]["hooks"][0]["args"], [self.NEW])
+        self.assertEqual(got[0]["hooks"][0]["command"], "/v/python")
+        self.assertEqual(got[0]["hooks"][1], {"type": "command", "command": "mine", "args": ["--flag"]})
+        self.assertFalse(m.detect({}, out))
+
+    def test_apply_is_idempotent(self):
+        m = _migration("compress-hook-renamed")
+        settings = self._settings([{"hooks": [{"args": [self.OLD]}]}])
+        _, once = m.apply({}, settings, _ctx())
+        _, twice = m.apply({}, once, _ctx())
+        self.assertEqual(once, twice)
+
+    def test_does_not_touch_other_events_hooks(self):
+        m = _migration("compress-hook-renamed")
+        settings = {
+            "hooks": {
+                "PostToolUse": [{"hooks": [{"args": [self.OLD]}]}],
+                "SessionEnd": [{"hooks": [{"args": ["/x/hooks/session_end_savings.py"]}]}],
+            }
+        }
+        _, out = m.apply({}, settings, _ctx())
+        self.assertEqual(out["hooks"]["SessionEnd"], settings["hooks"]["SessionEnd"])
+
+    def test_drops_stale_duplicate_when_new_name_already_registered(self):
+        m = _migration("compress-hook-renamed")
+        settings = self._settings(
+            [
+                {"matcher": "Bash", "hooks": [{"args": [self.OLD]}]},
+                {"matcher": "Bash", "hooks": [{"args": [self.NEW]}]},
+            ]
+        )
+        _, out = m.apply({}, settings, _ctx())
+        self.assertEqual(out["hooks"]["PostToolUse"], [{"matcher": "Bash", "hooks": [{"args": [self.NEW]}]}])
+
+    def test_legacy_hook_with_a_different_matcher_is_renamed_not_dropped(self):
+        # Copilot review (PR #402): a legacy Bash block next to a new-named
+        # Grep block is not a duplicate; dropping it disabled Bash compression.
+        m = _migration("compress-hook-renamed")
+        settings = self._settings(
+            [
+                {"matcher": "Bash", "hooks": [{"args": [self.OLD]}]},
+                {"matcher": "Grep", "hooks": [{"args": [self.NEW]}]},
+            ]
+        )
+        _, out = m.apply({}, settings, _ctx())
+        self.assertEqual(
+            out["hooks"]["PostToolUse"],
+            [
+                {"matcher": "Bash", "hooks": [{"args": [self.NEW]}]},
+                {"matcher": "Grep", "hooks": [{"args": [self.NEW]}]},
+            ],
+        )
+
+    def test_duplicate_drop_keeps_a_block_that_still_holds_other_hooks(self):
+        m = _migration("compress-hook-renamed")
+        settings = self._settings(
+            [
+                {"hooks": [{"args": [self.OLD]}, {"args": ["--mine"]}]},
+                {"hooks": [{"args": [self.NEW]}]},
+            ]
+        )
+        _, out = m.apply({}, settings, _ctx())
+        self.assertEqual(out["hooks"]["PostToolUse"][0]["hooks"], [{"args": ["--mine"]}])
+
+    def test_setup_lib_still_recognizes_the_legacy_name_as_toolkit_owned(self):
+        """setup_project_lib must still RECOGNIZE the old name as toolkit-owned."""
+        from setup_project_lib import _is_toolkit_owned_hook
+
+        self.assertTrue(_is_toolkit_owned_hook({"args": [self.OLD]}))
+        self.assertTrue(_is_toolkit_owned_hook({"args": [self.NEW]}))
 
 
 if __name__ == "__main__":

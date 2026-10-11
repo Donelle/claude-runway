@@ -49,13 +49,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping, Optional
 
+from setup_project_lib import LEGACY_COMPRESS_HOOK_SCRIPT
+
 DEFAULT_LMSTUDIO_URL = "http://localhost:1234/v1"
 _AUTO_DETECT_MODEL = "(auto-detect -- no model pinned)"
 
 # Every CLAUDE_RUNWAY_* var README's env-var table marks "both" -- i.e.
 # genuinely needs matching values in .mcp.json's local-compress env block
 # AND the shell. Deliberately excluded from this list:
-# - CLAUDE_RUNWAY_COMPRESS_THRESHOLD_CHARS: shell-only (compress_bash_output.py
+# - CLAUDE_RUNWAY_COMPRESS_THRESHOLD_CHARS: shell-only (compress_output.py
 #   is the sole reader); an .mcp.json copy is inert.
 # - CLAUDE_RUNWAY_CACHE_DB: read by both codebase-indexer MCP server AND
 #   redirect_webfetch_to_fetch_url.py hook (issue #64). Shell export is the
@@ -289,6 +291,45 @@ class DoctorResult:
     local_compress_configured: bool
     mismatches: list = field(default_factory=list)
     config_error: Optional[str] = None
+    # Hook events in .claude/settings.json still invoking the pre-#395
+    # compress_bash_output.py (see find_legacy_compress_hook_events).
+    legacy_compress_hook_events: list = field(default_factory=list)
+
+
+def find_legacy_compress_hook_events(target_repo: Path) -> list:
+    """
+    Event names (e.g. "PostToolUse") in `target_repo`'s
+    `.claude/settings.json` with a hook still invoking the old
+    `compress_bash_output.py` (renamed to `compress_output.py`, issue #395 --
+    the old path no longer exists, so that hook now errors on every call).
+    Best-effort and read-only: a missing/unreadable/oddly-shaped settings
+    file yields `[]` rather than an error, since this check is an extra on
+    top of the .mcp.json check and `.claude/settings.json` is optional
+    (`--skip-hooks`). `upgrade` is the fix; this only reports.
+    """
+    settings_path = Path(target_repo) / ".claude" / "settings.json"
+    try:
+        with open(settings_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return []
+    hooks = data.get("hooks") if isinstance(data, dict) else None
+    if not isinstance(hooks, dict):
+        return []
+    events = []
+    for event, blocks in hooks.items():
+        if not isinstance(blocks, list):
+            continue
+        for block in blocks:
+            inner = block.get("hooks") if isinstance(block, dict) else None
+            for hook in inner if isinstance(inner, list) else []:
+                args = hook.get("args") if isinstance(hook, dict) else None
+                if isinstance(args, list) and any(
+                    isinstance(a, str) and Path(a).name == LEGACY_COMPRESS_HOOK_SCRIPT for a in args
+                ):
+                    if event not in events:
+                        events.append(event)
+    return events
 
 
 def run_doctor(target_repo: Path, *, shell_env: Mapping[str, str], home_dir: Optional[Path] = None) -> DoctorResult:
@@ -303,7 +344,15 @@ def run_doctor(target_repo: Path, *, shell_env: Mapping[str, str], home_dir: Opt
         env = load_local_compress_env(mcp_json_path)
     except MalformedMcpJsonError as exc:
         return DoctorResult(mcp_json_path=mcp_json_path, local_compress_configured=False, config_error=str(exc))
+    legacy_events = find_legacy_compress_hook_events(Path(target_repo))
     if env is None:
-        return DoctorResult(mcp_json_path=mcp_json_path, local_compress_configured=False)
+        return DoctorResult(
+            mcp_json_path=mcp_json_path, local_compress_configured=False, legacy_compress_hook_events=legacy_events
+        )
     mismatches = check_dual_env_vars(env, shell_env, home_dir=resolved_home)
-    return DoctorResult(mcp_json_path=mcp_json_path, local_compress_configured=True, mismatches=mismatches)
+    return DoctorResult(
+        mcp_json_path=mcp_json_path,
+        local_compress_configured=True,
+        mismatches=mismatches,
+        legacy_compress_hook_events=legacy_events,
+    )

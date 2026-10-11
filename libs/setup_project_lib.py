@@ -64,14 +64,13 @@ def default_collection_name(repo_path: Path) -> str:
     Derive a Qdrant collection name suggestion from the target repo's own
     directory name, e.g. "My Cool App!" -> "my-cool-app".
 
-    This is only a convenience DEFAULT, not a collision-proofed identifier
-    the way tools/compress_mcp_server.py's `_sanitize_project` is (that one
-    hashes the original string to guard against a *silent* same-name
-    collision for the auto-managed conversation-compacts collection, since
-    nothing else would ever surface that collision to a human). Here, by
-    contrast, the collection name is a one-time, visible choice a human
-    reviews in the generated `.mcp.json` before ever committing it -- so a
-    plain, readable slug is more useful than an opaque hash suffix. Pass
+    This is only a convenience DEFAULT, not a collision-proofed identifier.
+    tools/compress_mcp_server.py's `_sanitize_project` is not one either: it
+    appends no hash, so names differing only in punctuation/whitespace map to
+    the same conversation-compacts collection, and per-project isolation there
+    comes from payload filtering on read/prune. Here the collection name is a
+    one-time, visible choice a human reviews in the generated `.mcp.json`
+    before ever committing it -- so a plain, readable slug is what we want. Pass
     `--collection-name` explicitly if this default would collide with an
     already-indexed project's collection on the same Qdrant instance.
     """
@@ -179,6 +178,7 @@ def build_mcp_servers(
     hf_hub_offline: bool = False,
     embedding_model: str = "",
     memory_bank_embedding_model: str = "",
+    compact_embedding_model: str = "",
 ) -> dict:
     """
     Returns a fresh `mcpServers` dict (deep-copied from `template`, never
@@ -189,9 +189,10 @@ def build_mcp_servers(
 
     `compact_collection`, if blank, defaults to the template's own historical
     "conversation-compacts" -- a single bucket shared by every project on
-    the machine, with per-project isolation coming entirely from
-    compress_mcp_server.py's own `_sanitize_project`+hash suffix at runtime
-    (see `_collections_for_project`'s sibling-scan there, which finds other
+    the machine. This is a shared base prefix: compress_mcp_server.py
+    appends the sanitized project name at runtime, and per-project isolation
+    comes from its payload filtering on read/prune, not from the name being
+    unique (see `_collections_for_project`'s sibling-scan there, which finds other
     collections for the same project by matching this exact prefix).
     Deliberately NOT derived from `collection_name` here the way
     `COLLECTION_NAME` on the qdrant/codebase-indexer servers is: found in
@@ -225,7 +226,7 @@ def build_mcp_servers(
     fallback only fires when the key is genuinely ABSENT, not when it's
     present-but-empty -- an explicit `.mcp.json` env entry set to `""`
     would otherwise build a collection name with a leading stray hyphen
-    (`-<sanitized-project>-<hash8>`).
+    (`-<sanitized-project>`).
 
     `memory_bank_collection`, if blank, defaults to the template's own
     literal `"memory-bank"` -- the ONE collection every project's
@@ -288,6 +289,12 @@ def build_mcp_servers(
     (same "present-but-blank, not absent" convention as
     `CLAUDE_RUNWAY_TRACK_SAVINGS`/`compact_collection`/etc. above) --
     `False` writes an explicit empty string, not a missing key.
+
+    `compact_embedding_model` (issue #397) is the `local-compress` block's own
+    `EMBEDDING_MODEL`, deliberately separate from `embedding_model`: compacts
+    are stored under a model-named vector, so changing it orphans an existing
+    install's compacts. Blank leaves the template default. `run_setup` decides
+    what to pass (see `resolve_compact_embedding_model`).
 
     `embedding_model` (issue #279), if blank, leaves the template's own
     `EMBEDDING_MODEL` default in place; otherwise it is written into every
@@ -362,6 +369,11 @@ def build_mcp_servers(
         compress["env"]["CLAUDE_RUNWAY_TRACK_SAVINGS"] = "1" if track_savings else ""
         compress["env"]["CLAUDE_RUNWAY_SAVINGS_DB"] = savings_db
         compress["env"]["COMPACT_COLLECTION"] = compact_collection or "conversation-compacts"
+        # Issue #397: the compact embedding model is its own value, never
+        # blindly the template's -- changing it orphans existing compacts.
+        # Blank leaves the template default (a brand-new install).
+        if compact_embedding_model:
+            compress["env"]["EMBEDDING_MODEL"] = compact_embedding_model
     else:
         del servers["local-compress"]
 
@@ -410,6 +422,35 @@ def resolve_embedding_model(explicit: str, existing_mcp: dict, template_default:
     return (explicit or "").strip() or existing_embedding_model(existing_mcp) or template_default
 
 
+# What an install that predates the local-compress `EMBEDDING_MODEL` setting
+# (issue #397) actually stored its compacts with -- must match
+# `compress_mcp_server.LEGACY_COMPACT_EMBEDDING_MODEL`. Full model id, never
+# the short name.
+LEGACY_COMPACT_EMBEDDING_MODEL = "BAAI/bge-small-en"
+
+
+def resolve_compact_embedding_model(existing_mcp: dict, project_model: str) -> str:
+    """
+    Which `EMBEDDING_MODEL` a (re-)run of `init` writes into `local-compress`
+    (issue #397). Unlike the code-index model there is no explicit-override
+    flag: changing it only ever orphans stored compacts, so a re-run must
+    never do that on its own:
+      1. an existing `local-compress` block's own non-blank value is kept;
+      2. an existing block WITHOUT one predates the setting, so its compacts
+         were stored under the legacy model -- pin that;
+      3. no block at all (a brand-new install) uses the project model.
+    """
+    servers = existing_mcp.get("mcpServers") if isinstance(existing_mcp, dict) else None
+    block = servers.get("local-compress") if isinstance(servers, dict) else None
+    if not isinstance(block, dict):
+        return project_model
+    env = block.get("env")
+    value = env.get("EMBEDDING_MODEL") if isinstance(env, dict) else None
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return LEGACY_COMPACT_EMBEDDING_MODEL
+
+
 # (event, script filename) for every hook this toolkit's templates define,
 # split into two groups (issue #198, #231):
 #   - _CORE_HOOK_SCRIPTS: written for EVERY project regardless of
@@ -433,11 +474,21 @@ _CORE_HOOK_SCRIPTS = (
     ("SessionEnd", "record_session_id.py"),
 )
 _COMPRESS_HOOK_SCRIPTS = (
-    ("PostToolUse", "compress_bash_output.py"),
+    ("PostToolUse", "compress_output.py"),
     ("PreToolUse", "redirect_webfetch_to_fetch_url.py"),
     ("SessionEnd", "session_end_savings.py"),
 )
 _TOOLKIT_HOOK_SCRIPTS = _CORE_HOOK_SCRIPTS + _COMPRESS_HOOK_SCRIPTS
+
+# The compress hook's pre-#395 filename. Existing installs' settings.json
+# still reference it, so it must stay RECOGNIZED as toolkit-owned (otherwise
+# `init` would treat that block as a user's own hook and append a second,
+# new-named block beside it, double-compressing every tool call). It is
+# deliberately NOT in _COMPRESS_HOOK_SCRIPTS: nothing generates it anymore.
+# Shared with upgrade_lib (the rename migration) and doctor_lib (the stale-
+# registration check) so the three can't disagree about the old name.
+LEGACY_COMPRESS_HOOK_SCRIPT = "compress_bash_output.py"
+COMPRESS_HOOK_SCRIPT = "compress_output.py"
 
 
 def _find_and_patch_block(blocks: list, script_name: str, *, command: str, args: list) -> bool:
@@ -568,7 +619,7 @@ def merge_mcp_json(existing: dict, generated_servers: dict, *, owned_keys: tuple
 
 # Every script filename (basename, not full path) this toolkit's hooks
 # generate -- used by _is_toolkit_owned_hook below.
-_TOOLKIT_HOOK_SCRIPT_NAMES = frozenset(name for _, name in _TOOLKIT_HOOK_SCRIPTS)
+_TOOLKIT_HOOK_SCRIPT_NAMES = frozenset(name for _, name in _TOOLKIT_HOOK_SCRIPTS) | {LEGACY_COMPRESS_HOOK_SCRIPT}
 
 
 def _is_toolkit_owned_hook(hook: dict) -> bool:
@@ -599,7 +650,7 @@ def _strip_toolkit_owned_inner_hooks(block: dict) -> Optional[dict]:
     Operates at INNER-HOOK granularity, not whole-BLOCK granularity, because
     a single block's "hooks" list can hold more than one entry sharing the
     same matcher -- e.g. a user manually adding their own custom hook
-    alongside this toolkit's `compress_bash_output.py` entry in the SAME
+    alongside this toolkit's `compress_output.py` entry in the SAME
     block object, rather than as a separate top-level block. Found in PR
     #113 review and confirmed by reproducing it directly: an earlier
     whole-block check discarded that entire block -- including the user's
@@ -661,7 +712,7 @@ def strip_toolkit_hooks(existing: dict) -> dict:
     correctly omitted `local-compress` from the generated `.mcp.json` (see
     merge_mcp_json), but previously left settings.json completely untouched
     either way, so a repo that had a prior FULL setup (local-compress +
-    hooks) still had compress_bash_output.py/session_end_savings.py firing
+    hooks) still had compress_output.py/session_end_savings.py firing
     on every matching event, and the PreToolUse hook still denying WebFetch
     and redirecting to a `fetch_url` tool that's no longer configured --
     both silently broken rather than genuinely "qdrant only".
@@ -973,6 +1024,7 @@ def run_setup(
         hf_hub_offline=hf_hub_offline,
         embedding_model=resolved_embedding_model,
         memory_bank_embedding_model=shared_memory_bank_model,
+        compact_embedding_model=resolve_compact_embedding_model(existing_mcp, resolved_embedding_model),
     )
     unresolved = find_unresolved_placeholders(generated_servers)
     if unresolved:

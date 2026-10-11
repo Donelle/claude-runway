@@ -1,9 +1,10 @@
 # Development workflow for this repo
 
-Separately from the `skills/` directory (see the [Files](../README.md#files-34) table) (which ships product features that get installed into *other* projects), this repo also carries its own contributor-facing skills in `.claude/skills/` — project-scoped, so they only work inside claude-runway itself, and hardcode this repo's own coordinates (`Donelle/claude-runway`) rather than trying to be generic. They're the recommended way to work an issue end to end, and are the ideal shape for this project's own development cycle.
+Separately from the `skills/` directory (see the [Files](../README.md#files) table — it ships product features that get installed into *other* projects), this repo also carries its own contributor-facing skills in `.claude/skills/` — project-scoped, so they only work inside claude-runway itself, and hardcode this repo's own coordinates (`Donelle/claude-runway`) rather than trying to be generic. They're the recommended way to work an issue end to end, and are the ideal shape for this project's own development cycle.
 
 | Skill | Invocation | What it does |
 |---|---|---|
+| `my-gh-triage` | `/my-gh-triage <paste the error, symptom, or question>` | For a reported symptom rather than a ready ticket. Runs four gates in order: investigate read-only (source, intent, whether it works, `file:line` evidence, parity across checkouts), state one verdict and one recommended fix, file a ticket via `/my-gh-create-issue` only when there is a concrete change to make (after a duplicate search), then work it now via `/my-gh-code-it` only if it is P0/P1 or small and low risk, unassigned, and needs no design call. |
 | `my-gh-create-issue` | `/my-gh-create-issue type=bug theme=theme-savings-tracker priority=priority-p1 <description>` | Investigates a described bug/idea first (reproduces it or confirms it by reading the actual code — never files a claim that wasn't checked), then files a GitHub issue in the exact format the existing backlog uses: a **Location**/**Suggested fix** (bug) or **Sanity-checked**/**Proposal** (enhancement) body, labeled by type (`bug`/`enhancement`/`documentation`), `priority-p{0-3}`, and `theme-*`. Missing `type`/`theme`/`priority` get inferred and confirmed rather than guessed silently. |
 | `my-gh-code-it` | `/my-gh-code-it 21` | Fetches the GitHub issue, sets its type (`Bug`/`Feature`/`Task`, from labels) and assignee, creates a **native GitHub linked branch** (`gh issue develop`) following this repo's `fix/`/`feature/` naming convention, then plans the fix (seeded from the issue's own **Location**/**Suggested fix** sections) and waits for approval before writing any code. |
 | `my-gh-pr` | `/my-gh-pr 21` | Opens the PR (`Fixes #21` in the body, so merging auto-closes the issue) and posts research/plan/validate artifacts as **comments on the issue** — the closest GitHub-native equivalent to attaching RPIV artifacts to a ticket, since GitHub has no generic file-attachment API for issues. |
@@ -12,6 +13,35 @@ Separately from the `skills/` directory (see the [Files](../README.md#files-34) 
 | `my-gh-load-context` | `/my-gh-load-context` | Loads full project context by reading `README.md`, `docs/`, `EVALUATION.md`, and — when present locally (both are gitignored, so a fresh checkout won't have them) — `CLAUDE.md` and `.plans/`. Checks what it read against the repo's actual current state (skill inventories, `EVALUATION.md` track status, `.plans/` vs. issue closure) and reports mismatches as a TODO instead of trusting the docs, then proposes resuming any clear in-progress work or asks what's next. |
 
 ## Developer setup (running from a clone)
+
+### macOS and Linux
+
+From a shell in the repository, run the bootstrap script:
+
+```bash
+./scripts/bootstrap.sh
+```
+
+It checks for Python 3.12 (through `uv` or a `python3.12` on `PATH`), creates `.venv` if needed, installs `requirements.txt` and `requirements-dev.txt` plus this checkout's command-line tools, runs `git config core.hooksPath .githooks` (git doesn't let a repo set this for itself, so each clone opts in once), and runs the doctor check. Re-running it is safe: it won't touch a correct `.venv` or an already-set hooks path, and it stops with a message, rather than deleting anything, if an existing `.venv` is the wrong Python version or layout.
+
+Manual fallback:
+
+```bash
+# With uv:
+uv venv --python 3.12
+uv pip install --python .venv/bin/python -r requirements.txt --index-url https://pypi.org/simple
+uv pip install --python .venv/bin/python -r requirements-dev.txt --index-url https://pypi.org/simple
+uv pip install --python .venv/bin/python --no-deps --no-build-isolation .
+
+# Without uv: python3.12 -m venv .venv, then the same installs through .venv/bin/python -m pip.
+
+git config core.hooksPath .githooks
+.venv/bin/claude-runway-doctor .
+```
+
+**Verification:** Linux only (see the PR for #31 for the run details); macOS has not been run. The steps most likely to differ there are the `python3.12` name under Homebrew and the system `git`/`uv` versions.
+
+### Windows
 
 From a Windows PowerShell prompt in the repository, run the bootstrap script:
 
@@ -55,7 +85,7 @@ git config core.hooksPath .githooks
 .\.venv\Scripts\claude-runway-doctor.exe .
 ```
 
-**Recommended cycle:** `/my-gh-create-issue` to file new work in the same verified, labeled format as the existing backlog → pick an open issue → `/my-gh-code-it {N}` to implement it → `/my-gh-pr {N}` to open the PR and document it against the issue → `/my-gh-pr-feedback` to work through review comments as they come in. This is exactly how the code-review backlog filed against this repo (see `.plans/` locally, or the repo's GitHub issues) is meant to be worked one item at a time — and how new items should keep getting added to it. `/my-gh-autowork` runs this same cycle without stopping between steps, once told to.
+**Recommended cycle:** `/my-gh-triage` when starting from a symptom instead of a known change → `/my-gh-create-issue` to file new work in the same verified, labeled format as the existing backlog → pick an open issue → `/my-gh-code-it {N}` to implement it → `/my-gh-pr {N}` to open the PR and document it against the issue → `/my-gh-pr-feedback` to work through review comments as they come in. This is exactly how the code-review backlog filed against this repo (see `.plans/` locally, or the repo's GitHub issues) is meant to be worked one item at a time — and how new items should keep getting added to it. `/my-gh-autowork` runs this same cycle without stopping between steps, once told to.
 
 **A note on issue and PR numbers in comments and docs:** this repository's own tracker is small (it started in September 2026), but code comments, test docstrings, templates and some docs cite issue and PR numbers well above that range (`#22`, `#175`, and about 70 others). Those come from the upstream repository this one was ported from, and they don't resolve in this tracker: `gh issue view 175` here finds nothing. Treat them as provenance labels rather than links. Where a claim rests on one of them, the surrounding text should carry enough of the rationale to stand alone. For some of them, the upstream number of the PR that shipped the work differs from the issue number: memory-bank (issue `#175`) shipped as PR `#178`. Confirming any individual claim against upstream is a separate task from working on this repo.
 

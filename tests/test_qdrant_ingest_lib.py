@@ -1809,5 +1809,73 @@ class PhpHashCommentScanning(unittest.TestCase):
                 self.assertIn("$y = 2", content)
 
 
+class SharedIngestDefaults(unittest.TestCase):
+    """Issue #276: parse_csv_set/ingest_env_defaults/MANIFEST_FILENAME moved
+    into the lib so ingest_mcp_server.py and ingest_to_qdrant.py resolve them
+    identically. Imported lazily via the module so a missing helper fails
+    the test rather than the whole file's import."""
+
+    def setUp(self):
+        import qdrant_ingest_lib
+        self.lib = qdrant_ingest_lib
+
+    def test_parse_csv_set_strips_whitespace_and_drops_blanks(self):
+        self.assertEqual(self.lib.parse_csv_set(".py, .md ,, "), {".py", ".md"})
+
+    def test_parse_csv_set_whitespace_entry_normalizes_correctly(self):
+        """The exact CLI symptom: a bare split gave '. .md' after
+        normalization, so markdown was silently never indexed."""
+        self.assertEqual(
+            self.lib.normalize_extensions(self.lib.parse_csv_set(".py, .md")), {".py", ".md"}
+        )
+
+    def test_parse_csv_set_none_for_empty_inputs(self):
+        for value in (None, "", " , ,"):
+            with self.subTest(value=value):
+                self.assertIsNone(self.lib.parse_csv_set(value))
+
+    def test_manifest_filename_is_the_sync_manifest(self):
+        self.assertEqual(self.lib.MANIFEST_FILENAME, ".qdrant_index_manifest.json")
+
+    def test_env_defaults_read_every_var(self):
+        env = {
+            "QDRANT_URL": "http://remote:6333",
+            "QDRANT_API_KEY": "secret",
+            "EMBEDDING_MODEL": "BAAI/bge-small-en",
+            "INDEX_INCLUDE_EXTENSIONS": ".py, .md",
+            "INDEX_EXCLUDE_DIRS": "fixtures",
+            "MEMORY_BANK_COLLECTION": "team-memory",
+        }
+        self.assertEqual(self.lib.ingest_env_defaults(env), {
+            "qdrant_url": "http://remote:6333",
+            "qdrant_api_key": "secret",
+            "embedding_model": "BAAI/bge-small-en",
+            "include_extensions": ".py, .md",
+            "exclude_dirs": "fixtures",
+            "memory_bank_collection": "team-memory",
+        })
+
+    def test_env_defaults_fallbacks_when_unset_or_blank(self):
+        expected = {
+            "qdrant_url": "http://localhost:6333",
+            "qdrant_api_key": None,
+            "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
+            "include_extensions": None,
+            "exclude_dirs": None,
+            "memory_bank_collection": "memory-bank",
+        }
+        blank = {k: "" for k in (
+            "QDRANT_URL", "QDRANT_API_KEY", "EMBEDDING_MODEL",
+            "INDEX_INCLUDE_EXTENSIONS", "INDEX_EXCLUDE_DIRS", "MEMORY_BANK_COLLECTION",
+        )}
+        for env in ({}, blank):
+            with self.subTest(env=env):
+                self.assertEqual(self.lib.ingest_env_defaults(env), expected)
+
+    def test_env_defaults_reads_os_environ_by_default(self):
+        with mock.patch.dict(os.environ, {"QDRANT_URL": "http://from-os:6333"}, clear=True):
+            self.assertEqual(self.lib.ingest_env_defaults()["qdrant_url"], "http://from-os:6333")
+
+
 if __name__ == "__main__":
     unittest.main()

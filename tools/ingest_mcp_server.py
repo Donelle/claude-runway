@@ -55,18 +55,29 @@ from mcp_server_qdrant.embeddings.fastembed import FastEmbedProvider
 from qdrant_client import QdrantClient, models
 
 from qdrant_ingest_lib import (
+    MANIFEST_FILENAME,
     batched,
     build_entries,
     chunk_file,
     compute_file_hashes,
     ensure_persistent_fastembed_cache,
     files_removed_since_last_sync,
+    ingest_env_defaults,
     iter_entries,
+    parse_csv_set,
     validate_chunk_params,
 )
 from qdrant_retry import call_with_retry, async_call_with_retry
 from qdrant_batch_store import store_batch, ensure_file_path_index, FIELD_INDEXES, UPSERT_BATCH_SIZE
-from qdrant_collection_hints import get_cached_descriptions, set_cached_description
+from qdrant_index_prep import prepare_collection_for_index
+from qdrant_collection_hints import (
+    compute_search_limit,
+    get_cached_descriptions,
+    get_cached_search_limit,
+    set_cached_description,
+    set_cached_search_limit,
+)
+from qdrant_compact_marker import collection_is_marked_compact, is_marked_compact
 from qdrant_model_check import check_embedding_model_mismatch
 from mcp_tool_introspect import tool_count
 import memory_bank_lib as mb
@@ -76,7 +87,8 @@ import memory_bank_lib as mb
 # function's own docstring for why this can't just be a .mcp.json env value.
 ensure_persistent_fastembed_cache()
 
-MANIFEST_FILENAME = ".qdrant_index_manifest.json"
+# MANIFEST_FILENAME is imported from qdrant_ingest_lib (issue #276) so
+# ingest_to_qdrant.py excludes the same file -- see its comment there.
 
 # sync_repo batches its per-file delete filter into chunks of this size
 # instead of one client.delete() call per changed/removed file (issue #75/
@@ -115,10 +127,14 @@ def _save_manifest(repo: Path, manifest: dict) -> None:
 
 # Same env var names mcp-server-qdrant reads, so a single project .mcp.json
 # config keeps this server and the qdrant-find/qdrant-store server aligned.
-DEFAULT_QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
-DEFAULT_QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY")
+# Resolved through qdrant_ingest_lib.ingest_env_defaults (issue #276) -- the
+# same helper ingest_to_qdrant.py's argparse defaults come from, so the two
+# entry points can't drift apart on these again.
+_ENV_DEFAULTS = ingest_env_defaults()
+DEFAULT_QDRANT_URL = _ENV_DEFAULTS["qdrant_url"]
+DEFAULT_QDRANT_API_KEY = _ENV_DEFAULTS["qdrant_api_key"]
 DEFAULT_COLLECTION = os.environ.get("COLLECTION_NAME")
-DEFAULT_EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+DEFAULT_EMBEDDING_MODEL = _ENV_DEFAULTS["embedding_model"]
 
 # Optional, this repo's own -- not read by mcp-server-qdrant. Declared once
 # alongside COLLECTION_NAME so a project's description doesn't require a
@@ -131,11 +147,7 @@ DEFAULT_COLLECTION_DESCRIPTION = os.environ.get("COLLECTION_DESCRIPTION")
 # memory-bank collection, not to write into it. Defaults to the same
 # "memory-bank" default so the guard still applies out of the box even on a
 # project that hasn't explicitly configured this var.
-DEFAULT_MEMORY_BANK_COLLECTION = os.environ.get("MEMORY_BANK_COLLECTION") or "memory-bank"
-
-
-def _parse_csv_set(value: Optional[str]) -> Optional[set]:
-    return {v.strip() for v in value.split(",") if v.strip()} if value else None
+DEFAULT_MEMORY_BANK_COLLECTION = _ENV_DEFAULTS["memory_bank_collection"]
 
 
 def _skipped_summary(skipped: list) -> str:
@@ -153,8 +165,8 @@ def _skipped_summary(skipped: list) -> str:
 
 # Project-specific file filtering, settable once via .mcp.json so every tool
 # call picks it up without repeating it per call.
-DEFAULT_INCLUDE_EXTENSIONS = _parse_csv_set(os.environ.get("INDEX_INCLUDE_EXTENSIONS"))
-DEFAULT_EXTRA_EXCLUDE_DIRS = _parse_csv_set(os.environ.get("INDEX_EXCLUDE_DIRS"))
+DEFAULT_INCLUDE_EXTENSIONS = parse_csv_set(_ENV_DEFAULTS["include_extensions"])
+DEFAULT_EXTRA_EXCLUDE_DIRS = parse_csv_set(_ENV_DEFAULTS["exclude_dirs"])
 
 
 def _sync_static_collection_description(collection: Optional[str], qdrant_url: str, qdrant_api_key: Optional[str]) -> None:
@@ -229,6 +241,92 @@ def _sync_static_collection_description(collection: Optional[str], qdrant_url: s
         print(f"[claude-runway] synced COLLECTION_DESCRIPTION for '{collection}'", file=sys.stderr)
     except Exception as e:
         print(f"[claude-runway] could not sync COLLECTION_DESCRIPTION for '{collection}': {e}", file=sys.stderr)
+
+
+def _recompute_search_limit(collection: Optional[str], qdrant_url: str, qdrant_api_key: Optional[str]) -> None:
+    """
+    Recomputes the collection's default search limit from its current point
+    count and writes it through to BOTH Qdrant collection metadata
+    (`search_limit`, the source of truth) and the local hint cache -- but
+    each only if it actually differs (issue #331, part of #326). Shared by
+    index_repo and sync_repo: a fresh index is often the single biggest
+    point-count jump a collection sees (0 -> N), and sync_repo covers
+    incremental drift.
+
+    Unlike _sync_static_collection_description, this is NOT guarded to this
+    project's own default collection: any collection these tools index has a
+    point count that should drive its limit.
+
+    Fails open: catches everything, logs to stderr, never raises, so a
+    search_limit hiccup can never turn an otherwise-successful sync/index
+    into a reported failure. The metadata write sends ONLY the search_limit
+    key: Qdrant merges metadata patches (same contract as
+    set_collection_description), and resending a read-back snapshot would
+    risk overwriting a concurrent change to another key (PR #383 review).
+
+    The two stores are compared independently: Qdrant metadata is compared
+    against the new value on its own, and the cache against it on its own, so
+    a stale or missing cache row self-heals without a needless network write
+    (and vice versa). No-ops if the collection doesn't exist (e.g.
+    store_batch skipped creating it for an empty entry list).
+    """
+    if not collection:
+        return
+    try:
+        client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
+        if not call_with_retry(client.collection_exists, collection):
+            return
+        info = call_with_retry(client.get_collection, collection)
+        new_limit = compute_search_limit(info.points_count or 0)
+        if (info.config.metadata or {}).get("search_limit") != new_limit:
+            call_with_retry(
+                client.update_collection, collection_name=collection, metadata={"search_limit": new_limit}
+            )
+            print(f"[claude-runway] search_limit for '{collection}' set to {new_limit}", file=sys.stderr)
+        if get_cached_search_limit(qdrant_url, collection) != new_limit:
+            set_cached_search_limit(qdrant_url, collection, new_limit)
+    except Exception as e:
+        print(f"[claude-runway] could not recompute search_limit for '{collection}': {e}", file=sys.stderr)
+
+
+# Hardcoded last-resort search limit for find_in_collection when the caller
+# passes none and no per-collection value is stored anywhere (issue #332).
+DEFAULT_SEARCH_LIMIT = 10
+
+
+def _valid_search_limit(value: object) -> Optional[int]:
+    """A stored limit is usable only if it's a real positive int (bool is an
+    int subclass, so it's excluded explicitly)."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return None
+    return value
+
+
+def _resolve_search_limit(client: QdrantClient, collection: str, qdrant_url: str) -> int:
+    """
+    Resolves find_in_collection's limit when the caller passed none (issue
+    #332, part of #326): local cache first, then live Qdrant collection
+    metadata (`search_limit`, the source of truth written by
+    _recompute_search_limit), then DEFAULT_SEARCH_LIMIT. A live hit
+    backfills the cache; a miss deliberately does not (same "cache only
+    genuine values" rule as descriptions), so a limit written later is picked
+    up on the next call.
+
+    Fails open to the default on any error: a limit-lookup hiccup must never
+    block an otherwise-valid query.
+    """
+    try:
+        cached = _valid_search_limit(get_cached_search_limit(qdrant_url, collection))
+        if cached is not None:
+            return cached
+        info = call_with_retry(client.get_collection, collection)
+        live = _valid_search_limit((info.config.metadata or {}).get("search_limit"))
+        if live is not None:
+            set_cached_search_limit(qdrant_url, collection, live)
+            return live
+    except Exception as e:
+        print(f"[claude-runway] could not resolve search_limit for '{collection}': {e}", file=sys.stderr)
+    return DEFAULT_SEARCH_LIMIT
 
 
 mcp = MCPServer("codebase-indexer")
@@ -318,13 +416,15 @@ async def index_repo(
     qdrant-find/qdrant-store MCP server, or search relevance will silently
     break (different models produce incompatible vector spaces).
 
-    Set reset=true to delete all existing NON-memory-bank entries in the
-    collection first -- otherwise re-running this on an already-indexed repo
+    Set reset=true to delete all existing UNPROTECTED entries (everything
+    except the protected sources listed below) in the collection first -- otherwise re-running this on an already-indexed repo
     creates duplicate chunks. memory-bank points (metadata.source ==
-    "memory-bank") are always preserved regardless (issue #175) -- but do NOT
-    set reset=true if the collection is shared with OTHER non-code data (e.g.
-    qdrant-store notes, conversation-compacts) you don't want wiped; those
-    still get deleted. Note this means reset=true no longer recreates the
+    "memory-bank") and conversation compacts stored since issue #282
+    (metadata.source == "conversation-compact") are always preserved
+    regardless -- but do NOT set reset=true if the collection is shared with
+    OTHER non-code data (e.g. qdrant-store notes, or conversation-compacts
+    stored before #282, which carry no source marker) you don't want wiped;
+    those still get deleted. Note this means reset=true no longer recreates the
     collection's underlying vector SCHEMA either (PR #178 review -- an
     earlier version did, via a full delete_collection, whenever no
     memory-bank points existed at check-time, but that check-then-act was
@@ -399,91 +499,60 @@ async def index_repo(
     qdrant_api_key = qdrant_api_key or DEFAULT_QDRANT_API_KEY
     embedding_model = embedding_model or DEFAULT_EMBEDDING_MODEL
 
-    # Retry once on a transient dropped connection -- see issue #75/#76 /
+    # Retry on a transient dropped connection -- see issue #75/#76 /
     # libs/qdrant_retry.py. Every QdrantClient/QdrantConnector call in this
     # server is wrapped, not just the ones directly after a known CPU-bound
     # gap -- this is a long-running MCP server process, so any call can be
     # the first one after an arbitrarily long idle period since the
-    # previous tool invocation. Constructed unconditionally now (not just
-    # inside `if reset:`) since the non-reset branch below also needs it
-    # for the file_path payload-index backfill (issue #54).
+    # previous tool invocation.
     client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
-    # Only constructed here, inside `if reset:`, not unconditionally before
-    # it -- the elif branch below has its own early-return (the "collection
-    # already contains N points" warning) that must NOT pay for a model
-    # load just to return that warning, same reasoning as the recall() fix
-    # earlier in this review. Reused below (not reconstructed) once we reach
-    # the shared embed/store setup.
-    embedding_provider = None
-    if reset:
-        if call_with_retry(client.collection_exists, collection):
-            embedding_provider = FastEmbedProvider(embedding_model)
-            # Issue #175 / PR #178 review: this ALWAYS takes the filtered
-            # delete (preserving memory-bank points), never a real
-            # delete_collection. An earlier version counted memory-bank
-            # points first and only fell back to the filtered path when the
-            # count was nonzero -- but that count and this delete are two
-            # SEPARATE Qdrant requests with no transaction spanning them, so
-            # a remember() call landing in between could insert a point that
-            # a zero-count-based delete_collection would then destroy anyway,
-            # count notwithstanding. Removing the count-based branch removes
-            # the race entirely instead of trying to narrow it. Tradeoff:
-            # reset=True can no longer fully recreate a collection's vector
-            # schema (needed only when EMBEDDING_MODEL changes -- see
-            # README's Known Limitations) -- is_memory_bank_collection_name's
-            # guard above means this should never actually collide with the
-            # shared memory-bank collection in normal use regardless.
-            #
-            # Found in PR #178 review (third pass): without a check here,
-            # a genuine EMBEDDING_MODEL change (or an unnamed-vector legacy
-            # collection) would still hit this filtered delete FIRST -- wiping
-            # the existing non-memory-bank index -- and only THEN fail on the
-            # embed/store loop below once the schema mismatch surfaces via a
-            # raw Qdrant upsert error, having already destroyed the old index
-            # with nothing successfully re-indexed to replace it. Validating
-            # BEFORE deleting turns that into a clean, non-destructive error.
-            # fail_closed=True (PR #178 review, fourth pass): this is a
-            # PRE-DELETE safety check -- an inconclusive result (a transient
-            # error, not a confirmed match) must block the destructive delete
-            # below, not silently be treated as "compatible." Every other
-            # caller of this function keeps the default fail-open behavior;
-            # this, sync_repo's own pre-delete check below, and
-            # ingest_to_qdrant.py's --reset (issue #265) are the only
-            # three destructive call sites where that default is actively
-            # wrong.
-            mismatch = check_embedding_model_mismatch(client, collection, embedding_provider, fail_closed=True)
-            if mismatch:
-                return mismatch
-            call_with_retry(
-                client.delete, collection_name=collection, points_selector=mb.memory_bank_exclusion_filter()
-            )
-    elif call_with_retry(client.collection_exists, collection):
-        # Check existing point count BEFORE starting the expensive embedding
-        # work (issue #58) -- surface the duplicate-risk warning up front so
-        # the user can cancel/reset/use sync_repo instead of discovering it
-        # after the full embed-and-store loop has already run.
-        _existing_info = call_with_retry(client.get_collection, collection)
-        _existing_count = _existing_info.points_count or 0
-        if _existing_count > 0 and not force:
-            return (
-                f"Warning: collection '{collection}' already contains "
-                f"{_existing_count} points. Re-running index_repo without "
-                f"reset=True may add duplicate chunks on top of those. "
-                f"Options: (1) use sync_repo instead for an incremental update "
-                f"that avoids duplicates (preferred for most cases), "
-                f"(2) re-run with reset=True to wipe non-memory-bank collection "
-                f"data and re-index cleanly (caution: wipes any other non-code "
-                f"data stored there, e.g. qdrant-store notes or conversation-"
-                f"compacts -- memory-bank points are always preserved), "
-                f"or (3) re-run with force=True to add content "
-                f"to the existing index deliberately."
-            )
-        # FIELD_INDEXES below only takes effect when QdrantConnector's own
-        # _ensure_collection_exists() creates a BRAND NEW collection -- an
-        # already-existing collection (any repo indexed before this fix, or
-        # simply re-run with reset=false) never hits that branch again, so
-        # it needs this explicit backfill instead (issue #54).
-        call_with_retry(ensure_file_path_index, client, collection)
+
+    def _duplicate_risk_warning(existing_count: int) -> Optional[str]:
+        # Checked BEFORE the expensive embedding work (issue #58) -- surface
+        # the duplicate-risk warning up front so the user can cancel/reset/
+        # use sync_repo instead of discovering it after the full
+        # embed-and-store loop has already run.
+        if existing_count == 0 or force:
+            return None
+        return (
+            f"Warning: collection '{collection}' already contains "
+            f"{existing_count} points. Re-running index_repo without "
+            f"reset=True may add duplicate chunks on top of those. "
+            f"Options: (1) use sync_repo instead for an incremental update "
+            f"that avoids duplicates (preferred for most cases), "
+            f"(2) re-run with reset=True to wipe unprotected collection "
+            f"data and re-index cleanly (caution: wipes any other non-code "
+            f"data stored there, e.g. qdrant-store notes or conversation-"
+            f"compacts stored before issue #282 -- memory-bank points and "
+            f"newer conversation compacts are always preserved), "
+            f"or (3) re-run with force=True to add content "
+            f"to the existing index deliberately."
+        )
+
+    # Shared with tools/ingest_to_qdrant.py (issue #304) -- see
+    # libs/qdrant_index_prep.py for the full reset (pre-delete model check,
+    # then an always-filtered, memory-bank-preserving delete -- issue #175 /
+    # PR #178) and non-reset (issue #58 guard above, then the issue #54
+    # file_path payload-index backfill) sequence. This module's own
+    # FastEmbedProvider/call_with_retry/check_embedding_model_mismatch/
+    # ensure_file_path_index are passed in so they stay the patch point
+    # this server's tests use. The provider is only built inside the reset
+    # branch, so the guard's early return never pays for a model load; it's
+    # reused (not reconstructed) below.
+    prep = prepare_collection_for_index(
+        client,
+        collection,
+        embedding_model,
+        reset=reset,
+        provider_factory=FastEmbedProvider,
+        existing_points_guard=_duplicate_risk_warning,
+        retry=call_with_retry,
+        model_check=check_embedding_model_mismatch,
+        backfill=ensure_file_path_index,
+    )
+    if prep.error:
+        return prep.error
+    embedding_provider = prep.embedding_provider
 
     if embedding_provider is None:
         embedding_provider = FastEmbedProvider(embedding_model)
@@ -528,8 +597,8 @@ async def index_repo(
     # Errors from iter_entries() arrive as (None, (rel, err)) tuples (the
     # same sentinel contract as the generator itself) and are collected into
     # `skipped` without interrupting the drain.
-    resolved_include_extensions = _parse_csv_set(include_extensions) or DEFAULT_INCLUDE_EXTENSIONS
-    resolved_exclude_dirs = _parse_csv_set(exclude_dirs) or DEFAULT_EXTRA_EXCLUDE_DIRS
+    resolved_include_extensions = parse_csv_set(include_extensions) or DEFAULT_INCLUDE_EXTENSIONS
+    resolved_exclude_dirs = parse_csv_set(exclude_dirs) or DEFAULT_EXTRA_EXCLUDE_DIRS
 
     _DONE = object()  # sentinel -- never equals any real chunk tuple
     # Caps how many items can sit in the queue at once. Note: a chunk is a
@@ -698,6 +767,9 @@ async def index_repo(
     if collection == DEFAULT_COLLECTION and qdrant_url == DEFAULT_QDRANT_URL:
         _sync_static_collection_description(collection, qdrant_url, qdrant_api_key)
 
+    # Fail-open (never raises) -- see _recompute_search_limit (issue #331).
+    _recompute_search_limit(collection, qdrant_url, qdrant_api_key)
+
     return (
         f"Indexed {total} chunks from {repo} into collection '{collection}' "
         f"({code_count} code chunks, {doc_count} doc chunks). "
@@ -778,8 +850,8 @@ async def sync_repo(
     qdrant_api_key = qdrant_api_key or DEFAULT_QDRANT_API_KEY
     embedding_model = embedding_model or DEFAULT_EMBEDDING_MODEL
 
-    resolved_include_extensions = _parse_csv_set(include_extensions) or DEFAULT_INCLUDE_EXTENSIONS
-    resolved_exclude_dirs = _parse_csv_set(exclude_dirs) or DEFAULT_EXTRA_EXCLUDE_DIRS
+    resolved_include_extensions = parse_csv_set(include_extensions) or DEFAULT_INCLUDE_EXTENSIONS
+    resolved_exclude_dirs = parse_csv_set(exclude_dirs) or DEFAULT_EXTRA_EXCLUDE_DIRS
 
     manifest = _load_manifest(repo)
     # Run off the event loop -- this is a synchronous scan that can take
@@ -1012,11 +1084,9 @@ async def sync_repo(
                     # metadata.file_path on a memory-bank point, so this isn't
                     # fixing a live bug -- just closing the gap structurally in
                     # case a future schema change reintroduces overlap.
-                    must_not=[
-                        models.FieldCondition(
-                            key=mb.SOURCE_FIELD, match=models.MatchValue(value=mb.MEMORY_BANK_SOURCE)
-                        )
-                    ],
+                    # Issue #282: same shared fragment as the reset path, so
+                    # conversation compacts are protected here too.
+                    must_not=mb.memory_bank_exclusion_filter().must_not,
                 ),
             )
 
@@ -1067,6 +1137,10 @@ async def sync_repo(
     all_skipped = hash_skipped + chunk_skipped
     _save_manifest(repo, current_hashes)
 
+    # After the manifest save, so a (fail-open) recompute can never precede or
+    # interfere with it. Not reached on the "no changes" early return (issue #331).
+    _recompute_search_limit(collection, qdrant_url, qdrant_api_key)
+
     return (
         f"Synced '{collection}': {len(successfully_changed)} file(s) re-indexed ({new_chunk_count} chunks), "
         f"{len(removed)} file(s) removed, {unchanged_count} file(s) unchanged and skipped."
@@ -1104,8 +1178,8 @@ def preview_index(
 
     entries, skipped = build_entries(
         repo, scope, chunk_lines, overlap,
-        include_extensions=_parse_csv_set(include_extensions) or DEFAULT_INCLUDE_EXTENSIONS,
-        extra_exclude_dirs=_parse_csv_set(exclude_dirs) or DEFAULT_EXTRA_EXCLUDE_DIRS,
+        include_extensions=parse_csv_set(include_extensions) or DEFAULT_INCLUDE_EXTENSIONS,
+        extra_exclude_dirs=parse_csv_set(exclude_dirs) or DEFAULT_EXTRA_EXCLUDE_DIRS,
         respect_gitignore=respect_gitignore,
         # Same as index_repo -- the manifest must never appear in preview
         # results (issue #91).
@@ -1152,7 +1226,7 @@ def get_collection_info(
 async def find_in_collection(
     query: str,
     collection: str,
-    limit: int = 10,
+    limit: Optional[int] = None,
     qdrant_url: Optional[str] = None,
     qdrant_api_key: Optional[str] = None,
     embedding_model: Optional[str] = None,
@@ -1179,10 +1253,15 @@ async def find_in_collection(
     querying and returns an actionable error rather than silently returning
     irrelevant results; the check fails open on network errors so a transient
     Qdrant hiccup never blocks a valid query.
+
+    limit is how many results to return. Leave it unset to use the
+    collection's own stored search_limit (scaled to its size by
+    index_repo/sync_repo, issue #326), falling back to 10 if none is stored;
+    an explicit limit always wins outright.
     """
     if not collection:
         return "Error: collection is required -- call list_collections to see what's available."
-    if limit < 1:
+    if limit is not None and limit < 1:
         return f"Error: limit must be 1 or greater (got {limit})."
 
     qdrant_url = qdrant_url or DEFAULT_QDRANT_URL
@@ -1198,6 +1277,16 @@ async def find_in_collection(
             "Call list_collections to see what's available."
         )
 
+    # Issue #397: conversation-compact collections hold saved session summaries
+    # read back only through compact_find, never by semantic search. Answer
+    # exactly as a genuinely empty search would -- an error or special message
+    # would prompt the calling model to react and go off track. Checked BEFORE
+    # the model-mismatch guard below, whose misleading error (compacts use a
+    # different embedding model than the project default) was the only thing
+    # keeping callers out of these collections until now. Fails open.
+    if collection_is_marked_compact(client, collection):
+        return f"No results found in collection '{collection}' for query '{query}'."
+
     embedding_provider = FastEmbedProvider(embedding_model)
 
     # Guard against silently-meaningless results from an embedding model
@@ -1209,6 +1298,9 @@ async def find_in_collection(
     mismatch_error = check_embedding_model_mismatch(client, collection, embedding_provider)
     if mismatch_error:
         return mismatch_error
+
+    if limit is None:
+        limit = _resolve_search_limit(client, collection, qdrant_url)
 
     connector = QdrantConnector(
         qdrant_url=qdrant_url,
@@ -1291,10 +1383,11 @@ def list_collections(
     find_in_collection, or to sanity-check this project's own collection
     exists.
 
-    include_counts (default true) additionally fetches each collection's
-    point count, at the cost of one extra Qdrant request per collection --
-    set false for a fast names-only listing if the instance has many
-    collections and you don't need counts.
+    include_counts (default true) additionally shows each collection's
+    point count. Every collection's metadata is fetched (one Qdrant request
+    per collection) regardless, to skip internal conversation-compact
+    collections (issue #397), which are never search targets and are not
+    listed.
 
     include_descriptions (default true) surfaces each collection's stored
     hint (set via set_collection_description), so you can often pick the
@@ -1329,12 +1422,19 @@ def list_collections(
     descriptions = get_cached_descriptions(qdrant_url, names) if include_descriptions else {}
 
     lines = [f"Collections at {qdrant_url}:"]
+    listed = 0
     for name in names:
         marker = " (this project's own)" if name == DEFAULT_COLLECTION else ""
         needs_description_fetch = include_descriptions and name not in descriptions
-        info = None
-        if include_counts or needs_description_fetch:
-            info = call_with_retry(client.get_collection, name)
+        # Issue #397: every collection's metadata is read so conversation-
+        # compact collections (marked by compact_store) can be skipped
+        # entirely -- they're internal, not search targets. This is the same
+        # request include_counts/the description fetch already made, so it
+        # only adds requests when neither of those needed one.
+        info = call_with_retry(client.get_collection, name)
+        if is_marked_compact(info.config.metadata):
+            continue
+        listed += 1
         description = descriptions.get(name, "")
         if needs_description_fetch:
             description = (info.config.metadata or {}).get("description", "") if info else ""
@@ -1359,6 +1459,8 @@ def list_collections(
             lines.append(f"- {name}: {info.points_count} points{marker}{hint}")
         else:
             lines.append(f"- {name}{marker}{hint}")
+    if not listed:
+        return f"No collections found at {qdrant_url}."
     return "\n".join(lines)
 
 

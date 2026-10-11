@@ -365,15 +365,15 @@ class PathExtractionHeuristic(unittest.TestCase):
         # pyproject.toml has no slash so the reference impl skips it (it
         # requires at least one slash for relative paths).  templates/mcp.json
         # has both a slash AND a known .json extension so it is extracted.
-        body = "- `pyproject.toml`\n- `templates/mcp.json`\n- `hooks/compress_bash_output.py`"
+        body = "- `pyproject.toml`\n- `templates/mcp.json`\n- `hooks/compress_output.py`"
         paths = extract_important_file_paths(self._compact(body))
         self.assertTrue(
             any("templates/mcp.json" in p for p in paths),
             f"Expected templates/mcp.json in {paths}",
         )
         self.assertTrue(
-            any("compress_bash_output.py" in p for p in paths),
-            f"Expected hooks/compress_bash_output.py in {paths}",
+            any("compress_output.py" in p for p in paths),
+            f"Expected hooks/compress_output.py in {paths}",
         )
 
     def test_preserves_order_of_appearance(self):

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
 MCP server exposing `remember`/`recall`/`forget` -- durable, cross-session
-knowledge storage independent of the code index (issue #175). Where
+knowledge storage independent of the code index (issue #175) -- plus
+`transfer_memories` (issue #336), which copies a legacy collection's
+in-scope memories into the shared collection. Where
 `codebase-indexer` remembers what a repo's CODE looks like, this server
 remembers what a project (or, via `general=True`, every project) has
 LEARNED: a cited incident's root cause, a design decision and its rationale,
@@ -427,6 +429,90 @@ def forget(
         f"Deleted {count} memor{'y' if count == 1 else 'ies'} belonging to repo '{caller_repo}' "
         f"(count reflects what this call found and targeted, not a separately-verified post-delete total)."
     )
+
+
+@mcp.tool()
+async def transfer_memories(
+    source_collection: str,
+    dry_run: bool = True,
+    qdrant_url: Optional[str] = None,
+    qdrant_api_key: Optional[str] = None,
+) -> str:
+    """
+    Copy memories from a legacy/foreign Qdrant collection (one shaped like a
+    memory-bank export: payload `document` plus a `metadata` object with
+    `repo`/`kind`/`description`/`weight`) into the shared memory-bank
+    collection. Reads every point with a full scroll, not a top-k search.
+
+    source_collection: REQUIRED, the exact collection name -- no guessing
+    (call codebase-indexer's list_collections first if unsure).
+    dry_run: defaults to True -- reports what WOULD happen without writing
+    anything. Show the user that report, then pass dry_run=False only once
+    they want the write to happen.
+
+    Only points tagged with THIS project's own MEMORY_BANK_ID (written
+    project-scoped) or the reserved "general" tag (written as general) are
+    migrated. Points tagged with any other project are skipped and reported
+    under skipped_foreign_repo by tag -- run this tool from a session in that
+    project to migrate them. Re-running is safe: each source point maps to a
+    fixed target id, and points already migrated are counted under
+    already_present and left untouched -- but only points THIS tool wrote; a
+    memory copied over earlier by hand with remember() is not recognized and
+    would be written again, so compare the dry-run counts with what was
+    already migrated. The source collection is never modified or deleted by
+    this tool.
+
+    qdrant_url/qdrant_api_key override this project's QDRANT_URL/
+    QDRANT_API_KEY for this call (both collections are on that one instance).
+    The configured QDRANT_API_KEY is only sent to the configured QDRANT_URL;
+    a different qdrant_url needs its own qdrant_api_key if it requires one.
+
+    Returns a JSON report: would_migrate/migrated ({general, project}),
+    skipped_foreign_repo ({tag: count}), already_present, errors (per point),
+    and error (only when the run stopped early, including before it started
+    because this project's MEMORY_BANK_ID is missing or invalid).
+    """
+    # Same boundary remember() enforces: no write is ever possible without a
+    # valid, non-placeholder, non-"general" MEMORY_BANK_ID for this project.
+    # Checked before any client/provider is built, so a misconfigured project
+    # pays for nothing.
+    caller_repo, error = mb.resolve_repo(DEFAULT_MEMORY_BANK_ID, general=False)
+    if error:
+        # JSON like every other outcome of this tool (PR #422 review), so a
+        # caller can parse every result the same way.
+        return json.dumps({"source_collection": source_collection, "dry_run": dry_run, "error": error}, indent=2)
+    assert caller_repo is not None  # resolve_repo returns a repo whenever error is None
+
+    # The configured key is only sent to the configured URL (PR #422 review):
+    # qdrant_url is tool input, so falling back to DEFAULT_QDRANT_API_KEY for
+    # ANY url would hand this project's Qdrant credential to whatever host a
+    # call names. A different endpoint gets only the key passed with it.
+    url = qdrant_url or DEFAULT_QDRANT_URL
+    if qdrant_api_key:
+        api_key = qdrant_api_key
+    elif url == DEFAULT_QDRANT_URL:
+        api_key = DEFAULT_QDRANT_API_KEY
+    else:
+        api_key = None
+    client = QdrantClient(url=url, api_key=api_key)
+    # A dry run never embeds anything, and FastEmbedProvider's constructor
+    # eagerly loads the ONNX model (see recall()'s comment above), so only
+    # a real write pays for it.
+    embedding_provider = None if dry_run else FastEmbedProvider(DEFAULT_EMBEDDING_MODEL)
+
+    report = await mb.transfer_points(
+        client, embedding_provider,
+        source=source_collection,
+        target=DEFAULT_MEMORY_BANK_COLLECTION,
+        caller_repo=caller_repo,
+        embedding_model=DEFAULT_EMBEDDING_MODEL,
+        dry_run=dry_run,
+    )
+    report["caller_repo"] = caller_repo
+    # default=str: a Qdrant point id in `errors` can be an int or a UUID
+    # string, both fine, but this keeps any other odd id type from failing
+    # the whole report at serialization time.
+    return json.dumps(report, indent=2, default=str)
 
 
 if __name__ == "__main__":

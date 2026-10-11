@@ -1,6 +1,6 @@
 # Skill: my-savings
 
-Show the opt-in ClaudeRunway savings tracker: an estimate of context tokens avoided by local compression this session, plus this project's history. This includes both the `local-compress` MCP server's tools (`compress_file`, `compress_command_output`, `fetch_url`) and the `compress_bash_output.py` hook's own compressions of Bash/Grep/Glob/WebFetch/WebSearch output — both contribute to the same session total.
+Show the opt-in ClaudeRunway savings tracker: an estimate of context tokens avoided by local compression this session, plus this project's history. This includes both the `local-compress` MCP server's tools (`compress_file`, `compress_command_output`, `fetch_url`) and the `compress_output.py` hook's own compressions of Bash/Grep/Glob/WebFetch/WebSearch output — both contribute to the same session total.
 
 Optional argument: `detail` (e.g. `/my-savings detail`), `trend` (e.g. `/my-savings trend`, `/my-savings trend day`). Omit it for the simple view.
 

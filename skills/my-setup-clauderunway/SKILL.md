@@ -1,8 +1,15 @@
 # Skill: my-setup-clauderunway
 
-Interactively configure any project for ClaudeRunway. Generates `.mcp.json`,
-updates `.claude/settings.json` hooks, and adds the correct usage guidance to
-`CLAUDE.md` — all in one pass.
+Interactively configure any project for ClaudeRunway, or upgrade one that is
+already configured. Two paths, chosen in step 2:
+
+- **init** — generates `.mcp.json`, updates `.claude/settings.json` hooks, and adds the
+  correct usage guidance to `CLAUDE.md`, all in one pass (steps 3-7).
+- **upgrade** — applies only the specific, named config migrations a newer claude-runway
+  release added (e.g. a renamed hook script), leaving every other setting alone (step 8).
+  This is the supported route for users who cannot install the `claude-runway-*` console
+  scripts: it runs the checkout's own `tools/setup_project.py upgrade`, so it always sees
+  the migrations that match the checkout rather than a possibly stale installed copy.
 
 ## Prerequisites
 
@@ -64,9 +71,37 @@ any run of non-alphanumeric characters with a single hyphen, strip leading/trail
 hyphens, and fall back to `"project"` if the result is empty (e.g. `My.Cool.App` →
 `my-cool-app`; `___` → `project`). This matches `setup_project_lib.default_collection_name()`.
 
-Check whether `.mcp.json` already exists in the current directory. If it does,
-read it to see which claude-runway servers are currently configured (`qdrant`,
-`codebase-indexer`, `memory-bank`, `local-compress`). Note this for the summary at the end.
+Check whether `.mcp.json` already exists in the current directory. **Never `Read` the
+file whole, or `cat` it** — an inline `QDRANT_API_KEY` would land in the model context and
+the tool-call transcript. Inspect it with a local parser that prints only what you need,
+e.g. (single quotes per step 5's rules; adapt the quoting on PowerShell):
+
+```
+<venv-python> -c 'import json;d=json.load(open(".mcp.json"));print(sorted(d.get("mcpServers",{})))'
+```
+
+For the init-path values extracted below, print only those specific non-secret keys the
+same way (never the whole env block), and for `QDRANT_API_KEY` print only a key-present
+boolean. The output tells you which claude-runway servers are currently configured
+(`qdrant`, `codebase-indexer`, `memory-bank`, `local-compress`). Note this for the summary
+at the end.
+
+**Choose the path (init vs. upgrade):** the upgrade predicate is the presence of the
+`qdrant` server, because that is exactly what `setup_project.py upgrade` requires
+(`upgrade_lib.is_project_configured` — every real `init` writes it, even `--qdrant-only`).
+- No `.mcp.json`, or no `qdrant` server in it (including a partial/hand-edited config with
+  only `codebase-indexer`, `memory-bank`, or `local-compress`) → **init path** (steps 3-7,
+  unchanged). Do not offer upgrade: it refuses a project without a `qdrant` server.
+- `qdrant` server present → use `AskUserQuestion` (header
+  "Path"): "Upgrade (Recommended)" — apply only pending config migrations, nothing else
+  reset; "Re-run init" — reconfigure from scratch via the question flow below, which
+  resets every toolkit-owned setting to the answers you give. If the user asked for
+  one explicitly in their message, skip the question.
+- **Upgrade chosen → skip the rest of step 2 and go straight to step 8.** Everything
+  below in this step (value extraction, the `QDRANT_API_KEY` stop, the qdrant-only
+  detection) exists only because `init` rewrites those values; `upgrade` does not.
+
+The rest of this step applies to the **init path only**.
 
 Also extract the following values from the existing config — these would silently
 revert to defaults on re-run without preservation:
@@ -79,7 +114,8 @@ revert to defaults on re-run without preservation:
   checked because `build_mcp_servers()` sets the same key in all of them, and legacy or
   hand-edited configs may only have it in one.
 
-**If `QDRANT_API_KEY` is non-empty in any owned block, stop immediately** and tell the user:
+**If `QDRANT_API_KEY` is non-empty in any owned block (init path only — the upgrade path
+in step 8 proceeds), stop immediately** and tell the user:
 
 > This project has `QDRANT_API_KEY` configured. The skill cannot carry credentials
 > through safely — reading the key and passing it in a shell command would expose it
@@ -418,3 +454,44 @@ whenever ANY of the following transitions apply:
   see it as enabled even though the MCP server now has it cleared):
   - macOS/Linux: `unset CLAUDE_RUNWAY_TRACK_SAVINGS`
   - Windows: `Remove-Item Env:CLAUDE_RUNWAY_TRACK_SAVINGS`
+
+### 8. Upgrade path
+
+Reached only when step 2 chose **upgrade**. Reuses step 1's validated `<CLAUDE_RUNWAY_DIR>`
+and `<venv-python>`; the quoting rules from step 5 apply here too (single quotes around
+every dynamic argument on both platforms, `&` call operator prefix on PowerShell).
+
+**`QDRANT_API_KEY` is not a blocker here.** Unlike `init`, `upgrade` never takes the key
+on its command line and never prints it: it reads the existing value from the target's own
+`.mcp.json` inside the Python process and copies it into any block it adds. So do NOT read
+the key into context, and do NOT stop for it — just proceed.
+
+1. **Preview.** Run, and show the user the full output:
+   ```
+   <venv-python> <CLAUDE_RUNWAY_DIR>/tools/setup_project.py upgrade <cwd> --dry-run
+   ```
+   If it reports no pending migrations, say so ("already up to date"), skip to the
+   `doctor` check (item 4 below), and stop. If it exits non-zero, show the output and stop.
+2. **Approve.** Use `AskUserQuestion` (header "Apply"): "Apply all pending migrations"
+   / "Cancel". Be explicit that approval is **all-or-nothing**: a skill cannot answer the
+   CLI's interactive per-migration prompts, so every pending migration is applied. A user
+   who wants to pick migrations individually should decline and run the CLI directly
+   (`<venv-python> <CLAUDE_RUNWAY_DIR>/tools/setup_project.py upgrade <cwd>`) in their own
+   terminal. On "Cancel", stop and change nothing.
+3. **Apply.** Run:
+   ```
+   <venv-python> <CLAUDE_RUNWAY_DIR>/tools/setup_project.py upgrade <cwd> --auto-yes
+   ```
+   If it exits non-zero, show the full output and stop. Otherwise report the migrations
+   it applied, from its output.
+4. **Verify.** Tell the user to confirm with `doctor` (it flags a stale compress-hook
+   path left by the #395 rename, among other things), and offer to run it:
+   ```
+   <venv-python> <CLAUDE_RUNWAY_DIR>/tools/doctor.py <cwd>
+   ```
+5. **Restart.** Remind the user to restart Claude Code: hook and MCP server config is
+   only read at startup, so the upgrade has no effect on the running session.
+
+`upgrade` does not touch `CLAUDE.md`; it has no CLAUDE.md step (that is `init`-only,
+step 6). The migration list lives in `libs/upgrade_lib.py` (`MIGRATIONS`) and is the
+single source of truth for what an upgrade can change; this skill adds nothing to it.

@@ -25,7 +25,7 @@ two functions are RESYNC primitives (built for `init`, which regenerates and
 re-merges every toolkit-owned field on every run) and their "strip every
 toolkit-owned entry for this event, then re-add only what this run
 generated" semantics silently DELETE an unrelated toolkit hook (e.g. an
-existing `compress_bash_output.py` PostToolUse block) that a narrower,
+existing `compress_output.py` PostToolUse block) that a narrower,
 single-migration apply never intended to touch. A migration's `apply` only
 ever ADDS the one thing its `detect` found missing -- confirmed by writing
 the naive merge-based version first and catching it deleting a pre-existing
@@ -45,7 +45,14 @@ from typing import Callable, Optional
 # Flat import, matching every other libs/*.py module's own convention (see
 # setup_project_lib.py's module docstring for why: libs/ is added to
 # sys.path directly by callers, not treated as a real Python package).
-from setup_project_lib import build_mcp_servers, build_settings_hooks, load_json
+from setup_project_lib import (
+    COMPRESS_HOOK_SCRIPT,
+    LEGACY_COMPACT_EMBEDDING_MODEL,
+    LEGACY_COMPRESS_HOOK_SCRIPT,
+    build_mcp_servers,
+    build_settings_hooks,
+    load_json,
+)
 
 
 @dataclass
@@ -288,14 +295,14 @@ def _apply_record_session_id_hooks_missing(
     exactly right for `init`, which regenerates every toolkit-owned block on
     every run, but wrong here: this migration's own `detect` fires precisely
     for a project that adopted local-compress BEFORE #198 shipped, i.e. one
-    whose PostToolUse already has a REAL `compress_bash_output.py` block and
+    whose PostToolUse already has a REAL `compress_output.py` block and
     no separate CORE block at all (the template's own SessionStart entry for
     record_session_id.py didn't exist yet when that project was set up --
     it was originally a PostToolUse entry, replaced by SessionStart in
     issue #231).  Calling `build_settings_hooks(..., include_compress=False)`
     and merging the result would treat PostToolUse as "generated -> only the
     core block" and, via `merge_settings_hooks`'s strip-then-replace logic,
-    silently DELETE that project's real, working `compress_bash_output.py`
+    silently DELETE that project's real, working `compress_output.py`
     entry -- confirmed by writing that version first and catching it wiping
     the compress hook out of a fixture that had one, in this file's own tests.
     A pure append has no such failure mode: it only ever adds the core
@@ -348,6 +355,38 @@ def _apply_hf_hub_offline_missing(mcp_json: dict, settings_json: dict, ctx: Migr
     mcp_json = copy.deepcopy(mcp_json)
     qdrant_env = mcp_json.setdefault("mcpServers", {}).setdefault("qdrant", {}).setdefault("env", {})
     qdrant_env["HF_HUB_OFFLINE"] = ""
+    return mcp_json, settings_json
+
+
+# ---------------------------------------------------------------------------
+# local-compress-embedding-model-missing (feature: #397)
+# ---------------------------------------------------------------------------
+
+
+def _detect_compress_embedding_model_missing(mcp_json: dict, settings_json: dict) -> bool:
+    """True only when a `local-compress` server EXISTS and its env has no
+    non-blank EMBEDDING_MODEL. No local-compress block (a `--qdrant-only`
+    project) has nothing to fix."""
+    block = mcp_json.get("mcpServers", {}).get("local-compress")
+    if block is None:
+        return False
+    value = block.get("env", {}).get("EMBEDDING_MODEL")
+    return not (isinstance(value, str) and value.strip())
+
+
+def _apply_compress_embedding_model_missing(
+    mcp_json: dict, settings_json: dict, ctx: MigrationContext
+) -> "tuple[dict, dict]":
+    """
+    Pins `EMBEDDING_MODEL` in the `local-compress` env to `BAAI/bge-small-en`
+    -- the model every existing install's compacts were actually stored with
+    (the server used to hardcode it) -- NEVER the new template default, which
+    would orphan that compact history (issue #397). Full model id, not the
+    short name. Only this one key is written.
+    """
+    mcp_json = copy.deepcopy(mcp_json)
+    env = mcp_json["mcpServers"]["local-compress"].setdefault("env", {})
+    env["EMBEDDING_MODEL"] = LEGACY_COMPACT_EMBEDDING_MODEL
     return mcp_json, settings_json
 
 
@@ -434,6 +473,76 @@ def _apply_record_session_id_posttooluse_wildcard(
     return mcp_json, settings_json
 
 
+# ---------------------------------------------------------------------------
+# compress-hook-renamed (refactor: #395)
+# ---------------------------------------------------------------------------
+
+
+def _is_script_hook(hook: dict, script_name: str) -> bool:
+    return any(Path(a).name == script_name for a in hook.get("args", []))
+
+
+def _detect_compress_hook_renamed(mcp_json: dict, settings_json: dict) -> bool:
+    """True when ANY hook, under any event, still invokes the pre-#395
+    `compress_bash_output.py` -- a path that no longer exists in the toolkit
+    repo, so that hook now fails on every tool call."""
+    for blocks in settings_json.get("hooks", {}).values():
+        for block in blocks:
+            if any(_is_script_hook(h, LEGACY_COMPRESS_HOOK_SCRIPT) for h in block.get("hooks", [])):
+                return True
+    return False
+
+
+def _apply_compress_hook_renamed(mcp_json: dict, settings_json: dict, ctx: MigrationContext) -> "tuple[dict, dict]":
+    """
+    Rewrites ONLY the script filename in each legacy hook's args
+    (`.../hooks/compress_bash_output.py` -> `.../hooks/compress_output.py`),
+    keeping the directory, the command/venv, the matcher, and every sibling
+    inner hook exactly as they were -- the same "never delete a working
+    block" discipline as record-session-id-hooks-missing (see its docstring
+    for why a regenerate-and-merge would be wrong here: it would clobber a
+    project's own matcher/path customizations).
+
+    One guarded exception: if the SAME event AND MATCHER already has a hook
+    invoking the new name (hand-added, or from a partial earlier run),
+    rewriting would leave two compress hooks double-compressing every call
+    matching it, so the stale legacy inner hook is dropped instead (the
+    block itself survives if it still holds anything else). Scoped to the
+    matcher, not the whole event: a legacy `Bash` block beside a new-named
+    `Grep` block is NOT a duplicate -- dropping it would silently disable
+    Bash compression (Copilot review, PR #402).
+    """
+    settings_json = copy.deepcopy(settings_json)
+    for blocks in settings_json.get("hooks", {}).values():
+        new_matchers = {
+            b.get("matcher")
+            for b in blocks
+            if any(_is_script_hook(h, COMPRESS_HOOK_SCRIPT) for h in b.get("hooks", []))
+        }
+        surviving = []
+        for block in blocks:
+            has_new = block.get("matcher") in new_matchers
+            inner = []
+            for hook in block.get("hooks", []):
+                if _is_script_hook(hook, LEGACY_COMPRESS_HOOK_SCRIPT):
+                    if has_new:
+                        continue  # the new-named hook is already registered; drop the stale duplicate
+                    hook["args"] = [
+                        a[: -len(LEGACY_COMPRESS_HOOK_SCRIPT)] + COMPRESS_HOOK_SCRIPT
+                        if Path(a).name == LEGACY_COMPRESS_HOOK_SCRIPT
+                        else a
+                        for a in hook.get("args", [])
+                    ]
+                inner.append(hook)
+            if block.get("hooks") and not inner:
+                continue  # block held only the stale duplicate
+            if "hooks" in block:
+                block["hooks"] = inner
+            surviving.append(block)
+        blocks[:] = surviving
+    return mcp_json, settings_json
+
+
 # Ordered oldest-feature-first -- order only affects DISPLAY order when more
 # than one migration is pending; `detect` alone decides whether each one is
 # shown at all.
@@ -505,6 +614,23 @@ MIGRATIONS: "list[Migration]" = [
         apply=_apply_hf_hub_offline_missing,
     ),
     Migration(
+        id="local-compress-embedding-model-missing",
+        title="Pin EMBEDDING_MODEL in local-compress server env",
+        kind="add",
+        description=(
+            "The local-compress server now reads EMBEDDING_MODEL (like the other MCP servers) to choose the "
+            "model conversation compacts are embedded with (issue #397); until now it was hardcoded. Adds "
+            '"EMBEDDING_MODEL": "BAAI/bge-small-en" to .mcp.json local-compress.env -- the model your '
+            "existing compacts were stored with, so none are orphaned."
+        ),
+        note=(
+            "Do NOT change this to another model once you have saved compacts: they are stored under a "
+            "model-named vector and would become unreadable. Set it in the .mcp.json env block, not a shell export."
+        ),
+        detect=_detect_compress_embedding_model_missing,
+        apply=_apply_compress_embedding_model_missing,
+    ),
+    Migration(
         id="record-session-id-sessionstart",
         title="Remove stale PostToolUse '.*' record_session_id.py hook from .claude/settings.json",
         kind="remove",
@@ -524,6 +650,20 @@ MIGRATIONS: "list[Migration]" = [
         ),
         detect=_detect_record_session_id_posttooluse_wildcard,
         apply=_apply_record_session_id_posttooluse_wildcard,
+    ),
+    Migration(
+        id="compress-hook-renamed",
+        title="Point the compress hook at hooks/compress_output.py",
+        kind="update",
+        description=(
+            "This project's .claude/settings.json still runs hooks/compress_bash_output.py, which was "
+            "renamed to hooks/compress_output.py (issue #395) -- the old path no longer exists, so "
+            "output compression silently stops working. Rewrites just the script filename in each such "
+            "hook; the venv path, tools-repo directory, matcher, and every other hook are left untouched."
+        ),
+        note="",
+        detect=_detect_compress_hook_renamed,
+        apply=_apply_compress_hook_renamed,
     ),
 ]
 

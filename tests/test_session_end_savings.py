@@ -27,6 +27,25 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 import session_end_savings as hook  # noqa: E402
 
 
+_RECOVER_PATCH = None
+
+
+def setUpModule():
+    # Issue #306: main() now calls savings_ledger.recover_orphaned_sessions(),
+    # which is NOT stubbed by the per-test patches below and would otherwise
+    # scan (and roll up/delete from) the REAL ~/.claude/claude-runway/sessions
+    # directory whenever a test patches tracking_enabled to True. Stub it for
+    # the whole module; RecoveryWiring below re-patches it to assert on it.
+    global _RECOVER_PATCH
+    _RECOVER_PATCH = mock.patch.object(hook.savings_ledger, "recover_orphaned_sessions", return_value=0)
+    _RECOVER_PATCH.start()
+
+
+def tearDownModule():
+    if _RECOVER_PATCH is not None:
+        _RECOVER_PATCH.stop()
+
+
 _PAYLOAD = json.dumps({"session_id": "abc123", "cwd": "/some/project"})
 _SUMMARY = "ClaudeRunway · Token Savings\n\nThis session · my-project\n  Context tokens avoided  ~1.8k"
 
@@ -48,10 +67,10 @@ class OutputShape(unittest.TestCase):
     def setUp(self):
         patchers = [
             mock.patch.object(hook.savings_ledger, "tracking_enabled", return_value=True),
-            mock.patch.object(hook.savings_ledger, "read_session_events", return_value=[object()]),
+            mock.patch.object(hook.savings_ledger, "has_session_artifacts", return_value=True),
             mock.patch.object(hook.savings_ledger, "project_name_from_cwd", return_value="my-project"),
             mock.patch.object(hook.savings_ledger, "get_schema_overhead_tokens", return_value=0),
-            mock.patch.object(hook.savings_ledger, "finalize_session", return_value={"event_count": 1}),
+            mock.patch.object(hook.savings_ledger, "finalize_owned_session", return_value={"event_count": 1}),
             mock.patch.object(hook.savings_ledger, "query_project_summary", return_value={}),
             mock.patch.object(hook.savings_ledger, "format_simple_view", return_value=_SUMMARY),
         ]
@@ -91,7 +110,7 @@ class SilentExitPaths(unittest.TestCase):
     def test_empty_events_no_output(self):
         with (
             mock.patch.object(hook.savings_ledger, "tracking_enabled", return_value=True),
-            mock.patch.object(hook.savings_ledger, "read_session_events", return_value=[]),
+            mock.patch.object(hook.savings_ledger, "has_session_artifacts", return_value=False),
         ):
             self.assertEqual(_run_main(), "")
 
@@ -101,11 +120,11 @@ class SilentExitPaths(unittest.TestCase):
         # rolled up into the perpetual store, yet nothing may be printed.
         with (
             mock.patch.object(hook.savings_ledger, "tracking_enabled", return_value=True),
-            mock.patch.object(hook.savings_ledger, "read_session_events", return_value=[object()]),
+            mock.patch.object(hook.savings_ledger, "has_session_artifacts", return_value=True),
             mock.patch.object(hook.savings_ledger, "project_name_from_cwd", return_value="p"),
             mock.patch.object(hook.savings_ledger, "get_schema_overhead_tokens", return_value=0),
             mock.patch.object(
-                hook.savings_ledger, "finalize_session", return_value={"event_count": 0, "fetch_url_count": 2}
+                hook.savings_ledger, "finalize_owned_session", return_value={"event_count": 0, "fetch_url_count": 2}
             ) as fin,
             mock.patch.object(hook.savings_ledger, "query_project_summary", return_value={}),
             mock.patch.object(hook.savings_ledger, "format_simple_view", return_value=_SUMMARY) as fmt,
@@ -117,6 +136,87 @@ class SilentExitPaths(unittest.TestCase):
     def test_invalid_json_stdin_no_output(self):
         # Malformed stdin must not crash the hook — it exits silently.
         self.assertEqual(_run_main("not valid json {{"), "")
+
+
+class RecoveryWiring(unittest.TestCase):
+    """Issue #306: every SessionEnd (tracking on) rolls up OTHER sessions'
+    orphaned ledgers, excluding the session that is ending, regardless of
+    whether the ending session logged anything, and never at the cost of
+    the ending session's own roll-up/summary."""
+
+    def test_recovery_runs_excluding_the_ending_session_even_with_no_events(self):
+        with (
+            mock.patch.object(hook.savings_ledger, "tracking_enabled", return_value=True),
+            mock.patch.object(hook.savings_ledger, "has_session_artifacts", return_value=False),
+            mock.patch.object(hook.savings_ledger, "recover_orphaned_sessions", return_value=1) as rec,
+        ):
+            self.assertEqual(_run_main(), "")
+        rec.assert_called_once_with(exclude_session_id="abc123")
+
+    def test_recovery_not_run_when_tracking_disabled(self):
+        with (
+            mock.patch.object(hook.savings_ledger, "tracking_enabled", return_value=False),
+            mock.patch.object(hook.savings_ledger, "recover_orphaned_sessions") as rec,
+        ):
+            self.assertEqual(_run_main(), "")
+        rec.assert_not_called()
+
+    def test_recovery_failure_does_not_block_own_summary(self):
+        with (
+            mock.patch.object(hook.savings_ledger, "tracking_enabled", return_value=True),
+            mock.patch.object(hook.savings_ledger, "recover_orphaned_sessions", side_effect=OSError("boom")),
+            mock.patch.object(hook.savings_ledger, "has_session_artifacts", return_value=True),
+            mock.patch.object(hook.savings_ledger, "project_name_from_cwd", return_value="my-project"),
+            mock.patch.object(hook.savings_ledger, "get_schema_overhead_tokens", return_value=0),
+            mock.patch.object(hook.savings_ledger, "finalize_owned_session", return_value={"event_count": 1}) as fin,
+            mock.patch.object(hook.savings_ledger, "query_project_summary", return_value={}),
+            mock.patch.object(hook.savings_ledger, "format_simple_view", return_value=_SUMMARY),
+        ):
+            data = json.loads(_run_main())
+        fin.assert_called_once()
+        self.assertEqual(data["systemMessage"], _SUMMARY)
+
+    def test_own_roll_up_goes_through_the_owned_protocol(self):
+        # PR #412 review: the hook must use the same ownership protocol as
+        # recovery (finalize_owned_session -- serialized, and combining this
+        # session's ledger with any leftover claim of it), not the plain
+        # finalize_session, or the two can overwrite each other's rows.
+        with (
+            mock.patch.object(hook.savings_ledger, "tracking_enabled", return_value=True),
+            mock.patch.object(hook.savings_ledger, "has_session_artifacts", return_value=True),
+            mock.patch.object(hook.savings_ledger, "project_name_from_cwd", return_value="my-project"),
+            mock.patch.object(hook.savings_ledger, "get_schema_overhead_tokens", return_value=0),
+            mock.patch.object(hook.savings_ledger, "finalize_session") as plain,
+            mock.patch.object(hook.savings_ledger, "finalize_owned_session", return_value={"event_count": 0}) as fin,
+        ):
+            _run_main()
+        plain.assert_not_called()
+        fin.assert_called_once_with("abc123", "my-project", overhead_tokens=0, actual_tokens=None)
+
+    def test_artifact_check_error_fails_open(self):
+        # PR #412 review (round 6): has_session_artifacts() ran outside the
+        # hook's guard, so an error there escaped as a traceback at session
+        # shutdown instead of failing open like every other step.
+        with (
+            mock.patch.object(hook.savings_ledger, "tracking_enabled", return_value=True),
+            mock.patch.object(hook.savings_ledger, "has_session_artifacts", side_effect=PermissionError("denied")),
+            mock.patch.object(hook.savings_ledger, "finalize_owned_session") as fin,
+        ):
+            self.assertEqual(_run_main(), "")  # _run_main only swallows SystemExit
+        fin.assert_not_called()
+
+    def test_already_consumed_by_another_process_prints_nothing(self):
+        # None: a concurrent recovery owned and rolled up this session first.
+        with (
+            mock.patch.object(hook.savings_ledger, "tracking_enabled", return_value=True),
+            mock.patch.object(hook.savings_ledger, "has_session_artifacts", return_value=True),
+            mock.patch.object(hook.savings_ledger, "project_name_from_cwd", return_value="my-project"),
+            mock.patch.object(hook.savings_ledger, "get_schema_overhead_tokens", return_value=0),
+            mock.patch.object(hook.savings_ledger, "finalize_owned_session", return_value=None),
+            mock.patch.object(hook.savings_ledger, "format_simple_view", return_value=_SUMMARY) as fmt,
+        ):
+            self.assertEqual(_run_main(), "")
+        fmt.assert_not_called()
 
 
 _PAYLOAD_WITH_TRANSCRIPT = json.dumps({
@@ -134,7 +234,7 @@ class TranscriptParsing(unittest.TestCase):
         """Run main() with all ledger calls stubbed; capture finalize_session kwargs."""
         captured = {}
 
-        def _fake_finalize(session_id, project, overhead_tokens=0, delete_jsonl=True, actual_tokens=None):
+        def _fake_finalize(session_id, project=None, overhead_tokens=0, actual_tokens=None, stale_before=None):
             captured["actual_tokens"] = actual_tokens
             return {"event_count": 1}
 
@@ -149,10 +249,10 @@ class TranscriptParsing(unittest.TestCase):
         patchers = [
             mock.patch.dict(os.environ, patched_env, clear=True),
             mock.patch.object(hook.savings_ledger, "tracking_enabled", return_value=True),
-            mock.patch.object(hook.savings_ledger, "read_session_events", return_value=[object()]),
+            mock.patch.object(hook.savings_ledger, "has_session_artifacts", return_value=True),
             mock.patch.object(hook.savings_ledger, "project_name_from_cwd", return_value="proj"),
             mock.patch.object(hook.savings_ledger, "get_schema_overhead_tokens", return_value=0),
-            mock.patch.object(hook.savings_ledger, "finalize_session", side_effect=_fake_finalize),
+            mock.patch.object(hook.savings_ledger, "finalize_owned_session", side_effect=_fake_finalize),
             mock.patch.object(hook.savings_ledger, "query_project_summary", return_value={}),
             mock.patch.object(hook.savings_ledger, "format_simple_view", return_value=_SUMMARY),
             # #364: the hook calls the session-level parser (main + subagent
@@ -208,10 +308,10 @@ class TranscriptParsing(unittest.TestCase):
         with (
             mock.patch.dict(os.environ, {"CLAUDE_RUNWAY_PARSE_TRANSCRIPT_TOKENS": "1"}),
             mock.patch.object(hook.savings_ledger, "tracking_enabled", return_value=True),
-            mock.patch.object(hook.savings_ledger, "read_session_events", return_value=[object()]),
+            mock.patch.object(hook.savings_ledger, "has_session_artifacts", return_value=True),
             mock.patch.object(hook.savings_ledger, "project_name_from_cwd", return_value="proj"),
             mock.patch.object(hook.savings_ledger, "get_schema_overhead_tokens", return_value=0),
-            mock.patch.object(hook.savings_ledger, "finalize_session", return_value={}),
+            mock.patch.object(hook.savings_ledger, "finalize_owned_session", return_value={}),
             mock.patch.object(hook.savings_ledger, "query_project_summary", return_value={}),
             mock.patch.object(hook.savings_ledger, "format_simple_view", return_value=_SUMMARY),
             mock.patch.object(hook.savings_ledger, "parse_session_token_counts", return_value=None) as parse,
