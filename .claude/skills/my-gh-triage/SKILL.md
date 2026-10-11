@@ -49,7 +49,7 @@ A ticket is needed when the verdict is `bug`, `intended but confusing`, or `plau
 
 No ticket for `working as intended` or `config / environment`. Answer the user and stop there, unless a doc change would prevent the confusion. That is an `intended but confusing` verdict, so file it.
 
-Before filing, search open issues for a duplicate (`gh issue list -R Donelle/claude-runway --search "<key terms>" --state open`). If one exists, add your findings as a comment on it instead of filing a new one.
+Before filing, search open issues for a duplicate (`gh issue list -R Donelle/claude-runway --search "<key terms>" --state open --limit 100`). If one exists, add your findings as a comment on it instead of filing a new one.
 
 Otherwise run `/my-gh-create-issue` and feed it the Gate 1 findings directly. They become its Location and Sanity-checked lines, so it should not need to re-investigate. Respect its approval stop.
 
