@@ -365,3 +365,26 @@ class DeniedUrlCache(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DenyReason(unittest.TestCase):
+    def setUp(self):
+        self.reason = hook._deny_reason("https://example.com/page", "what does it say")
+
+    def test_names_url_and_focus(self):
+        self.assertIn("url='https://example.com/page'", self.reason)
+        self.assertIn("focus='what does it say'", self.reason)
+
+    def test_does_not_read_as_a_site_block(self):
+        # The old "unavailable for this URL by policy" wording read like a
+        # site-specific block; the hook denies every WebFetch while LM
+        # Studio is up.
+        self.assertNotIn("by policy", self.reason)
+        self.assertIn("not a block on this site", self.reason)
+
+    def test_fallback_covers_any_error_and_missing_tool(self):
+        # The one-shot retry in main() allows WebFetch through regardless of
+        # why fetch_url failed, so the message must not narrow the fallback
+        # to auth/JS cases, and must cover a caller with no fetch_url tool.
+        self.assertIn("an error of any kind", self.reason)
+        self.assertIn("fetch_url is not in your tool list", self.reason)

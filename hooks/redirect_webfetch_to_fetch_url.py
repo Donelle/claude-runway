@@ -392,6 +392,38 @@ def _deny(reason: str) -> NoReturn:
     sys.exit(0)
 
 
+def _deny_reason(url: str, prompt: str) -> str:
+    """
+    The message Claude (and the user, in the transcript) sees on a deny.
+
+    Says plainly that this is claude-runway's own routing rule, not a block
+    on this particular site: the earlier "unavailable for this URL by
+    policy" wording read like a site-specific security policy, when the hook
+    actually denies every WebFetch while LM Studio is up.
+
+    The fallback covers ANY fetch_url failure, not just the auth/JS/cookie
+    cases the earlier wording listed -- a 403 from a bot-blocking site, a
+    timeout or an empty extraction leaves Claude with nothing either, and
+    the one-shot retry skip in main() allows WebFetch through regardless of
+    why fetch_url failed. It also covers a caller that has no fetch_url
+    tool at all (a subagent with a restricted tool list), which otherwise
+    has no way forward except retrying WebFetch, and the verbatim-text case
+    fetch_url's own docstring already sends back to WebFetch.
+    """
+    return (
+        "claude-runway routes web fetches through the local model while LM Studio is "
+        "running, so this WebFetch call was redirected (this is not a block on this site). "
+        "Call the fetch_url tool from the local-compress MCP server now, without asking the "
+        f"user first. Use url={url!r} and pass the same intent via its `focus` parameter "
+        f"(e.g. focus={prompt!r} if that captures what you're looking for). Retry the "
+        "original WebFetch call for this URL instead, and it will be allowed through, if "
+        "any of these hold: fetch_url returns an error of any kind (HTTP error, timeout, "
+        "nothing extracted, or a page needing authentication, JavaScript rendering, or "
+        "cookies); fetch_url is not in your tool list; or you need the page's exact text "
+        "verbatim. Do not stop and ask the user; just proceed."
+    )
+
+
 def main():
     # Force UTF-8 on stdin before the read: Claude Code sends the payload as
     # UTF-8, but Windows Python defaults stdin to the locale codepage
@@ -443,16 +475,7 @@ def main():
     if not _denied_url_cache.record_denied(url):
         _allow()
 
-    _deny(
-        f"WebFetch is unavailable for this URL by policy. Immediately call the fetch_url tool "
-        f"from the local-compress MCP server instead -- do NOT ask the user for confirmation "
-        f"first, just call it now. Use url={url!r} and pass the same intent via its `focus` "
-        f"parameter (e.g. focus={prompt!r} if that captures what you're looking for). If "
-        "fetch_url itself then errors because the page needs authentication, JavaScript "
-        "rendering, or session/cookie handling, immediately retry the original WebFetch call "
-        "for this URL -- the hook will allow it through on that retry. Do NOT stop and ask the "
-        "user; just proceed: fetch_url first, and if that errors, WebFetch next."
-    )
+    _deny(_deny_reason(url, prompt))
 
 
 if __name__ == "__main__":
