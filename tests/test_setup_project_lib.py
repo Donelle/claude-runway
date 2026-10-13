@@ -44,6 +44,7 @@ from setup_project_lib import (  # noqa: E402
     merge_mcp_json,
     merge_settings_hooks,
     plan_skill_installs,
+    split_skill_frontmatter,
     resolved_fastembed_cache_path,
     run_setup,
     strip_toolkit_hooks,
@@ -1069,6 +1070,118 @@ class PlanSkillInstalls(unittest.TestCase):
         by_name = {p.name: p for p in plans}
         self.assertEqual(by_name["skill-a"].action, "update")
         self.assertEqual(by_name["skill-b"].action, "install")
+
+
+class SkillFrontmatterHandling(unittest.TestCase):
+    """Issue #449: shipped skills have no frontmatter, installed ones do. The
+    installed copy's frontmatter is preserved and only the body is compared,
+    so there is no perpetual false "update" and no frontmatter is deleted."""
+
+    FM = b'---\nname: skill-a\ndescription: "hand edited description"\n---\n\n'
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.tools_repo_dir = Path(self._tmpdir.name) / "tools-repo"
+        self.skills_dir = Path(self._tmpdir.name) / "dest-skills"
+        (self.tools_repo_dir / "skills" / "skill-a").mkdir(parents=True)
+        self.src = self.tools_repo_dir / "skills" / "skill-a" / "SKILL.md"
+        self.src.write_bytes(b"# Skill: a\nbody v2\n")
+        (self.skills_dir / "skill-a").mkdir(parents=True)
+        self.dest = self.skills_dir / "skill-a" / "SKILL.md"
+
+    def _plan(self):
+        return plan_skill_installs(self.tools_repo_dir, self.skills_dir)[0]
+
+    def test_split_roundtrips_and_handles_no_frontmatter(self):
+        data = self.FM + b"# Skill: a\n"
+        prefix, body = split_skill_frontmatter(data)
+        self.assertEqual(prefix + body, data)
+        self.assertEqual(body, b"# Skill: a\n")
+        self.assertEqual(split_skill_frontmatter(b"# Skill: a\n"), (b"", b"# Skill: a\n"))
+        self.assertEqual(split_skill_frontmatter(b""), (b"", b""))
+
+    def test_bom_before_the_opening_fence_is_still_frontmatter(self):
+        # Copilot review on PR #451: a Windows editor's UTF-8 BOM must not
+        # make the block look absent (which would delete it on refresh).
+        bom = b"\xef\xbb\xbf"
+        data = bom + self.FM + b"# Skill: a\n"
+        prefix, body = split_skill_frontmatter(data)
+        self.assertEqual(prefix, bom + self.FM)
+        self.assertEqual(body, b"# Skill: a\n")
+        self.dest.write_bytes(bom + self.FM + b"stale\n")
+        plan = self._plan()
+        self.assertEqual(plan.action, "update")
+        self.assertEqual(plan.content.encode("utf-8"), bom + self.FM + b"# Skill: a\nbody v2\n")
+        self.dest.write_bytes(plan.content.encode("utf-8"))
+        self.assertEqual(self._plan().action, "up_to_date")
+
+    def test_unclosed_fence_is_not_frontmatter(self):
+        data = b"---\nname: x\n# Skill: a\n"
+        self.assertEqual(split_skill_frontmatter(data), (b"", data))
+
+    def test_installed_copy_with_frontmatter_and_same_body_is_up_to_date(self):
+        self.dest.write_bytes(self.FM + b"# Skill: a\nbody v2\n")
+        plan = self._plan()
+        self.assertEqual(plan.action, "up_to_date")
+        self.assertTrue(plan.frontmatter_preserved)
+
+    def test_installed_copy_without_frontmatter_and_same_body_is_up_to_date(self):
+        self.dest.write_bytes(b"# Skill: a\nbody v2\n")
+        plan = self._plan()
+        self.assertEqual(plan.action, "up_to_date")
+        self.assertFalse(plan.frontmatter_preserved)
+
+    def test_stale_body_updates_and_keeps_the_users_frontmatter(self):
+        self.dest.write_bytes(self.FM + b"# Skill: a\nbody v1 mentions EVALUATION.md\n")
+        plan = self._plan()
+        self.assertEqual(plan.action, "update")
+        self.assertEqual(plan.content.encode("utf-8"), self.FM + b"# Skill: a\nbody v2\n")
+        self.assertNotIn("EVALUATION.md", plan.content)
+
+    def test_stale_copy_without_frontmatter_gets_none_invented(self):
+        self.dest.write_bytes(b"old\n")
+        plan = self._plan()
+        self.assertEqual(plan.action, "update")
+        self.assertEqual(plan.content, "# Skill: a\nbody v2\n")
+
+    def test_hand_edited_body_is_reported_as_update(self):
+        self.dest.write_bytes(self.FM + b"# Skill: a\nbody v2 plus my edit\n")
+        self.assertEqual(self._plan().action, "update")
+
+    def test_crlf_installed_copy_keeps_crlf_frontmatter(self):
+        fm = self.FM.replace(b"\n", b"\r\n")
+        self.dest.write_bytes(fm + b"# Skill: a\nbody v2\n")
+        self.assertEqual(self._plan().action, "up_to_date")
+        self.dest.write_bytes(fm + b"stale\n")
+        plan = self._plan()
+        self.assertEqual(plan.action, "update")
+        self.assertTrue(plan.content.encode("utf-8").startswith(fm))
+
+    def test_non_utf8_frontmatter_round_trips(self):
+        fm = b'---\nname: skill-a\ndescription: "caf\xe9"\n---\n\n'
+        self.dest.write_bytes(fm + b"stale\n")
+        plan = self._plan()
+        self.assertEqual(plan.content.encode("utf-8", errors="surrogateescape"), fm + b"# Skill: a\nbody v2\n")
+
+    def test_source_gaining_frontmatter_never_overwrites_the_installed_block(self):
+        # Copilot review on PR #451: a shipped skill that later gains its own
+        # frontmatter must not replace the installed copy's frontmatter.
+        self.src.write_bytes(self.FM + b"body\n")
+        installed_fm = b"---\nname: other\ndescription: mine\n---\n\n"
+        self.dest.write_bytes(installed_fm + b"stale\n")
+        plan = self._plan()
+        self.assertEqual(plan.action, "update")
+        self.assertEqual(plan.content.encode("utf-8"), installed_fm + b"body\n")
+        # ...and once refreshed it is up to date, not a perpetual update.
+        self.dest.write_bytes(plan.content.encode("utf-8"))
+        self.assertEqual(self._plan().action, "up_to_date")
+
+    def test_source_with_frontmatter_installs_whole_when_installed_has_none(self):
+        self.src.write_bytes(self.FM + b"body\n")
+        self.dest.write_bytes(b"stale, no frontmatter\n")
+        plan = self._plan()
+        self.assertEqual(plan.content.encode("utf-8"), self.FM + b"body\n")
 
 
 class CompactEmbeddingModelOnInit(unittest.TestCase):

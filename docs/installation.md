@@ -261,6 +261,8 @@ python tools/setup_project.py upgrade /path/to/target-repo --dry-run   # preview
 python tools/setup_project.py upgrade /path/to/target-repo --auto-yes  # apply every pending migration, no prompts (scripting/CI)
 ```
 
+**`upgrade` also refreshes installed skills** (upstream #449). After the config migrations it compares each product skill you have ALREADY installed under `~/.claude/skills/` (`--skills-dir <path>` to override) with the shipped one, lists the ones that differ, and asks before rewriting each (`--auto-yes` approves all; `--dry-run` previews and writes nothing). This runs even when no config migration is pending. It never installs a skill you do not have (that stays `init --install-skills`), so a user with no skills installed is not forced to get any. Frontmatter rule: shipped skills have no `---` frontmatter block but installed ones usually do, so an installed copy's frontmatter is kept as-is and only the body is compared and replaced. A copy that differs from the shipped file only by its frontmatter is therefore reported as up to date, `init --install-skills` and `upgrade` agree on this, and a refresh never deletes your frontmatter. Comparison is byte-for-byte on the body, so a hand edit to the body counts as a difference and is overwritten when you approve.
+
 **If you pass `--qdrant-api-key`**, the real key is written in plaintext into `.mcp.json` (never echoed back in `--dry-run`'s preview or the printed follow-up command, which are both redacted/placeholdered instead) — the script prints a warning reminding you NOT to commit `.mcp.json` as-is in that case, replacing the usual "commit it" instruction. There's no built-in mechanism here for keeping the key out of a committed `.mcp.json`; either gitignore `.mcp.json` for that project or manage the key through your own separate process.
 
 The manual steps below still apply if you'd rather hand-edit (or need to understand exactly what the script does / verify its output):
@@ -351,9 +353,9 @@ The package version is derived from commit history (see the "Which version/commi
 
 **2. Pick `init` or `upgrade` per configured project.** Neither runs automatically; the generated `.mcp.json`/`.claude/settings.json` keep whatever the older version wrote until you re-run one of them:
 
-- **`upgrade`** (step 4 above) is the default after a normal update. It applies only the specific, named config gaps a newer release added (for example the `memory-bank` server or the `record_session_id.py` hooks), asks before each one, and leaves every option you originally set alone. Preview with `--dry-run` first.
+- **`upgrade`** (step 4 above) is the default after a normal update. It applies only the specific, named config gaps a newer release added (for example the `memory-bank` server or the `record_session_id.py` hooks), asks before each one, and leaves every option you originally set alone. It then also refreshes any already-installed skill that went stale (asking per skill). Preview with `--dry-run` first.
 - **`init`** (re-passing the flags you originally used) is required when existing paths in the generated config are no longer valid, or when you need the fastembed-cache/`HF_HUB_OFFLINE` fix confirmed for this machine. In particular, after a pipx/`uv tool` upgrade that crosses issue upstream #206 (the move of `libs`/`tools`/`hooks`/`templates` out of site-packages into `<env>/src/`), `upgrade` will NOT repair the stale absolute paths, so re-run `init`. See the callout under step 4 and README's Known limitations for the full explanation.
-- If you installed the product skills, refresh them too: `claude-runway-setup init --install-skills` (or `python tools/setup_project.py init --install-skills` from a clone).
+- If you installed the product skills, `upgrade` (above) now refreshes the stale ones for you. To also install skills you do not have yet, run `claude-runway-setup init --install-skills` (or `python tools/setup_project.py init --install-skills` from a clone).
 
 Restart Claude Code in each project afterward so it reloads the MCP servers and hooks.
 

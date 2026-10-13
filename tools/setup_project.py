@@ -17,7 +17,7 @@ Usage:
     python tools/setup_project.py init /path/to/target-repo --install-skills
     python tools/setup_project.py init --install-skills   # skills only, no target_repo (issue #205)
 
-    python tools/setup_project.py upgrade /path/to/target-repo             # apply pending config migrations
+    python tools/setup_project.py upgrade /path/to/target-repo             # apply pending config migrations + refresh installed skills
     python tools/setup_project.py upgrade /path/to/target-repo --dry-run
     python tools/setup_project.py upgrade /path/to/target-repo --auto-yes
 
@@ -26,7 +26,13 @@ which resets every toolkit-owned setting to whatever this run's flags/
 defaults are, `upgrade` compares the target's current `.mcp.json`/
 `.claude/settings.json` against a fixed set of named, individually
 detectable config gaps (see `libs/upgrade_lib.py`) and applies only the ones
-the user approves, leaving everything else untouched.
+the user approves, leaving every other config setting untouched. Since issue
+#449 it ALSO refreshes product skills that are already installed under
+`~/.claude/skills/` (`--skills-dir` to override) and differ from the shipped
+ones -- a second, separate step after the config migrations (same
+`--dry-run`/`--auto-yes` semantics), which rewrites only the body of an
+installed SKILL.md (its own frontmatter is kept) and never installs a skill
+that is not already there.
 
 The templates stay the single source of truth: this script loads and
 patches them (see libs/setup_project_lib.py) rather than duplicating their
@@ -53,7 +59,13 @@ from typing import Optional
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "libs"))
 
-from setup_project_lib import default_skills_dir, plan_skill_installs, run_setup, venv_python_path  # noqa: E402
+from setup_project_lib import (  # noqa: E402
+    SKILL_TEXT_ERRORS,
+    default_skills_dir,
+    plan_skill_installs,
+    run_setup,
+    venv_python_path,
+)
 from upgrade_lib import is_project_configured, run_upgrade  # noqa: E402
 from version_lib import version_string  # noqa: E402
 
@@ -148,7 +160,7 @@ def _atomic_write(path: Path, content: str) -> None:
     tmp_path = Path(tmp_path_str)
     try:
         with os.fdopen(fd, "wb") as f:
-            f.write(content.encode("utf-8"))
+            f.write(content.encode("utf-8", errors=SKILL_TEXT_ERRORS))
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, path)
@@ -527,6 +539,82 @@ def cmd_init(args: argparse.Namespace) -> None:
         _report_and_apply_skill_plan(plan_skill_installs(TOOLS_REPO_DIR, skills_dir), dry_run=False)
 
 
+def _confirm_skill_refresh(plan) -> bool:
+    """Default interactive Y/n prompt for one stale skill, mirroring
+    upgrade_lib._console_prompt (blank input defaults to Yes). A closed stdin
+    (EOFError, e.g. a non-interactive run without --auto-yes) counts as a
+    decline rather than a crash: nothing is written, and the skill is
+    reported again on the next run, exactly like a declined migration."""
+    try:
+        answer = input(f"      Refresh {plan.name}? [Y/n] ").strip().lower()
+    except EOFError:
+        print("      (no input available -- skipped; pass --auto-yes to apply without prompting)")
+        return False
+    return answer not in ("n", "no")
+
+
+def refresh_installed_skills(
+    skills_dir: Path,
+    *,
+    auto_yes: bool,
+    dry_run: bool,
+    prompt_fn=None,
+    tools_repo_dir: "Path | None" = None,
+) -> "list[str]":
+    """
+    `upgrade`'s skill refresh (issue #449): brings INSTALLED product skills
+    that differ from the shipped ones up to date, reusing
+    `plan_skill_installs` (one comparison, shared with `init
+    --install-skills`, so the two can never disagree about what counts as
+    stale -- including the frontmatter rule documented there).
+
+    Deliberately narrower than `init --install-skills`: only skills that are
+    ALREADY installed (plan action "update") are touched. A skill that is
+    not installed is never installed here -- a user who skipped the skills
+    must not be forced to get them by running `upgrade`; they are only told
+    how many exist. Approval works like config migrations: a Y/n prompt per
+    stale skill, every one with `auto_yes`, none written with `dry_run`
+    (which also never prompts). Returns the names refreshed (or, for
+    `dry_run`, that would be).
+    """
+    plans = plan_skill_installs(tools_repo_dir or TOOLS_REPO_DIR, skills_dir)
+    stale = [p for p in plans if p.action == "update"]
+    not_installed = [p for p in plans if p.action == "install"]
+    print(f"\nChecking installed skills under {skills_dir}...")
+    if not stale:
+        installed = len(plans) - len(not_installed)
+        print(
+            "  No installed skills to refresh."
+            if installed == 0
+            else "  All installed skills are up to date."
+        )
+    else:
+        print(f"  Found {len(stale)} installed skill(s) that differ from the shipped version:")
+    ask = prompt_fn or _confirm_skill_refresh
+    refreshed: list = []
+    for plan in stale:
+        note = " (keeping its existing frontmatter)" if plan.frontmatter_preserved else ""
+        if dry_run:
+            print(f"  - Would refresh {plan.name} -> {plan.dest}{note}")
+            refreshed.append(plan.name)
+            continue
+        print(f"  - {plan.name} -> {plan.dest}{note}")
+        if not (auto_yes or ask(plan)):
+            print("      Skipped.")
+            continue
+        _atomic_write(plan.dest, plan.content)
+        print("      Refreshed.")
+        refreshed.append(plan.name)
+    if not_installed:
+        print(
+            f"  ({len(not_installed)} shipped skill(s) are not installed and were left alone; "
+            "`init --install-skills` installs them.)"
+        )
+    if dry_run and stale:
+        print("  Dry run: no skills written.")
+    return refreshed
+
+
 def cmd_upgrade(args: argparse.Namespace) -> None:
     """
     Structured like `cmd_init`: validate `target_repo` exists, compute the
@@ -576,6 +664,11 @@ def cmd_upgrade(args: argparse.Namespace) -> None:
         auto_yes=args.auto_yes,
         dry_run=args.dry_run,
     )
+
+    # Issue #449: config migrations never touched installed skills, so a user
+    # who only ran `upgrade` kept stale skill text indefinitely. Runs after
+    # the config migrations, whether or not any were pending.
+    refresh_installed_skills(_resolve_skills_dir(args), auto_yes=args.auto_yes, dry_run=args.dry_run)
 
 
 def parse_args() -> argparse.Namespace:
@@ -723,15 +816,27 @@ def parse_args() -> argparse.Namespace:
     # ones the user approves. No feature-selection flags (--qdrant-only,
     # --lmstudio-model, etc.) -- migrations are self-contained and derive
     # everything they need from the existing config or the template.
+    # Issue #449: after the migrations it also refreshes already-installed
+    # skills (see refresh_installed_skills), so the flags below cover both.
     upgrade = sub.add_parser(
-        "upgrade", help="Apply pending config migrations to an already-configured project"
+        "upgrade",
+        help="Apply pending config migrations to an already-configured project and refresh installed skills",
     )
     upgrade.add_argument("target_repo", help="Path to the already-configured project repo to migrate")
     upgrade.add_argument(
-        "--dry-run", action="store_true", help="Print pending migrations without writing anything"
+        "--dry-run", action="store_true", help="Print pending migrations and stale skills without writing anything"
     )
     upgrade.add_argument(
-        "--auto-yes", action="store_true", help="Apply every pending migration without prompting (for scripting/CI)"
+        "--auto-yes",
+        action="store_true",
+        help="Apply every pending migration and refresh every stale installed skill without prompting (for scripting/CI)",
+    )
+    upgrade.add_argument(
+        "--skills-dir",
+        default="",
+        help="Where installed product skills live (default: ~/.claude/skills) -- upgrade also refreshes "
+        "any skill already installed there that differs from the shipped version (issue #449); skills "
+        "that are not installed are never installed by upgrade",
     )
     upgrade.set_defaults(func=cmd_upgrade)
 

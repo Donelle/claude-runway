@@ -743,17 +743,63 @@ def default_skills_dir(home_dir: Path) -> Path:
     return home_dir / ".claude" / "skills"
 
 
+def split_skill_frontmatter(data: bytes) -> "tuple[bytes, bytes]":
+    """
+    Splits a SKILL.md's raw bytes into `(frontmatter_prefix, body)` (issue
+    #449). `frontmatter_prefix` is everything from the opening `---` line
+    through the closing `---` line PLUS the blank line(s) after it, so
+    `frontmatter_prefix + body == data` always holds; it is `b""` when
+    `data` has no frontmatter block.
+
+    Why this exists: the shipped `skills/*/SKILL.md` files carry NO
+    frontmatter (they start at `# Skill: <name>`), but a skill installed on
+    a user's machine needs `name`/`description` frontmatter to be listed,
+    so real installed copies start with a `---` ... `---` block the source
+    lacks. A raw byte comparison would therefore call such a copy "update"
+    on EVERY run. The decision (see `plan_skill_installs`): the installed
+    copy's frontmatter is the USER'S (it may carry a hand-edited
+    description), so it is preserved verbatim and only the body is compared
+    and replaced. Never delete it, never invent one.
+
+    Operates on bytes and tolerates CRLF line endings, so it is safe on a
+    copy saved by a Windows editor. An opening fence with no closing fence
+    is not frontmatter (returns `b""` prefix): there is no well-defined
+    boundary to preserve, so the whole file is treated as body.
+    """
+    # A UTF-8 BOM before the opening fence (common from Windows editors) is
+    # not part of the fence line: skip it for detection but keep its bytes in
+    # the returned prefix, so the file is still recognised as having
+    # frontmatter and a refresh keeps the BOM along with the block (Copilot
+    # review on PR #451).
+    bom = b"\xef\xbb\xbf" if data.startswith(b"\xef\xbb\xbf") else b""
+    lines = data[len(bom):].splitlines(keepends=True)
+    if not lines or lines[0].rstrip() != b"---":
+        return b"", data
+    close = next((i for i in range(1, len(lines)) if lines[i].rstrip() == b"---"), None)
+    if close is None:
+        return b"", data
+    end = close + 1
+    while end < len(lines) and lines[end].strip() == b"":
+        end += 1
+    prefix = bom + b"".join(lines[:end])
+    return prefix, data[len(prefix):]
+
+
 @dataclass
 class SkillInstallPlan:
     """
     One entry per skill directory found under `tools_repo_dir/skills/`
     (issue #205) -- `name` is the skill's directory name (e.g.
     "my-compact"), `action` is one of "install" (dest doesn't exist yet),
-    "up_to_date" (dest already holds byte-identical content -- nothing to
-    do), or "update" (dest exists but differs -- overwrite). `content` is
-    the shipped SKILL.md's full text, already read here so a caller can
-    write it without touching `source` again (and so --dry-run/tests never
-    need to re-read the file to report what WOULD be written).
+    "up_to_date" (dest already holds exactly what this plan would write --
+    nothing to do), or "update" (dest exists but differs -- overwrite).
+    `content` is the FULL text this plan would write to `dest`: the shipped
+    SKILL.md, preceded by the installed copy's own frontmatter block when it
+    has one (issue #449, `frontmatter_preserved`), already computed here so a
+    caller can write it without touching `source` again (and so
+    --dry-run/tests never need to re-read the file to report what WOULD be
+    written). Bytes that are not valid UTF-8 inside a preserved frontmatter
+    block round-trip via `surrogateescape` (see `SKILL_TEXT_ERRORS`).
     """
 
     name: str
@@ -761,12 +807,22 @@ class SkillInstallPlan:
     source: Path
     dest: Path
     content: str
+    frontmatter_preserved: bool = False
+
+
+# The one error handler used to decode/encode skill text, shared with
+# tools/setup_project.py's _atomic_write so a preserved frontmatter block
+# that is not valid UTF-8 survives the round trip instead of crashing the
+# run or being silently dropped (issue #449). For valid UTF-8 it behaves
+# exactly like plain "strict".
+SKILL_TEXT_ERRORS = "surrogateescape"
 
 
 def plan_skill_installs(tools_repo_dir: Path, skills_dir: Path) -> list:
     """
     Read-only planning step for `claude-runway-setup init --install-skills`
-    (issue #205) -- scans `tools_repo_dir/skills/*/SKILL.md` (the shipped
+    (issue #205) and, since issue #449, `upgrade`'s skill refresh -- scans
+    `tools_repo_dir/skills/*/SKILL.md` (the shipped
     source of truth: the SAME path for a clone and a pipx/`uv tool install`,
     since `skills/` is now packaged as a sibling of `libs/tools/templates/
     hooks` under `[tool.setuptools] packages` in pyproject.toml, exactly the
@@ -776,6 +832,18 @@ def plan_skill_installs(tools_repo_dir: Path, skills_dir: Path) -> list:
     writes anything itself. Mirrors `run_setup`'s own "pure computation, the
     CLI does the actual writing" split, so this stays trivially testable
     with only tmp directories, no mocking of file I/O needed.
+
+    Frontmatter rule (issue #449): when the shipped source has no
+    frontmatter but the installed copy does, the installed copy's
+    frontmatter block is preserved and only the body is compared/replaced
+    (`split_skill_frontmatter`). So an installed copy that differs from the
+    shipped one ONLY by its frontmatter is "up_to_date" (no perpetual false
+    "update"), and an "update" rewrites the body while keeping the user's
+    frontmatter. A fresh "install" writes the shipped source as-is (no
+    frontmatter is invented). If the shipped source itself ever gains
+    frontmatter, an installed copy's own block STILL wins (the shipped block
+    is not written over it); only an installed copy with no frontmatter gets
+    the shipped file whole.
 
     Only `SKILL.md` files are considered; a skill directory without one
     (shouldn't happen for anything shipped by this repo, but a defensive
@@ -813,8 +881,10 @@ def plan_skill_installs(tools_repo_dir: Path, skills_dir: Path) -> list:
         # right back with no text-mode translation on either end, keeps
         # this byte-for-byte round-trippable regardless of platform or
         # what line-ending style the shipped SKILL.md actually uses.
-        content = source.read_bytes().decode("utf-8")
+        source_bytes = source.read_bytes()
+        content = source_bytes.decode("utf-8")
         dest = skills_dir / skill_dir.name / "SKILL.md"
+        preserved = False
         if not dest.exists():
             action = "install"
         else:
@@ -828,11 +898,29 @@ def plan_skill_installs(tools_repo_dir: Path, skills_dir: Path) -> list:
             # (already read above), so encoding it once and comparing bytes
             # is both simpler and more precise than a lossy decode (e.g.
             # errors="replace") would be.
-            if dest.read_bytes() == content.encode("utf-8"):
+            dest_bytes = dest.read_bytes()
+            # Issue #449: the installed copy's own frontmatter always wins.
+            # It is carried over in front of the shipped BODY -- if a future
+            # shipped source gains frontmatter of its own, that block is
+            # dropped from what is written (an installed copy already has
+            # one, which is the user's to keep), so a refresh can never
+            # replace or delete it. An installed copy with NO frontmatter
+            # gets the shipped file whole, frontmatter included if any.
+            prefix = split_skill_frontmatter(dest_bytes)[0]
+            if prefix:
+                source_body = split_skill_frontmatter(source_bytes)[1]
+                content = prefix.decode("utf-8", errors=SKILL_TEXT_ERRORS) + source_body.decode("utf-8")
+                preserved = True
+            if dest_bytes == content.encode("utf-8", errors=SKILL_TEXT_ERRORS):
                 action = "up_to_date"
             else:
                 action = "update"
-        plans.append(SkillInstallPlan(name=skill_dir.name, action=action, source=source, dest=dest, content=content))
+        plans.append(
+            SkillInstallPlan(
+                name=skill_dir.name, action=action, source=source, dest=dest, content=content,
+                frontmatter_preserved=preserved,
+            )
+        )
     return plans
 
 
