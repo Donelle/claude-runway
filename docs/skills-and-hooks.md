@@ -13,6 +13,29 @@ In practice, WebFetch and WebSearch are usually no-ops: both already run their o
 
 `Read` (and `Write`/`Edit`/`NotebookEdit`) are deliberately excluded from the matcher: their output is often the exact basis for a following `Edit`, and a silent lossy rewrite there risks Claude editing from compressed content — a worse failure than a compressed log.
 
+## The hooks this toolkit ships
+
+All four are scripts in `hooks/`, referenced by absolute path from `.claude/settings.json` (`templates/settings.json.template` has the registrations). Each fails open.
+
+| Hook | Registered under | What it does |
+|---|---|---|
+| `hooks/compress_output.py` | `PostToolUse` | Compresses large tool output on the local model; described above. |
+| `hooks/redirect_webfetch_to_fetch_url.py` | `PreToolUse` on `WebFetch` | Denies `WebFetch` and points Claude at `fetch_url`, only while LM Studio is reachable; see below. |
+| `hooks/record_session_id.py` | `SessionStart` and `SessionEnd` | Core hook, installed in every project (only `init --skip-hooks` omits it). Writes or refreshes this session's shadow marker (`libs/session_id_lib.py`'s `SHADOW_FILE` strategy) at each start, sweeps markers older than `CLAUDE_RUNWAY_SESSION_MARKER_TTL_HOURS`, and deletes its own marker on a graceful `SessionEnd`. It never touches tool output. |
+| `hooks/session_end_savings.py` | `SessionEnd` | Rolls the session's transient savings ledger into the perpetual SQLite store and shows a short summary. Silent unless `CLAUDE_RUNWAY_TRACK_SAVINGS` is on and the session logged a credited event. See [Savings tracker](savings-tracker.md). |
+
+## The skills this toolkit ships
+
+Installed under `~/.claude/skills/` by `claude-runway-setup init --install-skills`; each is a slash command.
+
+| Skill | What it does |
+|---|---|
+| `my-compact` | `/my-compact` stores a structured summary of the current conversation through the `qdrant` server's `compact_store`, a local alternative to native `/compact`. See [Session continuity skills](session-continuity.md). |
+| `my-resume` | `/my-resume` fetches a stored compact (`compact_find`) by project and label and restores it into a fresh session. See [Session continuity skills](session-continuity.md). |
+| `my-savings` | `/my-savings [detail\|trend]` shows the savings tracker through the opt-in `analytics` server. See [Savings tracker](savings-tracker.md). |
+| `my-metrics` | `/my-metrics <metricId> [view] [bucket]` shows a view of the shared metrics store through `analytics`'s `get_metrics`. See [Shared metrics store](metrics.md). |
+| `my-setup-clauderunway` | `/my-setup-clauderunway` configures a project interactively (runs `setup_project.py init`, or `upgrade` on an already-configured project) and updates its `CLAUDE.md`. Needs `CLAUDE_RUNWAY_DIR` exported. See [Installation](installation.md). |
+
 ## Exactness-critical commands (Bash only)
 
 The same "is this output the exact basis for what happens next" question gets asked a second time *within* Bash, because — unlike the other matched tools — Bash output isn't one kind of thing. `dotnet build` is a log to skim; `git rev-parse HEAD` is a 40-char identifier where one wrong character is a silent, confident lie. So before compressing a Bash call, the hook checks the command string and skips compression entirely for commands whose value depends on being byte-exact:

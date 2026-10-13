@@ -7,7 +7,7 @@
 
 ## Vector memory (Qdrant MCP)
 
-Five tools from the `qdrant` server: `qdrant-find` (semantic search) and `qdrant-store` (save a note for later retrieval) for this project's own knowledge, and `compact_store`/`compact_find`/`compact_prune` for conversation compacts (see below), plus `index_repo`/`sync_repo`/`preview_index`/`get_collection_info`/`find_in_collection`/`list_collections` from the codebase-indexer server.
+Five tools from the `qdrant` server: `qdrant-find` (semantic search) and `qdrant-store` (save a note for later retrieval) for this project's own knowledge, and `compact_store`/`compact_find`/`compact_prune` for conversation compacts (see below), plus `index_repo`/`sync_repo`/`preview_index`/`get_collection_info`/`find_in_collection`/`set_collection_description`/`list_collections` from the codebase-indexer server.
 
 Prefer `qdrant-find` over Grep/Read for conceptual lookups — "where is X handled," "how does Y work," "what did we decide about Z." Use Grep directly for exact identifiers, error strings, or known symbols.
 
@@ -21,7 +21,7 @@ Dedup within a session: if the same conceptual question resurfaces, reuse the ea
 
 **Conversation compacts:** `compact_store` saves a summary of the current conversation into this project's own compact collection, compressing it on the local model first when LM Studio is available and storing it as given when it is not. `compact_find` lists a project's saved compacts newest first, or searches them when given a `query`. `compact_prune` deletes old compacts by `keep_last_n` or `older_than_days`, and only reports what it would delete unless you pass `dry_run=False`. `/my-compact` and `/my-resume` call `compact_store` and `compact_find` for you, so you rarely call them by hand. Never use them for notes about the code: that is what `qdrant-store`/`qdrant-find` are for, and compacts stored there would be buried under code chunks.
 
-**Cross-repo lookups:** `qdrant-find` only ever searches THIS project's own collection. When a question genuinely requires another already-indexed repo's codebase — e.g. working in a frontend repo but needing to understand how the backend it calls actually implements an endpoint — use `find_in_collection(query, collection)` instead. If the user names an exact collection directly in their prompt, pass it through as given rather than guessing. Call `list_collections` first if you don't know the other repo's exact collection name. Don't reach for this for questions answerable from this project's own collection; it's specifically for when the answer lives in a different repo's code.
+**Cross-repo lookups:** `qdrant-find` only ever searches THIS project's own collection. When a question genuinely requires another already-indexed repo's codebase — e.g. working in a frontend repo but needing to understand how the backend it calls actually implements an endpoint — use `find_in_collection(query, collection)` instead. If the user names an exact collection directly in their prompt, pass it through as given rather than guessing. Call `list_collections` first if you don't know the other repo's exact collection name. Don't reach for this for questions answerable from this project's own collection; it's specifically for when the answer lives in a different repo's code. `set_collection_description(collection, description)` sets the one-line hint `list_collections` shows for a collection; call it only when the user asks, since this project's own hint normally comes from `COLLECTION_DESCRIPTION` in `.mcp.json`.
 
 ## Durable memory (memory-bank MCP)
 
@@ -71,3 +71,9 @@ Reporting CLIs that sit beside these tools and answer what they cannot (run them
 - `tools/autowork_cost.py report`: per-ticket cost of `/my-gh-autowork` runs from subagent transcripts: tokens by model, cache-read share, tool calls and wall clock.
 - `tools/context_breakdown.py`: what a subagent's starting context is made of and why it grows (subcommands `start`, `calibrate`, `growth`, `reads`).
 - `tools/report_tool_counts.py`: how many tools each claude-runway MCP server exposes and how big their descriptions are.
+
+## Setup and diagnostics (claude-runway skills and CLIs)
+
+Include this section only for a project that has the claude-runway skills installed. Slash commands, each answering one question: `/my-setup-clauderunway` (configure or upgrade this project's `.mcp.json` and `.claude/settings.json`; needs `CLAUDE_RUNWAY_DIR` exported), `/my-compact` and `/my-resume` (save and restore a conversation, see the compacts paragraph above), `/my-savings` and `/my-metrics` (read the `analytics` server, see above).
+
+Two CLIs, run from the claude-runway checkout (they read files and never call a model), to diagnose a setup: `tools/doctor.py <project>` reports whether `.mcp.json`'s `local-compress` env block and the live shell disagree on the `CLAUDE_RUNWAY_*` variables that must match ("why is compression not happening?"), and `tools/measure_startup_context.py` measures what the MCP servers add to a session's starting context from real transcripts ("what does this toolkit cost me before I type anything?").
