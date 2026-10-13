@@ -1,8 +1,9 @@
 """
 FastEmbed embedding provider used by every Qdrant-backed tool in this repo.
 
-This is the repo's own replacement for `mcp_server_qdrant.embeddings.fastembed
-.FastEmbedProvider`, which it used to import. It keeps that class's behavior
+This is the repo's own `FastEmbedProvider`, written to replace the one the
+third-party Qdrant MCP server package provided and this repo used to import.
+It keeps that class's behavior
 exactly, because existing collections were written under it and must stay
 readable:
 

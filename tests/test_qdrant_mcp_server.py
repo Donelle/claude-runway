@@ -1238,7 +1238,7 @@ class CompactPruneTests(unittest.TestCase):
 
 class RegisteredToolSet(unittest.TestCase):
     """Pins the tool names. `qdrant-find` and `qdrant-store` must stay exactly
-    as they were under mcp-server-qdrant so `mcp__qdrant__qdrant-find` and every
+    as the third-party server served them so `mcp__qdrant__qdrant-find` and every
     permission rule written against it keep working; the compact tools come
     with the server the compact skills now call."""
 

@@ -735,7 +735,7 @@ class FileRouting(unittest.TestCase):
             "# Core -- required for the Qdrant piece",
             "# install these even if you skip local-compress",
             "mcp[cli]",
-            "mcp-server-qdrant",
+            "qdrant-client",
             "# Local-compress piece only",
             "openai",
         ])

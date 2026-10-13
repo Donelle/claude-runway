@@ -2,9 +2,9 @@
 Async Qdrant connector used by `index_repo`/`sync_repo`/`find_in_collection`
 and `tools/ingest_to_qdrant.py`.
 
-This is the repo's own replacement for `mcp_server_qdrant.qdrant
-.QdrantConnector`/`Entry`, which it used to import. The on-disk format is kept
-exactly as that package wrote it, because existing collections depend on it:
+This is the repo's own `QdrantConnector`/`Entry`, written to replace the ones
+the third-party Qdrant MCP server package provided and this repo used to
+import. The on-disk format is kept exactly as that package wrote it, because existing collections depend on it:
 
   - one named vector per point, named by the embedding provider
     (`"fast-" + model basename`, see `qdrant_embeddings.py`), cosine distance,

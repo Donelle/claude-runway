@@ -1,27 +1,24 @@
 #!/usr/bin/env python3
 """Tests for libs/qdrant_connector.py and libs/qdrant_embeddings.py.
 
-These two modules replaced the `mcp_server_qdrant` imports, so the main job of
-this file is to pin the on-disk format that existing collections depend on:
+These two modules replaced the third-party Qdrant MCP server package's
+connector and embedding provider, so the main job of this file is to pin the on-disk format that existing collections depend on:
 
   - vector name: "fast-" + the model's basename, lowercased
   - payload: {"document": <content>, "metadata": <metadata>}
   - distance: cosine, one named vector, size from the provider
   - point id: uuid4().hex
 
-and to prove a collection written by the old package reads back through the
-new connector (and the other way round). The compatibility tests run against
-qdrant-client's in-process `:memory:` mode and a fake embedding provider, so
-they need no Qdrant server and no model download. The cross-package ones skip
-when `mcp_server_qdrant` is not installed (it is no longer imported by any
-server, and stays installed only until it is dropped as a dependency).
+and to prove a point shaped the way that package wrote it reads back through
+the connector. The tests run against qdrant-client's in-process `:memory:` mode
+and a fake embedding provider, so they need no Qdrant server and no model
+download.
 
     .venv/bin/python -m unittest discover -s tests
 """
 
 import asyncio
 import os
-import re
 import sys
 import unittest
 from unittest import mock
@@ -39,13 +36,6 @@ from qdrant_connector import (  # noqa: E402
     make_point,
 )
 from qdrant_embeddings import FastEmbedProvider, vector_name_for_model  # noqa: E402
-
-try:
-    from mcp_server_qdrant.qdrant import Entry as OldEntry, QdrantConnector as OldConnector  # noqa: E402
-except ImportError:  # pragma: no cover - depends on the environment
-    OldConnector = None
-    OldEntry = None
-
 
 def _run(coro):
     return asyncio.run(coro)
@@ -296,56 +286,28 @@ class ConnectorBehavior(unittest.TestCase):
         self.assertEqual(_run(go()), ["one"])
 
 
-@unittest.skipIf(OldConnector is None, "mcp_server_qdrant is not installed")
-class ReadsAndWritesLikeTheOldPackage(unittest.TestCase):
-    """Round-trips through the real third-party connector, the strongest
-    available proof that existing collections stay readable."""
-
-    def test_new_connector_reads_a_collection_the_old_package_wrote(self):
+class ReadsPointsInThePreExistingFormat(unittest.TestCase):
+    def test_a_hand_built_point_in_the_old_on_disk_shape_reads_back(self):
+        # Written with the raw client, not the connector, so it stands for a
+        # collection that already exists on a user's machine.
         async def go():
-            old = OldConnector(":memory:", None, "coll", _FakeProvider())
-            await old.store(OldEntry(content="legacy text", metadata={"file_path": "x.py"}))
-            # Share the one in-memory client: a second ":memory:" client would
-            # be a separate, empty database.
-            new = _connector()
-            new.client = old._client
-            return await new.search("legacy text")
+            provider = _FakeProvider()
+            c = _connector(provider)
+            await c.ensure_collection_exists("coll")
+            await c.client.upsert(
+                "coll",
+                points=[
+                    models.PointStruct(
+                        id="0123456789abcdef0123456789abcdef",
+                        vector={provider.get_vector_name(): provider._vec("legacy text")},
+                        payload={"document": "legacy text", "metadata": {"file_path": "x.py"}},
+                    )
+                ],
+            )
+            return await c.search("legacy text")
 
         [hit] = _run(go())
         self.assertEqual(hit, Entry("legacy text", {"file_path": "x.py"}))
-
-    def test_old_package_reads_a_collection_the_new_connector_wrote(self):
-        async def go():
-            new = _connector()
-            await new.store(Entry("fresh text", {"file_path": "y.py"}))
-            old = OldConnector(":memory:", None, "coll", _FakeProvider())
-            old._client = new.client
-            return await old.search("fresh text")
-
-        [hit] = _run(go())
-        self.assertEqual(hit.content, "fresh text")
-        self.assertEqual(hit.metadata, {"file_path": "y.py"})
-
-    def test_collection_schema_and_point_shape_are_identical(self):
-        # The old connector keeps its client private, the new one public, so
-        # the client is passed in alongside the connector.
-        async def shape(connector, client, make_entry):
-            await connector.store(make_entry("same text", {"k": "v"}))
-            info = await client.get_collection("coll")
-            [record], _ = await client.scroll("coll", with_vectors=True)
-            vectors = info.config.params.vectors
-            return (
-                {name: (v.size, v.distance) for name, v in vectors.items()},
-                record.payload,
-                list(record.vector),
-                bool(re.fullmatch(r"[0-9a-f]{32}", str(record.id))),
-            )
-
-        old = OldConnector(":memory:", None, "coll", _FakeProvider())
-        new = _connector()
-        old_shape = _run(shape(old, old._client, lambda c, m: OldEntry(content=c, metadata=m)))
-        new_shape = _run(shape(new, new.client, Entry))
-        self.assertEqual(new_shape, old_shape)
 
 
 class OldClientTypeStillUsable(unittest.TestCase):

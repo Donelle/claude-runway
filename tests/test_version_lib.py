@@ -114,14 +114,14 @@ class IngestVersionWorksWithBrokenDependencies(unittest.TestCase):
     def test_version_exits_zero_even_when_qdrant_imports_fail(self):
         # Copilot review (PR #372): the dependency import guard in
         # ingest_to_qdrant.py exit(1)s before parse_args() ever runs, so
-        # --version must be answered ahead of it. Shadow both third-party
+        # --version must be answered ahead of it. Shadow the third-party
         # modules with ones that raise ImportError (PYTHONPATH wins over
         # site-packages) to simulate a half-broken install.
         import subprocess
         import tempfile
 
         with tempfile.TemporaryDirectory() as stub_dir:
-            for name in ("mcp_server_qdrant", "qdrant_client"):
+            for name in ("fastembed", "qdrant_client"):
                 os.makedirs(os.path.join(stub_dir, name))
                 with open(os.path.join(stub_dir, name, "__init__.py"), "w", encoding="utf-8") as f:
                     f.write("raise ImportError('simulated broken dependency')\n")

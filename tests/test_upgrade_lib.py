@@ -1505,5 +1505,81 @@ class CompressHookRenamed(unittest.TestCase):
         self.assertTrue(_is_toolkit_owned_hook({"args": [self.NEW]}))
 
 
+class UpgradeChainFromPreSplitProject(unittest.TestCase):
+    """A project written before the `qdrant`/`analytics` split: the `qdrant`
+    block launches the third-party console script, savings tracking is on and
+    there is no `analytics` block. `upgrade` must leave it exactly as a fresh
+    `init --track-savings` would, with no trace of the old launcher."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.target_repo = Path(self._tmpdir.name) / "presplit"
+        self.target_repo.mkdir()
+        lmstudio = {"CLAUDE_RUNWAY_LMSTUDIO_URL": "http://localhost:1234/v1", "CLAUDE_RUNWAY_LMSTUDIO_MODEL": ""}
+        (self.target_repo / ".mcp.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "qdrant": {
+                            "command": "/old/venv/bin/mcp-server-qdrant",
+                            "type": "stdio",
+                            "env": {
+                                "QDRANT_URL": "http://localhost:6333",
+                                "QDRANT_API_KEY": "",
+                                "COLLECTION_NAME": "presplit",
+                                "EMBEDDING_MODEL": "sentence-transformers/all-MiniLM-L6-v2",
+                                "HF_HUB_OFFLINE": "1",
+                            },
+                        },
+                        "local-compress": {
+                            "command": "/old/venv/bin/python",
+                            "type": "stdio",
+                            "args": ["/old/tools/compress_mcp_server.py"],
+                            "env": {
+                                **lmstudio,
+                                "COMPACT_COLLECTION": "conversation-compacts",
+                                "CLAUDE_RUNWAY_TRACK_SAVINGS": "1",
+                                "CLAUDE_RUNWAY_SAVINGS_DB": "",
+                            },
+                        },
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def _mcp(self):
+        return json.loads((self.target_repo / ".mcp.json").read_text(encoding="utf-8"))
+
+    def test_upgrade_leaves_no_third_party_reference_and_matches_a_fresh_init(self):
+        from setup_project_lib import run_setup
+
+        run_upgrade(self.target_repo, REPO_ROOT, _VENV_PYTHON, auto_yes=True)
+        text = (self.target_repo / ".mcp.json").read_text(encoding="utf-8")
+        for stale in ("mcp-server-qdrant", "mcp_server_qdrant", "fastmcp"):
+            self.assertNotIn(stale, text)
+
+        fresh_target = Path(self._tmpdir.name) / "fresh"
+        fresh_target.mkdir()
+        fresh = run_setup(
+            fresh_target, REPO_ROOT, collection_name="presplit", venv_python=_VENV_PYTHON, track_savings=True
+        ).mcp_json["mcpServers"]
+        upgraded = self._mcp()["mcpServers"]
+
+        self.assertEqual(upgraded["analytics"], fresh["analytics"])
+        # Compacts that predate the setting stay pinned to the model they were
+        # stored with; that is the one deliberate difference from a new install.
+        fresh_qdrant = copy.deepcopy(fresh["qdrant"])
+        fresh_qdrant["env"]["COMPACT_EMBEDDING_MODEL"] = "BAAI/bge-small-en"
+        self.assertEqual(upgraded["qdrant"], fresh_qdrant)
+
+    def test_a_second_upgrade_changes_nothing(self):
+        run_upgrade(self.target_repo, REPO_ROOT, _VENV_PYTHON, auto_yes=True)
+        before = (self.target_repo / ".mcp.json").read_bytes()
+        self.assertEqual(run_upgrade(self.target_repo, REPO_ROOT, _VENV_PYTHON, auto_yes=True), [])
+        self.assertEqual((self.target_repo / ".mcp.json").read_bytes(), before)
+
+
 if __name__ == "__main__":
     unittest.main()

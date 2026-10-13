@@ -13,7 +13,7 @@ a correction a reviewer made -- the kind of thing worth surviving a
 Project minimum: Python 3.12 (policy floor; the dependency chain supports >=3.10).
 
 Setup:
-    pip install "mcp[cli]" mcp-server-qdrant qdrant-client --break-system-packages
+    pip install "mcp[cli]" qdrant-client fastembed pydantic_settings --break-system-packages
 
 Register in .mcp.json (see templates/mcp.json.template's "memory-bank"
 block). Reuses the same QDRANT_URL/QDRANT_API_KEY/EMBEDDING_MODEL env var

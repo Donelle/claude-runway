@@ -8,7 +8,7 @@ running ingest_to_qdrant.py by hand every time.
 Project minimum: Python 3.12 (policy floor; the dependency chain supports >=3.10).
 
 Setup:
-    pip install "mcp[cli]" mcp-server-qdrant qdrant-client --break-system-packages
+    pip install "mcp[cli]" qdrant-client fastembed pydantic_settings --break-system-packages
 
 Register in .mcp.json (adjust the path to wherever you save this file). Set
 QDRANT_URL / COLLECTION_NAME / EMBEDDING_MODEL here -- these are the SAME env

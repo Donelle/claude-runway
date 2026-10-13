@@ -7,8 +7,7 @@ Five tools:
 
   - `qdrant-find` / `qdrant-store`: search and save notes in THIS project's own
     collection (`COLLECTION_NAME`). These keep the names the third-party
-    `mcp-server-qdrant` console script served before this server replaced it,
-    so `mcp__qdrant__qdrant-find` and every permission rule written against it
+    Qdrant MCP server this one replaced served, so `mcp__qdrant__qdrant-find` and every permission rule written against it
     keep working. Their descriptions live in the docstrings below instead of
     in `TOOL_FIND_DESCRIPTION`/`TOOL_STORE_DESCRIPTION` env entries.
   - `compact_store` / `compact_find` / `compact_prune`: the conversation-compact

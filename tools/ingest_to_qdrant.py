@@ -5,7 +5,7 @@ Bulk-index a repo's code and docs into the same Qdrant collection your
 provider the server uses (so vectors are compatible with qdrant-find).
 
 Usage:
-    pip install mcp-server-qdrant
+    pip install qdrant-client fastembed pydantic_settings
 
     python tools/ingest_to_qdrant.py \
         --repo-path /path/to/your/repo \
@@ -50,7 +50,7 @@ try:
 except ImportError:
     print(
         "Missing dependency. Install with:\n"
-        "    pip install mcp-server-qdrant qdrant-client --break-system-packages\n",
+        "    pip install qdrant-client fastembed pydantic_settings --break-system-packages\n",
         file=sys.stderr,
     )
     sys.exit(1)
