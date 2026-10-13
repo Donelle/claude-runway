@@ -84,7 +84,7 @@ e.g. (single quotes per step 5's rules; adapt the quoting on PowerShell):
 For the init-path values extracted below, print only those specific non-secret keys the
 same way (never the whole env block), and for `QDRANT_API_KEY` print only a key-present
 boolean. The output tells you which claude-runway servers are currently configured
-(`qdrant`, `codebase-indexer`, `memory-bank`, `local-compress`). Note this for the summary
+(`qdrant`, `codebase-indexer`, `memory-bank`, `local-compress`, and the opt-in `analytics`). Note this for the summary
 at the end.
 
 **Choose the path (init vs. upgrade):** the upgrade predicate is the presence of the
@@ -140,6 +140,7 @@ in step 8 proceeds), stop immediately** and tell the user:
   a `--qdrant-only` config has them only in `qdrant.env`
 - `CLAUDE_RUNWAY_TRACK_SAVINGS` from `local-compress.env` (default: off)
 - `CLAUDE_RUNWAY_SAVINGS_DB` from `local-compress.env` (default: empty)
+- `CLAUDE_RUNWAY_METRICS_DB` from `analytics.env`, else from `memory-bank.env` (where `init --metrics-db` also writes it, and the only place it lives when savings tracking is off or the setup is `--qdrant-only`), else from `local-compress.env` for a config written before the move — first non-empty one (default: empty). The `analytics` block exists only when savings tracking was enabled, so never treat its absence as "no override".
 - `COMPACT_COLLECTION` from `qdrant.env` (the `qdrant` server serves the compact tools),
   falling back to `local-compress.env` for a config written before they moved — use as the
   "Keep current" value in Q5 when present. Note this is a DIFFERENT env var than
@@ -284,6 +285,7 @@ non-default, add the corresponding flag so it is not silently reset:
 - `INDEX_EXCLUDE_DIRS` ≠ empty → add `--exclude-dirs <value>`
 - `CLAUDE_RUNWAY_LMSTUDIO_URL` ≠ `http://localhost:1234/v1` → add `--lmstudio-url <value>`
 - `CLAUDE_RUNWAY_SAVINGS_DB` ≠ empty → add `--savings-db <value>`
+- `CLAUDE_RUNWAY_METRICS_DB` ≠ empty → add `--metrics-db <value>`
 - `MEMORY_BANK_ID` present at all (regardless of value — it has no fixed default to compare
   against; its "default" is simply being omitted) → add `--memory-bank-id <value>`. See the
   extraction note in step 2 for why this must never be silently re-derived from Q2's answer
@@ -350,10 +352,11 @@ PowerShell — cmd.exe quoting uses double quotes which PowerShell would expand.
 
 Read the template at `$CLAUDE_RUNWAY_DIR/templates/CLAUDE.md.template`.
 
-From that file, extract three sections as verbatim text:
+From that file, extract four sections as verbatim text:
 - **Qdrant section**: everything from the line `## Vector memory (Qdrant MCP)` up to (but not including) the blank line that immediately precedes the next `##` heading.
 - **Durable memory section**: everything from the line `## Durable memory (memory-bank MCP)` up to (but not including) the blank line that immediately precedes the next `##` heading.
-- **LM Studio section**: everything from the line `## Local compression (LM Studio MCP)` to the end of the file (or the blank line before the next `##` heading, if any).
+- **LM Studio section**: everything from the line `## Local compression (LM Studio MCP)` up to (but not including) the blank line that immediately precedes the next `##` heading, or to the end of the file if there is none.
+- **Analytics section**: everything from the line `## Analytics (opt-in MCP server)` to the end of the file (or the blank line before the next `##` heading, if any).
 
 Do **not** include the HTML comment block at the top of the template — that is a
 template note, not guidance for Claude.
@@ -374,6 +377,8 @@ Create it with:
 <Durable memory section>
 
 <LM Studio section>   # only if full setup (not qdrant-only)
+
+<Analytics section>   # only if the savings tracker was enabled (Q4) in a full setup
 ```
 
 **If `CLAUDE.md` already exists:**
@@ -394,12 +399,22 @@ Check whether it already contains `## Local compression (LM Studio MCP)`.
   with `.mcp.json` — leaving LM Studio guidance in place when `local-compress` is gone
   would instruct Claude to call tools that are no longer connected.
 
-If all sections were already in the desired state (Qdrant and Durable memory present,
-LM Studio present for full setup or absent for qdrant-only), note "CLAUDE.md already up
-to date — no changes made."
+Check whether it already contains `## Analytics (opt-in MCP server)`.
+- If the savings tracker was enabled in a **full setup** and the section is missing: append it
+  (preceded by a blank line). `setup_project.py init --track-savings` is what wrote the
+  `analytics` block it describes.
+- If the tracker is **not** enabled, or this is **qdrant-only**, and the section IS present: remove
+  it the same way as the LM Studio section above (heading line through to, but not including, the
+  next `##` heading or end of file, plus the blank line before it). `init` without
+  `--track-savings` removes the `analytics` block, so leaving the section would point Claude at
+  tools that are no longer connected.
 
-Never modify or remove any content already in CLAUDE.md other than the LM Studio section
-removal described above.
+If all sections were already in the desired state (Qdrant and Durable memory present,
+LM Studio present for full setup or absent for qdrant-only, Analytics present only with the
+savings tracker enabled), note "CLAUDE.md already up to date — no changes made."
+
+Never modify or remove any content already in CLAUDE.md other than the LM Studio and
+Analytics section removals described above.
 
 ### 7. Report results and next steps
 
@@ -408,7 +423,7 @@ Print a concise summary:
 ```
 Done. Configured <target-project-path>:
 
-  ✓ .mcp.json              — qdrant, codebase-indexer, memory-bank[, local-compress]
+  ✓ .mcp.json              — qdrant, codebase-indexer, memory-bank[, local-compress][, analytics — only with the savings tracker]
   ✓ .claude/settings.json  — SessionStart/SessionEnd record_session_id.py hook (always)[; PostToolUse, PreToolUse, SessionEnd hooks — only if full setup]
   ✓ CLAUDE.md              — <what was added or "already up to date">
 

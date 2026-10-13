@@ -682,8 +682,8 @@ class MainFallsBackToGenericForNonFooterMcpTools(unittest.TestCase):
     (mcp__qdrant__compact_find / compact_store, mcp__local-compress__list_local_models
     -- none of these ever call _append_savings_footer) must still get the same
     size-based compression every other matched tool gets, not a silent no-op
-    regardless of size. Exception (issue #302): the exact-output tools in
-    hook._EXACT_OUTPUT_MCP_TOOLS (savings_summary/detail/trend, get_metrics) and
+    regardless of size. Exception (issue #302): every tool on the analytics
+    server (savings_summary/detail/trend, get_metrics, record_metric) and
     the qdrant server's compact_prune are deliberately a no-op at any size,
     since their numbers must be read verbatim. The qdrant server's qdrant-find
     and qdrant-store are never compressed at all."""
@@ -778,19 +778,19 @@ class MainFallsBackToGenericForNonFooterMcpTools(unittest.TestCase):
                 self.assertEqual(len(self.stub.calls), 0)
 
     def test_exact_output_tools_are_never_generically_compressed(self):
-        # Issue #302: savings/metrics/prune reports are exact numeric output
-        # read verbatim; they must pass through untouched however large.
+        # Issue #302: savings/metrics reports are exact numeric output read
+        # verbatim; they must pass through untouched however large. They now
+        # live on the analytics server, so the whole prefix is exempt.
         big = "row 1234567 tokens 89.5%\n" * 400
         self.assertGreater(len(big), hook.THRESHOLD)
-        expected = {"savings_summary", "savings_detail", "savings_trend", "get_metrics"}
-        self.assertEqual(hook._EXACT_OUTPUT_MCP_TOOLS, expected)
-        for bare_name in sorted(expected):
+        self.assertEqual(hook.MCP_ANALYTICS_TOOL_PREFIX, "mcp__analytics__")
+        for bare_name in ("savings_summary", "savings_detail", "savings_trend", "get_metrics", "record_metric"):
             with self.subTest(tool=bare_name):
                 self.stub.calls.clear()
                 payload = {
                     "session_id": "sess-1",
                     "cwd": "/repos/my-project",
-                    "tool_name": f"mcp__local-compress__{bare_name}",
+                    "tool_name": f"mcp__analytics__{bare_name}",
                     "tool_response": big,
                 }
                 printed = self._run_main(payload)
@@ -839,7 +839,7 @@ class MainFallsBackToGenericForNonFooterMcpTools(unittest.TestCase):
         # They do not exist there any more, so nothing under that prefix carries
         # the old compact_find exemption.
         self.assertEqual(hook._QDRANT_COMPACT_MCP_TOOLS, {"compact_store", "compact_find", "compact_prune"})
-        self.assertNotIn("compact_prune", hook._EXACT_OUTPUT_MCP_TOOLS)
+        self.assertFalse(hasattr(hook, "_EXACT_OUTPUT_MCP_TOOLS"))
 
     def test_footer_path_still_takes_priority_over_the_fallback(self):
         # Regression guard for issue #35's existing footer-path behavior --

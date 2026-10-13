@@ -43,7 +43,7 @@ A fourth tool, `transfer_memories(source_collection, dry_run=True)`, copies memo
 
 ## Local compression (LM Studio MCP)
 
-Four tools: `compress_file`, `compress_command_output`, `fetch_url` (use these), and `compress_text` (narrow case only — see below).
+Five tools from the `local-compress` server: `compress_file`, `compress_command_output`, `fetch_url` (use these), `compress_text` (narrow case only — see below), and `list_local_models` (a status check). The savings and metrics tools are not on this server: they live on the opt-in `analytics` server (see the Analytics section, when present).
 
 Prefer `compress_command_output` over Bash when a command is expected to produce large, mostly-mechanical output — test suites, builds, verbose linters — and you want to know the gist or whether it failed, not read the full log. Prefer `compress_file` over Read for large mechanical files already on disk (saved logs, big diffs) under the same condition. Prefer `fetch_url` over WebFetch when you want the page reviewed and summarized by the local model instead of by WebFetch's own Anthropic-hosted extraction step — `fetch_url` lets you steer what to extract via `focus`, and does the fetch, extraction, and summarization entirely server-side/locally. Do NOT use `fetch_url` for pages needing auth, JavaScript rendering, or session handling — use WebFetch for those. All three run/read/fetch server-side, so the raw content never enters your context — only the summary does. That's what makes these save tokens; reading the output yourself first and then trying to compress it does not.
 
@@ -54,3 +54,20 @@ Do NOT use either for source code you intend to edit — read that directly with
 compress_text does not save tokens if you already had to read something into context to call it — only use it for content you legitimately already hold (e.g. your own long draft), not as a way to compress something you just read or ran.
 
 If list_local_models reports LM Studio isn't reachable or no model is loaded, fall back to reading/running things directly rather than blocking on it.
+
+## Analytics (opt-in MCP server)
+
+Include this section only if the project's `.mcp.json` has an `analytics` server. `init --track-savings` writes that block; without the flag it is not written, and then these tools do not exist: calling one is an unknown-tool error, **not** an empty result or "no data yet". Do not conclude savings or metrics are zero because a call failed.
+
+Five read/write tools from the `analytics` server, all backed by local SQLite files (no model, no Qdrant):
+
+- `savings_summary`, `savings_detail`, `savings_trend`: the savings tracker's simple, detail and trend views (characters before and after local compression, per session, per tool and per project). `/my-savings` calls them. They answer "what is the compression saving me?", and say tracking is off (an explanation, not an error) when `CLAUDE_RUNWAY_TRACK_SAVINGS` is not set.
+- `get_metrics(metric_id, view=...)`: reads the shared cross-tool metrics store (views `summary`, `by_event_type`, `trend`, `detail`). `/my-metrics` calls it. The metric ids with a writer today are `autowork` (per-ticket outcome rows from `/my-gh-autowork`, including the `ticket_cost` rows `tools/autowork_cost.py record` writes) and `memory-bank` (a tally of `remember`/`recall`/`forget` calls). Any other id returns "no events recorded yet". Savings are a separate store: read them through the savings tools, not `get_metrics`.
+- `record_metric(metric_id, event_type, ...)`: appends one event to that metrics store. Only for a caller that has something to log and no CLI for it; routine recording needs no call from you, because savings events are written by the compression server and the hooks, and memory-bank counts its own calls.
+
+Reporting CLIs that sit beside these tools and answer what they cannot (run them from the claude-runway checkout; they read files, they never call a model):
+
+- `tools/memory_bank_report.py`: memory-bank usage: the dead-memory ratio and the recall payload trend, per project.
+- `tools/autowork_cost.py report`: per-ticket cost of `/my-gh-autowork` runs from subagent transcripts: tokens by model, cache-read share, tool calls and wall clock.
+- `tools/context_breakdown.py`: what a subagent's starting context is made of and why it grows (subcommands `start`, `calibrate`, `growth`, `reads`).
+- `tools/report_tool_counts.py`: how many tools each claude-runway MCP server exposes and how big their descriptions are.

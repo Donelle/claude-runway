@@ -59,6 +59,7 @@ def _args(**overrides) -> argparse.Namespace:
     defaults = dict(
         track_savings=False,
         savings_db="",
+        metrics_db="",
         lmstudio_model="",
         lmstudio_url="http://localhost:1234/v1",
     )
@@ -95,6 +96,17 @@ class HookEnvReminders(unittest.TestCase):
     def test_savings_db_flags_the_shell_export(self):
         reminders = self.mod._hook_env_reminders(_args(savings_db="/custom/savings.db"))
         self.assertIn("CLAUDE_RUNWAY_SAVINGS_DB=/custom/savings.db", reminders)
+
+    def test_metrics_db_is_not_a_hook_reminder(self):
+        # No hook reads the metrics database; it has its own note (below).
+        reminders = self.mod._hook_env_reminders(_args(metrics_db="/custom/metrics.db"))
+        self.assertEqual(reminders, [])
+
+    def test_metrics_db_note_names_the_export_and_is_empty_without_the_flag(self):
+        self.assertEqual(self.mod._metrics_db_reminder(_args()), "")
+        note = self.mod._metrics_db_reminder(_args(metrics_db="/custom/metrics.db"))
+        self.assertIn("CLAUDE_RUNWAY_METRICS_DB=/custom/metrics.db", note)
+        self.assertIn("memory-bank", note)
 
 
 class WriteJsonAtomic(unittest.TestCase):
@@ -144,6 +156,7 @@ def _init_args(target_repo, **overrides) -> argparse.Namespace:
         lmstudio_model="",
         track_savings=False,
         savings_db="",
+        metrics_db="",
         compact_collection="",
         memory_bank_collection="",
         memory_bank_id="",
@@ -411,6 +424,26 @@ class HookEnvReminderShownForSkipHooks(unittest.TestCase):
         with redirect_stdout(buf):
             self.mod.cmd_init(args)
         self.assertNotIn("CLAUDE_RUNWAY_TRACK_SAVINGS", buf.getvalue())
+
+    def test_qdrant_only_with_metrics_db_still_shows_the_export_note(self):
+        # --qdrant-only still writes the override into the memory-bank block,
+        # and a shell-run reporting CLI reads it from the shell, so the note
+        # must not be swallowed by the hook-side suppression.
+        args = _init_args(self.target_repo, qdrant_only=True, metrics_db="/custom/metrics.db", dry_run=False)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.mod.cmd_init(args)
+        self.assertIn("CLAUDE_RUNWAY_METRICS_DB=/custom/metrics.db", buf.getvalue())
+        written = json.loads((self.target_repo / ".mcp.json").read_text(encoding="utf-8"))
+        self.assertEqual(written["mcpServers"]["memory-bank"]["env"]["CLAUDE_RUNWAY_METRICS_DB"], "/custom/metrics.db")
+        self.assertNotIn("analytics", written["mcpServers"])
+
+    def test_normal_init_with_metrics_db_shows_the_note_once(self):
+        args = _init_args(self.target_repo, track_savings=True, metrics_db="/custom/metrics.db")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.mod.cmd_init(args)
+        self.assertEqual(buf.getvalue().count("CLAUDE_RUNWAY_METRICS_DB=/custom/metrics.db"), 1)
 
 
 class CompactCollectionFlag(unittest.TestCase):

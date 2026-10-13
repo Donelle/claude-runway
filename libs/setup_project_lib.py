@@ -112,6 +112,7 @@ def build_mcp_servers(
     lmstudio_model: str = "",
     track_savings: bool = False,
     savings_db: str = "",
+    metrics_db: str = "",
     compact_collection: str = "",
     memory_bank_collection: str = "",
     memory_bank_id: str = "",
@@ -215,6 +216,12 @@ def build_mcp_servers(
     install's compacts. Blank leaves the template default. `run_setup` decides
     what to pass (see `resolve_compact_embedding_model`).
 
+    `track_savings` also decides whether the opt-in `analytics` block is
+    emitted at all (it is dropped from the result otherwise); `savings_db` and
+    `metrics_db` reach that block only when non-blank. A non-blank
+    `metrics_db` is also written into the `memory-bank` block, which writes
+    into the same shared store, so the two stay on one file.
+
     The `qdrant` block also carries `lmstudio_url`/`lmstudio_model`, which
     only `compact_store` uses (to compress a summary before storing it), so a
     `--qdrant-only` setup (`include_compress=False`) still writes them: the
@@ -283,6 +290,16 @@ def build_mcp_servers(
     # `embedding_model`. The memory-bank collection is ONE shared collection
     # locked to the model that first created it, so a change made for the
     # per-project code collections must never reach it.
+    # `memory-bank` writes its call tally (metric_id="memory-bank") into the same
+    # shared metrics database the `analytics` server reads, so a non-default
+    # path has to reach both blocks, or a launch without the shell export
+    # (a GUI, say) leaves the two on different files and `/my-metrics
+    # memory-bank` silently reports partial data. Written only when given (a
+    # blank value would mask an inherited shell value), and regardless of
+    # `track_savings`, since the memory-bank server needs it either way.
+    if metrics_db:
+        memory_bank["env"]["CLAUDE_RUNWAY_METRICS_DB"] = metrics_db
+
     if embedding_model:
         for block in (qdrant, indexer):
             block["env"]["EMBEDDING_MODEL"] = embedding_model
@@ -299,6 +316,24 @@ def build_mcp_servers(
         compress["env"]["CLAUDE_RUNWAY_SAVINGS_DB"] = savings_db
     else:
         del servers["local-compress"]
+
+    # The `analytics` server (savings_summary/savings_detail/savings_trend,
+    # get_metrics, record_metric) is opt-in: it is written only when savings
+    # tracking is on, and only alongside local-compress (the tracker records
+    # compression events, which need that server and its hooks). Both DB keys
+    # are written only when overridden: a blank value would mask the
+    # inherited shell value instead of falling through to the default path.
+    if track_savings and include_compress:
+        analytics = servers["analytics"]
+        analytics["command"] = venv_python_str
+        analytics["args"] = [f"{tools_repo_str}/tools/analytics_mcp_server.py"]
+        analytics["env"]["CLAUDE_RUNWAY_TRACK_SAVINGS"] = "1"
+        if savings_db:
+            analytics["env"]["CLAUDE_RUNWAY_SAVINGS_DB"] = savings_db
+        if metrics_db:
+            analytics["env"]["CLAUDE_RUNWAY_METRICS_DB"] = metrics_db
+    else:
+        del servers["analytics"]
 
     return servers
 
@@ -569,7 +604,7 @@ def build_settings_hooks(
 # toolkit-owned server a prior run added but this run omits (e.g.
 # `--qdrant-only` after a previous run had configured local-compress) --
 # see merge_mcp_json's docstring.
-_OWNED_MCP_SERVER_KEYS = ("qdrant", "codebase-indexer", "memory-bank", "local-compress")
+_OWNED_MCP_SERVER_KEYS = ("qdrant", "codebase-indexer", "memory-bank", "local-compress", "analytics")
 
 
 def merge_mcp_json(existing: dict, generated_servers: dict, *, owned_keys: tuple = _OWNED_MCP_SERVER_KEYS) -> dict:
@@ -958,6 +993,7 @@ def run_setup(
     lmstudio_model: str = "",
     track_savings: bool = False,
     savings_db: str = "",
+    metrics_db: str = "",
     compact_collection: str = "",
     memory_bank_collection: str = "",
     memory_bank_id: str = "",
@@ -1053,6 +1089,7 @@ def run_setup(
         lmstudio_model=lmstudio_model,
         track_savings=track_savings,
         savings_db=savings_db,
+        metrics_db=metrics_db,
         compact_collection=compact_collection,
         memory_bank_collection=memory_bank_collection,
         memory_bank_id=memory_bank_id,

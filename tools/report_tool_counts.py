@@ -3,8 +3,8 @@
 Prints the LIVE `@mcp.tool()` count AND the size, in characters, of each
 tool's description text (name + signature + docstring, a proxy for the JSON
 tool schema -- see below) for every MCP server this repo's users connect (this repo's own
-`qdrant_mcp_server.py`/`compress_mcp_server.py`/`ingest_mcp_server.py`/
-`memory_bank_mcp_server.py`) -- instead of a number
+`qdrant_mcp_server.py`/`compress_mcp_server.py`/`analytics_mcp_server.py`/
+`ingest_mcp_server.py`/`memory_bank_mcp_server.py`) -- instead of a number
 hand-copied into EVALUATION.md that goes stale as tools are added. See
 libs/mcp_tool_introspect.py's docstring for the history of that exact
 failure mode (issues #22/#23), and issue #52/GROW-05 for why one shared,
@@ -21,7 +21,7 @@ adds to a session's starting context, use tools/measure_startup_context.py,
 which reads it from session transcripts; this script only reports how many
 tools there are and how big their descriptions are. Also
 used as a CI smoke check (see .github/workflows/tests.yml): a nonzero
-exit code here means one of the four servers failed to construct or
+exit code here means one of the five servers failed to construct or
 enumerate its own tools, which is a real regression worth failing the
 build on.
 
@@ -40,7 +40,8 @@ server and never blocks on stdin, so it's safe to run from a plain
 terminal or CI runner with no other infrastructure up.
 
 Note: importing `compress_mcp_server` requires `openai`/`requests`/
-`trafilatura` (see requirements.txt); importing `qdrant_mcp_server`,
+`trafilatura` (see requirements.txt); importing `analytics_mcp_server`
+needs only `mcp`; importing `qdrant_mcp_server`,
 `ingest_mcp_server` and `memory_bank_mcp_server` requires `qdrant-client`
 and `fastembed`. All are already required for the CI job's
 `pip install -r requirements.txt` step to succeed at all, so no extra
@@ -90,6 +91,7 @@ def main() -> int:
 
     for label, module_name in (
         ("local-compress", "compress_mcp_server"),
+        ("analytics", "analytics_mcp_server"),
         ("qdrant", "qdrant_mcp_server"),
         ("codebase-indexer", "ingest_mcp_server"),
         ("memory-bank", "memory_bank_mcp_server"),

@@ -677,6 +677,71 @@ def _apply_compress_hook_matcher_missing_compact_tools(
     return mcp_json, settings_json
 
 
+# ---------------------------------------------------------------------------
+# analytics-server-missing (follows the savings and metrics tools' move)
+# ---------------------------------------------------------------------------
+
+# The values `savings_ledger.tracking_enabled()` accepts, case-insensitive and
+# whitespace-trimmed. Duplicated rather than imported for the same reason
+# `doctor_lib` does: this module must not load the savings stack.
+_TRACK_SAVINGS_TRUTHY = frozenset({"1", "true", "yes"})
+
+
+def _local_compress_env(mcp_json: dict) -> dict:
+    servers = mcp_json.get("mcpServers")
+    block = servers.get("local-compress") if isinstance(servers, dict) else None
+    env = block.get("env") if isinstance(block, dict) else None
+    return env if isinstance(env, dict) else {}
+
+
+def _detect_analytics_server_missing(mcp_json: dict, settings_json: dict) -> bool:
+    """
+    True when this project's `local-compress` block has savings tracking on
+    (its `CLAUDE_RUNWAY_TRACK_SAVINGS` is a truthy string) but there is no
+    `analytics` block. That block now serves `savings_summary`/`savings_detail`/
+    `savings_trend`, `get_metrics` and `record_metric`, so `/my-savings` and
+    `/my-metrics` stop working after the tools leave `local-compress` until it
+    is added. A project with tracking off is deliberately not offered it: the
+    server is opt-in.
+    """
+    servers = mcp_json.get("mcpServers")
+    if isinstance(servers, dict) and "analytics" in servers:
+        return False
+    raw = _local_compress_env(mcp_json).get("CLAUDE_RUNWAY_TRACK_SAVINGS")
+    return isinstance(raw, str) and raw.strip().lower() in _TRACK_SAVINGS_TRUTHY
+
+
+def _apply_analytics_server_missing(
+    mcp_json: dict, settings_json: dict, ctx: MigrationContext
+) -> "tuple[dict, dict]":
+    """
+    Adds the `analytics` block, reusing `build_mcp_servers` (the SAME function
+    `init --track-savings` uses) so it cannot drift from a fresh `init`. Only
+    the `analytics` KEY is taken from the result; every other server, and the
+    whole of `settings.json`, is left as it was. A non-blank
+    `CLAUDE_RUNWAY_SAVINGS_DB` / `CLAUDE_RUNWAY_METRICS_DB` in the
+    `local-compress` block is carried over, so the server reads the same files
+    the tools read before they moved.
+    """
+    mcp_json = copy.deepcopy(mcp_json)
+    servers = mcp_json.setdefault("mcpServers", {})
+    compress_env = _local_compress_env(mcp_json)
+    template = load_json(Path(ctx.tools_repo_dir) / "templates" / "mcp.json.template")
+    generated = build_mcp_servers(
+        template,
+        collection_name="project",
+        venv_python=ctx.venv_python,
+        tools_repo_dir=ctx.tools_repo_dir,
+        home_dir=Path.home(),
+        track_savings=True,
+        savings_db=_env_str(compress_env, "CLAUDE_RUNWAY_SAVINGS_DB").strip(),
+        metrics_db=_env_str(compress_env, "CLAUDE_RUNWAY_METRICS_DB").strip(),
+        include_compress=True,
+    )
+    servers["analytics"] = generated["analytics"]
+    return mcp_json, settings_json
+
+
 # List order is both display and apply order when more than one migration is
 # pending; `detect` alone decides whether each one is shown at all. Order only
 # matters where one migration's guard depends on another:
@@ -809,6 +874,26 @@ MIGRATIONS: "list[Migration]" = [
         note="",
         detect=_detect_compress_hook_matcher_missing_compact_tools,
         apply=_apply_compress_hook_matcher_missing_compact_tools,
+    ),
+    Migration(
+        id="analytics-server-missing",
+        title="Add the opt-in analytics MCP server to .mcp.json",
+        kind="add",
+        description=(
+            "This project tracks savings (CLAUDE_RUNWAY_TRACK_SAVINGS is on in its local-compress block), "
+            "but its .mcp.json has no 'analytics' server. The savings and metrics tools (savings_summary, "
+            "savings_detail, savings_trend, get_metrics, record_metric) have moved there from "
+            "local-compress, so /my-savings and /my-metrics stop working until it is added. Adds the "
+            "analytics block, carrying over any CLAUDE_RUNWAY_SAVINGS_DB / CLAUDE_RUNWAY_METRICS_DB "
+            "override from the local-compress block. Recording is unaffected either way: the "
+            "local-compress server and the hooks still write savings events without it."
+        ),
+        note=(
+            "Restart Claude Code to load the new server. A project that does not track savings is not "
+            "offered this; `init --track-savings` writes the block for a new setup."
+        ),
+        detect=_detect_analytics_server_missing,
+        apply=_apply_analytics_server_missing,
     ),
 ]
 

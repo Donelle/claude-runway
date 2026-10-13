@@ -131,6 +131,51 @@ class BuildMcpServers(unittest.TestCase):
         for gone in ("QDRANT_URL", "QDRANT_API_KEY", "COMPACT_COLLECTION", "EMBEDDING_MODEL"):
             self.assertNotIn(gone, env)
 
+    def test_analytics_block_is_opt_in_and_absent_by_default(self):
+        self.assertNotIn("analytics", self._build())
+        self.assertNotIn("analytics", self._build(track_savings=False, savings_db="/x/s.db", metrics_db="/x/m.db"))
+
+    def test_track_savings_writes_the_analytics_block(self):
+        servers = self._build(track_savings=True)
+        block = servers["analytics"]
+        self.assertEqual(block["command"], "/home/user/tools/claude-runway/.venv/bin/python")
+        self.assertEqual(block["args"], ["/home/user/tools/claude-runway/tools/analytics_mcp_server.py"])
+        # No DB override: neither key is written (a blank one would mask inheritance).
+        self.assertEqual(block["env"], {"CLAUDE_RUNWAY_TRACK_SAVINGS": "1"})
+        # local-compress keeps its own TRACK_SAVINGS: its footer feeds the tracker.
+        self.assertEqual(servers["local-compress"]["env"]["CLAUDE_RUNWAY_TRACK_SAVINGS"], "1")
+        self.assertEqual(find_unresolved_placeholders(servers), [])
+
+    def test_analytics_block_passes_through_the_db_overrides(self):
+        env = self._build(track_savings=True, savings_db="/x/s.db", metrics_db="/x/m.db")["analytics"]["env"]
+        self.assertEqual(env["CLAUDE_RUNWAY_SAVINGS_DB"], "/x/s.db")
+        self.assertEqual(env["CLAUDE_RUNWAY_METRICS_DB"], "/x/m.db")
+
+    def test_metrics_db_override_reaches_memory_bank_too(self):
+        # memory-bank writes metric_id="memory-bank" into the same store the
+        # analytics server reads; both must see the same override.
+        servers = self._build(track_savings=True, metrics_db="/x/m.db")
+        self.assertEqual(servers["analytics"]["env"]["CLAUDE_RUNWAY_METRICS_DB"], "/x/m.db")
+        self.assertEqual(servers["memory-bank"]["env"]["CLAUDE_RUNWAY_METRICS_DB"], "/x/m.db")
+        # ...and without tracking there is no analytics block, but memory-bank still gets it.
+        servers = self._build(metrics_db="/x/m.db")
+        self.assertNotIn("analytics", servers)
+        self.assertEqual(servers["memory-bank"]["env"]["CLAUDE_RUNWAY_METRICS_DB"], "/x/m.db")
+
+    def test_memory_bank_has_no_metrics_key_when_not_overridden(self):
+        # A blank value would mask the inherited shell value, so it is omitted.
+        self.assertNotIn("CLAUDE_RUNWAY_METRICS_DB", self._build(track_savings=True)["memory-bank"]["env"])
+
+    def test_analytics_needs_local_compress(self):
+        # The tracker records compression events, so --qdrant-only never gets it.
+        self.assertNotIn("analytics", self._build(track_savings=True, include_compress=False))
+
+    def test_analytics_is_owned_so_a_rerun_without_track_savings_removes_it(self):
+        existing = {"mcpServers": {"analytics": {"command": "old"}, "my-own": {"command": "x"}}}
+        merged = merge_mcp_json(existing, self._build())
+        self.assertNotIn("analytics", merged["mcpServers"])
+        self.assertIn("my-own", merged["mcpServers"])
+
     def test_compact_embedding_model_blank_leaves_the_template_default(self):
         env = self._build(compact_embedding_model="")["qdrant"]["env"]
         self.assertEqual(env["COMPACT_EMBEDDING_MODEL"], MCP_TEMPLATE["mcpServers"]["qdrant"]["env"]["COMPACT_EMBEDDING_MODEL"])

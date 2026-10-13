@@ -346,16 +346,17 @@ _SELF_COMPRESSING_MCP_TOOLS = {"compress_file", "compress_command_output", "fetc
 # untouched.
 MCP_QDRANT_TOOL_PREFIX = "mcp__qdrant__"
 _QDRANT_COMPACT_MCP_TOOLS = {"compact_store", "compact_find", "compact_prune"}
-# Tool names (without the prefix) whose output is an exact numeric/structured
-# report meant to be read verbatim -- a savings breakdown table, a metrics
-# trend (issue #302). Same failure class as the Bash `grep -c` exemption:
-# running them through the lossy local-model path once the response passes
-# THRESHOLD could silently drop or alter a specific number. Distinct from
-# _SELF_COMPRESSING_MCP_TOOLS: these never compress anything themselves,
-# they're just exempt from the generic fallback. (The qdrant server's
-# `compact_prune`, a list of pruned compact ids, is the same class and is
-# handled by its own branch in _dispatch.)
-_EXACT_OUTPUT_MCP_TOOLS = {"savings_summary", "savings_detail", "savings_trend", "get_metrics"}
+# The opt-in `analytics` server (savings_summary/savings_detail/savings_trend,
+# get_metrics, record_metric). Every tool there returns an exact numeric/
+# structured report meant to be read verbatim -- a savings breakdown table, a
+# metrics trend (issue #302). Same failure class as the Bash `grep -c`
+# exemption: running them through the lossy local-model path once the response
+# passes THRESHOLD could silently drop or alter a specific number. So nothing
+# under this prefix is ever compressed, and the matcher does not list it; the
+# check in main() keeps that true even if a hand-edited matcher were widened
+# to `mcp__analytics__.*`. (The qdrant server's `compact_prune`, a list of
+# pruned compact ids, is the same class and is handled by its own branch.)
+MCP_ANALYTICS_TOOL_PREFIX = "mcp__analytics__"
 SAVINGS_FOOTER_RE = re.compile(r"\n?<!--CLAUDE_RUNWAY_SAVINGS:(\{.*?\})-->\s*\Z", re.DOTALL)
 # Below this length, a string is assumed to be metadata (a URL, a file
 # count, a status word) rather than content worth compressing or blanking --
@@ -1127,11 +1128,13 @@ def _dispatch(payload):
         bare_tool_name = tool_name[len(MCP_SAVINGS_TOOL_PREFIX):]
         if bare_tool_name in _SELF_COMPRESSING_MCP_TOOLS:
             sys.exit(0)
-        # Exact-output reports: pass through untouched regardless of size (#302).
-        if bare_tool_name in _EXACT_OUTPUT_MCP_TOOLS:
-            sys.exit(0)
         outcome = _handle_generic(tool_response)
         _finish_compression_outcome(outcome, tool_name, tool_name, session_id, project, agent_id, agent_type, tool_use_id)
+
+    # The analytics server's reports are exact numbers read verbatim (see
+    # MCP_ANALYTICS_TOOL_PREFIX): never compressed, at any size.
+    if tool_name and tool_name.startswith(MCP_ANALYTICS_TOOL_PREFIX):
+        sys.exit(0)
 
     # The compact tools live on the qdrant server (they used to be on
     # local-compress). They never compress anything themselves and carry no
@@ -1140,12 +1143,14 @@ def _dispatch(payload):
     # server (`qdrant-find`, `qdrant-store`) is never compressed, and the
     # matcher does not list them; this check keeps that true even if a
     # hand-edited matcher were widened to `mcp__qdrant__.*`.
+    # (compact_prune, an exact list of ids, is the same verbatim-report class
+    # as the analytics tools above.)
     if tool_name and tool_name.startswith(MCP_QDRANT_TOOL_PREFIX):
         bare_tool_name = tool_name[len(MCP_QDRANT_TOOL_PREFIX):]
         if bare_tool_name not in _QDRANT_COMPACT_MCP_TOOLS or tool_response is None:
             sys.exit(0)
         # A list of pruned compact ids is an exact report, the same class as
-        # _EXACT_OUTPUT_MCP_TOOLS (#302).
+        # the analytics server's reports (#302).
         if bare_tool_name == "compact_prune":
             sys.exit(0)
         # compact_find can return up to 10 full stored conversation compacts,

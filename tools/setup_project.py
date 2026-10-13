@@ -198,7 +198,8 @@ def _hook_env_reminders(args: argparse.Namespace) -> list:
     """
     --track-savings/--lmstudio-model/--lmstudio-url/--savings-db only reach
     the MCP servers' env blocks in the generated .mcp.json (local-compress,
-    and for the two LM Studio values also qdrant) --
+    for the two LM Studio values also qdrant, and for --track-savings/
+    --savings-db the opt-in analytics block) --
     they do NOT reach compress_output.py/session_end_savings.py, the
     hook scripts written into .claude/settings.json, since Claude Code hook
     entries have no env field of their own and instead inherit the shell's
@@ -213,11 +214,34 @@ def _hook_env_reminders(args: argparse.Namespace) -> list:
         reminders.append("CLAUDE_RUNWAY_TRACK_SAVINGS=1")
     if args.savings_db:
         reminders.append(f"CLAUDE_RUNWAY_SAVINGS_DB={args.savings_db}")
+    # CLAUDE_RUNWAY_METRICS_DB is deliberately not here: no hook reads it, so it
+    # is not a hook-side reminder (and this list is skipped under --qdrant-only,
+    # where the override is still written). See _metrics_db_reminder.
     if args.lmstudio_model:
         reminders.append(f"CLAUDE_RUNWAY_LMSTUDIO_MODEL={args.lmstudio_model}")
     if args.lmstudio_url != _DEFAULT_LMSTUDIO_URL:
         reminders.append(f"CLAUDE_RUNWAY_LMSTUDIO_URL={args.lmstudio_url}")
     return reminders
+
+
+def _metrics_db_reminder(args: argparse.Namespace) -> str:
+    """
+    The note printed for `--metrics-db`, or "" when it was not passed. Separate
+    from `_hook_env_reminders` because the reason is different: no hook reads
+    the metrics database, but the reporting CLIs run from a shell
+    (`tools/autowork_cost.py` and friends) read `CLAUDE_RUNWAY_METRICS_DB` from
+    the shell, and the override is written into the memory-bank block (and the
+    analytics block with --track-savings) in EVERY init mode, `--qdrant-only`
+    included, so the note must not depend on the hook-side suppression either.
+    """
+    if not args.metrics_db:
+        return ""
+    return (
+        f"\nNote: --metrics-db wrote CLAUDE_RUNWAY_METRICS_DB={args.metrics_db} into the memory-bank "
+        "server's env block (and the analytics block, with --track-savings). The reporting CLIs run from "
+        "a shell (e.g. tools/autowork_cost.py) read it from the shell environment, so export the same "
+        "value there too, or they will read the default database and miss these events."
+    )
 
 
 def _quote_command(argv: list, *, windows: bool) -> str:
@@ -333,6 +357,7 @@ def cmd_init(args: argparse.Namespace) -> None:
         lmstudio_model=args.lmstudio_model,
         track_savings=args.track_savings,
         savings_db=args.savings_db,
+        metrics_db=args.metrics_db,
         compact_collection=args.compact_collection,
         memory_bank_collection=args.memory_bank_collection,
         memory_bank_id=args.memory_bank_id,
@@ -383,6 +408,9 @@ def cmd_init(args: argparse.Namespace) -> None:
             "is launched from), or the hooks will silently keep using their own defaults. "
             "See README.md's 'Environment variables' section."
         )
+    metrics_reminder = _metrics_db_reminder(args)
+    if metrics_reminder:
+        print(metrics_reminder)
 
     # Use the ACTUAL resolved collection name/Qdrant URL/include-exclude
     # filters from this run, not a generic placeholder -- found in PR #113
@@ -710,9 +738,20 @@ def parse_args() -> argparse.Namespace:
         help="Exact model id loaded in LM Studio; leave blank to auto-detect (only works if exactly one model is loaded). "
         "Written to the local-compress block and to the qdrant block (compact_store compresses with it)",
     )
-    init.add_argument("--track-savings", action="store_true", help="Enable the opt-in savings tracker")
+    init.add_argument(
+        "--track-savings",
+        action="store_true",
+        help="Enable the opt-in savings tracker. Also writes the opt-in `analytics` server (savings_summary/"
+        "savings_detail/savings_trend, get_metrics, record_metric); without this flag that block is not written",
+    )
     init.add_argument(
         "--savings-db", default="", help="Override the savings tracker DB path (leave blank for the default)"
+    )
+    init.add_argument(
+        "--metrics-db",
+        default="",
+        help="Override the shared metrics DB path (leave blank for the default). Written into the `memory-bank` "
+        "block (it writes into that store) and, with --track-savings, the `analytics` block, so both use one file",
     )
     init.add_argument(
         "--memory-bank-collection",

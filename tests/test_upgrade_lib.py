@@ -831,7 +831,8 @@ class PendingMigrations(unittest.TestCase):
             "mcpServers": {
                 "qdrant": {"command": "/old/venv/bin/mcp-server-qdrant", "env": {}},
                 "codebase-indexer": {"env": {}},
-                "local-compress": {"env": {}},
+                # Tracking on, no analytics block: analytics-server-missing too.
+                "local-compress": {"env": {"CLAUDE_RUNWAY_TRACK_SAVINGS": "1"}},
             }
         }
         settings_json = {
@@ -926,7 +927,13 @@ class RunUpgradeEndToEnd(unittest.TestCase):
                         "codebase-indexer": {"env": {"COLLECTION_NAME": "my-target-project"}},
                         # No EMBEDDING_MODEL in the local-compress env: compacts were stored
                         # under the legacy model.
-                        "local-compress": {"env": {"COMPACT_COLLECTION": "conversation-compacts"}},
+                        # Savings tracking is on with a non-default DB, so the analytics
+                        # server is offered and carries that DB over.
+                        "local-compress": {"env": {
+                            "COMPACT_COLLECTION": "conversation-compacts",
+                            "CLAUDE_RUNWAY_TRACK_SAVINGS": "1",
+                            "CLAUDE_RUNWAY_SAVINGS_DB": "/data/savings.db",
+                        }},
                     }
                 }
             ),
@@ -992,6 +999,13 @@ class RunUpgradeEndToEnd(unittest.TestCase):
         self.assertTrue(qdrant["args"][0].endswith("tools/qdrant_mcp_server.py"))
         self.assertEqual(qdrant["env"]["COMPACT_EMBEDDING_MODEL"], "BAAI/bge-small-en")
         self.assertEqual(qdrant["env"]["COMPACT_COLLECTION"], "conversation-compacts")
+        analytics = mcp_json["mcpServers"]["analytics"]
+        self.assertEqual(analytics["command"], "/fake/venv/bin/python")
+        self.assertTrue(analytics["args"][0].endswith("tools/analytics_mcp_server.py"))
+        self.assertEqual(
+            analytics["env"],
+            {"CLAUDE_RUNWAY_TRACK_SAVINGS": "1", "CLAUDE_RUNWAY_SAVINGS_DB": "/data/savings.db"},
+        )
         # record_session_id.py must now live under SessionStart (not PostToolUse).
         start_scripts = [
             Path(a).name
@@ -1290,6 +1304,100 @@ class CompressHookMatcherCoversCompactTools(unittest.TestCase):
         before = self._settings(_OLD_MATCHER, extra_blocks=(second,))
         after = _migration(self._ID).apply({}, before, _ctx())[1]
         self.assertEqual([b["matcher"] for b in after["hooks"]["PostToolUse"]], [f"{_OLD_MATCHER}|{COMPACT_TOOLS_MATCHER}"] * 2)
+
+
+class AnalyticsServerMissing(unittest.TestCase):
+    """The savings and metrics tools moved from `local-compress` to the opt-in
+    `analytics` server. A project that already tracks savings is offered the
+    block so `/my-savings` keeps working; a project that does not is not."""
+
+    _ID = "analytics-server-missing"
+
+    def _mcp(self, **compress_env):
+        return {"mcpServers": {
+            "qdrant": {"command": "/venv/bin/python", "args": ["/t/tools/qdrant_mcp_server.py"], "env": {}},
+            "local-compress": {"command": "/venv/bin/python", "env": dict(compress_env)},
+        }}
+
+    def test_detect_true_when_tracking_is_on_and_there_is_no_analytics_block(self):
+        for value in ("1", "true", "TRUE", " yes "):
+            with self.subTest(value=value):
+                self.assertTrue(_migration(self._ID).detect(self._mcp(CLAUDE_RUNWAY_TRACK_SAVINGS=value), {}))
+
+    def test_detect_false_when_tracking_is_off_blank_or_unset(self):
+        for env in ({}, {"CLAUDE_RUNWAY_TRACK_SAVINGS": ""}, {"CLAUDE_RUNWAY_TRACK_SAVINGS": "0"},
+                    {"CLAUDE_RUNWAY_TRACK_SAVINGS": "maybe"}, {"CLAUDE_RUNWAY_TRACK_SAVINGS": 1}):
+            with self.subTest(env=env):
+                self.assertFalse(_migration(self._ID).detect(self._mcp(**env), {}))
+
+    def test_detect_false_without_a_local_compress_block_or_with_an_odd_shape(self):
+        self.assertFalse(_migration(self._ID).detect({}, {}))
+        self.assertFalse(_migration(self._ID).detect({"mcpServers": {"qdrant": {}}}, {}))
+        self.assertFalse(_migration(self._ID).detect({"mcpServers": None}, {}))
+        self.assertFalse(_migration(self._ID).detect({"mcpServers": {"local-compress": None}}, {}))
+
+    def test_detect_false_once_the_analytics_block_exists(self):
+        mcp = self._mcp(CLAUDE_RUNWAY_TRACK_SAVINGS="1")
+        mcp["mcpServers"]["analytics"] = {"command": "/venv/bin/python"}
+        self.assertFalse(_migration(self._ID).detect(mcp, {}))
+
+    def test_apply_adds_exactly_the_analytics_block(self):
+        before = self._mcp(CLAUDE_RUNWAY_TRACK_SAVINGS="1")
+        settings = {"hooks": {"SessionStart": []}}
+        after, after_settings = _migration(self._ID).apply(before, settings, _ctx())
+        self.assertEqual(after_settings, settings)
+        block = after["mcpServers"]["analytics"]
+        self.assertEqual(block["command"], "/fake/venv/bin/python")
+        self.assertEqual(block["type"], "stdio")
+        self.assertEqual(block["args"], [(REPO_ROOT / "tools" / "analytics_mcp_server.py").as_posix()])
+        # No DB override was set, so neither key is written (a blank one would mask inheritance).
+        self.assertEqual(block["env"], {"CLAUDE_RUNWAY_TRACK_SAVINGS": "1"})
+        expected = copy.deepcopy(before)
+        expected["mcpServers"]["analytics"] = block
+        self.assertEqual(after, expected)
+
+    def test_apply_carries_over_both_db_overrides_and_never_mutates_its_input(self):
+        before = self._mcp(
+            CLAUDE_RUNWAY_TRACK_SAVINGS="1", CLAUDE_RUNWAY_SAVINGS_DB=" /data/s.db ", CLAUDE_RUNWAY_METRICS_DB="/data/m.db"
+        )
+        snapshot = copy.deepcopy(before)
+        after = _migration(self._ID).apply(before, {}, _ctx())[0]
+        self.assertEqual(before, snapshot)
+        self.assertEqual(
+            after["mcpServers"]["analytics"]["env"],
+            {
+                "CLAUDE_RUNWAY_TRACK_SAVINGS": "1",
+                "CLAUDE_RUNWAY_SAVINGS_DB": "/data/s.db",
+                "CLAUDE_RUNWAY_METRICS_DB": "/data/m.db",
+            },
+        )
+
+    def test_apply_leaves_no_placeholder_behind(self):
+        from setup_project_lib import find_unresolved_placeholders
+
+        after = _migration(self._ID).apply(self._mcp(CLAUDE_RUNWAY_TRACK_SAVINGS="1"), {}, _ctx())[0]
+        self.assertEqual(find_unresolved_placeholders(after["mcpServers"]["analytics"]), [])
+
+    def test_a_pre_change_config_is_migrated_and_a_second_run_changes_nothing(self):
+        # The pre-change shape: tracking on in local-compress, no analytics block.
+        pre_change = self._mcp(CLAUDE_RUNWAY_TRACK_SAVINGS="1", CLAUDE_RUNWAY_SAVINGS_DB="/data/s.db")
+        self.assertTrue(_migration(self._ID).detect(pre_change, {}))
+
+        once = _migration(self._ID).apply(pre_change, {}, _ctx())[0]
+        self.assertIn("analytics", once["mcpServers"])
+        self.assertEqual(once["mcpServers"]["analytics"]["env"]["CLAUDE_RUNWAY_SAVINGS_DB"], "/data/s.db")
+        self.assertFalse(_migration(self._ID).detect(once, {}))
+        self.assertNotIn(self._ID, {m.id for m in pending_migrations(once, {})})
+
+        twice = _migration(self._ID).apply(once, {}, _ctx())[0]
+        self.assertEqual(twice, once)
+
+    def test_it_never_touches_the_local_compress_block(self):
+        # That block keeps TRACK_SAVINGS: the compression server's footer, which
+        # the hook turns into savings events, still depends on it.
+        before = self._mcp(CLAUDE_RUNWAY_TRACK_SAVINGS="1", CLAUDE_RUNWAY_SAVINGS_DB="/data/s.db")
+        after = _migration(self._ID).apply(before, {}, _ctx())[0]
+        self.assertEqual(after["mcpServers"]["local-compress"], before["mcpServers"]["local-compress"])
 
 
 class CompressHookRenamed(unittest.TestCase):

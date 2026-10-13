@@ -84,8 +84,36 @@ class ReportQdrantServerCoversTheServerThatReplacedTheThirdPartyOne(unittest.Tes
         self.assertFalse(names & {"compact_store", "compact_find", "compact_prune"})
 
 
-class MainReportsAllFourServersAndExitsCleanly(unittest.TestCase):
-    def test_main_prints_all_four_server_labels_and_returns_zero(self):
+class AnalyticsServerIsReported(unittest.TestCase):
+    """The savings and metrics tools moved off `local-compress` onto the opt-in
+    `analytics` server; both must show their own live count."""
+
+    def test_analytics_reports_the_five_moved_tools(self):
+        count, chars = _rtc._report_repo_server("analytics_mcp_server")
+        self.assertEqual(count, 5)
+        self.assertGreater(chars, 0)
+
+    def test_local_compress_reports_five_tools_and_none_of_the_moved_ones(self):
+        import compress_mcp_server
+        from mcp_tool_introspect import list_registered_tools
+
+        names = {fn.__name__ for fn in list_registered_tools(compress_mcp_server.mcp)}
+        self.assertEqual(
+            names,
+            {"list_local_models", "compress_file", "compress_command_output", "fetch_url", "compress_text"},
+        )
+
+    def test_main_prints_both_counts(self):
+        captured = io.StringIO()
+        with redirect_stdout(captured):
+            _rtc.main()
+        output = captured.getvalue()
+        self.assertIn("local-compress (compress_mcp_server.py): 5 tools", output)
+        self.assertIn("analytics (analytics_mcp_server.py): 5 tools", output)
+
+
+class MainReportsAllServersAndExitsCleanly(unittest.TestCase):
+    def test_main_prints_all_server_labels_and_returns_zero(self):
         captured = io.StringIO()
         with redirect_stdout(captured):
             exit_code = _rtc.main()
@@ -93,6 +121,7 @@ class MainReportsAllFourServersAndExitsCleanly(unittest.TestCase):
         output = captured.getvalue()
         self.assertEqual(exit_code, 0)
         self.assertIn("local-compress", output)
+        self.assertIn("analytics", output)
         self.assertIn("codebase-indexer", output)
         self.assertIn("memory-bank", output)
         self.assertIn("qdrant (qdrant_mcp_server.py): 5 tools", output)
