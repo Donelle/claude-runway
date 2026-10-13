@@ -1,7 +1,7 @@
 # Core -- required for the Qdrant codebase-memory piece (ingest_to_qdrant.py,
 # ingest_mcp_server.py) and the memory-bank piece (tools/memory_bank_mcp_server.py,
 # issue #175) -- memory-bank reuses this same Qdrant client machinery (mcp,
-# mcp-server-qdrant's FastEmbedProvider, qdrant-client), so no separate
+# this repo's own libs/qdrant_embeddings.py FastEmbedProvider, qdrant-client), so no separate
 # dependency section is needed for it. Install these even if you're not using
 # local-compress.
 #
@@ -17,6 +17,11 @@ mcp[cli]>=2.0.0
 # only mcp without upgrading fastmcp would bypass that. Declaring the lower
 # bound here makes it explicit for both cases.
 fastmcp>=4.0.0
+# mcp-server-qdrant is no longer imported by this repo's code (libs/qdrant_connector.py
+# and libs/qdrant_embeddings.py replaced those imports), but the generated .mcp.json
+# still launches its console script for qdrant-find/qdrant-store, and
+# tools/report_tool_counts.py introspects its server, so it stays until the
+# standalone server is replaced.
 mcp-server-qdrant
 qdrant-client
 fastembed

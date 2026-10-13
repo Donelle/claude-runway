@@ -36,7 +36,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 from version_lib import version_string  # noqa: E402
 
 # Issue #348 (Copilot review): answer --version BEFORE the dependency imports
-# below. Those exit(1) on a missing/broken mcp_server_qdrant/qdrant_client --
+# below. Those exit(1) on a missing/broken fastembed/qdrant_client --
 # exactly the half-broken environment where someone most needs to report which
 # version they have. parse_args() still declares the flag (so --help lists it).
 if len(sys.argv) == 2 and sys.argv[1] == "--version":
@@ -44,8 +44,8 @@ if len(sys.argv) == 2 and sys.argv[1] == "--version":
     sys.exit(0)
 
 try:
-    from mcp_server_qdrant.qdrant import QdrantConnector, Entry
-    from mcp_server_qdrant.embeddings.fastembed import FastEmbedProvider
+    from qdrant_connector import QdrantConnector, Entry
+    from qdrant_embeddings import FastEmbedProvider
     from qdrant_client import QdrantClient
 except ImportError:
     print(

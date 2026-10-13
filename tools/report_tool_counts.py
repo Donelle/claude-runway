@@ -45,10 +45,10 @@ connection is required) is the only way to check this live rather than
 assuming it never changes -- same "verify, don't assume" standard the
 rest of this fix applies to this repo's own servers. This does couple
 to `mcp_server_qdrant`'s internal `QdrantMCPServer`/`ToolSettings`/
-`QdrantSettings` classes, which aren't a documented public API -- but
-`ingest_mcp_server.py` already couples to that same package's internals
-elsewhere (`QdrantConnector`, `FastEmbedProvider`), so this isn't a new
-class of risk for this repo, just the same one applied one level deeper.
+`QdrantSettings` classes, which aren't a documented public API. This is
+now the ONLY place this repo reaches into that package's internals: the
+connector and embedding provider other tools used to import from it live
+in `libs/qdrant_connector.py` and `libs/qdrant_embeddings.py`.
 If a future `mcp-server-qdrant` release renames or restructures these,
 this check fails loudly (nonzero exit, clear stderr message) rather than
 silently reporting a stale number -- which is the whole point.

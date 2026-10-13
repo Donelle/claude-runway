@@ -41,7 +41,7 @@ from typing import Optional
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "libs"))
 
 from mcp.server.mcpserver import MCPServer, Context
-from mcp_server_qdrant.embeddings.fastembed import FastEmbedProvider
+from qdrant_embeddings import FastEmbedProvider
 from qdrant_client import QdrantClient
 
 from qdrant_ingest_lib import ensure_persistent_fastembed_cache

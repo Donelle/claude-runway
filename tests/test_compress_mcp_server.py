@@ -90,7 +90,7 @@ class SanitizeProjectCollectionName(unittest.TestCase):
 
 
 class _FakeEmbeddingProvider:
-    """Stands in for mcp_server_qdrant.embeddings.fastembed.FastEmbedProvider
+    """Stands in for qdrant_embeddings.FastEmbedProvider
     -- compact_store/compact_find only ever call get_vector_name(),
     embed_documents(), and embed_query() on it, never anything else."""
 

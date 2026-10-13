@@ -78,7 +78,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 import requests
 import trafilatura
 from mcp.server.mcpserver import MCPServer, Context
-from mcp_server_qdrant.embeddings.fastembed import FastEmbedProvider
+from qdrant_embeddings import FastEmbedProvider
 from qdrant_client import QdrantClient, models as qdrant_models
 
 from qdrant_compact_marker import mark_compact_collection
@@ -1022,7 +1022,7 @@ async def compact_store(
     the first call succeeded) can't silently duplicate a compact in the
     /my-resume picker.
 
-    Requires mcp-server-qdrant + fastembed (both already installed via
+    Requires fastembed and qdrant-client (both already installed via
     requirements.txt's Core section). QDRANT_URL / QDRANT_API_KEY /
     COMPACT_COLLECTION env vars are read from this server's .mcp.json env block.
     """

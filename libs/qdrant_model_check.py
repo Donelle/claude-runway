@@ -63,7 +63,7 @@ def check_embedding_model_mismatch(
     Covers three Qdrant vector-config cases:
     - None -- sparse-only collection with no dense-vector config at all; definitive
       incompatibility (not inconclusive), same as empty dict.
-    - Dict[str, VectorParams] -- named vectors (mcp-server-qdrant's own format,
+    - Dict[str, VectorParams] -- named vectors (the format libs/qdrant_connector.py writes, unchanged from mcp-server-qdrant's,
       using a "fast-<model-slug>" key produced by FastEmbedProvider.get_vector_name()).
       Errors on missing name (including empty dict -- sparse-only) or wrong dimension.
     - VectorParams -- unnamed/default single vector (older or third-party ingestion).

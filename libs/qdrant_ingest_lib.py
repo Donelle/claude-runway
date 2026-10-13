@@ -3,7 +3,7 @@ Shared, side-effect-free chunking helpers used by both:
   - ingest_to_qdrant.py   (standalone CLI script)
   - ingest_mcp_server.py  (MCP server exposing the same logic as tools)
 
-Kept dependency-free (no qdrant-client / mcp_server_qdrant imports here) so
+Kept dependency-free (no qdrant-client / fastembed imports here) so
 it's easy to unit test and reuse. No print() calls in this file on purpose --
 ingest_mcp_server.py runs over stdio, where stray prints corrupt the protocol.
 """

@@ -50,8 +50,8 @@ from typing import Optional
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "libs"))
 
 from mcp.server.mcpserver import MCPServer, Context
-from mcp_server_qdrant.qdrant import QdrantConnector, Entry
-from mcp_server_qdrant.embeddings.fastembed import FastEmbedProvider
+from qdrant_connector import QdrantConnector, Entry
+from qdrant_embeddings import FastEmbedProvider
 from qdrant_client import QdrantClient, models
 
 from qdrant_ingest_lib import (
@@ -200,7 +200,7 @@ def _sync_static_collection_description(collection: Optional[str], qdrant_url: s
     fresh-collection case themselves in the COMMON case -- but NOT
     guaranteed: store_batch itself returns immediately without creating the
     collection when entries is empty (libs/qdrant_batch_store.py's own
-    `if not entries: return 0`, before _ensure_collection_exists is ever
+    `if not entries: return 0`, before ensure_collection_exists is ever
     called) -- reachable from index_repo on an empty/no-matching-files repo,
     or from sync_repo when only files were REMOVED (changed is empty, so
     _chunk_changed_files() produces no entries, but the "nothing to do"
