@@ -11,21 +11,23 @@ This exists because that exact drift already happened twice on this repo:
 - Issue #22 (BUG-02): `compress_mcp_server.py`'s `_log_fixed_overhead()`
   hardcoded a 5-tool tuple. `compact_store`/`compact_find`/
   `savings_summary`/`savings_detail` shipped later and were never added to
-  it -- the /my-savings "tool overhead" annotation silently understated
-  the real cost for months, with no error to notice.
+  it -- the /my-savings "tool overhead" annotation (since removed, issue
+  #439) silently undercounted for months, with no error to notice.
 - Issue #23 (BUG-03): EVALUATION.md's Track A/B prose separately hardcoded
   "6 total" and "5 total" tool counts that drifted the same way.
 
 Issue #22's fix replaced compress_mcp_server.py's own hardcoded tuple with
 an inline enumeration of `mcp._tool_manager.list_tools()`. This module
 extracts that same logic into one shared place (issue #52/GROW-05) so
-every caller that needs a live tool count -- `compress_mcp_server.py`,
-`ingest_mcp_server.py`, `tools/report_tool_counts.py`, and EVALUATION.md's
-own "how to check this" prose -- goes through the identical code path and
-can't drift relative to each other.
+every caller that needs a live tool count -- `ingest_mcp_server.py`,
+`memory_bank_mcp_server.py`, `tools/report_tool_counts.py`, and
+EVALUATION.md's own "how to check this" prose -- goes through the identical
+code path and can't drift relative to each other. (`compress_mcp_server.py`
+was a caller until issue #439 removed its `_log_fixed_overhead()` schema-size
+estimate.)
 
 Deliberately STDLIB-ONLY (no third-party imports, not even
-`local_compress_lib.estimate_tokens`) so importing this from
+`local_compress_lib.py`) so importing this from
 `ingest_mcp_server.py`'s side doesn't drag in `openai` for a project that
 only wants the Qdrant memory piece -- same reasoning `libs/doctor_lib.py`'s
 own docstring already gives for not importing `local_compress_lib.py`
@@ -58,8 +60,9 @@ def describe_tools(mcp: Any) -> str:
     Name + signature + docstring for every registered tool, concatenated
     into one blob -- a proxy for the real JSON tool schema Claude Code
     actually sends (MCPServer doesn't expose the real schema synchronously
-    either, so this is the same approximation `_log_fixed_overhead()`
-    already used before this extraction).
+    either). `tools/report_tool_counts.py` reports its length in characters,
+    labeled as a schema proxy; it is not the serialized schema and is not
+    converted to tokens.
     """
     return "\n".join(
         f"{fn.__name__}{inspect.signature(fn)}\n{fn.__doc__ or ''}"

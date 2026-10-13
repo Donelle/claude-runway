@@ -262,7 +262,7 @@ def _old_schema_db_path(db_path: Path) -> None:
 
 class SchemaMigration(SavingsLedgerTestCase):
     """Issue #30/#69: a pre-existing savings.db from before
-    raw_tokens_sum/out_tokens_sum/overhead_tokens existed must not make
+    raw_chars_sum/out_chars_sum/overhead_tokens existed must not make
     finalize_session raise sqlite3.OperationalError -- and the migration
     scaffold itself must be safe to run against a DB that already has the
     columns but hasn't been through PRAGMA user_version tracking yet."""
@@ -274,13 +274,15 @@ class SchemaMigration(SavingsLedgerTestCase):
         _old_schema_db_path(self._db_path())
 
         # The exact regression: this used to raise sqlite3.OperationalError.
-        result = L.finalize_session("sess1", "myproject", overhead_tokens=5)
-        self.assertEqual(result["raw_tokens_sum"], 0)
-        self.assertEqual(result["overhead_tokens"], 5)
+        result = L.finalize_session("sess1", "myproject")
+        self.assertEqual(result["raw_chars_sum"], 0)
+        self.assertNotIn("overhead_tokens", result)
 
         conn = sqlite3.connect(str(self._db_path()))
         columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()}
-        self.assertTrue({"raw_tokens_sum", "out_tokens_sum", "overhead_tokens"} <= columns)
+        self.assertTrue({"raw_chars_sum", "out_chars_sum"} <= columns)
+        # Issue #439: the schema-overhead estimate column is gone.
+        self.assertNotIn("overhead_tokens", columns)
         self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], L.SCHEMA_VERSION)
         conn.close()
 
@@ -293,11 +295,13 @@ class SchemaMigration(SavingsLedgerTestCase):
 
         conn = sqlite3.connect(str(self._db_path()))
         row = conn.execute(
-            "SELECT project, credited_saved_tokens, raw_tokens_sum, out_tokens_sum, overhead_tokens "
+            "SELECT project, credited_saved_chars, raw_chars_sum, out_chars_sum "
             "FROM sessions WHERE session_id = 'old-sess'"
         ).fetchone()
         conn.close()
-        self.assertEqual(row, ("old-project", 42, 0, 0, 0))
+        # 42 saved tokens -> 147 chars via v6's tokens x 3.5 backfill; the token
+        # columns themselves are gone after v7 (issue #438).
+        self.assertEqual(row, ("old-project", 147, 0, 0))
 
     def test_brand_new_db_gets_latest_schema_and_version_immediately(self):
         # No file exists yet -- _connect()'s CREATE TABLE already produces
@@ -401,7 +405,7 @@ class MigrationTransactionSafety(SavingsLedgerTestCase):
         _old_schema_db_path(self._db_path())
 
         def _broken_migration(conn):
-            conn.execute("ALTER TABLE sessions ADD COLUMN raw_tokens_sum INTEGER NOT NULL DEFAULT 0")
+            conn.execute("ALTER TABLE sessions ADD COLUMN raw_chars_sum INTEGER NOT NULL DEFAULT 0")
             raise RuntimeError("simulated failure partway through a migration")
 
         with mock.patch.object(L, "_MIGRATIONS", {1: _broken_migration}):
@@ -412,7 +416,7 @@ class MigrationTransactionSafety(SavingsLedgerTestCase):
         self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 0)
         columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()}
         self.assertNotIn(
-            "raw_tokens_sum", columns,
+            "raw_chars_sum", columns,
             "a migration's own ALTER TABLE must roll back if it fails partway through",
         )
         conn.close()
@@ -478,7 +482,7 @@ class FormatDetailViewAcrossProjectsTotal(unittest.TestCase):
     # Deliberately a different project name than any all_projects row below,
     # so "This session · <project>" never collides with a per-project-row
     # substring match in the assertions.
-    _SESSION_AGG = {"credited_saved_tokens": 0, "event_count": 0, "raw_tokens_sum": 0, "out_tokens_sum": 0, "project": "current-session-project"}
+    _SESSION_AGG = {"credited_saved_chars": 0, "event_count": 0, "raw_chars_sum": 0, "out_chars_sum": 0, "project": "current-session-project"}
     _PROJECT_SUMMARY = {"project": "current-session-project"}
 
     def _render(self, all_projects):
@@ -486,26 +490,29 @@ class FormatDetailViewAcrossProjectsTotal(unittest.TestCase):
 
     def test_multiple_projects_sum_correctly(self):
         out = self._render([
-            {"project": "acme-a", "sessions": 10, "total_saved_tokens": 115300},
-            {"project": "acme-b", "sessions": 8, "total_saved_tokens": 70700},
+            {"project": "acme-a", "sessions": 10, "total_raw_chars": 200000, "total_out_chars": 84700},
+            {"project": "acme-b", "sessions": 8, "total_raw_chars": 100000, "total_out_chars": 29300},
         ])
         lines = out.splitlines()
         total_line = [ln for ln in lines if ln.strip().startswith("Total")]
         self.assertEqual(len(total_line), 1)
-        # 10 + 8 sessions, 115300 + 70700 = 186000 -> "~186.0k" -> "~186k"
-        # per _fmt_tokens' own ".0k" collapse rule.
+        # 10 + 8 sessions; 300,000 chars before, 114,000 after -> 62% reduction.
         self.assertIn("18 sessions", total_line[0])
-        self.assertIn(L._fmt_tokens(186000), total_line[0])
+        self.assertIn("300,000", total_line[0])
+        self.assertIn("114,000", total_line[0])
+        self.assertIn("62% reduction", total_line[0])
 
     def test_single_project_total_matches_its_own_row(self):
-        out = self._render([{"project": "acme-a", "sessions": 5, "total_saved_tokens": 42000}])
+        out = self._render([{"project": "acme-a", "sessions": 5, "total_raw_chars": 100000, "total_out_chars": 58000}])
         lines = out.splitlines()
         project_line = [ln for ln in lines if "acme-a" in ln]
         total_line = [ln for ln in lines if ln.strip().startswith("Total")]
         self.assertEqual(len(project_line), 1)
         self.assertEqual(len(total_line), 1)
         self.assertIn("5 sessions", total_line[0])
-        self.assertIn(L._fmt_tokens(42000), total_line[0])
+        for line in (project_line[0], total_line[0]):
+            self.assertIn("100,000 → 58,000 chars", line)
+            self.assertIn("42% reduction", line)
 
     def test_no_all_projects_means_no_total_row(self):
         out = self._render([])
@@ -514,83 +521,83 @@ class FormatDetailViewAcrossProjectsTotal(unittest.TestCase):
 
 
 class PerToolRawTokensAccumulation(SavingsLedgerTestCase):
-    """Issue #65: raw_tokens_sum, out_tokens_sum, and credited_event_count
+    """Issue #65: raw_chars_sum, out_chars_sum, and credited_event_count
     accumulated per tool so avg % reduction can be computed and displayed.
     Tests the accumulation logic in both finalize_session (DB path) and
     get_live_session_aggregate (JSONL path).
     """
 
-    def test_finalize_session_accumulates_raw_and_out_tokens_per_tool(self):
+    def test_finalize_session_accumulates_raw_and_out_chars_per_tool(self):
         # Two credited events for the same tool -- raw and out must sum both.
-        L.record_event("s1", "hook:Bash", raw_tokens=1000, out_tokens=100, credited=True)
-        L.record_event("s1", "hook:Bash", raw_tokens=500, out_tokens=50, credited=True)
+        L.record_event("s1", "hook:Bash", raw_chars=1000, out_chars=100, credited=True)
+        L.record_event("s1", "hook:Bash", raw_chars=500, out_chars=50, credited=True)
         L.finalize_session("s1", "proj")
 
         rows = L.query_session_tool_breakdown("s1")
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["tool"], "hook:Bash")
         self.assertEqual(rows[0]["event_count"], 2)
-        self.assertEqual(rows[0]["saved_tokens"], 1350)        # (1000-100) + (500-50)
-        self.assertEqual(rows[0]["raw_tokens_sum"], 1500)      # 1000 + 500
-        self.assertEqual(rows[0]["out_tokens_sum"], 150)       # 100 + 50
+        self.assertEqual(rows[0]["saved_chars"], 1350)        # (1000-100) + (500-50)
+        self.assertEqual(rows[0]["raw_chars_sum"], 1500)      # 1000 + 500
+        self.assertEqual(rows[0]["out_chars_sum"], 150)       # 100 + 50
         self.assertEqual(rows[0]["credited_event_count"], 2)
 
-    def test_finalize_session_does_not_credit_uncredited_raw_tokens(self):
+    def test_finalize_session_does_not_credit_uncredited_raw_chars(self):
         # fetch_url events are uncredited -- their raw/out must NOT feed into
         # the credited aggregates (the % would be meaningless).
-        L.record_event("s2", "fetch_url", raw_tokens=2000, out_tokens=200, credited=False)
-        L.record_event("s2", "hook:Bash", raw_tokens=800, out_tokens=80, credited=True)
+        L.record_event("s2", "fetch_url", raw_chars=2000, out_chars=200, credited=False)
+        L.record_event("s2", "hook:Bash", raw_chars=800, out_chars=80, credited=True)
         L.finalize_session("s2", "proj")
 
         rows = {r["tool"]: r for r in L.query_session_tool_breakdown("s2")}
-        self.assertEqual(rows["fetch_url"]["raw_tokens_sum"], 0)      # uncredited -> 0
-        self.assertEqual(rows["fetch_url"]["out_tokens_sum"], 0)
+        self.assertEqual(rows["fetch_url"]["raw_chars_sum"], 0)      # uncredited -> 0
+        self.assertEqual(rows["fetch_url"]["out_chars_sum"], 0)
         self.assertEqual(rows["fetch_url"]["credited_event_count"], 0)
-        self.assertEqual(rows["hook:Bash"]["raw_tokens_sum"], 800)
-        self.assertEqual(rows["hook:Bash"]["out_tokens_sum"], 80)
+        self.assertEqual(rows["hook:Bash"]["raw_chars_sum"], 800)
+        self.assertEqual(rows["hook:Bash"]["out_chars_sum"], 80)
         self.assertEqual(rows["hook:Bash"]["credited_event_count"], 1)
 
     def test_finalize_session_multiple_tools_tracked_independently(self):
-        L.record_event("s3", "hook:Bash", raw_tokens=1000, out_tokens=100, credited=True)
-        L.record_event("s3", "mcp:compress_command_output", raw_tokens=3000, out_tokens=450, credited=True)
+        L.record_event("s3", "hook:Bash", raw_chars=1000, out_chars=100, credited=True)
+        L.record_event("s3", "mcp:compress_command_output", raw_chars=3000, out_chars=450, credited=True)
         L.finalize_session("s3", "proj")
 
         rows = {r["tool"]: r for r in L.query_session_tool_breakdown("s3")}
-        self.assertEqual(rows["hook:Bash"]["raw_tokens_sum"], 1000)
-        self.assertEqual(rows["hook:Bash"]["out_tokens_sum"], 100)
-        self.assertEqual(rows["mcp:compress_command_output"]["raw_tokens_sum"], 3000)
-        self.assertEqual(rows["mcp:compress_command_output"]["out_tokens_sum"], 450)
+        self.assertEqual(rows["hook:Bash"]["raw_chars_sum"], 1000)
+        self.assertEqual(rows["hook:Bash"]["out_chars_sum"], 100)
+        self.assertEqual(rows["mcp:compress_command_output"]["raw_chars_sum"], 3000)
+        self.assertEqual(rows["mcp:compress_command_output"]["out_chars_sum"], 450)
 
     def test_get_live_session_aggregate_accumulates_all_credited_fields(self):
         # Same logic as finalize_session but reads from JSONL (mid-session).
-        L.record_event("s4", "hook:Bash", raw_tokens=600, out_tokens=60, credited=True)
-        L.record_event("s4", "hook:Bash", raw_tokens=400, out_tokens=40, credited=True)
+        L.record_event("s4", "hook:Bash", raw_chars=600, out_chars=60, credited=True)
+        L.record_event("s4", "hook:Bash", raw_chars=400, out_chars=40, credited=True)
         agg = L.get_live_session_aggregate("s4")
 
         bash_agg = agg["by_tool"]["hook:Bash"]
-        self.assertEqual(bash_agg["raw_tokens_sum"], 1000)        # 600 + 400
-        self.assertEqual(bash_agg["out_tokens_sum"], 100)         # 60 + 40
-        self.assertEqual(bash_agg["saved_tokens"], 900)           # (600-60) + (400-40)
+        self.assertEqual(bash_agg["raw_chars_sum"], 1000)        # 600 + 400
+        self.assertEqual(bash_agg["out_chars_sum"], 100)         # 60 + 40
+        self.assertEqual(bash_agg["saved_chars"], 900)           # (600-60) + (400-40)
         self.assertEqual(bash_agg["credited_event_count"], 2)
 
-    def test_get_live_session_aggregate_uncredited_does_not_add_raw_tokens(self):
-        L.record_event("s5", "fetch_url", raw_tokens=5000, out_tokens=500, credited=False)
+    def test_get_live_session_aggregate_uncredited_does_not_add_raw_chars(self):
+        L.record_event("s5", "fetch_url", raw_chars=5000, out_chars=500, credited=False)
         agg = L.get_live_session_aggregate("s5")
-        self.assertEqual(agg["by_tool"]["fetch_url"]["raw_tokens_sum"], 0)
-        self.assertEqual(agg["by_tool"]["fetch_url"]["out_tokens_sum"], 0)
+        self.assertEqual(agg["by_tool"]["fetch_url"]["raw_chars_sum"], 0)
+        self.assertEqual(agg["by_tool"]["fetch_url"]["out_chars_sum"], 0)
         self.assertEqual(agg["by_tool"]["fetch_url"]["credited_event_count"], 0)
 
-    def test_credited_event_with_expanding_summary_uses_real_out_tokens(self):
-        # A summary that expands (out > raw): saved_tokens is clamped to 0 by
+    def test_credited_event_with_expanding_summary_uses_real_out_chars(self):
+        # A summary that expands (out > raw): saved_chars is clamped to 0 by
         # record_event, but raw and out are still recorded faithfully on the
-        # event. out_tokens_sum must reflect the REAL out (150), not raw-saved (100-0=100).
-        L.record_event("s6", "hook:Bash", raw_tokens=100, out_tokens=150, credited=True)
+        # event. out_chars_sum must reflect the REAL out (150), not raw-saved (100-0=100).
+        L.record_event("s6", "hook:Bash", raw_chars=100, out_chars=150, credited=True)
         L.finalize_session("s6", "proj")
 
         rows = L.query_session_tool_breakdown("s6")
-        self.assertEqual(rows[0]["saved_tokens"], 0)          # clamped at record_event
-        self.assertEqual(rows[0]["raw_tokens_sum"], 100)
-        self.assertEqual(rows[0]["out_tokens_sum"], 150)      # real out, not raw-saved
+        self.assertEqual(rows[0]["saved_chars"], 0)          # clamped at record_event
+        self.assertEqual(rows[0]["raw_chars_sum"], 100)
+        self.assertEqual(rows[0]["out_chars_sum"], 150)      # real out, not raw-saved
         self.assertEqual(rows[0]["credited_event_count"], 1)  # still credited
 
 
@@ -600,8 +607,8 @@ class PerToolAvgPctFormat(unittest.TestCase):
     """
 
     _SESSION_AGG = {
-        "credited_saved_tokens": 0, "event_count": 0,
-        "raw_tokens_sum": 0, "out_tokens_sum": 0, "project": "p",
+        "credited_saved_chars": 0, "event_count": 0,
+        "raw_chars_sum": 0, "out_chars_sum": 0, "project": "p",
     }
     _PROJECT_SUMMARY = {"project": "p"}
 
@@ -612,56 +619,56 @@ class PerToolAvgPctFormat(unittest.TestCase):
 
     def test_avg_pct_appears_for_credited_tool(self):
         # 1000 raw, 150 out -> 1 - 150/1000 = 85% reduction.
-        breakdown = [{"tool": "hook:Bash", "event_count": 10, "saved_tokens": 850,
-                      "raw_tokens_sum": 1000, "out_tokens_sum": 150, "credited_event_count": 10}]
+        breakdown = [{"tool": "hook:Bash", "event_count": 10, "saved_chars": 850,
+                      "raw_chars_sum": 1000, "out_chars_sum": 150, "credited_event_count": 10}]
         out = self._render(breakdown)
-        # The percentage and "avg reduction" label must both appear on the tool line.
+        # The percentage and "reduction" label must both appear on the tool line.
         tool_lines = [ln for ln in out.splitlines() if "hook:Bash" in ln]
         self.assertEqual(len(tool_lines), 1)
-        self.assertIn("avg reduction", tool_lines[0])
+        self.assertIn("reduction", tool_lines[0])
         self.assertIn("85%", tool_lines[0])
 
     def test_avg_pct_zero_raw_does_not_crash(self):
-        # Old DB rows backfilled with raw_tokens_sum=0 must display gracefully.
-        # saved_tokens=200 ensures the credited branch is taken (heuristic fallback).
-        breakdown = [{"tool": "hook:Bash", "event_count": 5, "saved_tokens": 200,
-                      "raw_tokens_sum": 0, "out_tokens_sum": 0, "credited_event_count": 5}]
+        # Old DB rows backfilled with raw_chars_sum=0 must display gracefully.
+        # saved_chars=200 ensures the credited branch is taken (heuristic fallback).
+        breakdown = [{"tool": "hook:Bash", "event_count": 5, "saved_chars": 200,
+                      "raw_chars_sum": 0, "out_chars_sum": 0, "credited_event_count": 5}]
         out = self._render(breakdown)
         tool_lines = [ln for ln in out.splitlines() if "hook:Bash" in ln]
         self.assertEqual(len(tool_lines), 1)
         # No % shown (denominator is 0), but the line must still appear.
-        self.assertNotIn("avg reduction", tool_lines[0])
+        self.assertNotIn("reduction", tool_lines[0])
 
     def test_uncredited_tool_has_no_avg_pct(self):
-        breakdown = [{"tool": "fetch_url", "event_count": 3, "saved_tokens": 0,
-                      "raw_tokens_sum": 0, "out_tokens_sum": 0, "credited_event_count": 0}]
+        breakdown = [{"tool": "fetch_url", "event_count": 3, "saved_chars": 0,
+                      "raw_chars_sum": 0, "out_chars_sum": 0, "credited_event_count": 0}]
         out = self._render(breakdown)
         tool_lines = [ln for ln in out.splitlines() if "fetch_url" in ln]
         self.assertEqual(len(tool_lines), 1)
         self.assertIn("not credited", tool_lines[0])
-        self.assertNotIn("avg reduction", tool_lines[0])
+        self.assertNotIn("reduction", tool_lines[0])
 
     def test_credited_tool_with_zero_savings_shows_0pct_not_uncredited(self):
         # A credited tool whose every summary EXPANDED (out > raw per event) --
-        # saved_tokens is clamped to 0, but credited_event_count > 0 means the
-        # tool IS credited; it should render "0% avg reduction" not "not credited".
-        breakdown = [{"tool": "hook:Bash", "event_count": 2, "saved_tokens": 0,
-                      "raw_tokens_sum": 200, "out_tokens_sum": 300, "credited_event_count": 2}]
+        # saved_chars is clamped to 0, but credited_event_count > 0 means the
+        # tool IS credited; it should render "0% reduction" not "not credited".
+        breakdown = [{"tool": "hook:Bash", "event_count": 2, "saved_chars": 0,
+                      "raw_chars_sum": 200, "out_chars_sum": 300, "credited_event_count": 2}]
         out = self._render(breakdown)
         tool_lines = [ln for ln in out.splitlines() if "hook:Bash" in ln]
         self.assertEqual(len(tool_lines), 1)
         self.assertNotIn("not credited", tool_lines[0])
-        self.assertIn("0% avg reduction", tool_lines[0])
+        self.assertIn("0% reduction", tool_lines[0])
 
-    def test_avg_pct_uses_out_tokens_sum_not_raw_minus_saved(self):
+    def test_avg_pct_uses_out_chars_sum_not_raw_minus_saved(self):
         # Regression guard for the Copilot-found bug: out = raw - saved gives
-        # the wrong % when any event had a clamped saved_tokens. Two events:
+        # the wrong % when any event had a clamped saved_chars. Two events:
         #   event 1: raw=100, out=150 -> saved=0 (clamped) -> naive out = 100-0=100 (WRONG, real=150)
         #   event 2: raw=100, out=10  -> saved=90
         # Naive reconstructed out: (100+100)-(0+90)=110 -> 1-110/200 = 45%
-        # Real out_tokens_sum: 150+10=160            -> 1-160/200 = 20%
-        breakdown = [{"tool": "hook:Bash", "event_count": 2, "saved_tokens": 90,
-                      "raw_tokens_sum": 200, "out_tokens_sum": 160, "credited_event_count": 2}]
+        # Real out_chars_sum: 150+10=160            -> 1-160/200 = 20%
+        breakdown = [{"tool": "hook:Bash", "event_count": 2, "saved_chars": 90,
+                      "raw_chars_sum": 200, "out_chars_sum": 160, "credited_event_count": 2}]
         out = self._render(breakdown)
         tool_lines = [ln for ln in out.splitlines() if "hook:Bash" in ln]
         # 1 - 160/200 = 20%
@@ -669,30 +676,30 @@ class PerToolAvgPctFormat(unittest.TestCase):
         self.assertNotIn("45%", tool_lines[0])
 
     def test_avg_pct_100_percent(self):
-        # out_tokens_sum=0, credited_event_count=1 -> 100% reduction (real zero-output).
-        breakdown = [{"tool": "hook:Bash", "event_count": 1, "saved_tokens": 500,
-                      "raw_tokens_sum": 500, "out_tokens_sum": 0, "credited_event_count": 1}]
+        # out_chars_sum=0, credited_event_count=1 -> 100% reduction (real zero-output).
+        breakdown = [{"tool": "hook:Bash", "event_count": 1, "saved_chars": 500,
+                      "raw_chars_sum": 500, "out_chars_sum": 0, "credited_event_count": 1}]
         out = self._render(breakdown)
         tool_lines = [ln for ln in out.splitlines() if "hook:Bash" in ln]
         self.assertIn("100%", tool_lines[0])
 
     def test_v2_migrated_row_credited_but_no_pct_shown(self):
-        # A v2→v3 migrated row: real saved_tokens and raw_tokens_sum (from v2),
-        # but credited_event_count=0 and out_tokens_sum=0 (v3 backfill defaults).
-        # The row IS credited (saved_tokens > 0 heuristic), but the avg % must
+        # A v2→v3 migrated row: real saved_chars and raw_chars_sum (from v2),
+        # but credited_event_count=0 and out_chars_sum=0 (v3 backfill defaults).
+        # The row IS credited (saved_chars > 0 heuristic), but the avg % must
         # be SUPPRESSED -- computing 1 - 0/raw would yield a fabricated 100%.
-        breakdown = [{"tool": "hook:Bash", "event_count": 5, "saved_tokens": 900,
-                      "raw_tokens_sum": 1000, "out_tokens_sum": 0, "credited_event_count": 0}]
+        breakdown = [{"tool": "hook:Bash", "event_count": 5, "saved_chars": 900,
+                      "raw_chars_sum": 1000, "out_chars_sum": 0, "credited_event_count": 0}]
         out = self._render(breakdown)
         tool_lines = [ln for ln in out.splitlines() if "hook:Bash" in ln]
         self.assertEqual(len(tool_lines), 1)
         # Must render as credited (not "not credited") but without a % metric.
         self.assertNotIn("not credited", tool_lines[0])
-        self.assertNotIn("avg reduction", tool_lines[0])
+        self.assertNotIn("reduction", tool_lines[0])
 
 
 class SchemaMigrationV2V3(SavingsLedgerTestCase):
-    """Schema migrations: v2 adds raw_tokens_sum; v3 adds out_tokens_sum and
+    """Schema migrations: v2 adds raw_chars_sum; v3 adds out_chars_sum and
     credited_event_count to session_tools (issue #65 and follow-up).
     Mirrors the shape of existing SchemaMigration tests for v1.
     """
@@ -742,8 +749,8 @@ class SchemaMigrationV2V3(SavingsLedgerTestCase):
 
         conn = sqlite3.connect(str(self._db_path()))
         columns = {row[1] for row in conn.execute("PRAGMA table_info(session_tools)").fetchall()}
-        self.assertIn("raw_tokens_sum", columns)
-        self.assertIn("out_tokens_sum", columns)
+        self.assertIn("raw_chars_sum", columns)
+        self.assertIn("out_chars_sum", columns)
         self.assertIn("credited_event_count", columns)
         self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], L.SCHEMA_VERSION)
         conn.close()
@@ -754,34 +761,34 @@ class SchemaMigrationV2V3(SavingsLedgerTestCase):
 
         conn = sqlite3.connect(str(self._db_path()))
         row = conn.execute(
-            "SELECT event_count, saved_tokens, raw_tokens_sum, out_tokens_sum, credited_event_count "
+            "SELECT event_count, saved_chars, raw_chars_sum, out_chars_sum, credited_event_count "
             "FROM session_tools WHERE session_id = 'old-sess'"
         ).fetchone()
         conn.close()
-        # Existing row must survive with new columns backfilled to 0 (honest "unknown").
-        self.assertEqual(row, (5, 300, 0, 0, 0))
+        # Existing row must survive with the unknown columns at 0 (honest "unknown");
+        # its 300 saved tokens carry over as 1050 chars (v6's tokens x 3.5 backfill).
+        self.assertEqual(row, (5, 1050, 0, 0, 0))
 
     def test_query_session_tool_breakdown_includes_all_new_fields(self):
-        L.record_event("s-qbd", "hook:Bash", raw_tokens=1000, out_tokens=100, credited=True)
+        L.record_event("s-qbd", "hook:Bash", raw_chars=1000, out_chars=100, credited=True)
         L.finalize_session("s-qbd", "proj")
 
         rows = L.query_session_tool_breakdown("s-qbd")
         self.assertEqual(len(rows), 1)
-        self.assertIn("raw_tokens_sum", rows[0])
-        self.assertIn("out_tokens_sum", rows[0])
+        self.assertIn("raw_chars_sum", rows[0])
+        self.assertIn("out_chars_sum", rows[0])
         self.assertIn("credited_event_count", rows[0])
-        self.assertEqual(rows[0]["raw_tokens_sum"], 1000)
-        self.assertEqual(rows[0]["out_tokens_sum"], 100)
+        self.assertEqual(rows[0]["raw_chars_sum"], 1000)
+        self.assertEqual(rows[0]["out_chars_sum"], 100)
         self.assertEqual(rows[0]["credited_event_count"], 1)
 
 
 class QueryAllProjectsRicherStats(SavingsLedgerTestCase):
-    """Issue #68: query_all_projects() must return avg_tokens_per_session and
-    best_tool in addition to the existing {project, sessions, total_saved_tokens}
-    -- pure DB-layer tests that exercise the SQL directly."""
+    """Issue #68/#438: query_all_projects() returns, per project, the characters
+    before/after/saved and best_tool -- pure DB-layer tests that exercise the SQL
+    directly."""
 
-    def test_avg_tokens_per_session_correct(self):
-        # Two sessions for one project: 100 + 300 = 400 total → avg 200.
+    def test_totals_are_summed_across_sessions(self):
         L.record_event("s-avg-1", "hook:Bash", 1000, 900, credited=True)   # saved=100
         L.finalize_session("s-avg-1", "proj-a")
         L.record_event("s-avg-2", "hook:Bash", 1000, 700, credited=True)   # saved=300
@@ -790,8 +797,15 @@ class QueryAllProjectsRicherStats(SavingsLedgerTestCase):
         rows = {r["project"]: r for r in L.query_all_projects()}
         self.assertIn("proj-a", rows)
         self.assertEqual(rows["proj-a"]["sessions"], 2)
-        self.assertEqual(rows["proj-a"]["total_saved_tokens"], 400)
-        self.assertEqual(rows["proj-a"]["avg_tokens_per_session"], 200)
+        self.assertEqual(rows["proj-a"]["total_raw_chars"], 2000)
+        self.assertEqual(rows["proj-a"]["total_out_chars"], 1600)
+        self.assertEqual(rows["proj-a"]["total_saved_chars"], 400)
+
+    def test_no_estimated_token_fields_are_returned(self):
+        L.record_event("s-x", "hook:Bash", 1000, 900, credited=True)
+        L.finalize_session("s-x", "proj-x")
+        row = L.query_all_projects()[0]
+        self.assertFalse([k for k in row if k.endswith("_tokens") or "tokens_per" in k], row)
 
     def test_best_tool_per_project(self):
         # hook:Bash saves 100, compress_command_output saves 300 -- best_tool must
@@ -802,6 +816,21 @@ class QueryAllProjectsRicherStats(SavingsLedgerTestCase):
 
         rows = {r["project"]: r for r in L.query_all_projects()}
         self.assertEqual(rows["proj-b"]["best_tool"], "mcp:compress_command_output")
+
+    def test_best_tool_ranks_by_aggregate_not_sum_of_clamped_savings(self):
+        # hook:Bash saves 800 in one session and grows its content by 400 in another.
+        # Each session's stored saving is clamped at 0 (800 and 0, summing to 800),
+        # but the tool's real aggregate is 1100 -> 700 = 400. compress_file's
+        # aggregate is 500, so it is the better tool even though hook:Bash's summed
+        # per-session saved_chars is higher.
+        L.record_event("s-agg-1", "hook:Bash", 1000, 200, credited=True)
+        L.record_event("s-agg-1", "mcp:compress_file", 1000, 500, credited=True)
+        L.finalize_session("s-agg-1", "proj-agg")
+        L.record_event("s-agg-2", "hook:Bash", 100, 500, credited=True)
+        L.finalize_session("s-agg-2", "proj-agg")
+
+        rows = {r["project"]: r for r in L.query_all_projects()}
+        self.assertEqual(rows["proj-agg"]["best_tool"], "mcp:compress_file")
 
     def test_best_tool_none_when_no_session_tools_rows(self):
         # A project whose session was inserted directly into `sessions` without
@@ -814,9 +843,9 @@ class QueryAllProjectsRicherStats(SavingsLedgerTestCase):
         conn = L._connect()
         conn.execute(
             "INSERT OR REPLACE INTO sessions "
-            "(session_id, project, ended_at, credited_saved_tokens, raw_tokens_sum, "
-            " out_tokens_sum, event_count, fetch_url_count, overhead_tokens) "
-            "VALUES ('bare-sess', 'proj-bare', '2026-01-01T00:00:00Z', 50, 0, 0, 1, 0, 0)"
+            "(session_id, project, ended_at, credited_saved_chars, raw_chars_sum, "
+            " out_chars_sum, event_count, fetch_url_count) "
+            "VALUES ('bare-sess', 'proj-bare', '2026-01-01T00:00:00Z', 50, 0, 0, 1, 0)"
         )
         conn.commit()
         conn.close()
@@ -824,52 +853,41 @@ class QueryAllProjectsRicherStats(SavingsLedgerTestCase):
         rows = {r["project"]: r for r in L.query_all_projects()}
         self.assertIn("proj-bare", rows)
         self.assertIsNone(rows["proj-bare"]["best_tool"])
+        # Credited events but no recorded size: counted as unsized, not as a 0-char total.
+        self.assertEqual(rows["proj-bare"]["unsized_sessions"], 1)
+        self.assertEqual(rows["proj-bare"]["total_saved_chars"], 0)
 
-    def test_avg_is_zero_for_project_with_zero_savings(self):
-        # A single session that saved 0 tokens (e.g. every summary expanded).
+    def test_zero_totals_for_project_with_no_credited_events(self):
         L.finalize_session("s-zero", "proj-zero")
         rows = {r["project"]: r for r in L.query_all_projects()}
-        self.assertEqual(rows["proj-zero"]["avg_tokens_per_session"], 0)
+        self.assertEqual(
+            (rows["proj-zero"]["total_raw_chars"], rows["proj-zero"]["total_out_chars"],
+             rows["proj-zero"]["total_saved_chars"]),
+            (0, 0, 0),
+        )
 
     def test_multiple_projects_independent(self):
-        # Two different projects must not bleed into each other's avg or best_tool.
+        # Two different projects must not bleed into each other's totals or best_tool.
         L.record_event("s-p1", "hook:Bash", 1000, 500, credited=True)    # saved=500
         L.finalize_session("s-p1", "proj-x")
         L.record_event("s-p2", "mcp:compress_file", 1000, 100, credited=True)  # saved=900
         L.finalize_session("s-p2", "proj-y")
 
         rows = {r["project"]: r for r in L.query_all_projects()}
-        self.assertEqual(rows["proj-x"]["avg_tokens_per_session"], 500)
+        self.assertEqual(rows["proj-x"]["total_saved_chars"], 500)
         self.assertEqual(rows["proj-x"]["best_tool"], "hook:Bash")
-        self.assertEqual(rows["proj-y"]["avg_tokens_per_session"], 900)
+        self.assertEqual(rows["proj-y"]["total_saved_chars"], 900)
         self.assertEqual(rows["proj-y"]["best_tool"], "mcp:compress_file")
-
-    def test_avg_uses_python_round_not_sql_round(self):
-        # Regression guard for the Copilot-found rounding inconsistency: SQLite's
-        # ROUND() uses half-away-from-zero (2.5 → 3), Python's round() uses
-        # ties-to-even (2.5 → 2). The "Last N sessions" average uses Python's
-        # round(); avg_tokens_per_session must also use Python's round() so
-        # the two blocks never disagree on identical data. Two sessions:
-        #   session 1: saved=2, session 2: saved=3 → sum=5, count=2 → 2.5
-        # SQLite ROUND(2.5) = 3; Python round(2.5) = 2.
-        L.record_event("s-rnd-1", "hook:Bash", 100, 98, credited=True)   # saved=2
-        L.finalize_session("s-rnd-1", "proj-rnd")
-        L.record_event("s-rnd-2", "hook:Bash", 100, 97, credited=True)   # saved=3
-        L.finalize_session("s-rnd-2", "proj-rnd")
-
-        rows = {r["project"]: r for r in L.query_all_projects()}
-        # Python round(2.5) = 2 (ties-to-even); SQLite ROUND(2.5) = 3.
-        self.assertEqual(rows["proj-rnd"]["avg_tokens_per_session"], round(2.5))
 
 
 class FormatDetailViewCrossProjectRicherStats(unittest.TestCase):
-    """Issue #68: format_detail_view must show avg_tokens_per_session and
-    best_tool in the 'Across projects' block when present.
+    """Issue #68/#438: format_detail_view shows characters before/after, percent
+    reduction and best_tool in the 'Across projects' block when present.
     Pure-function tests -- no DB or temp dir needed."""
 
     _SESSION_AGG = {
-        "credited_saved_tokens": 0, "event_count": 0,
-        "raw_tokens_sum": 0, "out_tokens_sum": 0,
+        "credited_saved_chars": 0, "event_count": 0,
+        "raw_chars_sum": 0, "out_chars_sum": 0,
         "project": "current-session-project",
     }
     _PROJECT_SUMMARY = {"project": "current-session-project"}
@@ -879,61 +897,55 @@ class FormatDetailViewCrossProjectRicherStats(unittest.TestCase):
             self._SESSION_AGG, self._PROJECT_SUMMARY, [], [], all_projects
         )
 
-    def test_avg_and_best_tool_shown_when_present(self):
+    def test_before_after_reduction_and_best_tool_shown_when_present(self):
         out = self._render([{
-            "project": "acme-a", "sessions": 4, "total_saved_tokens": 80000,
-            "avg_tokens_per_session": 20000, "best_tool": "hook:Bash",
+            "project": "acme-a", "sessions": 4, "total_raw_chars": 80000,
+            "total_out_chars": 20000, "best_tool": "hook:Bash",
         }])
         project_lines = [ln for ln in out.splitlines() if "acme-a" in ln]
         self.assertEqual(len(project_lines), 1)
-        self.assertIn("avg", project_lines[0])
+        self.assertIn("80,000 → 20,000 chars", project_lines[0])
+        self.assertIn("75% reduction", project_lines[0])
         self.assertIn("best: hook:Bash", project_lines[0])
 
     def test_best_tool_suppressed_when_none(self):
         # best_tool=None means no session_tools data -- must not render "best: None".
         out = self._render([{
-            "project": "proj-bare", "sessions": 1, "total_saved_tokens": 50,
-            "avg_tokens_per_session": 50, "best_tool": None,
+            "project": "proj-bare", "sessions": 1, "total_raw_chars": 100,
+            "total_out_chars": 50, "best_tool": None,
         }])
         project_lines = [ln for ln in out.splitlines() if "proj-bare" in ln]
         self.assertEqual(len(project_lines), 1)
         self.assertNotIn("best:", project_lines[0])
         self.assertNotIn("None", project_lines[0])
 
-    def test_avg_shown_even_when_best_tool_absent(self):
-        out = self._render([{
-            "project": "proj-c", "sessions": 2, "total_saved_tokens": 400,
-            "avg_tokens_per_session": 200, "best_tool": None,
-        }])
-        project_lines = [ln for ln in out.splitlines() if "proj-c" in ln]
-        self.assertEqual(len(project_lines), 1)
-        self.assertIn("avg", project_lines[0])
-        self.assertNotIn("best:", project_lines[0])
-
     def test_backward_compat_missing_keys_do_not_crash(self):
-        # Old-shape dict without the new fields (e.g. tests that were written
-        # before issue #68) must not raise -- .get() returns None, suppressing
-        # both new fields gracefully.
-        out = self._render([
-            {"project": "acme-a", "sessions": 10, "total_saved_tokens": 115300},
-        ])
+        # An old-shape dict without the character totals must not raise -- .get()
+        # supplies 0, shown as "n/a" rather than a fabricated percentage.
+        out = self._render([{"project": "acme-a", "sessions": 10}])
         lines = out.splitlines()
         project_line = [ln for ln in lines if "acme-a" in ln]
         self.assertEqual(len(project_line), 1)
-        # Old callers keep working -- no crash, no "None" visible in output.
+        self.assertIn("n/a reduction", project_line[0])
         self.assertNotIn("None", project_line[0])
 
-    def test_zero_avg_is_shown_not_suppressed(self):
-        # avg_tokens_per_session=0 is a real value (zero savings), not absent --
-        # must display rather than being treated as falsy and hidden.
+    def test_zero_raw_is_na_not_a_fabricated_percentage(self):
         out = self._render([{
-            "project": "proj-zero", "sessions": 1, "total_saved_tokens": 0,
-            "avg_tokens_per_session": 0, "best_tool": None,
+            "project": "proj-zero", "sessions": 1, "total_raw_chars": 0,
+            "total_out_chars": 0, "best_tool": None,
         }])
         project_lines = [ln for ln in out.splitlines() if "proj-zero" in ln]
         self.assertEqual(len(project_lines), 1)
-        # 0 is not None -- avg suffix must still appear.
-        self.assertIn("avg", project_lines[0])
+        self.assertIn("0 → 0 chars", project_lines[0])
+        self.assertIn("n/a reduction", project_lines[0])
+
+    def test_output_has_no_estimated_token_wording(self):
+        out = self._render([{
+            "project": "acme-a", "sessions": 4, "total_raw_chars": 80000,
+            "total_out_chars": 20000, "best_tool": "hook:Bash",
+        }])
+        self.assertNotIn("~", out)
+        self.assertNotIn("tokens avoided", out)
 
 
 class FormatJson(unittest.TestCase):
@@ -944,18 +956,17 @@ class FormatJson(unittest.TestCase):
     # Shared minimal inputs; tests override only the part they care about.
     _SESSION_AGG = {
         "project": "my-repo",
-        "credited_saved_tokens": 1234,
-        "raw_tokens_sum": 5000,
-        "out_tokens_sum": 3766,
+        "credited_saved_chars": 1234,
+        "raw_chars_sum": 5000,
+        "out_chars_sum": 3766,
         "event_count": 7,
         "fetch_url_count": 2,
-        "overhead_tokens": 300,
     }
     _PROJECT_SUMMARY = {
         "project": "my-repo",
         "sessions": 10,
-        "total_saved_tokens": 50000,
-        "best_session_tokens": 8000,
+        "total_saved_chars": 50000,
+        "best_session_chars": 8000,
     }
 
     def _render(self, session_agg=None, project_summary=None,
@@ -982,46 +993,46 @@ class FormatJson(unittest.TestCase):
         parsed = json.loads(self._render())
         sess = parsed["session"]
         self.assertEqual(sess["project"], "my-repo")
-        self.assertEqual(sess["credited_saved_tokens"], 1234)
-        self.assertEqual(sess["raw_tokens_sum"], 5000)
+        self.assertEqual(sess["credited_saved_chars"], 1234)
+        self.assertEqual(sess["raw_chars_sum"], 5000)
         self.assertEqual(sess["event_count"], 7)
         self.assertEqual(sess["fetch_url_count"], 2)
-        self.assertEqual(sess["overhead_tokens"], 300)
+        self.assertNotIn("overhead_tokens", sess)  # issue #439
 
     def test_project_summary_values_are_correct(self):
         parsed = json.loads(self._render())
         ps = parsed["project_summary"]
         self.assertEqual(ps["project"], "my-repo")
         self.assertEqual(ps["sessions"], 10)
-        self.assertEqual(ps["total_saved_tokens"], 50000)
-        self.assertEqual(ps["best_session_tokens"], 8000)
+        self.assertEqual(ps["total_saved_chars"], 50000)
+        self.assertEqual(ps["best_session_chars"], 8000)
 
     def test_tool_breakdown_serialised_correctly(self):
         breakdown = [
-            {"tool": "hook:Bash", "event_count": 5, "saved_tokens": 900,
-             "raw_tokens_sum": 1000, "out_tokens_sum": 100, "credited_event_count": 5},
+            {"tool": "hook:Bash", "event_count": 5, "saved_chars": 900,
+             "raw_chars_sum": 1000, "out_chars_sum": 100, "credited_event_count": 5},
         ]
         parsed = json.loads(self._render(tool_breakdown=breakdown))
         self.assertEqual(len(parsed["tool_breakdown"]), 1)
         t = parsed["tool_breakdown"][0]
         self.assertEqual(t["tool"], "hook:Bash")
-        self.assertEqual(t["saved_tokens"], 900)
-        self.assertEqual(t["raw_tokens_sum"], 1000)
+        self.assertEqual(t["saved_chars"], 900)
+        self.assertEqual(t["raw_chars_sum"], 1000)
 
     def test_last_n_sessions_serialised_correctly(self):
         last_n = [
-            {"ended_at": "2026-09-01T10:00:00Z", "saved_tokens": 500},
-            {"ended_at": "2026-09-02T10:00:00Z", "saved_tokens": 800},
+            {"ended_at": "2026-09-01T10:00:00Z", "saved_chars": 500},
+            {"ended_at": "2026-09-02T10:00:00Z", "saved_chars": 800},
         ]
         parsed = json.loads(self._render(last_n=last_n))
         self.assertEqual(len(parsed["last_n_sessions"]), 2)
-        self.assertEqual(parsed["last_n_sessions"][0]["saved_tokens"], 500)
+        self.assertEqual(parsed["last_n_sessions"][0]["saved_chars"], 500)
         self.assertEqual(parsed["last_n_sessions"][1]["ended_at"], "2026-09-02T10:00:00Z")
 
     def test_all_projects_best_tool_none_stays_null(self):
         # best_tool=None must round-trip as JSON null, not the string "None".
         all_projects = [
-            {"project": "proj-bare", "sessions": 1, "total_saved_tokens": 50,
+            {"project": "proj-bare", "sessions": 1, "total_saved_chars": 50,
              "avg_tokens_per_session": 50, "best_tool": None},
         ]
         parsed = json.loads(self._render(all_projects=all_projects))
@@ -1029,7 +1040,7 @@ class FormatJson(unittest.TestCase):
 
     def test_all_projects_best_tool_present_is_a_string(self):
         all_projects = [
-            {"project": "proj-a", "sessions": 3, "total_saved_tokens": 300,
+            {"project": "proj-a", "sessions": 3, "total_saved_chars": 300,
              "avg_tokens_per_session": 100, "best_tool": "hook:Bash"},
         ]
         parsed = json.loads(self._render(all_projects=all_projects))
@@ -1038,9 +1049,9 @@ class FormatJson(unittest.TestCase):
     def test_none_values_in_session_agg_are_coerced_to_zero(self):
         # A partially-filled aggregate (e.g. from a brand-new session with no
         # events yet) must not produce null in the JSON output.
-        sparse_agg = {"project": "p", "credited_saved_tokens": None}
+        sparse_agg = {"project": "p", "credited_saved_chars": None}
         parsed = json.loads(self._render(session_agg=sparse_agg))
-        self.assertEqual(parsed["session"]["credited_saved_tokens"], 0)
+        self.assertEqual(parsed["session"]["credited_saved_chars"], 0)
 
     def test_empty_lists_produce_empty_json_arrays(self):
         parsed = json.loads(self._render())
@@ -1056,18 +1067,17 @@ class FormatCsv(unittest.TestCase):
 
     _SESSION_AGG = {
         "project": "my-repo",
-        "credited_saved_tokens": 1234,
-        "raw_tokens_sum": 5000,
-        "out_tokens_sum": 3766,
+        "credited_saved_chars": 1234,
+        "raw_chars_sum": 5000,
+        "out_chars_sum": 3766,
         "event_count": 7,
         "fetch_url_count": 2,
-        "overhead_tokens": 300,
     }
     _PROJECT_SUMMARY = {
         "project": "my-repo",
         "sessions": 10,
-        "total_saved_tokens": 50000,
-        "best_session_tokens": 8000,
+        "total_saved_chars": 50000,
+        "best_session_chars": 8000,
     }
 
     def _parse(self, text: str) -> list:
@@ -1084,8 +1094,8 @@ class FormatCsv(unittest.TestCase):
         rows = self._parse(out)
         header = rows[0]
         self.assertIn("project", header)
-        self.assertIn("credited_saved_tokens", header)
-        self.assertIn("project_total_saved_tokens", header)
+        self.assertIn("credited_saved_chars", header)
+        self.assertIn("project_total_saved_chars", header)
 
     def test_session_table_data_matches_inputs(self):
         out = L.format_csv(self._SESSION_AGG, self._PROJECT_SUMMARY, [], [], [], table="session")
@@ -1093,16 +1103,16 @@ class FormatCsv(unittest.TestCase):
         header, data = rows[0], rows[1]
         d = dict(zip(header, data, strict=False))
         self.assertEqual(d["project"], "my-repo")
-        self.assertEqual(int(d["credited_saved_tokens"]), 1234)
-        self.assertEqual(int(d["project_total_saved_tokens"]), 50000)
+        self.assertEqual(int(d["credited_saved_chars"]), 1234)
+        self.assertEqual(int(d["project_total_saved_chars"]), 50000)
         self.assertEqual(int(d["project_sessions"]), 10)
 
     def test_tools_table_has_header_and_correct_number_of_rows(self):
         breakdown = [
-            {"tool": "hook:Bash", "event_count": 5, "saved_tokens": 900,
-             "raw_tokens_sum": 1000, "out_tokens_sum": 100, "credited_event_count": 5},
-            {"tool": "fetch_url", "event_count": 3, "saved_tokens": 0,
-             "raw_tokens_sum": 0, "out_tokens_sum": 0, "credited_event_count": 0},
+            {"tool": "hook:Bash", "event_count": 5, "saved_chars": 900,
+             "raw_chars_sum": 1000, "out_chars_sum": 100, "credited_event_count": 5},
+            {"tool": "fetch_url", "event_count": 3, "saved_chars": 0,
+             "raw_chars_sum": 0, "out_chars_sum": 0, "credited_event_count": 0},
         ]
         out = L.format_csv(self._SESSION_AGG, self._PROJECT_SUMMARY, breakdown, [], [], table="tools")
         rows = self._parse(out)
@@ -1112,22 +1122,22 @@ class FormatCsv(unittest.TestCase):
 
     def test_tools_table_data_matches_breakdown(self):
         breakdown = [
-            {"tool": "hook:Bash", "event_count": 5, "saved_tokens": 900,
-             "raw_tokens_sum": 1000, "out_tokens_sum": 100, "credited_event_count": 5},
+            {"tool": "hook:Bash", "event_count": 5, "saved_chars": 900,
+             "raw_chars_sum": 1000, "out_chars_sum": 100, "credited_event_count": 5},
         ]
         out = L.format_csv(self._SESSION_AGG, self._PROJECT_SUMMARY, breakdown, [], [], table="tools")
         rows = self._parse(out)
         header, data = rows[0], rows[1]
         d = dict(zip(header, data, strict=False))
         self.assertEqual(d["tool"], "hook:Bash")
-        self.assertEqual(int(d["saved_tokens"]), 900)
+        self.assertEqual(int(d["saved_chars"]), 900)
         self.assertEqual(int(d["credited_event_count"]), 5)
 
     def test_projects_table_has_header_and_correct_number_of_rows(self):
         all_projects = [
-            {"project": "proj-a", "sessions": 3, "total_saved_tokens": 300,
+            {"project": "proj-a", "sessions": 3, "total_saved_chars": 300,
              "avg_tokens_per_session": 100, "best_tool": "hook:Bash"},
-            {"project": "proj-b", "sessions": 1, "total_saved_tokens": 50,
+            {"project": "proj-b", "sessions": 1, "total_saved_chars": 50,
              "avg_tokens_per_session": 50, "best_tool": None},
         ]
         out = L.format_csv(self._SESSION_AGG, self._PROJECT_SUMMARY, [], [], all_projects, table="projects")
@@ -1137,7 +1147,7 @@ class FormatCsv(unittest.TestCase):
     def test_projects_table_none_best_tool_is_empty_string(self):
         # None best_tool must render as an empty CSV field, not "None".
         all_projects = [
-            {"project": "proj-bare", "sessions": 1, "total_saved_tokens": 50,
+            {"project": "proj-bare", "sessions": 1, "total_saved_chars": 50,
              "avg_tokens_per_session": 50, "best_tool": None},
         ]
         out = L.format_csv(self._SESSION_AGG, self._PROJECT_SUMMARY, [], [], all_projects, table="projects")
@@ -1190,8 +1200,8 @@ class FormatCsv(unittest.TestCase):
     def test_formula_injection_prefix_on_plus_leading_tool(self):
         # Tool names could in principle start with '+' (e.g. a malformed event).
         breakdown = [
-            {"tool": "+BAD", "event_count": 1, "saved_tokens": 10,
-             "raw_tokens_sum": 100, "out_tokens_sum": 90, "credited_event_count": 1},
+            {"tool": "+BAD", "event_count": 1, "saved_chars": 10,
+             "raw_chars_sum": 100, "out_chars_sum": 90, "credited_event_count": 1},
         ]
         out = L.format_csv(self._SESSION_AGG, self._PROJECT_SUMMARY, breakdown, [], [], table="tools")
         rows = self._parse(out)
@@ -1238,17 +1248,17 @@ class QueryTrend(SavingsLedgerTestCase):
         conn = L._connect()
         conn.execute(
             "INSERT INTO sessions "
-            "(session_id, project, ended_at, credited_saved_tokens, "
-            " raw_tokens_sum, out_tokens_sum, event_count, fetch_url_count, overhead_tokens) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            ("s-w1", "proj-w", "2026-09-07T09:00:00Z", 100, 1000, 900, 1, 0, 0),
+            "(session_id, project, ended_at, credited_saved_chars, "
+            " raw_chars_sum, out_chars_sum, event_count, fetch_url_count) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("s-w1", "proj-w", "2026-09-07T09:00:00Z", 100, 1000, 900, 1, 0),
         )
         conn.execute(
             "INSERT INTO sessions "
-            "(session_id, project, ended_at, credited_saved_tokens, "
-            " raw_tokens_sum, out_tokens_sum, event_count, fetch_url_count, overhead_tokens) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            ("s-w2", "proj-w", "2026-09-09T17:00:00Z", 200, 1000, 800, 1, 0, 0),
+            "(session_id, project, ended_at, credited_saved_chars, "
+            " raw_chars_sum, out_chars_sum, event_count, fetch_url_count) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("s-w2", "proj-w", "2026-09-09T17:00:00Z", 200, 1000, 800, 1, 0),
         )
         conn.commit()
         conn.close()
@@ -1256,7 +1266,7 @@ class QueryTrend(SavingsLedgerTestCase):
         rows = L.query_trend("proj-w", bucket="week", n=10)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["sessions"], 2)
-        self.assertEqual(rows[0]["total_saved_tokens"], 300)
+        self.assertEqual(rows[0]["total_saved_chars"], 300)
 
     def test_weekly_buckets_iso_year_boundary_not_split(self):
         # Regression guard for the %Y-W%W bug Copilot identified in PR #157:
@@ -1267,17 +1277,17 @@ class QueryTrend(SavingsLedgerTestCase):
         conn = L._connect()
         conn.execute(
             "INSERT INTO sessions "
-            "(session_id, project, ended_at, credited_saved_tokens, "
-            " raw_tokens_sum, out_tokens_sum, event_count, fetch_url_count, overhead_tokens) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            ("s-boundary-1", "proj-boundary", "2024-12-30T10:00:00Z", 100, 1000, 900, 1, 0, 0),
+            "(session_id, project, ended_at, credited_saved_chars, "
+            " raw_chars_sum, out_chars_sum, event_count, fetch_url_count) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("s-boundary-1", "proj-boundary", "2024-12-30T10:00:00Z", 100, 1000, 900, 1, 0),
         )
         conn.execute(
             "INSERT INTO sessions "
-            "(session_id, project, ended_at, credited_saved_tokens, "
-            " raw_tokens_sum, out_tokens_sum, event_count, fetch_url_count, overhead_tokens) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            ("s-boundary-2", "proj-boundary", "2025-01-01T14:00:00Z", 200, 1000, 800, 1, 0, 0),
+            "(session_id, project, ended_at, credited_saved_chars, "
+            " raw_chars_sum, out_chars_sum, event_count, fetch_url_count) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("s-boundary-2", "proj-boundary", "2025-01-01T14:00:00Z", 200, 1000, 800, 1, 0),
         )
         conn.commit()
         conn.close()
@@ -1286,7 +1296,7 @@ class QueryTrend(SavingsLedgerTestCase):
         # Both dates are in ISO week 2025-W01 -- must produce exactly ONE bucket.
         self.assertEqual(len(rows), 1, f"Expected 1 bucket (ISO 2025-W01) but got {len(rows)}: {rows}")
         self.assertEqual(rows[0]["sessions"], 2)
-        self.assertEqual(rows[0]["total_saved_tokens"], 300)
+        self.assertEqual(rows[0]["total_saved_chars"], 300)
         # Bucket key must reflect the ISO week year (2025), not the calendar year
         # of the first session (2024).
         self.assertTrue(
@@ -1303,10 +1313,10 @@ class QueryTrend(SavingsLedgerTestCase):
         ):
             conn.execute(
                 "INSERT INTO sessions "
-                "(session_id, project, ended_at, credited_saved_tokens, "
-                " raw_tokens_sum, out_tokens_sum, event_count, fetch_url_count, overhead_tokens) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (session_id, "proj-d", f"{day}T12:00:00Z", saved, 1000, 1000 - saved, 1, 0, 0),
+                "(session_id, project, ended_at, credited_saved_chars, "
+                " raw_chars_sum, out_chars_sum, event_count, fetch_url_count) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (session_id, "proj-d", f"{day}T12:00:00Z", saved, 1000, 1000 - saved, 1, 0),
             )
         conn.commit()
         conn.close()
@@ -1315,9 +1325,9 @@ class QueryTrend(SavingsLedgerTestCase):
         self.assertEqual(len(rows), 3)
         # Oldest first (ascending).
         self.assertEqual(rows[0]["bucket"], "2026-09-07")
-        self.assertEqual(rows[0]["total_saved_tokens"], 100)
+        self.assertEqual(rows[0]["total_saved_chars"], 100)
         self.assertEqual(rows[2]["bucket"], "2026-09-09")
-        self.assertEqual(rows[2]["total_saved_tokens"], 300)
+        self.assertEqual(rows[2]["total_saved_chars"], 300)
 
     def test_n_caps_returned_buckets(self):
         # Insert 5 sessions on 5 different days; n=3 must return only the
@@ -1326,10 +1336,10 @@ class QueryTrend(SavingsLedgerTestCase):
         for i in range(5):
             conn.execute(
                 "INSERT INTO sessions "
-                "(session_id, project, ended_at, credited_saved_tokens, "
-                " raw_tokens_sum, out_tokens_sum, event_count, fetch_url_count, overhead_tokens) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (f"s-cap-{i}", "proj-cap", f"2026-09-0{i + 1}T12:00:00Z", (i + 1) * 100, 1000, 900, 1, 0, 0),
+                "(session_id, project, ended_at, credited_saved_chars, "
+                " raw_chars_sum, out_chars_sum, event_count, fetch_url_count) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (f"s-cap-{i}", "proj-cap", f"2026-09-0{i + 1}T12:00:00Z", (i + 1) * 100, 1000, 900, 1, 0),
             )
         conn.commit()
         conn.close()
@@ -1356,10 +1366,10 @@ class QueryTrend(SavingsLedgerTestCase):
         for proj in ("proj-alpha", "proj-beta"):
             conn.execute(
                 "INSERT INTO sessions "
-                "(session_id, project, ended_at, credited_saved_tokens, "
-                " raw_tokens_sum, out_tokens_sum, event_count, fetch_url_count, overhead_tokens) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (f"s-{proj}", proj, "2026-09-07T12:00:00Z", 500, 1000, 500, 1, 0, 0),
+                "(session_id, project, ended_at, credited_saved_chars, "
+                " raw_chars_sum, out_chars_sum, event_count, fetch_url_count) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (f"s-{proj}", proj, "2026-09-07T12:00:00Z", 500, 1000, 500, 1, 0),
             )
         conn.commit()
         conn.close()
@@ -1367,23 +1377,26 @@ class QueryTrend(SavingsLedgerTestCase):
         alpha = L.query_trend("proj-alpha", bucket="day", n=10)
         beta = L.query_trend("proj-beta", bucket="day", n=10)
         self.assertEqual(len(alpha), 1)
-        self.assertEqual(alpha[0]["total_saved_tokens"], 500)
+        self.assertEqual(alpha[0]["total_saved_chars"], 500)
         self.assertEqual(len(beta), 1)
-        self.assertEqual(beta[0]["total_saved_tokens"], 500)
+        self.assertEqual(beta[0]["total_saved_chars"], 500)
 
 
 class FormatTrendView(unittest.TestCase):
-    """Issue #67: format_trend_view must render a sparkline + table for the
-    bucketed trend data returned by query_trend.
+    """Issue #67/#438: format_trend_view must render a sparkline + table of
+    characters before/after and percent reduction for the bucketed trend data
+    returned by query_trend.
     Pure-function tests — no DB or temp dir needed.
     """
 
+    @staticmethod
+    def _row(bucket, sessions, raw, saved):
+        return {"bucket": bucket, "sessions": sessions, "total_raw_chars": raw,
+                "total_out_chars": raw - saved, "total_saved_chars": saved}
+
     def _rows(self, values, prefix="2026-W3"):
-        """Build synthetic weekly trend rows from a list of token-saved values."""
-        return [
-            {"bucket": f"{prefix}{i}", "sessions": 1, "total_saved_tokens": v}
-            for i, v in enumerate(values, 1)
-        ]
+        """Build synthetic weekly trend rows from a list of characters-saved values."""
+        return [self._row(f"{prefix}{i}", 1, v * 10, v) for i, v in enumerate(values, 1)]
 
     def test_empty_rows_returns_no_history_message(self):
         out = L.format_trend_view([], "my-repo", bucket="week")
@@ -1396,31 +1409,39 @@ class FormatTrendView(unittest.TestCase):
         self.assertIn("my-repo", out)
 
     def test_daily_header_says_daily(self):
-        rows = [{"bucket": "2026-09-07", "sessions": 1, "total_saved_tokens": 100}]
+        rows = [self._row("2026-09-07", 1, 1000, 100)]
         out = L.format_trend_view(rows, "my-repo", bucket="day")
         self.assertIn("Daily", out)
 
     def test_each_bucket_appears_in_output(self):
-        rows = [
-            {"bucket": "2026-W36", "sessions": 2, "total_saved_tokens": 300},
-            {"bucket": "2026-W37", "sessions": 3, "total_saved_tokens": 700},
-        ]
+        rows = [self._row("2026-W36", 2, 1000, 300), self._row("2026-W37", 3, 2000, 700)]
         out = L.format_trend_view(rows, "my-repo", bucket="week")
         self.assertIn("2026-W36", out)
         self.assertIn("2026-W37", out)
 
+    def test_each_bucket_shows_before_after_and_reduction(self):
+        rows = [self._row("2026-W36", 2, 1000, 300)]
+        line = [ln for ln in L.format_trend_view(rows, "my-repo", bucket="week").splitlines() if "2026-W36" in ln][0]
+        self.assertIn("1,000", line)   # before
+        self.assertIn("700", line)     # after
+        self.assertIn("30%", line)     # reduction
+
     def test_total_row_sums_correctly(self):
-        rows = [
-            {"bucket": "2026-W36", "sessions": 2, "total_saved_tokens": 300},
-            {"bucket": "2026-W37", "sessions": 3, "total_saved_tokens": 700},
-        ]
+        rows = [self._row("2026-W36", 2, 1000, 300), self._row("2026-W37", 3, 2000, 700)]
         out = L.format_trend_view(rows, "my-repo", bucket="week")
         lines = out.splitlines()
         total_lines = [ln for ln in lines if "Total" in ln]
         self.assertEqual(len(total_lines), 1)
-        # 2 + 3 = 5 sessions total; 300 + 700 = 1000 tokens.
+        # 2 + 3 = 5 sessions; 3,000 chars before, 2,000 after -> 33% reduction.
         self.assertIn("5", total_lines[0])
-        self.assertIn(L._fmt_tokens(1000), total_lines[0])
+        self.assertIn("3,000", total_lines[0])
+        self.assertIn("2,000", total_lines[0])
+        self.assertIn("33%", total_lines[0])
+
+    def test_no_estimated_token_wording(self):
+        out = L.format_trend_view(self._rows([100, 200]), "my-repo", bucket="week")
+        self.assertNotIn("Tokens avoided", out)
+        self.assertNotIn("~", out)
 
     def test_sparkline_is_present(self):
         # A sparkline character must appear somewhere in the output.
@@ -1432,10 +1453,7 @@ class FormatTrendView(unittest.TestCase):
         )
 
     def test_single_bucket_does_not_crash(self):
-        out = L.format_trend_view(
-            [{"bucket": "2026-W36", "sessions": 1, "total_saved_tokens": 500}],
-            "my-repo",
-        )
+        out = L.format_trend_view([self._row("2026-W36", 1, 1000, 500)], "my-repo")
         self.assertIn("2026-W36", out)
         self.assertIn("Total", out)
 
@@ -1726,16 +1744,18 @@ class AggregateByAgent(unittest.TestCase):
     """_aggregate_by_agent: grouping, credited-only sums, subagent detection."""
 
     @staticmethod
-    def _ev(saved=100, raw=200, out=100, credited=True, **agent):
-        return {"tool": "hook:Bash", "raw_tokens": raw, "out_tokens": out,
-                "saved_tokens": saved if credited else 0, "credited": credited, **agent}
+    def _ev(saved=100, raw=None, out=100, credited=True, **agent):
+        # The saving is derived from before/after, so build `raw` from the wanted saving.
+        raw = out + saved if raw is None else raw
+        return {"tool": "hook:Bash", "raw_chars": raw, "out_chars": out,
+                "saved_chars": saved if credited else 0, "credited": credited, **agent}
 
     def test_no_agent_fields_lands_in_the_main_row(self):
         rows = L._aggregate_by_agent([self._ev(), self._ev()])
         self.assertEqual(len(rows), 1)
         self.assertEqual((rows[0]["is_subagent"], rows[0]["agent_type"]), (0, ""))
         self.assertEqual(rows[0]["event_count"], 2)
-        self.assertEqual(rows[0]["saved_tokens"], 200)
+        self.assertEqual(rows[0]["saved_chars"], 200)
 
     def test_subagent_detected_by_agent_id(self):
         rows = L._aggregate_by_agent([self._ev(), self._ev(agent_id="a1", agent_type="Explore")])
@@ -1762,7 +1782,7 @@ class AggregateByAgent(unittest.TestCase):
         ])
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["event_count"], 2)
-        self.assertEqual(rows[0]["saved_tokens"], 200)
+        self.assertEqual(rows[0]["saved_chars"], 200)
 
     def test_uncredited_events_count_as_events_but_not_savings(self):
         rows = L._aggregate_by_agent([
@@ -1771,10 +1791,10 @@ class AggregateByAgent(unittest.TestCase):
         ])
         self.assertEqual(rows[0]["event_count"], 2)
         self.assertEqual(rows[0]["credited_event_count"], 1)
-        self.assertEqual(rows[0]["saved_tokens"], 100)
-        self.assertEqual(rows[0]["raw_tokens_sum"], 200)  # uncredited raw excluded
+        self.assertEqual(rows[0]["saved_chars"], 100)
+        self.assertEqual(rows[0]["raw_chars_sum"], 200)  # uncredited raw excluded
 
-    def test_sorted_by_saved_tokens_descending(self):
+    def test_sorted_by_saved_chars_descending(self):
         rows = L._aggregate_by_agent([
             self._ev(saved=10),
             self._ev(saved=500, agent_id="a1", agent_type="Big"),
@@ -1800,14 +1820,14 @@ class SessionAgentsRollup(SavingsLedgerTestCase):
         self.assertEqual({(r["is_subagent"], r["agent_type"]) for r in agg["by_agent"]},
                          {(0, ""), (1, "general-purpose")})
         rows = {(r["is_subagent"], r["agent_type"]): r for r in L.query_session_agent_breakdown("s1")}
-        self.assertEqual(rows[(0, "")]["saved_tokens"], 900)
-        self.assertEqual(rows[(1, "general-purpose")]["saved_tokens"], 1800 + 2700)
+        self.assertEqual(rows[(0, "")]["saved_chars"], 900)
+        self.assertEqual(rows[(1, "general-purpose")]["saved_chars"], 1800 + 2700)
         self.assertEqual(rows[(1, "general-purpose")]["credited_event_count"], 2)
 
     def test_main_plus_subagent_rows_sum_to_the_session_total(self):
         self._mixed_session()
         agg = L.finalize_session("s1", "proj")
-        self.assertEqual(sum(r["saved_tokens"] for r in agg["by_agent"]), agg["credited_saved_tokens"])
+        self.assertEqual(sum(r["saved_chars"] for r in agg["by_agent"]), agg["credited_saved_chars"])
 
     def test_refinalizing_replaces_rather_than_duplicates(self):
         self._mixed_session()
@@ -1860,7 +1880,7 @@ class SessionAgentsRollup(SavingsLedgerTestCase):
         self.assertTrue(L._table_exists(conn, "session_agents"))
         self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], L.SCHEMA_VERSION)
         self.assertEqual(
-            conn.execute("SELECT credited_saved_tokens FROM sessions WHERE session_id = 'old'").fetchone()[0], 42)
+            conn.execute("SELECT credited_saved_chars FROM sessions WHERE session_id = 'old'").fetchone()[0], 147)
         self.assertEqual(L.query_session_agent_breakdown("old"), [])  # no backfill
         conn.close()
 
@@ -1871,26 +1891,27 @@ class FormatDetailViewByAgent(unittest.TestCase):
     _PROJECT_SUMMARY = {"project": "proj"}
 
     def _render(self, by_agent):
-        agg = {"credited_saved_tokens": 0, "event_count": 0, "raw_tokens_sum": 0,
-               "out_tokens_sum": 0, "project": "proj"}
+        agg = {"credited_saved_chars": 0, "event_count": 0, "raw_chars_sum": 0,
+               "out_chars_sum": 0, "project": "proj"}
         if by_agent is not None:
             agg["by_agent"] = by_agent
         return L.format_detail_view(agg, self._PROJECT_SUMMARY, [], [], [])
 
     @staticmethod
     def _row(is_sub, agent_type, saved, credited_events):
+        # before = 10x the saving, so the figures shown are distinguishable from it.
         return {"is_subagent": is_sub, "agent_type": agent_type, "event_count": credited_events,
-                "saved_tokens": saved, "raw_tokens_sum": 0, "out_tokens_sum": 0,
+                "saved_chars": saved, "raw_chars_sum": saved * 10, "out_chars_sum": saved * 9,
                 "credited_event_count": credited_events}
 
     def test_block_shown_when_a_subagent_earned_savings(self):
         out = self._render([self._row(1, "Explore", 3000, 4), self._row(0, "", 1000, 2)])
         self.assertIn("Main session vs subagents", out)
         main_line = [ln for ln in out.splitlines() if ln.strip().startswith("main session")][0]
-        self.assertIn(L._fmt_tokens(1000), main_line)
+        self.assertIn("10,000 → 9,000 chars", main_line)
         self.assertIn("2 events", main_line)
         sub_line = [ln for ln in out.splitlines() if "subagent · Explore" in ln][0]
-        self.assertIn(L._fmt_tokens(3000), sub_line)
+        self.assertIn("30,000 → 27,000 chars", sub_line)
         self.assertIn("4 events", sub_line)
 
     def test_block_absent_without_subagents(self):
@@ -2039,7 +2060,7 @@ class FormatActualTokenBlock(unittest.TestCase):
             "actual_output_tokens":      out,
             "actual_cache_read_tokens":  cr,
             "actual_cache_write_tokens": cw,
-            "credited_saved_tokens":     saved,
+            "credited_saved_chars":     saved,
         }
 
     def test_returns_empty_when_all_zero(self):
@@ -2070,16 +2091,14 @@ class FormatActualTokenBlock(unittest.TestCase):
         self.assertIn("0.10×", joined)
         self.assertIn("5.00×", joined)
 
-    def test_savings_rate_shown_when_nonzero_saved(self):
-        lines = L._format_actual_token_block(self._agg(inp=100, out=50, cr=1000, cw=200, saved=300))
-        joined = "\n".join(lines)
-        self.assertIn("Local compression avoided", joined)
-        self.assertIn("of total processed", joined)
-
-    def test_savings_rate_absent_when_saved_is_zero(self):
-        lines = L._format_actual_token_block(self._agg(inp=100, out=50, cr=1000, cw=200, saved=0))
-        joined = "\n".join(lines)
-        self.assertNotIn("Local compression avoided", joined)
+    def test_no_compression_rate_line_even_when_saved_nonzero(self):
+        # Issue #436: the line divided an estimate by a measurement; it must
+        # not come back, whether or not savings were credited.
+        for saved in (300, 0):
+            lines = L._format_actual_token_block(self._agg(inp=100, out=50, cr=1000, cw=200, saved=saved))
+            joined = "\n".join(lines)
+            self.assertNotIn("Local compression avoided", joined)
+            self.assertNotIn("of total processed", joined)
 
     def test_cache_efficiency_shown_when_input_nonzero(self):
         # cache_read=700, input=100 -> ratio=7
@@ -2121,8 +2140,8 @@ class ActualTokensReadPath(SavingsLedgerTestCase):
 
     # Shared session_agg with all-zero actual_* (live session, always 0).
     _SESSION_AGG = {
-        "credited_saved_tokens": 0, "event_count": 0,
-        "raw_tokens_sum": 0, "out_tokens_sum": 0,
+        "credited_saved_chars": 0, "event_count": 0,
+        "raw_chars_sum": 0, "out_chars_sum": 0,
         "project": "test-proj",
         "actual_input_tokens": 0, "actual_output_tokens": 0,
         "actual_cache_read_tokens": 0, "actual_cache_write_tokens": 0,
@@ -2133,7 +2152,7 @@ class ActualTokensReadPath(SavingsLedgerTestCase):
     # returns after the fix.
     _SESSION_WITH_ACTUALS = {
         "ended_at": "2026-09-10T19:00:00Z",
-        "saved_tokens": 1800,
+        "saved_chars": 1800,
         "actual_input_tokens": 1000,
         "actual_output_tokens": 200,
         "actual_cache_read_tokens": 5000,
@@ -2141,7 +2160,7 @@ class ActualTokensReadPath(SavingsLedgerTestCase):
     }
     _SESSION_ALL_ZEROS = {
         "ended_at": "2026-09-08T15:00:00Z",
-        "saved_tokens": 7200,
+        "saved_chars": 7200,
         "actual_input_tokens": 0,
         "actual_output_tokens": 0,
         "actual_cache_read_tokens": 0,
@@ -2242,7 +2261,7 @@ class ActualTokensReadPath(SavingsLedgerTestCase):
     def test_format_json_last_n_sessions_actual_fields_absent_coerces_to_zero(self):
         # A last_n entry without actual_* keys (e.g. an old-shape dict from before
         # this fix) must produce 0 in JSON, not raise KeyError.
-        old_shape = {"ended_at": "2026-09-01T00:00:00Z", "saved_tokens": 500}
+        old_shape = {"ended_at": "2026-09-01T00:00:00Z", "saved_chars": 500}
         parsed = json.loads(L.format_json(
             self._SESSION_AGG, self._PROJECT_SUMMARY, [], [old_shape], [],
         ))
@@ -2296,10 +2315,10 @@ class OrphanedLedgerRecovery(SavingsLedgerTestCase):
         self.assertFalse(path.exists())
         row = self._session_row("crashed")
         self.assertIsNotNone(row)
-        self.assertEqual(row["credited_saved_tokens"], 1200)
+        self.assertEqual(row["credited_saved_chars"], 1200)
         self.assertEqual(row["event_count"], 2)
         self.assertEqual(row["project"], "proj")
-        self.assertEqual(L.query_project_summary("proj")["total_saved_tokens"], 1200)
+        self.assertEqual(L.query_project_summary("proj")["total_saved_chars"], 1200)
 
     def test_ended_at_is_the_ledgers_last_write_not_now(self):
         L.record_event("crashed", "compress_file", 1000, 100, True, project="proj")
@@ -2382,9 +2401,9 @@ class OrphanedLedgerRecovery(SavingsLedgerTestCase):
 
         with mock.patch.object(L, "_write_session_rows", side_effect=append_then_write):
             self.assertEqual(L.recover_orphaned_sessions(now=self.now), 1)
-        self.assertEqual(self._session_row("busy")["credited_saved_tokens"], 900)
+        self.assertEqual(self._session_row("busy")["credited_saved_chars"], 900)
         self.assertTrue(path.exists())
-        self.assertEqual([e["raw_tokens"] for e in L.read_session_events("busy")], [300])
+        self.assertEqual([e["raw_chars"] for e in L.read_session_events("busy")], [300])
         self.assertEqual(self._claims(), [])
 
     def test_finalize_session_aggregates_a_given_snapshot_without_rereading(self):
@@ -2392,8 +2411,8 @@ class OrphanedLedgerRecovery(SavingsLedgerTestCase):
         snapshot = L.read_session_events("snap")
         L._session_jsonl_path("snap").unlink()  # gone, as after a concurrent recovery
         agg = L.finalize_session("snap", "proj", events=snapshot)
-        self.assertEqual(agg["credited_saved_tokens"], 900)
-        self.assertEqual(self._session_row("snap")["credited_saved_tokens"], 900)
+        self.assertEqual(agg["credited_saved_chars"], 900)
+        self.assertEqual(self._session_row("snap")["credited_saved_chars"], 900)
 
     def test_second_owner_finds_nothing_and_leaves_the_row_alone(self):
         # PR #412 review (round 1): a second finalizer re-reading a ledger the
@@ -2404,7 +2423,7 @@ class OrphanedLedgerRecovery(SavingsLedgerTestCase):
         self.assertIsNone(L.finalize_owned_session("x", stale_before=self.now))  # owner B
         self.assertIsNone(L.finalize_owned_session("x", "proj"))  # or the session's own end
         row = self._session_row("x")
-        self.assertEqual((row["credited_saved_tokens"], row["event_count"]), (900, 1))
+        self.assertEqual((row["credited_saved_chars"], row["event_count"]), (900, 1))
 
     def test_finalizers_are_serialized_on_the_db_write_lock(self):
         # PR #412 review (round 3): per-file claims let two workers each own
@@ -2438,7 +2457,7 @@ class OrphanedLedgerRecovery(SavingsLedgerTestCase):
         path, _ = self._age("s", self.ttl_seconds * 2)
         self.assertEqual(L.recover_orphaned_sessions(now=self.now), 1)
         row = self._session_row("s")
-        self.assertEqual((row["credited_saved_tokens"], row["event_count"]), (1300, 2))
+        self.assertEqual((row["credited_saved_chars"], row["event_count"]), (1300, 2))
         self.assertEqual(self._claims(), [])
         self.assertFalse(path.exists())
 
@@ -2453,10 +2472,10 @@ class OrphanedLedgerRecovery(SavingsLedgerTestCase):
         L.record_event("s", "compress_file", 500, 100, True, project="proj")  # resumed, fresh
         self.assertEqual(L.recover_orphaned_sessions(exclude_session_id="s", now=self.now), 0)
         agg = L.finalize_owned_session("s", "proj")
-        self.assertEqual(agg["credited_saved_tokens"], 1300)
+        self.assertEqual(agg["credited_saved_chars"], 1300)
         self.assertEqual(L.recover_orphaned_sessions(now=self.now + self.ttl_seconds * 2), 0)
         row = self._session_row("s")
-        self.assertEqual((row["credited_saved_tokens"], row["event_count"]), (1300, 2))
+        self.assertEqual((row["credited_saved_chars"], row["event_count"]), (1300, 2))
         self.assertEqual(L._session_artifacts("s"), [])
 
     def test_failed_roll_up_leaves_everything_for_the_next_owner(self):
@@ -2467,7 +2486,7 @@ class OrphanedLedgerRecovery(SavingsLedgerTestCase):
         self.assertIsNone(self._session_row("f"))
         self.assertEqual(len(self._claims()), 1)  # rolled back, events kept
         self.assertEqual(L.recover_orphaned_sessions(now=self.now), 1)
-        self.assertEqual(self._session_row("f")["credited_saved_tokens"], 900)
+        self.assertEqual(self._session_row("f")["credited_saved_chars"], 900)
         self.assertEqual(self._claims(), [])
 
     def test_roll_up_that_died_after_commit_is_redone_idempotently(self):
@@ -2480,7 +2499,7 @@ class OrphanedLedgerRecovery(SavingsLedgerTestCase):
         self.assertEqual(len(self._claims()), 1)
         self.assertEqual(L.recover_orphaned_sessions(now=self.now), 1)
         row = self._session_row("d")
-        self.assertEqual((row["credited_saved_tokens"], row["event_count"]), (900, 1))
+        self.assertEqual((row["credited_saved_chars"], row["event_count"]), (900, 1))
         self.assertEqual(self._claims(), [])
 
     def _actual(self, session_id):
@@ -2498,19 +2517,19 @@ class OrphanedLedgerRecovery(SavingsLedgerTestCase):
         L.record_event("s", "compress_file", 300, 100, True, project="proj")   # resumed
         L.record_event("s", "fetch_url", 50, 10, False, project="proj")
         agg = L.finalize_owned_session("s", "proj")
-        self.assertEqual(agg["credited_saved_tokens"], 200)  # the summary: this run
+        self.assertEqual(agg["credited_saved_chars"], 200)  # the summary: this run
         row = self._session_row("s")
         self.assertEqual(
-            (row["credited_saved_tokens"], row["raw_tokens_sum"], row["out_tokens_sum"],
+            (row["credited_saved_chars"], row["raw_chars_sum"], row["out_chars_sum"],
              row["event_count"], row["fetch_url_count"]),
             (1100, 1300, 200, 2, 1),
         )
         tools = {t["tool"]: t for t in L.query_session_tool_breakdown("s")}
-        self.assertEqual(tools["compress_file"]["saved_tokens"], 1100)
-        self.assertEqual(L.query_project_summary("proj")["total_saved_tokens"], 1100)
+        self.assertEqual(tools["compress_file"]["saved_chars"], 1100)
+        self.assertEqual(L.query_project_summary("proj")["total_saved_chars"], 1100)
         conn = L._connect()
         agents = conn.execute(
-            "SELECT event_count, saved_tokens FROM session_agents WHERE session_id = 's'"
+            "SELECT event_count, saved_chars FROM session_agents WHERE session_id = 's'"
         ).fetchall()
         conn.close()
         self.assertEqual(agents, [(3, 1100)])
@@ -2521,8 +2540,8 @@ class OrphanedLedgerRecovery(SavingsLedgerTestCase):
             L.record_event(sid, "compress_file", 1000, 100, True, project="proj")
             L.record_event(sid, "fetch_url", 50, 10, False, project="proj")
         counts = {"input": 1, "output": 2, "cache_read": 3, "cache_write": 4}
-        L.finalize_session("plain", "proj", overhead_tokens=7, actual_tokens=counts)
-        L.finalize_owned_session("owned", "proj", overhead_tokens=7, actual_tokens=counts)
+        L.finalize_session("plain", "proj", actual_tokens=counts)
+        L.finalize_owned_session("owned", "proj", actual_tokens=counts)
         skip = {"session_id", "ended_at"}
         plain, owned = self._session_row("plain"), self._session_row("owned")
         self.assertEqual({k: plain[k] for k in plain.keys() if k not in skip},
@@ -2539,11 +2558,11 @@ class OrphanedLedgerRecovery(SavingsLedgerTestCase):
         L.finalize_owned_session("r", "proj", actual_tokens={"input": 11, "output": 22, "cache_read": 33, "cache_write": 44})
         L.record_event("r", "compress_file", 500, 100, True, project="proj")
         L.finalize_owned_session("r", "proj", actual_tokens=None)
-        self.assertEqual(self._session_row("r")["credited_saved_tokens"], 1300)
+        self.assertEqual(self._session_row("r")["credited_saved_chars"], 1300)
         self.assertEqual(self._actual("r"), (11, 22, 33, 44))
         L.record_event("r", "compress_file", 200, 100, True, project="proj")
         L.finalize_owned_session("r", "proj", actual_tokens={"input": 50, "output": 60, "cache_read": 70, "cache_write": 80})
-        self.assertEqual(self._session_row("r")["credited_saved_tokens"], 1400)
+        self.assertEqual(self._session_row("r")["credited_saved_chars"], 1400)
         self.assertEqual(self._actual("r"), (50, 60, 70, 80))
 
     def test_redo_after_commit_never_counts_a_claim_twice(self):
@@ -2559,7 +2578,7 @@ class OrphanedLedgerRecovery(SavingsLedgerTestCase):
         L.record_event("d", "compress_file", 300, 100, True, project="proj")    # +200, resumed again
         L.finalize_owned_session("d", "proj")
         row = self._session_row("d")
-        self.assertEqual((row["credited_saved_tokens"], row["event_count"]), (1500, 3))
+        self.assertEqual((row["credited_saved_chars"], row["event_count"]), (1500, 3))
         self.assertEqual(self._claims(), [])
         self.assertEqual(L.get_meta("consumed_claim:" + "x", None), None)
         conn = L._connect()
@@ -2573,7 +2592,7 @@ class OrphanedLedgerRecovery(SavingsLedgerTestCase):
         # taking the last event in list order filed the row under the OLD
         # claim's project after the resumed session moved projects.
         old = {"ts": "2026-01-01T00:00:00Z", "tool": "compress_file", "credited": True,
-               "raw_tokens": 1000, "out_tokens": 100, "saved_tokens": 900, "project": "old-proj"}
+               "raw_chars": 1000, "out_chars": 100, "saved_chars": 900, "project": "old-proj"}
         new = dict(old, ts="2026-01-02T00:00:00Z", project="new-proj")
         path = L._session_jsonl_path("s")
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -2602,7 +2621,7 @@ class OrphanedLedgerRecovery(SavingsLedgerTestCase):
         self._leave_claim("c")
         self.assertEqual(L.read_session_events("c"), [])
         self.assertTrue(L.has_session_artifacts("c"))
-        self.assertEqual(L.finalize_owned_session("c", "proj")["credited_saved_tokens"], 900)
+        self.assertEqual(L.finalize_owned_session("c", "proj")["credited_saved_chars"], 900)
         self.assertFalse(L.has_session_artifacts("c"))
 
     def test_live_again_by_the_time_the_lock_is_held_is_skipped(self):
@@ -2637,6 +2656,720 @@ class OrphanedLedgerRecovery(SavingsLedgerTestCase):
     def test_missing_sessions_dir_is_a_noop(self):
         self.assertFalse(L._sessions_dir().exists())
         self.assertEqual(L.recover_orphaned_sessions(now=self.now), 0)
+
+
+class ExactCharCountsAndToolUseId(SavingsLedgerTestCase):
+    """Issues #437/#438: exact character counts and the tool-call id are the only
+    size fields recorded, rolled up at SessionEnd and in orphan recovery. A
+    pre-v6 database migrates with a tokens x 3.5 backfill, then v7 drops the
+    estimated-token columns."""
+
+    def test_event_stores_exact_chars_and_no_token_estimates(self):
+        L.record_event("s", "hook:Bash", 3501, 351, True, "cmd")
+        e = L.read_session_events("s")[0]
+        self.assertEqual((e["raw_chars"], e["out_chars"], e["saved_chars"]), (3501, 351, 3150))
+        for key in ("raw_tokens", "out_tokens", "saved_tokens"):
+            self.assertNotIn(key, e)
+
+    def test_saved_chars_clamped_and_zero_when_uncredited(self):
+        L.record_event("s", "hook:Bash", 350, 525, True)
+        L.record_event("s", "fetch_url", 350, 35, False)
+        clamped, uncredited = L.read_session_events("s")
+        self.assertEqual(clamped["saved_chars"], 0)
+        self.assertEqual((uncredited["raw_chars"], uncredited["saved_chars"]), (350, 0))
+
+    def test_tool_use_id_stored_when_present_and_empty_when_absent(self):
+        L.record_event("s", "hook:Bash", 1000, 100, True, tool_use_id="toolu_01")
+        L.record_event("s", "hook:Bash", 1000, 100, True, tool_use_id="")
+        L.record_event("s", "hook:Bash", 1000, 100, True, tool_use_id=None)
+        with_id, empty, none = L.read_session_events("s")
+        self.assertEqual(with_id["tool_use_id"], "toolu_01")
+        self.assertNotIn("tool_use_id", empty)
+        self.assertNotIn("tool_use_id", none)
+
+    def _append_legacy_event(self, session_id):
+        """A line as a pre-#438 build wrote it: estimated tokens (and, from #437,
+        sometimes chars) but none of the fields this version reads."""
+        path = L._session_jsonl_path(session_id)
+        legacy = {"ts": "2026-10-01T00:00:00Z", "tool": "hook:Bash", "raw_tokens": 10, "out_tokens": 10,
+                  "saved_tokens": 0, "credited": True, "source": "", "project": None}
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(legacy) + "\n")
+
+    def test_finalize_rolls_chars_up_into_all_three_tables(self):
+        L.record_event("s", "hook:Bash", 3500, 350, True)
+        L.record_event("s", "hook:Bash", 7000, 700, True, agent_id="a1", agent_type="Explore")
+        L.record_event("s", "fetch_url", 17500, 175, False)  # uncredited: excluded
+        self._append_legacy_event("s")                       # no char fields: contributes nothing
+        agg = L.finalize_session("s", "proj")
+        self.assertEqual((agg["raw_chars_sum"], agg["out_chars_sum"], agg["credited_saved_chars"]),
+                         (10500, 1050, 9450))
+        conn = sqlite3.connect(str(L.resolve_db_path()))
+        self.assertEqual(
+            conn.execute("SELECT raw_chars_sum, out_chars_sum, credited_saved_chars FROM sessions").fetchone(),
+            (10500, 1050, 9450))
+        self.assertEqual(
+            conn.execute("SELECT raw_chars_sum, out_chars_sum, saved_chars FROM session_tools "
+                         "WHERE tool = 'hook:Bash'").fetchone(), (10500, 1050, 9450))
+        self.assertEqual(
+            conn.execute("SELECT raw_chars_sum, out_chars_sum, saved_chars FROM session_tools "
+                         "WHERE tool = 'fetch_url'").fetchone(), (0, 0, 0))
+        agents = {(r[0], r[1]): r[2:] for r in conn.execute(
+            "SELECT is_subagent, agent_type, raw_chars_sum, out_chars_sum, saved_chars FROM session_agents")}
+        self.assertEqual(agents[(1, "Explore")], (7000, 700, 6300))
+        self.assertEqual(agents[(0, "")], (3500, 350, 3150))
+        conn.close()
+
+    def test_live_aggregate_reports_chars(self):
+        L.record_event("s", "hook:Bash", 3500, 350, True)
+        agg = L.get_live_session_aggregate("s")
+        self.assertEqual((agg["raw_chars_sum"], agg["out_chars_sum"], agg["credited_saved_chars"]),
+                         (3500, 350, 3150))
+        self.assertEqual(agg["by_tool"]["hook:Bash"]["saved_chars"], 3150)
+
+    def test_aggregates_carry_no_estimated_token_fields(self):
+        L.record_event("s", "hook:Bash", 3500, 350, True, agent_id="a1", agent_type="Explore")
+        agg = L.get_live_session_aggregate("s")
+        flat_keys = set(agg) | set(agg["by_tool"]["hook:Bash"]) | set(agg["by_agent"][0])
+        self.assertFalse(
+            {k for k in flat_keys if k in ("raw_tokens_sum", "out_tokens_sum", "saved_tokens", "credited_saved_tokens")},
+            flat_keys)
+
+    def test_corrupt_char_field_does_not_sink_the_rollup(self):
+        L.record_event("s", "hook:Bash", 3500, 350, True)
+        path = L._session_jsonl_path("s")
+        entry = json.loads(path.read_text().splitlines()[0])
+        entry["raw_chars"] = "lots"
+        path.write_text(json.dumps(entry) + "\n")
+        agg = L.finalize_session("s", "proj")
+        # An event whose size can't be trusted is not counted at all, so the figures
+        # (and the event count beside them) never describe a partial set.
+        self.assertEqual((agg["raw_chars_sum"], agg["credited_saved_chars"], agg["event_count"]), (0, 0, 0))
+
+    def test_orphan_recovery_rolls_chars_up(self):
+        ttl_patch = mock.patch.dict(os.environ, {"CLAUDE_RUNWAY_SESSION_MARKER_TTL_HOURS": ""})
+        ttl_patch.start()
+        self.addCleanup(ttl_patch.stop)
+        now = time.time()
+        L.record_event("crashed", "compress_file", 3500, 350, True, project="proj")
+        ts = now - session_id_lib._ttl_hours() * 3600 - 60
+        os.utime(L._session_jsonl_path("crashed"), (ts, ts))
+        self.assertEqual(L.recover_orphaned_sessions(now=now), 1)
+        conn = sqlite3.connect(str(L.resolve_db_path()))
+        self.assertEqual(
+            conn.execute("SELECT raw_chars_sum, out_chars_sum, credited_saved_chars FROM sessions "
+                         "WHERE session_id = 'crashed'").fetchone(), (3500, 350, 3150))
+        conn.close()
+
+    def test_accumulating_rollups_add_chars(self):
+        L.record_event("s", "hook:Bash", 3500, 350, True)
+        L.finalize_owned_session("s", "proj")
+        L.record_event("s", "hook:Bash", 3500, 350, True)
+        L.finalize_owned_session("s", "proj")
+        conn = sqlite3.connect(str(L.resolve_db_path()))
+        self.assertEqual(
+            conn.execute("SELECT raw_chars_sum, credited_saved_chars FROM sessions").fetchone(), (7000, 6300))
+        self.assertEqual(
+            conn.execute("SELECT raw_chars_sum, saved_chars FROM session_tools").fetchone(), (7000, 6300))
+        conn.close()
+
+    def _make_v5_db(self):
+        """A database exactly as v5 left it: no character columns anywhere."""
+        conn = sqlite3.connect(str(L.resolve_db_path()))
+        conn.execute(
+            "CREATE TABLE sessions (session_id TEXT PRIMARY KEY, project TEXT NOT NULL, ended_at TEXT NOT NULL, "
+            "credited_saved_tokens INTEGER NOT NULL, raw_tokens_sum INTEGER NOT NULL DEFAULT 0, "
+            "out_tokens_sum INTEGER NOT NULL DEFAULT 0, event_count INTEGER NOT NULL, fetch_url_count INTEGER NOT NULL, "
+            "overhead_tokens INTEGER NOT NULL DEFAULT 0, actual_input_tokens INTEGER NOT NULL DEFAULT 0, "
+            "actual_output_tokens INTEGER NOT NULL DEFAULT 0, actual_cache_read_tokens INTEGER NOT NULL DEFAULT 0, "
+            "actual_cache_write_tokens INTEGER NOT NULL DEFAULT 0)")
+        conn.execute(
+            "CREATE TABLE session_tools (session_id TEXT NOT NULL, tool TEXT NOT NULL, event_count INTEGER NOT NULL, "
+            "saved_tokens INTEGER NOT NULL, raw_tokens_sum INTEGER NOT NULL DEFAULT 0, "
+            "out_tokens_sum INTEGER NOT NULL DEFAULT 0, credited_event_count INTEGER NOT NULL DEFAULT 0, "
+            "PRIMARY KEY (session_id, tool))")
+        conn.execute(
+            "CREATE TABLE session_agents (session_id TEXT NOT NULL, is_subagent INTEGER NOT NULL, "
+            "agent_type TEXT NOT NULL DEFAULT '', event_count INTEGER NOT NULL, saved_tokens INTEGER NOT NULL, "
+            "raw_tokens_sum INTEGER NOT NULL DEFAULT 0, out_tokens_sum INTEGER NOT NULL DEFAULT 0, "
+            "credited_event_count INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (session_id, is_subagent, agent_type))")
+        # known before/after (odd token counts so x3.5 lands on a .5 and rounding is exercised)
+        conn.execute("INSERT INTO sessions (session_id, project, ended_at, credited_saved_tokens, raw_tokens_sum, "
+                     "out_tokens_sum, event_count, fetch_url_count, overhead_tokens, actual_input_tokens) "
+                     "VALUES ('known', 'p', '2026-09-01T00:00:00Z', 900, 1001, 101, 3, 0, 55, 777)")
+        # v1-era row: saved known, before/after unknown (0)
+        conn.execute("INSERT INTO sessions (session_id, project, ended_at, credited_saved_tokens, event_count, "
+                     "fetch_url_count) VALUES ('legacy', 'p', '2026-08-01T00:00:00Z', 42, 3, 0)")
+        # v2-era tool row: raw known, out unknown
+        conn.execute("INSERT INTO session_tools (session_id, tool, event_count, saved_tokens, raw_tokens_sum) "
+                     "VALUES ('legacy', 'hook:Bash', 3, 42, 100)")
+        conn.execute("INSERT INTO session_agents (session_id, is_subagent, agent_type, event_count, saved_tokens, "
+                     "raw_tokens_sum, out_tokens_sum) VALUES ('known', 1, 'Explore', 2, 300, 400, 100)")
+        conn.execute("PRAGMA user_version = 5")
+        conn.commit()
+        conn.close()
+
+    def test_v5_database_migrates_with_tokens_times_3_5_backfill(self):
+        self._make_v5_db()
+        conn = L._connect()  # runs the v6 migration (backfill), then v7 (drops the token columns)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], L.SCHEMA_VERSION)
+        sess = {r[0]: r[1:] for r in conn.execute(
+            "SELECT session_id, raw_chars_sum, out_chars_sum, credited_saved_chars FROM sessions")}
+        # 1001 * 3.5 = 3503.5 -> 3504 (ROUND half away from zero); 101 * 3.5 = 353.5 -> 354; 900 * 3.5 = 3150
+        self.assertEqual(sess["known"], (3504, 354, 3150))
+        # unknown before/after stay unknown (0); the saved figure is still backfilled (42 * 3.5 = 147)
+        self.assertEqual(sess["legacy"], (0, 0, 147))
+        tool = conn.execute("SELECT raw_chars_sum, out_chars_sum, saved_chars FROM session_tools").fetchone()
+        self.assertEqual(tool, (350, 0, 147))
+        agent = conn.execute("SELECT raw_chars_sum, out_chars_sum, saved_chars FROM session_agents").fetchone()
+        self.assertEqual(agent, (1400, 350, 1050))
+        conn.close()
+
+    def test_v7_drops_estimated_token_columns_and_keeps_everything_else(self):
+        self._make_v5_db()
+        conn = L._connect()
+        dropped = {"credited_saved_tokens", "raw_tokens_sum", "out_tokens_sum", "saved_tokens"}
+        for table in ("sessions", "session_tools", "session_agents"):
+            cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+            self.assertFalse(cols & dropped, (table, cols & dropped))
+        # Real transcript usage is NOT an estimate and stays. (The schema-overhead
+        # estimate column went in v8, issue #439 -- see SchemaOverheadRemovedV8.)
+        row = conn.execute(
+            "SELECT actual_input_tokens, event_count FROM sessions WHERE session_id = 'known'"
+        ).fetchone()
+        self.assertEqual(row, (777, 3))
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(sessions)")}
+        self.assertTrue({"actual_input_tokens", "actual_output_tokens", "actual_cache_read_tokens",
+                         "actual_cache_write_tokens"} <= cols)
+        self.assertEqual(conn.execute("SELECT credited_event_count FROM session_tools").fetchone()[0], 0)
+        conn.close()
+
+    def test_v7_rebuilt_tables_keep_their_keys(self):
+        # The rebuilds must keep the PRIMARY KEYs the upserts in _write_session_rows
+        # (ON CONFLICT(...)) depend on.
+        self._make_v5_db()
+        L.record_event("known", "hook:Bash", 3500, 350, True)
+        L.finalize_owned_session("known", "p")
+        L.record_event("known", "hook:Bash", 3500, 350, True)
+        L.finalize_owned_session("known", "p")  # second roll-up hits ON CONFLICT on all three tables
+        conn = sqlite3.connect(str(L.resolve_db_path()))
+        self.assertEqual(
+            conn.execute("SELECT raw_chars_sum, credited_saved_chars FROM sessions "
+                         "WHERE session_id = 'known'").fetchone(), (3504 + 7000, 3150 + 6300))
+        self.assertEqual(
+            conn.execute("SELECT raw_chars_sum, saved_chars FROM session_tools "
+                         "WHERE session_id = 'known' AND tool = 'hook:Bash'").fetchone(), (7000, 6300))
+        conn.close()
+
+    def test_v6_database_with_both_column_sets_migrates_to_v7(self):
+        # A DB at v6 has the token columns AND the char columns side by side.
+        self._make_v5_db()
+        conn = sqlite3.connect(str(L.resolve_db_path()))
+        conn.close()
+        with mock.patch.object(L, "SCHEMA_VERSION", 6):
+            L._connect().close()
+        conn = sqlite3.connect(str(L.resolve_db_path()))
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 6)
+        self.assertIn("raw_tokens_sum", {r[1] for r in conn.execute("PRAGMA table_info(sessions)")})
+        conn.close()
+        with mock.patch.object(L, "SCHEMA_VERSION", 7):
+            L._connect().close()  # now v7
+        conn = sqlite3.connect(str(L.resolve_db_path()))
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 7)
+        self.assertNotIn("raw_tokens_sum", {r[1] for r in conn.execute("PRAGMA table_info(sessions)")})
+        self.assertEqual(
+            conn.execute("SELECT credited_saved_chars FROM sessions WHERE session_id = 'known'").fetchone(), (3150,))
+        conn.close()
+
+    def test_migrated_ledger_still_rolls_up_new_sessions_and_keeps_old_data(self):
+        self._make_v5_db()
+        L.record_event("new", "hook:Bash", 3500, 350, True)
+        L.finalize_session("new", "p")
+        conn = sqlite3.connect(str(L.resolve_db_path()))
+        self.assertEqual(
+            conn.execute("SELECT credited_saved_chars, raw_chars_sum FROM sessions "
+                         "WHERE session_id = 'known'").fetchone(), (3150, 3504))
+        self.assertEqual(
+            conn.execute("SELECT credited_saved_chars FROM sessions WHERE session_id = 'new'").fetchone(), (3150,))
+        conn.close()
+        self.assertEqual(L.query_project_summary("p")["sessions"], 3)
+
+    def test_migration_does_not_overwrite_existing_char_columns(self):
+        # A DB whose table already has the column (e.g. created by this file's own
+        # CREATE TABLE while user_version lagged) must keep its real exact counts.
+        self._make_v5_db()
+        conn = sqlite3.connect(str(L.resolve_db_path()))
+        conn.execute("ALTER TABLE sessions ADD COLUMN raw_chars_sum INTEGER NOT NULL DEFAULT 0")
+        # 3500 chars is what 1001 estimated tokens come from (x 3.5 = 3503.5); the v6 backfill
+        # would have written 3504 over it.
+        conn.execute("UPDATE sessions SET raw_chars_sum = 3500 WHERE session_id = 'known'")
+        conn.commit()
+        conn.close()
+        conn = L._connect()
+        self.assertEqual(
+            conn.execute("SELECT raw_chars_sum FROM sessions WHERE session_id = 'known'").fetchone(), (3500,))
+        conn.close()
+
+    def test_fresh_database_has_char_columns_and_no_token_estimates(self):
+        conn = L._connect()
+        for table in ("sessions", "session_tools", "session_agents"):
+            cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+            self.assertTrue({"raw_chars_sum", "out_chars_sum"} <= cols, table)
+            self.assertFalse(cols & {"raw_tokens_sum", "out_tokens_sum", "saved_tokens", "credited_saved_tokens"}, table)
+        conn.close()
+
+
+class ConsistentCharacterFigures(SavingsLedgerTestCase):
+    """PR #446 review: the figures shown together must describe the same events
+    (counted events only), the saving must agree with the before/after beside it,
+    and history with no recorded size must be reported as left out rather than
+    folded into a total that looks complete."""
+
+    def _append_legacy_event(self, session_id):
+        path = L._session_jsonl_path(session_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"tool": "hook:Bash", "raw_tokens": 10, "out_tokens": 10,
+                                "saved_tokens": 0, "credited": True}) + "\n")
+
+    def _insert_unsized_session(self, session_id, project, ended_at="2026-01-01T00:00:00Z"):
+        """A pre-v6 row: credited events, but before/after unknown (0)."""
+        conn = L._connect()
+        conn.execute(
+            "INSERT INTO sessions (session_id, project, ended_at, credited_saved_chars, event_count, fetch_url_count) "
+            "VALUES (?, ?, ?, 147, 3, 0)", (session_id, project, ended_at))
+        conn.commit()
+        conn.close()
+
+    # -- finding 1: only events with a recorded size are counted --
+
+    def test_credited_event_without_chars_is_not_counted_anywhere(self):
+        L.record_event("s", "hook:Bash", 3500, 350, True)
+        self._append_legacy_event("s")
+        live = L.get_live_session_aggregate("s")
+        self.assertEqual(live["event_count"], 1)
+        self.assertEqual(live["by_tool"]["hook:Bash"]["credited_event_count"], 1)
+        self.assertEqual(live["by_tool"]["hook:Bash"]["event_count"], 2)  # still a call that happened
+        self.assertEqual(live["by_agent"][0]["credited_event_count"], 1)
+        agg = L.finalize_session("s", "proj")
+        self.assertEqual(agg["event_count"], 1)
+        conn = sqlite3.connect(str(L.resolve_db_path()))
+        self.assertEqual(conn.execute("SELECT event_count FROM sessions").fetchone(), (1,))
+        self.assertEqual(
+            conn.execute("SELECT credited_event_count FROM session_tools").fetchone(), (1,))
+        conn.close()
+
+    def test_a_session_of_only_unsized_events_has_no_counted_events(self):
+        self._append_legacy_event("s")
+        self.assertEqual(L.get_live_session_aggregate("s")["event_count"], 0)
+
+    # -- finding 2: the saving is derived from before/after, never summed --
+
+    def test_saving_is_derived_from_the_totals_not_summed_per_event(self):
+        L.record_event("s", "hook:Bash", 100, 150, True)   # expands: its own saving is clamped to 0
+        L.record_event("s", "hook:Bash", 100, 10, True)    # saves 90 on its own
+        # 200 -> 160 is a saving of 40, not 0 + 90.
+        live = L.get_live_session_aggregate("s")
+        self.assertEqual(live["credited_saved_chars"], 40)
+        self.assertEqual(live["by_tool"]["hook:Bash"]["saved_chars"], 40)
+        self.assertEqual(live["by_agent"][0]["saved_chars"], 40)
+        agg = L.finalize_session("s", "proj")
+        self.assertEqual(agg["credited_saved_chars"], 40)
+        conn = sqlite3.connect(str(L.resolve_db_path()))
+        self.assertEqual(conn.execute("SELECT credited_saved_chars FROM sessions").fetchone(), (40,))
+        self.assertEqual(conn.execute("SELECT saved_chars FROM session_tools").fetchone(), (40,))
+        self.assertEqual(conn.execute("SELECT saved_chars FROM session_agents").fetchone(), (40,))
+        conn.close()
+        self.assertEqual(L.query_project_summary("proj")["best_session_chars"], 40)
+        self.assertEqual(L.query_project_summary("proj")["total_saved_chars"], 40)
+        self.assertEqual(L.query_last_n_sessions("proj")[0]["saved_chars"], 40)
+
+    def test_accumulating_rollups_rederive_the_saving_from_the_summed_totals(self):
+        L.record_event("s", "hook:Bash", 100, 150, True)   # first roll-up: 100 -> 150, saves 0
+        L.finalize_owned_session("s", "proj")
+        L.record_event("s", "hook:Bash", 100, 10, True)    # second: 100 -> 10, saves 90
+        L.finalize_owned_session("s", "proj")
+        # Together 200 -> 160 = 40; adding the two clamped savings would give 90.
+        conn = sqlite3.connect(str(L.resolve_db_path()))
+        self.assertEqual(
+            conn.execute("SELECT raw_chars_sum, out_chars_sum, credited_saved_chars FROM sessions").fetchone(),
+            (200, 160, 40))
+        self.assertEqual(conn.execute("SELECT saved_chars FROM session_tools").fetchone(), (40,))
+        self.assertEqual(conn.execute("SELECT saved_chars FROM session_agents").fetchone(), (40,))
+        conn.close()
+
+    def test_trend_and_all_projects_derive_the_saving_from_their_totals(self):
+        L.record_event("a", "hook:Bash", 100, 150, True)
+        L.finalize_session("a", "proj")
+        L.record_event("b", "hook:Bash", 100, 10, True)
+        L.finalize_session("b", "proj")
+        (bucket,) = L.query_trend("proj", bucket="week")
+        self.assertEqual((bucket["total_raw_chars"], bucket["total_out_chars"], bucket["total_saved_chars"]),
+                         (200, 160, 40))
+        (row,) = [r for r in L.query_all_projects() if r["project"] == "proj"]
+        self.assertEqual(row["total_saved_chars"], 40)
+
+    # -- finding 3: history with no recorded size is reported, not folded in --
+
+    def test_project_summary_leaves_unsized_sessions_out_and_counts_them(self):
+        self._insert_unsized_session("legacy", "p")
+        L.record_event("new", "hook:Bash", 3500, 350, True)
+        L.finalize_session("new", "p")
+        ps = L.query_project_summary("p")
+        self.assertEqual(ps["sessions"], 2)
+        self.assertEqual((ps["total_raw_chars"], ps["total_out_chars"]), (3500, 350))
+        self.assertEqual(ps["unsized_sessions"], 1)
+
+    def test_simple_view_says_how_many_sessions_were_left_out(self):
+        self._insert_unsized_session("legacy", "p")
+        L.record_event("new", "hook:Bash", 3500, 350, True)
+        L.finalize_session("new", "p")
+        text = L.format_simple_view({"project": "p", "event_count": 0}, L.query_project_summary("p"))
+        self.assertIn("Note: 1 of 2 sessions have no recorded size and are left out", text)
+
+    def test_simple_view_has_no_note_when_every_session_is_sized(self):
+        L.record_event("new", "hook:Bash", 3500, 350, True)
+        L.finalize_session("new", "p")
+        text = L.format_simple_view({"project": "p", "event_count": 0}, L.query_project_summary("p"))
+        self.assertNotIn("no recorded size", text)
+
+    def test_a_row_with_before_known_but_after_unknown_is_not_a_hundred_percent(self):
+        # v2-era shape after the v6 backfill: before known, after 0 (unknown).
+        conn = L._connect()
+        conn.execute(
+            "INSERT INTO sessions (session_id, project, ended_at, credited_saved_chars, raw_chars_sum, "
+            "out_chars_sum, event_count, fetch_url_count) VALUES ('v2', 'p', '2026-01-01T00:00:00Z', 147, 350, 0, 3, 0)")
+        conn.commit()
+        conn.close()
+        ps = L.query_project_summary("p")
+        self.assertEqual((ps["total_raw_chars"], ps["total_out_chars"], ps["unsized_sessions"]), (0, 0, 1))
+        self.assertIn("n/a", L.format_simple_view({"project": "p"}, ps))
+
+    def test_trend_buckets_count_unsized_sessions_and_note_them(self):
+        self._insert_unsized_session("legacy", "p", ended_at="2026-09-07T10:00:00Z")
+        conn = L._connect()
+        conn.execute(
+            "INSERT INTO sessions (session_id, project, ended_at, credited_saved_chars, raw_chars_sum, "
+            "out_chars_sum, event_count, fetch_url_count) VALUES ('new', 'p', '2026-09-08T10:00:00Z', 900, 1000, 100, 1, 0)")
+        conn.commit()
+        conn.close()
+        (bucket,) = L.query_trend("p", bucket="week")
+        self.assertEqual((bucket["sessions"], bucket["unsized_sessions"]), (2, 1))
+        self.assertEqual((bucket["total_raw_chars"], bucket["total_out_chars"]), (1000, 100))
+        self.assertIn("Note: 1 of 2 sessions have no recorded size", L.format_trend_view([bucket], "p"))
+
+    def test_all_projects_counts_unsized_sessions(self):
+        self._insert_unsized_session("legacy", "p")
+        L.record_event("new", "hook:Bash", 3500, 350, True)
+        L.finalize_session("new", "p")
+        (row,) = L.query_all_projects()
+        self.assertEqual((row["sessions"], row["unsized_sessions"]), (2, 1))
+        self.assertEqual((row["total_raw_chars"], row["total_out_chars"]), (3500, 350))
+        out = L.format_detail_view({"project": "p"}, {"project": "p"}, [], [], [row])
+        self.assertIn("1 unsized session(s) left out", out)
+
+    def test_unsized_sessions_reach_json_and_csv(self):
+        ps = {"project": "p", "sessions": 2, "unsized_sessions": 1}
+        parsed = json.loads(L.format_json({"project": "p"}, ps, [], [], [dict(ps, best_tool=None)]))
+        self.assertEqual(parsed["project_summary"]["unsized_sessions"], 1)
+        self.assertEqual(parsed["all_projects"][0]["unsized_sessions"], 1)
+        rows = list(_csv_mod.reader(_io_mod.StringIO(L.format_csv({"project": "p"}, ps, [], [], [ps], table="projects"))))
+        self.assertEqual(dict(zip(rows[0], rows[1], strict=False))["unsized_sessions"], "1")
+        rows = list(_csv_mod.reader(_io_mod.StringIO(L.format_csv({"project": "p"}, ps, [], [], [], table="session"))))
+        self.assertEqual(dict(zip(rows[0], rows[1], strict=False))["project_unsized_sessions"], "1")
+
+
+    # -- round 2: migration re-derives, counts match their metrics, exports carry the percent --
+
+    def _make_v6_db(self):
+        """A v6 database: token AND character columns, with the saving stored as the
+        SUM of per-event clamped savings (events 100->150 and 100->10 -> 90, although
+        200 -> 160 saves 40), plus a pre-v6 row with no recorded size."""
+        conn = sqlite3.connect(str(L.resolve_db_path()))
+        conn.execute(
+            "CREATE TABLE sessions (session_id TEXT PRIMARY KEY, project TEXT NOT NULL, ended_at TEXT NOT NULL, "
+            "credited_saved_tokens INTEGER NOT NULL, raw_tokens_sum INTEGER NOT NULL DEFAULT 0, "
+            "out_tokens_sum INTEGER NOT NULL DEFAULT 0, event_count INTEGER NOT NULL, fetch_url_count INTEGER NOT NULL, "
+            "overhead_tokens INTEGER NOT NULL DEFAULT 0, actual_input_tokens INTEGER NOT NULL DEFAULT 0, "
+            "actual_output_tokens INTEGER NOT NULL DEFAULT 0, actual_cache_read_tokens INTEGER NOT NULL DEFAULT 0, "
+            "actual_cache_write_tokens INTEGER NOT NULL DEFAULT 0, raw_chars_sum INTEGER NOT NULL DEFAULT 0, "
+            "out_chars_sum INTEGER NOT NULL DEFAULT 0, credited_saved_chars INTEGER NOT NULL DEFAULT 0)")
+        conn.execute(
+            "CREATE TABLE session_tools (session_id TEXT NOT NULL, tool TEXT NOT NULL, event_count INTEGER NOT NULL, "
+            "saved_tokens INTEGER NOT NULL, raw_tokens_sum INTEGER NOT NULL DEFAULT 0, "
+            "out_tokens_sum INTEGER NOT NULL DEFAULT 0, credited_event_count INTEGER NOT NULL DEFAULT 0, "
+            "raw_chars_sum INTEGER NOT NULL DEFAULT 0, out_chars_sum INTEGER NOT NULL DEFAULT 0, "
+            "saved_chars INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (session_id, tool))")
+        conn.execute(
+            "CREATE TABLE session_agents (session_id TEXT NOT NULL, is_subagent INTEGER NOT NULL, "
+            "agent_type TEXT NOT NULL DEFAULT '', event_count INTEGER NOT NULL, saved_tokens INTEGER NOT NULL, "
+            "raw_tokens_sum INTEGER NOT NULL DEFAULT 0, out_tokens_sum INTEGER NOT NULL DEFAULT 0, "
+            "credited_event_count INTEGER NOT NULL DEFAULT 0, raw_chars_sum INTEGER NOT NULL DEFAULT 0, "
+            "out_chars_sum INTEGER NOT NULL DEFAULT 0, saved_chars INTEGER NOT NULL DEFAULT 0, "
+            "PRIMARY KEY (session_id, is_subagent, agent_type))")
+        conn.execute("INSERT INTO sessions (session_id, project, ended_at, credited_saved_tokens, event_count, "
+                     "fetch_url_count, raw_chars_sum, out_chars_sum, credited_saved_chars) "
+                     "VALUES ('sized', 'p', '2026-09-01T00:00:00Z', 26, 2, 0, 200, 160, 90)")
+        conn.execute("INSERT INTO sessions (session_id, project, ended_at, credited_saved_tokens, event_count, "
+                     "fetch_url_count, credited_saved_chars) "
+                     "VALUES ('unsized', 'p', '2026-08-01T00:00:00Z', 42, 3, 0, 147)")
+        conn.execute("INSERT INTO session_tools (session_id, tool, event_count, saved_tokens, credited_event_count, "
+                     "raw_chars_sum, out_chars_sum, saved_chars) VALUES ('sized', 'hook:Bash', 2, 26, 2, 200, 160, 90)")
+        conn.execute("INSERT INTO session_tools (session_id, tool, event_count, saved_tokens, credited_event_count, "
+                     "raw_chars_sum, out_chars_sum, saved_chars) VALUES ('unsized', 'hook:Bash', 3, 42, 0, 0, 0, 147)")
+        conn.execute("INSERT INTO session_agents (session_id, is_subagent, agent_type, event_count, saved_tokens, "
+                     "credited_event_count, raw_chars_sum, out_chars_sum, saved_chars) "
+                     "VALUES ('sized', 0, '', 2, 26, 2, 200, 160, 90)")
+        conn.execute("PRAGMA user_version = 6")
+        conn.commit()
+        conn.close()
+
+    def test_v7_migration_rederives_the_saving_for_sized_rows_and_keeps_it_for_unsized(self):
+        self._make_v6_db()
+        conn = L._connect()
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], L.SCHEMA_VERSION)
+        sess = dict(conn.execute("SELECT session_id, credited_saved_chars FROM sessions"))
+        self.assertEqual(sess, {"sized": 40, "unsized": 147})  # 200 -> 160 saves 40; unsized keeps its backfill
+        tools = {(r[0], r[1]): r[2] for r in conn.execute("SELECT session_id, tool, saved_chars FROM session_tools")}
+        self.assertEqual(tools, {("sized", "hook:Bash"): 40, ("unsized", "hook:Bash"): 147})
+        self.assertEqual(conn.execute("SELECT saved_chars FROM session_agents").fetchone(), (40,))
+        conn.close()
+        # The unsized row's 147 backfill is left out of the best session, like the other figures
+        # (the "left out of the figures above" note would otherwise be untrue).
+        self.assertEqual(L.query_project_summary("p")["best_session_chars"], 40)
+
+    def test_v7_migration_reconstructs_v6_rows_whose_tokens_exceed_their_characters(self):
+        # After #437 a not-yet-restarted MCP server still sent token-only footers and the
+        # hook recorded them, so a v6 row can be token-only (characters 0) or mixed
+        # (characters partial). Dropping the token columns must not lose that.
+        self._make_v6_db()
+        conn = sqlite3.connect(str(L.resolve_db_path()))
+        insert = ("INSERT INTO sessions (session_id, project, ended_at, credited_saved_tokens, raw_tokens_sum, "
+                  "out_tokens_sum, event_count, fetch_url_count, raw_chars_sum, out_chars_sum, credited_saved_chars) "
+                  "VALUES (?, 'p', '2026-09-02T00:00:00Z', ?, ?, ?, ?, 0, ?, ?, ?)")
+        conn.execute(insert, ("tokenonly", 900, 1001, 101, 2, 0, 0, 0))
+        conn.execute(insert, ("mixed", 1800, 2000, 200, 2, 3500, 350, 3150))      # half its events had characters
+        conn.execute(insert, ("covered", 900, 1000, 100, 1, 3501, 351, 3150))     # characters already cover the tokens
+        conn.execute("INSERT INTO session_tools (session_id, tool, event_count, saved_tokens, raw_tokens_sum, "
+                     "out_tokens_sum, credited_event_count, raw_chars_sum, out_chars_sum, saved_chars) "
+                     "VALUES ('tokenonly', 'compress_file', 2, 900, 1001, 101, 2, 0, 0, 0)")
+        conn.commit()
+        conn.close()
+        conn = L._connect()
+        rows = {r[0]: r[1:] for r in conn.execute(
+            "SELECT session_id, raw_chars_sum, out_chars_sum, credited_saved_chars FROM sessions")}
+        # tokens x 3.5 (1001 -> 3504, 101 -> 354: ROUND half away from zero), saving re-derived
+        self.assertEqual(rows["tokenonly"], (3504, 354, 3150))
+        self.assertEqual(rows["mixed"], (7000, 700, 6300))      # the whole row, from tokens
+        self.assertEqual(rows["covered"], (3501, 351, 3150))    # exact characters left untouched
+        self.assertEqual(rows["sized"], (200, 160, 40))         # no token data: unchanged
+        self.assertEqual(conn.execute(
+            "SELECT raw_chars_sum, out_chars_sum, saved_chars FROM session_tools WHERE session_id = 'tokenonly'"
+        ).fetchone(), (3504, 354, 3150))
+        conn.close()
+        ps = L.query_project_summary("p")
+        self.assertEqual(ps["unsized_sessions"], 1)  # only the original pre-v6 unsized row; token-only is now sized
+
+    def test_v7_reconstruction_slack_counts_credited_events_only_for_tool_and_agent_rows(self):
+        # session_agents/session_tools event_count also counts uncredited calls (fetch_url) but their
+        # token sums don't, so scaling the rounding slack with it would hide a small token-only row.
+        self._make_v6_db()
+        conn = sqlite3.connect(str(L.resolve_db_path()))
+        conn.execute("INSERT INTO session_agents (session_id, is_subagent, agent_type, event_count, saved_tokens, "
+                     "raw_tokens_sum, out_tokens_sum, credited_event_count, raw_chars_sum, out_chars_sum, saved_chars) "
+                     "VALUES ('sized', 1, 'Explore', 100, 8, 10, 2, 1, 0, 0, 0)")  # 99 fetch_url calls + 1 credited
+        conn.execute("INSERT INTO session_tools (session_id, tool, event_count, saved_tokens, raw_tokens_sum, "
+                     "out_tokens_sum, credited_event_count, raw_chars_sum, out_chars_sum, saved_chars) "
+                     "VALUES ('sized', 'compress_file', 100, 8, 10, 2, 1, 0, 0, 0)")
+        conn.commit()
+        conn.close()
+        conn = L._connect()
+        self.assertEqual(conn.execute(
+            "SELECT raw_chars_sum, out_chars_sum, saved_chars FROM session_agents WHERE agent_type = 'Explore'"
+        ).fetchone(), (35, 7, 28))   # 10 x 3.5, 2 x 3.5
+        self.assertEqual(conn.execute(
+            "SELECT raw_chars_sum, out_chars_sum, saved_chars FROM session_tools WHERE tool = 'compress_file'"
+        ).fetchone(), (35, 7, 28))
+        conn.close()
+
+    def test_by_tool_rows_show_the_events_their_figures_cover(self):
+        # 5 calls, but only 3 contributed a before/after: the row must say 3.
+        breakdown = [{"tool": "hook:Bash", "event_count": 5, "credited_event_count": 3,
+                      "raw_chars_sum": 3000, "out_chars_sum": 300, "saved_chars": 2700}]
+        out = L.format_detail_view({"project": "p", "event_count": 3}, {"project": "p"}, breakdown, [], [])
+        (line,) = [ln for ln in out.splitlines() if "hook:Bash" in ln]
+        self.assertIn("  3 events", line)
+        self.assertNotIn("  5 events", line)
+        self.assertIn("3,000 → 300 chars", line)
+
+    def test_json_exports_the_percent_reduction_at_every_level(self):
+        session = {"project": "p", "raw_chars_sum": 1000, "out_chars_sum": 250}
+        ps = {"project": "p", "total_raw_chars": 2000, "total_out_chars": 1000}
+        tool = {"tool": "hook:Bash", "raw_chars_sum": 400, "out_chars_sum": 100}
+        proj = {"project": "p", "total_raw_chars": 50, "total_out_chars": 50}
+        none = {"project": "q"}
+        parsed = json.loads(L.format_json(session, ps, [tool], [], [proj, none]))
+        self.assertEqual(parsed["session"]["reduction_percent"], 75)
+        self.assertEqual(parsed["project_summary"]["reduction_percent"], 50)
+        self.assertEqual(parsed["tool_breakdown"][0]["reduction_percent"], 75)
+        self.assertEqual(parsed["all_projects"][0]["reduction_percent"], 0)
+        self.assertIsNone(parsed["all_projects"][1]["reduction_percent"])  # no before size: null, not 100
+
+    def test_csv_exports_the_percent_reduction_at_every_level(self):
+        session = {"project": "p", "raw_chars_sum": 1000, "out_chars_sum": 250}
+        ps = {"project": "p", "total_raw_chars": 2000, "total_out_chars": 1000}
+        tool = {"tool": "hook:Bash", "raw_chars_sum": 400, "out_chars_sum": 100}
+        none = {"project": "q"}
+
+        def row(table, **kw):
+            rows = list(_csv_mod.reader(_io_mod.StringIO(L.format_csv(session, ps, [tool], [], [none], table=table))))
+            return dict(zip(rows[0], rows[1], strict=False))
+
+        sess = row("session")
+        self.assertEqual((sess["reduction_percent"], sess["project_reduction_percent"]), ("75", "50"))
+        self.assertEqual(row("tools")["reduction_percent"], "75")
+        self.assertEqual(row("projects")["reduction_percent"], "")  # unknown: empty cell
+
+
+    # -- round 3: a resumed pre-v6 session stays unsized --
+
+    def test_resumed_unsized_session_stays_unsized_and_keeps_its_saving(self):
+        self._insert_unsized_session("old", "p")  # event_count 3, saved 147, before/after unknown
+        conn = L._connect()
+        conn.execute("INSERT INTO session_tools (session_id, tool, event_count, credited_event_count, "
+                     "raw_chars_sum, out_chars_sum, saved_chars) VALUES ('old', 'hook:Bash', 3, 0, 350, 0, 147)")
+        conn.commit()
+        conn.close()
+        L.record_event("old", "hook:Bash", 3500, 350, True, project="p")
+        agg = L.finalize_owned_session("old", "p")
+        # The summary of THIS run still reports its own exact figures...
+        self.assertEqual((agg["raw_chars_sum"], agg["out_chars_sum"], agg["event_count"]), (3500, 350, 1))
+        conn = sqlite3.connect(str(L.resolve_db_path()))
+        # ...but the stored row stays unsized: events add, characters and the saving don't.
+        self.assertEqual(
+            conn.execute("SELECT event_count, raw_chars_sum, out_chars_sum, credited_saved_chars FROM sessions "
+                         "WHERE session_id = 'old'").fetchone(), (4, 0, 0, 147))
+        self.assertEqual(
+            conn.execute("SELECT event_count, credited_event_count, raw_chars_sum, out_chars_sum, saved_chars "
+                         "FROM session_tools WHERE session_id = 'old'").fetchone(), (4, 0, 350, 0, 147))
+        self.assertEqual(
+            conn.execute("SELECT event_count, raw_chars_sum, saved_chars FROM session_agents "
+                         "WHERE session_id = 'old'").fetchone(), (1, 0, 0))
+        conn.close()
+        ps = L.query_project_summary("p")
+        self.assertEqual((ps["unsized_sessions"], ps["total_raw_chars"]), (1, 0))  # still reported as left out
+
+    def test_resumed_sized_session_still_accumulates(self):
+        L.record_event("s", "hook:Bash", 3500, 350, True, project="p")
+        L.finalize_owned_session("s", "p")
+        L.record_event("s", "hook:Bash", 3500, 350, True, project="p")
+        L.finalize_owned_session("s", "p")
+        ps = L.query_project_summary("p")
+        self.assertEqual((ps["total_raw_chars"], ps["total_out_chars"], ps["unsized_sessions"]), (7000, 700, 0))
+
+
+class FormatSimpleViewCharacters(unittest.TestCase):
+    """Issue #438: the simple view (and so the SessionEnd summary) reports exact
+    characters before and after compression and the percent reduction -- never an
+    estimated token count."""
+
+    _SESSION = {"project": "proj", "event_count": 3, "raw_chars_sum": 12000, "out_chars_sum": 3000,
+                "credited_saved_chars": 9000, "fetch_url_count": 0}
+    _PROJECT = {"project": "proj", "sessions": 4, "total_raw_chars": 50000, "total_out_chars": 20000,
+                "total_saved_chars": 30000, "best_session_chars": 11000}
+
+    def _lines(self, session=None, project=None):
+        return L.format_simple_view(session or self._SESSION, project or self._PROJECT).splitlines()
+
+    def test_session_block_shows_before_after_and_percent(self):
+        text = "\n".join(self._lines())
+        self.assertRegex(text, r"Characters before\s+12,000")
+        self.assertRegex(text, r"Characters after\s+3,000")
+        self.assertRegex(text, r"Reduction\s+75%\s+\(3 events\)")
+
+    def test_project_block_shows_before_after_and_percent(self):
+        text = "\n".join(self._lines())
+        self.assertRegex(text, r"Characters before\s+50,000")
+        self.assertRegex(text, r"Characters after\s+20,000")
+        self.assertRegex(text, r"Reduction\s+60%")
+        self.assertRegex(text, r"Best session \(saved\)\s+11,000")
+
+    def test_no_estimated_token_wording_or_approximation_marker(self):
+        text = "\n".join(self._lines())
+        self.assertNotIn("tokens avoided", text)
+        self.assertNotIn("Token Savings", text)
+        self.assertNotIn("~", text)
+
+    def test_no_raw_size_reports_na_not_a_fabricated_percentage(self):
+        session = dict(self._SESSION, raw_chars_sum=0, out_chars_sum=0, credited_saved_chars=0, event_count=0)
+        self.assertRegex("\n".join(self._lines(session=session)), r"Reduction\s+n/a")
+
+    def test_an_expanding_summary_is_clamped_to_zero_percent(self):
+        session = dict(self._SESSION, raw_chars_sum=100, out_chars_sum=150)
+        self.assertRegex("\n".join(self._lines(session=session)), r"Reduction\s+0%\s+\(3 events\)")
+
+    def test_no_tool_overhead_line_even_when_the_aggregate_carries_one(self):
+        # Issue #439: the "Tool overhead .../turn" line is gone. A stray
+        # overhead_tokens key (e.g. from an older caller) must not bring it back.
+        session = dict(self._SESSION, overhead_tokens=2500)
+        text = "\n".join(self._lines(session=session))
+        self.assertNotIn("Tool overhead", text)
+        self.assertNotIn("/turn", text)
+
+
+class SchemaOverheadRemovedV8(SavingsLedgerTestCase):
+    """Issue #439: `sessions.overhead_tokens` and the `schema_overhead_tokens` meta
+    row held a chars / 3.5 estimate of a per-turn cost real transcripts show is not
+    paid (the tools are deferred). v8 drops them; the rest of each row survives."""
+
+    _V7_SESSIONS = (
+        "CREATE TABLE sessions (session_id TEXT PRIMARY KEY, project TEXT NOT NULL, ended_at TEXT NOT NULL, "
+        "event_count INTEGER NOT NULL, fetch_url_count INTEGER NOT NULL, "
+        "overhead_tokens INTEGER NOT NULL DEFAULT 0, actual_input_tokens INTEGER NOT NULL DEFAULT 0, "
+        "actual_output_tokens INTEGER NOT NULL DEFAULT 0, actual_cache_read_tokens INTEGER NOT NULL DEFAULT 0, "
+        "actual_cache_write_tokens INTEGER NOT NULL DEFAULT 0, raw_chars_sum INTEGER NOT NULL DEFAULT 0, "
+        "out_chars_sum INTEGER NOT NULL DEFAULT 0, credited_saved_chars INTEGER NOT NULL DEFAULT 0)"
+    )
+
+    def _make_v7_db(self):
+        conn = sqlite3.connect(str(L.resolve_db_path()))
+        conn.execute(self._V7_SESSIONS)
+        conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.execute(
+            "INSERT INTO sessions VALUES ('known', 'p', '2026-09-01T00:00:00Z', 3, 1, 2500, 777, 8, 9, 10, 5000, 1000, 4000)"
+        )
+        conn.execute("INSERT INTO meta VALUES ('schema_overhead_tokens', '2500')")
+        conn.execute("INSERT INTO meta VALUES ('keep-me', 'yes')")
+        conn.execute("PRAGMA user_version = 7")
+        conn.commit()
+        conn.close()
+
+    def test_v7_database_loses_the_column_and_the_meta_row_but_keeps_every_other_value(self):
+        self._make_v7_db()
+        conn = L._connect()
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], L.SCHEMA_VERSION)
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(sessions)")]
+        self.assertNotIn("overhead_tokens", cols)
+        self.assertEqual(tuple(cols), L._SESSIONS_COLUMNS)
+        self.assertEqual(
+            conn.execute("SELECT * FROM sessions").fetchone(),
+            ("known", "p", "2026-09-01T00:00:00Z", 3, 1, 777, 8, 9, 10, 5000, 1000, 4000))
+        self.assertIsNone(conn.execute("SELECT 1 FROM meta WHERE key = 'schema_overhead_tokens'").fetchone())
+        self.assertIsNotNone(conn.execute("SELECT 1 FROM meta WHERE key = 'keep-me'").fetchone())
+        conn.close()
+
+    def test_a_fresh_database_never_has_the_column(self):
+        conn = L._connect()
+        self.assertNotIn("overhead_tokens", {r[1] for r in conn.execute("PRAGMA table_info(sessions)")})
+        conn.close()
+
+    def test_a_v8_database_reconnects_without_error(self):
+        self._make_v7_db()
+        L._connect().close()
+        L._connect().close()  # second connect: nothing left to do, nothing may raise
+
+    def test_the_removed_helpers_are_gone(self):
+        self.assertFalse(hasattr(L, "get_schema_overhead_tokens"))
 
 
 if __name__ == "__main__":

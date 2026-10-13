@@ -714,22 +714,6 @@ def derive_compact_label(information: str) -> str:
     return label[:_COMPACT_LABEL_MAX_CHARS].strip()
 
 
-def estimate_tokens(text: str) -> int:
-    """
-    Rough token estimate (chars / 3.5) used ONLY by the opt-in savings
-    tracker (see CLAUDE_RUNWAY_TRACK_SAVINGS in savings_ledger.py) -- never
-    for any compression decision in this file. Deliberately the same crude
-    ratio on both sides of every savings comparison (raw vs. compressed),
-    so error in the ratio itself mostly cancels out of the resulting
-    percentage. Claude's exact tokenizer isn't public, so a "more precise"
-    local tokenizer wouldn't actually be more accurate here -- just
-    differently wrong.
-    """
-    if not text:
-        return 0
-    return max(1, round(len(text) / 3.5))
-
-
 # ---------------------------------------------------------------------------
 # In-session compression cache (issue #60)
 # ---------------------------------------------------------------------------

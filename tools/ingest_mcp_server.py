@@ -180,7 +180,7 @@ def _sync_static_collection_description(collection: Optional[str], qdrant_url: s
     freshly wired up.
 
     Best-effort: catches everything, logs to stderr, never raises -- same
-    discipline as compress_mcp_server.py's _log_fixed_overhead(). A broad
+    discipline as this file's startup tool-count log. A broad
     except Exception (not the narrower sqlite3.Error/OSError caught inside
     qdrant_collection_hints.py itself) is deliberate here: this function
     also makes QdrantClient calls, which can raise assorted client/network
@@ -339,26 +339,21 @@ def _log_registered_tool_count():
     so nothing here may ever call print() without file=sys.stderr) of how
     many tools this server currently registers.
 
-    This is Track A's counterpart to compress_mcp_server.py's
-    _log_fixed_overhead() -- EVALUATION.md's Track A section used to have
-    no live self-reporting mechanism at all for this server's half of the
-    fixed per-turn overhead (unlike Track B, which issue #22 already fixed
-    this way), so its "as of this writing" tool count drifted stale twice
-    in a row (issue #23 corrected 6->8 total across both servers; by the
-    time of issue #52's investigation this server alone had already moved
-    on to 7, since set_collection_description shipped after #23 and was
-    never added to the doc). Uses libs/mcp_tool_introspect.py (issue #52/
-    GROW-05) so this can't drift relative to compress_mcp_server.py's own
-    count -- both go through the identical enumeration logic.
+    EVALUATION.md's Track A section used to have no live self-reporting
+    mechanism at all for this server's tool count, so its "as of this
+    writing" number drifted stale twice in a row (issue #23 corrected 6->8
+    total across both servers; by the time of issue #52's investigation
+    this server alone had already moved on to 7, since
+    set_collection_description shipped after #23 and was never added to the
+    doc). Uses libs/mcp_tool_introspect.py (issue #52/GROW-05), the same
+    enumeration `tools/report_tool_counts.py` uses, so the two can't drift.
 
-    Deliberately doesn't write to savings_ledger the way
-    _log_fixed_overhead() does: the Qdrant memory piece is intentionally
-    never credited toward the savings tracker (see README's "Savings
-    tracker" section -- qdrant-find's counterfactual isn't observable the
-    way local-compress's is), so there's no meta key for this server to
-    populate. This is purely an operator-visible log line plus the live
-    count `tools/report_tool_counts.py` and EVALUATION.md's Track A prose
-    both point at instead of a hardcoded number.
+    This is purely an operator-visible log line plus the live count
+    `tools/report_tool_counts.py` and EVALUATION.md's Track A prose point at
+    instead of a hardcoded number. (compress_mcp_server.py used to log a
+    schema-size estimate and store it in the savings ledger; issue #439
+    removed that -- see tools/measure_startup_context.py for the measured
+    replacement.)
     """
     try:
         n = tool_count(mcp)

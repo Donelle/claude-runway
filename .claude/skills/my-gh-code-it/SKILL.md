@@ -82,28 +82,37 @@ Project-scoped to this repo on purpose: it hardcodes claude-runway's actual conv
 
 12. **Write or update unit tests** in the relevant `tests/test_*.py` file, following existing patterns in that file (e.g. `test_local_compress_lib.py`'s stub-injection technique for anything touching LM Studio, so tests don't require a live model).
 
-13. **Run the test suite, then lint and type-check**:
+13. **Run the test suite, then lint and type-check.** First resolve the venv's
+    Python interpreter path once — Windows `uv venv` creates `.venv/Scripts/`,
+    Linux/macOS creates `.venv/bin/`, so a hardcoded `.venv/bin/python` fails
+    with command-not-found on a Windows checkout (issue #286 — the same defect
+    class issue #230 fixed for `/my-gh-autowork`). ruff and Pyright are invoked
+    as `$PYTHON -m ruff`/`$PYTHON -m pyright` rather than as their own
+    `.venv/bin/ruff`/`.venv/bin/pyright` binaries, so only the one interpreter
+    path has to be resolved per platform:
     ```bash
-    .venv/bin/python -m unittest discover -s tests
-    .venv/bin/ruff check libs tools hooks tests
-    .venv/bin/pyright --pythonpath .venv/bin/python
+    PYTHON=$(if [ -f .venv/Scripts/python ]; then echo .venv/Scripts/python; else echo .venv/bin/python; fi)
+    $PYTHON -m unittest discover -s tests
+    $PYTHON -m ruff check libs tools hooks tests
+    $PYTHON -m pyright --pythonpath "$PYTHON"
     ```
-    **The `--pythonpath` flag is required** (confirmed by a past Copilot review):
+    **The `--pythonpath "$PYTHON"` flag is required** (confirmed by a past Copilot review):
     `pyproject.toml`'s `[tool.pyright]` deliberately has no `venvPath`/`venv`
     setting (a hardcoded `.venv` broke CI, which never creates one), so
     without `--pythonpath` Pyright falls back to whatever Python is first on
     `PATH` and reports every third-party import as missing — confirmed live,
-    even when running `.venv/bin/pyright` itself, not just a bare `pyright`.
+    even when invoking it as `$PYTHON -m pyright` from inside the venv itself,
+    not just a bare `pyright`.
     All tests must pass, including any new ones, and both ruff and Pyright
     must report no issues (Pyright replaced mypy so the editor's
     Pylance extension and this gate agree). Both are installed via
     `requirements-dev.txt` (a separate, dev-only file from
     `requirements.txt` — see that file's own comment); if either is missing
     from this repo's venv, install with
-    `uv pip install --python .venv/bin/python -r requirements-dev.txt --index-url https://pypi.org/simple`
-    (the explicit `--python` matters when run from a git worktree: without it `uv`
-    can resolve to the primary checkout's venv instead of this one — use
-    `.venv/Scripts/python` on Windows; and not `.venv/bin/pip install` — `uv venv` doesn't seed a `pip` executable
+    `uv pip install --python "$PYTHON" -r requirements-dev.txt --index-url https://pypi.org/simple`
+    (the explicit `--python "$PYTHON"` matters when run from a git worktree: without it `uv`
+    can resolve to the primary checkout's venv instead of this one; and not
+    `$PYTHON -m pip install` directly — `uv venv` doesn't seed a `pip` executable
     by default, so that would fail in exactly the recovery case this is
     for) rather than skipping the check.
 

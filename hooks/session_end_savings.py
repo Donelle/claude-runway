@@ -9,9 +9,11 @@ perpetual SQLite store, then surfaces a short summary to the user via
 Verified against Claude Code v2.1.218: SessionEnd supports `systemMessage`
 (not `additionalContext`, which SessionEnd does NOT support) as the way to
 show text to the user, and receives session_id/transcript_path/cwd/reason on
-stdin. See libs/savings_ledger.py's module docstring for why this is an
-ONLINE ESTIMATE of a counterfactual, not a measured A/B delta (EVALUATION.md
-Track D covers that distinction).
+stdin. The summary shows exact characters before and after compression and the
+percent reduction (issue #438), and -- when the transcript opt-in below is on --
+the same split per model, with a token figure labelled as derived (issue #440); see libs/savings_ledger.py's module docstring
+for why the counterfactual behind it is observed online, not a measured A/B
+delta (EVALUATION.md Track D covers that distinction).
 
 No-op (silent, zero output) when CLAUDE_RUNWAY_TRACK_SAVINGS is off, or when
 this session logged no credited compression events -- an empty summary isn't
@@ -123,8 +125,14 @@ def main():
     # session's earlier roll-up) rather than zeroing them.
     # STOPGAP: remove when #164 is resolved (Stop hook will expose these directly).
     actual_tokens = None
+    # Issue #440: the same opt-in also lets the hook join each compression event to
+    # the model and turn it happened under (from the same transcript), read here,
+    # before the roll-up takes savings.db's write lock. None means no per-model
+    # rows: no transcript, or the opt-in is off.
+    attribution = None
     if _parse_transcript_enabled() and transcript_path:
         actual_tokens = savings_ledger.parse_session_token_counts(transcript_path)
+        attribution = savings_ledger.read_transcript_attribution(transcript_path)
 
     # This hook is meant to be best-effort and fail open, same philosophy as
     # compress_output.py -- a savings-tracker problem (a corrupted DB
@@ -132,7 +140,6 @@ def main():
     # crashed hook or a missing systemMessage at normal session shutdown.
     try:
         project = savings_ledger.project_name_from_cwd(cwd)
-        overhead = savings_ledger.get_schema_overhead_tokens()
         # finalize_owned_session, not finalize_session (#306): the same
         # ownership protocol orphan recovery uses -- serialized on savings.db's
         # write lock, and rolling up this session's ledger TOGETHER with any
@@ -140,7 +147,7 @@ def main():
         # up separately would let one overwrite the other. None means another
         # process already consumed this session's events; that roll-up stands.
         session_agg = savings_ledger.finalize_owned_session(
-            session_id, project, overhead_tokens=overhead, actual_tokens=actual_tokens,
+            session_id, project, actual_tokens=actual_tokens, attribution=attribution,
         )
         if not session_agg:
             sys.exit(0)
@@ -148,8 +155,8 @@ def main():
         # #307: events existing isn't enough to print -- `event_count` counts
         # CREDITED events only (see _write_session_rows), so a fetch_url-only
         # session (logged but never credited) rolls up into the perpetual
-        # store above but stays silent here instead of printing a "0 tokens
-        # avoided" summary, matching the documented no-op behavior.
+        # store above but stays silent here instead of printing an all-zero
+        # characters summary, matching the documented no-op behavior.
         if not session_agg.get("event_count"):
             sys.exit(0)
         project_summary = savings_ledger.query_project_summary(project)

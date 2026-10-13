@@ -5,14 +5,16 @@ events, my-gh-autowork's per-ticket run metrics, whatever comes next),
 behind ONE small `MetricsStore` class and ONE new MCP tool
 (`get_metrics`, added to tools/compress_mcp_server.py -- see that file).
 
-Why this exists instead of "add a new MCP tool per domain": this repo's own
-tool-count sanity check (issue #208's own investigation) found 23 tools
-already riding along in context on every single turn across the four
-connected MCP servers, regardless of whether they're used that turn -- see
-EVALUATION.md's Track A4/B4/E4. A metrics-reporting design that adds one new
-tool per future metric domain would directly work against that cost model;
-a single generic dispatch tool (`get_metrics`) adds a flat, bounded cost
-regardless of how many domains eventually write into this store.
+Why this exists instead of "add a new MCP tool per domain": the toolkit's
+connected MCP servers already expose many tools (`python
+tools/report_tool_counts.py` gives the live count; a number written here
+would go stale). Issue #208 assumed each one rides along in context on every
+turn; session transcripts later showed Claude Code listing them as deferred
+(loaded on demand) -- see EVALUATION.md's Step A4 and docs/metrics.md. A
+metrics-reporting design that adds one new tool per future metric domain
+would still add a schema to load and one more tool to choose among; a single
+generic dispatch tool (`get_metrics`) adds a flat, bounded cost regardless of
+how many domains eventually write into this store.
 
 Deliberately NOT the home for savings_ledger.py's `savings.db` or
 memory_events_lib.py's `memory-events.db` -- both are genuinely tailored

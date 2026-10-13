@@ -465,7 +465,7 @@ class MainDerivesProjectFromPayloadCwd(unittest.TestCase):
 
     def test_cwd_derived_project_reaches_record_event(self):
         footer = json.dumps({
-            "tool": "compress_file", "raw_tokens": 1000, "out_tokens": 100,
+            "tool": "compress_file", "raw_chars": 1000, "out_chars": 100,
             "credited": True, "source": "some/file.log",
         })
         payload = {
@@ -519,7 +519,7 @@ class MainThreadsAgentFieldsToRecordEvent(unittest.TestCase):
         return self.stub.calls[0][1]
 
     def test_mcp_footer_path(self):
-        footer = json.dumps({"tool": "compress_file", "raw_tokens": 1000, "out_tokens": 100,
+        footer = json.dumps({"tool": "compress_file", "raw_chars": 1000, "out_chars": 100,
                              "credited": True, "source": "f.log"})
         self._run_main({
             "session_id": "s", "cwd": "/repos/p",
@@ -577,6 +577,91 @@ class MainThreadsAgentFieldsToRecordEvent(unittest.TestCase):
         kwargs = self._single_call_kwargs()
         self.assertIsNone(kwargs.get("agent_id"))
         self.assertEqual(kwargs.get("agent_type"), "my-agent")
+
+
+class MainThreadsCharsAndToolUseId(MainThreadsAgentFieldsToRecordEvent):
+    """Issues #437/#438: exact character counts and the PostToolUse `tool_use_id`
+    reach record_event on every recording path. Inherits the stub/fake-compress
+    setUp and _run_main helpers; its own inherited tests are re-run harmlessly."""
+
+    def test_mcp_footer_path_forwards_footer_chars_and_tool_use_id(self):
+        footer = json.dumps({"tool": "compress_file", "raw_chars": 3500, "out_chars": 350,
+                             "credited": True, "source": "f.log"})
+        self._run_main({
+            "session_id": "s", "cwd": "/repos/p", "tool_use_id": "toolu_abc",
+            "tool_name": "mcp__local-compress__compress_file",
+            "tool_response": f"[compressed 3500 -> 350 chars]\n<!--CLAUDE_RUNWAY_SAVINGS:{footer}-->",
+        })
+        self.assertEqual(len(self.stub.calls), 1)
+        args, kwargs = self.stub.calls[0]
+        # record_event(session_id, tool, raw_chars, out_chars, credited, source, ...)
+        self.assertEqual((args[2], args[3]), (3500, 350))
+        self.assertEqual(kwargs.get("tool_use_id"), "toolu_abc")
+
+    def test_footer_written_before_437_is_stripped_but_not_recorded(self):
+        # A footer from an MCP server that predates #437 carries only the chars / 3.5
+        # estimates. There is no exact size to record (#438 dropped the estimate),
+        # but the footer must still be stripped so Claude never sees it.
+        footer = json.dumps({"tool": "compress_file", "raw_tokens": 1000, "out_tokens": 100,
+                             "credited": True, "source": "f.log"})
+        printed = self._run_main({
+            "session_id": "s", "cwd": "/repos/p",
+            "tool_name": "mcp__local-compress__compress_file",
+            "tool_response": f"[compressed 1000 -> 100 chars]\n<!--CLAUDE_RUNWAY_SAVINGS:{footer}-->",
+        })
+        self.assertEqual(len(self.stub.calls), 0)
+        self.assertIn("[compressed 1000 -> 100 chars]", printed)
+        self.assertNotIn("CLAUDE_RUNWAY_SAVINGS", printed)
+
+    def test_malformed_footer_chars_are_not_recorded(self):
+        footer = json.dumps({"tool": "compress_file", "raw_chars": "lots", "out_chars": True,
+                             "credited": True, "source": "f.log"})
+        self._run_main({
+            "session_id": "s", "cwd": "/repos/p",
+            "tool_name": "mcp__local-compress__compress_file",
+            "tool_response": f"[compressed 1000 -> 100 chars]\n<!--CLAUDE_RUNWAY_SAVINGS:{footer}-->",
+        })
+        self.assertEqual(len(self.stub.calls), 0)
+
+    def test_bash_path_records_exact_lengths_of_both_texts(self):
+        stdout = "LOG LINE. " * 600
+        self._run_main({
+            "session_id": "s", "cwd": "/repos/p", "tool_use_id": "toolu_bash1",
+            "tool_name": "Bash",
+            "tool_input": {"command": "cat big.log"},
+            "tool_response": {"stdout": stdout, "stderr": ""},
+        })
+        kwargs = self._single_call_kwargs()
+        # The hook's own "raw" text is what it handed to compress(); the compressed
+        # side is _fake_compress's fixed reply. Both are exact len()s, not estimates.
+        args = self.stub.calls[0][0]
+        self.assertGreaterEqual(args[2], len(stdout))
+        raw_chars = args[2]
+        self.assertEqual(
+            args[3],
+            len(f"[compressed {raw_chars} -> 4 chars across 1 chunk(s), ~99% smaller]\nGIST"))
+        self.assertEqual(kwargs.get("tool_use_id"), "toolu_bash1")
+
+    def test_generic_mcp_path_forwards_tool_use_id(self):
+        self._run_main({
+            "session_id": "s", "cwd": "/repos/p", "tool_use_id": "toolu_gen",
+            "tool_name": "mcp__local-compress__compact_find",
+            "tool_response": "STORED COMPACT CONTENT. " * 200,
+        })
+        self.assertEqual(self._single_call_kwargs().get("tool_use_id"), "toolu_gen")
+
+    def test_absent_or_non_string_tool_use_id_is_none(self):
+        for bad in (None, 123, ["x"]):
+            self.stub.calls.clear()
+            payload = {
+                "session_id": "s", "cwd": "/repos/p", "tool_name": "Bash",
+                "tool_input": {"command": "cat big.log"},
+                "tool_response": {"stdout": "LOG LINE. " * 600, "stderr": ""},
+            }
+            if bad is not None:
+                payload["tool_use_id"] = bad
+            self._run_main(payload)
+            self.assertIsNone(self._single_call_kwargs().get("tool_use_id"))
 
 
 async def _fake_compress(text, skip_if_under_chars=2000, **kwargs):
@@ -714,7 +799,7 @@ class MainFallsBackToGenericForNonFooterMcpTools(unittest.TestCase):
         # confirms the refactor into _finish_compression_outcome() didn't
         # change what happens when a footer IS present.
         footer = json.dumps({
-            "tool": "compress_file", "raw_tokens": 1000, "out_tokens": 100,
+            "tool": "compress_file", "raw_chars": 1000, "out_chars": 100,
             "credited": True, "source": "some/file.log",
         })
         payload = {
@@ -1218,7 +1303,7 @@ class MainHandlesGenericMcpTools(unittest.TestCase):
         # tool with a savings footer must still go through the footer-strip
         # path and NOT be re-processed generically.
         footer = json.dumps({
-            "tool": "compress_file", "raw_tokens": 500, "out_tokens": 50,
+            "tool": "compress_file", "raw_chars": 500, "out_chars": 50,
             "credited": True, "source": "some/file.log",
         })
         payload = {

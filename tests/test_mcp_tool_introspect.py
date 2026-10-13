@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Tests for libs/mcp_tool_introspect.py -- the shared utility extracted
-in issue #52/GROW-05 so compress_mcp_server.py, ingest_mcp_server.py, and
+in issue #52/GROW-05 so ingest_mcp_server.py, memory_bank_mcp_server.py, and
 tools/report_tool_counts.py all enumerate an MCPServer's registered tools
 through one identical code path instead of duplicating (and independently
-drifting on) the same "mcp._tool_manager.list_tools()" logic in three
-places.
+drifting on) the same "mcp._tool_manager.list_tools()" logic in several
+places. (compress_mcp_server.py used it too until issue #439 removed its
+schema-size estimate.)
 
 Stdlib-only (unittest, no pytest) and no network -- exercises a small
 ad-hoc MCPServer instance built just for these tests, not either of the

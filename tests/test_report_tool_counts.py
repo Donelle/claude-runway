@@ -31,16 +31,16 @@ sys.path.insert(0, os.path.join(REPO_ROOT, "tools"))
 import report_tool_counts as _rtc  # noqa: E402
 
 
-class ReportRepoServerReturnsLiveCountsAndTokenEstimates(unittest.TestCase):
-    def test_local_compress_reports_a_positive_count_and_tokens(self):
-        count, tokens = _rtc._report_repo_server("compress_mcp_server")
+class ReportRepoServerReturnsLiveCountsAndSchemaSizes(unittest.TestCase):
+    def test_local_compress_reports_a_positive_count_and_schema_size(self):
+        count, chars = _rtc._report_repo_server("compress_mcp_server")
         self.assertGreater(count, 0)
-        self.assertGreater(tokens, 0)
+        self.assertGreater(chars, 0)
 
-    def test_codebase_indexer_reports_a_positive_count_and_tokens(self):
-        count, tokens = _rtc._report_repo_server("ingest_mcp_server")
+    def test_codebase_indexer_reports_a_positive_count_and_schema_size(self):
+        count, chars = _rtc._report_repo_server("ingest_mcp_server")
         self.assertGreater(count, 0)
-        self.assertGreater(tokens, 0)
+        self.assertGreater(chars, 0)
 
     def test_unimportable_module_raises_rather_than_reporting_zero(self):
         # A silent 0 here would be indistinguishable from "this server
@@ -63,9 +63,9 @@ class ReportStandaloneQdrantServerCoversTheThirdPartyHalf(unittest.TestCase):
     """
 
     def test_reports_the_two_known_qdrant_tools_without_a_live_connection(self):
-        count, tokens = _rtc._report_standalone_qdrant_server()
+        count, chars = _rtc._report_standalone_qdrant_server()
         self.assertEqual(count, 2)
-        self.assertGreater(tokens, 0)
+        self.assertGreater(chars, 0)
 
     def test_pinned_to_the_actual_tool_names_not_just_the_count(self):
         # PR #120 review finding: a count-only assertion would still pass
@@ -111,7 +111,9 @@ class MainReportsAllThreeServersAndExitsCleanly(unittest.TestCase):
         self.assertIn("codebase-indexer", output)
         self.assertIn("qdrant", output)
         self.assertIn("tools", output)
-        self.assertIn("schema tokens", output)
+        self.assertIn("tool-description characters (schema proxy)", output)
+        # Issue #439: no token estimate is printed any more.
+        self.assertNotIn("schema tokens", output)
 
     def test_main_reports_a_specific_live_count_matching_direct_introspection(self):
         # Cross-check against the same underlying utility used elsewhere
