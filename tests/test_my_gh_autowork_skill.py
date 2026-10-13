@@ -674,5 +674,75 @@ class ShortCopilotWaitContentRequirements(unittest.TestCase):
         self.assertIn("rather than one long sleep", section)
 
 
+AGENT_PATH = os.path.join(REPO_ROOT, ".claude", "agents", "autowork-ticket.md")
+
+
+def _agent_frontmatter():
+    with open(AGENT_PATH, encoding="utf-8") as fh:
+        text = fh.read()
+    match = re.match(r"---\n(.*?)\n---\n", text, re.DOTALL)
+    assert match, "agent file has no frontmatter"
+    fields = {}
+    for line in match.group(1).splitlines():
+        key, _, value = line.partition(":")
+        fields[key.strip()] = value.strip()
+    return fields
+
+
+class AutoworkAgentTypeTests(unittest.TestCase):
+    """The autowork subagent type's tool allow-list must cover everything the template uses."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(SKILL_PATH, encoding="utf-8") as fh:
+            cls.content = fh.read()
+        fence = "````"
+        start = cls.content.index(fence) + len(fence)
+        cls.template = cls.content[start : cls.content.index(fence, start)]
+        fields = _agent_frontmatter()
+        cls.fields = fields
+        cls.tools = {t.strip() for t in fields["tools"].split(",") if t.strip()}
+
+    def test_name_matches_what_the_skill_launches(self):
+        self.assertEqual(self.fields["name"], "autowork-ticket")
+        self.assertIn('`subagent_type: "autowork-ticket"`, `isolation: "worktree"`', self.content)
+
+    def test_allow_list_covers_the_basics_the_procedure_uses(self):
+        # Bash (git/gh/uv/tests), Read/Edit/Write (files and plans), ToolSearch (the only way
+        # to load deferred MCP tools), and sync_repo (Step 1).
+        for tool in ("Bash", "Read", "Edit", "Write", "ToolSearch", "mcp__codebase-indexer__sync_repo"):
+            self.assertIn(tool, self.tools)
+
+    def test_every_mcp_tool_the_template_names_is_allowed(self):
+        self.assertIn("sync_repo", self.template)
+        for name in set(re.findall(r"mcp__[A-Za-z0-9_-]+__[A-Za-z0-9_-]+", self.template)):
+            self.assertIn(name, self.tools)
+
+    def test_every_builtin_tool_the_template_names_is_allowed(self):
+        builtins = ("Bash", "Read", "Edit", "Write", "Glob", "Grep", "ToolSearch", "Skill")
+        for tool in builtins:
+            if re.search(r"`%s`|\b%s tool\b" % (tool, tool), self.template):
+                self.assertIn(tool, self.tools)
+
+    def test_agent_and_artifact_tools_are_left_out(self):
+        for tool in self.tools:
+            self.assertNotIn(tool, ("Agent", "Task", "ScheduleWakeup"))
+            self.assertFalse(tool.startswith("Artifact"), tool)
+
+    def test_template_never_asks_the_subagent_to_start_agents_or_artifacts(self):
+        self.assertNotIn("subagent_type", self.template)
+        self.assertNotIn("Artifact", self.template)
+
+    def test_fallback_is_only_for_an_unknown_agent_type(self):
+        section = _normalized(self.content)
+        self.assertIn("unknown-agent-type error", section)
+        self.assertIn('`subagent_type: "general-purpose"` for this run', section)
+        self.assertIn("Never fall back on any other error", section)
+
+    def test_no_other_place_launches_general_purpose(self):
+        # Only the fallback instruction may still name general-purpose as a launch type.
+        self.assertEqual(self.content.count('subagent_type: "general-purpose"'), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
