@@ -1280,7 +1280,7 @@ class MainHandlesGenericMcpTools(unittest.TestCase):
         # _finish_compression_outcome, which logs the tool as "hook:{tool_name}"
         # -- the same "hook:" prefix used for all non-footer paths (Bash, Grep,
         # etc. included), mirroring the existing assertion at test case
-        # test_large_no_footer_response_gets_compressed_and_recorded (line 308).
+        # test_large_no_footer_response_gets_compressed_and_recorded.
         # Sized dynamically so this passes regardless of the configured threshold.
         big_response = "SEARCH RESULTS " * (hook.THRESHOLD // 10 + 50)
         self.assertGreater(len(big_response), hook.THRESHOLD)
@@ -1347,8 +1347,9 @@ def _utf8_stdin_bytes(payload):
 #     unmapped bytes, so reading these bytes as cp1252 raises UnicodeDecodeError
 #     on the 0x81, while a correct utf-8 read keeps it. That unmapped byte is
 #     what makes the cp1252-vs-utf-8 difference an observable RAISE, not merely
-#     cosmetic mojibake. All three chars are written as \u escapes so no
-#     editor/terminal round-trip can silently drop them.
+#     cosmetic mojibake. All three are literal characters in this file (U+0081
+#     is an invisible control char), so an editor that strips it would silently
+#     weaken these tests -- test_vehicle_is_real_cp1252_would_raise guards that.
 _E_ACUTE = "é"
 _ARROW = "→"
 _CTRL_0081 = ""  # UTF-8: C2 81 -> 0x81 unmapped in cp1252

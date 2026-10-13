@@ -97,11 +97,11 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 def main(argv=None) -> int:
     """
-    Also the entry point pip/pipx/uvx wires up as the `claude-runway-doctor`
-    console script (issue #50) -- `[project.scripts]` in pyproject.toml
-    points straight at this existing function, no new wrapper needed since
-    it already took this shape for `python tools/doctor.py` (the
-    `if __name__` guard below).
+    Also what the `claude-runway-doctor` console script (issue #50) ends up
+    calling: `[project.scripts]` in pyproject.toml points at
+    `claude_runway:doctor_main`, a small shim (issue #206) that loads this
+    file by path and calls this function, which already took this shape for
+    `python tools/doctor.py` (the `if __name__` guard below).
     """
     args = parse_args(argv)
     target_repo = Path(args.target_repo).resolve()

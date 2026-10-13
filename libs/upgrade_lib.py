@@ -132,24 +132,23 @@ def _apply_memory_bank_server_missing(
     matching what a fresh `init` run does when `--memory-bank-id` isn't
     passed.
 
-    `EMBEDDING_MODEL` is likewise taken from the existing `qdrant`/
-    `codebase-indexer` block rather than left at whatever
+    KNOWN LEGACY BEHAVIOR (issue #458): `EMBEDDING_MODEL` is copied from the
+    existing `qdrant`/`codebase-indexer` block instead of being left at what
     `build_mcp_servers` bakes in from the CURRENT `mcp.json.template`
     (`build_mcp_servers`'s `embedding_model` parameter, added for issue #279,
-    defaults to blank -- every server it generates then just inherits the
-    template's own default verbatim -- and this migration doesn't pass it). Found in Copilot review on PR #227 and confirmed by
-    reproducing it directly: a project whose `qdrant`/`codebase-indexer`
-    blocks were hand-customized to a non-default `EMBEDDING_MODEL` (the
-    documented, if manual, way to change this -- see README's Known
-    limitations) got a freshly-added `memory-bank` block silently pinned to
-    the template's CURRENT default instead, which can mismatch whatever
-    model actually created the shared `memory-bank` collection on this
-    machine (`docs/memory-bank.md`: "EMBEDDING_MODEL... Must match the model
-    that created the shared collection") -- `memory_bank_mcp_server.py`
-    detects and reports that mismatch loudly rather than silently returning
-    wrong results, but this migration has no reason to manufacture one in
-    the first place when the value it needs is sitting right there in the
-    project's own existing config.
+    defaults to blank, so every server it generates inherits the template's
+    own default -- and this migration doesn't pass it). That copy was added
+    after a Copilot review on PR #227: a project whose `qdrant`/
+    `codebase-indexer` blocks were hand-customized to a non-default model
+    (see README's Known limitations) got a freshly-added `memory-bank` block
+    pinned to the template's default, which can mismatch the model that
+    created the shared `memory-bank` collection (`docs/memory-bank.md`: the
+    collection locks in whichever `EMBEDDING_MODEL` created it first).
+    Since issue #428, though, memory-bank's model is its own value,
+    independent of the code-index model, so the copy is not a correct source
+    either and can produce the same mismatch the other way round;
+    `memory_bank_mcp_server.py` reports such a mismatch loudly rather than
+    returning wrong results. Issue #458 tracks the fix.
     """
     mcp_json = copy.deepcopy(mcp_json)
     servers = mcp_json.setdefault("mcpServers", {})
@@ -543,9 +542,11 @@ def _apply_compress_hook_renamed(mcp_json: dict, settings_json: dict, ctx: Migra
     return mcp_json, settings_json
 
 
-# Ordered oldest-feature-first -- order only affects DISPLAY order when more
-# than one migration is pending; `detect` alone decides whether each one is
-# shown at all.
+# List order is both display and apply order when more than one migration is
+# pending; `detect` alone decides whether each one is shown at all. Order only
+# matters where one migration's guard depends on another:
+# record-session-id-sessionstart needs record-session-id-hooks-missing to
+# appear (and be applied) earlier in this list.
 MIGRATIONS: "list[Migration]" = [
     Migration(
         id="memory-bank-server-missing",

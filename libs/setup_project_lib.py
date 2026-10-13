@@ -3,7 +3,8 @@ Shared, dependency-free logic behind `tools/setup_project.py` -- computing
 defaults and patching `templates/mcp.json.template` /
 `templates/settings.json.template` into a real, ready-to-use `.mcp.json` /
 `.claude/settings.json` for a target project repo, instead of the manual
-copy-and-hand-edit flow `docs/installation.md`'s steps 4/4b/5 otherwise require
+copy-and-hand-edit flow docs/installation.md's steps 4/4b/4c otherwise require (step 5's manual
+CLAUDE.md edit is NOT covered here)
 (issue #48). Kept separate from `tools/setup_project.py` (the thin CLI) the
 same way `qdrant_ingest_lib.py`/`local_compress_lib.py` are kept separate
 from their own CLI/MCP-server callers -- pure functions here are what make
@@ -855,9 +856,9 @@ def plan_skill_installs(tools_repo_dir: Path, skills_dir: Path) -> list:
     (issue #205) and, since issue #449, `upgrade`'s skill refresh -- scans
     `tools_repo_dir/skills/*/SKILL.md` (the shipped
     source of truth: the SAME path for a clone and a pipx/`uv tool install`,
-    since `skills/` is now packaged as a sibling of `libs/tools/templates/
-    hooks` under `[tool.setuptools] packages` in pyproject.toml, exactly the
-    same "sibling directories under site-packages" arithmetic every other
+    since `skills/` is shipped as wheel data files (setup.py's `data_files()`)
+    landing as a sibling of `libs/tools/templates/hooks` under `<env>/src/`,
+    exactly the same "sibling directories" arithmetic every other
     TOOLS_REPO_DIR-relative path in this module already relies on) and
     reports what installing into `skills_dir` would do to each one -- never
     writes anything itself. Mirrors `run_setup`'s own "pure computation, the

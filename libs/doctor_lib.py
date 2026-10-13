@@ -1,7 +1,7 @@
 """
 Shared, dependency-free logic behind `tools/doctor.py` -- a validator that
-diffs each dual-config `CLAUDE_RUNWAY_*` env var (the ones README's
-"Environment variables" table marks "both") between a target repo's
+diffs each dual-config `CLAUDE_RUNWAY_*` env var (the ones
+docs/environment-variables.md's table marks "both") between a target repo's
 `.mcp.json` `local-compress` env block and the live shell environment,
 flagging any mismatch instead of relying on a human to notice silently
 split behavior (issue #49, GROW-02 in `.plans/code-review-2026-08-18.md`).
@@ -19,8 +19,8 @@ URL/MODEL and `savings_ledger.py` for TRACK_SAVINGS/SAVINGS_DB) are small
 enough to reproduce directly here instead -- the same "small, independent,
 dependency-free lib" precedent `setup_project_lib.py` already follows.
 
-The key semantic this whole module hinges on (see README's "Why two
-places" section): a `CLAUDE_RUNWAY_*` key PRESENT in `.mcp.json`'s
+The key semantic this whole module hinges on (see
+docs/environment-variables.md's "Why two places" section): a `CLAUDE_RUNWAY_*` key PRESENT in `.mcp.json`'s
 local-compress `env` block -- even set to `""` -- always masks/overrides
 whatever the shell would otherwise supply to that subprocess; a key ABSENT
 from that block inherits straight from the shell, i.e. from the exact same
@@ -54,7 +54,7 @@ from setup_project_lib import LEGACY_COMPRESS_HOOK_SCRIPT
 DEFAULT_LMSTUDIO_URL = "http://localhost:1234/v1"
 _AUTO_DETECT_MODEL = "(auto-detect -- no model pinned)"
 
-# Every CLAUDE_RUNWAY_* var README's env-var table marks "both" -- i.e.
+# Every CLAUDE_RUNWAY_* var docs/environment-variables.md's table marks "both" -- i.e.
 # genuinely needs matching values in .mcp.json's local-compress env block
 # AND the shell. Deliberately excluded from this list:
 # - CLAUDE_RUNWAY_COMPRESS_THRESHOLD_CHARS: shell-only (compress_output.py

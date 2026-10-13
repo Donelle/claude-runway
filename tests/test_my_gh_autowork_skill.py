@@ -94,7 +94,7 @@ class SkillContentRequirements(unittest.TestCase):
 
     def test_preflight_stops_on_missing_permissions(self):
         # Must instruct a hard stop, matching the existing dogfood-preflight pattern.
-        # Window is 2500 (was 2000) to accommodate the issue #230 note appended to the
+        # The 2500-char window leaves room for the issue #230 note in the
         # preflight's explanatory paragraph without pushing STOP out of sight.
         section = self.content[self.content.find("Baseline Bash permission preflight"):]
         self.assertIn("STOP", section[:2500])

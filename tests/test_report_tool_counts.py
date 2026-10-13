@@ -2,8 +2,9 @@
 """Tests for tools/report_tool_counts.py -- the CLI (issue #52/GROW-05)
 that EVALUATION.md's Track A/B prose and the CI lint step both point at
 instead of a hardcoded tool count/token estimate. Verifies it reports a
-live, nonzero count AND token estimate for each real server (this repo's
-own two, plus the standalone third-party `mcp-server-qdrant` package) and
+live, nonzero count AND schema size (in characters, issue #439) for each
+real server (this repo's own, plus the standalone third-party
+`mcp-server-qdrant` package) and
 correctly signals failure (nonzero exit) if a server can't be
 constructed/enumerated, rather than silently reporting zero -- a silent
 zero would be indistinguishable from "this server genuinely has no

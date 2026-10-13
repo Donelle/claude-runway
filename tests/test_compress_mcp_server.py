@@ -871,30 +871,22 @@ class CollectionMatchingScansEveryPointNotJustTheNewest(unittest.TestCase):
 
 
 class CompactFindQueryPathFiltersBeforeQdrantTruncates(unittest.TestCase):
-    """Regression coverage for a real truncation-before-filter bug flagged
-    in PR review on #123 (rounds 4 AND 5): the semantic query path used to
-    ask Qdrant for exactly `limit` results per collection and only THEN
-    apply the case-insensitive per-entry project filter client-side. A
-    shared collection holding more than `limit` entries that rank ahead of
-    a project's own (lower-ranked) entries could fill the entire truncated
-    page with OTHER projects' points, which the filter would then remove
-    entirely -- silently reporting no matches even though the target
-    project's real history still exists in that same collection, just
+    """Regression coverage for a truncation-before-filter bug flagged in PR
+    review on #123 (rounds 4 AND 5): the semantic query path used to ask
+    Qdrant for exactly `limit` results per collection and only THEN apply
+    the case-insensitive per-entry project filter client-side. A shared
+    collection holding more than `limit` entries that rank ahead of a
+    project's own entries could fill the whole truncated page with OTHER
+    projects' points, which the filter then removed entirely -- silently
+    reporting no matches even though the target project's history exists
     past the truncation point.
 
-    Round 4's first attempt at a fix (over-fetching a larger, but still
-    fundamentally capped, number of results) was itself flagged as
-    insufficient in round 5: it only moves the same bug to a bigger
-    threshold, since ANY fixed cap can still be exceeded by enough
-    higher-ranked OTHER-project points. The actual fix builds an EXACT,
-    Qdrant-SIDE MatchAny filter (from every literal casing variant
-    actually stored in that collection -- see _collection_project_values)
-    for any non-canonical collection, so Qdrant itself only ever ranks and
-    truncates ALREADY-isolated points -- there's no cap to exceed, because
-    truncation happens after isolation, not before it. This test uses a
-    count of other-project points well beyond round 4's old 12-point/200
-    over-fetch-floor test case specifically to prove this isn't just a
-    bigger buffer."""
+    Over-fetching a larger number of results only moves the threshold, since
+    ANY fixed cap can be exceeded. The fix builds an EXACT, Qdrant-SIDE
+    MatchAny filter (from every literal casing variant stored in that
+    collection -- see _collection_project_values), so Qdrant only ever ranks
+    and truncates ALREADY-isolated points. This test inserts far more
+    other-project points than any plausible over-fetch buffer to prove that."""
 
     def _patched_module(self):
         mod = _load_compress_mcp_server()
@@ -907,9 +899,8 @@ class CompactFindQueryPathFiltersBeforeQdrantTruncates(unittest.TestCase):
         client_cls = mod.QdrantClient
         shared_name = f"{mod.COMPACT_COLLECTION}-a-shared-collection-abcdef01"
         # Insert far more other-project points than any fixed over-fetch
-        # cap would have covered (round 4's fix used a 200-point floor) --
-        # the fake's query_points returns points in insertion order,
-        # standing in for "rank", so these are all inserted FIRST.
+        # cap would cover -- the fake's query_points returns points in
+        # insertion order, standing in for "rank", so these go in FIRST.
         points = []
         for i in range(250):
             points.append(mod.qdrant_models.PointStruct(

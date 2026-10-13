@@ -116,12 +116,14 @@ compressed log, since it can corrupt an edit rather than just lose detail
 in a summary. Don't add Read to the matcher without addressing that.
 
 Setup:
-    pip install openai --break-system-packages
+    Dependencies (openai, via libs/local_compress_lib.py) come from
+    requirements.txt; run this script with that environment's Python.
 
-Register in .claude/settings.json (see settings.json.template) -- point
-the args path at this script's location in the cloned tools repo, nothing
-needs to be copied into the target project. The full recommended matcher
-is in settings.json.template, which extends the base set below with a vetted
+Register in .claude/settings.json (see templates/settings.json.template; the
+`claude-runway-setup` tool writes this for you) -- point the args path at
+this script's location in the cloned tools repo, nothing needs to be copied
+into the target project. The full recommended matcher is in
+templates/settings.json.template, which extends the base set below with a vetted
 MCP tool allowlist for GitHub (individually vetted against the edit-basis
 rule -- get_file_contents and get_pull_request_files excluded, see dispatch
 comments below):
@@ -133,7 +135,7 @@ comments below):
         "hooks": [
           {
             "type": "command",
-            "command": "python3",
+            "command": "REPLACE-WITH-VENV-PYTHON",
             "args": ["/absolute/path/to/tools-repo/hooks/compress_output.py"]
           }
         ]
@@ -159,7 +161,7 @@ Env vars (same names local_compress_lib.py / compress_mcp_server.py use):
     a hook entry in .claude/settings.json has no `env` field, so it inherits the
     parent environment and cannot see .mcp.json's env block. The MCP server
     actually inherits the same full shell environment too (not a small
-    allowlist -- see README's "Why two places" section and issue #117), but
+    allowlist -- see docs/environment-variables.md's "Why two places" section and issue #117), but
     only for a key genuinely absent from its own env block; this toolkit's
     shipped .mcp.json always declares CLAUDE_RUNWAY_LMSTUDIO_URL/
     CLAUDE_RUNWAY_LMSTUDIO_MODEL/CLAUDE_RUNWAY_TRACK_SAVINGS/
@@ -1014,7 +1016,7 @@ def _finish_compression_outcome(outcome, tool_name, source, session_id, project,
     sys.exit(0)
 
 
-# Matches compact_find's own header verbatim (compress_mcp_server.py:1516):
+# Matches compact_find's own header verbatim (compress_mcp_server.py):
 # f"Found {len(entries)} compact(s) for project '{project}':\n". Anchored to
 # the START of the leaf (^, no re.MULTILINE, so this only matches the
 # absolute beginning of the string) -- not just anchored to that exact
@@ -1099,7 +1101,7 @@ def _dispatch(payload):
         # alone regardless of size -- re-compressing it generically here
         # would discard exactly what that first pass was told to preserve.
         # Otherwise, this is one of the local-compress tools that never
-        # compresses anything itself (compact_find, compact_store,
+        # compresses anything itself (e.g. compact_find, compact_store,
         # list_local_models) -- fall back to the
         # same size-based compression every other matched tool gets,
         # otherwise every one of THOSE calls is a complete no-op regardless

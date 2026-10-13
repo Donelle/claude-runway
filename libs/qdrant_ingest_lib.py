@@ -189,8 +189,8 @@ def validate_chunk_params(chunk_size: int, overlap: int) -> Optional[str]:
     into "chunk every line," multiplying the number of chunks (and
     embedding/storage cost) by roughly chunk_size -- confirmed real, not
     theoretical (issue #26). chunk_size < 1 is the same class of defect from
-    the other direction: chunk_file's `end <= start` on every line then
-    yields an empty (or near-empty) chunk per line instead of raising
+    the other direction: chunk_lines()'s `end <= start` window then yields
+    nothing at all (0) or a nonsensical chunk (negative) instead of raising
     cleanly. overlap < 0 has no valid meaning either.
 
     Called once at every CLI/tool boundary that accepts these two params
@@ -576,7 +576,7 @@ def brace_boundary_indexes(lines, ext: str = "") -> set:
     Strings and comments (including backtick template/raw-string literals
     -- see _strip_c_style_line) are stripped first so a brace inside one is
     never miscounted -- the same "safe direction" philosophy as
-    heading_line_indexes' fence tracking above: a missed real boundary just
+    heading_line_indexes' fence tracking below: a missed real boundary just
     falls back to a fixed-line cut (see chunk_code_by_boundaries), it never
     invents a wrong one.
     """

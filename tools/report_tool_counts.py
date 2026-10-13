@@ -119,7 +119,7 @@ def _report_standalone_qdrant_server() -> tuple:
     (the underlying Python function) the same way `mcp_tool_introspect`
     does for `MCPServer` instances, so the schema blob is built in
     the same format (name + signature + docstring) for a consistent
-    three-way comparison.
+    comparison across all four servers.
 
     The embedding provider factory is patched out for this introspection-
     only call to prevent `FastEmbedProvider.__init__` from triggering a
@@ -144,7 +144,7 @@ def _report_standalone_qdrant_server() -> tuple:
     # FunctionTool objects expose .fn (the underlying Python function) the same
     # way mcp_tool_introspect.list_registered_tools() does for our MCPServer
     # instances, so build the describe_tools()-equivalent blob in the same
-    # format (name + signature + docstring) so the three reported sizes are
+    # format (name + signature + docstring) so the four reported sizes are
     # computed from comparable subsets.
     blob = "\n".join(
         # The declared return type of list_tools() is the generic MCP SDK
