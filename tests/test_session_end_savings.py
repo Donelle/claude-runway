@@ -47,7 +47,7 @@ def tearDownModule():
 
 
 _PAYLOAD = json.dumps({"session_id": "abc123", "cwd": "/some/project"})
-_SUMMARY = "ClaudeRunway · Token Savings\n\nThis session · my-project\n  Context tokens avoided  ~1.8k"
+_SUMMARY = "ClaudeRunway · Compression Savings\n\nThis session · my-project\n  Characters before  12,000"
 
 
 def _run_main(stdin_text=_PAYLOAD):

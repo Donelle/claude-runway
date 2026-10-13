@@ -9,9 +9,10 @@ perpetual SQLite store, then surfaces a short summary to the user via
 Verified against Claude Code v2.1.218: SessionEnd supports `systemMessage`
 (not `additionalContext`, which SessionEnd does NOT support) as the way to
 show text to the user, and receives session_id/transcript_path/cwd/reason on
-stdin. See libs/savings_ledger.py's module docstring for why this is an
-ONLINE ESTIMATE of a counterfactual, not a measured A/B delta (EVALUATION.md
-Track D covers that distinction).
+stdin. The summary shows exact characters before and after compression and the
+percent reduction (issue #438); see libs/savings_ledger.py's module docstring
+for why the counterfactual behind it is observed online, not a measured A/B
+delta (EVALUATION.md Track D covers that distinction).
 
 No-op (silent, zero output) when CLAUDE_RUNWAY_TRACK_SAVINGS is off, or when
 this session logged no credited compression events -- an empty summary isn't
@@ -148,8 +149,8 @@ def main():
         # #307: events existing isn't enough to print -- `event_count` counts
         # CREDITED events only (see _write_session_rows), so a fetch_url-only
         # session (logged but never credited) rolls up into the perpetual
-        # store above but stays silent here instead of printing a "0 tokens
-        # avoided" summary, matching the documented no-op behavior.
+        # store above but stays silent here instead of printing an all-zero
+        # characters summary, matching the documented no-op behavior.
         if not session_agg.get("event_count"):
             sys.exit(0)
         project_summary = savings_ledger.query_project_summary(project)

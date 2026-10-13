@@ -1278,10 +1278,10 @@ class SavingsFooterRedactsSourceCredentials(unittest.TestCase):
 
 
 class SavingsFooterCarriesExactChars(unittest.TestCase):
-    """Issue #437: the footer carries exact character counts of the same two
-    texts the token estimates come from -- raw_text and the returned outer_text."""
+    """Issues #437/#438: the footer carries exact character counts of raw_text and
+    the returned outer_text, and no longer the chars / 3.5 token estimates."""
 
-    def test_footer_has_exact_char_counts_next_to_token_estimates(self):
+    def test_footer_has_exact_char_counts_and_no_token_estimates(self):
         mod = _load_compress_mcp_server()
         mod.TRACK_SAVINGS = True
         raw_text = "r" * 701
@@ -1293,8 +1293,8 @@ class SavingsFooterCarriesExactChars(unittest.TestCase):
         footer = json.loads(result.split("<!--CLAUDE_RUNWAY_SAVINGS:")[1].rsplit("-->", 1)[0])
         self.assertEqual(footer["raw_chars"], 701)
         self.assertEqual(footer["out_chars"], len(outer_text))
-        self.assertIn("raw_tokens", footer)   # the estimate is kept, not replaced
-        self.assertIn("out_tokens", footer)
+        self.assertNotIn("raw_tokens", footer)
+        self.assertNotIn("out_tokens", footer)
 
 
 class _FakeStreamedResponse:

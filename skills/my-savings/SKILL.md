@@ -1,10 +1,10 @@
 # Skill: my-savings
 
-Show the opt-in ClaudeRunway savings tracker: an estimate of context tokens avoided by local compression this session, plus this project's history. This includes both the `local-compress` MCP server's tools (`compress_file`, `compress_command_output`, `fetch_url`) and the `compress_output.py` hook's own compressions of Bash/Grep/Glob/WebFetch/WebSearch output — both contribute to the same session total.
+Show the opt-in ClaudeRunway savings tracker: the exact characters before and after local compression this session, and the percent reduction, plus this project's history. This includes both the `local-compress` MCP server's tools (`compress_file`, `compress_command_output`, `fetch_url`) and the `compress_output.py` hook's own compressions of Bash/Grep/Glob/WebFetch/WebSearch output — both contribute to the same session total.
 
 Optional argument: `detail` (e.g. `/my-savings detail`), `trend` (e.g. `/my-savings trend`, `/my-savings trend day`). Omit it for the simple view.
 
-**Important — this is an estimate, not a benchmark.** This tracker computes a live, online estimate of a counterfactual ("what would this have cost without compression"), not a controlled A/B measurement. `EVALUATION.md`'s tracks measure that rigorously by running a task twice; this skill reports what a heuristic estimator observed in real time. Don't present the two as equivalent.
+**Important — this is an observation, not a benchmark.** The character counts are exact, but the counterfactual ("what would this have cost without compression") is observed live, not measured in a controlled A/B run. `EVALUATION.md`'s tracks measure that rigorously by running a task twice; this skill reports what was observed in real time. Don't present the two as equivalent, and don't convert the character counts into tokens: the tracker deliberately doesn't (a token count depends on the model's vocabulary, which isn't public).
 
 ## When to use
 
@@ -27,5 +27,5 @@ Run this any time you want to check how much local compression has saved this se
 ## Notes
 
 - This is read-only — it never writes, modifies, or deletes anything. (The perpetual SQLite rollup happens automatically at session end via a separate hook, not through this skill.)
-- Only local-compression events are credited toward the headline number. Qdrant/`qdrant-find` activity is intentionally never counted here — its counterfactual (what Grep+Read would have cost) isn't observable, so crediting it would be a guess dressed up as a measurement. See the repo's `EVALUATION.md`.
+- Only local-compression events are credited toward the headline figures. Qdrant/`qdrant-find` activity is intentionally never counted here — its counterfactual (what Grep+Read would have cost) isn't observable, so crediting it would be a guess dressed up as a measurement. See the repo's `EVALUATION.md`.
 - `fetch_url` calls are logged but never credited — its honest counterfactual is WebFetch's own already-compressed summary, which isn't observed. The tool's output will show fetch_url call counts separately from the credited savings figure.
