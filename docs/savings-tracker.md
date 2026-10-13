@@ -39,7 +39,6 @@ Tokens Anthropic processed · claude-runway
   ────────────────────────────────────────────────────────
   Total          ~115.6M        100.0%
 
-  Local compression avoided   ~320K est.  (0.3% of total processed)
   Cache efficiency            72×  (reads vs. fresh input — higher is better)
 ```
 

@@ -1560,10 +1560,10 @@ def _format_actual_token_block(session_agg: dict, project: str = "") -> list:
         "",
     ]
 
-    saved = session_agg.get("credited_saved_tokens", 0) or 0
-    if saved:
-        rate = f"{100 * saved / total:.1f}%"
-        lines.append(f"  Local compression avoided  {_fmt_tokens(saved):>9} est.  ({rate} of total processed)")
+    # Deliberately no "local compression avoided ... % of total processed" line
+    # here (issue #436): it divided an ESTIMATE (chars/3.5 credited savings) by
+    # a MEASUREMENT (real usage from the transcript) without saying so. The
+    # compression figure already appears in the savings summary itself.
 
     # Cache efficiency ratio: how many times more cache-read tokens than fresh
     # input. A high ratio means skills/CLAUDE.md are producing stable, cacheable

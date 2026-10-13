@@ -2070,16 +2070,14 @@ class FormatActualTokenBlock(unittest.TestCase):
         self.assertIn("0.10×", joined)
         self.assertIn("5.00×", joined)
 
-    def test_savings_rate_shown_when_nonzero_saved(self):
-        lines = L._format_actual_token_block(self._agg(inp=100, out=50, cr=1000, cw=200, saved=300))
-        joined = "\n".join(lines)
-        self.assertIn("Local compression avoided", joined)
-        self.assertIn("of total processed", joined)
-
-    def test_savings_rate_absent_when_saved_is_zero(self):
-        lines = L._format_actual_token_block(self._agg(inp=100, out=50, cr=1000, cw=200, saved=0))
-        joined = "\n".join(lines)
-        self.assertNotIn("Local compression avoided", joined)
+    def test_no_compression_rate_line_even_when_saved_nonzero(self):
+        # Issue #436: the line divided an estimate by a measurement; it must
+        # not come back, whether or not savings were credited.
+        for saved in (300, 0):
+            lines = L._format_actual_token_block(self._agg(inp=100, out=50, cr=1000, cw=200, saved=saved))
+            joined = "\n".join(lines)
+            self.assertNotIn("Local compression avoided", joined)
+            self.assertNotIn("of total processed", joined)
 
     def test_cache_efficiency_shown_when_input_nonzero(self):
         # cache_read=700, input=100 -> ratio=7
