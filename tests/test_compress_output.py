@@ -579,6 +579,89 @@ class MainThreadsAgentFieldsToRecordEvent(unittest.TestCase):
         self.assertEqual(kwargs.get("agent_type"), "my-agent")
 
 
+class MainThreadsCharsAndToolUseId(MainThreadsAgentFieldsToRecordEvent):
+    """Issue #437: exact character counts and the PostToolUse `tool_use_id`
+    reach record_event on every recording path. Inherits the stub/fake-compress
+    setUp and _run_main helpers; its own inherited tests are re-run harmlessly."""
+
+    def test_mcp_footer_path_forwards_footer_chars_and_tool_use_id(self):
+        footer = json.dumps({"tool": "compress_file", "raw_tokens": 1000, "out_tokens": 100,
+                             "raw_chars": 3500, "out_chars": 350, "credited": True, "source": "f.log"})
+        self._run_main({
+            "session_id": "s", "cwd": "/repos/p", "tool_use_id": "toolu_abc",
+            "tool_name": "mcp__local-compress__compress_file",
+            "tool_response": f"[compressed 3500 -> 350 chars]\n<!--CLAUDE_RUNWAY_SAVINGS:{footer}-->",
+        })
+        kwargs = self._single_call_kwargs()
+        self.assertEqual(kwargs.get("raw_chars"), 3500)
+        self.assertEqual(kwargs.get("out_chars"), 350)
+        self.assertEqual(kwargs.get("tool_use_id"), "toolu_abc")
+
+    def test_footer_written_before_437_has_no_chars(self):
+        footer = json.dumps({"tool": "compress_file", "raw_tokens": 1000, "out_tokens": 100,
+                             "credited": True, "source": "f.log"})
+        self._run_main({
+            "session_id": "s", "cwd": "/repos/p",
+            "tool_name": "mcp__local-compress__compress_file",
+            "tool_response": f"[compressed 1000 -> 100 chars]\n<!--CLAUDE_RUNWAY_SAVINGS:{footer}-->",
+        })
+        kwargs = self._single_call_kwargs()
+        self.assertIsNone(kwargs.get("raw_chars"))
+        self.assertIsNone(kwargs.get("out_chars"))
+        self.assertIsNone(kwargs.get("tool_use_id"))
+
+    def test_malformed_footer_chars_are_dropped(self):
+        footer = json.dumps({"tool": "compress_file", "raw_tokens": 1000, "out_tokens": 100,
+                             "raw_chars": "lots", "out_chars": True, "credited": True, "source": "f.log"})
+        self._run_main({
+            "session_id": "s", "cwd": "/repos/p",
+            "tool_name": "mcp__local-compress__compress_file",
+            "tool_response": f"[compressed 1000 -> 100 chars]\n<!--CLAUDE_RUNWAY_SAVINGS:{footer}-->",
+        })
+        kwargs = self._single_call_kwargs()
+        self.assertIsNone(kwargs.get("raw_chars"))
+        self.assertIsNone(kwargs.get("out_chars"))
+
+    def test_bash_path_records_exact_lengths_of_both_texts(self):
+        stdout = "LOG LINE. " * 600
+        self._run_main({
+            "session_id": "s", "cwd": "/repos/p", "tool_use_id": "toolu_bash1",
+            "tool_name": "Bash",
+            "tool_input": {"command": "cat big.log"},
+            "tool_response": {"stdout": stdout, "stderr": ""},
+        })
+        kwargs = self._single_call_kwargs()
+        # The hook's own "raw" text is what it handed to compress(); the compressed
+        # side is _fake_compress's fixed reply. Both are exact len()s, not estimates.
+        self.assertGreaterEqual(kwargs.get("raw_chars"), len(stdout))
+        raw_chars = kwargs.get("raw_chars")
+        self.assertEqual(
+            kwargs.get("out_chars"),
+            len(f"[compressed {raw_chars} -> 4 chars across 1 chunk(s), ~99% smaller]\nGIST"))
+        self.assertEqual(kwargs.get("tool_use_id"), "toolu_bash1")
+
+    def test_generic_mcp_path_forwards_tool_use_id(self):
+        self._run_main({
+            "session_id": "s", "cwd": "/repos/p", "tool_use_id": "toolu_gen",
+            "tool_name": "mcp__local-compress__compact_find",
+            "tool_response": "STORED COMPACT CONTENT. " * 200,
+        })
+        self.assertEqual(self._single_call_kwargs().get("tool_use_id"), "toolu_gen")
+
+    def test_absent_or_non_string_tool_use_id_is_none(self):
+        for bad in (None, 123, ["x"]):
+            self.stub.calls.clear()
+            payload = {
+                "session_id": "s", "cwd": "/repos/p", "tool_name": "Bash",
+                "tool_input": {"command": "cat big.log"},
+                "tool_response": {"stdout": "LOG LINE. " * 600, "stderr": ""},
+            }
+            if bad is not None:
+                payload["tool_use_id"] = bad
+            self._run_main(payload)
+            self.assertIsNone(self._single_call_kwargs().get("tool_use_id"))
+
+
 async def _fake_compress(text, skip_if_under_chars=2000, **kwargs):
     """Deterministic stand-in for local_compress_lib.compress() -- avoids
     needing a live LM Studio model for tests that exercise the actual

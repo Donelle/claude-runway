@@ -20,6 +20,7 @@ that exact failure mode impossible to reintroduce silently again.
 
 import codecs
 import importlib.util
+import json
 import os
 import sys
 import tempfile
@@ -1274,6 +1275,26 @@ class SavingsFooterRedactsSourceCredentials(unittest.TestCase):
             source=source,
         )
         self.assertNotIn(secret, result)
+
+
+class SavingsFooterCarriesExactChars(unittest.TestCase):
+    """Issue #437: the footer carries exact character counts of the same two
+    texts the token estimates come from -- raw_text and the returned outer_text."""
+
+    def test_footer_has_exact_char_counts_next_to_token_estimates(self):
+        mod = _load_compress_mcp_server()
+        mod.TRACK_SAVINGS = True
+        raw_text = "r" * 701
+        outer_text = "[compressed 701 -> 10 chars across 1 chunk(s), ~99% smaller]\n\nsummary"
+        result = mod._append_savings_footer(
+            outer_text=outer_text, inner_result=outer_text,
+            tool="compress_file", raw_text=raw_text, credited=True, source="f.log",
+        )
+        footer = json.loads(result.split("<!--CLAUDE_RUNWAY_SAVINGS:")[1].rsplit("-->", 1)[0])
+        self.assertEqual(footer["raw_chars"], 701)
+        self.assertEqual(footer["out_chars"], len(outer_text))
+        self.assertIn("raw_tokens", footer)   # the estimate is kept, not replaced
+        self.assertIn("out_tokens", footer)
 
 
 class _FakeStreamedResponse:

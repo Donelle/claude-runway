@@ -208,7 +208,9 @@ def current_session_id(project: Optional[str] = None) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 def record_event(session_id: str, tool: str, raw_tokens: int, out_tokens: int, credited: bool, source: str = "", project: Optional[str] = None,
-                agent_id: Optional[str] = None, agent_type: Optional[str] = None) -> None:
+                agent_id: Optional[str] = None, agent_type: Optional[str] = None,
+                raw_chars: Optional[int] = None, out_chars: Optional[int] = None,
+                tool_use_id: Optional[str] = None) -> None:
     """
     Append one compression event to the session's transient JSONL ledger.
     saved_tokens is forced to 0 for uncredited events (e.g. fetch_url, whose
@@ -235,6 +237,16 @@ def record_event(session_id: str, tool: str, raw_tokens: int, out_tokens: int, c
     was started with `claude --agent <name>`; only `agent_id` marks a subagent
     (see _aggregate_by_agent). `agent_id` lives in this transient ledger only --
     the SQLite rollup keeps just the subagent flag and `agent_type`.
+
+    `raw_chars`/`out_chars` (issue #437) are the EXACT character counts of the
+    same two texts raw_tokens/out_tokens were estimated from. Unlike the token
+    figures (len / 3.5, which undercounts real tokens) they are exact and need
+    no model or credential. They're written together, only when both are given,
+    along with `saved_chars` -- clamped at 0 and forced to 0 for uncredited
+    events exactly like saved_tokens -- so an event without them (one logged
+    before this existed) keeps its previous shape and rolls up as "unknown".
+    `tool_use_id` is the PostToolUse payload's id for the tool call; written only
+    when non-empty so a later change can join the event to its turn and model.
     """
     saved_tokens = max(0, raw_tokens - out_tokens) if credited else 0
     entry = {
@@ -247,6 +259,12 @@ def record_event(session_id: str, tool: str, raw_tokens: int, out_tokens: int, c
         "source": source[:200] if source else "",
         "project": project,
     }
+    if raw_chars is not None and out_chars is not None:
+        entry["raw_chars"] = raw_chars
+        entry["out_chars"] = out_chars
+        entry["saved_chars"] = max(0, raw_chars - out_chars) if credited else 0
+    if tool_use_id:
+        entry["tool_use_id"] = str(tool_use_id)[:200]
     if agent_id:
         entry["agent_id"] = str(agent_id)[:200]
     if agent_type:
@@ -308,7 +326,7 @@ def _parse_event_lines(lines) -> list:
 # existing databases on the same versioned path as new ones.
 # _MIGRATIONS below must gain a matching entry for every bump -- see
 # _run_migrations' docstring for how the two stay in sync (issue #30/#69).
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # Issue #365: per-session savings split by which agent earned them. One DDL
 # string shared by _connect (fresh DBs) and _migrate_to_v5 (existing DBs) so the
@@ -327,6 +345,9 @@ _SESSION_AGENTS_DDL = """
         raw_tokens_sum INTEGER NOT NULL DEFAULT 0,
         out_tokens_sum INTEGER NOT NULL DEFAULT 0,
         credited_event_count INTEGER NOT NULL DEFAULT 0,
+        raw_chars_sum INTEGER NOT NULL DEFAULT 0,
+        out_chars_sum INTEGER NOT NULL DEFAULT 0,
+        saved_chars INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (session_id, is_subagent, agent_type)
     )
 """
@@ -432,12 +453,56 @@ def _migrate_to_v5(conn) -> None:
     conn.execute(_SESSION_AGENTS_DDL)
 
 
+# Issue #437: exact character counts stored next to the estimated token fields.
+# (table, char column, token column the backfill derives it from). `sessions`
+# names its saved figure credited_saved_tokens; the other two tables saved_tokens.
+_CHAR_COLUMNS = (
+    ("sessions", "raw_chars_sum", "raw_tokens_sum"),
+    ("sessions", "out_chars_sum", "out_tokens_sum"),
+    ("sessions", "credited_saved_chars", "credited_saved_tokens"),
+    ("session_tools", "raw_chars_sum", "raw_tokens_sum"),
+    ("session_tools", "out_chars_sum", "out_tokens_sum"),
+    ("session_tools", "saved_chars", "saved_tokens"),
+    ("session_agents", "raw_chars_sum", "raw_tokens_sum"),
+    ("session_agents", "out_chars_sum", "out_tokens_sum"),
+    ("session_agents", "saved_chars", "saved_tokens"),
+)
+
+
+def _migrate_to_v6(conn) -> None:
+    """
+    Adds exact character counts (issue #437) to `sessions`, `session_tools` and
+    `session_agents`, alongside -- never replacing -- the estimated token fields.
+
+    Existing rows are backfilled as tokens x 3.5, because that is exactly how
+    they were produced (estimate_tokens is len / 3.5), so the result is the
+    original character count to within rounding (SQLite ROUND, half away from
+    zero; each event's token figure was itself rounded before being summed, so
+    a backfilled row carries a little rounding error -- see
+    docs/savings-tracker.md). The before/after pair keeps the token columns' own
+    "unknown" convention: a row whose raw_tokens_sum or out_tokens_sum is 0
+    (DEFAULT 0 means "unknown" -- see _migrate_to_v1/v3) gets 0 for the matching
+    character column too, never a figure derived from something else. The saved
+    figure is always known, so it is always backfilled.
+
+    Backfills only a column this call actually adds: a column already present
+    (a DB whose CREATE TABLE already had it) may hold real exact counts that a
+    token-derived guess must never overwrite.
+    """
+    for table, char_col, token_col in _CHAR_COLUMNS:
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if char_col in existing:
+            continue
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {char_col} INTEGER NOT NULL DEFAULT 0")
+        conn.execute(f"UPDATE {table} SET {char_col} = CAST(ROUND({token_col} * 3.5) AS INTEGER)")
+
+
 # Maps target schema version -> the function that migrates INTO it from the
 # version immediately before. The next schema change adds one more entry here
 # and bumps SCHEMA_VERSION -- _run_migrations doesn't need to change at all,
 # which is the actual "scaffold" issue #69 asked for: a repeatable shape for
 # schema changes, not a one-off patch for this specific set of columns.
-_MIGRATIONS = {1: _migrate_to_v1, 2: _migrate_to_v2, 3: _migrate_to_v3, 4: _migrate_to_v4, 5: _migrate_to_v5}
+_MIGRATIONS = {1: _migrate_to_v1, 2: _migrate_to_v2, 3: _migrate_to_v3, 4: _migrate_to_v4, 5: _migrate_to_v5, 6: _migrate_to_v6}
 
 
 def _table_exists(conn, name: str) -> bool:
@@ -565,7 +630,10 @@ def _ensure_schema(conn) -> None:
             actual_input_tokens INTEGER NOT NULL DEFAULT 0,
             actual_output_tokens INTEGER NOT NULL DEFAULT 0,
             actual_cache_read_tokens INTEGER NOT NULL DEFAULT 0,
-            actual_cache_write_tokens INTEGER NOT NULL DEFAULT 0
+            actual_cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+            raw_chars_sum INTEGER NOT NULL DEFAULT 0,
+            out_chars_sum INTEGER NOT NULL DEFAULT 0,
+            credited_saved_chars INTEGER NOT NULL DEFAULT 0
         )
         """
     )
@@ -579,6 +647,9 @@ def _ensure_schema(conn) -> None:
             raw_tokens_sum INTEGER NOT NULL DEFAULT 0,
             out_tokens_sum INTEGER NOT NULL DEFAULT 0,
             credited_event_count INTEGER NOT NULL DEFAULT 0,
+            raw_chars_sum INTEGER NOT NULL DEFAULT 0,
+            out_chars_sum INTEGER NOT NULL DEFAULT 0,
+            saved_chars INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (session_id, tool)
         )
         """
@@ -620,6 +691,26 @@ def get_schema_overhead_tokens() -> int:
     return int(get_meta("schema_overhead_tokens", "0") or "0")
 
 
+# Per-event exact-character fields (issue #437) -> the aggregate key each one
+# sums into. An event logged before #437 has none of them, so it contributes
+# nothing -- "unknown", the same as a backfilled row.
+_EVENT_CHAR_FIELDS = (("raw_chars", "raw_chars_sum"), ("out_chars", "out_chars_sum"), ("saved_chars", "saved_chars"))
+
+
+def _zero_chars() -> dict:
+    return {key: 0 for _, key in _EVENT_CHAR_FIELDS}
+
+
+def _int_field(v) -> int:
+    """A hand-edited or corrupt JSONL line must not sink the roll-up."""
+    return v if isinstance(v, int) and not isinstance(v, bool) else 0
+
+
+def _add_event_chars(agg: dict, e: dict) -> None:
+    for field, key in _EVENT_CHAR_FIELDS:
+        agg[key] += _int_field(e.get(field))
+
+
 def _aggregate_by_agent(events: list) -> list:
     """
     Group a session's events by which agent earned them (issue #365). Returns a
@@ -644,6 +735,7 @@ def _aggregate_by_agent(events: list) -> list:
             "raw_tokens_sum": 0,
             "out_tokens_sum": 0,
             "credited_event_count": 0,
+            **_zero_chars(),
         })
         agg["event_count"] += 1
         if e.get("credited"):
@@ -651,6 +743,7 @@ def _aggregate_by_agent(events: list) -> list:
             agg["raw_tokens_sum"] += e.get("raw_tokens", 0)
             agg["out_tokens_sum"] += e.get("out_tokens", 0)
             agg["credited_event_count"] += 1
+            _add_event_chars(agg, e)
     rows = [{"is_subagent": k[0], "agent_type": k[1], **v} for k, v in groups.items()]
     rows.sort(key=lambda r: (-r["saved_tokens"], r["is_subagent"], r["agent_type"]))
     return rows
@@ -685,6 +778,9 @@ def _write_session_rows(conn, session_id: str, project: str, events: list, overh
     credited_saved = sum(e.get("saved_tokens", 0) for e in credited)
     raw_sum = sum(e.get("raw_tokens", 0) for e in credited)
     out_sum = sum(e.get("out_tokens", 0) for e in credited)
+    chars_sum = _zero_chars()
+    for e in credited:
+        _add_event_chars(chars_sum, e)
     # Credited-only, not len(events): the reduction % (and raw/out sums above)
     # are computed from credited events only, so the "N events" figure shown
     # alongside them must match that same subset or the two numbers disagree
@@ -703,11 +799,13 @@ def _write_session_rows(conn, session_id: str, project: str, events: list, overh
             "raw_tokens_sum": 0,
             "out_tokens_sum": 0,
             "credited_event_count": 0,
+            **_zero_chars(),
         })
         agg["event_count"] += 1
         if e.get("credited"):
             agg["saved_tokens"] += e.get("saved_tokens", 0)
             agg["raw_tokens_sum"] += e.get("raw_tokens", 0)
+            _add_event_chars(agg, e)
             # Actual out_tokens (pre-clamping) for accurate avg % computation --
             # see _migrate_to_v3's docstring for why raw - saved_tokens is wrong.
             agg["out_tokens_sum"] += e.get("out_tokens", 0)
@@ -722,15 +820,18 @@ def _write_session_rows(conn, session_id: str, project: str, events: list, overh
     actual_cw   = int(_at.get("cache_write",0) or 0)
 
     session_values = (session_id, project, ended_at, credited_saved, raw_sum, out_sum, event_count,
-                      fetch_url_count, overhead_tokens, actual_inp, actual_out, actual_cr, actual_cw)
+                      fetch_url_count, overhead_tokens, actual_inp, actual_out, actual_cr, actual_cw,
+                      chars_sum["raw_chars_sum"], chars_sum["out_chars_sum"], chars_sum["saved_chars"])
     session_columns = (
         "(session_id, project, ended_at, credited_saved_tokens, raw_tokens_sum, out_tokens_sum, "
         " event_count, fetch_url_count, overhead_tokens, "
-        " actual_input_tokens, actual_output_tokens, actual_cache_read_tokens, actual_cache_write_tokens) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        " actual_input_tokens, actual_output_tokens, actual_cache_read_tokens, actual_cache_write_tokens, "
+        " raw_chars_sum, out_chars_sum, credited_saved_chars) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     # Per-key counter columns shared by session_tools and session_agents.
-    counters = ("event_count", "saved_tokens", "raw_tokens_sum", "out_tokens_sum", "credited_event_count")
+    counters = ("event_count", "saved_tokens", "raw_tokens_sum", "out_tokens_sum", "credited_event_count",
+                "raw_chars_sum", "out_chars_sum", "saved_chars")
     add_counters = ", ".join(f"{c} = {c} + excluded.{c}" for c in counters)
     if accumulate:
         # SQLite UPSERT (3.24+): with no existing row this is a plain INSERT
@@ -744,6 +845,9 @@ def _write_session_rows(conn, session_id: str, project: str, events: list, overh
             "credited_saved_tokens = credited_saved_tokens + excluded.credited_saved_tokens, "
             "raw_tokens_sum = raw_tokens_sum + excluded.raw_tokens_sum, "
             "out_tokens_sum = out_tokens_sum + excluded.out_tokens_sum, "
+            "raw_chars_sum = raw_chars_sum + excluded.raw_chars_sum, "
+            "out_chars_sum = out_chars_sum + excluded.out_chars_sum, "
+            "credited_saved_chars = credited_saved_chars + excluded.credited_saved_chars, "
             "event_count = event_count + excluded.event_count, "
             "fetch_url_count = fetch_url_count + excluded.fetch_url_count, "
             "overhead_tokens = excluded.overhead_tokens, "
@@ -762,18 +866,22 @@ def _write_session_rows(conn, session_id: str, project: str, events: list, overh
     for tool, agg in by_tool.items():
         conn.execute(
             "INSERT INTO session_tools (session_id, tool, event_count, saved_tokens, "
-            "raw_tokens_sum, out_tokens_sum, credited_event_count) VALUES (?, ?, ?, ?, ?, ?, ?)"
+            "raw_tokens_sum, out_tokens_sum, credited_event_count, raw_chars_sum, out_chars_sum, saved_chars) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
             + tools_conflict,
             (session_id, tool, agg["event_count"], agg["saved_tokens"],
-             agg["raw_tokens_sum"], agg["out_tokens_sum"], agg["credited_event_count"]),
+             agg["raw_tokens_sum"], agg["out_tokens_sum"], agg["credited_event_count"],
+             agg["raw_chars_sum"], agg["out_chars_sum"], agg["saved_chars"]),
         )
     for row in by_agent:
         conn.execute(
             "INSERT INTO session_agents (session_id, is_subagent, agent_type, event_count, saved_tokens, "
-            "raw_tokens_sum, out_tokens_sum, credited_event_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            "raw_tokens_sum, out_tokens_sum, credited_event_count, raw_chars_sum, out_chars_sum, saved_chars) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
             + agents_conflict,
             (session_id, row["is_subagent"], row["agent_type"], row["event_count"], row["saved_tokens"],
-             row["raw_tokens_sum"], row["out_tokens_sum"], row["credited_event_count"]),
+             row["raw_tokens_sum"], row["out_tokens_sum"], row["credited_event_count"],
+             row["raw_chars_sum"], row["out_chars_sum"], row["saved_chars"]),
         )
 
     return {
@@ -782,6 +890,9 @@ def _write_session_rows(conn, session_id: str, project: str, events: list, overh
         "credited_saved_tokens": credited_saved,
         "raw_tokens_sum": raw_sum,
         "out_tokens_sum": out_sum,
+        "raw_chars_sum": chars_sum["raw_chars_sum"],
+        "out_chars_sum": chars_sum["out_chars_sum"],
+        "credited_saved_chars": chars_sum["saved_chars"],
         "event_count": event_count,
         "fetch_url_count": fetch_url_count,
         "overhead_tokens": overhead_tokens,
@@ -1147,6 +1258,7 @@ def get_live_session_aggregate(session_id: str) -> dict:
             "raw_tokens_sum": 0,
             "out_tokens_sum": 0,
             "credited_event_count": 0,
+            **_zero_chars(),
         })
         agg["event_count"] += 1
         if e.get("credited"):
@@ -1154,11 +1266,18 @@ def get_live_session_aggregate(session_id: str) -> dict:
             agg["raw_tokens_sum"] += e.get("raw_tokens", 0)
             agg["out_tokens_sum"] += e.get("out_tokens", 0)
             agg["credited_event_count"] += 1
+            _add_event_chars(agg, e)
+    live_chars = _zero_chars()
+    for e in credited:
+        _add_event_chars(live_chars, e)
     return {
         "session_id": session_id,
         "credited_saved_tokens": sum(e.get("saved_tokens", 0) for e in credited),
         "raw_tokens_sum": sum(e.get("raw_tokens", 0) for e in credited),
         "out_tokens_sum": sum(e.get("out_tokens", 0) for e in credited),
+        "raw_chars_sum": live_chars["raw_chars_sum"],
+        "out_chars_sum": live_chars["out_chars_sum"],
+        "credited_saved_chars": live_chars["saved_chars"],
         "event_count": len(credited),  # credited-only -- see finalize_session's comment
         "fetch_url_count": sum(1 for e in events if e.get("tool") == "fetch_url"),
         "overhead_tokens": get_schema_overhead_tokens(),

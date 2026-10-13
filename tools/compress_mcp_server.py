@@ -229,6 +229,9 @@ def _append_savings_footer(outer_text: str, inner_result: str, tool: str, raw_te
         "tool": tool,
         "raw_tokens": estimate_tokens(raw_text),
         "out_tokens": estimate_tokens(outer_text),
+        # Exact character counts of the same two texts (issue #437).
+        "raw_chars": len(raw_text),
+        "out_chars": len(outer_text),
         "credited": credited,
         "source": redacted_source[:200],
     })

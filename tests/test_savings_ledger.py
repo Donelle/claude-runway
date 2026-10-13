@@ -2637,5 +2637,195 @@ class OrphanedLedgerRecovery(SavingsLedgerTestCase):
         self.assertEqual(L.recover_orphaned_sessions(now=self.now), 0)
 
 
+class ExactCharCountsAndToolUseId(SavingsLedgerTestCase):
+    """Issue #437: exact character counts and the tool-call id are recorded next
+    to the estimated token fields, rolled up at SessionEnd and in orphan
+    recovery, and a pre-v6 database migrates with a tokens x 3.5 backfill."""
+
+    def test_event_stores_exact_chars_alongside_tokens(self):
+        L.record_event("s", "hook:Bash", 1000, 100, True, "cmd", raw_chars=3501, out_chars=351)
+        e = L.read_session_events("s")[0]
+        self.assertEqual((e["raw_chars"], e["out_chars"], e["saved_chars"]), (3501, 351, 3150))
+        self.assertEqual((e["raw_tokens"], e["out_tokens"], e["saved_tokens"]), (1000, 100, 900))
+
+    def test_saved_chars_clamped_and_zero_when_uncredited(self):
+        L.record_event("s", "hook:Bash", 100, 150, True, raw_chars=350, out_chars=525)
+        L.record_event("s", "fetch_url", 100, 10, False, raw_chars=350, out_chars=35)
+        clamped, uncredited = L.read_session_events("s")
+        self.assertEqual(clamped["saved_chars"], 0)
+        self.assertEqual((uncredited["raw_chars"], uncredited["saved_chars"]), (350, 0))
+
+    def test_event_without_chars_keeps_its_old_shape(self):
+        L.record_event("s", "hook:Bash", 1000, 100, True, "cmd")
+        e = L.read_session_events("s")[0]
+        for key in ("raw_chars", "out_chars", "saved_chars", "tool_use_id"):
+            self.assertNotIn(key, e)
+
+    def test_tool_use_id_stored_when_present_and_empty_when_absent(self):
+        L.record_event("s", "hook:Bash", 1000, 100, True, tool_use_id="toolu_01")
+        L.record_event("s", "hook:Bash", 1000, 100, True, tool_use_id="")
+        L.record_event("s", "hook:Bash", 1000, 100, True, tool_use_id=None)
+        with_id, empty, none = L.read_session_events("s")
+        self.assertEqual(with_id["tool_use_id"], "toolu_01")
+        self.assertNotIn("tool_use_id", empty)
+        self.assertNotIn("tool_use_id", none)
+
+    def test_finalize_rolls_chars_up_into_all_three_tables(self):
+        L.record_event("s", "hook:Bash", 1000, 100, True, raw_chars=3500, out_chars=350)
+        L.record_event("s", "hook:Bash", 2000, 200, True, raw_chars=7000, out_chars=700,
+                       agent_id="a1", agent_type="Explore")
+        L.record_event("s", "fetch_url", 5000, 50, False, raw_chars=17500, out_chars=175)  # uncredited: excluded
+        L.record_event("s", "hook:Bash", 10, 10, True)  # pre-#437 style event: contributes nothing
+        agg = L.finalize_session("s", "proj")
+        self.assertEqual((agg["raw_chars_sum"], agg["out_chars_sum"], agg["credited_saved_chars"]),
+                         (10500, 1050, 9450))
+        conn = sqlite3.connect(str(L.resolve_db_path()))
+        self.assertEqual(
+            conn.execute("SELECT raw_chars_sum, out_chars_sum, credited_saved_chars FROM sessions").fetchone(),
+            (10500, 1050, 9450))
+        self.assertEqual(
+            conn.execute("SELECT raw_chars_sum, out_chars_sum, saved_chars FROM session_tools "
+                         "WHERE tool = 'hook:Bash'").fetchone(), (10500, 1050, 9450))
+        self.assertEqual(
+            conn.execute("SELECT raw_chars_sum, out_chars_sum, saved_chars FROM session_tools "
+                         "WHERE tool = 'fetch_url'").fetchone(), (0, 0, 0))
+        agents = {(r[0], r[1]): r[2:] for r in conn.execute(
+            "SELECT is_subagent, agent_type, raw_chars_sum, out_chars_sum, saved_chars FROM session_agents")}
+        self.assertEqual(agents[(1, "Explore")], (7000, 700, 6300))
+        self.assertEqual(agents[(0, "")], (3500, 350, 3150))
+        conn.close()
+
+    def test_live_aggregate_reports_chars_too(self):
+        L.record_event("s", "hook:Bash", 1000, 100, True, raw_chars=3500, out_chars=350)
+        agg = L.get_live_session_aggregate("s")
+        self.assertEqual((agg["raw_chars_sum"], agg["out_chars_sum"], agg["credited_saved_chars"]),
+                         (3500, 350, 3150))
+        self.assertEqual(agg["by_tool"]["hook:Bash"]["saved_chars"], 3150)
+
+    def test_corrupt_char_field_does_not_sink_the_rollup(self):
+        L.record_event("s", "hook:Bash", 1000, 100, True, raw_chars=3500, out_chars=350)
+        path = L._session_jsonl_path("s")
+        entry = json.loads(path.read_text().splitlines()[0])
+        entry["raw_chars"] = "lots"
+        path.write_text(json.dumps(entry) + "\n")
+        agg = L.finalize_session("s", "proj")
+        self.assertEqual(agg["raw_chars_sum"], 0)
+        self.assertEqual(agg["credited_saved_tokens"], 900)
+
+    def test_orphan_recovery_rolls_chars_up(self):
+        ttl_patch = mock.patch.dict(os.environ, {"CLAUDE_RUNWAY_SESSION_MARKER_TTL_HOURS": ""})
+        ttl_patch.start()
+        self.addCleanup(ttl_patch.stop)
+        now = time.time()
+        L.record_event("crashed", "compress_file", 1000, 100, True, project="proj",
+                       raw_chars=3500, out_chars=350)
+        ts = now - session_id_lib._ttl_hours() * 3600 - 60
+        os.utime(L._session_jsonl_path("crashed"), (ts, ts))
+        self.assertEqual(L.recover_orphaned_sessions(now=now), 1)
+        conn = sqlite3.connect(str(L.resolve_db_path()))
+        self.assertEqual(
+            conn.execute("SELECT raw_chars_sum, out_chars_sum, credited_saved_chars FROM sessions "
+                         "WHERE session_id = 'crashed'").fetchone(), (3500, 350, 3150))
+        conn.close()
+
+    def test_accumulating_rollups_add_chars(self):
+        L.record_event("s", "hook:Bash", 1000, 100, True, raw_chars=3500, out_chars=350)
+        L.finalize_owned_session("s", "proj")
+        L.record_event("s", "hook:Bash", 1000, 100, True, raw_chars=3500, out_chars=350)
+        L.finalize_owned_session("s", "proj")
+        conn = sqlite3.connect(str(L.resolve_db_path()))
+        self.assertEqual(
+            conn.execute("SELECT raw_chars_sum, credited_saved_chars FROM sessions").fetchone(), (7000, 6300))
+        self.assertEqual(
+            conn.execute("SELECT raw_chars_sum, saved_chars FROM session_tools").fetchone(), (7000, 6300))
+        conn.close()
+
+    def _make_v5_db(self):
+        """A database exactly as v5 left it: no character columns anywhere."""
+        conn = sqlite3.connect(str(L.resolve_db_path()))
+        conn.execute(
+            "CREATE TABLE sessions (session_id TEXT PRIMARY KEY, project TEXT NOT NULL, ended_at TEXT NOT NULL, "
+            "credited_saved_tokens INTEGER NOT NULL, raw_tokens_sum INTEGER NOT NULL DEFAULT 0, "
+            "out_tokens_sum INTEGER NOT NULL DEFAULT 0, event_count INTEGER NOT NULL, fetch_url_count INTEGER NOT NULL, "
+            "overhead_tokens INTEGER NOT NULL DEFAULT 0, actual_input_tokens INTEGER NOT NULL DEFAULT 0, "
+            "actual_output_tokens INTEGER NOT NULL DEFAULT 0, actual_cache_read_tokens INTEGER NOT NULL DEFAULT 0, "
+            "actual_cache_write_tokens INTEGER NOT NULL DEFAULT 0)")
+        conn.execute(
+            "CREATE TABLE session_tools (session_id TEXT NOT NULL, tool TEXT NOT NULL, event_count INTEGER NOT NULL, "
+            "saved_tokens INTEGER NOT NULL, raw_tokens_sum INTEGER NOT NULL DEFAULT 0, "
+            "out_tokens_sum INTEGER NOT NULL DEFAULT 0, credited_event_count INTEGER NOT NULL DEFAULT 0, "
+            "PRIMARY KEY (session_id, tool))")
+        conn.execute(
+            "CREATE TABLE session_agents (session_id TEXT NOT NULL, is_subagent INTEGER NOT NULL, "
+            "agent_type TEXT NOT NULL DEFAULT '', event_count INTEGER NOT NULL, saved_tokens INTEGER NOT NULL, "
+            "raw_tokens_sum INTEGER NOT NULL DEFAULT 0, out_tokens_sum INTEGER NOT NULL DEFAULT 0, "
+            "credited_event_count INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (session_id, is_subagent, agent_type))")
+        # known before/after (odd token counts so x3.5 lands on a .5 and rounding is exercised)
+        conn.execute("INSERT INTO sessions (session_id, project, ended_at, credited_saved_tokens, raw_tokens_sum, "
+                     "out_tokens_sum, event_count, fetch_url_count) VALUES ('known', 'p', '2026-09-01T00:00:00Z', "
+                     "900, 1001, 101, 3, 0)")
+        # v1-era row: saved known, before/after unknown (0)
+        conn.execute("INSERT INTO sessions (session_id, project, ended_at, credited_saved_tokens, event_count, "
+                     "fetch_url_count) VALUES ('legacy', 'p', '2026-08-01T00:00:00Z', 42, 3, 0)")
+        # v2-era tool row: raw known, out unknown
+        conn.execute("INSERT INTO session_tools (session_id, tool, event_count, saved_tokens, raw_tokens_sum) "
+                     "VALUES ('legacy', 'hook:Bash', 3, 42, 100)")
+        conn.execute("INSERT INTO session_agents (session_id, is_subagent, agent_type, event_count, saved_tokens, "
+                     "raw_tokens_sum, out_tokens_sum) VALUES ('known', 1, 'Explore', 2, 300, 400, 100)")
+        conn.execute("PRAGMA user_version = 5")
+        conn.commit()
+        conn.close()
+
+    def test_v5_database_migrates_with_tokens_times_3_5_backfill(self):
+        self._make_v5_db()
+        conn = L._connect()  # runs the v6 migration
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], L.SCHEMA_VERSION)
+        sess = {r[0]: r[1:] for r in conn.execute(
+            "SELECT session_id, raw_chars_sum, out_chars_sum, credited_saved_chars FROM sessions")}
+        # 1001 * 3.5 = 3503.5 -> 3504 (ROUND half away from zero); 101 * 3.5 = 353.5 -> 354; 900 * 3.5 = 3150
+        self.assertEqual(sess["known"], (3504, 354, 3150))
+        # unknown before/after stay unknown (0); the saved figure is still backfilled (42 * 3.5 = 147)
+        self.assertEqual(sess["legacy"], (0, 0, 147))
+        tool = conn.execute("SELECT raw_chars_sum, out_chars_sum, saved_chars FROM session_tools").fetchone()
+        self.assertEqual(tool, (350, 0, 147))
+        agent = conn.execute("SELECT raw_chars_sum, out_chars_sum, saved_chars FROM session_agents").fetchone()
+        self.assertEqual(agent, (1400, 350, 1050))
+        conn.close()
+
+    def test_migrated_ledger_still_rolls_up_new_sessions_and_keeps_token_data(self):
+        self._make_v5_db()
+        L.record_event("new", "hook:Bash", 1000, 100, True, raw_chars=3500, out_chars=350)
+        L.finalize_session("new", "p")
+        conn = sqlite3.connect(str(L.resolve_db_path()))
+        self.assertEqual(
+            conn.execute("SELECT credited_saved_tokens, raw_tokens_sum FROM sessions "
+                         "WHERE session_id = 'known'").fetchone(), (900, 1001))
+        self.assertEqual(
+            conn.execute("SELECT credited_saved_chars FROM sessions WHERE session_id = 'new'").fetchone(), (3150,))
+        conn.close()
+        self.assertEqual(L.query_project_summary("p")["sessions"], 3)
+
+    def test_migration_does_not_overwrite_existing_char_columns(self):
+        # A DB whose table already has the column (e.g. created by this file's own
+        # CREATE TABLE while user_version lagged) must keep its real exact counts.
+        self._make_v5_db()
+        conn = sqlite3.connect(str(L.resolve_db_path()))
+        conn.execute("ALTER TABLE sessions ADD COLUMN raw_chars_sum INTEGER NOT NULL DEFAULT 0")
+        conn.execute("UPDATE sessions SET raw_chars_sum = 7 WHERE session_id = 'known'")
+        conn.commit()
+        conn.close()
+        conn = L._connect()
+        self.assertEqual(
+            conn.execute("SELECT raw_chars_sum FROM sessions WHERE session_id = 'known'").fetchone(), (7,))
+        conn.close()
+
+    def test_fresh_database_has_char_columns(self):
+        conn = L._connect()
+        for table in ("sessions", "session_tools", "session_agents"):
+            cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+            self.assertTrue({"raw_chars_sum", "out_chars_sum"} <= cols, table)
+        conn.close()
+
+
 if __name__ == "__main__":
     unittest.main()
