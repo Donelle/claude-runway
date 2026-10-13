@@ -8,7 +8,7 @@ Optional argument: a keyword or phrase to narrow which compact to find (e.g., `/
 
 1. **Identify the project**: Note the current working directory name.
 
-2. **Call `compact_find`** with:
+2. **Call `compact_find`** (on the `qdrant` MCP server) with:
    - `project`: the working directory name from step 1
    - `query` (optional): the argument if one was provided (e.g., `"auth refactor"`)
 

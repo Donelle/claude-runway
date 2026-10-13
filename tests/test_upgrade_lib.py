@@ -35,6 +35,7 @@ REPO_ROOT = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, str(REPO_ROOT / "libs"))
 
 from upgrade_lib import (  # noqa: E402
+    COMPACT_TOOLS_MATCHER,
     MIGRATIONS,
     MigrationContext,
     is_project_configured,
@@ -51,6 +52,11 @@ def _ctx() -> MigrationContext:
 
 def _migration(migration_id: str):
     return next(m for m in MIGRATIONS if m.id == migration_id)
+
+
+# The compress hook's matcher as `init` wrote it before the compact tools moved
+# to the qdrant server: it lists the local-compress tools, not the compact tools.
+_OLD_MATCHER = "Bash|Grep|WebFetch|Glob|WebSearch|mcp__local-compress__.*"
 
 
 class MemoryBankServerMissing(unittest.TestCase):
@@ -387,32 +393,25 @@ class RecordSessionIdHooksMissing(unittest.TestCase):
         self.assertFalse(migration.detect({}, after_settings))
 
 
-class HfHubOfflineMissing(unittest.TestCase):
-    def test_detect_true_when_key_absent(self):
-        migration = _migration("hf-hub-offline-missing")
-        mcp_json = {"mcpServers": {"qdrant": {"env": {"FASTEMBED_CACHE_PATH": "/x"}}}}
-        self.assertTrue(migration.detect(mcp_json, {}))
+class ObsoleteMigrationsAreGone(unittest.TestCase):
+    """`hf-hub-offline-missing` and `local-compress-embedding-model-missing` were
+    replaced by `qdrant-server-replaced`: the new server needs no HF_HUB_OFFLINE
+    (the embedding provider loads from the local cache without the network on
+    its own), and the compact embedding model now lives in the qdrant block,
+    where that migration carries it over."""
 
-    def test_detect_false_when_present_even_if_blank(self):
-        # Present-but-blank is the "already applied, not yet warmed" state --
-        # NOT the same as missing entirely.
-        migration = _migration("hf-hub-offline-missing")
-        mcp_json = {"mcpServers": {"qdrant": {"env": {"HF_HUB_OFFLINE": ""}}}}
-        self.assertFalse(migration.detect(mcp_json, {}))
+    def test_neither_old_migration_is_offered_any_more(self):
+        ids = {m.id for m in MIGRATIONS}
+        self.assertNotIn("hf-hub-offline-missing", ids)
+        self.assertNotIn("local-compress-embedding-model-missing", ids)
 
-    def test_detect_false_when_present_and_set(self):
-        migration = _migration("hf-hub-offline-missing")
-        mcp_json = {"mcpServers": {"qdrant": {"env": {"HF_HUB_OFFLINE": "1"}}}}
-        self.assertFalse(migration.detect(mcp_json, {}))
-
-    def test_apply_adds_blank_value_only(self):
-        migration = _migration("hf-hub-offline-missing")
-        before = {"mcpServers": {"qdrant": {"env": {"COLLECTION_NAME": "my-project"}}}}
-        after_mcp, after_settings = migration.apply(before, {}, _ctx())
-        self.assertEqual(after_mcp["mcpServers"]["qdrant"]["env"]["HF_HUB_OFFLINE"], "")
-        self.assertEqual(after_mcp["mcpServers"]["qdrant"]["env"]["COLLECTION_NAME"], "my-project")
-        self.assertEqual(after_settings, {})
-        self.assertNotIn("HF_HUB_OFFLINE", before["mcpServers"]["qdrant"]["env"])
+    def test_a_block_without_hf_hub_offline_is_not_pending_on_its_own(self):
+        mcp_json = {"mcpServers": {"qdrant": {"command": "/venv/bin/python", "args": ["/t/tools/qdrant_mcp_server.py"],
+                                              "env": {"COLLECTION_NAME": "p"}},
+                                   "memory-bank": {"env": {}}, "codebase-indexer": {"env": {"MEMORY_BANK_COLLECTION": "m"}}}}
+        settings = {"hooks": {"SessionStart": [{"hooks": [{"args": ["/x/hooks/record_session_id.py"]}]}],
+                              "SessionEnd": [{"hooks": [{"args": ["/x/hooks/record_session_id.py"]}]}]}}
+        self.assertEqual(pending_migrations(mcp_json, settings), [])
 
 
 class RecordSessionIdSessionstart(unittest.TestCase):
@@ -593,54 +592,244 @@ class RecordSessionIdSessionstart(unittest.TestCase):
         self.assertFalse(migration.detect({}, after_settings))
 
 
-class LocalCompressEmbeddingModelMissing(unittest.TestCase):
-    """Issue #397: existing installs stored compacts with BAAI/bge-small-en
-    (the server used to hardcode it), so the migration must pin THAT, never
-    the new template default, or their compact history is orphaned."""
+class QdrantServerReplaced(unittest.TestCase):
+    """The `qdrant` block must be rewritten from the third-party console script
+    to this repo's own server, with the compact settings moved over from
+    `local-compress`, WITHOUT orphaning compacts already stored: they live under
+    a model-named vector, so the compact embedding model has to carry over."""
+
+    _ID = "qdrant-server-replaced"
+    _SERVER = f"{REPO_ROOT.as_posix()}/tools/qdrant_mcp_server.py"
 
     def _migration(self):
-        return _migration("local-compress-embedding-model-missing")
+        return _migration(self._ID)
 
-    def test_detect_true_when_env_lacks_embedding_model(self):
-        mcp_json = {"mcpServers": {"local-compress": {"env": {"COMPACT_COLLECTION": "c"}}}}
-        self.assertTrue(self._migration().detect(mcp_json, {}))
-
-    def test_detect_true_when_embedding_model_is_blank(self):
-        mcp_json = {"mcpServers": {"local-compress": {"env": {"EMBEDDING_MODEL": "  "}}}}
-        self.assertTrue(self._migration().detect(mcp_json, {}))
-
-    def test_detect_false_when_set(self):
-        mcp_json = {"mcpServers": {"local-compress": {"env": {"EMBEDDING_MODEL": "x/y"}}}}
-        self.assertFalse(self._migration().detect(mcp_json, {}))
-
-    def test_detect_false_without_a_local_compress_block(self):
-        self.assertFalse(self._migration().detect({"mcpServers": {"qdrant": {}}}, {}))
-
-    def test_apply_pins_the_legacy_model_and_touches_nothing_else(self):
-        before = {
+    def _pre_split(self):
+        """A realistic pre-split `.mcp.json`, as `init` wrote it before the move."""
+        return {
             "mcpServers": {
-                "qdrant": {"env": {"EMBEDDING_MODEL": "sentence-transformers/all-MiniLM-L6-v2"}},
-                "local-compress": {"env": {"COMPACT_COLLECTION": "custom-prefix"}},
+                "qdrant": {
+                    "command": "/old/venv/bin/mcp-server-qdrant",
+                    "type": "stdio",
+                    "env": {
+                        "QDRANT_URL": "http://remote-qdrant:6333",
+                        "QDRANT_API_KEY": "real-key",
+                        "COLLECTION_NAME": "my-project",
+                        "EMBEDDING_MODEL": "sentence-transformers/all-mpnet-base-v2",
+                        "FASTEMBED_CACHE_PATH": "/home/user/.claude/claude-runway/fastembed-cache",
+                        "HF_HUB_OFFLINE": "1",
+                        "TOOL_FIND_DESCRIPTION": "custom find text",
+                        "TOOL_STORE_DESCRIPTION": "custom store text",
+                    },
+                },
+                "codebase-indexer": {"command": "/old/venv/bin/python", "env": {"COLLECTION_NAME": "my-project"}},
+                "memory-bank": {"command": "/old/venv/bin/python", "env": {"MEMORY_BANK_ID": "my-project"}},
+                "local-compress": {
+                    "command": "/old/venv/bin/python",
+                    "env": {
+                        "CLAUDE_RUNWAY_LMSTUDIO_URL": "http://lm-host:1234/v1",
+                        "CLAUDE_RUNWAY_LMSTUDIO_MODEL": "qwen-small",
+                        "QDRANT_URL": "http://remote-qdrant:6333",
+                        "QDRANT_API_KEY": "real-key",
+                        "COMPACT_COLLECTION": "my-compacts",
+                        "EMBEDDING_MODEL": "BAAI/bge-small-en",
+                        "CLAUDE_RUNWAY_TRACK_SAVINGS": "1",
+                    },
+                },
             }
         }
-        snapshot = copy.deepcopy(before)
-        after_mcp, after_settings = self._migration().apply(before, {}, _ctx())
-        env = after_mcp["mcpServers"]["local-compress"]["env"]
-        self.assertEqual(env["EMBEDDING_MODEL"], "BAAI/bge-small-en")
-        self.assertEqual(env["COMPACT_COLLECTION"], "custom-prefix")
-        self.assertEqual(after_mcp["mcpServers"]["qdrant"], before["mcpServers"]["qdrant"])
+
+    # --- detect ---
+
+    def test_detect_true_for_the_console_script_command(self):
+        self.assertTrue(self._migration().detect(self._pre_split(), {}))
+
+    def test_detect_true_for_a_windows_exe_command(self):
+        mcp_json = {"mcpServers": {"qdrant": {"command": "C:/tools/.venv/Scripts/mcp-server-qdrant.exe", "env": {}}}}
+        self.assertTrue(self._migration().detect(mcp_json, {}))
+
+    def test_detect_true_when_a_launcher_runs_the_package_through_args(self):
+        mcp_json = {"mcpServers": {"qdrant": {"command": "uvx", "args": ["mcp-server-qdrant"], "env": {}}}}
+        self.assertTrue(self._migration().detect(mcp_json, {}))
+
+    def test_detect_false_once_the_block_runs_the_own_server(self):
+        after, _ = self._migration().apply(self._pre_split(), {}, _ctx())
+        self.assertFalse(self._migration().detect(after, {}))
+
+    def test_detect_false_without_a_qdrant_block_or_with_a_malformed_one(self):
+        for mcp_json in ({}, {"mcpServers": {}}, {"mcpServers": {"qdrant": None}}, {"mcpServers": {"qdrant": "x"}},
+                         {"mcpServers": {"qdrant": {"command": 7, "args": "nope"}}}):
+            with self.subTest(mcp_json=mcp_json):
+                self.assertFalse(self._migration().detect(mcp_json, {}))
+
+    def test_detect_false_for_an_unrelated_custom_launcher(self):
+        mcp_json = {"mcpServers": {"qdrant": {"command": "/opt/my-own-qdrant-wrapper", "env": {}}}}
+        self.assertFalse(self._migration().detect(mcp_json, {}))
+
+    # --- apply: the rewritten qdrant block ---
+
+    def test_apply_rewrites_command_args_and_env_exactly(self):
+        after, after_settings = self._migration().apply(self._pre_split(), {}, _ctx())
+        block = after["mcpServers"]["qdrant"]
+        self.assertEqual(block["command"], "/fake/venv/bin/python")
+        self.assertEqual(block["type"], "stdio")
+        self.assertEqual(block["args"], [self._SERVER])
+        self.assertEqual(
+            block["env"],
+            {
+                "QDRANT_URL": "http://remote-qdrant:6333",
+                "QDRANT_API_KEY": "real-key",
+                "COLLECTION_NAME": "my-project",
+                "EMBEDDING_MODEL": "sentence-transformers/all-mpnet-base-v2",
+                "COMPACT_COLLECTION": "my-compacts",
+                "COMPACT_EMBEDDING_MODEL": "BAAI/bge-small-en",
+                "CLAUDE_RUNWAY_LMSTUDIO_URL": "http://lm-host:1234/v1",
+                "CLAUDE_RUNWAY_LMSTUDIO_MODEL": "qwen-small",
+            },
+        )
         self.assertEqual(after_settings, {})
-        self.assertEqual(before, snapshot)  # never mutated in place
-        self.assertFalse(self._migration().detect(after_mcp, {}))
+
+    def test_apply_drops_what_the_new_server_does_not_read(self):
+        env = self._migration().apply(self._pre_split(), {}, _ctx())[0]["mcpServers"]["qdrant"]["env"]
+        for gone in ("HF_HUB_OFFLINE", "FASTEMBED_CACHE_PATH", "TOOL_FIND_DESCRIPTION", "TOOL_STORE_DESCRIPTION"):
+            self.assertNotIn(gone, env)
+
+    def test_apply_touches_no_other_server_and_never_mutates_its_input(self):
+        before = self._pre_split()
+        snapshot = copy.deepcopy(before)
+        after, _ = self._migration().apply(before, {}, _ctx())
+        self.assertEqual(before, snapshot)
+        for name in ("codebase-indexer", "memory-bank", "local-compress"):
+            self.assertEqual(after["mcpServers"][name], snapshot["mcpServers"][name], name)
+
+    def test_apply_is_idempotent(self):
+        once, _ = self._migration().apply(self._pre_split(), {}, _ctx())
+        self.assertFalse(self._migration().detect(once, {}))
+        twice, _ = self._migration().apply(once, {}, _ctx())
+        self.assertEqual(twice, once)
+
+    # --- apply: the compact embedding model must never move ---
+
+    def test_an_install_that_never_set_the_model_is_pinned_to_the_legacy_one(self):
+        # Compacts stored before the setting existed were embedded with
+        # BAAI/bge-small-en whatever the code-index model is.
+        before = self._pre_split()
+        del before["mcpServers"]["local-compress"]["env"]["EMBEDDING_MODEL"]
+        env = self._migration().apply(before, {}, _ctx())[0]["mcpServers"]["qdrant"]["env"]
+        self.assertEqual(env["COMPACT_EMBEDDING_MODEL"], "BAAI/bge-small-en")
+        self.assertEqual(env["EMBEDDING_MODEL"], "sentence-transformers/all-mpnet-base-v2")
+
+    def test_a_blank_local_compress_model_counts_as_never_set(self):
+        before = self._pre_split()
+        before["mcpServers"]["local-compress"]["env"]["EMBEDDING_MODEL"] = "  "
+        env = self._migration().apply(before, {}, _ctx())[0]["mcpServers"]["qdrant"]["env"]
+        self.assertEqual(env["COMPACT_EMBEDDING_MODEL"], "BAAI/bge-small-en")
+
+    def test_a_model_the_user_set_in_local_compress_is_carried_over(self):
+        before = self._pre_split()
+        before["mcpServers"]["local-compress"]["env"]["EMBEDDING_MODEL"] = "x/custom-compact-model"
+        env = self._migration().apply(before, {}, _ctx())[0]["mcpServers"]["qdrant"]["env"]
+        self.assertEqual(env["COMPACT_EMBEDDING_MODEL"], "x/custom-compact-model")
+
+    def test_a_missing_local_compress_block_does_not_prove_no_compact_was_ever_stored(self):
+        # A full setup later re-run with `init --qdrant-only` deletes the
+        # local-compress block but leaves its compacts in Qdrant, embedded with the
+        # legacy model. Guessing the project model here would orphan them; guessing
+        # legacy for a project that never stored one costs nothing.
+        before = self._pre_split()
+        del before["mcpServers"]["local-compress"]
+        env = self._migration().apply(before, {}, _ctx())[0]["mcpServers"]["qdrant"]["env"]
+        self.assertEqual(env["COMPACT_EMBEDDING_MODEL"], "BAAI/bge-small-en")
+        self.assertEqual(env["EMBEDDING_MODEL"], "sentence-transformers/all-mpnet-base-v2")
+        self.assertEqual(env["COMPACT_COLLECTION"], "conversation-compacts")
+        self.assertEqual(env["CLAUDE_RUNWAY_LMSTUDIO_URL"], "http://localhost:1234/v1")
+        self.assertEqual(env["CLAUDE_RUNWAY_LMSTUDIO_MODEL"], "")
+
+    # --- apply: the Qdrant URL and key must survive wherever they were kept ---
+
+    def _without_qdrant_connection(self, *names):
+        """The pre-split config with URL and key removed from the named blocks."""
+        before = self._pre_split()
+        for name in names:
+            for key in ("QDRANT_URL", "QDRANT_API_KEY"):
+                before["mcpServers"][name]["env"].pop(key, None)
+        return before
+
+    def test_a_key_kept_only_in_local_compress_survives(self):
+        before = self._without_qdrant_connection("qdrant")
+        env = self._migration().apply(before, {}, _ctx())[0]["mcpServers"]["qdrant"]["env"]
+        self.assertEqual(env["QDRANT_API_KEY"], "real-key")
+        self.assertEqual(env["QDRANT_URL"], "http://remote-qdrant:6333")
+
+    def test_a_key_kept_only_in_the_indexer_or_memory_bank_survives(self):
+        for holder in ("codebase-indexer", "memory-bank"):
+            with self.subTest(holder=holder):
+                before = self._without_qdrant_connection("qdrant", "local-compress")
+                before["mcpServers"][holder]["env"].update(
+                    {"QDRANT_URL": "http://other:6333", "QDRANT_API_KEY": f"key-from-{holder}"}
+                )
+                env = self._migration().apply(before, {}, _ctx())[0]["mcpServers"]["qdrant"]["env"]
+                self.assertEqual(env["QDRANT_API_KEY"], f"key-from-{holder}")
+                self.assertEqual(env["QDRANT_URL"], "http://other:6333")
+
+    def test_the_old_qdrant_blocks_own_values_win_over_the_other_blocks(self):
+        before = self._pre_split()
+        before["mcpServers"]["local-compress"]["env"].update({"QDRANT_URL": "http://stale:6333", "QDRANT_API_KEY": "stale"})
+        env = self._migration().apply(before, {}, _ctx())[0]["mcpServers"]["qdrant"]["env"]
+        self.assertEqual((env["QDRANT_URL"], env["QDRANT_API_KEY"]), ("http://remote-qdrant:6333", "real-key"))
+
+    def test_a_blank_key_in_the_qdrant_block_falls_through_to_one_that_is_set(self):
+        before = self._pre_split()
+        before["mcpServers"]["qdrant"]["env"]["QDRANT_API_KEY"] = ""
+        env = self._migration().apply(before, {}, _ctx())[0]["mcpServers"]["qdrant"]["env"]
+        self.assertEqual(env["QDRANT_API_KEY"], "real-key")
+
+    def test_an_unauthenticated_install_stays_unauthenticated(self):
+        before = self._without_qdrant_connection("qdrant", "local-compress")
+        env = self._migration().apply(before, {}, _ctx())[0]["mcpServers"]["qdrant"]["env"]
+        self.assertEqual(env["QDRANT_API_KEY"], "")
+        self.assertEqual(env["QDRANT_URL"], "http://localhost:6333")
+
+    # --- apply: fallbacks for a sparse, hand-built block ---
+
+    def test_collection_and_model_fall_back_to_the_codebase_indexer_block(self):
+        before = {
+            "mcpServers": {
+                "qdrant": {"command": "/old/bin/mcp-server-qdrant", "env": {}},
+                "codebase-indexer": {"env": {"COLLECTION_NAME": "from-indexer", "EMBEDDING_MODEL": "x/indexer-model"}},
+            }
+        }
+        env = self._migration().apply(before, {}, _ctx())[0]["mcpServers"]["qdrant"]["env"]
+        self.assertEqual(env["COLLECTION_NAME"], "from-indexer")
+        self.assertEqual(env["EMBEDDING_MODEL"], "x/indexer-model")
+        self.assertEqual(env["QDRANT_URL"], "http://localhost:6333")
+        self.assertEqual(env["QDRANT_API_KEY"], "")
+
+    def test_a_block_with_no_env_at_all_still_gets_a_complete_one(self):
+        before = {"mcpServers": {"qdrant": {"command": "/old/bin/mcp-server-qdrant"}}}
+        block = self._migration().apply(before, {}, _ctx())[0]["mcpServers"]["qdrant"]
+        self.assertEqual(block["args"], [self._SERVER])
+        self.assertEqual(
+            set(block["env"]),
+            {"QDRANT_URL", "QDRANT_API_KEY", "COLLECTION_NAME", "EMBEDDING_MODEL", "COMPACT_COLLECTION",
+             "COMPACT_EMBEDDING_MODEL", "CLAUDE_RUNWAY_LMSTUDIO_URL", "CLAUDE_RUNWAY_LMSTUDIO_MODEL"},
+        )
+
+    def test_no_placeholder_survives_in_the_rewritten_block(self):
+        from setup_project_lib import find_unresolved_placeholders
+
+        block = self._migration().apply(self._pre_split(), {}, _ctx())[0]["mcpServers"]["qdrant"]
+        self.assertEqual(find_unresolved_placeholders(block), [])
 
 
 class PendingMigrations(unittest.TestCase):
     def test_all_pending_on_a_fully_stale_project(self):
         # A project with the old PostToolUse '.*' block (issue #198 config)
-        # plus no memory-bank / HF_HUB_OFFLINE: every migration pending.
+        # plus no memory-bank and the third-party qdrant server: every
+        # migration pending.
         mcp_json = {
             "mcpServers": {
-                "qdrant": {"env": {}},
+                "qdrant": {"command": "/old/venv/bin/mcp-server-qdrant", "env": {}},
                 "codebase-indexer": {"env": {}},
                 "local-compress": {"env": {}},
             }
@@ -649,7 +838,7 @@ class PendingMigrations(unittest.TestCase):
             "hooks": {
                 "PostToolUse": [
                     {"matcher": ".*", "hooks": [{"args": ["/x/hooks/record_session_id.py"]}]},
-                    {"matcher": "Bash", "hooks": [{"args": ["/x/hooks/compress_bash_output.py"]}]},
+                    {"matcher": _OLD_MATCHER, "hooks": [{"args": ["/x/hooks/compress_bash_output.py"]}]},
                 ]
             }
         }
@@ -659,7 +848,7 @@ class PendingMigrations(unittest.TestCase):
     def test_none_pending_on_a_fully_up_to_date_project(self):
         mcp_json = {
             "mcpServers": {
-                "qdrant": {"env": {"HF_HUB_OFFLINE": ""}},
+                "qdrant": {"command": "/venv/bin/python", "args": ["/t/tools/qdrant_mcp_server.py"], "env": {}},
                 "codebase-indexer": {"env": {"MEMORY_BANK_COLLECTION": "memory-bank"}},
                 "memory-bank": {"env": {}},
             }
@@ -722,7 +911,7 @@ class RunUpgradeEndToEnd(unittest.TestCase):
 
     def _write_stale_config(self):
         # A project configured by issues #175/#198/#221 but BEFORE #231:
-        # has memory-bank and HF_HUB_OFFLINE absent (pre-#175/#221), plus
+        # has memory-bank absent (pre-#175) and the third-party qdrant server, plus
         # the OLD PostToolUse '.*' registration for record_session_id.py
         # (issue #198's original design, superseded by SessionStart in #231).
         # This exercises every migration in one end-to-end run.
@@ -735,7 +924,8 @@ class RunUpgradeEndToEnd(unittest.TestCase):
                             "env": {"QDRANT_URL": "http://localhost:6333", "COLLECTION_NAME": "my-target-project"},
                         },
                         "codebase-indexer": {"env": {"COLLECTION_NAME": "my-target-project"}},
-                        # Pre-#397: no EMBEDDING_MODEL in the local-compress env.
+                        # No EMBEDDING_MODEL in the local-compress env: compacts were stored
+                        # under the legacy model.
                         "local-compress": {"env": {"COMPACT_COLLECTION": "conversation-compacts"}},
                     }
                 }
@@ -759,7 +949,7 @@ class RunUpgradeEndToEnd(unittest.TestCase):
                                 ],
                             },
                             {
-                                "matcher": "Bash",
+                                "matcher": _OLD_MATCHER,
                                 "hooks": [
                                     {
                                         "type": "command",
@@ -797,7 +987,11 @@ class RunUpgradeEndToEnd(unittest.TestCase):
 
         mcp_json, settings_json = self._read_configs()
         self.assertIn("memory-bank", mcp_json["mcpServers"])
-        self.assertEqual(mcp_json["mcpServers"]["qdrant"]["env"]["HF_HUB_OFFLINE"], "")
+        qdrant = mcp_json["mcpServers"]["qdrant"]
+        self.assertEqual(qdrant["command"], "/fake/venv/bin/python")
+        self.assertTrue(qdrant["args"][0].endswith("tools/qdrant_mcp_server.py"))
+        self.assertEqual(qdrant["env"]["COMPACT_EMBEDDING_MODEL"], "BAAI/bge-small-en")
+        self.assertEqual(qdrant["env"]["COMPACT_COLLECTION"], "conversation-compacts")
         # record_session_id.py must now live under SessionStart (not PostToolUse).
         start_scripts = [
             Path(a).name
@@ -814,6 +1008,13 @@ class RunUpgradeEndToEnd(unittest.TestCase):
             for a in hook["args"]
         ]
         self.assertIn("compress_output.py", post_scripts)
+        # ...and its matcher now also routes the compact tools to it.
+        compress_matchers = [
+            block["matcher"]
+            for block in settings_json["hooks"]["PostToolUse"]
+            if any(Path(a).name == "compress_output.py" for hook in block["hooks"] for a in hook["args"])
+        ]
+        self.assertEqual(compress_matchers, [f"{_OLD_MATCHER}|{COMPACT_TOOLS_MATCHER}"])
         # The stale '.*' PostToolUse block for record_session_id.py was removed.
         wildcard_scripts = [
             Path(a).name
@@ -851,7 +1052,7 @@ class RunUpgradeEndToEnd(unittest.TestCase):
         self.assertEqual(set(applied), {m.id for m in MIGRATIONS})
 
     def test_declining_a_migration_leaves_it_pending_next_run(self):
-        declined_id = "hf-hub-offline-missing"
+        declined_id = "qdrant-server-replaced"
 
         def _decline_one(migration, index, total):
             return migration.id != declined_id
@@ -861,7 +1062,7 @@ class RunUpgradeEndToEnd(unittest.TestCase):
         self.assertIn("memory-bank-server-missing", applied)
 
         mcp_json, _ = self._read_configs()
-        self.assertNotIn("HF_HUB_OFFLINE", mcp_json["mcpServers"]["qdrant"]["env"])
+        self.assertEqual(mcp_json["mcpServers"]["qdrant"]["command"], "/old/venv/bin/mcp-server-qdrant")
 
         # Declined migration reappears as pending on the next run.
         second_pending = pending_migrations(*self._read_configs())
@@ -941,7 +1142,7 @@ class RunUpgradeWritesOnlyChangedFiles(unittest.TestCase):
     """Issue #278: run_upgrade must write only the documents an applied
     migration actually changed, and must not report a no-op apply as applied."""
 
-    _MCP_COMPACT = '{"mcpServers":{"qdrant":{"command":"/x","env":{"COLLECTION_NAME":"p"}}}}'
+    _MCP_COMPACT = '{"mcpServers":{"qdrant":{"command":"/x/bin/mcp-server-qdrant","env":{"COLLECTION_NAME":"p"}}}}'
 
     def setUp(self):
         self._tmpdir = tempfile.TemporaryDirectory()
@@ -961,12 +1162,12 @@ class RunUpgradeWritesOnlyChangedFiles(unittest.TestCase):
             self.target_repo,
             REPO_ROOT,
             _VENV_PYTHON,
-            prompt_fn=lambda m, i, t: m.id == "hf-hub-offline-missing",
+            prompt_fn=lambda m, i, t: m.id == "qdrant-server-replaced",
         )
-        self.assertEqual(applied, ["hf-hub-offline-missing"])
+        self.assertEqual(applied, ["qdrant-server-replaced"])
         self.assertFalse(self.settings_path.exists(), "settings.json must not be materialized")
         written = json.loads(self.mcp_path.read_text(encoding="utf-8"))
-        self.assertIn("HF_HUB_OFFLINE", written["mcpServers"]["qdrant"]["env"])
+        self.assertEqual(written["mcpServers"]["qdrant"]["command"], "/fake/venv/bin/python")
 
     def test_settings_only_migration_leaves_mcp_json_bytes_untouched(self):
         self.settings_path.parent.mkdir()
@@ -1007,6 +1208,88 @@ class RunUpgradeWritesOnlyChangedFiles(unittest.TestCase):
         self.assertEqual(applied, [])
         self.assertEqual(self.settings_path.read_text(encoding="utf-8"), settings_text)
         self.assertEqual(self.mcp_path.read_text(encoding="utf-8"), self._MCP_COMPACT)
+
+
+class CompressHookMatcherCoversCompactTools(unittest.TestCase):
+    """The compact tools moved from `mcp__local-compress__` to `mcp__qdrant__`.
+    A compress-hook matcher `init` wrote before that no longer reaches the hook
+    for them after `qdrant-server-replaced`, so `upgrade` must add the new
+    alternative, idempotently, without touching anything it does not own."""
+
+    _ID = "compress-hook-matcher-covers-compact-tools"
+    _HOOK = "/old/tools-repo/hooks/compress_output.py"
+
+    def _settings(self, matcher, script=None, extra_blocks=()):
+        script = script or self._HOOK
+        return {"hooks": {"PostToolUse": [
+            {"matcher": matcher, "hooks": [{"type": "command", "command": "py", "args": [script]}]},
+            *extra_blocks,
+        ]}}
+
+    def _matcher_of(self, settings):
+        return settings["hooks"]["PostToolUse"][0]["matcher"]
+
+    def test_the_constant_is_exactly_what_the_shipped_template_carries(self):
+        template = json.loads((REPO_ROOT / "templates" / "settings.json.template").read_text(encoding="utf-8"))
+        [block] = [b for b in template["hooks"]["PostToolUse"]
+                   if any(Path(a).name == "compress_output.py" for h in b["hooks"] for a in h["args"])]
+        self.assertIn(COMPACT_TOOLS_MATCHER, block["matcher"])
+        # ...directly after the local-compress alternative, which is where apply splices it in.
+        self.assertIn(f"mcp__local-compress__.*|{COMPACT_TOOLS_MATCHER}", block["matcher"])
+
+    def test_detect_true_for_a_matcher_written_before_the_move(self):
+        self.assertTrue(_migration(self._ID).detect({}, self._settings(_OLD_MATCHER)))
+
+    def test_detect_true_for_the_legacy_hook_name_too(self):
+        settings = self._settings(_OLD_MATCHER, script="/old/tools-repo/hooks/compress_bash_output.py")
+        self.assertTrue(_migration(self._ID).detect({}, settings))
+
+    def test_detect_false_once_the_matcher_has_the_alternative(self):
+        self.assertFalse(_migration(self._ID).detect({}, self._settings(f"{_OLD_MATCHER}|{COMPACT_TOOLS_MATCHER}")))
+
+    def test_detect_false_for_a_matcher_the_user_wrote_by_hand(self):
+        for matcher in ("Bash", "Bash|Grep", "mcp__github__.*"):
+            with self.subTest(matcher=matcher):
+                self.assertFalse(_migration(self._ID).detect({}, self._settings(matcher)))
+
+    def test_detect_false_without_a_compress_hook_or_without_settings(self):
+        other = {"hooks": {"PostToolUse": [{"matcher": _OLD_MATCHER, "hooks": [{"args": ["/x/my_own_hook.py"]}]}]}}
+        self.assertFalse(_migration(self._ID).detect({}, other))
+        self.assertFalse(_migration(self._ID).detect({}, {}))
+        self.assertFalse(_migration(self._ID).detect({}, {"hooks": {"PostToolUse": [{"hooks": []}]}}))  # no matcher key
+
+    def test_apply_splices_the_alternative_in_right_after_the_local_compress_one(self):
+        github = "mcp__github__(?:search_code|get_issue)$"
+        before = self._settings(f"Bash|WebFetch|mcp__local-compress__.*|{github}|mcp__example_tools__.*")
+        after_mcp, after = _migration(self._ID).apply({"mcpServers": {}}, before, _ctx())
+        self.assertEqual(
+            self._matcher_of(after),
+            f"Bash|WebFetch|mcp__local-compress__.*|{COMPACT_TOOLS_MATCHER}|{github}|mcp__example_tools__.*",
+        )
+        self.assertEqual(after_mcp, {"mcpServers": {}})
+
+    def test_apply_touches_only_the_matcher_and_never_mutates_its_input(self):
+        other_block = {"matcher": "Bash", "hooks": [{"command": "my-hook", "args": ["my_hook.py"]}]}
+        before = self._settings(_OLD_MATCHER, extra_blocks=(other_block,))
+        snapshot = copy.deepcopy(before)
+        _, after = _migration(self._ID).apply({}, before, _ctx())
+        self.assertEqual(before, snapshot)
+        expected = copy.deepcopy(snapshot)
+        expected["hooks"]["PostToolUse"][0]["matcher"] = f"{_OLD_MATCHER}|{COMPACT_TOOLS_MATCHER}"
+        self.assertEqual(after, expected)
+
+    def test_apply_is_idempotent(self):
+        once = _migration(self._ID).apply({}, self._settings(_OLD_MATCHER), _ctx())[1]
+        self.assertFalse(_migration(self._ID).detect({}, once))
+        twice = _migration(self._ID).apply({}, once, _ctx())[1]
+        self.assertEqual(twice, once)
+        self.assertEqual(self._matcher_of(twice).count(COMPACT_TOOLS_MATCHER), 1)
+
+    def test_it_fixes_every_compress_hook_block_that_needs_it(self):
+        second = {"matcher": _OLD_MATCHER, "hooks": [{"command": "py", "args": [self._HOOK]}]}
+        before = self._settings(_OLD_MATCHER, extra_blocks=(second,))
+        after = _migration(self._ID).apply({}, before, _ctx())[1]
+        self.assertEqual([b["matcher"] for b in after["hooks"]["PostToolUse"]], [f"{_OLD_MATCHER}|{COMPACT_TOOLS_MATCHER}"] * 2)
 
 
 class CompressHookRenamed(unittest.TestCase):

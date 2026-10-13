@@ -353,6 +353,72 @@ class RunDoctor(unittest.TestCase):
         self.assertTrue(result.mismatches[0].shell_value.endswith("savings.db"))
 
 
+class QdrantBlockIsCheckedToo(unittest.TestCase):
+    """The `qdrant` block carries the LM Studio URL/model `compact_store`
+    compresses with, so a shell that disagrees with it is the same silent split
+    the local-compress check exists to catch."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.target_repo = Path(self._tmpdir.name) / "my-project"
+        self.target_repo.mkdir()
+        self.home_dir = Path("/home/testuser")
+
+    def _write(self, qdrant_env, local_compress_env=None):
+        servers = {"qdrant": {"command": "x", "env": qdrant_env}}
+        if local_compress_env is not None:
+            servers["local-compress"] = {"command": "x", "env": local_compress_env}
+        (self.target_repo / ".mcp.json").write_text(json.dumps({"mcpServers": servers}), encoding="utf-8")
+
+    def _doctor(self, shell_env):
+        return doctor_lib.run_doctor(self.target_repo, shell_env=shell_env, home_dir=self.home_dir)
+
+    def test_a_qdrant_block_that_agrees_with_the_shell_is_ok(self):
+        self._write({"CLAUDE_RUNWAY_LMSTUDIO_URL": "http://lm:1234/v1", "CLAUDE_RUNWAY_LMSTUDIO_MODEL": "m"})
+        result = self._doctor({"CLAUDE_RUNWAY_LMSTUDIO_URL": "http://lm:1234/v1", "CLAUDE_RUNWAY_LMSTUDIO_MODEL": "m"})
+        self.assertEqual(result.mismatches, [])
+        self.assertTrue(result.qdrant_checked)
+        self.assertFalse(result.local_compress_configured)
+
+    def test_a_qdrant_block_mismatch_is_reported_against_the_qdrant_server(self):
+        self._write({"CLAUDE_RUNWAY_LMSTUDIO_URL": "http://block:1234/v1"})
+        result = self._doctor({"CLAUDE_RUNWAY_LMSTUDIO_URL": "http://shell:1234/v1"})
+        [mismatch] = result.mismatches
+        self.assertEqual(mismatch.var, "CLAUDE_RUNWAY_LMSTUDIO_URL")
+        self.assertEqual(mismatch.server, "qdrant")
+        self.assertEqual(mismatch.mcp_json_value, "http://block:1234/v1")
+        self.assertEqual(mismatch.shell_value, "http://shell:1234/v1")
+
+    def test_both_blocks_are_checked_and_each_mismatch_names_its_server(self):
+        self._write(
+            {"CLAUDE_RUNWAY_LMSTUDIO_MODEL": "block-model"},
+            local_compress_env={"CLAUDE_RUNWAY_TRACK_SAVINGS": "1"},
+        )
+        result = self._doctor({"CLAUDE_RUNWAY_LMSTUDIO_MODEL": "shell-model"})
+        self.assertEqual(
+            {(m.server, m.var) for m in result.mismatches},
+            {("qdrant", "CLAUDE_RUNWAY_LMSTUDIO_MODEL"), ("local-compress", "CLAUDE_RUNWAY_TRACK_SAVINGS")},
+        )
+        self.assertTrue(result.local_compress_configured)
+
+    def test_the_qdrant_blocks_other_vars_are_not_dual_config_ones(self):
+        # Only the CLAUDE_RUNWAY_* values the hooks also read can diverge.
+        self._write({"QDRANT_URL": "http://a", "COLLECTION_NAME": "c", "COMPACT_COLLECTION": "x"})
+        result = self._doctor({"QDRANT_URL": "http://b"})
+        self.assertEqual(result.mismatches, [])
+        self.assertFalse(result.qdrant_checked)
+
+    def test_a_malformed_qdrant_block_is_a_config_error(self):
+        (self.target_repo / ".mcp.json").write_text(json.dumps({"mcpServers": {"qdrant": None}}), encoding="utf-8")
+        result = self._doctor({})
+        self.assertIn("qdrant", result.config_error or "")
+
+    def test_a_non_string_value_in_the_qdrant_env_is_a_config_error(self):
+        self._write({"CLAUDE_RUNWAY_LMSTUDIO_URL": 5})
+        self.assertIn("non-string", self._doctor({}).config_error or "")
+
+
 class LegacyCompressHook(unittest.TestCase):
     """Issue #395: doctor flags a settings.json still on compress_bash_output.py."""
 

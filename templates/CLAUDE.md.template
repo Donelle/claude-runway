@@ -7,7 +7,7 @@
 
 ## Vector memory (Qdrant MCP)
 
-Two tools: `qdrant-find` (semantic search) and `qdrant-store` (save a note for later retrieval), plus `index_repo`/`sync_repo`/`preview_index`/`get_collection_info`/`find_in_collection`/`list_collections` from the codebase-indexer server.
+Five tools from the `qdrant` server: `qdrant-find` (semantic search) and `qdrant-store` (save a note for later retrieval) for this project's own knowledge, and `compact_store`/`compact_find`/`compact_prune` for conversation compacts (see below), plus `index_repo`/`sync_repo`/`preview_index`/`get_collection_info`/`find_in_collection`/`list_collections` from the codebase-indexer server.
 
 Prefer `qdrant-find` over Grep/Read for conceptual lookups — "where is X handled," "how does Y work," "what did we decide about Z." Use Grep directly for exact identifiers, error strings, or known symbols.
 
@@ -18,6 +18,8 @@ Storage convention for qdrant-store: always include file_path + line_range (or s
 Run sync_repo at the start of a session (or after a batch of edits) to keep the index current — it only re-embeds files that changed, so it's cheap to run often. Use index_repo with reset=true only for first-time indexing or after changing chunking/embedding settings. Call get_collection_info if qdrant-find comes back empty, to check whether the collection actually has data.
 
 Dedup within a session: if the same conceptual question resurfaces, reuse the earlier qdrant-find result instead of re-querying.
+
+**Conversation compacts:** `compact_store` saves a summary of the current conversation into this project's own compact collection, compressing it on the local model first when LM Studio is available and storing it as given when it is not. `compact_find` lists a project's saved compacts newest first, or searches them when given a `query`. `compact_prune` deletes old compacts by `keep_last_n` or `older_than_days`, and only reports what it would delete unless you pass `dry_run=False`. `/my-compact` and `/my-resume` call `compact_store` and `compact_find` for you, so you rarely call them by hand. Never use them for notes about the code: that is what `qdrant-store`/`qdrant-find` are for, and compacts stored there would be buried under code chunks.
 
 **Cross-repo lookups:** `qdrant-find` only ever searches THIS project's own collection. When a question genuinely requires another already-indexed repo's codebase — e.g. working in a frontend repo but needing to understand how the backend it calls actually implements an endpoint — use `find_in_collection(query, collection)` instead. If the user names an exact collection directly in their prompt, pass it through as given rather than guessing. Call `list_collections` first if you don't know the other repo's exact collection name. Don't reach for this for questions answerable from this project's own collection; it's specifically for when the answer lives in a different repo's code.
 

@@ -98,7 +98,7 @@ One session gives one number for the whole prefix, so it cannot attribute a shar
 - **On-demand loads are the part of the cost that is visible.** In 72 of the 108 sessions that parsed (whatever their first-turn classification) the transcript recorded at least one toolkit tool's schema as loaded on demand. Across all sessions that is 24 distinct tools, 53,051 characters of recorded schema in total, the largest (`index_repo`) 3,483 characters. Characters, not tokens: a token count depends on the model's vocabulary, which is not public. This is only the observed on-demand subset, not the complete cost: a schema sent up front leaves no such record, and its cost sits inside the first turn's usage, where one transcript cannot size it separately.
 - **The controlled with/without measurement was NOT made.** No pair of otherwise-identical sessions with the toolkit connected vs. removed exists in the local transcripts, so there is no measured number for "what the toolkit adds to the starting context" beyond the deferral and loaded-schema facts above. The observational comparison is not a substitute, and its "none listed" group (8 sessions) is not verified to be toolkit-free: a connected toolkit whose schemas were sent up front and never called leaves no trace. It showed *lower* starting context for sessions that listed the toolkit's tools (about 61k vs. 67k tokens on `claude-sonnet-5-5`, 63k vs. 77k on `claude-sonnet-5`, with only 4 sessions in the other group on each model), which reflects the sessions differing, not the toolkit saving anything. This also covers only the Claude Code builds that wrote those transcripts; re-run the survey after an upgrade rather than assuming it still holds.
 
-Keep the live tool count separate from this, because it is still useful and still drifts if hand-typed (a hardcoded count has gone stale before): run `python tools/report_tool_counts.py` for the current live count AND the size in characters of the tool descriptions (name + signature + docstring, a proxy for the JSON schema, not the schema itself) of `codebase-indexer`, `local-compress`, `memory-bank` and the standalone `qdrant` server (`qdrant-find`, `qdrant-store`), or read `ingest_mcp_server.py`'s stderr startup log (`[claude-runway] codebase-indexer registered N tools`). The standalone `qdrant` server is introspected by constructing the third-party `mcp_server_qdrant` package's own server directly (no live Qdrant/embedding model needed), because that package is **unpinned** in `requirements.txt` and could gain a tool without this repo changing. All of these go through `libs/mcp_tool_introspect.py`, so they can't drift relative to each other. Those are sizes of the schemas as written, not a per-turn cost. Where A4's measurement shows the toolkit adds a starting-context cost at all, that cost is what the savings on conceptual tasks have to beat.
+Keep the live tool count separate from this, because it is still useful and still drifts if hand-typed (a hardcoded count has gone stale before): run `python tools/report_tool_counts.py` for the current live count AND the size in characters of the tool descriptions (name + signature + docstring, a proxy for the JSON schema, not the schema itself) of `qdrant` (`qdrant-find`, `qdrant-store` and the three compact tools), `codebase-indexer`, `local-compress` and `memory-bank`, or read `ingest_mcp_server.py`'s stderr startup log (`[claude-runway] codebase-indexer registered N tools`). All four servers are this repo's own scripts, imported without a live Qdrant or embedding model (the `qdrant` server builds its model on first use). All of these go through `libs/mcp_tool_introspect.py`, so they can't drift relative to each other. Those are sizes of the schemas as written, not a per-turn cost. Where A4's measurement shows the toolkit adds a starting-context cost at all, that cost is what the savings on conceptual tasks have to beat.
 
 ### Step A5: Extract transcript data (optional but recommended)
 
@@ -146,9 +146,9 @@ Whether a built-in tool's own internal processing (e.g. WebFetch's server-side e
 
 ## Track C: Session continuity (`/my-compact` + `/my-resume`)
 
-This track tests a different claim than A and B: not "does the tool save tokens during a task" but "does resuming via Qdrant cost less than the alternatives across session boundaries." The `/my-compact` skill summarizes the current conversation locally (LM Studio via `compress_text`), stores the result in Qdrant, and `/my-resume` retrieves it at the start of the next session.
+This track tests a different claim than A and B: not "does the tool save tokens during a task" but "does resuming via Qdrant cost less than the alternatives across session boundaries." The `/my-compact` skill fills in a structured summary of the current conversation and hands it to `compact_store`, which compresses it locally (LM Studio) and stores the result in Qdrant in the same call, and `/my-resume` retrieves it at the start of the next session.
 
-One structural advantage over Tracks A and B: if the Qdrant and local-compress servers are already connected (which Tracks A and B require), this workflow adds no tool schemas of its own -- it reuses the same tools, so there is no additional fixed cost.
+One structural advantage over Tracks A and B: if the `qdrant` server is already connected (which Track A requires), this workflow adds no tool schemas of its own -- the compact tools live on that same server, so there is no additional fixed cost.
 
 ### The two comparisons worth making
 
@@ -157,9 +157,9 @@ One structural advantage over Tracks A and B: if the Qdrant and local-compress s
 The native `/compact` command sends the conversation to Anthropic for summarization. `/my-compact` routes the same job through LM Studio locally. Both produce a summary that seeds the next session — but the token cost profile differs:
 
 - Native `/compact`: one Anthropic API call (input = full conversation, output = summary) billed to your account
-- `/my-compact`: `compress_text` runs on LM Studio (zero Anthropic tokens), then `compact_store` + later `compact_find` each cost one tool round-trip
+- `/my-compact`: one `compact_store` call whose compression runs on LM Studio (zero Anthropic tokens), then a later `compact_find` costs one tool round-trip; the summary is written once, not passed through your output a second time as a separate compression step would have required
 
-Whether C1 shows a win depends on conversation length — short conversations may not generate enough summary-output tokens to offset the tool call overhead of `compress_text` + `compact_store`.
+Whether C1 shows a win depends on conversation length — short conversations may not generate enough summary-output tokens to offset the tool call overhead of `compact_store`.
 
 **Comparison C2: `/my-compact` + `/my-resume` vs. starting fresh**
 
@@ -176,7 +176,7 @@ Pick one realistic multi-session task — something you'd naturally pause mid-wa
 1. Run session 1 of the task until the natural stopping point. Record `/usage`.
 2. Run native `/compact`. Record the `/usage` delta (input + output tokens added by the compaction call).
 3. Quit and relaunch. Paste the compact summary manually to seed session 2. Record the `/usage` cost of that seeding turn.
-4. Repeat with `/my-compact` instead: record the `/usage` delta for the `compress_text` + `compact_store` round-trips, then in session 2 the `compact_find` round-trip cost.
+4. Repeat with `/my-compact` instead: record the `/usage` delta for the `compact_store` round-trip, then in session 2 the `compact_find` round-trip cost.
 5. Compare: total cross-session overhead of native path vs. `/my-compact` path.
 
 ### Step C3: Comparison C2 run (`/my-resume` vs. starting fresh)

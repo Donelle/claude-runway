@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 Doctor/validator for a target project's dual-config `CLAUDE_RUNWAY_*` env
-vars -- diffs `.mcp.json`'s `local-compress` env block against the live
-shell environment for each variable README's "Environment variables" table
+vars -- diffs `.mcp.json`'s `local-compress` env block (and the `qdrant`
+block's LM Studio values, which `compact_store` compresses with) against the
+live shell environment for each variable README's "Environment variables" table
 marks "both" (`CLAUDE_RUNWAY_LMSTUDIO_URL`/`_MODEL`/`_TRACK_SAVINGS`/
 `_SAVINGS_DB`), flagging any mismatch instead of relying on a human to
 notice that the MCP-server side (`compress_file`/`fetch_url`) and the
@@ -20,8 +21,8 @@ Also flags a .claude/settings.json still running the renamed-away
 `compress_bash_output.py` hook (issue #395; `upgrade` fixes it).
 
 Exit code is 1 if any mismatch (or stale hook) is found, 0 otherwise (including when
-`local-compress` isn't configured at all -- e.g. a `--qdrant-only` setup --
-which is a valid state, not a misconfiguration) -- usable as a CI/
+there is nothing to check -- e.g. a `--qdrant-only` setup whose `qdrant` block
+carries no dual-config values -- which is a valid state, not a misconfiguration) -- usable as a CI/
 pre-flight gate, not just an interactive report.
 """
 
@@ -63,7 +64,7 @@ def _format_env_report(result: DoctorResult) -> str:
         # reported "nothing to check" and exited 0 instead of surfacing
         # the real problem.
         return f"error: {result.config_error}"
-    if not result.local_compress_configured:
+    if not result.local_compress_configured and not result.qdrant_checked:
         return (
             f"No 'local-compress' server found in {result.mcp_json_path} -- nothing to check "
             "(expected if this project only uses the Qdrant memory piece, e.g. --qdrant-only)."
@@ -78,8 +79,8 @@ def _format_env_report(result: DoctorResult) -> str:
     ]
     for m in result.mismatches:
         lines.append(f"  {m.var}")
-        lines.append(f"    .mcp.json (local-compress): {m.mcp_json_value!r}")
-        lines.append(f"    shell (os.environ):         {m.shell_value!r}")
+        lines.append(f"    .mcp.json ({m.server}): {m.mcp_json_value!r}")
+        lines.append(f"    shell (os.environ): {m.shell_value!r}")
         lines.append("")
     lines.append(
         "These need matching values in both places -- see README.md's 'Environment variables' "

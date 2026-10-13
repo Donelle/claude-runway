@@ -2,8 +2,9 @@
 Shared, dependency-free logic behind `tools/doctor.py` -- a validator that
 diffs each dual-config `CLAUDE_RUNWAY_*` env var (the ones
 docs/environment-variables.md's table marks "both") between a target repo's
-`.mcp.json` `local-compress` env block and the live shell environment,
-flagging any mismatch instead of relying on a human to notice silently
+`.mcp.json` `local-compress` env block (and the `qdrant` block, which holds
+the LM Studio values `compact_store` compresses with) and the live shell
+environment, flagging any mismatch instead of relying on a human to notice silently
 split behavior (issue #49, GROW-02 in `.plans/code-review-2026-08-18.md`).
 Extends the same "loud instead of silent" idea `local_compress_lib.py`'s
 `stale_env_warning()` already applies to the *renamed*-var case, to the
@@ -21,8 +22,8 @@ enough to reproduce directly here instead -- the same "small, independent,
 dependency-free lib" precedent `setup_project_lib.py` already follows.
 
 The key semantic this whole module hinges on (see
-docs/environment-variables.md's "Why two places" section): a `CLAUDE_RUNWAY_*` key PRESENT in `.mcp.json`'s
-local-compress `env` block -- even set to `""` -- always masks/overrides
+docs/environment-variables.md's "Why two places" section): a `CLAUDE_RUNWAY_*` key PRESENT in a checked server's
+`env` block in `.mcp.json` -- even set to `""` -- always masks/overrides
 whatever the shell would otherwise supply to that subprocess; a key ABSENT
 from that block inherits straight from the shell, i.e. from the exact same
 `os.environ` this tool already reads. So a var absent from the env block
@@ -57,7 +58,7 @@ _AUTO_DETECT_MODEL = "(auto-detect -- no model pinned)"
 
 # Every CLAUDE_RUNWAY_* var docs/environment-variables.md's table marks "both" -- i.e.
 # genuinely needs matching values in .mcp.json's local-compress env block
-# AND the shell. Deliberately excluded from this list:
+# (the two LMSTUDIO ones also in the qdrant block) AND the shell. Deliberately excluded from this list:
 # - CLAUDE_RUNWAY_COMPRESS_THRESHOLD_CHARS: shell-only (compress_output.py
 #   is the sole reader); an .mcp.json copy is inert.
 # - CLAUDE_RUNWAY_CACHE_DB: read by both codebase-indexer MCP server AND
@@ -155,6 +156,8 @@ class DualEnvMismatch:
     var: str
     mcp_json_value: str
     shell_value: str
+    # Which `.mcp.json` server block held the value (`local-compress` or `qdrant`).
+    server: str = "local-compress"
 
 
 class MalformedMcpJsonError(Exception):
@@ -184,11 +187,16 @@ class MalformedMcpJsonError(Exception):
 
 
 def load_local_compress_env(mcp_json_path: Path) -> Optional[dict]:
+    """The `local-compress` server's `env` block; see `load_server_env`."""
+    return load_server_env(mcp_json_path, "local-compress")
+
+
+def load_server_env(mcp_json_path: Path, server_name: str) -> Optional[dict]:
     """
-    Returns the `local-compress` server's `env` block from `mcp_json_path`,
+    Returns the `server_name` server's `env` block from `mcp_json_path`,
     or `None` if the file doesn't exist, or exists and parses as valid
-    JSON but simply doesn't configure a `local-compress` server (e.g. a
-    `--qdrant-only` setup) -- either of which means there's nothing to
+    JSON but simply doesn't configure that server (e.g. no `local-compress`
+    in a `--qdrant-only` setup) -- either of which means there's nothing to
     dual-check here. Raises `MalformedMcpJsonError` (see its docstring) for
     every other bad shape, rather than silently treating it the same as
     "nothing configured," or crashing with an unhandled `AttributeError`
@@ -210,24 +218,24 @@ def load_local_compress_env(mcp_json_path: Path) -> Optional[dict]:
             f"{mcp_json_path}'s \"mcpServers\" is a {type(mcp_servers).__name__}, expected an object"
         )
 
-    if "local-compress" not in mcp_servers:
-        return None  # valid config, simply no local-compress server configured
+    if server_name not in mcp_servers:
+        return None  # valid config, simply no such server configured
     # Checked by KEY MEMBERSHIP, not by whether the resulting value is
-    # None -- .get("local-compress") would return None for BOTH a
+    # None -- .get(server_name) would return None for BOTH a
     # genuinely absent key AND a key explicitly present with a JSON `null`
     # value, silently treating an explicit "local-compress": null as if
     # nothing were configured at all (exit 0) instead of the malformed
     # config it actually is. Found in PR #119 review.
-    server = mcp_servers["local-compress"]
+    server = mcp_servers[server_name]
     if not isinstance(server, dict):
         raise MalformedMcpJsonError(
-            f"{mcp_json_path}'s \"local-compress\" server is a {type(server).__name__}, expected an object"
+            f"{mcp_json_path}'s \"{server_name}\" server is a {type(server).__name__}, expected an object"
         )
 
     env = server.get("env", {})
     if not isinstance(env, dict):
         raise MalformedMcpJsonError(
-            f"{mcp_json_path}'s \"local-compress\".\"env\" is a {type(env).__name__}, expected an object"
+            f"{mcp_json_path}'s \"{server_name}\".\"env\" is a {type(env).__name__}, expected an object"
         )
     # Every value must be a string -- real MCP env blocks (and real shell
     # environments) are string-valued by definition; a JSON `null`/number/
@@ -244,18 +252,18 @@ def load_local_compress_env(mcp_json_path: Path) -> Optional[dict]:
     if non_string:
         bad = ", ".join(f"{k!r} ({type(v).__name__})" for k, v in non_string.items())
         raise MalformedMcpJsonError(
-            f"{mcp_json_path}'s \"local-compress\".\"env\" has non-string value(s): {bad} -- "
+            f"{mcp_json_path}'s \"{server_name}\".\"env\" has non-string value(s): {bad} -- "
             "MCP env blocks must be string-valued"
         )
     return env
 
 
 def check_dual_env_vars(
-    mcp_env: Mapping[str, str], shell_env: Mapping[str, str], *, home_dir: Path
+    mcp_env: Mapping[str, str], shell_env: Mapping[str, str], *, home_dir: Path, server: str = "local-compress"
 ) -> list:
     """
-    Diffs every var in `DUAL_ENV_VARS` between `mcp_env` (the
-    `local-compress` server's `.mcp.json` env block) and `shell_env`
+    Diffs every var in `DUAL_ENV_VARS` between `mcp_env` (the `server`
+    block's `.mcp.json` env) and `shell_env`
     (typically `os.environ`), returning one `DualEnvMismatch` per var whose
     effective values disagree. A var absent from `mcp_env` is skipped
     entirely -- it inherits straight from `shell_env` (the exact same
@@ -268,7 +276,9 @@ def check_dual_env_vars(
         mcp_norm = _normalize(var, mcp_env[var], home_dir=home_dir)
         shell_norm = _normalize(var, shell_env.get(var), home_dir=home_dir)
         if mcp_norm != shell_norm:
-            mismatches.append(DualEnvMismatch(var=var, mcp_json_value=mcp_norm, shell_value=shell_norm))
+            mismatches.append(
+                DualEnvMismatch(var=var, mcp_json_value=mcp_norm, shell_value=shell_norm, server=server)
+            )
     return mismatches
 
 
@@ -291,6 +301,10 @@ class DoctorResult:
     mcp_json_path: Path
     local_compress_configured: bool
     mismatches: list = field(default_factory=list)
+    # True when the `qdrant` block carries at least one dual-config var (its
+    # LM Studio values), so there was something to check there even with no
+    # local-compress server (a `--qdrant-only` setup).
+    qdrant_checked: bool = False
     config_error: Optional[str] = None
     # Hook events in .claude/settings.json still invoking the pre-#395
     # compress_bash_output.py (see find_legacy_compress_hook_events).
@@ -342,18 +356,24 @@ def run_doctor(target_repo: Path, *, shell_env: Mapping[str, str], home_dir: Opt
     resolved_home = home_dir if home_dir is not None else Path.home()
     mcp_json_path = Path(target_repo) / ".mcp.json"
     try:
-        env = load_local_compress_env(mcp_json_path)
+        compress_env = load_server_env(mcp_json_path, "local-compress")
+        qdrant_env = load_server_env(mcp_json_path, "qdrant")
     except MalformedMcpJsonError as exc:
         return DoctorResult(mcp_json_path=mcp_json_path, local_compress_configured=False, config_error=str(exc))
     legacy_events = find_legacy_compress_hook_events(Path(target_repo))
-    if env is None:
-        return DoctorResult(
-            mcp_json_path=mcp_json_path, local_compress_configured=False, legacy_compress_hook_events=legacy_events
-        )
-    mismatches = check_dual_env_vars(env, shell_env, home_dir=resolved_home)
+    mismatches = []
+    if compress_env is not None:
+        mismatches += check_dual_env_vars(compress_env, shell_env, home_dir=resolved_home, server="local-compress")
+    # The qdrant block holds the LM Studio URL/model compact_store compresses
+    # with, which the shell (and the hooks) must agree with just like the
+    # local-compress block's copy. Its other vars are not dual-config ones.
+    qdrant_checked = qdrant_env is not None and any(var in qdrant_env for var in DUAL_ENV_VARS)
+    if qdrant_env is not None:
+        mismatches += check_dual_env_vars(qdrant_env, shell_env, home_dir=resolved_home, server="qdrant")
     return DoctorResult(
         mcp_json_path=mcp_json_path,
-        local_compress_configured=True,
+        local_compress_configured=compress_env is not None,
         mismatches=mismatches,
+        qdrant_checked=qdrant_checked,
         legacy_compress_hook_events=legacy_events,
     )

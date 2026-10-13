@@ -1,13 +1,13 @@
 """
 Collection-metadata marker for conversation-compact collections (issue #397).
 
-`compact_store` (tools/compress_mcp_server.py) writes saved conversation
+`compact_store` (tools/qdrant_mcp_server.py) writes saved conversation
 summaries for /my-compact and /my-resume into their own collections, which
 are only ever read back by project through `compact_find` -- never by
 semantic search. Nothing used to say so: `find_in_collection` would search
 them and `list_collections` listed them next to real codebase collections as
 if they were search targets. This module is the ONE place that defines how
-such a collection is marked internal, so the writer (compress_mcp_server.py)
+such a collection is marked internal, so the writer (qdrant_mcp_server.py)
 and the two readers (ingest_mcp_server.py's `find_in_collection` /
 `list_collections`) cannot drift apart on the key, the value, or the
 read/write rules. (libs/qdrant_collection_hints.py is a description cache

@@ -712,6 +712,62 @@ def derive_compact_label(information: str) -> str:
     return label[:_COMPACT_LABEL_MAX_CHARS].strip()
 
 
+# What the qdrant server's `compact_store` asks the local model for when it
+# compresses a conversation summary before storing it. This is the text the
+# /my-compact skill used to pass as `compress_text`'s `focus`; it lives here
+# now so the compression happens in one call inside `compact_store` instead of
+# a second tool call that sent the whole summary through Claude's output twice.
+# `compact_store` also sets preserve_identifiers and preserve_sections, which
+# are required for a handoff artifact (see compress()'s docstring for the
+# measured failures that motivated both).
+COMPACT_FOCUS = (
+    "Create a high-density handoff summary for resuming this session in a new agent instance.\n\n"
+    "CRITICAL EXTRACTION REQUIREMENTS:\n"
+    "1. Verbatim Technical Identifiers: Retain exact file paths, class/function/variable names, "
+    "CLI commands, and database schema keys without modification or generic substitution "
+    "(e.g., do NOT replace `src/utils/auth.ts` with \"the auth file\").\n"
+    "2. Session Goal & Intent: Core objective the user wants to achieve.\n"
+    "3. Decisions & Rationales: Agreed architectural choices, solutions implemented, and "
+    "explicitly rejected alternatives.\n"
+    "4. State & Next Steps: Current execution state, open errors/blockers, and immediate "
+    "actions needed to resume work immediately.\n"
+    "5. User Constraints & Rules: Specific guidelines, preferences, or boundaries established "
+    "by the user.\n\n"
+    "STYLE: Maximum signal-to-noise ratio. Eliminate conversational filler; keep the technical "
+    "specificity needed to continue the work. Tighten prose, do not drop facts."
+)
+
+# The two notices compress() prepends when preserve_sections is set and no
+# model request succeeded. What follows each is a blank line, the usual
+# "[compressed N -> M chars ...]" statistics header (it describes a run that did
+# nothing, so it is a false claim once the notice is gone), another blank line,
+# and the content, which is complete (just not summarized). A caller storing the
+# result strips both generated lines instead of treating the call as failed.
+_UNREACHABLE_PREFIX = "[LM Studio appears unreachable"
+_STATS_HEADER_PREFIX = "[compressed "
+
+
+def strip_total_outage_notice(result: str) -> Optional[str]:
+    """
+    If `result` is compress()'s total-outage fallback (every model request
+    failed), returns the preserved content (credentials already redacted)
+    without the outage notice AND without the generated "[compressed ...]"
+    statistics header that follows it, both of which are about a compression
+    that did not happen. Returns None when `result` is not that shape, so a
+    caller can tell "nothing was compressed" apart from a real result.
+    """
+    if not (result.startswith(_UNREACHABLE_PREFIX) or result.startswith(_ALL_TIMED_OUT_PREFIX)):
+        return None
+    _, sep, body = result.partition("\n\n")
+    if not sep:
+        return None
+    if body.startswith(_STATS_HEADER_PREFIX):
+        _, sep, body = body.partition("\n\n")
+        if not sep:
+            return None
+    return body
+
+
 # ---------------------------------------------------------------------------
 # In-session compression cache (issue #60)
 # ---------------------------------------------------------------------------

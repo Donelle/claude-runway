@@ -3106,6 +3106,46 @@ class TimeoutVersusConnectionFailureReporting(unittest.TestCase):
         out = self._sections([self._ok("compressed prose")])
         self.assertTrue(out.startswith("[compressed"), out)
 
+    def test_strip_total_outage_notice_removes_the_notice_and_the_false_statistics_header(self):
+        # A real outage result is: notice, blank line, a generated
+        # "[compressed N -> M chars ...]" header describing a run that did
+        # nothing, blank line, the preserved content. The caller storing the
+        # content must not keep either generated line.
+        from local_compress_lib import strip_total_outage_notice
+
+        for outcomes, prefix in (
+            ([self._conn_error()], "[LM Studio appears unreachable"),
+            ([self._timeout()], "[LM Studio timed out on every request"),
+        ):
+            with self.subTest(prefix=prefix):
+                clear_compression_cache()
+                out = self._sections(outcomes)
+                self.assertTrue(out.startswith(prefix), out)
+                self.assertIn("\n\n[compressed ", out)  # the header the finding is about really is there
+                stripped = strip_total_outage_notice(out)
+                self.assertIsNotNone(stripped)
+                assert stripped is not None
+                self.assertEqual(stripped, stripped.lstrip())
+                self.assertTrue(stripped.startswith("## "), stripped[:120])
+                self.assertNotIn("[LM Studio", stripped)
+                self.assertNotIn("[compressed ", stripped)
+                for section in ("## Current state / progress", "More narrative prose describing where things stand."):
+                    self.assertIn(section, stripped)
+
+    def test_strip_total_outage_notice_ignores_results_that_are_not_an_outage(self):
+        from local_compress_lib import strip_total_outage_notice
+
+        self.assertIsNone(strip_total_outage_notice("[compressed 10 -> 5 chars across 1 section(s), ~50% smaller]\n\nbody"))
+        self.assertIsNone(strip_total_outage_notice("Error: LM Studio request failed"))
+        self.assertIsNone(strip_total_outage_notice("plain text under the threshold"))
+
+    def test_strip_total_outage_notice_without_a_statistics_header_keeps_the_content(self):
+        from local_compress_lib import strip_total_outage_notice
+
+        notice = "[LM Studio appears unreachable -- no section was compressed; original content preserved]"
+        self.assertEqual(strip_total_outage_notice(f"{notice}\n\nthe content"), "the content")
+        self.assertIsNone(strip_total_outage_notice(notice))  # notice alone: nothing to keep
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,6 @@
 # Skill: my-compact
 
-Locally summarize and persist the current conversation to Qdrant so it can be restored in a fresh session with `/my-resume`. Everything stays local — the summarization runs on LM Studio, and storage goes to Qdrant. No Anthropic tokens are spent on the summarization step.
+Locally summarize and persist the current conversation to Qdrant so it can be restored in a fresh session with `/my-resume`. Everything stays local — `compact_store` (on the `qdrant` MCP server) compresses the summary on LM Studio and stores it in Qdrant, in one call. No Anthropic tokens are spent on the compression step, and the summary passes through your output only once.
 
 Optional argument: a short label to identify this compact (e.g., `/my-compact "auth middleware refactor"`). If omitted, `compact_store` derives the label server-side from the first sentence of "## What we were working on" in the structured summary — you do not need to extract it yourself.
 
@@ -42,46 +42,31 @@ LABEL: <label from step 2, or omit/leave blank if using server-side derivation>
 <anything left open, unclear, or deferred>
 ```
 
-4. **Compress the summary** by calling `compress_text` with:
-   - `text`: the structured summary from step 3
-   - `preserve_identifiers`: `true` — required here, not optional. The focus below asks for verbatim identifiers, but asking is not enforcing: a real 9,876-char handoff came back with the `Options` segment silently dropped from a colon-delimited config key and a stray triple-quote. This flag re-appends, verbatim, any identifier the model dropped.
-   - `preserve_sections`: `true` — also required. The same handoff lost three *entire* sections (all of its unresolved questions, all of its environment notes, and a user instruction) while still reading as complete. A single call over the whole summary can only get shorter by discarding content, and whole sections are the cheapest thing to discard. This compresses one section at a time, passes the exactness-critical sections through untouched, and re-emits every heading from the source so none can vanish.
-   - `focus`: >
-       Create a high-density handoff summary for resuming this session in a new agent instance.
-
-       CRITICAL EXTRACTION REQUIREMENTS:
-       1. Verbatim Technical Identifiers: Retain exact file paths, class/function/variable names, CLI commands, and database schema keys without modification or generic substitution (e.g., do NOT replace `src/utils/auth.ts` with "the auth file").
-       2. Session Goal & Intent: Core objective the user wants to achieve.
-       3. Decisions & Rationales: Agreed architectural choices, solutions implemented, and explicitly rejected alternatives.
-       4. State & Next Steps: Current execution state, open errors/blockers, and immediate actions needed to resume work immediately.
-       5. User Constraints & Rules: Specific guidelines, preferences, or boundaries established by the user.
-
-       STYLE: Maximum signal-to-noise ratio. Eliminate conversational filler; keep the technical specificity needed to continue the work. Tighten prose, do not drop facts.
-
-   If LM Studio is not available and `compress_text` fails, skip this step and use the uncompressed summary from step 3 directly.
-
-5. **Store in the dedicated compacts collection** by calling `compact_store` with:
-   - `information`: the output from step 4 (or step 3 if step 4 was skipped)
+4. **Store it by calling `compact_store`** (on the `qdrant` MCP server) with:
+   - `information`: the full structured summary from step 3, exactly as you filled in the template. Do NOT compress it yourself first: `compact_store` compresses it on the local model before storing it, and it asks for what a handoff needs (every file path, identifier and command kept verbatim, every `##` section kept). A second compression pass here would only throw away what that one preserves.
    - `project`: the working directory name from step 1
    - `label`: the label from step 2 — omit this parameter (or pass `""`) if no argument was given; the server derives it automatically from the summary
    - `date`: today's date
 
-   Note: `compact_store` uses a dedicated per-project Qdrant collection (e.g. `conversation-compacts-ProjectX`), isolated from the codebase index. Do NOT use `qdrant-store` here — that writes to the shared codebase collection where compacts get buried under code chunks.
+   If LM Studio is not available, `compact_store` stores the summary uncompressed instead of failing, and its reply says so; nothing for you to do. Note: `compact_store` uses a dedicated per-project Qdrant collection (e.g. `conversation-compacts-ProjectX`), isolated from the codebase index. Do NOT use `qdrant-store` here — that writes to the shared codebase collection where compacts get buried under code chunks.
 
-6. **Check the result before confirming anything.** `compact_store` returns exactly one of
-   two shapes: a success string starting with `Stored compact in '...'`, or an error string
+5. **Check the result before confirming anything.** `compact_store` returns exactly one of
+   two shapes: a success string starting with `Stored compact in '...'` (ending with a
+   parenthesized note saying whether the summary was compressed or stored uncompressed, and why), or an error string
    starting with `Error:` (currently only a non-ISO `date`, but treat any `Error:`-prefixed
    return the same way — future error paths shouldn't need this check updated). Do NOT
    assume success and confirm regardless — this has happened before: a silent
    `date`-validation failure looked identical to a real save, so the user saw a normal
    "stored successfully" confirmation and the compact was never actually stored.
    - **If it starts with `Error:`** — stop here. Show the user the exact error text and do
-     NOT print step 7's confirmation. Tell them the compact was NOT saved and they'll need
+     NOT print step 6's confirmation. Tell them the compact was NOT saved and they'll need
      to re-run `/my-compact` after the underlying issue is fixed (e.g. correct the date).
-   - **If it starts with `Stored compact in`** — proceed to step 7.
+   - **If it starts with `Stored compact in`** — proceed to step 6.
 
-7. **Confirm** to the user:
+6. **Confirm** to the user:
 
    > Conversation compacted and stored.
    > Project: `<name>` | Date: `<date>` | Label: `<label>`
    > Run `/clear` then `/my-resume` in the new session to restore context.
+
+   If the success note in step 5 said the summary was stored uncompressed, add one line saying so, with the reason it gave (for example, LM Studio was not reachable). The compact is complete either way; it is just larger.

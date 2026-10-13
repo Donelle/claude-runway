@@ -13,8 +13,8 @@ and to prove a collection written by the old package reads back through the
 new connector (and the other way round). The compatibility tests run against
 qdrant-client's in-process `:memory:` mode and a fake embedding provider, so
 they need no Qdrant server and no model download. The cross-package ones skip
-when `mcp_server_qdrant` is not installed (it stays a dependency only for the
-standalone qdrant-find/qdrant-store server).
+when `mcp_server_qdrant` is not installed (it is no longer imported by any
+server, and stays installed only until it is dropped as a dependency).
 
     .venv/bin/python -m unittest discover -s tests
 """
@@ -143,7 +143,7 @@ class FastEmbedProviderBehavior(unittest.TestCase):
         fake_model.query_embed.side_effect = lambda qs: [mock.Mock(tolist=lambda: [9.0]) for _ in qs]
         with mock.patch.object(qdrant_embeddings, "TextEmbedding", return_value=fake_model) as ctor:
             provider = FastEmbedProvider("BAAI/Bge-Small-EN")
-        ctor.assert_called_once_with("BAAI/Bge-Small-EN")
+        ctor.assert_called_once_with("BAAI/Bge-Small-EN", local_files_only=True)
         return provider, fake_model
 
     def test_documents_use_passage_embed_and_queries_use_query_embed(self):
@@ -156,6 +156,41 @@ class FastEmbedProviderBehavior(unittest.TestCase):
     def test_vector_name_comes_from_the_loaded_models_name(self):
         provider, _ = self._provider()
         self.assertEqual(provider.get_vector_name(), "fast-bge-small-en")
+
+
+class LoadsFromTheLocalCacheFirst(unittest.TestCase):
+    """The provider must not pay for a huggingface.co round-trip when the model
+    is already cached (measured 59.6s on a slow network against 2.0s without
+    it), and must still download on a cold cache. This replaced the
+    `HF_HUB_OFFLINE` entry servers used to need in their config."""
+
+    def test_a_warm_cache_is_loaded_with_no_network_attempt(self):
+        model = mock.Mock(model_name="BAAI/bge-small-en")
+        ctor = mock.Mock(return_value=model)
+        self.assertIs(qdrant_embeddings.load_text_embedding("BAAI/bge-small-en", ctor), model)
+        ctor.assert_called_once_with("BAAI/bge-small-en", local_files_only=True)
+
+    def test_a_cold_cache_falls_back_to_a_normal_download(self):
+        model = mock.Mock(model_name="BAAI/bge-small-en")
+        ctor = mock.Mock(side_effect=[ValueError("model not in the local cache"), model])
+        self.assertIs(qdrant_embeddings.load_text_embedding("BAAI/bge-small-en", ctor), model)
+        self.assertEqual(
+            ctor.call_args_list,
+            [mock.call("BAAI/bge-small-en", local_files_only=True), mock.call("BAAI/bge-small-en")],
+        )
+
+    def test_a_failed_download_is_not_swallowed(self):
+        ctor = mock.Mock(side_effect=[ValueError("not cached"), OSError("no network")])
+        with self.assertRaises(OSError):
+            qdrant_embeddings.load_text_embedding("BAAI/bge-small-en", ctor)
+
+    def test_the_provider_constructor_uses_the_module_level_class(self):
+        # Looked up at call time, so replacing qdrant_embeddings.TextEmbedding
+        # (as the tests above and other servers' tests do) takes effect.
+        model = mock.Mock(model_name="m")
+        with mock.patch.object(qdrant_embeddings, "TextEmbedding", return_value=model) as ctor:
+            self.assertIs(FastEmbedProvider("m").embedding_model, model)
+        ctor.assert_called_once_with("m", local_files_only=True)
 
 
 class ConnectorBehavior(unittest.TestCase):

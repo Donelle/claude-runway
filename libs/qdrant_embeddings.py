@@ -17,6 +17,13 @@ readable:
 
 Constructing a provider loads the ONNX model (and downloads it on a cold cache),
 so callers construct it as late as they can.
+
+It loads from the local cache first, with no network access, and only goes to
+the network when the cache does not hold the model. Without that, a cache HIT
+still made a live huggingface.co round-trip to resolve the revision, which was
+measured at 59.6s on a slow network against 2.0s with it skipped, long enough
+to pass Claude Code's MCP connection timeout. Doing it in code means no server
+needs an `HF_HUB_OFFLINE` entry in its config, and a cold cache still downloads.
 """
 
 import asyncio
@@ -25,6 +32,25 @@ from typing import Any
 from fastembed import TextEmbedding
 
 VECTOR_NAME_PREFIX = "fast-"
+
+
+def load_text_embedding(model_name: str, text_embedding_cls=None) -> Any:
+    """Builds the FastEmbed model, from the local cache when it is complete.
+
+    `local_files_only=True` is a per-call argument that fastembed passes to
+    `huggingface_hub.snapshot_download`, whose network call is gated on that
+    literal parameter, so it works regardless of when `huggingface_hub` was
+    imported (unlike setting `HF_HUB_OFFLINE` in `os.environ`, which
+    `huggingface_hub` reads once at import). On a cold or incomplete cache it
+    raises immediately, and the second call downloads as before.
+    """
+    # Looked up at call time (not a default argument) so a test or caller that
+    # replaces this module's `TextEmbedding` is honored.
+    cls = text_embedding_cls or TextEmbedding
+    try:
+        return cls(model_name, local_files_only=True)
+    except Exception:
+        return cls(model_name)
 
 
 def vector_name_for_model(model_name: str) -> str:
@@ -39,7 +65,7 @@ def vector_name_for_model(model_name: str) -> str:
 class FastEmbedProvider:
     def __init__(self, model_name: str):
         self.model_name = model_name
-        self.embedding_model: Any = TextEmbedding(model_name)
+        self.embedding_model: Any = load_text_embedding(model_name)
 
     async def embed_documents(self, documents: list[str]) -> list[list[float]]:
         loop = asyncio.get_running_loop()

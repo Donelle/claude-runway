@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Bulk-index a repo's code and docs into the same Qdrant collection your
-mcp-server-qdrant MCP server reads from, using the *same* embedding
+`qdrant` MCP server reads from, using the *same* embedding
 provider the server uses (so vectors are compatible with qdrant-find).
 
 Usage:

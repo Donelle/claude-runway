@@ -12,7 +12,7 @@ Setup:
 
 Register in .mcp.json (adjust the path to wherever you save this file). Set
 QDRANT_URL / COLLECTION_NAME / EMBEDDING_MODEL here -- these are the SAME env
-var names mcp-server-qdrant itself reads, so one project config drives both
+var names tools/qdrant_mcp_server.py reads, so one project config drives both
 servers and they can't drift apart:
 {
   "mcpServers": {
@@ -125,7 +125,7 @@ def _save_manifest(repo: Path, manifest: dict) -> None:
         json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
     )
 
-# Same env var names mcp-server-qdrant reads, so a single project .mcp.json
+# Same env var names tools/qdrant_mcp_server.py reads, so a single project .mcp.json
 # config keeps this server and the qdrant-find/qdrant-store server aligned.
 # Resolved through qdrant_ingest_lib.ingest_env_defaults (issue #276) -- the
 # same helper ingest_to_qdrant.py's argparse defaults come from, so the two
@@ -136,7 +136,7 @@ DEFAULT_QDRANT_API_KEY = _ENV_DEFAULTS["qdrant_api_key"]
 DEFAULT_COLLECTION = os.environ.get("COLLECTION_NAME")
 DEFAULT_EMBEDDING_MODEL = _ENV_DEFAULTS["embedding_model"]
 
-# Optional, this repo's own -- not read by mcp-server-qdrant. Declared once
+# Optional, this repo's own -- not read by the qdrant server. Declared once
 # alongside COLLECTION_NAME so a project's description doesn't require a
 # one-off set_collection_description call (issue #83); applied by
 # _sync_static_collection_description() below.
@@ -172,7 +172,7 @@ DEFAULT_EXTRA_EXCLUDE_DIRS = parse_csv_set(_ENV_DEFAULTS["exclude_dirs"])
 def _sync_static_collection_description(collection: Optional[str], qdrant_url: str, qdrant_api_key: Optional[str]) -> None:
     """
     Applies COLLECTION_DESCRIPTION (this project's own .mcp.json env var,
-    not read by mcp-server-qdrant) to the collection's native Qdrant
+    not read by the qdrant server) to the collection's native Qdrant
     metadata + the local hint cache from libs/qdrant_collection_hints.py,
     if it's configured and doesn't already match (issue #83). This is what
     lets a description be declared once in .mcp.json instead of requiring
