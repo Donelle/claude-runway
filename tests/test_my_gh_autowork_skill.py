@@ -625,5 +625,54 @@ class RunLessonsContentRequirements(unittest.TestCase):
             self.assertIn(int(ref), numbered | {0}, f"dangling cross-reference: Step {ref}")
 
 
+class ShortCopilotWaitContentRequirements(unittest.TestCase):
+    """Step 19's wait must stay a few short calls to the tested helper: one long sleep
+    outlasts the subagent's prompt cache (about five minutes) and forces a full
+    context re-write on the next request."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(SKILL_PATH, encoding="utf-8") as f:
+            cls.content = f.read()
+        cls.template = _normalized(_template(cls.content))
+
+    def test_no_inline_sleep_loop_comes_back(self):
+        self.assertNotIn("{1..36}", self.content)
+        self.assertNotIn("sleep 15", self.content)
+        self.assertNotIn("36 iterations", self.content)
+        self.assertNotRegex(self.content, r"for i in \{1\.\.\d+\}")
+
+    def test_template_uses_the_helper_in_short_calls(self):
+        self.assertIn("tools/poll_copilot_review.py", self.template)
+        self.assertIn("THREE short Bash calls", self.template)
+        self.assertIn("`NOT_YET`", self.template)
+        self.assertIn("the third `NOT_YET` in a row", self.template)
+        self.assertIn("same `HEAD_SHA`", self.template)
+
+    def test_timeout_is_still_failed_and_never_clean(self):
+        self.assertIn("NOT the same as \"clean\"", self.template)
+        self.assertIn("OUTCOME: FAILED (issue #<N>) — Copilot's review did not arrive within 9 minutes", self.template)
+
+    def test_head_sha_rules_survive(self):
+        self.assertIn("full 40-character SHA", self.template)
+        self.assertIn("never an abbreviated one", self.template)
+
+    def test_helper_per_call_wait_stays_under_the_cache_lifetime(self):
+        import sys
+        sys.path.insert(0, os.path.join(REPO_ROOT, "libs"))
+        import copilot_review_poll_lib as P
+        # The cache lapses after about five minutes; one call must stay well under it.
+        self.assertLess(P.MAX_CALL_SECONDS, 300)
+        self.assertLessEqual(P.DEFAULT_ITERATIONS * P.DEFAULT_INTERVAL_S, P.MAX_CALL_SECONDS)
+        # ...while the whole window stays about nine minutes.
+        self.assertEqual(P.MAX_CALLS * P.DEFAULT_ITERATIONS * P.DEFAULT_INTERVAL_S, 540)
+
+    def test_follow_up_pattern_reuses_the_short_waits(self):
+        start = self.content.find("## Continuing after a BLOCKED at the round cap")
+        section = _normalized(self.content[start : self.content.find("## Subagent Prompt Template")])
+        self.assertIn("tools/poll_copilot_review.py", section)
+        self.assertIn("rather than one long sleep", section)
+
+
 if __name__ == "__main__":
     unittest.main()

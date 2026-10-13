@@ -200,7 +200,7 @@ Step 2b's rule — a `BLOCKED` stops the whole run — still holds. This section
   - **Seed `seen_ids` first.** Step 4 starts `seen_ids` empty because a normal run never has a pre-existing PR. On this PR, an empty set would make Step 20 report every comment and review from all five earlier rounds as new. Before anything else, run Step 20's three-endpoint fetch once and put every id it returns into `seen_ids`.
   - **The inherited round-6 findings are follow-up round 1.** Set `ROUND=1` and handle them with Step 22's reproduce-or-decline rules and Steps 23–24, straight from the round history and their existing threads, without polling first: their review has already arrived. Then apply Step 25 as written: loop back to Step 19 only if that round pushed a fix, and go straight to Step 5 if every finding was declined.
   - **The cap is 3, not 5.** In Step 22's check, replace "greater than 5" with "greater than 3", and report `OUTCOME: BLOCKED (issue #<N>) — hit the 3-round follow-up review cap on PR #<PR>, see round history above`. These are leftovers from a PR that already used five rounds; if three more don't close it, the ticket needs a human, not more rounds.
-- Everything else about the review loop stays as written: the same verify-before-fix rules (reproduce or decline with evidence, never `@copilot`, reply to and resolve every thread), the same full 40-character `HEAD_SHA` poll, the same three-check gate before every push, and Step 5's merge.
+- Everything else about the review loop stays as written: the same verify-before-fix rules (reproduce or decline with evidence, never `@copilot`, reply to and resolve every thread), the same full 40-character `HEAD_SHA` wait, made of short helper calls (`tools/poll_copilot_review.py`, up to three of 12 looks each) rather than one long sleep, so the prompt cache stays warm; if the prompt says "wait" or "poll", that is what it means, the same three-check gate before every push, and Step 5's merge.
 - The same Final report section and `OUTCOME:` line shapes, so Step 2b can read the result and log it to the metrics store as its own attempt, as usual.
 
 If the follow-up reports `MERGED` and the user's authorization covered keeping the run going, pick the run back up where it stopped, without removing or re-adding anything. In `all` mode, go back to 2a; the original ticket is already in `attempted`. In list mode, go back to 2a with whatever ticket is now at the front of the remaining queue: the original ticket already left the queue when its own call returned (Step 1), so it must not be "removed" a second time. Otherwise the run ends there, and Step 3's summary table shows both the original `BLOCKED` and the follow-up's outcome.
@@ -233,8 +233,9 @@ this run.
 **YOU are the one actually doing the work, end to end, in your own tool calls — there is
 no separate background process or orchestrator waiting to run steps for you.** Whenever
 this prompt says "wait" or "poll" (Step 19's wait for a Copilot review is the main case),
-that means YOU must run a blocking command yourself (a shell loop with `sleep`, with an
-explicit long-enough timeout on the Bash call itself, up to 600000ms) and keep making tool
+that means YOU must run a blocking command yourself (for Step 19, up to three short calls to
+its polling helper, each with a long-enough timeout on the Bash call itself and none waiting
+more than about three minutes, so your prompt cache stays warm) and keep making tool
 calls until you reach a terminal state. Confirmed live: a subagent working without this
 paragraph has completed real work correctly, then ended its turn with a bare "I'll wait
 for the notification" instead of running Step 19's poll itself — it had correctly
@@ -572,60 +573,61 @@ actionable) does NOT increment it, since no fix cycle happens there.
     first and get mistaken for coverage of the latest one, wrongly authorizing a merge
     while the true latest push goes unreviewed. Capture the current HEAD SHA right before
     polling, and require the arriving review's own `commit_id` to match it — a stray human
-    comment or unrelated bot can't satisfy this either, since it isn't a review at all:
+    comment or unrelated bot can't satisfy this either, since it isn't a review at all.
+
+    **The wait is up to THREE short Bash calls, never one long one.** Your prompt cache
+    lapses after roughly five minutes without a request. One Bash call that sleeps for nine
+    minutes outlasts it, so the very next request cannot read the cache and re-writes your
+    entire context at the (dearer) cache-write rate: measured on a real run, that single
+    rebuild was 48% of the whole ticket's cache-creation tokens. Each short call below is an
+    ordinary request that keeps the cache warm. The total window stays about nine minutes.
+    Shell state does not persist between Bash calls, so every call is given everything it
+    needs as arguments; the logic lives in a tested helper, `tools/poll_copilot_review.py`
+    (see `libs/copilot_review_poll_lib.py`), not in a shell loop you retype:
     ```bash
     HEAD_SHA=$(git rev-parse HEAD)
-    _seen_tmp=$(mktemp)
-    printf '%s\n' $SEEN_IDS | sort -u > "$_seen_tmp"
-    for i in {1..36}; do
-      NEW_COPILOT_IDS=$(gh api repos/Donelle/claude-runway/pulls/<PR>/reviews --paginate \
-          --jq ".[] | select(.user.login == \"copilot-pull-request-reviewer[bot]\" and .commit_id == \"$HEAD_SHA\") | \"review:\" + (.id|tostring)" 2>/dev/null \
-        | sort -u | grep -vxFf "$_seen_tmp" || true)
-      if [ -n "$NEW_COPILOT_IDS" ]; then
-        echo "Copilot review of $HEAD_SHA arrived: $NEW_COPILOT_IDS"
-        rm -f "$_seen_tmp"
-        break
-      fi
-      sleep 15
-    done
-    rm -f "$_seen_tmp"
     ```
-    (`{1..36}` brace expansion, not `$(seq 1 36)` — `seq` is absent from Git Bash on
-    Windows; brace expansion is a bash built-in and works cross-platform. `grep -vxFf` with
-    a temp file, not `comm -23 - <(...)` — process substitution `<(...)` is unreliable in
-    Git Bash on Windows; `grep -vxFf tmpfile` achieves the same set-difference without it.
-    `mktemp` IS available in Git Bash.)
+    Print `$HEAD_SHA` once and copy the 40 characters into the calls below (variables are
+    gone by the next call). Then, in its own Bash call, with `timeout` of at least 240000
+    (the call itself waits about 180 seconds; the helper stops it at a wall-clock deadline that
+    counts fetch time too, so it never runs past 240):
+    ```bash
+    $PYTHON tools/poll_copilot_review.py --pr <PR> --head-sha <the 40-character HEAD_SHA> \
+        --me "$ME" --seen "<every review id already in seen_ids, e.g. review:123,review:456>"
+    ```
+    (`$PYTHON` and `$ME` are not set in a new call either: write out the interpreter path,
+    `.venv/bin/python` or `.venv/Scripts/python`, and your login literally.) The helper
+    makes up to 12 looks, 15 seconds apart, and prints one of:
+    - one or more `review:<id>` lines: Copilot's review of exactly that commit arrived. Go
+      to Step 20.
+    - `NOT_YET`: nothing arrived in this call's window. Make the SAME call again, passing
+      the same `HEAD_SHA` and the same seen ids. After the third `NOT_YET` in a row for the
+      same `HEAD_SHA`, that is the timeout below.
+    - `ERROR: ...` (exit 1): GitHub could not be reached on any attempt in that call. This
+      is neither a timeout nor a clean review; try the call once more, and if it errors
+      again report `FAILED` with the error text.
+    - `ERROR: ...` (exit 2): a bad argument, most often a short SHA. Fix the argument; this
+      does not count as one of the three calls.
+
     **`HEAD_SHA` must be the full 40-character SHA from `git rev-parse HEAD`, never an
     abbreviated one** (`git rev-parse --short HEAD`, `git log --oneline`'s 7 characters,
     or a SHA copied out of a push or commit message). The API's `commit_id` is always the
-    full 40-character form and the `jq` test above is an exact string comparison, so a short
-    SHA never matches anything: confirmed live in the 2026-10-12/13 run, a follow-up subagent
-    polled with a short SHA, could never match, and burned the whole ~9-minute window. A
-    timeout from this loop that you can't otherwise explain is worth one check that
-    `HEAD_SHA` is 40 characters before reporting it.
-    **36 iterations, not 40 — the loop's own sleep budget must leave real headroom under the
-    wrapping Bash tool call's hard 600000ms timeout, not just equal it.** 40×15s of pure
-    `sleep` alone already totals exactly 600000ms with zero margin left for the `gh api`
-    calls interleaved between those sleeps, each of which takes real, nonzero wall-clock
-    time; the Bash tool would then kill the command mid-loop on any run that genuinely needs
-    the full timeout path, before the shell script ever reaches its own `done` and before the
-    subagent could print the required `FAILED` outcome line — silently recreating the exact
-    stalled/no-terminal-output problem this whole section exists to prevent (`40 * 15 == 600`
-    exactly, verified independently). 36×15s = 540s (9 minutes) of guaranteed sleep, leaving
-    a full 60 real seconds of headroom under the cap for the loop's own `gh api` calls plus
-    general shell/tool overhead — comfortably safe for calls that normally take well under a
-    second each, and the loop can still always finish (whether by finding a match or
-    exhausting its iterations) before the Bash tool's own timeout would ever fire.
-    (Same `--jq` constraint as elsewhere in this file — it takes exactly one argument, so
-    the shell variable is interpolated directly into the expression string, not passed via
-    jq's own `--arg` flag, which `gh api` doesn't support regardless of position;
-    re-verified live for this exact form before writing it down here.) ~9 minutes, not 5 —
-    confirmed live that a real re-review can take longer than 5 minutes, so a 5-minute
-    window risked timing out and merging before Copilot's actual review arrived.
-    **If the loop times out with nothing new, that is NOT the same as "clean" — do not
-    proceed to merge.** Absence of a new id after ~9 minutes doesn't prove the review is
-    clean; it may just mean the review hasn't arrived yet, and merging in that ambiguous
-    state risks shipping code no review actually covered. Report
+    full 40-character form and the comparison is exact, so a short SHA never matches
+    anything: confirmed live, a follow-up subagent polled with a short SHA, could never
+    match, and burned the whole window. The helper refuses anything but 40 hex characters
+    for that reason. Never raise `--iterations` or `--interval` to make one call wait
+    longer: the helper rejects a single call over 240 seconds, because the point is that
+    no single wait outlasts the prompt cache. Never replace the helper with a hand-written
+    `sleep` loop, and never put a `sleep` longer than about four minutes in any one Bash
+    call anywhere else in this prompt either (the unit tests, ruff and Pyright finish in
+    well under that; if a run you start would genuinely exceed it, run it in the
+    background and poll it in short calls the same way). The whole window is nine minutes,
+    not five — confirmed live that a real re-review can take longer than five minutes, so
+    a five-minute window risked timing out and merging before Copilot's actual review
+    arrived. **If all three calls return `NOT_YET`, that is NOT the same as "clean" — do
+    not proceed to merge.** Absence of a new id after about nine minutes doesn't prove the
+    review is clean; it may just mean the review hasn't arrived yet, and merging in that
+    ambiguous state risks shipping code no review actually covered. Report
     `OUTCOME: FAILED (issue #<N>) — Copilot's review did not arrive within 9 minutes on
     PR #<PR>; can't confirm the PR is clean` and stop — a human can check whether the review
     is just slow or something's actually stuck. (A later re-run of this skill will NOT pick
@@ -633,12 +635,11 @@ actionable) does NOT increment it, since no fix cycle happens there.
     progress on any re-attempt; clearing its assignee/branch/PR first is required before it
     can be retried.) (A `gh api ... --paginate` call's output can come back summarized/
     compressed by this repo's own `PostToolUse` compression hook rather than raw JSON if the
-    hook's exemption list doesn't recognize the exact form of the call — this has produced a
-    fabricated phrase in a summarized review body in the past. The hook now matches `gh api`
-    (REST or GraphQL, any flags) as exactness-critical, so this pattern reaches you
-    unmodified; if that behavior ever regresses, treat any suspiciously clean/short `gh api`
-    output here with suspicion and re-run it directly.)
-20. The poll above only reaches here when a new Copilot review specifically arrived — a
+    hook's exemption list doesn't recognize the exact form of the call. The helper prints
+    only its own short lines, so its output reaches you unmodified; for the direct `gh api`
+    calls in Step 20, treat any suspiciously clean/short output with suspicion and re-run
+    it directly.)
+20. The wait above only reaches here when a new Copilot review specifically arrived — a
     genuine timeout is Step 19's `FAILED` path above, not this one; there's no "nothing
     new, not a timeout" case, so this step doesn't need one either. NOW gather the full
     picture across all three endpoints, non-self. **Check each endpoint's own success —
@@ -781,7 +782,7 @@ actionable) does NOT increment it, since no fix cycle happens there.
 25. **Only loop back to Step 19 if this round actually pushed a fix.** `review_on_push` is
     the ONLY re-review trigger this repo has — if every finding this round was declined
     (no code change, no push), nothing will ever trigger a fresh review to check against,
-    so looping back to poll would just burn ~9 minutes and land on Step 19's
+    so looping back to wait would just burn about nine minutes and land on Step 19's
     timeout-`FAILED` path for no reason. In that case, go straight to Step 5 (merge)
     instead — there's nothing further a review-loop round could discover once nothing
     changed. If at least one finding WAS fixed and pushed this round, loop back to Step 19
