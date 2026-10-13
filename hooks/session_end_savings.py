@@ -10,7 +10,8 @@ Verified against Claude Code v2.1.218: SessionEnd supports `systemMessage`
 (not `additionalContext`, which SessionEnd does NOT support) as the way to
 show text to the user, and receives session_id/transcript_path/cwd/reason on
 stdin. The summary shows exact characters before and after compression and the
-percent reduction (issue #438); see libs/savings_ledger.py's module docstring
+percent reduction (issue #438), and -- when the transcript opt-in below is on --
+the same split per model, with a token figure labelled as derived (issue #440); see libs/savings_ledger.py's module docstring
 for why the counterfactual behind it is observed online, not a measured A/B
 delta (EVALUATION.md Track D covers that distinction).
 
@@ -124,8 +125,14 @@ def main():
     # session's earlier roll-up) rather than zeroing them.
     # STOPGAP: remove when #164 is resolved (Stop hook will expose these directly).
     actual_tokens = None
+    # Issue #440: the same opt-in also lets the hook join each compression event to
+    # the model and turn it happened under (from the same transcript), read here,
+    # before the roll-up takes savings.db's write lock. None means no per-model
+    # rows: no transcript, or the opt-in is off.
+    attribution = None
     if _parse_transcript_enabled() and transcript_path:
         actual_tokens = savings_ledger.parse_session_token_counts(transcript_path)
+        attribution = savings_ledger.read_transcript_attribution(transcript_path)
 
     # This hook is meant to be best-effort and fail open, same philosophy as
     # compress_output.py -- a savings-tracker problem (a corrupted DB
@@ -140,7 +147,7 @@ def main():
         # up separately would let one overwrite the other. None means another
         # process already consumed this session's events; that roll-up stands.
         session_agg = savings_ledger.finalize_owned_session(
-            session_id, project, actual_tokens=actual_tokens,
+            session_id, project, actual_tokens=actual_tokens, attribution=attribution,
         )
         if not session_agg:
             sys.exit(0)

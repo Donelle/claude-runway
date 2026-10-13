@@ -57,6 +57,13 @@ def _entries(path):
         return
 
 
+def iter_entries(path):
+    """Public name for the shared line reader, for sibling libs that read the same
+    transcript (libs/transcript_attribution_lib.py, issue #440): same fail-open
+    behavior, one reader so the two can't drift on what counts as a readable line."""
+    return _entries(path)
+
+
 def _first_usage(obj) -> Optional[dict]:
     """The usage block of an assistant entry that carries one, else None. Skips
     `<synthetic>` messages (Claude Code's own placeholders, all-zero usage)."""

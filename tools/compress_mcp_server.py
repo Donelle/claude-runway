@@ -1884,7 +1884,8 @@ def savings_summary(project: Optional[str] = None, format: str = "text") -> str:
 def savings_detail(project: Optional[str] = None, format: str = "text", csv_table: str = "session") -> str:
     """
     DETAIL view of the opt-in savings tracker: this session's per-tool
-    breakdown, a sparkline of the last 10 sessions for this project, and a
+    breakdown, the per-model split of the most recent finished session (exact
+    characters before and after, plus a token figure labelled as derived), a sparkline of the last 10 sessions for this project, and a
     cross-project comparison of characters before and after compression. Called by
     `/my-savings detail`. See savings_summary's docstring for the same
     counterfactual-estimate caveat.
@@ -1953,11 +1954,14 @@ def savings_detail(project: Optional[str] = None, format: str = "text", csv_tabl
         project_summary = savings_ledger.query_project_summary(project)
         last_n = savings_ledger.query_last_n_sessions(project, n=10)
         all_projects = savings_ledger.query_all_projects()
+        # The session in progress has no transcript to join yet, so the per-model
+        # split comes from the most recent finished session (issue #440).
+        model_breakdown = savings_ledger.query_recent_model_breakdown(project)
         if format == "json":
-            return savings_ledger.format_json(session_agg, project_summary, tool_breakdown, last_n, all_projects)
+            return savings_ledger.format_json(session_agg, project_summary, tool_breakdown, last_n, all_projects, model_breakdown)
         if format == "csv":
             return savings_ledger.format_csv(session_agg, project_summary, tool_breakdown, last_n, all_projects, table=csv_table)
-        return savings_ledger.format_detail_view(session_agg, project_summary, tool_breakdown, last_n, all_projects)
+        return savings_ledger.format_detail_view(session_agg, project_summary, tool_breakdown, last_n, all_projects, model_breakdown)
     except Exception as e:
         # Same reasoning as savings_summary's try/except -- best-effort feature,
         # must not fail the tool call over a DB problem.

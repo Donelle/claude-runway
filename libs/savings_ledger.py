@@ -11,7 +11,10 @@ This tracker observes a COUNTERFACTUAL online (the exact characters before and
 after compression, and the percent reduction between them), which is categorically
 different from EVALUATION.md's measured A/B delta -- the two numbers must never be
 conflated. It reports characters, not tokens (issue #438): a token count depends on
-the model's vocabulary, which is not public. See EVALUATION.md's "Track D" section.
+the model's vocabulary, which is not public. The one token figure it shows is the
+per-model DERIVED one (issue #440, labelled as derived wherever it appears): the
+characters removed, divided by the chars-per-token that session's own transcript
+shows for that model. It is not a measurement. See EVALUATION.md's "Track D" section.
 
 Two-tier storage:
   Tier 1 (transient): one JSONL file per session, appended to DURING the session
@@ -53,6 +56,8 @@ from typing import Optional
 # it). Used by current_session_id() below (issue #213) -- see that
 # function's docstring for exactly what is and isn't delegated.
 import session_id_lib
+# Same convention: joins events to the transcript's model and turn (issue #440).
+import transcript_attribution_lib
 
 
 def tracking_enabled() -> bool:
@@ -248,7 +253,8 @@ def record_event(session_id: str, tool: str, raw_chars: int, out_chars: int, cre
     the SQLite rollup keeps just the subagent flag and `agent_type`.
 
     `tool_use_id` is the PostToolUse payload's id for the tool call; written only
-    when non-empty so a later change can join the event to its turn and model.
+    when non-empty. At SessionEnd it is the key that joins the event to its
+    transcript turn and model (issue #440, libs/transcript_attribution_lib.py).
     """
     entry = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -317,13 +323,13 @@ def _parse_event_lines(lines) -> list:
 # ---------------------------------------------------------------------------
 
 # Bumped whenever the shape of ANY persistent table changes: `sessions`,
-# `session_tools`, `session_agents` (added in v5, #365) or `meta`. That includes
+# `session_tools`, `session_agents` (added in v5, #365), `session_models` (added in v9, #440) or `meta`. That includes
 # adding a new table, even though _connect creates it for fresh DBs via CREATE
 # TABLE IF NOT EXISTS -- the bump plus a registered migration is what keeps
 # existing databases on the same versioned path as new ones.
 # _MIGRATIONS below must gain a matching entry for every bump -- see
 # _run_migrations' docstring for how the two stay in sync (issue #30/#69).
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 # Issue #365: per-session savings split by which agent earned them. One DDL
 # string shared by _connect (fresh DBs) and _migrate_to_v5 (existing DBs) so the
@@ -386,6 +392,27 @@ _SESSION_TOOLS_DDL = """
         out_chars_sum INTEGER NOT NULL DEFAULT 0,
         saved_chars INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (session_id, tool)
+    )
+"""
+
+
+# Issue #440: the session's compression split by the model that was running. One
+# row per (session, model); model '' is the unattributed bucket (events with no
+# matching transcript turn), so the rows always add up to the session's own
+# characters. `derived_tokens`/`chars_per_token` are NULL when the session had too
+# few samples to derive a ratio for that model: NULL means "not derived", never 0.
+_SESSION_MODELS_DDL = """
+    CREATE TABLE IF NOT EXISTS {name} (
+        session_id TEXT NOT NULL,
+        model TEXT NOT NULL DEFAULT '',
+        event_count INTEGER NOT NULL,
+        raw_chars_sum INTEGER NOT NULL DEFAULT 0,
+        out_chars_sum INTEGER NOT NULL DEFAULT 0,
+        saved_chars INTEGER NOT NULL DEFAULT 0,
+        derived_tokens INTEGER,
+        chars_per_token REAL,
+        ratio_samples INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (session_id, model)
     )
 """
 
@@ -658,12 +685,24 @@ def _migrate_to_v8(conn) -> None:
     conn.execute("DELETE FROM meta WHERE key = 'schema_overhead_tokens'")
 
 
+def _migrate_to_v9(conn) -> None:
+    """
+    Adds the `session_models` table (issue #440): compression split by model, with
+    the derived token figure. Purely additive and idempotent (CREATE TABLE IF NOT
+    EXISTS) -- _connect already creates it before migrations run, in its final
+    shape, so no earlier migration ever needs to know about it. Sessions finalized
+    before this version have no rows here: the model was never recorded and the
+    transcript is not kept, so nothing is backfilled.
+    """
+    conn.execute(_SESSION_MODELS_DDL.format(name="session_models"))
+
+
 # Maps target schema version -> the function that migrates INTO it from the
 # version immediately before. The next schema change adds one more entry here
 # and bumps SCHEMA_VERSION -- _run_migrations doesn't need to change at all,
 # which is the actual "scaffold" issue #69 asked for: a repeatable shape for
 # schema changes, not a one-off patch for this specific set of columns.
-_MIGRATIONS = {1: _migrate_to_v1, 2: _migrate_to_v2, 3: _migrate_to_v3, 4: _migrate_to_v4, 5: _migrate_to_v5, 6: _migrate_to_v6, 7: _migrate_to_v7, 8: _migrate_to_v8}
+_MIGRATIONS = {1: _migrate_to_v1, 2: _migrate_to_v2, 3: _migrate_to_v3, 4: _migrate_to_v4, 5: _migrate_to_v5, 6: _migrate_to_v6, 7: _migrate_to_v7, 8: _migrate_to_v8, 9: _migrate_to_v9}
 
 
 def _table_exists(conn, name: str) -> bool:
@@ -770,8 +809,8 @@ def _ensure_schema(conn) -> None:
     # Checked BEFORE the CREATE TABLE calls below, specifically so
     # _run_migrations can tell a genuinely fresh DB (nothing to migrate --
     # see its docstring) apart from a pre-existing one that needs its
-    # history replayed. `sessions` specifically, not the other three tables
-    # (`session_tools`/`session_agents`/`meta`), since it's the one this
+    # history replayed. `sessions` specifically, not the other four tables
+    # (`session_tools`/`session_agents`/`session_models`/`meta`), since it's the one this
     # migration scaffold actually versions.
     sessions_existed = _table_exists(conn, "sessions")
     # Always the LATEST schema -- a brand-new DB gets every current column
@@ -779,11 +818,13 @@ def _ensure_schema(conn) -> None:
     conn.execute(_SESSIONS_DDL.format(name="sessions"))
     conn.execute(_SESSION_TOOLS_DDL.format(name="session_tools"))
     conn.execute(_SESSION_AGENTS_DDL.format(name="session_agents"))
+    conn.execute(_SESSION_MODELS_DDL.format(name="session_models"))
     conn.execute(
         "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
     )
-    # Only after all four tables are guaranteed to exist -- a migration may
-    # assume `sessions`/`session_tools`/`session_agents`/`meta` are all already there.
+    # Only after all five tables are guaranteed to exist -- a migration may
+    # assume `sessions`/`session_tools`/`session_agents`/`session_models`/`meta`
+    # are all already there.
     _run_migrations(conn, is_new_db=not sessions_existed)
 
 
@@ -901,7 +942,8 @@ def _aggregate_by_agent(events: list) -> list:
 
 
 def _write_session_rows(conn, session_id: str, project: str, events: list,
-                        actual_tokens: Optional[dict], ended_at: str, accumulate: bool = False) -> dict:
+                        actual_tokens: Optional[dict], ended_at: str, accumulate: bool = False,
+                        attribution: Optional[dict] = None) -> dict:
     """
     Aggregate `events` and write them as `session_id`'s rows on `conn`, inside
     whatever transaction the caller holds. Shared by finalize_session() and
@@ -924,6 +966,18 @@ def _write_session_rows(conn, session_id: str, project: str, events: list,
     whole session) and otherwise keep the counts already recorded. Adding is
     only correct if no event is ever rolled up twice -- finalize_owned_session
     guarantees that, see its docstring.
+
+    attribution (issue #440): the transcript index from
+    transcript_attribution_lib.read_transcript, or None (no transcript, or the
+    opt-in is off). Given, each counted event is joined to its model and the
+    session is also written per model to `session_models`. The model rows follow
+    the same rules as the rest: replaced on the replace path; added to on the
+    accumulate path -- except that a session whose stored row already has events
+    but no model rows (finalized before v9, or without a transcript) gets none,
+    because rows covering only the later events would read as the whole session;
+    a resumed session's derived token figure is dropped (it cannot be recomputed
+    from events that are gone); and a roll-up with new credited events but no
+    transcript drops the session's split, which would no longer add up.
     """
     counted = [e for e in events if _counted(e)]
     chars_sum = _zero_chars()
@@ -957,11 +1011,13 @@ def _write_session_rows(conn, session_id: str, project: str, events: list,
     # and would drop its backfilled saving (PR #446 review). Such a row only
     # accumulates its event counts; its character figures stay "unknown".
     resumed_unsized = False
+    had_events_before = False  # a resume: the stored row already holds credited events
     if accumulate:
         prior = conn.execute(
             "SELECT event_count, raw_chars_sum, out_chars_sum FROM sessions WHERE session_id = ?", (session_id,)
         ).fetchone()
         resumed_unsized = bool(prior and prior[0] > 0 and (prior[1] == 0 or prior[2] == 0))
+        had_events_before = bool(prior and prior[0] > 0)
     w_chars = _zero_chars() if resumed_unsized else chars_sum
     w_by_tool = {t: dict(a, credited_event_count=0, **_zero_chars()) for t, a in by_tool.items()} if resumed_unsized else by_tool
     w_by_agent = [dict(a, credited_event_count=0, **_zero_chars()) for a in by_agent] if resumed_unsized else by_agent
@@ -1037,7 +1093,29 @@ def _write_session_rows(conn, session_id: str, project: str, events: list,
              row["credited_event_count"], row["raw_chars_sum"], row["out_chars_sum"], row["saved_chars"]),
         )
 
+    result_extra: dict = {}
+    if attribution is not None:
+        joined = transcript_attribution_lib.attribute_events(counted, attribution, all_events=events)
+        if had_events_before:
+            # A resumed session reuses its transcript, so the transcript's marker
+            # results cover the whole session while `events` hold only this
+            # roll-up's: every result from an earlier roll-up would be reported as
+            # having no ledger event. The cross-check is skipped for a resume.
+            joined["marker_without_event"] = []
+        _write_model_rows(conn, session_id, joined["by_model"], accumulate, had_events_before)
+        result_extra = {
+            "by_model": joined["by_model"],
+            "attribution": {"unjoined": joined["unjoined"], "marker_without_event": joined["marker_without_event"]},
+        }
+    elif not accumulate or counted:
+        # No transcript this time. The replace path writes the row as exactly these
+        # events, so a stale split of an earlier roll-up must not survive it; on the
+        # accumulate path, new credited events that the split does not cover would
+        # leave it adding up to less than the session, so it is dropped too.
+        conn.execute("DELETE FROM session_models WHERE session_id = ?", (session_id,))
+
     return {
+        **result_extra,
         "session_id": session_id,
         "project": project,
         "raw_chars_sum": chars_sum["raw_chars_sum"],
@@ -1054,8 +1132,53 @@ def _write_session_rows(conn, session_id: str, project: str, events: list,
     }
 
 
+def _write_model_rows(conn, session_id: str, rows: list, accumulate: bool, had_events_before: bool = False) -> None:
+    """Write a roll-up's per-model rows (see _write_session_rows).
+    `had_events_before`: the session's stored row already held credited events
+    (a resume, accumulate path only)."""
+    columns = ("session_id, model, event_count, raw_chars_sum, out_chars_sum, saved_chars, "
+               "derived_tokens, chars_per_token, ratio_samples")
+    conflict = ""
+    if accumulate:
+        has_models = conn.execute("SELECT 1 FROM session_models WHERE session_id = ? LIMIT 1", (session_id,)).fetchone()
+        if had_events_before and not has_models:
+            return
+        if had_events_before:
+            # The derived figure cannot be carried across a resume: the earlier
+            # roll-ups' events are gone, and the transcript has since grown, so
+            # their results were carried by more requests and the session's
+            # chars-per-token may have moved. Summing the stored value would mix
+            # the two, so it is dropped (NULL = not derived). The exact
+            # characters still add up.
+            # Mutated in place so the roll-up's own return value (the SessionEnd
+            # summary) agrees with what is stored, and every row already stored
+            # for the session is invalidated too, including a model with no new
+            # event this time (PR #450 review, round 2).
+            for r in rows:
+                r["derived_tokens"] = None
+            conn.execute("UPDATE session_models SET derived_tokens = NULL WHERE session_id = ?", (session_id,))
+        conflict = (
+            " ON CONFLICT(session_id, model) DO UPDATE SET "
+            "event_count = event_count + excluded.event_count, "
+            "raw_chars_sum = raw_chars_sum + excluded.raw_chars_sum, "
+            "out_chars_sum = out_chars_sum + excluded.out_chars_sum, "
+            "saved_chars = MAX(0, (raw_chars_sum + excluded.raw_chars_sum) - (out_chars_sum + excluded.out_chars_sum)), "
+            "derived_tokens = excluded.derived_tokens, "
+            "chars_per_token = excluded.chars_per_token, ratio_samples = excluded.ratio_samples"
+        )
+    else:
+        conn.execute("DELETE FROM session_models WHERE session_id = ?", (session_id,))
+    for r in rows:
+        conn.execute(
+            f"INSERT INTO session_models ({columns}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)" + conflict,
+            (session_id, r["model"], r["event_count"], r["raw_chars_sum"], r["out_chars_sum"], r["saved_chars"],
+             r["derived_tokens"], r["chars_per_token"], r["ratio_samples"]),
+        )
+
+
 def finalize_session(session_id: str, project: str, delete_jsonl: bool = True, actual_tokens: Optional[dict] = None,
-                     ended_at: Optional[str] = None, events: Optional[list] = None) -> dict:
+                     ended_at: Optional[str] = None, events: Optional[list] = None,
+                     attribution: Optional[dict] = None) -> dict:
     """
     Aggregate a session's transient JSONL into one SQLite row (+ per-tool
     rows), then delete the JSONL (its job is done once rolled up). Returns
@@ -1073,7 +1196,8 @@ def finalize_session(session_id: str, project: str, delete_jsonl: bool = True, a
 
     ended_at: optional "%Y-%m-%dT%H:%M:%SZ" timestamp to record instead of
     "now". events: optional, already-read events to aggregate instead of
-    re-reading the ledger.
+    re-reading the ledger. attribution: optional transcript index (see
+    read_transcript_attribution) for the per-model split.
     """
     if events is None:
         events = read_session_events(session_id)
@@ -1081,7 +1205,8 @@ def finalize_session(session_id: str, project: str, delete_jsonl: bool = True, a
         ended_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     conn = _connect()
     with conn:
-        result = _write_session_rows(conn, session_id, project, events, actual_tokens, ended_at)
+        result = _write_session_rows(conn, session_id, project, events, actual_tokens, ended_at,
+                                     attribution=attribution)
     conn.close()
 
     if delete_jsonl:
@@ -1180,7 +1305,8 @@ def has_session_artifacts(session_id: str) -> bool:
 
 def finalize_owned_session(session_id: str, project: Optional[str] = None,
                            actual_tokens: Optional[dict] = None,
-                           stale_before: Optional[float] = None) -> Optional[dict]:
+                           stale_before: Optional[float] = None,
+                           attribution: Optional[dict] = None) -> Optional[dict]:
     """
     Roll ALL of a session's event artifacts (its ledger plus any leftover
     claims) into savings.db as ONE snapshot, then delete them -- the single
@@ -1232,6 +1358,9 @@ def finalize_owned_session(session_id: str, project: Optional[str] = None,
     stale_before: recovery only -- an epoch time; if any artifact was written
     after it, the session is live again, so nothing is taken. Checked under
     the lock, closing the gap between recovery's directory scan and here.
+    attribution: the session's transcript index for the per-model split (the
+    SessionEnd hook reads it before taking the lock); recovery has no transcript
+    path and passes None, so a recovered session has no per-model rows.
     ended_at is "now" for a graceful end, and the newest artifact's last
     write for a recovery, so /my-savings trend buckets a session that
     crashed weeks ago into the week it actually ran.
@@ -1290,7 +1419,7 @@ def finalize_owned_session(session_id: str, project: Optional[str] = None,
                     ended_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                 result = _write_session_rows(
                     conn, sid, project or _orphan_project(events), events,
-                    actual_tokens, ended_at, accumulate=True,
+                    actual_tokens, ended_at, accumulate=True, attribution=attribution,
                 )
             conn.execute("COMMIT")
         except BaseException:
@@ -1673,6 +1802,50 @@ def query_session_agent_breakdown(session_id: str) -> list:
     ]
 
 
+_MODEL_ROW_COLUMNS = ("model", "event_count", "raw_chars_sum", "out_chars_sum", "saved_chars",
+                      "derived_tokens", "chars_per_token", "ratio_samples")
+
+
+def _model_rows(conn, session_id: str) -> list:
+    rows = conn.execute(
+        f"SELECT {', '.join(_MODEL_ROW_COLUMNS)} FROM session_models WHERE session_id = ?", (session_id,)
+    ).fetchall()
+    out = [dict(zip(_MODEL_ROW_COLUMNS, r, strict=True)) for r in rows]
+    # Named models by saving, the unattributed bucket last (same order as a fresh join).
+    out.sort(key=lambda r: (r["model"] == transcript_attribution_lib.UNATTRIBUTED, -r["saved_chars"], r["model"]))
+    return out
+
+
+def query_session_model_breakdown(session_id: str) -> list:
+    """Per-model rows for one finalized session (issue #440), same shape as
+    finalize_session's `by_model`. Empty for a session finalized before schema v9,
+    or without a transcript (nothing was recorded to backfill from)."""
+    conn = _connect()
+    try:
+        return _model_rows(conn, session_id)
+    finally:
+        conn.close()
+
+
+def query_recent_model_breakdown(project: str) -> Optional[dict]:
+    """The per-model rows of the project's most recent finalized session that has
+    any, as {"ended_at", "models"}; None when no session has. The detail view shows
+    it because the session in progress has no transcript to join yet."""
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT s.session_id, s.ended_at FROM sessions s WHERE s.project = ? "
+            "AND EXISTS (SELECT 1 FROM session_models m WHERE m.session_id = s.session_id) "
+            "ORDER BY s.ended_at DESC LIMIT 1",
+            (project,),
+        ).fetchone()
+        if not row:
+            return None
+        return {"ended_at": row[1], "models": _model_rows(conn, row[0])}
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Transcript token parsing (opt-in stopgap -- see issue #165)
 # ---------------------------------------------------------------------------
@@ -1785,6 +1958,19 @@ def parse_session_token_counts(transcript_path) -> Optional[dict]:
     if not parts:
         return None
     return {key: sum(p[key] for p in parts) for key in ("input", "output", "cache_read", "cache_write")}
+
+
+def read_transcript_attribution(transcript_path) -> Optional[dict]:
+    """The transcript index finalize_owned_session's `attribution` takes: each
+    tool call's model, turn and timestamp, plus per-model chars-per-token samples
+    (issue #440; see libs/transcript_attribution_lib.py). None when the path is
+    absent or unreadable. Always fails open -- never raises. Like
+    parse_session_token_counts it reads Claude Code's internal transcript format,
+    so the hook only calls it under the same opt-in."""
+    try:
+        return transcript_attribution_lib.read_transcript(transcript_path)
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -1914,6 +2100,37 @@ def _sparkline(values: list) -> str:
     return "".join(_SPARK_CHARS[min(7, int((v - lo) / span * 7))] for v in values)
 
 
+def _format_model_block(rows: list, heading: str, attribution: Optional[dict] = None) -> list:
+    """Lines for the per-model split (issue #440), or [] when there are none. The
+    characters before and after are exact counts; the token line under a model is
+    DERIVED and says so, with the ratio and sample size it came from. It is absent
+    for a model with too few samples to derive a ratio -- not shown as 0."""
+    if not rows:
+        return []
+    lines = ["", heading]
+    for r in rows:
+        unattributed = r["model"] == transcript_attribution_lib.UNATTRIBUTED
+        label = "unattributed" if unattributed else r["model"]
+        lines.append(
+            f"  {label:<24} {r['event_count']:>3} events  {_fmt_chars(r['raw_chars_sum'])} → "
+            f"{_fmt_chars(r['out_chars_sum'])} chars  {_fmt_reduction(r['raw_chars_sum'], r['out_chars_sum'])} reduction"
+        )
+        if r.get("derived_tokens") is not None and r.get("chars_per_token"):
+            lines.append(
+                f"    derived: {_fmt_tokens(r['derived_tokens'])} tokens kept out of context "
+                f"(characters saved ÷ {r['chars_per_token']:.2f} chars/token observed in this session, "
+                f"{r.get('ratio_samples', 0)} samples; each saving counted once per request that carried it; "
+                f"not a measurement)"
+            )
+    unjoined = (attribution or {}).get("unjoined", 0)
+    if unjoined:
+        lines.append(f"  Note: {unjoined} event(s) could not be matched to a transcript turn (listed as unattributed)")
+    orphans = (attribution or {}).get("marker_without_event", [])
+    if orphans:
+        lines.append(f"  Note: {len(orphans)} compressed result(s) in the transcript have no ledger event")
+    return lines
+
+
 def format_simple_view(session_agg: dict, project_summary: dict) -> str:
     events = session_agg.get("event_count", 0)
     raw_sum = session_agg.get("raw_chars_sum", 0)
@@ -1932,6 +2149,7 @@ def format_simple_view(session_agg: dict, project_summary: dict) -> str:
     if fetch_count:
         lines.append(f"  fetch_url                {fetch_count:>12} calls  (not credited — WebFetch already compresses server-side)")
 
+    lines += _format_model_block(session_agg.get("by_model") or [], "By model · this session", session_agg.get("attribution"))
     lines += _format_actual_token_block(session_agg, project)
 
     p_raw = project_summary.get("total_raw_chars", 0)
@@ -1951,7 +2169,8 @@ def format_simple_view(session_agg: dict, project_summary: dict) -> str:
     return "\n".join(lines)
 
 
-def format_detail_view(session_agg: dict, project_summary: dict, tool_breakdown: list, last_n: list, all_projects: list) -> str:
+def format_detail_view(session_agg: dict, project_summary: dict, tool_breakdown: list, last_n: list, all_projects: list,
+                       model_breakdown: Optional[dict] = None) -> str:
     events = session_agg.get("event_count", 0)
     raw_sum = session_agg.get("raw_chars_sum", 0)
     out_sum = session_agg.get("out_chars_sum", 0)
@@ -1966,6 +2185,15 @@ def format_detail_view(session_agg: dict, project_summary: dict, tool_breakdown:
     ]
 
     lines += _format_actual_token_block(session_agg, project)
+
+    # This session's own split when it has one (a finalized aggregate); otherwise
+    # the most recent finished session's, since a session in progress has no
+    # transcript to join yet (issue #440).
+    if session_agg.get("by_model"):
+        lines += _format_model_block(session_agg["by_model"], "By model · this session", session_agg.get("attribution"))
+    elif model_breakdown and model_breakdown.get("models"):
+        lines += _format_model_block(
+            model_breakdown["models"], f"By model · most recent finished session ({str(model_breakdown.get('ended_at', ''))[:10]})")
 
     if tool_breakdown:
         max_saved = max((t["saved_chars"] for t in tool_breakdown), default=0) or 1
@@ -2149,7 +2377,8 @@ def format_trend_view(trend_rows: list, project: str, bucket: str = "week") -> s
     return "\n".join(lines)
 
 
-def format_json(session_agg: dict, project_summary: dict, tool_breakdown: list, last_n: list, all_projects: list) -> str:
+def format_json(session_agg: dict, project_summary: dict, tool_breakdown: list, last_n: list, all_projects: list,
+                model_breakdown: Optional[dict] = None) -> str:
     """
     Machine-readable JSON export of all savings data.  Mirrors the same five
     data blocks that format_detail_view renders as text, serialised as a
@@ -2232,6 +2461,29 @@ def format_json(session_agg: dict, project_summary: dict, tool_breakdown: list, 
             for p in (all_projects or [])
         ],
     }
+    # Only when there is a split to report, so the document keeps its old shape
+    # for everyone else (issue #440). `derived_tokens`/`chars_per_token` are null
+    # when not derived; the characters are exact, the tokens are derived.
+    models = session_raw.get("by_model") or (model_breakdown or {}).get("models") or []
+    if models:
+        doc["model_breakdown"] = {
+            "source": "this_session" if session_raw.get("by_model") else "most_recent_finished_session",
+            "ended_at": None if session_raw.get("by_model") else (model_breakdown or {}).get("ended_at"),
+            "models": [
+                {
+                    "model": m.get("model", ""),
+                    "event_count": _int(m.get("event_count")),
+                    "raw_chars_sum": _int(m.get("raw_chars_sum")),
+                    "out_chars_sum": _int(m.get("out_chars_sum")),
+                    "saved_chars": _int(m.get("saved_chars")),
+                    "reduction_percent": _json_pct(m.get("raw_chars_sum"), m.get("out_chars_sum")),
+                    "derived_tokens": m.get("derived_tokens"),
+                    "chars_per_token": m.get("chars_per_token"),
+                    "ratio_samples": _int(m.get("ratio_samples")),
+                }
+                for m in models
+            ],
+        }
     return json.dumps(doc, indent=2)
 
 

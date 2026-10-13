@@ -262,8 +262,8 @@ def _record_savings_event(session_id, tool, raw_chars, out_chars, credited, sour
     being None (a savings footer from an MCP server that predates #437 carries
     only token estimates) means there is nothing honest to record, so the event
     is skipped. `tool_use_id` is the PostToolUse payload's id for this tool
-    call, kept so a later change can join the event to its transcript turn and
-    model."""
+    call, kept so SessionEnd can join the event to its transcript turn and model
+    (issue #440, libs/transcript_attribution_lib.py)."""
     # Split out of one combined `and` expression (issue #297) so Pyright can
     # narrow savings_ledger's type via the assert below -- same short-circuit
     # order and return behavior as the original `if not (A and B and C):`.

@@ -62,7 +62,10 @@ If you're not sure whether something clears the bar above, don't comment on it.
   It reports exact character counts and the percent reduction, deliberately no token
   estimate (a token count depends on the model's vocabulary, which isn't public; the old
   chars ÷ 3.5 `estimate_tokens` was removed in #438/#439) — don't suggest adding a
-  tokenizer or token estimates back.
+  tokenizer or a fixed chars-per-token constant back. The one token figure it does show
+  (#440, `libs/transcript_attribution_lib.py`) is per model, opt-in, and DERIVED from
+  that session's own transcript (never a constant), labelled as derived, and left out
+  when there are too few samples; that is deliberate, not an estimate sneaking back in.
 - **`libs/savings_ledger.py` is the sole storage interface** for the savings tracker by
   design (SQLite today, swappable later) — don't suggest inlining `sqlite3` calls
   elsewhere for "simplicity."
