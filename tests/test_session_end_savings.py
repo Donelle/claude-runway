@@ -69,7 +69,6 @@ class OutputShape(unittest.TestCase):
             mock.patch.object(hook.savings_ledger, "tracking_enabled", return_value=True),
             mock.patch.object(hook.savings_ledger, "has_session_artifacts", return_value=True),
             mock.patch.object(hook.savings_ledger, "project_name_from_cwd", return_value="my-project"),
-            mock.patch.object(hook.savings_ledger, "get_schema_overhead_tokens", return_value=0),
             mock.patch.object(hook.savings_ledger, "finalize_owned_session", return_value={"event_count": 1}),
             mock.patch.object(hook.savings_ledger, "query_project_summary", return_value={}),
             mock.patch.object(hook.savings_ledger, "format_simple_view", return_value=_SUMMARY),
@@ -122,7 +121,6 @@ class SilentExitPaths(unittest.TestCase):
             mock.patch.object(hook.savings_ledger, "tracking_enabled", return_value=True),
             mock.patch.object(hook.savings_ledger, "has_session_artifacts", return_value=True),
             mock.patch.object(hook.savings_ledger, "project_name_from_cwd", return_value="p"),
-            mock.patch.object(hook.savings_ledger, "get_schema_overhead_tokens", return_value=0),
             mock.patch.object(
                 hook.savings_ledger, "finalize_owned_session", return_value={"event_count": 0, "fetch_url_count": 2}
             ) as fin,
@@ -167,7 +165,6 @@ class RecoveryWiring(unittest.TestCase):
             mock.patch.object(hook.savings_ledger, "recover_orphaned_sessions", side_effect=OSError("boom")),
             mock.patch.object(hook.savings_ledger, "has_session_artifacts", return_value=True),
             mock.patch.object(hook.savings_ledger, "project_name_from_cwd", return_value="my-project"),
-            mock.patch.object(hook.savings_ledger, "get_schema_overhead_tokens", return_value=0),
             mock.patch.object(hook.savings_ledger, "finalize_owned_session", return_value={"event_count": 1}) as fin,
             mock.patch.object(hook.savings_ledger, "query_project_summary", return_value={}),
             mock.patch.object(hook.savings_ledger, "format_simple_view", return_value=_SUMMARY),
@@ -185,13 +182,12 @@ class RecoveryWiring(unittest.TestCase):
             mock.patch.object(hook.savings_ledger, "tracking_enabled", return_value=True),
             mock.patch.object(hook.savings_ledger, "has_session_artifacts", return_value=True),
             mock.patch.object(hook.savings_ledger, "project_name_from_cwd", return_value="my-project"),
-            mock.patch.object(hook.savings_ledger, "get_schema_overhead_tokens", return_value=0),
             mock.patch.object(hook.savings_ledger, "finalize_session") as plain,
             mock.patch.object(hook.savings_ledger, "finalize_owned_session", return_value={"event_count": 0}) as fin,
         ):
             _run_main()
         plain.assert_not_called()
-        fin.assert_called_once_with("abc123", "my-project", overhead_tokens=0, actual_tokens=None)
+        fin.assert_called_once_with("abc123", "my-project", actual_tokens=None)
 
     def test_artifact_check_error_fails_open(self):
         # PR #412 review (round 6): has_session_artifacts() ran outside the
@@ -211,7 +207,6 @@ class RecoveryWiring(unittest.TestCase):
             mock.patch.object(hook.savings_ledger, "tracking_enabled", return_value=True),
             mock.patch.object(hook.savings_ledger, "has_session_artifacts", return_value=True),
             mock.patch.object(hook.savings_ledger, "project_name_from_cwd", return_value="my-project"),
-            mock.patch.object(hook.savings_ledger, "get_schema_overhead_tokens", return_value=0),
             mock.patch.object(hook.savings_ledger, "finalize_owned_session", return_value=None),
             mock.patch.object(hook.savings_ledger, "format_simple_view", return_value=_SUMMARY) as fmt,
         ):
@@ -234,7 +229,7 @@ class TranscriptParsing(unittest.TestCase):
         """Run main() with all ledger calls stubbed; capture finalize_session kwargs."""
         captured = {}
 
-        def _fake_finalize(session_id, project=None, overhead_tokens=0, actual_tokens=None, stale_before=None):
+        def _fake_finalize(session_id, project=None, actual_tokens=None, stale_before=None):
             captured["actual_tokens"] = actual_tokens
             return {"event_count": 1}
 
@@ -251,7 +246,6 @@ class TranscriptParsing(unittest.TestCase):
             mock.patch.object(hook.savings_ledger, "tracking_enabled", return_value=True),
             mock.patch.object(hook.savings_ledger, "has_session_artifacts", return_value=True),
             mock.patch.object(hook.savings_ledger, "project_name_from_cwd", return_value="proj"),
-            mock.patch.object(hook.savings_ledger, "get_schema_overhead_tokens", return_value=0),
             mock.patch.object(hook.savings_ledger, "finalize_owned_session", side_effect=_fake_finalize),
             mock.patch.object(hook.savings_ledger, "query_project_summary", return_value={}),
             mock.patch.object(hook.savings_ledger, "format_simple_view", return_value=_SUMMARY),
@@ -310,7 +304,6 @@ class TranscriptParsing(unittest.TestCase):
             mock.patch.object(hook.savings_ledger, "tracking_enabled", return_value=True),
             mock.patch.object(hook.savings_ledger, "has_session_artifacts", return_value=True),
             mock.patch.object(hook.savings_ledger, "project_name_from_cwd", return_value="proj"),
-            mock.patch.object(hook.savings_ledger, "get_schema_overhead_tokens", return_value=0),
             mock.patch.object(hook.savings_ledger, "finalize_owned_session", return_value={}),
             mock.patch.object(hook.savings_ledger, "query_project_summary", return_value={}),
             mock.patch.object(hook.savings_ledger, "format_simple_view", return_value=_SUMMARY),

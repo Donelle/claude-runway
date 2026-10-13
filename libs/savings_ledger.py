@@ -2,7 +2,7 @@
 Storage + formatting for ClaudeRunway's opt-in savings tracker. Used by:
   - hooks/compress_output.py   (sole ledger WRITER -- see below for why)
   - hooks/session_end_savings.py    (rolls a session's ledger into SQLite, emits a summary)
-  - compress_mcp_server.py          (writes the fixed schema-overhead estimate at startup;
+  - compress_mcp_server.py          (the savings_summary/savings_detail/savings_trend tools read it;
                                       the 3 credited tools themselves do NOT import this module --
                                       their footer helper only measures character counts)
   - skills/my-savings/SKILL.md      (reads, via the savings_summary/savings_detail MCP tools)
@@ -323,7 +323,7 @@ def _parse_event_lines(lines) -> list:
 # existing databases on the same versioned path as new ones.
 # _MIGRATIONS below must gain a matching entry for every bump -- see
 # _run_migrations' docstring for how the two stay in sync (issue #30/#69).
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 # Issue #365: per-session savings split by which agent earned them. One DDL
 # string shared by _connect (fresh DBs) and _migrate_to_v5 (existing DBs) so the
@@ -358,7 +358,6 @@ _SESSIONS_DDL = """
         ended_at TEXT NOT NULL,
         event_count INTEGER NOT NULL,
         fetch_url_count INTEGER NOT NULL,
-        overhead_tokens INTEGER NOT NULL DEFAULT 0,
         actual_input_tokens INTEGER NOT NULL DEFAULT 0,
         actual_output_tokens INTEGER NOT NULL DEFAULT 0,
         actual_cache_read_tokens INTEGER NOT NULL DEFAULT 0,
@@ -368,6 +367,14 @@ _SESSIONS_DDL = """
         credited_saved_chars INTEGER NOT NULL DEFAULT 0
     )
 """
+
+# The columns of the current `sessions` table, in DDL order -- what _migrate_to_v8
+# copies across.
+_SESSIONS_COLUMNS = (
+    "session_id", "project", "ended_at", "event_count", "fetch_url_count",
+    "actual_input_tokens", "actual_output_tokens", "actual_cache_read_tokens", "actual_cache_write_tokens",
+    "raw_chars_sum", "out_chars_sum", "credited_saved_chars",
+)
 
 _SESSION_TOOLS_DDL = """
     CREATE TABLE IF NOT EXISTS {name} (
@@ -532,7 +539,10 @@ def _migrate_to_v6(conn) -> None:
 # see _v7_select, which reads them first so no history is lost with them.
 _V7_REBUILDS = (
     ("sessions", _SESSIONS_DDL,
-     ("session_id", "project", "ended_at", "event_count", "fetch_url_count", "overhead_tokens",
+     # No overhead_tokens: v7 builds the CURRENT `sessions` shape (issue #439 dropped
+     # that column), so a v6 database going straight to v8 loses it here, and
+     # _migrate_to_v8 only has work for a database that already reached v7.
+     ("session_id", "project", "ended_at", "event_count", "fetch_url_count",
       "actual_input_tokens", "actual_output_tokens", "actual_cache_read_tokens", "actual_cache_write_tokens",
       "raw_chars_sum", "out_chars_sum", "credited_saved_chars"),
      "credited_saved_chars", "event_count"),
@@ -596,8 +606,9 @@ def _migrate_to_v7(conn) -> None:
     `raw_tokens_sum`, `out_tokens_sum`, and `saved_tokens`/`raw_tokens_sum`/
     `out_tokens_sum` on `session_tools` and `session_agents`. The exact character
     columns v6 added replace them, and every reader now uses those. The
-    `actual_*_tokens` columns hold real transcript usage and stay, as does
-    `overhead_tokens`.
+    `actual_*_tokens` columns hold real transcript usage and stay. (`overhead_tokens`
+    stayed in the original v7 but is dropped by v8, issue #439; this rebuild already
+    omits it, since it builds the current `sessions` shape.)
 
     Rebuilds each table (create side table, copy the kept columns, drop, rename)
     rather than ALTER TABLE ... DROP COLUMN, which needs SQLite 3.35+ -- older
@@ -621,12 +632,38 @@ def _migrate_to_v7(conn) -> None:
         conn.execute(f"ALTER TABLE {side} RENAME TO {table}")
 
 
+def _migrate_to_v8(conn) -> None:
+    """
+    Drops `sessions.overhead_tokens` and the `schema_overhead_tokens` meta row
+    (issue #439). Both held a chars / 3.5 estimate of the toolkit's tool-schema
+    size, shown as "Tool overhead .../turn". That premise is not what the real
+    transcripts show: Claude Code lists these tools as deferred, loaded on demand
+    rather than sent every turn (tools/measure_startup_context.py measures it from
+    a session transcript). An estimate of a cost that is not paid is worse than no
+    figure, and the exact before/after character columns need no estimate.
+
+    Rebuilds `sessions` (create side table, copy, drop, rename) for the same reason
+    _migrate_to_v7 does: ALTER TABLE ... DROP COLUMN needs SQLite 3.35+. A database
+    that came through _migrate_to_v7 in this same run has no such column already
+    (that rebuild builds the current shape), so there is nothing to do for it.
+    """
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()}
+    if "overhead_tokens" in existing:
+        conn.execute("DROP TABLE IF EXISTS sessions_v8")
+        conn.execute(_SESSIONS_DDL.format(name="sessions_v8"))
+        cols = ", ".join(_SESSIONS_COLUMNS)
+        conn.execute(f"INSERT INTO sessions_v8 ({cols}) SELECT {cols} FROM sessions")
+        conn.execute("DROP TABLE sessions")
+        conn.execute("ALTER TABLE sessions_v8 RENAME TO sessions")
+    conn.execute("DELETE FROM meta WHERE key = 'schema_overhead_tokens'")
+
+
 # Maps target schema version -> the function that migrates INTO it from the
 # version immediately before. The next schema change adds one more entry here
 # and bumps SCHEMA_VERSION -- _run_migrations doesn't need to change at all,
 # which is the actual "scaffold" issue #69 asked for: a repeatable shape for
 # schema changes, not a one-off patch for this specific set of columns.
-_MIGRATIONS = {1: _migrate_to_v1, 2: _migrate_to_v2, 3: _migrate_to_v3, 4: _migrate_to_v4, 5: _migrate_to_v5, 6: _migrate_to_v6, 7: _migrate_to_v7}
+_MIGRATIONS = {1: _migrate_to_v1, 2: _migrate_to_v2, 3: _migrate_to_v3, 4: _migrate_to_v4, 5: _migrate_to_v5, 6: _migrate_to_v6, 7: _migrate_to_v7, 8: _migrate_to_v8}
 
 
 def _table_exists(conn, name: str) -> bool:
@@ -768,16 +805,6 @@ def get_meta(key: str, default: Optional[str] = None) -> Optional[str]:
     return row[0] if row else default
 
 
-def get_schema_overhead_tokens() -> int:
-    """
-    The fixed per-turn schema-overhead estimate, computed live at
-    compress_mcp_server.py startup (see its _log_fixed_overhead) and stashed
-    here so hooks/skills in a different process can read the same number
-    without recomputing it or importing the MCP server module.
-    """
-    return int(get_meta("schema_overhead_tokens", "0") or "0")
-
-
 # Aggregate keys for the exact-character sums (issue #437). `saved_chars` is NOT
 # summed from the events: see _derive_saved.
 _CHAR_SUM_KEYS = ("raw_chars_sum", "out_chars_sum", "saved_chars")
@@ -873,7 +900,7 @@ def _aggregate_by_agent(events: list) -> list:
     return rows
 
 
-def _write_session_rows(conn, session_id: str, project: str, events: list, overhead_tokens: int,
+def _write_session_rows(conn, session_id: str, project: str, events: list,
                         actual_tokens: Optional[dict], ended_at: str, accumulate: bool = False) -> dict:
     """
     Aggregate `events` and write them as `session_id`'s rows on `conn`, inside
@@ -891,7 +918,7 @@ def _write_session_rows(conn, session_id: str, project: str, events: list, overh
     orphan, then resumed and ended cleanly; or ended, resumed, ended again --
     and replacing threw away every earlier part. With no existing row this
     writes exactly what the replace path writes, so a session that ends once
-    is unchanged. Counters add; project/ended_at/overhead take the newest
+    is unchanged. Counters add; project/ended_at take the newest
     roll-up's value; actual_* take the new transcript counts when there are
     any (a resumed session reuses its transcript, so a later parse covers the
     whole session) and otherwise keep the counts already recorded. Adding is
@@ -940,13 +967,13 @@ def _write_session_rows(conn, session_id: str, project: str, events: list, overh
     w_by_agent = [dict(a, credited_event_count=0, **_zero_chars()) for a in by_agent] if resumed_unsized else by_agent
 
     session_values = (session_id, project, ended_at, event_count,
-                      fetch_url_count, overhead_tokens, actual_inp, actual_out, actual_cr, actual_cw,
+                      fetch_url_count, actual_inp, actual_out, actual_cr, actual_cw,
                       w_chars["raw_chars_sum"], w_chars["out_chars_sum"], w_chars["saved_chars"])
     session_columns = (
-        "(session_id, project, ended_at, event_count, fetch_url_count, overhead_tokens, "
+        "(session_id, project, ended_at, event_count, fetch_url_count, "
         " actual_input_tokens, actual_output_tokens, actual_cache_read_tokens, actual_cache_write_tokens, "
         " raw_chars_sum, out_chars_sum, credited_saved_chars) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     # Per-key counter columns shared by session_tools and session_agents.
     # `saved_chars` is not added: it is re-derived from the summed before/after
@@ -979,7 +1006,6 @@ def _write_session_rows(conn, session_id: str, project: str, events: list, overh
             + session_chars_set +
             "event_count = event_count + excluded.event_count, "
             "fetch_url_count = fetch_url_count + excluded.fetch_url_count, "
-            "overhead_tokens = excluded.overhead_tokens, "
             + ", ".join(f"{c} = {keep_actual.format(c)}" for c in actual_cols),
             session_values,
         )
@@ -1019,7 +1045,6 @@ def _write_session_rows(conn, session_id: str, project: str, events: list, overh
         "credited_saved_chars": chars_sum["saved_chars"],
         "event_count": event_count,
         "fetch_url_count": fetch_url_count,
-        "overhead_tokens": overhead_tokens,
         "by_tool": by_tool,
         "by_agent": by_agent,
         "actual_input_tokens":      actual_inp,
@@ -1029,7 +1054,7 @@ def _write_session_rows(conn, session_id: str, project: str, events: list, overh
     }
 
 
-def finalize_session(session_id: str, project: str, overhead_tokens: int = 0, delete_jsonl: bool = True, actual_tokens: Optional[dict] = None,
+def finalize_session(session_id: str, project: str, delete_jsonl: bool = True, actual_tokens: Optional[dict] = None,
                      ended_at: Optional[str] = None, events: Optional[list] = None) -> dict:
     """
     Aggregate a session's transient JSONL into one SQLite row (+ per-tool
@@ -1056,7 +1081,7 @@ def finalize_session(session_id: str, project: str, overhead_tokens: int = 0, de
         ended_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     conn = _connect()
     with conn:
-        result = _write_session_rows(conn, session_id, project, events, overhead_tokens, actual_tokens, ended_at)
+        result = _write_session_rows(conn, session_id, project, events, actual_tokens, ended_at)
     conn.close()
 
     if delete_jsonl:
@@ -1153,7 +1178,7 @@ def has_session_artifacts(session_id: str) -> bool:
     return bool(_session_artifacts(session_id))
 
 
-def finalize_owned_session(session_id: str, project: Optional[str] = None, overhead_tokens: int = 0,
+def finalize_owned_session(session_id: str, project: Optional[str] = None,
                            actual_tokens: Optional[dict] = None,
                            stale_before: Optional[float] = None) -> Optional[dict]:
     """
@@ -1265,7 +1290,7 @@ def finalize_owned_session(session_id: str, project: Optional[str] = None, overh
                     ended_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                 result = _write_session_rows(
                     conn, sid, project or _orphan_project(events), events,
-                    overhead_tokens, actual_tokens, ended_at, accumulate=True,
+                    actual_tokens, ended_at, accumulate=True,
                 )
             conn.execute("COMMIT")
         except BaseException:
@@ -1350,15 +1375,12 @@ def recover_orphaned_sessions(exclude_session_id: Optional[str] = None, now: Opt
             continue  # vanished mid-scan
         newest[sid] = max(mtime, newest.get(sid, mtime))
 
-    overhead: Optional[int] = None
     recovered = 0
     for sid, mtime in newest.items():
         if mtime > stale_before:
             continue  # live, or written to recently
         try:
-            if overhead is None:
-                overhead = get_schema_overhead_tokens()
-            if finalize_owned_session(sid, overhead_tokens=overhead, stale_before=stale_before) is not None:
+            if finalize_owned_session(sid, stale_before=stale_before) is not None:
                 recovered += 1
         except Exception:
             continue
@@ -1384,7 +1406,6 @@ def get_live_session_aggregate(session_id: str) -> dict:
         "credited_saved_chars": live_chars["saved_chars"],
         "event_count": len(counted),  # counted-only -- see _write_session_rows' comment
         "fetch_url_count": sum(1 for e in events if e.get("tool") == "fetch_url"),
-        "overhead_tokens": get_schema_overhead_tokens(),
         "by_tool": _aggregate_by_tool(events),
         "by_agent": _aggregate_by_agent(events),
         # Transcript parsing only happens at SessionEnd -- always 0 mid-session.
@@ -1897,7 +1918,6 @@ def format_simple_view(session_agg: dict, project_summary: dict) -> str:
     events = session_agg.get("event_count", 0)
     raw_sum = session_agg.get("raw_chars_sum", 0)
     out_sum = session_agg.get("out_chars_sum", 0)
-    overhead = session_agg.get("overhead_tokens", 0)
     fetch_count = session_agg.get("fetch_url_count", 0)
     project = session_agg.get("project") or project_summary.get("project", "")
 
@@ -1909,8 +1929,6 @@ def format_simple_view(session_agg: dict, project_summary: dict) -> str:
         f"  Characters after         {_fmt_chars(out_sum):>12}",
         f"  Reduction                {_fmt_reduction(raw_sum, out_sum):>12}   ({events} events)",
     ]
-    if overhead:
-        lines.append(f"  Tool overhead            {_fmt_tokens(overhead):>12}/turn  (mostly cached after turn 1)")
     if fetch_count:
         lines.append(f"  fetch_url                {fetch_count:>12} calls  (not credited — WebFetch already compresses server-side)")
 
@@ -2156,7 +2174,6 @@ def format_json(session_agg: dict, project_summary: dict, tool_breakdown: list, 
             "reduction_percent": _json_pct(session_raw.get("raw_chars_sum"), session_raw.get("out_chars_sum")),
             "event_count": _int(session_raw.get("event_count")),
             "fetch_url_count": _int(session_raw.get("fetch_url_count")),
-            "overhead_tokens": _int(session_raw.get("overhead_tokens")),
             # actual_* are always 0 for a live session (transcript is only
             # parsed at SessionEnd); included here so JSON consumers don't
             # need to special-case their absence.
@@ -2226,7 +2243,7 @@ def format_csv(session_agg: dict, project_summary: dict, tool_breakdown: list, l
 
     * ``"session"``  — one-row summary of the current session (default).
       Columns: project, raw_chars_sum, out_chars_sum, credited_saved_chars,
-               reduction_percent, event_count, fetch_url_count, overhead_tokens,
+               reduction_percent, event_count, fetch_url_count,
                project_total_raw_chars, project_total_out_chars,
                project_total_saved_chars, project_reduction_percent, project_sessions,
                project_best_session_chars, project_unsized_sessions.
@@ -2286,7 +2303,7 @@ def format_csv(session_agg: dict, project_summary: dict, tool_breakdown: list, l
         session_raw = session_agg or {}
         w.writerow([
             "project", "raw_chars_sum", "out_chars_sum", "credited_saved_chars",
-            "reduction_percent", "event_count", "fetch_url_count", "overhead_tokens",
+            "reduction_percent", "event_count", "fetch_url_count",
             "project_total_raw_chars", "project_total_out_chars",
             "project_total_saved_chars", "project_reduction_percent", "project_sessions",
             "project_best_session_chars", "project_unsized_sessions",
@@ -2299,7 +2316,6 @@ def format_csv(session_agg: dict, project_summary: dict, tool_breakdown: list, l
             _csv_pct(session_raw.get("raw_chars_sum"), session_raw.get("out_chars_sum")),
             _int(session_raw.get("event_count")),
             _int(session_raw.get("fetch_url_count")),
-            _int(session_raw.get("overhead_tokens")),
             _int(project_summary.get("total_raw_chars")),
             _int(project_summary.get("total_out_chars")),
             _int(project_summary.get("total_saved_chars")),

@@ -274,13 +274,15 @@ class SchemaMigration(SavingsLedgerTestCase):
         _old_schema_db_path(self._db_path())
 
         # The exact regression: this used to raise sqlite3.OperationalError.
-        result = L.finalize_session("sess1", "myproject", overhead_tokens=5)
+        result = L.finalize_session("sess1", "myproject")
         self.assertEqual(result["raw_chars_sum"], 0)
-        self.assertEqual(result["overhead_tokens"], 5)
+        self.assertNotIn("overhead_tokens", result)
 
         conn = sqlite3.connect(str(self._db_path()))
         columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()}
-        self.assertTrue({"raw_chars_sum", "out_chars_sum", "overhead_tokens"} <= columns)
+        self.assertTrue({"raw_chars_sum", "out_chars_sum"} <= columns)
+        # Issue #439: the schema-overhead estimate column is gone.
+        self.assertNotIn("overhead_tokens", columns)
         self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], L.SCHEMA_VERSION)
         conn.close()
 
@@ -293,13 +295,13 @@ class SchemaMigration(SavingsLedgerTestCase):
 
         conn = sqlite3.connect(str(self._db_path()))
         row = conn.execute(
-            "SELECT project, credited_saved_chars, raw_chars_sum, out_chars_sum, overhead_tokens "
+            "SELECT project, credited_saved_chars, raw_chars_sum, out_chars_sum "
             "FROM sessions WHERE session_id = 'old-sess'"
         ).fetchone()
         conn.close()
         # 42 saved tokens -> 147 chars via v6's tokens x 3.5 backfill; the token
         # columns themselves are gone after v7 (issue #438).
-        self.assertEqual(row, ("old-project", 147, 0, 0, 0))
+        self.assertEqual(row, ("old-project", 147, 0, 0))
 
     def test_brand_new_db_gets_latest_schema_and_version_immediately(self):
         # No file exists yet -- _connect()'s CREATE TABLE already produces
@@ -842,8 +844,8 @@ class QueryAllProjectsRicherStats(SavingsLedgerTestCase):
         conn.execute(
             "INSERT OR REPLACE INTO sessions "
             "(session_id, project, ended_at, credited_saved_chars, raw_chars_sum, "
-            " out_chars_sum, event_count, fetch_url_count, overhead_tokens) "
-            "VALUES ('bare-sess', 'proj-bare', '2026-01-01T00:00:00Z', 50, 0, 0, 1, 0, 0)"
+            " out_chars_sum, event_count, fetch_url_count) "
+            "VALUES ('bare-sess', 'proj-bare', '2026-01-01T00:00:00Z', 50, 0, 0, 1, 0)"
         )
         conn.commit()
         conn.close()
@@ -959,7 +961,6 @@ class FormatJson(unittest.TestCase):
         "out_chars_sum": 3766,
         "event_count": 7,
         "fetch_url_count": 2,
-        "overhead_tokens": 300,
     }
     _PROJECT_SUMMARY = {
         "project": "my-repo",
@@ -996,7 +997,7 @@ class FormatJson(unittest.TestCase):
         self.assertEqual(sess["raw_chars_sum"], 5000)
         self.assertEqual(sess["event_count"], 7)
         self.assertEqual(sess["fetch_url_count"], 2)
-        self.assertEqual(sess["overhead_tokens"], 300)
+        self.assertNotIn("overhead_tokens", sess)  # issue #439
 
     def test_project_summary_values_are_correct(self):
         parsed = json.loads(self._render())
@@ -1071,7 +1072,6 @@ class FormatCsv(unittest.TestCase):
         "out_chars_sum": 3766,
         "event_count": 7,
         "fetch_url_count": 2,
-        "overhead_tokens": 300,
     }
     _PROJECT_SUMMARY = {
         "project": "my-repo",
@@ -1249,16 +1249,16 @@ class QueryTrend(SavingsLedgerTestCase):
         conn.execute(
             "INSERT INTO sessions "
             "(session_id, project, ended_at, credited_saved_chars, "
-            " raw_chars_sum, out_chars_sum, event_count, fetch_url_count, overhead_tokens) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            ("s-w1", "proj-w", "2026-09-07T09:00:00Z", 100, 1000, 900, 1, 0, 0),
+            " raw_chars_sum, out_chars_sum, event_count, fetch_url_count) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("s-w1", "proj-w", "2026-09-07T09:00:00Z", 100, 1000, 900, 1, 0),
         )
         conn.execute(
             "INSERT INTO sessions "
             "(session_id, project, ended_at, credited_saved_chars, "
-            " raw_chars_sum, out_chars_sum, event_count, fetch_url_count, overhead_tokens) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            ("s-w2", "proj-w", "2026-09-09T17:00:00Z", 200, 1000, 800, 1, 0, 0),
+            " raw_chars_sum, out_chars_sum, event_count, fetch_url_count) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("s-w2", "proj-w", "2026-09-09T17:00:00Z", 200, 1000, 800, 1, 0),
         )
         conn.commit()
         conn.close()
@@ -1278,16 +1278,16 @@ class QueryTrend(SavingsLedgerTestCase):
         conn.execute(
             "INSERT INTO sessions "
             "(session_id, project, ended_at, credited_saved_chars, "
-            " raw_chars_sum, out_chars_sum, event_count, fetch_url_count, overhead_tokens) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            ("s-boundary-1", "proj-boundary", "2024-12-30T10:00:00Z", 100, 1000, 900, 1, 0, 0),
+            " raw_chars_sum, out_chars_sum, event_count, fetch_url_count) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("s-boundary-1", "proj-boundary", "2024-12-30T10:00:00Z", 100, 1000, 900, 1, 0),
         )
         conn.execute(
             "INSERT INTO sessions "
             "(session_id, project, ended_at, credited_saved_chars, "
-            " raw_chars_sum, out_chars_sum, event_count, fetch_url_count, overhead_tokens) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            ("s-boundary-2", "proj-boundary", "2025-01-01T14:00:00Z", 200, 1000, 800, 1, 0, 0),
+            " raw_chars_sum, out_chars_sum, event_count, fetch_url_count) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("s-boundary-2", "proj-boundary", "2025-01-01T14:00:00Z", 200, 1000, 800, 1, 0),
         )
         conn.commit()
         conn.close()
@@ -1314,9 +1314,9 @@ class QueryTrend(SavingsLedgerTestCase):
             conn.execute(
                 "INSERT INTO sessions "
                 "(session_id, project, ended_at, credited_saved_chars, "
-                " raw_chars_sum, out_chars_sum, event_count, fetch_url_count, overhead_tokens) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (session_id, "proj-d", f"{day}T12:00:00Z", saved, 1000, 1000 - saved, 1, 0, 0),
+                " raw_chars_sum, out_chars_sum, event_count, fetch_url_count) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (session_id, "proj-d", f"{day}T12:00:00Z", saved, 1000, 1000 - saved, 1, 0),
             )
         conn.commit()
         conn.close()
@@ -1337,9 +1337,9 @@ class QueryTrend(SavingsLedgerTestCase):
             conn.execute(
                 "INSERT INTO sessions "
                 "(session_id, project, ended_at, credited_saved_chars, "
-                " raw_chars_sum, out_chars_sum, event_count, fetch_url_count, overhead_tokens) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (f"s-cap-{i}", "proj-cap", f"2026-09-0{i + 1}T12:00:00Z", (i + 1) * 100, 1000, 900, 1, 0, 0),
+                " raw_chars_sum, out_chars_sum, event_count, fetch_url_count) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (f"s-cap-{i}", "proj-cap", f"2026-09-0{i + 1}T12:00:00Z", (i + 1) * 100, 1000, 900, 1, 0),
             )
         conn.commit()
         conn.close()
@@ -1367,9 +1367,9 @@ class QueryTrend(SavingsLedgerTestCase):
             conn.execute(
                 "INSERT INTO sessions "
                 "(session_id, project, ended_at, credited_saved_chars, "
-                " raw_chars_sum, out_chars_sum, event_count, fetch_url_count, overhead_tokens) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (f"s-{proj}", proj, "2026-09-07T12:00:00Z", 500, 1000, 500, 1, 0, 0),
+                " raw_chars_sum, out_chars_sum, event_count, fetch_url_count) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (f"s-{proj}", proj, "2026-09-07T12:00:00Z", 500, 1000, 500, 1, 0),
             )
         conn.commit()
         conn.close()
@@ -2540,8 +2540,8 @@ class OrphanedLedgerRecovery(SavingsLedgerTestCase):
             L.record_event(sid, "compress_file", 1000, 100, True, project="proj")
             L.record_event(sid, "fetch_url", 50, 10, False, project="proj")
         counts = {"input": 1, "output": 2, "cache_read": 3, "cache_write": 4}
-        L.finalize_session("plain", "proj", overhead_tokens=7, actual_tokens=counts)
-        L.finalize_owned_session("owned", "proj", overhead_tokens=7, actual_tokens=counts)
+        L.finalize_session("plain", "proj", actual_tokens=counts)
+        L.finalize_owned_session("owned", "proj", actual_tokens=counts)
         skip = {"session_id", "ended_at"}
         plain, owned = self._session_row("plain"), self._session_row("owned")
         self.assertEqual({k: plain[k] for k in plain.keys() if k not in skip},
@@ -2832,14 +2832,15 @@ class ExactCharCountsAndToolUseId(SavingsLedgerTestCase):
         for table in ("sessions", "session_tools", "session_agents"):
             cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
             self.assertFalse(cols & dropped, (table, cols & dropped))
-        # Real transcript usage and the schema overhead are NOT estimates and stay.
+        # Real transcript usage is NOT an estimate and stays. (The schema-overhead
+        # estimate column went in v8, issue #439 -- see SchemaOverheadRemovedV8.)
         row = conn.execute(
-            "SELECT overhead_tokens, actual_input_tokens, event_count FROM sessions WHERE session_id = 'known'"
+            "SELECT actual_input_tokens, event_count FROM sessions WHERE session_id = 'known'"
         ).fetchone()
-        self.assertEqual(row, (55, 777, 3))
+        self.assertEqual(row, (777, 3))
         cols = {r[1] for r in conn.execute("PRAGMA table_info(sessions)")}
         self.assertTrue({"actual_input_tokens", "actual_output_tokens", "actual_cache_read_tokens",
-                         "actual_cache_write_tokens", "overhead_tokens"} <= cols)
+                         "actual_cache_write_tokens"} <= cols)
         self.assertEqual(conn.execute("SELECT credited_event_count FROM session_tools").fetchone()[0], 0)
         conn.close()
 
@@ -2871,7 +2872,8 @@ class ExactCharCountsAndToolUseId(SavingsLedgerTestCase):
         self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 6)
         self.assertIn("raw_tokens_sum", {r[1] for r in conn.execute("PRAGMA table_info(sessions)")})
         conn.close()
-        L._connect().close()  # now v7
+        with mock.patch.object(L, "SCHEMA_VERSION", 7):
+            L._connect().close()  # now v7
         conn = sqlite3.connect(str(L.resolve_db_path()))
         self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 7)
         self.assertNotIn("raw_tokens_sum", {r[1] for r in conn.execute("PRAGMA table_info(sessions)")})
@@ -3272,7 +3274,7 @@ class FormatSimpleViewCharacters(unittest.TestCase):
     estimated token count."""
 
     _SESSION = {"project": "proj", "event_count": 3, "raw_chars_sum": 12000, "out_chars_sum": 3000,
-                "credited_saved_chars": 9000, "fetch_url_count": 0, "overhead_tokens": 0}
+                "credited_saved_chars": 9000, "fetch_url_count": 0}
     _PROJECT = {"project": "proj", "sessions": 4, "total_raw_chars": 50000, "total_out_chars": 20000,
                 "total_saved_chars": 30000, "best_session_chars": 11000}
 
@@ -3306,10 +3308,68 @@ class FormatSimpleViewCharacters(unittest.TestCase):
         session = dict(self._SESSION, raw_chars_sum=100, out_chars_sum=150)
         self.assertRegex("\n".join(self._lines(session=session)), r"Reduction\s+0%\s+\(3 events\)")
 
-    def test_tool_overhead_line_is_unchanged(self):
-        # Out of scope (#439): the schema-overhead estimate keeps its token wording.
+    def test_no_tool_overhead_line_even_when_the_aggregate_carries_one(self):
+        # Issue #439: the "Tool overhead .../turn" line is gone. A stray
+        # overhead_tokens key (e.g. from an older caller) must not bring it back.
         session = dict(self._SESSION, overhead_tokens=2500)
-        self.assertIn("Tool overhead", "\n".join(self._lines(session=session)))
+        text = "\n".join(self._lines(session=session))
+        self.assertNotIn("Tool overhead", text)
+        self.assertNotIn("/turn", text)
+
+
+class SchemaOverheadRemovedV8(SavingsLedgerTestCase):
+    """Issue #439: `sessions.overhead_tokens` and the `schema_overhead_tokens` meta
+    row held a chars / 3.5 estimate of a per-turn cost real transcripts show is not
+    paid (the tools are deferred). v8 drops them; the rest of each row survives."""
+
+    _V7_SESSIONS = (
+        "CREATE TABLE sessions (session_id TEXT PRIMARY KEY, project TEXT NOT NULL, ended_at TEXT NOT NULL, "
+        "event_count INTEGER NOT NULL, fetch_url_count INTEGER NOT NULL, "
+        "overhead_tokens INTEGER NOT NULL DEFAULT 0, actual_input_tokens INTEGER NOT NULL DEFAULT 0, "
+        "actual_output_tokens INTEGER NOT NULL DEFAULT 0, actual_cache_read_tokens INTEGER NOT NULL DEFAULT 0, "
+        "actual_cache_write_tokens INTEGER NOT NULL DEFAULT 0, raw_chars_sum INTEGER NOT NULL DEFAULT 0, "
+        "out_chars_sum INTEGER NOT NULL DEFAULT 0, credited_saved_chars INTEGER NOT NULL DEFAULT 0)"
+    )
+
+    def _make_v7_db(self):
+        conn = sqlite3.connect(str(L.resolve_db_path()))
+        conn.execute(self._V7_SESSIONS)
+        conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.execute(
+            "INSERT INTO sessions VALUES ('known', 'p', '2026-09-01T00:00:00Z', 3, 1, 2500, 777, 8, 9, 10, 5000, 1000, 4000)"
+        )
+        conn.execute("INSERT INTO meta VALUES ('schema_overhead_tokens', '2500')")
+        conn.execute("INSERT INTO meta VALUES ('keep-me', 'yes')")
+        conn.execute("PRAGMA user_version = 7")
+        conn.commit()
+        conn.close()
+
+    def test_v7_database_loses_the_column_and_the_meta_row_but_keeps_every_other_value(self):
+        self._make_v7_db()
+        conn = L._connect()
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], L.SCHEMA_VERSION)
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(sessions)")]
+        self.assertNotIn("overhead_tokens", cols)
+        self.assertEqual(tuple(cols), L._SESSIONS_COLUMNS)
+        self.assertEqual(
+            conn.execute("SELECT * FROM sessions").fetchone(),
+            ("known", "p", "2026-09-01T00:00:00Z", 3, 1, 777, 8, 9, 10, 5000, 1000, 4000))
+        self.assertIsNone(conn.execute("SELECT 1 FROM meta WHERE key = 'schema_overhead_tokens'").fetchone())
+        self.assertIsNotNone(conn.execute("SELECT 1 FROM meta WHERE key = 'keep-me'").fetchone())
+        conn.close()
+
+    def test_a_fresh_database_never_has_the_column(self):
+        conn = L._connect()
+        self.assertNotIn("overhead_tokens", {r[1] for r in conn.execute("PRAGMA table_info(sessions)")})
+        conn.close()
+
+    def test_a_v8_database_reconnects_without_error(self):
+        self._make_v7_db()
+        L._connect().close()
+        L._connect().close()  # second connect: nothing left to do, nothing may raise
+
+    def test_the_removed_helpers_are_gone(self):
+        self.assertFalse(hasattr(L, "get_schema_overhead_tokens"))
 
 
 if __name__ == "__main__":

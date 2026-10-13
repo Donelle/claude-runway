@@ -91,12 +91,10 @@ from local_compress_lib import (
     DEFAULT_WEB_FOCUS,  # defined in the lib so _looks_non_selective can see it
     compress as _compress_impl,
     derive_compact_label,
-    estimate_tokens,
     fetch_loaded_models,
     redact_credentials,
 )
 from memory_bank_lib import COMPACT_SOURCE
-from mcp_tool_introspect import describe_tools, tool_count
 from qdrant_retry import call_with_retry
 
 # savings_ledger is optional at import time (e.g. an older checkout of just
@@ -236,38 +234,6 @@ def _append_savings_footer(outer_text: str, inner_result: str, tool: str, raw_te
         "source": redacted_source[:200],
     })
     return f"{outer_text}\n<!--CLAUDE_RUNWAY_SAVINGS:{footer}-->"
-
-
-def _log_fixed_overhead():
-    """
-    Estimates the fixed per-turn context cost of this server's tool schemas
-    (name + signature + docstring, as a proxy for the real JSON schema
-    Claude Code sends) and stashes it via savings_ledger.set_meta so
-    hooks/session_end_savings.py and the savings_summary/savings_detail
-    tools can report it without recomputing it or importing this module.
-    Runs once at startup -- self-updating on every restart, so it never
-    goes stale the way a hardcoded constant would if a tool's docstring or
-    signature changes. Best-effort: never blocks server startup.
-
-    Enumerates this server's own @mcp.tool()-decorated functions via
-    libs/mcp_tool_introspect.py (a shared utility, issue #52/GROW-05)
-    instead of a hardcoded tuple -- a fixed tuple silently went stale here
-    once already (issue #22: written against 5 tools, never updated when
-    compact_store/compact_find/savings_summary/savings_detail shipped,
-    understating the real overhead for months). See that module's own
-    docstring for why it reaches into MCPServer's private "_tool_manager"
-    attribute instead of the public (but async) list_tools().
-    """
-    if not TRACK_SAVINGS:
-        return
-    assert savings_ledger is not None  # TRACK_SAVINGS implies this (see module top)
-    try:
-        blob = describe_tools(mcp)
-        overhead = estimate_tokens(blob)
-        savings_ledger.set_meta("schema_overhead_tokens", str(overhead))
-        print(f"[claude-runway] local-compress schema overhead ~{overhead} tokens ({tool_count(mcp)} tools)", file=sys.stderr)
-    except Exception as e:
-        print(f"[claude-runway] could not estimate schema overhead: {e}", file=sys.stderr)
 
 
 @mcp.tool()
@@ -1898,7 +1864,7 @@ def savings_summary(project: Optional[str] = None, format: str = "text") -> str:
         # `session_agg["project"] = project` str assignment below type-checks.
         session_agg: dict = (
             savings_ledger.get_live_session_aggregate(session_id) if session_id
-            else {"credited_saved_chars": 0, "raw_chars_sum": 0, "out_chars_sum": 0, "event_count": 0, "fetch_url_count": 0, "overhead_tokens": savings_ledger.get_schema_overhead_tokens()}
+            else {"credited_saved_chars": 0, "raw_chars_sum": 0, "out_chars_sum": 0, "event_count": 0, "fetch_url_count": 0}
         )
         session_agg["project"] = project
         project_summary = savings_ledger.query_project_summary(project)
@@ -1981,7 +1947,7 @@ def savings_detail(project: Optional[str] = None, format: str = "text", csv_tabl
                 reverse=True,
             )
         else:
-            session_agg = {"credited_saved_chars": 0, "raw_chars_sum": 0, "out_chars_sum": 0, "event_count": 0, "fetch_url_count": 0, "overhead_tokens": savings_ledger.get_schema_overhead_tokens()}
+            session_agg = {"credited_saved_chars": 0, "raw_chars_sum": 0, "out_chars_sum": 0, "event_count": 0, "fetch_url_count": 0}
             tool_breakdown = []
         session_agg["project"] = project
         project_summary = savings_ledger.query_project_summary(project)
@@ -2217,5 +2183,4 @@ def record_metric(
 
 
 if __name__ == "__main__":
-    _log_fixed_overhead()
     mcp.run()

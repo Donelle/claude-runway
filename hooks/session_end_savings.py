@@ -133,7 +133,6 @@ def main():
     # crashed hook or a missing systemMessage at normal session shutdown.
     try:
         project = savings_ledger.project_name_from_cwd(cwd)
-        overhead = savings_ledger.get_schema_overhead_tokens()
         # finalize_owned_session, not finalize_session (#306): the same
         # ownership protocol orphan recovery uses -- serialized on savings.db's
         # write lock, and rolling up this session's ledger TOGETHER with any
@@ -141,7 +140,7 @@ def main():
         # up separately would let one overwrite the other. None means another
         # process already consumed this session's events; that roll-up stands.
         session_agg = savings_ledger.finalize_owned_session(
-            session_id, project, overhead_tokens=overhead, actual_tokens=actual_tokens,
+            session_id, project, actual_tokens=actual_tokens,
         )
         if not session_agg:
             sys.exit(0)

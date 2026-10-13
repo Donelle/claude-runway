@@ -1,21 +1,14 @@
 #!/usr/bin/env python3
-"""Tests for tools/compress_mcp_server.py's _log_fixed_overhead().
+"""Tests for tools/compress_mcp_server.py.
 
-Stdlib-only (unittest, no pytest) and no network -- _log_fixed_overhead()
-never calls out to LM Studio; it only inspects already-registered tool
-functions and estimates a token count from static text (name + signature +
-docstring), so this needs neither a live model nor a real database:
+Stdlib-only (unittest, no pytest) and no network -- needs neither a live model
+nor a real database:
 
     .venv/bin/python -m unittest discover -s tests
 
-Why this file exists (issue #22): _log_fixed_overhead() used to enumerate a
-hardcoded 5-function tuple. compact_store/compact_find/savings_summary/
-savings_detail shipped later and were never added to it, so the /my-savings
-"tool overhead" annotation silently understated the real cost for months --
-nothing errored, the estimate was just quietly wrong. The fix replaces the
-tuple with a runtime enumeration of the server's own registered tools; the
-point of test_new_tool_is_picked_up_without_code_changes below is to make
-that exact failure mode impossible to reintroduce silently again.
+Originally written for issue #22 (the startup schema-overhead estimate
+enumerated a hardcoded tool tuple that silently went stale); that estimate is
+gone (issue #439) and RegisteredToolSet keeps the live-enumeration guard.
 """
 
 import codecs
@@ -1011,19 +1004,20 @@ class CompactFindFiltersTheCanonicalCollectionToo(unittest.TestCase):
         self.assertIn("target content alpha", result)
 
 
-class LogFixedOverheadEnumeratesRegisteredTools(unittest.TestCase):
-    def test_overhead_covers_every_currently_registered_tool(self):
-        mod = _load_compress_mcp_server()
-        mod.TRACK_SAVINGS = True
-        captured = {}
-        with mock.patch.object(
-            mod.savings_ledger, "set_meta", side_effect=lambda k, v: captured.setdefault(k, v)
-        ):
-            mod._log_fixed_overhead()
+class RegisteredToolSet(unittest.TestCase):
+    """Pins the server's registered tool set and checks the shared live count
+    sees a tool added later. This used to be tested through
+    _log_fixed_overhead() (issue #22: a hardcoded 5-tool tuple silently went
+    stale); that startup estimate was removed in issue #439, but the failure
+    mode it guarded -- a tool list that drifts from what is really registered --
+    is still real for tools/report_tool_counts.py, which uses the same
+    libs/mcp_tool_introspect.py enumeration."""
 
+    def test_the_registered_tool_set_is_the_documented_one(self):
+        mod = _load_compress_mcp_server()
         tool_names = {info.name for info in mod.mcp._tool_manager.list_tools()}
-        # Pinned to the module's actual current tool set, not just len() ==
-        # 10, so a rename/removal is caught too, not just a count drift.
+        # Pinned to the module's actual current tool set, not just a count, so a
+        # rename/removal is caught too, not just a count drift.
         self.assertEqual(
             tool_names,
             {
@@ -1042,38 +1036,26 @@ class LogFixedOverheadEnumeratesRegisteredTools(unittest.TestCase):
                 "record_metric",
             },
         )
-        self.assertIn("schema_overhead_tokens", captured)
-        self.assertGreater(int(captured["schema_overhead_tokens"]), 0)
 
     def test_new_tool_is_picked_up_without_code_changes(self):
-        """The actual issue #22 regression guard: a tool registered AFTER
-        this function was last edited must still be included automatically,
-        with zero changes to _log_fixed_overhead() itself.
-        """
+        import mcp_tool_introspect
+
         mod = _load_compress_mcp_server()
+        before = mcp_tool_introspect.tool_count(mod.mcp)
 
         @mod.mcp.tool()
         def _newly_added_probe_tool() -> str:
-            """A tool added after _log_fixed_overhead was last edited."""
+            """A tool added after the enumeration code was last edited."""
             return "x"
 
-        mod.TRACK_SAVINGS = True
-        captured = {}
-        with mock.patch.object(
-            mod.savings_ledger, "set_meta", side_effect=lambda k, v: captured.setdefault(k, v)
-        ):
-            mod._log_fixed_overhead()
+        self.assertEqual(mcp_tool_introspect.tool_count(mod.mcp), before + 1)
+        self.assertIn("_newly_added_probe_tool", mcp_tool_introspect.describe_tools(mod.mcp))
 
-        tool_names = {info.name for info in mod.mcp._tool_manager.list_tools()}
-        self.assertIn("_newly_added_probe_tool", tool_names)
-        self.assertIn("schema_overhead_tokens", captured)
-
-    def test_noop_when_tracking_disabled(self):
+    def test_no_schema_overhead_estimate_is_computed_or_stored(self):
+        # Issue #439: the chars / 3.5 estimate and its meta row are gone.
         mod = _load_compress_mcp_server()
-        mod.TRACK_SAVINGS = False
-        with mock.patch.object(mod.savings_ledger, "set_meta") as set_meta:
-            mod._log_fixed_overhead()
-        set_meta.assert_not_called()
+        self.assertFalse(hasattr(mod, "_log_fixed_overhead"))
+        self.assertFalse(hasattr(mod.savings_ledger, "get_schema_overhead_tokens"))
 
 
 class CompressCommandOutputDefaultsToRedaction(unittest.TestCase):

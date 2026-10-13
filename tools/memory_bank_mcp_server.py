@@ -116,8 +116,8 @@ mcp = MCPServer("memory-bank")
 
 
 def _log_registered_tool_count():
-    """Best-effort startup log (stderr only) -- see this repo's other MCP
-    servers' identical helper for why this can't ever call print()."""
+    """Best-effort startup log (stderr only) -- see
+    ingest_mcp_server.py's identical helper for why this can't ever call print()."""
     try:
         n = tool_count(mcp)
         print(f"[claude-runway] memory-bank registered {n} tools", file=sys.stderr)

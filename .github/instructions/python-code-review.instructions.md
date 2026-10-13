@@ -58,9 +58,11 @@ If you're not sure whether something clears the bar above, don't comment on it.
   the savings tracker) hit an error. Don't flag this pattern as a bug or suggest narrowing
   it, unless the `except` is swallowing an error that should have surfaced via
   `additionalContext`/`systemMessage` instead of silently doing nothing.
-- **The savings tracker estimates a counterfactual, not a measurement.** Token counts
-  (`estimate_tokens`, chars ÷ 3.5) are an intentional approximation, not a bug — don't
-  suggest replacing it with an exact tokenizer.
+- **The savings tracker observes a counterfactual online, not a controlled measurement.**
+  It reports exact character counts and the percent reduction, deliberately no token
+  estimate (a token count depends on the model's vocabulary, which isn't public; the old
+  chars ÷ 3.5 `estimate_tokens` was removed in #438/#439) — don't suggest adding a
+  tokenizer or token estimates back.
 - **`libs/savings_ledger.py` is the sole storage interface** for the savings tracker by
   design (SQLite today, swappable later) — don't suggest inlining `sqlite3` calls
   elsewhere for "simplicity."
