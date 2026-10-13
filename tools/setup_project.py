@@ -355,6 +355,7 @@ def cmd_init(args: argparse.Namespace) -> None:
         memory_bank_collection=args.memory_bank_collection,
         memory_bank_id=args.memory_bank_id,
         embedding_model=args.embedding_model,
+        memory_bank_embedding_model=args.memory_bank_embedding_model,
         include_compress=not args.qdrant_only,
         include_hooks=include_hooks,
         # Issue #221: warm/verify the fastembed cache (and set
@@ -707,10 +708,20 @@ def parse_args() -> argparse.Namespace:
     init.add_argument(
         "--embedding-model",
         default="",
-        help="EMBEDDING_MODEL written into the qdrant/codebase-indexer/memory-bank blocks. Blank (default) "
-        "PRESERVES the model already in the target's existing .mcp.json, falling back to the template "
+        help="EMBEDDING_MODEL written into the qdrant/codebase-indexer blocks (NOT memory-bank, which has "
+        "--memory-bank-embedding-model). Blank (default) PRESERVES the model already in the target's "
+        "existing .mcp.json, falling back to the template "
         "default for a new project. Passing a value that differs from the existing one prints a warning: "
         "vectors indexed under the old model are incompatible, so drop the collection and re-index",
+    )
+    init.add_argument(
+        "--memory-bank-embedding-model",
+        default="",
+        help="EMBEDDING_MODEL written into the memory-bank block only, independent of --embedding-model. "
+        "Blank (default) PRESERVES the memory-bank block's existing value, falling back to the template "
+        "default. The memory-bank collection is shared by every project and locked to the model that "
+        "created it, so passing a different value prints a warning: remember/recall fail for every "
+        "project until that collection is rebuilt",
     )
     init.add_argument("--collection-description", default="", help="Short one-line hint for list_collections")
     init.add_argument("--include-extensions", default="", help="e.g. '.py,.md' -- blank uses the built-in defaults")

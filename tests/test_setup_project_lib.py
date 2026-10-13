@@ -904,25 +904,121 @@ class RunSetupEndToEnd(unittest.TestCase):
         new_model = "sentence-transformers/all-mpnet-base-v2"
         result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"), embedding_model=new_model)
         models = self._models(result)
-        # Per-project code collections move to the new model; the shared memory-bank
-        # server stays on the model its collection is locked to.
+        # Per-project code collections move to the new model; memory-bank's model is
+        # its own value (issue #428) and is untouched.
         self.assertEqual(models["qdrant"], new_model)
         self.assertEqual(models["codebase-indexer"], new_model)
         self.assertEqual(models["memory-bank"], self._CUSTOM_MODEL)
         self.assertTrue(any("EMBEDDING_MODEL changed" in c and "WARNING" in c for c in result.changes))
+        self.assertFalse(any("memory-bank EMBEDDING_MODEL changed" in c for c in result.changes))
 
-    def test_explicit_model_change_without_memory_bank_block_keeps_previous_shared_model(self):
-        # No memory-bank block: the shared collection is still locked to the old model,
-        # so the newly created server must not take the new one.
-        self._write_customized_existing_config(self._CUSTOM_MODEL)
+    def _drop_memory_bank_block(self):
         cfg = json.loads((self.target_repo / ".mcp.json").read_text())
         del cfg["mcpServers"]["memory-bank"]
         (self.target_repo / ".mcp.json").write_text(json.dumps(cfg))
-        new_model = "sentence-transformers/all-mpnet-base-v2"
-        result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"), embedding_model=new_model)
+
+    def _set_memory_bank_model(self, model):
+        cfg = json.loads((self.target_repo / ".mcp.json").read_text())
+        cfg["mcpServers"]["memory-bank"]["env"]["EMBEDDING_MODEL"] = model
+        (self.target_repo / ".mcp.json").write_text(json.dumps(cfg))
+
+    _OTHER_MODEL = "sentence-transformers/all-mpnet-base-v2"
+
+    def test_explicit_model_change_without_memory_bank_block_uses_template_default(self):
+        # Issue #428: no memory-bank block means memory-bank's model comes from the
+        # template default, never from the code-side model.
+        self._write_customized_existing_config(self._CUSTOM_MODEL)
+        self._drop_memory_bank_block()
+        result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"), embedding_model=self._OTHER_MODEL)
         models = self._models(result)
-        self.assertEqual(models["qdrant"], new_model)
+        self.assertEqual(models["qdrant"], self._OTHER_MODEL)
+        self.assertEqual(models["memory-bank"], MCP_TEMPLATE["mcpServers"]["memory-bank"]["env"]["EMBEDDING_MODEL"])
+
+    def test_no_memory_bank_block_does_not_inherit_custom_code_model(self):
+        # A re-run (no flags) against a config whose code blocks are customized but
+        # which has no memory-bank block must not copy the code-side model across.
+        self._write_customized_existing_config(self._CUSTOM_MODEL)
+        self._drop_memory_bank_block()
+        models = self._models(run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user")))
+        self.assertEqual(models["qdrant"], self._CUSTOM_MODEL)
+        self.assertEqual(models["memory-bank"], MCP_TEMPLATE["mcpServers"]["memory-bank"]["env"]["EMBEDDING_MODEL"])
+
+    def test_code_side_model_is_never_read_from_memory_bank_block(self):
+        # Issue #428: only the memory-bank block has a custom model; the code side
+        # must fall back to the template default rather than read it.
+        first = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
+        cfg = first.mcp_json
+        cfg["mcpServers"]["memory-bank"]["env"]["EMBEDDING_MODEL"] = self._CUSTOM_MODEL
+        for s in ("qdrant", "codebase-indexer"):
+            del cfg["mcpServers"][s]["env"]["EMBEDDING_MODEL"]
+        (self.target_repo / ".mcp.json").write_text(json.dumps(cfg))
+        models = self._models(run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user")))
+        default = MCP_TEMPLATE["mcpServers"]["qdrant"]["env"]["EMBEDDING_MODEL"]
+        self.assertEqual(models["qdrant"], default)
+        self.assertEqual(models["codebase-indexer"], default)
         self.assertEqual(models["memory-bank"], self._CUSTOM_MODEL)
+
+    def test_explicit_memory_bank_model_overrides_and_warns_without_touching_code_side(self):
+        self._write_customized_existing_config(self._CUSTOM_MODEL)
+        result = run_setup(
+            self.target_repo, REPO_ROOT, home_dir=Path("/home/user"), memory_bank_embedding_model=self._OTHER_MODEL
+        )
+        models = self._models(result)
+        self.assertEqual(models["memory-bank"], self._OTHER_MODEL)
+        self.assertEqual(models["qdrant"], self._CUSTOM_MODEL)
+        self.assertEqual(models["codebase-indexer"], self._CUSTOM_MODEL)
+        self.assertTrue(
+            any("memory-bank EMBEDDING_MODEL changed" in c and "WARNING" in c and "EVERY project" in c
+                for c in result.changes)
+        )
+        self.assertFalse(any(c.startswith("WARNING: EMBEDDING_MODEL changed") for c in result.changes))
+
+    def test_explicit_memory_bank_model_same_as_existing_does_not_warn(self):
+        self._write_customized_existing_config(self._CUSTOM_MODEL)
+        result = run_setup(
+            self.target_repo, REPO_ROOT, home_dir=Path("/home/user"), memory_bank_embedding_model=self._CUSTOM_MODEL
+        )
+        self.assertFalse(any("WARNING" in c for c in result.changes))
+
+    def test_explicit_memory_bank_model_on_fresh_target_does_not_warn(self):
+        result = run_setup(
+            self.target_repo, REPO_ROOT, home_dir=Path("/home/user"), memory_bank_embedding_model=self._CUSTOM_MODEL
+        )
+        self.assertEqual(self._models(result)["memory-bank"], self._CUSTOM_MODEL)
+        self.assertFalse(any("WARNING" in c for c in result.changes))
+
+    def test_rerun_preserves_memory_bank_model_when_code_model_differs(self):
+        self._write_customized_existing_config(self._CUSTOM_MODEL)
+        self._set_memory_bank_model(self._OTHER_MODEL)
+        models = self._models(run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user")))
+        self.assertEqual(models["memory-bank"], self._OTHER_MODEL)
+        self.assertEqual(models["qdrant"], self._CUSTOM_MODEL)
+
+    def test_warmup_also_warms_a_different_memory_bank_model(self):
+        self._write_customized_existing_config(self._CUSTOM_MODEL)
+        self._set_memory_bank_model(self._OTHER_MODEL)
+        calls = []
+
+        def _fake_warmup(model_name, cache_dir):
+            calls.append(model_name)
+            return True
+
+        result = run_setup(
+            self.target_repo, REPO_ROOT, home_dir=Path("/home/user"),
+            attempt_fastembed_warmup=True, fastembed_warmup_fn=_fake_warmup,
+        )
+        self.assertEqual(calls, [self._CUSTOM_MODEL, self._OTHER_MODEL])
+        self.assertFalse(any("memory-bank model" in c for c in result.changes))
+
+    def test_memory_bank_warmup_failure_is_reported_but_keeps_hf_hub_offline(self):
+        self._write_customized_existing_config(self._CUSTOM_MODEL)
+        self._set_memory_bank_model(self._OTHER_MODEL)
+        result = run_setup(
+            self.target_repo, REPO_ROOT, home_dir=Path("/home/user"),
+            attempt_fastembed_warmup=True, fastembed_warmup_fn=lambda model, cache_dir: model != self._OTHER_MODEL,
+        )
+        self.assertEqual(result.mcp_json["mcpServers"]["qdrant"]["env"]["HF_HUB_OFFLINE"], "1")
+        self.assertTrue(any(self._OTHER_MODEL in c and "memory-bank model" in c for c in result.changes))
 
     def test_explicit_embedding_model_same_as_existing_does_not_warn(self):
         self._write_customized_existing_config(self._CUSTOM_MODEL)
@@ -936,7 +1032,9 @@ class RunSetupEndToEnd(unittest.TestCase):
         result = run_setup(
             self.target_repo, REPO_ROOT, home_dir=Path("/home/user"), embedding_model=self._CUSTOM_MODEL
         )
-        self.assertEqual(set(self._models(result).values()), {self._CUSTOM_MODEL})
+        models = self._models(result)
+        self.assertEqual({models["qdrant"], models["codebase-indexer"]}, {self._CUSTOM_MODEL})
+        self.assertEqual(models["memory-bank"], MCP_TEMPLATE["mcpServers"]["memory-bank"]["env"]["EMBEDDING_MODEL"])
         self.assertFalse(any("WARNING" in c for c in result.changes))
 
     def test_existing_config_without_embedding_model_falls_back_to_template(self):
@@ -955,7 +1053,8 @@ class RunSetupEndToEnd(unittest.TestCase):
         cfg["mcpServers"]["codebase-indexer"]["env"]["EMBEDDING_MODEL"] = self._CUSTOM_MODEL
         (self.target_repo / ".mcp.json").write_text(json.dumps(cfg))
         result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
-        self.assertEqual(set(self._models(result).values()), {self._CUSTOM_MODEL})
+        models = self._models(result)
+        self.assertEqual({models["qdrant"], models["codebase-indexer"]}, {self._CUSTOM_MODEL})
 
     def test_warmup_uses_the_preserved_embedding_model(self):
         # The cache warm-up must warm the model that is actually written,

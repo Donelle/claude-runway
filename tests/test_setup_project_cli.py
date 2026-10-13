@@ -178,6 +178,7 @@ def _init_args(target_repo, **overrides) -> argparse.Namespace:
         memory_bank_collection="",
         memory_bank_id="",
         embedding_model="",
+        memory_bank_embedding_model="",
         qdrant_only=False,
         skip_hooks=False,
         install_skills=False,
@@ -515,12 +516,35 @@ class EmbeddingModelFlag(unittest.TestCase):
             for s in ("qdrant", "codebase-indexer", "memory-bank")
         }
 
-    def test_flag_is_written_into_all_three_blocks_and_survives_a_plain_rerun(self):
+    def test_flag_is_written_into_code_blocks_only_and_survives_a_plain_rerun(self):
         self.mod.cmd_init(_init_args(self.target_repo, embedding_model=self.CUSTOM, dry_run=False))
-        self.assertEqual(set(self._written_models().values()), {self.CUSTOM})
+        models = self._written_models()
+        self.assertEqual({models["qdrant"], models["codebase-indexer"]}, {self.CUSTOM})
+        # Issue #428: memory-bank's model is its own value, never taken from --embedding-model.
+        self.assertNotEqual(models["memory-bank"], self.CUSTOM)
         # A plain re-run (no flag) must not reset it to the template default.
         self.mod.cmd_init(_init_args(self.target_repo, dry_run=False))
-        self.assertEqual(set(self._written_models().values()), {self.CUSTOM})
+        again = self._written_models()
+        self.assertEqual({again["qdrant"], again["codebase-indexer"]}, {self.CUSTOM})
+        self.assertEqual(again["memory-bank"], models["memory-bank"])
+
+    def test_memory_bank_flag_is_written_into_memory_bank_block_only(self):
+        self.mod.cmd_init(_init_args(self.target_repo, memory_bank_embedding_model=self.CUSTOM, dry_run=False))
+        models = self._written_models()
+        self.assertEqual(models["memory-bank"], self.CUSTOM)
+        self.assertNotEqual(models["qdrant"], self.CUSTOM)
+        # Sticky across a plain re-run.
+        self.mod.cmd_init(_init_args(self.target_repo, dry_run=False))
+        self.assertEqual(self._written_models()["memory-bank"], self.CUSTOM)
+
+    def test_parser_accepts_memory_bank_embedding_model_and_defaults_blank(self):
+        with mock.patch.object(
+            self.mod.sys, "argv",
+            ["setup_project.py", "init", str(self.target_repo), "--memory-bank-embedding-model", self.CUSTOM],
+        ):
+            self.assertEqual(self.mod.parse_args().memory_bank_embedding_model, self.CUSTOM)
+        with mock.patch.object(self.mod.sys, "argv", ["setup_project.py", "init", str(self.target_repo)]):
+            self.assertEqual(self.mod.parse_args().memory_bank_embedding_model, "")
 
     def test_parser_accepts_embedding_model_and_defaults_blank(self):
         with mock.patch.object(

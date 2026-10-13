@@ -297,10 +297,10 @@ def build_mcp_servers(
     what to pass (see `resolve_compact_embedding_model`).
 
     `embedding_model` (issue #279), if blank, leaves the template's own
-    `EMBEDDING_MODEL` default in place; otherwise it is written into every
-    Qdrant-talking block that carries the key (`qdrant`, `codebase-indexer`,
-    `memory-bank`) -- the same single-value-many-blocks handling as
-    `qdrant_url`, because those servers must all agree on one model. Like
+    `EMBEDDING_MODEL` default in place; otherwise it is written into the two
+    code-index blocks (`qdrant`, `codebase-indexer`), which must agree on one
+    model. It is never written into `memory-bank` (issue #428): that block's
+    model is `memory_bank_embedding_model`, a separate value. Like
     everything else here this function does not detect re-runs itself:
     deciding WHICH value to pass (explicit flag > the target's existing
     config > template default) is `run_setup`'s job, see
@@ -348,15 +348,15 @@ def build_mcp_servers(
     memory_bank["env"]["MEMORY_BANK_ID"] = resolved_memory_bank_id
     memory_bank["env"]["MEMORY_BANK_COLLECTION"] = resolved_memory_bank_collection
 
-    # The memory-bank collection is ONE shared collection locked to the model
-    # that first created it, so its server keeps that model even when an
-    # explicit --embedding-model changes the per-project code collections.
+    # Issue #428: memory-bank's model is its own value, never derived from
+    # `embedding_model`. The memory-bank collection is ONE shared collection
+    # locked to the model that first created it, so a change made for the
+    # per-project code collections must never reach it.
     if embedding_model:
         for block in (qdrant, indexer):
             block["env"]["EMBEDDING_MODEL"] = embedding_model
-    shared_model = memory_bank_embedding_model or embedding_model
-    if shared_model:
-        memory_bank["env"]["EMBEDDING_MODEL"] = shared_model
+    if memory_bank_embedding_model:
+        memory_bank["env"]["EMBEDDING_MODEL"] = memory_bank_embedding_model
 
     if include_compress:
         compress = servers["local-compress"]
@@ -380,16 +380,19 @@ def build_mcp_servers(
     return servers
 
 
-# Servers whose env carries `EMBEDDING_MODEL`, in the order
-# `existing_embedding_model` consults them.
-_EMBEDDING_MODEL_SERVERS = ("qdrant", "codebase-indexer", "memory-bank")
+# Code-index servers whose env carries `EMBEDDING_MODEL`, in the order
+# `existing_embedding_model` consults them. `memory-bank` is deliberately NOT
+# here (issue #428): its model belongs to a shared, cross-project collection
+# and is resolved on its own, see `resolve_memory_bank_embedding_model`.
+_EMBEDDING_MODEL_SERVERS = ("qdrant", "codebase-indexer")
 
 
 def existing_embedding_model(existing_mcp: dict) -> str:
     """
     Returns the `EMBEDDING_MODEL` already configured in an existing
-    `.mcp.json` document (first non-blank string found across the `qdrant`,
-    `codebase-indexer`, `memory-bank` blocks), or "" if none is set. Tolerant
+    `.mcp.json` document (first non-blank string found across the `qdrant`
+    and `codebase-indexer` blocks -- never `memory-bank`'s, issue #428), or ""
+    if none is set. Tolerant
     of missing/odd-shaped blocks -- a hand-edited file may lack any of them.
     """
     servers = existing_mcp.get("mcpServers") if isinstance(existing_mcp, dict) else None
@@ -420,6 +423,34 @@ def resolve_embedding_model(explicit: str, existing_mcp: dict, template_default:
     collection.
     """
     return (explicit or "").strip() or existing_embedding_model(existing_mcp) or template_default
+
+
+def existing_memory_bank_model(existing_mcp: dict) -> str:
+    """
+    Returns the `EMBEDDING_MODEL` in an existing `.mcp.json`'s `memory-bank`
+    block, or "" if there is no such block or it has no non-blank value.
+    Tolerant of missing/odd-shaped blocks, like `existing_embedding_model`.
+    """
+    servers = existing_mcp.get("mcpServers") if isinstance(existing_mcp, dict) else None
+    block = servers.get("memory-bank") if isinstance(servers, dict) else None
+    env = block.get("env") if isinstance(block, dict) else None
+    value = env.get("EMBEDDING_MODEL") if isinstance(env, dict) else None
+    return value.strip() if isinstance(value, str) else ""
+
+
+def resolve_memory_bank_embedding_model(explicit: str, existing_mcp: dict, template_default: str) -> str:
+    """
+    Which `EMBEDDING_MODEL` a (re-)run of `init` writes into `memory-bank`
+    (issue #428), from memory-bank's own sources only -- never the code-index
+    model, because the shared collection is locked to whichever model created
+    it and a change made for code search must not make `remember`/`recall`
+    fail for every project:
+      1. an explicit `--memory-bank-embedding-model` value;
+      2. otherwise the existing `memory-bank` block's own value;
+      3. otherwise the template's default (a brand-new install, or a config
+         with no memory-bank block).
+    """
+    return (explicit or "").strip() or existing_memory_bank_model(existing_mcp) or template_default
 
 
 # What an install that predates the local-compress `EMBEDDING_MODEL` setting
@@ -988,6 +1019,7 @@ def run_setup(
     attempt_fastembed_warmup: bool = False,
     fastembed_warmup_fn: Optional[Callable[..., bool]] = None,
     embedding_model: str = "",
+    memory_bank_embedding_model: str = "",
 ) -> SetupResult:
     """
     Pure computation (no disk writes to `target_repo`, with one deliberate
@@ -1022,6 +1054,14 @@ def run_setup(
     target's existing `.mcp.json` already has" (template default for a
     brand-new project), never "reset to the template default". A non-blank
     value that differs from the existing one adds a WARNING to `changes`.
+
+    `memory_bank_embedding_model` (issue #428, CLI `--memory-bank-embedding-model`)
+    is the same sticky setting for the `memory-bank` block ONLY, and is fully
+    independent of `embedding_model`: blank keeps the block's existing value
+    (template default for a block that does not exist). A non-blank value that
+    differs from the existing one adds a WARNING, because the shared collection
+    is locked to the model that created it. Its model is warmed into the
+    fastembed cache too when `attempt_fastembed_warmup` is on.
 
     `include_hooks=False` corresponds to the CLI's `--skip-hooks`: don't
     touch `.claude/settings.json` at all, even if it already has this
@@ -1062,19 +1102,13 @@ def run_setup(
     template_embedding_model = mcp_template["mcpServers"]["qdrant"]["env"]["EMBEDDING_MODEL"]
     previous_embedding_model = existing_embedding_model(existing_mcp)
     resolved_embedding_model = resolve_embedding_model(embedding_model, existing_mcp, template_embedding_model)
-    existing_memory_bank_model = (
-        (existing_mcp.get("mcpServers", {}).get("memory-bank", {}).get("env", {}) or {}).get("EMBEDDING_MODEL") or ""
+    # Issue #428: memory-bank's model is resolved from its own sources only
+    # (explicit flag > its own existing block > template default).
+    template_memory_bank_model = mcp_template["mcpServers"]["memory-bank"]["env"]["EMBEDDING_MODEL"]
+    previous_memory_bank_model = existing_memory_bank_model(existing_mcp)
+    resolved_memory_bank_model = resolve_memory_bank_embedding_model(
+        memory_bank_embedding_model, existing_mcp, template_memory_bank_model
     )
-    # Only an explicit change of model (the drop-and-reindex case) keeps the shared
-    # memory-bank server on its locked model; a plain re-run is unchanged.
-    explicit_model_change = bool(embedding_model) and bool(previous_embedding_model) and (
-        resolved_embedding_model != previous_embedding_model
-    )
-    # A project with no memory-bank block still shares a collection locked to the
-    # model it was created under, which is the previous code model.
-    shared_memory_bank_model = resolved_embedding_model
-    if explicit_model_change:
-        shared_memory_bank_model = existing_memory_bank_model or previous_embedding_model
 
     # Issue #221: decide -- BEFORE building the qdrant server's env block --
     # whether it's safe to set HF_HUB_OFFLINE=1, so mcp-server-qdrant's own
@@ -1085,10 +1119,19 @@ def run_setup(
     # config actually points at. Opt-in (default False) and injectable
     # (fastembed_warmup_fn) so every existing caller/test is unaffected.
     hf_hub_offline = False
+    memory_bank_warm = False
     if attempt_fastembed_warmup:
         warmup_fn = fastembed_warmup_fn or warm_fastembed_cache
         fastembed_cache_path = resolved_fastembed_cache_path(home_dir)
         hf_hub_offline = bool(warmup_fn(resolved_embedding_model, fastembed_cache_path))
+        # Issue #428: the memory-bank server loads its own model, so warm that
+        # one too (skipped when it is the same model, already warmed above).
+        # Its outcome never affects HF_HUB_OFFLINE, which is the qdrant
+        # server's setting only.
+        if resolved_memory_bank_model == resolved_embedding_model:
+            memory_bank_warm = hf_hub_offline
+        else:
+            memory_bank_warm = bool(warmup_fn(resolved_memory_bank_model, fastembed_cache_path))
 
     generated_servers = build_mcp_servers(
         mcp_template,
@@ -1111,7 +1154,7 @@ def run_setup(
         include_compress=include_compress,
         hf_hub_offline=hf_hub_offline,
         embedding_model=resolved_embedding_model,
-        memory_bank_embedding_model=shared_memory_bank_model,
+        memory_bank_embedding_model=resolved_memory_bank_model,
         compact_embedding_model=resolve_compact_embedding_model(existing_mcp, resolved_embedding_model),
     )
     unresolved = find_unresolved_placeholders(generated_servers)
@@ -1129,13 +1172,31 @@ def run_setup(
             f"WARNING: EMBEDDING_MODEL changed from '{previous_embedding_model}' to "
             f"'{resolved_embedding_model}'. Vectors already indexed under the old model are "
             f"incompatible: drop the project's collection (directly in Qdrant) and re-run "
-            f"index_repo. The shared memory-bank server keeps '{shared_memory_bank_model}', "
-            f"the model its collection is locked to; this run does not change it."
+            f"index_repo. The memory-bank server's model is separate and is not changed by "
+            f"--embedding-model."
         )
     elif previous_embedding_model and previous_embedding_model != template_embedding_model:
         changes.append(
             f"Preserved the existing EMBEDDING_MODEL '{previous_embedding_model}' (pass "
             f"--embedding-model to change it)."
+        )
+    if previous_memory_bank_model and resolved_memory_bank_model != previous_memory_bank_model:
+        # Only reachable via an explicit --memory-bank-embedding-model.
+        changes.append(
+            f"WARNING: the memory-bank EMBEDDING_MODEL changed from '{previous_memory_bank_model}' to "
+            f"'{resolved_memory_bank_model}'. Its collection ('{resolved_memory_bank_collection}') is shared "
+            f"by every project and locked to the model that created it, so remember/recall will fail "
+            f"for EVERY project using it until that collection is rebuilt (or they all move to the new model)."
+        )
+    elif previous_memory_bank_model and previous_memory_bank_model != template_memory_bank_model:
+        changes.append(
+            f"Preserved the existing memory-bank EMBEDDING_MODEL '{previous_memory_bank_model}' (pass "
+            f"--memory-bank-embedding-model to change it)."
+        )
+    if attempt_fastembed_warmup and not memory_bank_warm:
+        changes.append(
+            f"Could not confirm the fastembed cache is warm for the memory-bank model "
+            f"'{resolved_memory_bank_model}'; its first start may download it. Safe to re-run this setup to retry."
         )
     if attempt_fastembed_warmup:
         changes.append(
