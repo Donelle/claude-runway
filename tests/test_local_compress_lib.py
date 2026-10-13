@@ -38,7 +38,7 @@ from local_compress_lib import (  # noqa: E402
     append_missing_identifiers,
     append_trailing_summary_if_missing,
     clear_compression_cache,
-    compress,
+    compress as _compress_lib,
     credential_token_count,
     derive_compact_label,
     find_trailing_summary_line,
@@ -54,6 +54,14 @@ from local_compress_lib import (  # noqa: E402
     split_prose_bullet_runs,
     split_sections,
 )
+
+
+async def compress(*args, client=None, **kwargs):
+    """compress() needs the caller to supply the model client (the library does
+    not build one). Almost every test here replaces complete()/classify_relevant()
+    with a stub, so the client is never touched and a bare object() will do; a
+    test that does exercise the client passes its own."""
+    return await _compress_lib(*args, client=client if client is not None else object(), **kwargs)
 
 # The exact template /my-compact step 3 fills in. These headings are AUTHORED by
 # the skill, which is what makes section handling a guarantee rather than a
@@ -1180,17 +1188,16 @@ class SectionCompressionEndToEnd(unittest.TestCase):
     def _run(self, fake_complete):
         import asyncio
         import local_compress_lib as L
-        real_complete, real_resolve, real_client = L.complete, L.resolve_model, L.client
+        real_complete, real_resolve = L.complete, L.resolve_model
         L.complete = fake_complete
         L.resolve_model = lambda m, b: ("stub-model", None)
-        L.client = lambda b: object()
         try:
-            return asyncio.run(L.compress(
+            return asyncio.run(compress(
                 COMPACT_TEMPLATE, focus="handoff", skip_if_under_chars=0,
                 preserve_identifiers=True, preserve_sections=True,
             ))
         finally:
-            L.complete, L.resolve_model, L.client = real_complete, real_resolve, real_client
+            L.complete, L.resolve_model = real_complete, real_resolve
 
     def test_all_six_headings_survive_a_destructive_summarizer(self):
         out = self._run(lambda *a, **k: "gone")
@@ -1299,16 +1306,15 @@ class SectionCompressionEndToEnd(unittest.TestCase):
             f"## What we were working on\nDeploying with token {secret} in the pipeline.\n\n"
             "## Current state / progress\nAnother prose section with narrative content.\n"
         )
-        real = (L.complete, L.resolve_model, L.client)
+        real = (L.complete, L.resolve_model)
         L.complete = lambda *a, **k: None  # total outage: every attempted call fails
         L.resolve_model = lambda m, b: ("stub", None)
-        L.client = lambda b: object()
         try:
-            out = asyncio.run(L.compress(
+            out = asyncio.run(compress(
                 text, focus="handoff", skip_if_under_chars=0, preserve_sections=True,
             ))
         finally:
-            L.complete, L.resolve_model, L.client = real
+            L.complete, L.resolve_model = real
         self.assertTrue(out.startswith("[LM Studio appears unreachable"))
         self.assertNotIn(secret, out, "the secret must still be redacted during an outage")
         self.assertNotIn(
@@ -1349,16 +1355,15 @@ class SectionCompressionEndToEnd(unittest.TestCase):
         def fail_if_called(*a, **k):
             raise AssertionError("no section here is prose -- the model must never be called")
 
-        real_complete, real_resolve, real_client = L.complete, L.resolve_model, L.client
+        real_complete, real_resolve = L.complete, L.resolve_model
         L.complete = fail_if_called
         L.resolve_model = lambda m, b: ("stub-model", None)
-        L.client = lambda b: object()
         try:
-            out = asyncio.run(L.compress(
+            out = asyncio.run(compress(
                 text, focus="handoff", skip_if_under_chars=0, preserve_sections=True,
             ))
         finally:
-            L.complete, L.resolve_model, L.client = real_complete, real_resolve, real_client
+            L.complete, L.resolve_model = real_complete, real_resolve
 
         self.assertNotIn("LM Studio appears unreachable", out)
         self.assertTrue(out.startswith("[compressed"))
@@ -1392,17 +1397,16 @@ class SectionCompressionEndToEnd(unittest.TestCase):
             "- Bump appVersion in Chart.yaml.\n\n"
             "## Unresolved questions\n- Does the topic need the -dev suffix?\n"
         )
-        real = (L.complete, L.resolve_model, L.client)
+        real = (L.complete, L.resolve_model)
         L.complete = lambda *a, **k: "compressed prose"
         L.resolve_model = lambda m, b: ("stub", None)
-        L.client = lambda b: object()
         try:
-            out = asyncio.run(L.compress(
+            out = asyncio.run(compress(
                 summary, focus="handoff", skip_if_under_chars=0,
                 preserve_identifiers=True, preserve_sections=True,
             ))
         finally:
-            L.complete, L.resolve_model, L.client = real
+            L.complete, L.resolve_model = real
         self.assertNotIn(secret, out, "no copy of the secret may survive")
         self.assertNotIn("ghp_", out)
         self.assertIn("credential-shaped value(s) redacted", out,
@@ -1431,16 +1435,15 @@ class MainPathTruncationNoteGatesOnWasTruncated(unittest.TestCase):
     def _run(self, text, complete_fn=lambda *a, **k: "compressed prose"):
         import asyncio
         import local_compress_lib as L
-        real = (L.complete, L.resolve_model, L.client)
+        real = (L.complete, L.resolve_model)
         L.complete = complete_fn
         L.resolve_model = lambda m, b: ("stub", None)
-        L.client = lambda b: object()
         try:
-            return asyncio.run(L.compress(
+            return asyncio.run(compress(
                 text, focus="summarize the lead section", skip_if_under_chars=100,
             ))
         finally:
-            L.complete, L.resolve_model, L.client = real
+            L.complete, L.resolve_model = real
 
     def test_no_false_note_when_positional_limit_not_reached(self):
         import local_compress_lib as L
@@ -1498,17 +1501,16 @@ class WholeTextFallbackRedactsWithEitherPreservationFlag(unittest.TestCase):
     def _run(self, text, preserve_identifiers, preserve_sections, fake_complete):
         import asyncio
         import local_compress_lib as L
-        real_complete, real_resolve, real_client = L.complete, L.resolve_model, L.client
+        real_complete, real_resolve = L.complete, L.resolve_model
         L.complete = fake_complete
         L.resolve_model = lambda m, b: ("stub-model", None)
-        L.client = lambda b: object()
         try:
-            return asyncio.run(L.compress(
+            return asyncio.run(compress(
                 text, focus="summarize this", skip_if_under_chars=0,
                 preserve_identifiers=preserve_identifiers, preserve_sections=preserve_sections,
             ))
         finally:
-            L.complete, L.resolve_model, L.client = real_complete, real_resolve, real_client
+            L.complete, L.resolve_model = real_complete, real_resolve
 
     def test_credential_echoed_by_the_model_is_redacted_with_preserve_sections_alone(self):
         secret = "ghp_" + "a" * 36
@@ -1830,50 +1832,55 @@ class FetchLoadedModelsTests(unittest.TestCase):
     old limitation -- when /api/v0 isn't available (404 / older LM Studio /
     non-LM-Studio OpenAI-compatible server).
 
-    Monkeypatches local_compress_lib's own `_http_get_json`/`client` module
-    globals directly (same style as SectionCompressionEndToEnd above)
-    rather than unittest.mock, to match this file's established pattern.
+    Monkeypatches local_compress_lib's own `_http_get_json` module global
+    directly (same style as SectionCompressionEndToEnd above) rather than
+    unittest.mock, to match this file's established pattern.
     `_http_get_json` (not `requests`, PR #318 review) is a stdlib-only
     (urllib) GET-and-parse-JSON helper -- see its own docstring for why a
-    third-party HTTP library was deliberately avoided here (both hook files
-    that import this module document a `pip install openai`-only standalone
-    install path).
+    third-party HTTP library was deliberately avoided here (this module is
+    standard-library only, and both hook files import it directly).
     """
 
     def setUp(self):
         import local_compress_lib as L
         self.L = L
         self._real_http_get_json = L._http_get_json
-        self._real_client = L.client
+        # fetch_loaded_models makes two plain GETs through _http_get_json: the
+        # native /api/v0/models probe, then (only if that fails or is
+        # unusable) the OpenAI-compatible /v1/models fallback. One router
+        # stands in for both, each with its own handler, recording every call
+        # so a test can assert which URL was hit with which timeout.
+        self.calls = []
+        self._v0_handler = lambda url, timeout: {"data": []}
+        self._v1_handler = lambda url, timeout: {"data": []}
+
+        def _router(url, timeout=None):
+            self.calls.append((url, timeout))
+            handler = self._v0_handler if url.endswith("/api/v0/models") else self._v1_handler
+            return handler(url, timeout)
+
+        L._http_get_json = _router
 
     def tearDown(self):
         self.L._http_get_json = self._real_http_get_json
-        self.L.client = self._real_client
 
     def _v0_returns(self, *entries):
         payload = {"data": list(entries)}
-        self.L._http_get_json = lambda url, timeout=None: payload
+        self._v0_handler = lambda url, timeout: payload
 
     def _v0_unavailable(self):
-        def _raise(url, timeout=None):
+        def _raise(url, timeout):
             raise ConnectionError("404 Not Found (or unreachable)")
-        self.L._http_get_json = _raise
+        self._v0_handler = _raise
 
     def _v1_returns(self, *ids):
-        from types import SimpleNamespace
-        models = SimpleNamespace(data=[SimpleNamespace(id=i) for i in ids])
-        # Accepts an optional timeout kwarg (PR #318 review: fetch_loaded_models'
-        # /v1 fallback now threads its own `timeout` param into client()) --
-        # captured so tests can assert it was actually passed through, not
-        # silently dropped.
-        self.L.client = lambda base_url, timeout=None: SimpleNamespace(
-            models=SimpleNamespace(list=lambda: models)
-        )
+        payload = {"data": [{"id": i, "object": "model"} for i in ids]}
+        self._v1_handler = lambda url, timeout: payload
 
     def _v1_raises(self, exc):
-        def _client(base_url, timeout=None):
+        def _raise(url, timeout):
             raise exc
-        self.L.client = _client
+        self._v1_handler = _raise
 
     def test_one_loaded_plus_several_downloaded_resolves_via_v0(self):
         # The issue's core repro: one loaded chat model, plus other
@@ -1929,26 +1936,17 @@ class FetchLoadedModelsTests(unittest.TestCase):
         self.assertEqual(source, "v1")
 
     def test_v1_fallback_receives_the_caller_supplied_timeout(self):
-        # PR #318 review: the /v1 fallback used to construct its OpenAI
-        # client via a bare `client(base_url)`, silently dropping whatever
-        # `timeout` the caller passed to fetch_loaded_models -- so a
-        # short-timeout caller (the WebFetch redirect hook, 2s) would fall
-        # through to the OpenAI SDK's own much longer default timeout
-        # whenever /api/v0 was unavailable, defeating the whole point of a
-        # short reachability check. Confirms `timeout` is threaded through
-        # to client() on this path, not just used for the /api/v0 probe.
+        # PR #318 review: the /v1 fallback used to drop whatever `timeout`
+        # the caller passed to fetch_loaded_models -- so a short-timeout
+        # caller (the WebFetch redirect hook, 2s) would fall through to a
+        # much longer default timeout whenever /api/v0 was unavailable,
+        # defeating the whole point of a short reachability check. Confirms
+        # `timeout` reaches the /v1 request too, not just the /api/v0 probe.
         self._v0_unavailable()
-        captured = {}
-
-        def _client(base_url, timeout=None):
-            captured["timeout"] = timeout
-            from types import SimpleNamespace
-            models = SimpleNamespace(data=[SimpleNamespace(id="only-model")])
-            return SimpleNamespace(models=SimpleNamespace(list=lambda: models))
-
-        self.L.client = _client
-        self.L.fetch_loaded_models(None, timeout=2.5)
-        self.assertEqual(captured["timeout"], 2.5)
+        self._v1_returns("only-model")
+        self.L.fetch_loaded_models("http://localhost:1234/v1", timeout=2.5)
+        v1_calls = [c for c in self.calls if not c[0].endswith("/api/v0/models")]
+        self.assertEqual(v1_calls, [("http://localhost:1234/v1/models", 2.5)])
 
     def test_two_loaded_chat_models_both_reported(self):
         # fetch_loaded_models itself doesn't apply the "exactly one" rule --
@@ -1966,7 +1964,7 @@ class FetchLoadedModelsTests(unittest.TestCase):
         # LM Studio genuinely down: /api/v0 fails, and the /v1 fallback ALSO
         # raises -- that exception must propagate, since every existing
         # caller's except block expects to catch "LM Studio is unreachable"
-        # from this call, the same contract the old bare .models.list() had.
+        # from this call, the same contract the old openai-client call had.
         self._v0_unavailable()
         self._v1_raises(ConnectionError("LM Studio is down"))
         with self.assertRaises(ConnectionError):
@@ -1976,15 +1974,26 @@ class FetchLoadedModelsTests(unittest.TestCase):
         # The suggested fix's "derived from the /v1 base URL" requirement --
         # the v0 probe must hit http://localhost:1234/api/v0/models, not
         # http://localhost:1234/v1/api/v0/models.
-        captured = {}
-
-        def _get(url, timeout=None):
-            captured["url"] = url
-            return {"data": []}
-
-        self.L._http_get_json = _get
         self.L.fetch_loaded_models("http://localhost:1234/v1")
-        self.assertEqual(captured["url"], "http://localhost:1234/api/v0/models")
+        self.assertEqual(self.calls[0][0], "http://localhost:1234/api/v0/models")
+
+    def test_v1_fallback_url_is_the_base_url_plus_models(self):
+        # Without an `openai` client to append the path, the fallback builds
+        # it itself: the configured base URL (already ending /v1), a trailing
+        # slash tolerated, plus /models.
+        self._v0_unavailable()
+        self._v1_returns("m")
+        self.L.fetch_loaded_models("http://example:9/v1/")
+        self.assertEqual(self.calls[-1][0], "http://example:9/v1/models")
+
+    def test_v1_fallback_with_an_unexpected_shape_raises(self):
+        # A 200 that is not the {"data": [...]} shape is an unusable response,
+        # reported as an error (callers catch Exception) rather than as "no
+        # models".
+        self._v0_unavailable()
+        self._v1_handler = lambda url, timeout: {"error": "nope"}
+        with self.assertRaises(ValueError):
+            self.L.fetch_loaded_models(None)
 
     def test_v0_200_with_unexpected_shape_falls_back_to_v1(self):
         # PR #318 review round 2: a 200 response that ISN'T the real
@@ -1994,7 +2003,7 @@ class FetchLoadedModelsTests(unittest.TestCase):
         # reporting "zero loaded models" via source="v0" for a server that
         # is actually WORKING, instead of falling back to /v1/models the
         # way a genuinely-missing /api/v0 (a real 404) correctly does.
-        self.L._http_get_json = lambda url, timeout=None: {"error": "no such route"}  # no "data" key at all
+        self._v0_handler = lambda url, timeout: {"error": "no such route"}  # no "data" key at all
         self._v1_returns("only-model")
         ids, source = self.L.fetch_loaded_models(None)
         self.assertEqual(ids, ["only-model"])
@@ -2002,7 +2011,7 @@ class FetchLoadedModelsTests(unittest.TestCase):
 
     def test_v0_200_with_non_list_data_falls_back_to_v1(self):
         # Same bug, different malformed shape: "data" present but not a list.
-        self.L._http_get_json = lambda url, timeout=None: {"data": "not-a-list"}
+        self._v0_handler = lambda url, timeout: {"data": "not-a-list"}
         self._v1_returns("only-model")
         ids, source = self.L.fetch_loaded_models(None)
         self.assertEqual(ids, ["only-model"])
@@ -2038,133 +2047,12 @@ class FetchLoadedModelsTests(unittest.TestCase):
         thread.start()
         try:
             port = server.server_address[1]
-            payload = self.L._http_get_json(f"http://127.0.0.1:{port}/api/v0/models", 5.0)
+            payload = self._real_http_get_json(f"http://127.0.0.1:{port}/api/v0/models", 5.0)
             self.assertEqual(payload, {"data": [{"id": "real-model", "state": "loaded", "type": "llm"}]})
             self.assertEqual(received_path["path"], "/api/v0/models")
         finally:
             server.shutdown()
             thread.join(timeout=5)
-
-
-class ClientOptionalTimeout(unittest.TestCase):
-    """PR #318 review: client() gained an optional `timeout` param so
-    fetch_loaded_models' /v1 fallback can honor a caller-supplied timeout.
-    These test the REAL client() function (not a stub) against the actual
-    openai.OpenAI constructor, confirming: (a) the existing single-arg call
-    shape every other caller/test stub uses is completely unaffected, and
-    (b) passing timeout actually reaches the constructed client's own
-    .timeout attribute, rather than being silently accepted and dropped."""
-
-    def test_no_timeout_arg_matches_pre_existing_single_arg_behavior(self):
-        import local_compress_lib as L
-        c = L.client("http://localhost:1234/v1")
-        self.assertEqual(str(c.base_url), "http://localhost:1234/v1/")
-
-    def test_explicit_timeout_is_applied_to_the_client(self):
-        import local_compress_lib as L
-        c = L.client("http://localhost:1234/v1", timeout=2.5)
-        # openai.OpenAI stores an explicit `timeout=` constructor arg as a
-        # plain float on `.timeout` (rather than wrapping it in its
-        # httpx.Timeout default), so this is a direct, non-fragile check.
-        self.assertEqual(c.timeout, 2.5)
-
-
-class ClientIsAlwaysBounded(unittest.TestCase):
-    """Issue #301: client() used to pass neither timeout nor max_retries, so
-    the OpenAI SDK's own defaults (600s read timeout, 2 retries) let a
-    reachable-but-hung LM Studio stall the PostToolUse hook for ~30 minutes.
-    Invariant under test: every client is built with a finite timeout and
-    max_retries=0, whichever way the timeout is supplied."""
-
-    ENV = "CLAUDE_RUNWAY_LMSTUDIO_TIMEOUT_SECONDS"
-
-    def setUp(self):
-        self._saved = os.environ.pop(self.ENV, None)
-
-    def tearDown(self):
-        os.environ.pop(self.ENV, None)
-        if self._saved is not None:
-            os.environ[self.ENV] = self._saved
-
-    def test_default_client_has_bounded_timeout_and_no_retries(self):
-        import local_compress_lib as L
-        c = L.client("http://localhost:1234/v1")
-        self.assertEqual(c.timeout, L.DEFAULT_REQUEST_TIMEOUT_SECONDS)
-        self.assertEqual(c.max_retries, 0)
-        # Guard against silently regressing toward the SDK's 600s default.
-        self.assertLess(c.timeout, 600)
-
-    def test_explicit_timeout_client_also_has_no_retries(self):
-        import local_compress_lib as L
-        c = L.client("http://localhost:1234/v1", timeout=2.5)
-        self.assertEqual(c.timeout, 2.5)
-        self.assertEqual(c.max_retries, 0)
-
-    def test_invalid_explicit_timeout_falls_back_to_bounded_default(self):
-        """PR #361 review: the explicit-arg path must apply the same
-        finite-and-positive rule as the env var, not bypass it."""
-        import local_compress_lib as L
-        for bad in (float("inf"), float("nan"), 0, -1):
-            with self.subTest(value=bad):
-                c = L.client("http://localhost:1234/v1", timeout=bad)
-                self.assertEqual(c.timeout, L.DEFAULT_REQUEST_TIMEOUT_SECONDS)
-                self.assertEqual(c.max_retries, 0)
-
-    def test_env_var_overrides_default_timeout(self):
-        import local_compress_lib as L
-        os.environ[self.ENV] = " 12.5 "
-        self.assertEqual(L.client("http://localhost:1234/v1").timeout, 12.5)
-
-    def test_invalid_env_values_fall_back_to_default(self):
-        import local_compress_lib as L
-        for bad in ("", "abc", "0", "-5", "inf", "nan"):
-            with self.subTest(value=bad):
-                os.environ[self.ENV] = bad
-                self.assertEqual(L.resolve_request_timeout(), L.DEFAULT_REQUEST_TIMEOUT_SECONDS)
-
-    def test_hung_server_fails_within_the_timeout_budget(self):
-        """End to end against a socket that accepts but never responds: the
-        real complete() must return None (fail open) within the configured
-        budget rather than blocking. Bounded by an outer join timeout so a
-        regression fails this test instead of hanging the suite."""
-        import socket
-        import threading
-        import time
-        import local_compress_lib as L
-
-        srv = socket.socket()
-        srv.bind(("127.0.0.1", 0))
-        srv.listen(5)
-        conns = []
-
-        def accept_loop():
-            while True:
-                try:
-                    conns.append(srv.accept()[0])
-                except OSError:
-                    return
-
-        threading.Thread(target=accept_loop, daemon=True).start()
-        os.environ[self.ENV] = "1"
-        result = {}
-
-        def call():
-            start = time.monotonic()
-            result["out"] = L.complete(L.client(f"http://127.0.0.1:{srv.getsockname()[1]}/v1"), "m", "s", "x")
-            result["elapsed"] = time.monotonic() - start
-
-        t = threading.Thread(target=call, daemon=True)
-        try:
-            t.start()
-            t.join(timeout=10)
-            self.assertFalse(t.is_alive(), "complete() hung past the configured timeout")
-            self.assertIsNone(result["out"])
-            # With retries on, 1s x 3 attempts (plus backoff) would exceed this.
-            self.assertLess(result["elapsed"], 3)
-        finally:
-            srv.close()
-            for c in conns:
-                c.close()
 
 
 class ResolveModelMultipleModelsMessaging(unittest.TestCase):
@@ -2257,14 +2145,12 @@ class ConcurrentClassification(unittest.TestCase):
         real_classify = L.classify_relevant
         real_complete = L.complete
         real_resolve = L.resolve_model
-        real_client = L.client
 
         L.classify_relevant = fake_classify
         L.complete = fake_complete
         L.resolve_model = lambda m, b: ("stub-model", None)
-        L.client = lambda b: object()
         try:
-            return asyncio.run(L.compress(
+            return asyncio.run(compress(
                 text,
                 focus=focus,
                 skip_if_under_chars=skip_if_under_chars,
@@ -2274,7 +2160,6 @@ class ConcurrentClassification(unittest.TestCase):
             L.classify_relevant = real_classify
             L.complete = real_complete
             L.resolve_model = real_resolve
-            L.client = real_client
 
     def test_all_chunks_classified_with_selective_focus(self):
         """Every chunk must be presented to classify_relevant, regardless of
@@ -2436,7 +2321,6 @@ class CompressionCache(unittest.TestCase):
 
         real_complete = L.complete
         real_resolve = L.resolve_model
-        real_client = L.client
 
         def counting_complete(client, model_id, system, content):
             if call_counter is not None:
@@ -2445,9 +2329,8 @@ class CompressionCache(unittest.TestCase):
 
         L.complete = counting_complete
         L.resolve_model = lambda m, b: (m or "stub-model", None)
-        L.client = lambda b: object()
         try:
-            return asyncio.run(L.compress(
+            return asyncio.run(compress(
                 text, focus=focus, skip_if_under_chars=0,
                 model=model, max_chars=max_chars,
                 preserve_identifiers=preserve_identifiers,
@@ -2456,7 +2339,6 @@ class CompressionCache(unittest.TestCase):
         finally:
             L.complete = real_complete
             L.resolve_model = real_resolve
-            L.client = real_client
 
     # ----- _compression_cache_key unit tests -----
 
@@ -2604,7 +2486,6 @@ class CompressionCache(unittest.TestCase):
         '[note: max_chars=N truncated...]' suffix. The auto_truncated flag in
         the key separates these two cases."""
         import asyncio
-        import local_compress_lib as L
 
         # A short text under skip_if_under_chars to exercise the truncated
         # early-return path without needing LM Studio at all: the positional
@@ -2621,7 +2502,7 @@ class CompressionCache(unittest.TestCase):
         text = f"{lead}\n{heading}\n{rest}"
 
         # First call: positional focus, no explicit max_chars -- auto-truncates.
-        result_auto = asyncio.run(L.compress(
+        result_auto = asyncio.run(compress(
             text, focus="summarize the lead section", skip_if_under_chars=10_000,
         ))
         # Auto-truncated result must have the positional note.
@@ -2636,7 +2517,7 @@ class CompressionCache(unittest.TestCase):
 
         # Second call: same text, same focus, explicit max_chars equal to the
         # auto-detected boundary -- must be a cache MISS (different key).
-        result_explicit = asyncio.run(L.compress(
+        result_explicit = asyncio.run(compress(
             text, focus="summarize the lead section", skip_if_under_chars=10_000,
             max_chars=detected_boundary,
         ))
@@ -2655,7 +2536,7 @@ class CompressionCache(unittest.TestCase):
         import asyncio
         import local_compress_lib as L
 
-        real_complete, real_resolve, real_client = L.complete, L.resolve_model, L.client
+        real_complete, real_resolve = L.complete, L.resolve_model
         calls = []
 
         def counting_complete(client, model_id, system, content):
@@ -2664,17 +2545,16 @@ class CompressionCache(unittest.TestCase):
 
         L.complete = counting_complete
         L.resolve_model = lambda m, b: ("stub-model", None)
-        L.client = lambda b: object()
         try:
             # Use a text large enough to produce multiple chunks at chunk_chars=50.
             text = "word " * 200  # 1000 chars
-            asyncio.run(L.compress(text, skip_if_under_chars=0, chunk_chars=50))
+            asyncio.run(compress(text, skip_if_under_chars=0, chunk_chars=50))
             after_first = len(calls)
             # Different chunk_chars must be a cache miss and invoke the model again.
-            asyncio.run(L.compress(text, skip_if_under_chars=0, chunk_chars=500))
+            asyncio.run(compress(text, skip_if_under_chars=0, chunk_chars=500))
             after_second = len(calls)
         finally:
-            L.complete, L.resolve_model, L.client = real_complete, real_resolve, real_client
+            L.complete, L.resolve_model = real_complete, real_resolve
 
         self.assertGreater(after_first, 0, "first call must invoke the model")
         self.assertGreater(after_second, after_first,
@@ -2686,11 +2566,10 @@ class CompressionCache(unittest.TestCase):
         it again must still return the original unchanged -- the cache must
         not interfere with or 'cache' an under-threshold no-op path."""
         import asyncio
-        import local_compress_lib as L
 
         short_text = "just a few words"
         # skip_if_under_chars is large so this is definitely under-threshold.
-        result = asyncio.run(L.compress(short_text, skip_if_under_chars=10_000))
+        result = asyncio.run(compress(short_text, skip_if_under_chars=10_000))
         self.assertEqual(result, short_text,
                          "under-threshold text must be returned unchanged, not compressed")
         # Cache must be empty -- the no-op path must never call _cache_put.
@@ -2704,18 +2583,15 @@ class CompressionCache(unittest.TestCase):
         import local_compress_lib as L
 
         real_resolve = L.resolve_model
-        real_client = L.client
         real_complete = L.complete
 
         L.resolve_model = lambda m, b: ("stub-model", None)
-        L.client = lambda b: object()
         # complete() returning None simulates a failed LM Studio call.
         L.complete = lambda *a, **k: None
         try:
-            result = asyncio.run(L.compress("x" * 500, skip_if_under_chars=0))
+            result = asyncio.run(compress("x" * 500, skip_if_under_chars=0))
         finally:
             L.resolve_model = real_resolve
-            L.client = real_client
             L.complete = real_complete
 
         self.assertTrue(result.startswith("Error:"),
@@ -2732,7 +2608,7 @@ class CompressionCache(unittest.TestCase):
         import asyncio
         import local_compress_lib as L
 
-        real_complete, real_resolve, real_client = L.complete, L.resolve_model, L.client
+        real_complete, real_resolve = L.complete, L.resolve_model
         calls = {"n": 0}
 
         def partial_fail(*a, **k):
@@ -2742,15 +2618,14 @@ class CompressionCache(unittest.TestCase):
             return None if calls["n"] == 1 else "compressed"
 
         L.resolve_model = lambda m, b: ("stub-model", None)
-        L.client = lambda b: object()
         L.complete = partial_fail
         try:
-            result = asyncio.run(L.compress(
+            result = asyncio.run(compress(
                 COMPACT_TEMPLATE, focus="handoff", skip_if_under_chars=0,
                 preserve_sections=True,
             ))
         finally:
-            L.complete, L.resolve_model, L.client = real_complete, real_resolve, real_client
+            L.complete, L.resolve_model = real_complete, real_resolve
 
         # Confirm the partial-failure indicator is present (precondition).
         self.assertIn(
@@ -2773,19 +2648,18 @@ class CompressionCache(unittest.TestCase):
         import asyncio
         import local_compress_lib as L
 
-        real_complete, real_resolve, real_client = L.complete, L.resolve_model, L.client
+        real_complete, real_resolve = L.complete, L.resolve_model
         L.resolve_model = lambda m, b: ("stub-model", None)
-        L.client = lambda b: object()
         # complete() returning None triggers the total-outage path in
         # _compress_each_section (every sent request fails outright).
         L.complete = lambda *a, **k: None
         try:
-            result = asyncio.run(L.compress(
+            result = asyncio.run(compress(
                 COMPACT_TEMPLATE, focus="handoff", skip_if_under_chars=0,
                 preserve_sections=True,
             ))
         finally:
-            L.complete, L.resolve_model, L.client = real_complete, real_resolve, real_client
+            L.complete, L.resolve_model = real_complete, real_resolve
 
         # Confirm the total-outage prefix is actually present (precondition).
         self.assertTrue(
@@ -2938,14 +2812,12 @@ class WholeTxtMapReducePath(unittest.TestCase):
         real_classify = L.classify_relevant
         real_complete = L.complete
         real_resolve = L.resolve_model
-        real_client = L.client
 
         L.classify_relevant = fake_classify
         L.complete = fake_complete
         L.resolve_model = lambda m, b: ("stub-model", None)
-        L.client = lambda b: object()
         try:
-            return asyncio.run(L.compress(
+            return asyncio.run(compress(
                 text,
                 focus=focus,
                 skip_if_under_chars=skip_if_under_chars,
@@ -2956,7 +2828,6 @@ class WholeTxtMapReducePath(unittest.TestCase):
             L.classify_relevant = real_classify
             L.complete = real_complete
             L.resolve_model = real_resolve
-            L.client = real_client
 
     def test_chars_limited_bypasses_classify_relevant(self):
         # When max_chars is set and the text is long enough to compress,
@@ -3058,7 +2929,7 @@ class TimeoutVersusConnectionFailureReporting(unittest.TestCase):
     runs a limited number of requests in parallel and queues the rest) must not
     be reported as "check it's still running", and an outage made up entirely of
     timeouts must not read as "appears unreachable". Drives the REAL
-    complete()/classify_relevant() against a fake OpenAI client that raises (or
+    complete()/classify_relevant() against a fake model client that raises (or
     returns) on demand, so the failure reason really travels the whole way."""
 
     def setUp(self):
@@ -3067,17 +2938,17 @@ class TimeoutVersusConnectionFailureReporting(unittest.TestCase):
     def tearDown(self):
         clear_compression_cache()
 
+    # The library knows only its own neutral CompletionTimeout; translating a
+    # real SDK's timeout into it is libs/lmstudio_client.py's job and is tested
+    # in tests/test_lmstudio_client.py. No `openai` import is needed here.
     @staticmethod
     def _timeout():
-        import httpx
-        import openai
-        return openai.APITimeoutError(request=httpx.Request("POST", "http://localhost:1234/v1"))
+        from local_compress_lib import CompletionTimeout
+        return CompletionTimeout("request timed out")
 
     @staticmethod
     def _conn_error():
-        import httpx
-        import openai
-        return openai.APIConnectionError(request=httpx.Request("POST", "http://localhost:1234/v1"))
+        return ConnectionError("connection refused")
 
     @staticmethod
     def _ok(text="summary"):
@@ -3113,13 +2984,14 @@ class TimeoutVersusConnectionFailureReporting(unittest.TestCase):
     def _compress(self, outcomes, text, **kwargs):
         import asyncio
         import local_compress_lib as L
-        real_resolve, real_client = L.resolve_model, L.client
+        real_resolve = L.resolve_model
         L.resolve_model = lambda m, b: ("stub-model", None)
-        L.client = lambda b: self._fake_client(outcomes)
         try:
-            return asyncio.run(L.compress(text, skip_if_under_chars=0, **kwargs))
+            return asyncio.run(compress(
+                text, skip_if_under_chars=0, client=self._fake_client(outcomes), **kwargs,
+            ))
         finally:
-            L.resolve_model, L.client = real_resolve, real_client
+            L.resolve_model = real_resolve
 
     # -- complete() / take_failure_kind() ------------------------------------
 
@@ -3134,8 +3006,8 @@ class TimeoutVersusConnectionFailureReporting(unittest.TestCase):
         self.assertIsNone(L.complete(client, "m", "sys", "content"))
         self.assertEqual(
             L.take_failure_kind(), "other",
-            "APITimeoutError subclasses APIConnectionError; a plain connection "
-            "error must NOT be classified as a timeout",
+            "only CompletionTimeout is a timeout; a plain connection "
+            "error must NOT be classified as one",
         )
 
     def test_success_clears_a_stale_reason(self):
@@ -3194,14 +3066,13 @@ class TimeoutVersusConnectionFailureReporting(unittest.TestCase):
     def test_stubbed_complete_with_no_reason_keeps_original_wording(self):
         import asyncio
         import local_compress_lib as L
-        real = (L.complete, L.resolve_model, L.client)
+        real = (L.complete, L.resolve_model)
         L.complete = lambda *a, **k: None  # a stub never records a reason
         L.resolve_model = lambda m, b: ("stub", None)
-        L.client = lambda b: object()
         try:
-            out = asyncio.run(L.compress("x" * 300, skip_if_under_chars=0))
+            out = asyncio.run(compress("x" * 300, skip_if_under_chars=0))
         finally:
-            L.complete, L.resolve_model, L.client = real
+            L.complete, L.resolve_model = real
         self.assertIn("LM Studio request failed (chunk 1/1) -- check it's still running", out)
 
     # -- the preserve_sections total-outage prefix ---------------------------

@@ -8,7 +8,7 @@ Qdrant and runs in milliseconds:
     .venv/bin/python -m unittest discover -s tests
 
 The venv Python is required only because importing the hook module pulls in
-local_compress_lib -> openai. Nothing in these tests calls it.
+lmstudio_client -> openai. Nothing in these tests calls it.
 
 Why this file exists: the exempt list is the one place in this repo where a
 regex mistake is SILENT in both directions. A false positive forfeits savings
@@ -1431,6 +1431,34 @@ class HooksReconfigureStdinToUtf8(unittest.TestCase):
         self.assertIn(_E_ACUTE, seen["text"])
         self.assertIn(_ARROW, seen["text"])
         self.assertNotIn("Ã©", seen["text"])  # 'Ã©', the cp1252 mojibake of é
+
+    def test_compress_hook_builds_and_passes_the_model_client(self):
+        # The compression library does not build a client (it imports no
+        # `openai`); the hook owns that and passes it on every compress() call.
+        seen = {}
+        sentinel = object()
+        built = []
+
+        async def _capture_compress(text, *a, **k):
+            seen["client"] = k.get("client")
+            return "[compressed %d -> 4 chars across 1 chunk(s), ~99%% smaller]\nGIST" % len(text)
+
+        real_compress, real_build = hook.compress, hook.build_client
+        hook.compress = _capture_compress
+        hook.build_client = lambda base_url: built.append(base_url) or sentinel
+        try:
+            payload = {
+                "session_id": "s",
+                "cwd": "/repos/p",
+                "tool_name": "Bash",
+                "tool_input": {"command": "run-build"},
+                "tool_response": {"stdout": "x" * (hook.THRESHOLD + 100), "stderr": ""},
+            }
+            self._run_hook_main(hook.main, payload)
+        finally:
+            hook.compress, hook.build_client = real_compress, real_build
+        self.assertIs(seen.get("client"), sentinel)
+        self.assertEqual(built, [None], "the hook uses the library's default LM Studio URL")
 
     def test_record_session_id_hook_parses_utf8_payload_without_crashing(self):
         # A SessionEnd payload (no tool_name) whose cwd carries non-ASCII.

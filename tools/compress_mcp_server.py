@@ -84,6 +84,7 @@ from qdrant_client import QdrantClient, models as qdrant_models
 from qdrant_compact_marker import mark_compact_collection
 from qdrant_ingest_lib import ensure_persistent_fastembed_cache
 from qdrant_model_check import check_embedding_model_mismatch
+from lmstudio_client import build_client
 from local_compress_lib import (
     DEFAULT_BASE_URL,
     DEFAULT_CHUNK_CHARS,
@@ -290,10 +291,13 @@ async def _compress(
     reliable path, with the classifier kept as a secondary aid for
     positional phrasings the keyword list doesn't catch).
     """
+    # This server owns the `openai` client (libs/lmstudio_client.py); the
+    # compression library only receives it. Built per call because base_url
+    # is a per-call tool parameter.
     return await _compress_impl(
         text, focus, skip_if_under_chars, chunk_chars, max_total_chars, max_chars,
         model, base_url, preserve_identifiers=preserve_identifiers,
-        preserve_sections=preserve_sections, ctx=ctx,
+        preserve_sections=preserve_sections, ctx=ctx, client=build_client(base_url),
     )
 
 

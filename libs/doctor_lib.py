@@ -9,11 +9,12 @@ Extends the same "loud instead of silent" idea `local_compress_lib.py`'s
 `stale_env_warning()` already applies to the *renamed*-var case, to the
 *dual-config-mismatch* case instead.
 
-Deliberately does NOT import `local_compress_lib.py` (which pulls in the
-`openai` package at module scope): a target repo running only the Qdrant
+Deliberately does NOT import `local_compress_lib.py` (which, although it
+no longer imports `openai` itself, is the compression library and has no
+business loading for a config check): a target repo running only the Qdrant
 half of this toolkit (`--qdrant-only`, no local-compress at all) has every
-reason to still want this doctor available, and shouldn't need `openai`
-installed just to check `.mcp.json`/shell agreement. The handful of
+reason to still want this doctor available, and shouldn't need the
+compression stack just to check `.mcp.json`/shell agreement. The handful of
 default-resolution rules this needs (mirroring `local_compress_lib.py` for
 URL/MODEL and `savings_ledger.py` for TRACK_SAVINGS/SAVINGS_DB) are small
 enough to reproduce directly here instead -- the same "small, independent,
@@ -66,7 +67,7 @@ _AUTO_DETECT_MODEL = "(auto-detect -- no model pinned)"
 #   for a var that's not a local-compress concern would be misleading.
 # - CLAUDE_RUNWAY_WEBFETCH_FAILED_URL_TTL: hook-only; no .mcp.json counterpart.
 # - CLAUDE_RUNWAY_LMSTUDIO_TIMEOUT_SECONDS: read by both halves via
-#   local_compress_lib.client() (issue #301), but deliberately not declared in
+#   libs/lmstudio_client.py's build_client() (issue #301), but deliberately not declared in
 #   the .mcp.json template: the MCP server inherits the shell value, and an
 #   absent .mcp.json key vs. a shell export is not a real divergence. Same
 #   shell-export-only channel as CLAUDE_RUNWAY_CACHE_DB above.

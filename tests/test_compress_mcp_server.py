@@ -1074,7 +1074,9 @@ class CompressCommandOutputDefaultsToRedaction(unittest.TestCase):
         async def _fake_compress_impl(
             text, focus, skip_if_under_chars, chunk_chars, max_total_chars, max_chars,
             model, base_url, preserve_identifiers=False, preserve_sections=False, ctx=None,
+            client=None,
         ):
+            captured["client"] = client
             captured["preserve_identifiers"] = preserve_identifiers
             captured["preserve_sections"] = preserve_sections
             return "[compressed 10 -> 5 chars across 1 chunk(s), ~50% smaller]\n\nfake summary"
@@ -1087,6 +1089,18 @@ class CompressCommandOutputDefaultsToRedaction(unittest.TestCase):
         captured = self._capture_compress_impl_kwargs(mod)
         _run(mod.compress_command_output(command="echo hello"))
         self.assertTrue(captured["preserve_identifiers"])
+
+    def test_the_server_builds_and_passes_the_model_client(self):
+        # The compression library no longer builds a client; this server owns
+        # it and hands it over on every call, built for that call's base_url.
+        mod = _load_compress_mcp_server()
+        captured = self._capture_compress_impl_kwargs(mod)
+        sentinel = object()
+        built = []
+        mod.build_client = lambda base_url: built.append(base_url) or sentinel
+        _run(mod.compress_command_output(command="echo hello", base_url="http://other:1/v1"))
+        self.assertIs(captured["client"], sentinel)
+        self.assertEqual(built, ["http://other:1/v1"])
 
     def test_caller_can_still_opt_out(self):
         mod = _load_compress_mcp_server()
@@ -1111,12 +1125,10 @@ class CompressCommandOutputDefaultsToRedaction(unittest.TestCase):
         # REAL local_compress_lib.compress() (not a fake) with a fake LM
         # Studio client, so this proves the default genuinely results in a
         # secret being redacted from compress_command_output's output, not
-        # just that a flag was threaded through correctly. Patches
-        # local_compress_lib.client directly (not compress_mcp_server's own
-        # `_client` alias) -- compress()'s internal call to `client(...)`
-        # resolves that name against ITS OWN module globals at call time,
-        # not against whatever compress_mcp_server imported it as.
-        import local_compress_lib
+        # just that a flag was threaded through correctly. The server owns
+        # the model client now (it builds one per call with build_client and
+        # passes it to the library), so the fake is patched in at the
+        # server's own `build_client` name.
         mod = _load_compress_mcp_server()
         secret = "ghp_" + ("a" * 36)
         # The secret comes from the command's STDOUT here, not its own
@@ -1152,7 +1164,7 @@ class CompressCommandOutputDefaultsToRedaction(unittest.TestCase):
             def __init__(self):
                 self.chat = _FakeChat()
 
-        with mock.patch.object(local_compress_lib, "client", lambda base_url: _FakeClient()):
+        with mock.patch.object(mod, "build_client", lambda base_url: _FakeClient()):
             result = _run(mod.compress_command_output(
                 command='printf "%s" "$CLAUDE_RUNWAY_TEST_SECRET"',
                 skip_if_under_chars=0, model="fake-model",

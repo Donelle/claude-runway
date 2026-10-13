@@ -116,7 +116,8 @@ compressed log, since it can corrupt an edit rather than just lose detail
 in a summary. Don't add Read to the matcher without addressing that.
 
 Setup:
-    Dependencies (openai, via libs/local_compress_lib.py) come from
+    Dependencies (openai, via libs/lmstudio_client.py, which builds the model
+    client this hook passes to libs/local_compress_lib.py) come from
     requirements.txt; run this script with that environment's Python.
 
 Register in .claude/settings.json (see templates/settings.json.template; the
@@ -212,6 +213,7 @@ for _dir in _candidates:
         sys.path.insert(0, _dir)
 
 try:
+    from lmstudio_client import build_client
     from local_compress_lib import compress, stale_env_warning
 except ImportError as e:
     # Fail open, but say why via stderr (stdout is reserved for the
@@ -219,7 +221,7 @@ except ImportError as e:
     # Claude Code's hook debug output instead of behaving identically to
     # "nothing needed compressing."
     print(
-        f"compress_output.py: could not import local_compress_lib ({e}). "
+        f"compress_output.py: could not import local_compress_lib or lmstudio_client ({e}). "
         f"Checked: {[d for d in _candidates if d]}. Set TOOLS_REPO_DIR if the "
         "tools repo isn't where this script's parent directory implies.",
         file=sys.stderr,
@@ -749,6 +751,14 @@ def _emit_updated(updated):
     }))
 
 
+def _compress_text(text):
+    """compress() with the model client this hook owns: the library never
+    builds one (it does not import `openai`), so the hook builds the bounded
+    client for the default LM Studio URL and passes it in. Built per call,
+    which is cheap (no network until the first request)."""
+    return asyncio.run(compress(text, skip_if_under_chars=THRESHOLD, client=build_client(None)))
+
+
 def _handle_bash(tool_response):
     """Known shape: {stdout, stderr, ...}. Proven by testing.
     Returns ("updated", updated, raw_text, compressed_text) on success so the
@@ -760,7 +770,7 @@ def _handle_bash(tool_response):
     if len(combined) < THRESHOLD:
         return None  # small enough to leave alone
 
-    result = asyncio.run(compress(combined, skip_if_under_chars=THRESHOLD))
+    result = _compress_text(combined)
     if result.startswith("Error:"):
         return ("error", combined, result)
 
@@ -831,7 +841,7 @@ def _compress_group(fields):
     exactly these two values. Mirrors the single-blob logic _handle_generic
     used to apply globally -- now scoped to just this group's own fields."""
     combined = "\n\n".join(s for _, s in fields)
-    result = asyncio.run(compress(combined, skip_if_under_chars=THRESHOLD))
+    result = _compress_text(combined)
     return combined, result
 
 
