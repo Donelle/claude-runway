@@ -210,7 +210,7 @@ for _dir in _candidates:
         sys.path.insert(0, _dir)
 
 try:
-    from local_compress_lib import compress, estimate_tokens, stale_env_warning
+    from local_compress_lib import compress, stale_env_warning
 except ImportError as e:
     # Fail open, but say why via stderr (stdout is reserved for the
     # hookSpecificOutput JSON contract) so a broken install is visible in
@@ -240,8 +240,8 @@ except ImportError:
     _SAVINGS_LEDGER_AVAILABLE = False
 
 
-def _record_savings_event(session_id, tool, raw_tokens, out_tokens, credited, source="", project=None,
-                          agent_id=None, agent_type=None):
+def _record_savings_event(session_id, tool, raw_chars, out_chars, credited, source="", project=None,
+                          agent_id=None, agent_type=None, tool_use_id=None):
     """Best-effort -- a ledger-logging bug must never break the hook's real job
     (making sure Claude sees the right output). `project` is threaded through to
     record_event's own `project` field -- originally (issue #35) what let
@@ -254,19 +254,30 @@ def _record_savings_event(session_id, tool, raw_tokens, out_tokens, credited, so
     `agent_id`/`agent_type` (issue #365) come from the hook payload and are only
     present for a tool call made inside a subagent (`agent_type` also when the
     session itself was started with `claude --agent`). They're forwarded as-is
-    and default to None, so a main-session event is recorded exactly as before."""
+    and default to None, so a main-session event is recorded exactly as before.
+
+    `raw_chars`/`out_chars` (issues #437, #438) are the EXACT character counts
+    of the content before and after compression -- the only size the ledger
+    records now; the chars / 3.5 token estimate was dropped (#438). Either one
+    being None (a savings footer from an MCP server that predates #437 carries
+    only token estimates) means there is nothing honest to record, so the event
+    is skipped. `tool_use_id` is the PostToolUse payload's id for this tool
+    call, kept so SessionEnd can join the event to its transcript turn and model
+    (issue #440, libs/transcript_attribution_lib.py)."""
     # Split out of one combined `and` expression (issue #297) so Pyright can
     # narrow savings_ledger's type via the assert below -- same short-circuit
     # order and return behavior as the original `if not (A and B and C):`.
     if not _SAVINGS_LEDGER_AVAILABLE or not session_id:
+        return
+    if raw_chars is None or out_chars is None:
         return
     assert savings_ledger is not None  # _SAVINGS_LEDGER_AVAILABLE implies this
     if not savings_ledger.tracking_enabled():
         return
     try:
         savings_ledger.record_event(
-            session_id, tool, raw_tokens, out_tokens, credited, source, project=project,
-            agent_id=agent_id, agent_type=agent_type,
+            session_id, tool, raw_chars, out_chars, credited, source, project=project,
+            agent_id=agent_id, agent_type=agent_type, tool_use_id=tool_use_id,
         )
     except Exception:
         pass
@@ -961,7 +972,16 @@ def _handle_mcp_savings_footer(tool_response):
     return None, None
 
 
-def _finish_compression_outcome(outcome, tool_name, source, session_id, project, agent_id=None, agent_type=None):
+def _footer_chars(value):
+    """A savings footer's char count, or None if absent/malformed (a footer
+    written before #437 has none, and the event is then not recorded) -- bool is excluded since it's an int subclass."""
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
+
+
+def _finish_compression_outcome(outcome, tool_name, source, session_id, project, agent_id=None, agent_type=None,
+                                tool_use_id=None):
     """
     Shared tail for turning an _handle_bash/_handle_generic `outcome` into
     the right hook response -- used by both the ordinary Bash/Grep/etc. path
@@ -986,8 +1006,9 @@ def _finish_compression_outcome(outcome, tool_name, source, session_id, project,
 
     _, updated, raw_text, compressed_text = outcome
     _record_savings_event(
-        session_id, f"hook:{tool_name}", estimate_tokens(raw_text), estimate_tokens(compressed_text),
+        session_id, f"hook:{tool_name}", len(raw_text), len(compressed_text),
         True, source, project=project, agent_id=agent_id, agent_type=agent_type,
+        tool_use_id=tool_use_id,
     )
     _emit_updated(updated)
     sys.exit(0)
@@ -1039,6 +1060,12 @@ def _dispatch(payload):
     # credited saving can later be attributed to the subagent that earned it.
     agent_id = payload.get("agent_id")
     agent_type = payload.get("agent_type")
+    # Issue #437: the id of THIS tool call (documented PostToolUse payload
+    # field). Recorded on the event so it can later be joined to its turn/model.
+    # Empty when absent; a non-string value is dropped rather than trusted.
+    tool_use_id = payload.get("tool_use_id")
+    if not isinstance(tool_use_id, str):
+        tool_use_id = None
     # Same source session_end_savings.py already uses for the identical
     # purpose -- derived once here so both _record_savings_event call sites
     # below tag their JSONL entries with it. Originally (issue #35) this is
@@ -1059,9 +1086,11 @@ def _dispatch(payload):
         data, updated = _handle_mcp_savings_footer(tool_response)
         if data is not None:
             _record_savings_event(
-                session_id, data.get("tool", tool_name), data.get("raw_tokens", 0),
-                data.get("out_tokens", 0), data.get("credited", True), data.get("source", ""),
+                session_id, data.get("tool", tool_name),
+                _footer_chars(data.get("raw_chars")), _footer_chars(data.get("out_chars")),
+                data.get("credited", True), data.get("source", ""),
                 project=project, agent_id=agent_id, agent_type=agent_type,
+                tool_use_id=tool_use_id,
             )
             _emit_updated(updated)
             sys.exit(0)
@@ -1104,7 +1133,7 @@ def _dispatch(payload):
             if entry_count is not None and entry_count > 1:
                 sys.exit(0)
         outcome = _handle_generic(tool_response)
-        _finish_compression_outcome(outcome, tool_name, tool_name, session_id, project, agent_id, agent_type)
+        _finish_compression_outcome(outcome, tool_name, tool_name, session_id, project, agent_id, agent_type, tool_use_id)
 
     # Generic MCP tools from other servers (GitHub, etc.) --
     # NOT mcp__local-compress__, whose path comes first above. All of these
@@ -1128,7 +1157,7 @@ def _dispatch(payload):
     #   not read-vs-write.
     if tool_name.startswith("mcp__"):
         outcome = _handle_generic(tool_response)
-        _finish_compression_outcome(outcome, tool_name, tool_name, session_id, project, agent_id, agent_type)
+        _finish_compression_outcome(outcome, tool_name, tool_name, session_id, project, agent_id, agent_type, tool_use_id)
 
     if tool_name not in SUPPORTED_TOOLS:
         sys.exit(0)  # matcher should already restrict this, but double-check
@@ -1147,7 +1176,7 @@ def _dispatch(payload):
         outcome = _handle_generic(tool_response)
         source = tool_name
 
-    _finish_compression_outcome(outcome, tool_name, source, session_id, project, agent_id, agent_type)
+    _finish_compression_outcome(outcome, tool_name, source, session_id, project, agent_id, agent_type, tool_use_id)
 
 
 def main():

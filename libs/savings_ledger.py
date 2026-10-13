@@ -2,15 +2,19 @@
 Storage + formatting for ClaudeRunway's opt-in savings tracker. Used by:
   - hooks/compress_output.py   (sole ledger WRITER -- see below for why)
   - hooks/session_end_savings.py    (rolls a session's ledger into SQLite, emits a summary)
-  - compress_mcp_server.py          (writes the fixed schema-overhead estimate at startup;
+  - compress_mcp_server.py          (the savings_summary/savings_detail/savings_trend tools read it;
                                       the 3 credited tools themselves do NOT import this module --
-                                      they only need estimate_tokens, see their footer helper)
+                                      their footer helper only measures character counts)
   - skills/my-savings/SKILL.md      (reads, via the savings_summary/savings_detail MCP tools)
 
-This tracker estimates a COUNTERFACTUAL online (what compression avoided vs. what
-raw content would have cost), which is categorically different from EVALUATION.md's
-measured A/B delta -- the two numbers must never be conflated. See EVALUATION.md's
-"Track D" section.
+This tracker observes a COUNTERFACTUAL online (the exact characters before and
+after compression, and the percent reduction between them), which is categorically
+different from EVALUATION.md's measured A/B delta -- the two numbers must never be
+conflated. It reports characters, not tokens (issue #438): a token count depends on
+the model's vocabulary, which is not public. The one token figure it shows is the
+per-model DERIVED one (issue #440, labelled as derived wherever it appears): the
+characters removed, divided by the chars-per-token that session's own transcript
+shows for that model. It is not a measurement. See EVALUATION.md's "Track D" section.
 
 Two-tier storage:
   Tier 1 (transient): one JSONL file per session, appended to DURING the session
@@ -52,6 +56,8 @@ from typing import Optional
 # it). Used by current_session_id() below (issue #213) -- see that
 # function's docstring for exactly what is and isn't delegated.
 import session_id_lib
+# Same convention: joins events to the transcript's model and turn (issue #440).
+import transcript_attribution_lib
 
 
 def tracking_enabled() -> bool:
@@ -207,13 +213,23 @@ def current_session_id(project: Optional[str] = None) -> Optional[str]:
 # Tier 1: transient per-session JSONL ledger
 # ---------------------------------------------------------------------------
 
-def record_event(session_id: str, tool: str, raw_tokens: int, out_tokens: int, credited: bool, source: str = "", project: Optional[str] = None,
-                agent_id: Optional[str] = None, agent_type: Optional[str] = None) -> None:
+def record_event(session_id: str, tool: str, raw_chars: int, out_chars: int, credited: bool, source: str = "", project: Optional[str] = None,
+                agent_id: Optional[str] = None, agent_type: Optional[str] = None,
+                tool_use_id: Optional[str] = None) -> None:
     """
     Append one compression event to the session's transient JSONL ledger.
-    saved_tokens is forced to 0 for uncredited events (e.g. fetch_url, whose
+    saved_chars is forced to 0 for uncredited events (e.g. fetch_url, whose
     honest counterfactual -- WebFetch's own server-side summary -- we don't
     observe) so an uncredited event can never contribute to the headline sum.
+
+    `raw_chars`/`out_chars` (issues #437, #438) are the EXACT character counts
+    of the content before and after compression. They are the only size fields
+    this ledger records: a token count depends on the model's vocabulary, which
+    is not public, so the old chars / 3.5 estimate was a uniform guess (about
+    29% low, #437) and is no longer written. `saved_chars` is clamped at 0 (a
+    summary can end up longer than a small raw chunk) exactly like the saved
+    figure always was. Events logged before #438 still carry their estimated
+    token fields; nothing reads them any more.
 
     `project` was originally what current_session_id()'s optional project
     filter matched against (issue #35); as of issue #213, that filtered
@@ -235,18 +251,23 @@ def record_event(session_id: str, tool: str, raw_tokens: int, out_tokens: int, c
     was started with `claude --agent <name>`; only `agent_id` marks a subagent
     (see _aggregate_by_agent). `agent_id` lives in this transient ledger only --
     the SQLite rollup keeps just the subagent flag and `agent_type`.
+
+    `tool_use_id` is the PostToolUse payload's id for the tool call; written only
+    when non-empty. At SessionEnd it is the key that joins the event to its
+    transcript turn and model (issue #440, libs/transcript_attribution_lib.py).
     """
-    saved_tokens = max(0, raw_tokens - out_tokens) if credited else 0
     entry = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "tool": tool,
-        "raw_tokens": raw_tokens,
-        "out_tokens": out_tokens,
-        "saved_tokens": saved_tokens,
+        "raw_chars": raw_chars,
+        "out_chars": out_chars,
+        "saved_chars": max(0, raw_chars - out_chars) if credited else 0,
         "credited": credited,
         "source": source[:200] if source else "",
         "project": project,
     }
+    if tool_use_id:
+        entry["tool_use_id"] = str(tool_use_id)[:200]
     if agent_id:
         entry["agent_id"] = str(agent_id)[:200]
     if agent_type:
@@ -302,13 +323,13 @@ def _parse_event_lines(lines) -> list:
 # ---------------------------------------------------------------------------
 
 # Bumped whenever the shape of ANY persistent table changes: `sessions`,
-# `session_tools`, `session_agents` (added in v5, #365) or `meta`. That includes
+# `session_tools`, `session_agents` (added in v5, #365), `session_models` (added in v9, #440) or `meta`. That includes
 # adding a new table, even though _connect creates it for fresh DBs via CREATE
 # TABLE IF NOT EXISTS -- the bump plus a registered migration is what keeps
 # existing databases on the same versioned path as new ones.
 # _MIGRATIONS below must gain a matching entry for every bump -- see
 # _run_migrations' docstring for how the two stay in sync (issue #30/#69).
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 9
 
 # Issue #365: per-session savings split by which agent earned them. One DDL
 # string shared by _connect (fresh DBs) and _migrate_to_v5 (existing DBs) so the
@@ -317,17 +338,81 @@ SCHEMA_VERSION = 5
 # agent_type means "no agent_type reported". The raw agent_id is deliberately NOT
 # stored here -- one row per spawned subagent would grow without bound for little
 # analytical value; type + flag answers "main or subagent, and which kind".
+# Issue #438: no estimated-token columns. `{name}` is the table name, so
+# _migrate_to_v7 can build a side table with the same shape.
 _SESSION_AGENTS_DDL = """
-    CREATE TABLE IF NOT EXISTS session_agents (
+    CREATE TABLE IF NOT EXISTS {name} (
         session_id TEXT NOT NULL,
         is_subagent INTEGER NOT NULL,
         agent_type TEXT NOT NULL DEFAULT '',
         event_count INTEGER NOT NULL,
-        saved_tokens INTEGER NOT NULL,
-        raw_tokens_sum INTEGER NOT NULL DEFAULT 0,
-        out_tokens_sum INTEGER NOT NULL DEFAULT 0,
         credited_event_count INTEGER NOT NULL DEFAULT 0,
+        raw_chars_sum INTEGER NOT NULL DEFAULT 0,
+        out_chars_sum INTEGER NOT NULL DEFAULT 0,
+        saved_chars INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (session_id, is_subagent, agent_type)
+    )
+"""
+
+# The latest `sessions` / `session_tools` shapes, same idea: one DDL per table,
+# shared by _connect (fresh DBs) and _migrate_to_v7 (which rebuilds the existing
+# tables into this shape) so the two can't drift.
+_SESSIONS_DDL = """
+    CREATE TABLE IF NOT EXISTS {name} (
+        session_id TEXT PRIMARY KEY,
+        project TEXT NOT NULL,
+        ended_at TEXT NOT NULL,
+        event_count INTEGER NOT NULL,
+        fetch_url_count INTEGER NOT NULL,
+        actual_input_tokens INTEGER NOT NULL DEFAULT 0,
+        actual_output_tokens INTEGER NOT NULL DEFAULT 0,
+        actual_cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+        actual_cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+        raw_chars_sum INTEGER NOT NULL DEFAULT 0,
+        out_chars_sum INTEGER NOT NULL DEFAULT 0,
+        credited_saved_chars INTEGER NOT NULL DEFAULT 0
+    )
+"""
+
+# The columns of the current `sessions` table, in DDL order -- what _migrate_to_v8
+# copies across.
+_SESSIONS_COLUMNS = (
+    "session_id", "project", "ended_at", "event_count", "fetch_url_count",
+    "actual_input_tokens", "actual_output_tokens", "actual_cache_read_tokens", "actual_cache_write_tokens",
+    "raw_chars_sum", "out_chars_sum", "credited_saved_chars",
+)
+
+_SESSION_TOOLS_DDL = """
+    CREATE TABLE IF NOT EXISTS {name} (
+        session_id TEXT NOT NULL,
+        tool TEXT NOT NULL,
+        event_count INTEGER NOT NULL,
+        credited_event_count INTEGER NOT NULL DEFAULT 0,
+        raw_chars_sum INTEGER NOT NULL DEFAULT 0,
+        out_chars_sum INTEGER NOT NULL DEFAULT 0,
+        saved_chars INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (session_id, tool)
+    )
+"""
+
+
+# Issue #440: the session's compression split by the model that was running. One
+# row per (session, model); model '' is the unattributed bucket (events with no
+# matching transcript turn), so the rows always add up to the session's own
+# characters. `derived_tokens`/`chars_per_token` are NULL when the session had too
+# few samples to derive a ratio for that model: NULL means "not derived", never 0.
+_SESSION_MODELS_DDL = """
+    CREATE TABLE IF NOT EXISTS {name} (
+        session_id TEXT NOT NULL,
+        model TEXT NOT NULL DEFAULT '',
+        event_count INTEGER NOT NULL,
+        raw_chars_sum INTEGER NOT NULL DEFAULT 0,
+        out_chars_sum INTEGER NOT NULL DEFAULT 0,
+        saved_chars INTEGER NOT NULL DEFAULT 0,
+        derived_tokens INTEGER,
+        chars_per_token REAL,
+        ratio_samples INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (session_id, model)
     )
 """
 
@@ -429,7 +514,187 @@ def _migrate_to_v5(conn) -> None:
     finalized before this version have no rows here: the agent information was
     never recorded, so nothing is backfilled.
     """
-    conn.execute(_SESSION_AGENTS_DDL)
+    conn.execute(_SESSION_AGENTS_DDL.format(name="session_agents"))
+
+
+# Issue #437: exact character counts stored next to the estimated token fields.
+# (table, char column, token column the backfill derives it from). `sessions`
+# names its saved figure credited_saved_tokens; the other two tables saved_tokens.
+_CHAR_COLUMNS = (
+    ("sessions", "raw_chars_sum", "raw_tokens_sum"),
+    ("sessions", "out_chars_sum", "out_tokens_sum"),
+    ("sessions", "credited_saved_chars", "credited_saved_tokens"),
+    ("session_tools", "raw_chars_sum", "raw_tokens_sum"),
+    ("session_tools", "out_chars_sum", "out_tokens_sum"),
+    ("session_tools", "saved_chars", "saved_tokens"),
+    ("session_agents", "raw_chars_sum", "raw_tokens_sum"),
+    ("session_agents", "out_chars_sum", "out_tokens_sum"),
+    ("session_agents", "saved_chars", "saved_tokens"),
+)
+
+
+def _migrate_to_v6(conn) -> None:
+    """
+    Adds exact character counts (issue #437) to `sessions`, `session_tools` and
+    `session_agents`, alongside -- never replacing -- the estimated token fields.
+
+    Existing rows are backfilled as tokens x 3.5, because that is exactly how
+    they were produced (estimate_tokens is len / 3.5), so the result is the
+    original character count to within rounding (SQLite ROUND, half away from
+    zero; each event's token figure was itself rounded before being summed, so
+    a backfilled row carries a little rounding error -- see
+    docs/savings-tracker.md). The before/after pair keeps the token columns' own
+    "unknown" convention: a row whose raw_tokens_sum or out_tokens_sum is 0
+    (DEFAULT 0 means "unknown" -- see _migrate_to_v1/v3) gets 0 for the matching
+    character column too, never a figure derived from something else. The saved
+    figure is always known, so it is always backfilled.
+
+    Backfills only a column this call actually adds: a column already present
+    (a DB whose CREATE TABLE already had it) may hold real exact counts that a
+    token-derived guess must never overwrite.
+    """
+    for table, char_col, token_col in _CHAR_COLUMNS:
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if char_col in existing:
+            continue
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {char_col} INTEGER NOT NULL DEFAULT 0")
+        conn.execute(f"UPDATE {table} SET {char_col} = CAST(ROUND({token_col} * 3.5) AS INTEGER)")
+
+
+# Issue #438: (table, DDL, columns kept, the saved column, the credited-event count). The estimated-token
+# columns are not in the kept lists, so they are simply not copied across -- but
+# see _v7_select, which reads them first so no history is lost with them.
+_V7_REBUILDS = (
+    ("sessions", _SESSIONS_DDL,
+     # No overhead_tokens: v7 builds the CURRENT `sessions` shape (issue #439 dropped
+     # that column), so a v6 database going straight to v8 loses it here, and
+     # _migrate_to_v8 only has work for a database that already reached v7.
+     ("session_id", "project", "ended_at", "event_count", "fetch_url_count",
+      "actual_input_tokens", "actual_output_tokens", "actual_cache_read_tokens", "actual_cache_write_tokens",
+      "raw_chars_sum", "out_chars_sum", "credited_saved_chars"),
+     "credited_saved_chars", "event_count"),
+    ("session_tools", _SESSION_TOOLS_DDL,
+     ("session_id", "tool", "event_count", "credited_event_count",
+      "raw_chars_sum", "out_chars_sum", "saved_chars"),
+     "saved_chars", "credited_event_count"),
+    ("session_agents", _SESSION_AGENTS_DDL,
+     ("session_id", "is_subagent", "agent_type", "event_count", "credited_event_count",
+      "raw_chars_sum", "out_chars_sum", "saved_chars"),
+     "saved_chars", "credited_event_count"),
+)
+
+
+def _v7_select(columns: tuple, saved_col: str, has_tokens: bool, count_col: str) -> str:
+    """The SELECT list that copies a table's kept columns into its v7 rebuild.
+    Two columns are not copied as-is (both PR #446 review):
+
+    - before/after: a v6 row can hold token data the character columns don't
+      cover. After #437 an MCP server that hadn't been restarted still sent
+      token-only savings footers, and the hook recorded them, so a v6 row may be
+      token-only (character sums 0) or mixed (character sums partial). Dropping
+      the token columns would lose that, so when the tokens x 3.5 estimate
+      exceeds the character sum by more than rounding slack (each event's token
+      figure was rounded, at most 1.75 characters off) the row is reconstructed
+      from tokens, exactly as the v6 backfill treated older rows -- approximate,
+      and documented as such. A row whose characters already cover its tokens
+      keeps them untouched.
+    - the saving: v6 stored the SUM of per-event clamped savings, which can exceed
+      `before - after` (100->150 and 100->10 sum to 90 against a real 40), and
+      every reader now treats it as max(0, before - after). Re-derived for any
+      row that ends up with both sizes; a row with no recorded size keeps its
+      backfilled figure.
+
+    `has_tokens` is False for a table that `_connect` just created in its v7 shape
+    (a database older than v5 has no `session_agents`), which has no token
+    columns to read. `count_col` is the event count the rounding slack scales with:
+    it must count the same events the token sums do, which are CREDITED events only
+    -- `sessions.event_count` already is, but `session_tools`/`session_agents`
+    `event_count` also counts uncredited calls (fetch_url), so they use
+    `credited_event_count` (PR #446 review)."""
+    if has_tokens:
+        def recon(chars: str, tokens: str) -> str:
+            est = f"CAST(ROUND({tokens} * 3.5) AS INTEGER)"
+            return f"CASE WHEN {est} > {chars} + 2 * {count_col} THEN {est} ELSE {chars} END"
+        raw = recon("raw_chars_sum", "raw_tokens_sum")
+        out = recon("out_chars_sum", "out_tokens_sum")
+    else:
+        raw, out = "raw_chars_sum", "out_chars_sum"
+    exprs = {
+        "raw_chars_sum": raw,
+        "out_chars_sum": out,
+        saved_col: f"CASE WHEN ({raw}) > 0 AND ({out}) > 0 THEN MAX(0, ({raw}) - ({out})) ELSE {saved_col} END",
+    }
+    return ", ".join(exprs[c] if c in exprs else c for c in columns)
+
+
+def _migrate_to_v7(conn) -> None:
+    """
+    Drops the estimated-token columns (issue #438): `sessions.credited_saved_tokens`,
+    `raw_tokens_sum`, `out_tokens_sum`, and `saved_tokens`/`raw_tokens_sum`/
+    `out_tokens_sum` on `session_tools` and `session_agents`. The exact character
+    columns v6 added replace them, and every reader now uses those. The
+    `actual_*_tokens` columns hold real transcript usage and stay. (`overhead_tokens`
+    stayed in the original v7 but is dropped by v8, issue #439; this rebuild already
+    omits it, since it builds the current `sessions` shape.)
+
+    Rebuilds each table (create side table, copy the kept columns, drop, rename)
+    rather than ALTER TABLE ... DROP COLUMN, which needs SQLite 3.35+ -- older
+    Python builds bundle older SQLite. Runs inside _run_migrations' transaction,
+    so a failure leaves the old tables untouched. The v6 backfill (which reads
+    the token columns) always ran before this, so the character columns hold the
+    best figure there is for older rows. Before the token columns go, a v6 row
+    whose tokens say more than its characters cover is reconstructed from them,
+    and every saving is re-derived -- see _v7_select.
+    """
+    for table, ddl, columns, saved_col, count_col in _V7_REBUILDS:
+        side = f"{table}_v7"
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        has_tokens = {"raw_tokens_sum", "out_tokens_sum"} <= existing
+        conn.execute(f"DROP TABLE IF EXISTS {side}")
+        conn.execute(ddl.format(name=side))
+        cols = ", ".join(columns)
+        selected = _v7_select(columns, saved_col, has_tokens, count_col)
+        conn.execute(f"INSERT INTO {side} ({cols}) SELECT {selected} FROM {table}")
+        conn.execute(f"DROP TABLE {table}")
+        conn.execute(f"ALTER TABLE {side} RENAME TO {table}")
+
+
+def _migrate_to_v8(conn) -> None:
+    """
+    Drops `sessions.overhead_tokens` and the `schema_overhead_tokens` meta row
+    (issue #439). Both held a chars / 3.5 estimate of the toolkit's tool-schema
+    size, shown as "Tool overhead .../turn". That premise is not what the real
+    transcripts show: Claude Code lists these tools as deferred, loaded on demand
+    rather than sent every turn (tools/measure_startup_context.py measures it from
+    a session transcript). An estimate of a cost that is not paid is worse than no
+    figure, and the exact before/after character columns need no estimate.
+
+    Rebuilds `sessions` (create side table, copy, drop, rename) for the same reason
+    _migrate_to_v7 does: ALTER TABLE ... DROP COLUMN needs SQLite 3.35+. A database
+    that came through _migrate_to_v7 in this same run has no such column already
+    (that rebuild builds the current shape), so there is nothing to do for it.
+    """
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()}
+    if "overhead_tokens" in existing:
+        conn.execute("DROP TABLE IF EXISTS sessions_v8")
+        conn.execute(_SESSIONS_DDL.format(name="sessions_v8"))
+        cols = ", ".join(_SESSIONS_COLUMNS)
+        conn.execute(f"INSERT INTO sessions_v8 ({cols}) SELECT {cols} FROM sessions")
+        conn.execute("DROP TABLE sessions")
+        conn.execute("ALTER TABLE sessions_v8 RENAME TO sessions")
+    conn.execute("DELETE FROM meta WHERE key = 'schema_overhead_tokens'")
+
+
+def _migrate_to_v9(conn) -> None:
+    """
+    Adds the `session_models` table (issue #440): compression split by model, with
+    the derived token figure. Purely additive and idempotent (CREATE TABLE IF NOT
+    EXISTS) -- _connect already creates it before migrations run, in its final
+    shape, so no earlier migration ever needs to know about it. Sessions finalized
+    before this version have no rows here: the model was never recorded and the
+    transcript is not kept, so nothing is backfilled.
+    """
+    conn.execute(_SESSION_MODELS_DDL.format(name="session_models"))
 
 
 # Maps target schema version -> the function that migrates INTO it from the
@@ -437,7 +702,7 @@ def _migrate_to_v5(conn) -> None:
 # and bumps SCHEMA_VERSION -- _run_migrations doesn't need to change at all,
 # which is the actual "scaffold" issue #69 asked for: a repeatable shape for
 # schema changes, not a one-off patch for this specific set of columns.
-_MIGRATIONS = {1: _migrate_to_v1, 2: _migrate_to_v2, 3: _migrate_to_v3, 4: _migrate_to_v4, 5: _migrate_to_v5}
+_MIGRATIONS = {1: _migrate_to_v1, 2: _migrate_to_v2, 3: _migrate_to_v3, 4: _migrate_to_v4, 5: _migrate_to_v5, 6: _migrate_to_v6, 7: _migrate_to_v7, 8: _migrate_to_v8, 9: _migrate_to_v9}
 
 
 def _table_exists(conn, name: str) -> bool:
@@ -544,51 +809,22 @@ def _ensure_schema(conn) -> None:
     # Checked BEFORE the CREATE TABLE calls below, specifically so
     # _run_migrations can tell a genuinely fresh DB (nothing to migrate --
     # see its docstring) apart from a pre-existing one that needs its
-    # history replayed. `sessions` specifically, not the other three tables
-    # (`session_tools`/`session_agents`/`meta`), since it's the one this
+    # history replayed. `sessions` specifically, not the other four tables
+    # (`session_tools`/`session_agents`/`session_models`/`meta`), since it's the one this
     # migration scaffold actually versions.
     sessions_existed = _table_exists(conn, "sessions")
     # Always the LATEST schema -- a brand-new DB gets every current column
     # in one step and never needs a migration to add anything for it.
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS sessions (
-            session_id TEXT PRIMARY KEY,
-            project TEXT NOT NULL,
-            ended_at TEXT NOT NULL,
-            credited_saved_tokens INTEGER NOT NULL,
-            raw_tokens_sum INTEGER NOT NULL DEFAULT 0,
-            out_tokens_sum INTEGER NOT NULL DEFAULT 0,
-            event_count INTEGER NOT NULL,
-            fetch_url_count INTEGER NOT NULL,
-            overhead_tokens INTEGER NOT NULL DEFAULT 0,
-            actual_input_tokens INTEGER NOT NULL DEFAULT 0,
-            actual_output_tokens INTEGER NOT NULL DEFAULT 0,
-            actual_cache_read_tokens INTEGER NOT NULL DEFAULT 0,
-            actual_cache_write_tokens INTEGER NOT NULL DEFAULT 0
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS session_tools (
-            session_id TEXT NOT NULL,
-            tool TEXT NOT NULL,
-            event_count INTEGER NOT NULL,
-            saved_tokens INTEGER NOT NULL,
-            raw_tokens_sum INTEGER NOT NULL DEFAULT 0,
-            out_tokens_sum INTEGER NOT NULL DEFAULT 0,
-            credited_event_count INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (session_id, tool)
-        )
-        """
-    )
-    conn.execute(_SESSION_AGENTS_DDL)
+    conn.execute(_SESSIONS_DDL.format(name="sessions"))
+    conn.execute(_SESSION_TOOLS_DDL.format(name="session_tools"))
+    conn.execute(_SESSION_AGENTS_DDL.format(name="session_agents"))
+    conn.execute(_SESSION_MODELS_DDL.format(name="session_models"))
     conn.execute(
         "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
     )
-    # Only after all four tables are guaranteed to exist -- a migration may
-    # assume `sessions`/`session_tools`/`session_agents`/`meta` are all already there.
+    # Only after all five tables are guaranteed to exist -- a migration may
+    # assume `sessions`/`session_tools`/`session_agents`/`session_models`/`meta`
+    # are all already there.
     _run_migrations(conn, is_new_db=not sessions_existed)
 
 
@@ -610,23 +846,78 @@ def get_meta(key: str, default: Optional[str] = None) -> Optional[str]:
     return row[0] if row else default
 
 
-def get_schema_overhead_tokens() -> int:
+# Aggregate keys for the exact-character sums (issue #437). `saved_chars` is NOT
+# summed from the events: see _derive_saved.
+_CHAR_SUM_KEYS = ("raw_chars_sum", "out_chars_sum", "saved_chars")
+
+
+def _zero_chars() -> dict:
+    return {key: 0 for key in _CHAR_SUM_KEYS}
+
+
+def _is_count(v) -> bool:
+    """A hand-edited or corrupt JSONL line must not sink the roll-up: only a
+    real, non-negative int is a character count."""
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+
+def _counted(e: dict) -> bool:
+    """True if an event contributes to the character figures: credited AND
+    carrying a valid before and after count. An event without them (logged before
+    #437, or corrupt) has an unknown size, so it must be left out of every figure
+    that is shown beside a reduction percentage -- the percentage and the "N
+    events" next to it have to describe the same set of events (PR #446 review)."""
+    return bool(e.get("credited")) and _is_count(e.get("raw_chars")) and _is_count(e.get("out_chars"))
+
+
+def _saved(raw: int, out: int) -> int:
+    """Characters saved, clamped at 0 (a summary CAN end up longer than a small
+    raw chunk)."""
+    return max(0, raw - out)
+
+
+def _add_event_chars(agg: dict, e: dict) -> None:
+    agg["raw_chars_sum"] += e["raw_chars"]
+    agg["out_chars_sum"] += e["out_chars"]
+
+
+def _derive_saved(agg: dict) -> None:
+    """Set `saved_chars` from the aggregate's own before/after totals instead of
+    summing the per-event savings. Each event's saving is clamped at 0 on its own,
+    so the sum can exceed `raw - out` (events 100->150 and 100->10 sum to 90, but
+    200->160 is only 40) and then contradict the totals shown beside it (PR #446
+    review). Deriving it keeps every displayed saving consistent with them."""
+    agg["saved_chars"] = _saved(agg["raw_chars_sum"], agg["out_chars_sum"])
+
+
+def _aggregate_by_tool(events: list) -> dict:
     """
-    The fixed per-turn schema-overhead estimate, computed live at
-    compress_mcp_server.py startup (see its _log_fixed_overhead) and stashed
-    here so hooks/skills in a different process can read the same number
-    without recomputing it or importing the MCP server module.
+    Group a session's events by tool. Shared by _write_session_rows() and
+    get_live_session_aggregate() so the stored and the live view can't drift.
+    event_count counts every event (uncredited fetch_url included);
+    credited_event_count and the character sums count only events that
+    contribute character figures (see _counted).
     """
-    return int(get_meta("schema_overhead_tokens", "0") or "0")
+    by_tool: dict[str, dict[str, int]] = {}
+    for e in events:
+        tool = e.get("tool", "unknown")
+        agg = by_tool.setdefault(tool, {"event_count": 0, "credited_event_count": 0, **_zero_chars()})
+        agg["event_count"] += 1
+        if _counted(e):
+            agg["credited_event_count"] += 1
+            _add_event_chars(agg, e)
+    for agg in by_tool.values():
+        _derive_saved(agg)
+    return by_tool
 
 
 def _aggregate_by_agent(events: list) -> list:
     """
     Group a session's events by which agent earned them (issue #365). Returns a
-    list of dicts, one per (is_subagent, agent_type), sorted by saved_tokens
+    list of dicts, one per (is_subagent, agent_type), sorted by saved_chars
     descending then deterministically, with the same counters as by_tool and
-    the same credited-only rules (saved/raw/out sums and credited_event_count
-    only count credited events; event_count counts all of them).
+    the same rules (character sums and credited_event_count only count events
+    that contribute character figures; event_count counts all of them).
 
     `is_subagent` is decided by `agent_id` alone. `agent_type` is just a label:
     the hooks docs say it's also present on the MAIN thread when the session
@@ -638,26 +929,21 @@ def _aggregate_by_agent(events: list) -> list:
     groups: dict[tuple[int, str], dict[str, int]] = {}
     for e in events:
         key = (1 if e.get("agent_id") else 0, str(e.get("agent_type") or ""))
-        agg = groups.setdefault(key, {
-            "event_count": 0,
-            "saved_tokens": 0,
-            "raw_tokens_sum": 0,
-            "out_tokens_sum": 0,
-            "credited_event_count": 0,
-        })
+        agg = groups.setdefault(key, {"event_count": 0, "credited_event_count": 0, **_zero_chars()})
         agg["event_count"] += 1
-        if e.get("credited"):
-            agg["saved_tokens"] += e.get("saved_tokens", 0)
-            agg["raw_tokens_sum"] += e.get("raw_tokens", 0)
-            agg["out_tokens_sum"] += e.get("out_tokens", 0)
+        if _counted(e):
             agg["credited_event_count"] += 1
+            _add_event_chars(agg, e)
+    for agg in groups.values():
+        _derive_saved(agg)
     rows = [{"is_subagent": k[0], "agent_type": k[1], **v} for k, v in groups.items()]
-    rows.sort(key=lambda r: (-r["saved_tokens"], r["is_subagent"], r["agent_type"]))
+    rows.sort(key=lambda r: (-r["saved_chars"], r["is_subagent"], r["agent_type"]))
     return rows
 
 
-def _write_session_rows(conn, session_id: str, project: str, events: list, overhead_tokens: int,
-                        actual_tokens: Optional[dict], ended_at: str, accumulate: bool = False) -> dict:
+def _write_session_rows(conn, session_id: str, project: str, events: list,
+                        actual_tokens: Optional[dict], ended_at: str, accumulate: bool = False,
+                        attribution: Optional[dict] = None) -> dict:
     """
     Aggregate `events` and write them as `session_id`'s rows on `conn`, inside
     whatever transaction the caller holds. Shared by finalize_session() and
@@ -674,45 +960,41 @@ def _write_session_rows(conn, session_id: str, project: str, events: list, overh
     orphan, then resumed and ended cleanly; or ended, resumed, ended again --
     and replacing threw away every earlier part. With no existing row this
     writes exactly what the replace path writes, so a session that ends once
-    is unchanged. Counters add; project/ended_at/overhead take the newest
+    is unchanged. Counters add; project/ended_at take the newest
     roll-up's value; actual_* take the new transcript counts when there are
     any (a resumed session reuses its transcript, so a later parse covers the
     whole session) and otherwise keep the counts already recorded. Adding is
     only correct if no event is ever rolled up twice -- finalize_owned_session
     guarantees that, see its docstring.
+
+    attribution (issue #440): the transcript index from
+    transcript_attribution_lib.read_transcript, or None (no transcript, or the
+    opt-in is off). Given, each counted event is joined to its model and the
+    session is also written per model to `session_models`. The model rows follow
+    the same rules as the rest: replaced on the replace path; added to on the
+    accumulate path -- except that a session whose stored row already has events
+    but no model rows (finalized before v9, or without a transcript) gets none,
+    because rows covering only the later events would read as the whole session;
+    a resumed session's derived token figure is dropped (it cannot be recomputed
+    from events that are gone); and a roll-up with new credited events but no
+    transcript drops the session's split, which would no longer add up.
     """
-    credited = [e for e in events if e.get("credited")]
-    credited_saved = sum(e.get("saved_tokens", 0) for e in credited)
-    raw_sum = sum(e.get("raw_tokens", 0) for e in credited)
-    out_sum = sum(e.get("out_tokens", 0) for e in credited)
-    # Credited-only, not len(events): the reduction % (and raw/out sums above)
-    # are computed from credited events only, so the "N events" figure shown
-    # alongside them must match that same subset or the two numbers disagree
-    # (e.g. "3 events, 90% reduction" where one of the 3 didn't count toward
-    # the 90% at all). Uncredited activity (fetch_url) is still surfaced,
-    # just via fetch_url_count separately, not folded into this count.
-    event_count = len(credited)
+    counted = [e for e in events if _counted(e)]
+    chars_sum = _zero_chars()
+    for e in counted:
+        _add_event_chars(chars_sum, e)
+    _derive_saved(chars_sum)
+    # Counted-only, not len(events): the reduction % (and the character sums
+    # above) are computed from these events only, so the "N events" figure
+    # shown alongside them must match that same subset or the two numbers
+    # disagree (e.g. "3 events, 90% reduction" where one of the 3 didn't count
+    # toward the 90% at all). Uncredited activity (fetch_url) is still
+    # surfaced, just via fetch_url_count separately, not folded into this count;
+    # a credited event with no recorded size is simply not counted.
+    event_count = len(counted)
     fetch_url_count = sum(1 for e in events if e.get("tool") == "fetch_url")
 
-    by_tool: dict[str, dict[str, int]] = {}
-    for e in events:
-        tool = e.get("tool", "unknown")
-        agg = by_tool.setdefault(tool, {
-            "event_count": 0,
-            "saved_tokens": 0,
-            "raw_tokens_sum": 0,
-            "out_tokens_sum": 0,
-            "credited_event_count": 0,
-        })
-        agg["event_count"] += 1
-        if e.get("credited"):
-            agg["saved_tokens"] += e.get("saved_tokens", 0)
-            agg["raw_tokens_sum"] += e.get("raw_tokens", 0)
-            # Actual out_tokens (pre-clamping) for accurate avg % computation --
-            # see _migrate_to_v3's docstring for why raw - saved_tokens is wrong.
-            agg["out_tokens_sum"] += e.get("out_tokens", 0)
-            agg["credited_event_count"] += 1
-
+    by_tool = _aggregate_by_tool(events)
     by_agent = _aggregate_by_agent(events)
 
     _at = actual_tokens or {}
@@ -721,17 +1003,53 @@ def _write_session_rows(conn, session_id: str, project: str, events: list, overh
     actual_cr   = int(_at.get("cache_read", 0) or 0)
     actual_cw   = int(_at.get("cache_write",0) or 0)
 
-    session_values = (session_id, project, ended_at, credited_saved, raw_sum, out_sum, event_count,
-                      fetch_url_count, overhead_tokens, actual_inp, actual_out, actual_cr, actual_cw)
+    # What is WRITTEN can differ from what this roll-up REPORTS (the return value
+    # below always describes this run's events). A resumed session whose stored
+    # row has credited events but no recorded size (a pre-v6 row) must stay
+    # unsized: adding the resumed events' exact counts to its zeros would turn it
+    # into a row that looks fully sized while covering only part of the session,
+    # and would drop its backfilled saving (PR #446 review). Such a row only
+    # accumulates its event counts; its character figures stay "unknown".
+    resumed_unsized = False
+    had_events_before = False  # a resume: the stored row already holds credited events
+    if accumulate:
+        prior = conn.execute(
+            "SELECT event_count, raw_chars_sum, out_chars_sum FROM sessions WHERE session_id = ?", (session_id,)
+        ).fetchone()
+        resumed_unsized = bool(prior and prior[0] > 0 and (prior[1] == 0 or prior[2] == 0))
+        had_events_before = bool(prior and prior[0] > 0)
+    w_chars = _zero_chars() if resumed_unsized else chars_sum
+    w_by_tool = {t: dict(a, credited_event_count=0, **_zero_chars()) for t, a in by_tool.items()} if resumed_unsized else by_tool
+    w_by_agent = [dict(a, credited_event_count=0, **_zero_chars()) for a in by_agent] if resumed_unsized else by_agent
+
+    session_values = (session_id, project, ended_at, event_count,
+                      fetch_url_count, actual_inp, actual_out, actual_cr, actual_cw,
+                      w_chars["raw_chars_sum"], w_chars["out_chars_sum"], w_chars["saved_chars"])
     session_columns = (
-        "(session_id, project, ended_at, credited_saved_tokens, raw_tokens_sum, out_tokens_sum, "
-        " event_count, fetch_url_count, overhead_tokens, "
-        " actual_input_tokens, actual_output_tokens, actual_cache_read_tokens, actual_cache_write_tokens) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        "(session_id, project, ended_at, event_count, fetch_url_count, "
+        " actual_input_tokens, actual_output_tokens, actual_cache_read_tokens, actual_cache_write_tokens, "
+        " raw_chars_sum, out_chars_sum, credited_saved_chars) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     # Per-key counter columns shared by session_tools and session_agents.
-    counters = ("event_count", "saved_tokens", "raw_tokens_sum", "out_tokens_sum", "credited_event_count")
+    # `saved_chars` is not added: it is re-derived from the summed before/after
+    # (see _derive_saved). In an UPSERT's SET clause a bare column name on the
+    # right-hand side is the row's value BEFORE the update, so this is the old
+    # total plus the new one. A pre-v6 row's backfilled saved figure is replaced
+    # by what its before/after say (0 when those are unknown) once it is resumed.
+    counters = ("event_count", "credited_event_count", "raw_chars_sum", "out_chars_sum")
     add_counters = ", ".join(f"{c} = {c} + excluded.{c}" for c in counters)
+    add_counters += ", saved_chars = MAX(0, (raw_chars_sum + excluded.raw_chars_sum) - (out_chars_sum + excluded.out_chars_sum))"
+    if resumed_unsized:
+        add_counters = "event_count = event_count + excluded.event_count"
+        session_chars_set = ""
+    else:
+        session_chars_set = (
+            "raw_chars_sum = raw_chars_sum + excluded.raw_chars_sum, "
+            "out_chars_sum = out_chars_sum + excluded.out_chars_sum, "
+            "credited_saved_chars = MAX(0, (raw_chars_sum + excluded.raw_chars_sum) - "
+            "(out_chars_sum + excluded.out_chars_sum)), "
+        )
     if accumulate:
         # SQLite UPSERT (3.24+): with no existing row this is a plain INSERT
         # of the same values the replace path writes.
@@ -741,12 +1059,9 @@ def _write_session_rows(conn, session_id: str, project: str, events: list, overh
         conn.execute(
             "INSERT INTO sessions " + session_columns + " ON CONFLICT(session_id) DO UPDATE SET "
             "project = excluded.project, ended_at = excluded.ended_at, "
-            "credited_saved_tokens = credited_saved_tokens + excluded.credited_saved_tokens, "
-            "raw_tokens_sum = raw_tokens_sum + excluded.raw_tokens_sum, "
-            "out_tokens_sum = out_tokens_sum + excluded.out_tokens_sum, "
+            + session_chars_set +
             "event_count = event_count + excluded.event_count, "
             "fetch_url_count = fetch_url_count + excluded.fetch_url_count, "
-            "overhead_tokens = excluded.overhead_tokens, "
             + ", ".join(f"{c} = {keep_actual.format(c)}" for c in actual_cols),
             session_values,
         )
@@ -759,32 +1074,55 @@ def _write_session_rows(conn, session_id: str, project: str, events: list, overh
         # re-finalizing a session can never leave stale per-agent rows behind.
         conn.execute("DELETE FROM session_agents WHERE session_id = ?", (session_id,))
         tools_conflict = agents_conflict = ""
-    for tool, agg in by_tool.items():
+    for tool, agg in w_by_tool.items():
         conn.execute(
-            "INSERT INTO session_tools (session_id, tool, event_count, saved_tokens, "
-            "raw_tokens_sum, out_tokens_sum, credited_event_count) VALUES (?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO session_tools (session_id, tool, event_count, credited_event_count, "
+            "raw_chars_sum, out_chars_sum, saved_chars) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)"
             + tools_conflict,
-            (session_id, tool, agg["event_count"], agg["saved_tokens"],
-             agg["raw_tokens_sum"], agg["out_tokens_sum"], agg["credited_event_count"]),
+            (session_id, tool, agg["event_count"], agg["credited_event_count"],
+             agg["raw_chars_sum"], agg["out_chars_sum"], agg["saved_chars"]),
         )
-    for row in by_agent:
+    for row in w_by_agent:
         conn.execute(
-            "INSERT INTO session_agents (session_id, is_subagent, agent_type, event_count, saved_tokens, "
-            "raw_tokens_sum, out_tokens_sum, credited_event_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO session_agents (session_id, is_subagent, agent_type, event_count, "
+            "credited_event_count, raw_chars_sum, out_chars_sum, saved_chars) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
             + agents_conflict,
-            (session_id, row["is_subagent"], row["agent_type"], row["event_count"], row["saved_tokens"],
-             row["raw_tokens_sum"], row["out_tokens_sum"], row["credited_event_count"]),
+            (session_id, row["is_subagent"], row["agent_type"], row["event_count"],
+             row["credited_event_count"], row["raw_chars_sum"], row["out_chars_sum"], row["saved_chars"]),
         )
 
+    result_extra: dict = {}
+    if attribution is not None:
+        joined = transcript_attribution_lib.attribute_events(counted, attribution, all_events=events)
+        if had_events_before:
+            # A resumed session reuses its transcript, so the transcript's marker
+            # results cover the whole session while `events` hold only this
+            # roll-up's: every result from an earlier roll-up would be reported as
+            # having no ledger event. The cross-check is skipped for a resume.
+            joined["marker_without_event"] = []
+        _write_model_rows(conn, session_id, joined["by_model"], accumulate, had_events_before)
+        result_extra = {
+            "by_model": joined["by_model"],
+            "attribution": {"unjoined": joined["unjoined"], "marker_without_event": joined["marker_without_event"]},
+        }
+    elif not accumulate or counted:
+        # No transcript this time. The replace path writes the row as exactly these
+        # events, so a stale split of an earlier roll-up must not survive it; on the
+        # accumulate path, new credited events that the split does not cover would
+        # leave it adding up to less than the session, so it is dropped too.
+        conn.execute("DELETE FROM session_models WHERE session_id = ?", (session_id,))
+
     return {
+        **result_extra,
         "session_id": session_id,
         "project": project,
-        "credited_saved_tokens": credited_saved,
-        "raw_tokens_sum": raw_sum,
-        "out_tokens_sum": out_sum,
+        "raw_chars_sum": chars_sum["raw_chars_sum"],
+        "out_chars_sum": chars_sum["out_chars_sum"],
+        "credited_saved_chars": chars_sum["saved_chars"],
         "event_count": event_count,
         "fetch_url_count": fetch_url_count,
-        "overhead_tokens": overhead_tokens,
         "by_tool": by_tool,
         "by_agent": by_agent,
         "actual_input_tokens":      actual_inp,
@@ -794,8 +1132,53 @@ def _write_session_rows(conn, session_id: str, project: str, events: list, overh
     }
 
 
-def finalize_session(session_id: str, project: str, overhead_tokens: int = 0, delete_jsonl: bool = True, actual_tokens: Optional[dict] = None,
-                     ended_at: Optional[str] = None, events: Optional[list] = None) -> dict:
+def _write_model_rows(conn, session_id: str, rows: list, accumulate: bool, had_events_before: bool = False) -> None:
+    """Write a roll-up's per-model rows (see _write_session_rows).
+    `had_events_before`: the session's stored row already held credited events
+    (a resume, accumulate path only)."""
+    columns = ("session_id, model, event_count, raw_chars_sum, out_chars_sum, saved_chars, "
+               "derived_tokens, chars_per_token, ratio_samples")
+    conflict = ""
+    if accumulate:
+        has_models = conn.execute("SELECT 1 FROM session_models WHERE session_id = ? LIMIT 1", (session_id,)).fetchone()
+        if had_events_before and not has_models:
+            return
+        if had_events_before:
+            # The derived figure cannot be carried across a resume: the earlier
+            # roll-ups' events are gone, and the transcript has since grown, so
+            # their results were carried by more requests and the session's
+            # chars-per-token may have moved. Summing the stored value would mix
+            # the two, so it is dropped (NULL = not derived). The exact
+            # characters still add up.
+            # Mutated in place so the roll-up's own return value (the SessionEnd
+            # summary) agrees with what is stored, and every row already stored
+            # for the session is invalidated too, including a model with no new
+            # event this time (PR #450 review, round 2).
+            for r in rows:
+                r["derived_tokens"] = None
+            conn.execute("UPDATE session_models SET derived_tokens = NULL WHERE session_id = ?", (session_id,))
+        conflict = (
+            " ON CONFLICT(session_id, model) DO UPDATE SET "
+            "event_count = event_count + excluded.event_count, "
+            "raw_chars_sum = raw_chars_sum + excluded.raw_chars_sum, "
+            "out_chars_sum = out_chars_sum + excluded.out_chars_sum, "
+            "saved_chars = MAX(0, (raw_chars_sum + excluded.raw_chars_sum) - (out_chars_sum + excluded.out_chars_sum)), "
+            "derived_tokens = excluded.derived_tokens, "
+            "chars_per_token = excluded.chars_per_token, ratio_samples = excluded.ratio_samples"
+        )
+    else:
+        conn.execute("DELETE FROM session_models WHERE session_id = ?", (session_id,))
+    for r in rows:
+        conn.execute(
+            f"INSERT INTO session_models ({columns}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)" + conflict,
+            (session_id, r["model"], r["event_count"], r["raw_chars_sum"], r["out_chars_sum"], r["saved_chars"],
+             r["derived_tokens"], r["chars_per_token"], r["ratio_samples"]),
+        )
+
+
+def finalize_session(session_id: str, project: str, delete_jsonl: bool = True, actual_tokens: Optional[dict] = None,
+                     ended_at: Optional[str] = None, events: Optional[list] = None,
+                     attribution: Optional[dict] = None) -> dict:
     """
     Aggregate a session's transient JSONL into one SQLite row (+ per-tool
     rows), then delete the JSONL (its job is done once rolled up). Returns
@@ -813,7 +1196,8 @@ def finalize_session(session_id: str, project: str, overhead_tokens: int = 0, de
 
     ended_at: optional "%Y-%m-%dT%H:%M:%SZ" timestamp to record instead of
     "now". events: optional, already-read events to aggregate instead of
-    re-reading the ledger.
+    re-reading the ledger. attribution: optional transcript index (see
+    read_transcript_attribution) for the per-model split.
     """
     if events is None:
         events = read_session_events(session_id)
@@ -821,7 +1205,8 @@ def finalize_session(session_id: str, project: str, overhead_tokens: int = 0, de
         ended_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     conn = _connect()
     with conn:
-        result = _write_session_rows(conn, session_id, project, events, overhead_tokens, actual_tokens, ended_at)
+        result = _write_session_rows(conn, session_id, project, events, actual_tokens, ended_at,
+                                     attribution=attribution)
     conn.close()
 
     if delete_jsonl:
@@ -918,9 +1303,10 @@ def has_session_artifacts(session_id: str) -> bool:
     return bool(_session_artifacts(session_id))
 
 
-def finalize_owned_session(session_id: str, project: Optional[str] = None, overhead_tokens: int = 0,
+def finalize_owned_session(session_id: str, project: Optional[str] = None,
                            actual_tokens: Optional[dict] = None,
-                           stale_before: Optional[float] = None) -> Optional[dict]:
+                           stale_before: Optional[float] = None,
+                           attribution: Optional[dict] = None) -> Optional[dict]:
     """
     Roll ALL of a session's event artifacts (its ledger plus any leftover
     claims) into savings.db as ONE snapshot, then delete them -- the single
@@ -972,6 +1358,9 @@ def finalize_owned_session(session_id: str, project: Optional[str] = None, overh
     stale_before: recovery only -- an epoch time; if any artifact was written
     after it, the session is live again, so nothing is taken. Checked under
     the lock, closing the gap between recovery's directory scan and here.
+    attribution: the session's transcript index for the per-model split (the
+    SessionEnd hook reads it before taking the lock); recovery has no transcript
+    path and passes None, so a recovered session has no per-model rows.
     ended_at is "now" for a graceful end, and the newest artifact's last
     write for a recovery, so /my-savings trend buckets a session that
     crashed weeks ago into the week it actually ran.
@@ -1030,7 +1419,7 @@ def finalize_owned_session(session_id: str, project: Optional[str] = None, overh
                     ended_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                 result = _write_session_rows(
                     conn, sid, project or _orphan_project(events), events,
-                    overhead_tokens, actual_tokens, ended_at, accumulate=True,
+                    actual_tokens, ended_at, accumulate=True, attribution=attribution,
                 )
             conn.execute("COMMIT")
         except BaseException:
@@ -1115,15 +1504,12 @@ def recover_orphaned_sessions(exclude_session_id: Optional[str] = None, now: Opt
             continue  # vanished mid-scan
         newest[sid] = max(mtime, newest.get(sid, mtime))
 
-    overhead: Optional[int] = None
     recovered = 0
     for sid, mtime in newest.items():
         if mtime > stale_before:
             continue  # live, or written to recently
         try:
-            if overhead is None:
-                overhead = get_schema_overhead_tokens()
-            if finalize_owned_session(sid, overhead_tokens=overhead, stale_before=stale_before) is not None:
+            if finalize_owned_session(sid, stale_before=stale_before) is not None:
                 recovered += 1
         except Exception:
             continue
@@ -1137,32 +1523,19 @@ def get_live_session_aggregate(session_id: str) -> dict:
     be written to SQLite or have its JSONL deleted.
     """
     events = read_session_events(session_id)
-    credited = [e for e in events if e.get("credited")]
-    by_tool: dict[str, dict[str, int]] = {}
-    for e in events:
-        tool = e.get("tool", "unknown")
-        agg = by_tool.setdefault(tool, {
-            "event_count": 0,
-            "saved_tokens": 0,
-            "raw_tokens_sum": 0,
-            "out_tokens_sum": 0,
-            "credited_event_count": 0,
-        })
-        agg["event_count"] += 1
-        if e.get("credited"):
-            agg["saved_tokens"] += e.get("saved_tokens", 0)
-            agg["raw_tokens_sum"] += e.get("raw_tokens", 0)
-            agg["out_tokens_sum"] += e.get("out_tokens", 0)
-            agg["credited_event_count"] += 1
+    counted = [e for e in events if _counted(e)]
+    live_chars = _zero_chars()
+    for e in counted:
+        _add_event_chars(live_chars, e)
+    _derive_saved(live_chars)
     return {
         "session_id": session_id,
-        "credited_saved_tokens": sum(e.get("saved_tokens", 0) for e in credited),
-        "raw_tokens_sum": sum(e.get("raw_tokens", 0) for e in credited),
-        "out_tokens_sum": sum(e.get("out_tokens", 0) for e in credited),
-        "event_count": len(credited),  # credited-only -- see finalize_session's comment
+        "raw_chars_sum": live_chars["raw_chars_sum"],
+        "out_chars_sum": live_chars["out_chars_sum"],
+        "credited_saved_chars": live_chars["saved_chars"],
+        "event_count": len(counted),  # counted-only -- see _write_session_rows' comment
         "fetch_url_count": sum(1 for e in events if e.get("tool") == "fetch_url"),
-        "overhead_tokens": get_schema_overhead_tokens(),
-        "by_tool": by_tool,
+        "by_tool": _aggregate_by_tool(events),
         "by_agent": _aggregate_by_agent(events),
         # Transcript parsing only happens at SessionEnd -- always 0 mid-session.
         "actual_input_tokens":      0,
@@ -1172,22 +1545,53 @@ def get_live_session_aggregate(session_id: str) -> dict:
     }
 
 
+def _sized_sql(prefix: str = "") -> str:
+    """SQL for "this session row has an exact before AND after size". A row that
+    has credited events (`event_count` > 0) but a 0 before or after is from before
+    schema v6 and has no recorded size (0 means "unknown" there, see
+    _migrate_to_v6); a real compression never produces an empty result, so a real
+    0 is not a case to worry about."""
+    return f"{prefix}raw_chars_sum > 0 AND {prefix}out_chars_sum > 0"
+
+
+def _unsized_sql(prefix: str = "") -> str:
+    return f"{prefix}event_count > 0 AND ({prefix}raw_chars_sum = 0 OR {prefix}out_chars_sum = 0)"
+
+
 def query_project_summary(project: str) -> dict:
+    """All-time totals for one project. Before/after and the saving cover only
+    sessions with a recorded size; `unsized_sessions` counts the rest (rows from
+    before schema v6 that have credited events but no before/after), so a caller
+    can say they were left out instead of presenting a partial total as complete
+    (PR #446 review). `total_saved_chars` is derived from the two totals; the best
+    session's saving is derived per session from its own before/after."""
     conn = _connect()
     row = conn.execute(
-        "SELECT COUNT(*), COALESCE(SUM(credited_saved_tokens), 0), COALESCE(MAX(credited_saved_tokens), 0) "
+        "SELECT COUNT(*), "
+        f"COALESCE(SUM(CASE WHEN {_sized_sql()} THEN raw_chars_sum ELSE 0 END), 0), "
+        f"COALESCE(SUM(CASE WHEN {_sized_sql()} THEN out_chars_sum ELSE 0 END), 0), "
+        # Unsized rows contribute 0 (not their backfilled credited_saved_chars): the
+        # note under the figures says they are left out, so they can't set the best.
+        f"COALESCE(MAX(CASE WHEN {_sized_sql()} THEN MAX(0, raw_chars_sum - out_chars_sum) "
+        "ELSE 0 END), 0), "
+        f"COALESCE(SUM(CASE WHEN {_unsized_sql()} THEN 1 ELSE 0 END), 0) "
         "FROM sessions WHERE project = ?",
         (project,),
     ).fetchone()
     conn.close()
-    sessions, total, best = row
-    return {"project": project, "sessions": sessions, "total_saved_tokens": total, "best_session_tokens": best}
+    sessions, raw, out, best, unsized = row
+    return {
+        "project": project, "sessions": sessions,
+        "total_raw_chars": raw, "total_out_chars": out,
+        "total_saved_chars": _saved(raw, out), "best_session_chars": best,
+        "unsized_sessions": unsized,
+    }
 
 
 def query_last_n_sessions(project: str, n: int = 10) -> list:
     conn = _connect()
     rows = conn.execute(
-        "SELECT ended_at, credited_saved_tokens, "
+        "SELECT ended_at, credited_saved_chars, raw_chars_sum, out_chars_sum, "
         "actual_input_tokens, actual_output_tokens, actual_cache_read_tokens, actual_cache_write_tokens "
         "FROM sessions WHERE project = ? "
         "ORDER BY ended_at DESC LIMIT ?",
@@ -1197,11 +1601,13 @@ def query_last_n_sessions(project: str, n: int = 10) -> list:
     return [
         {
             "ended_at": r[0],
-            "saved_tokens": r[1],
-            "actual_input_tokens": r[2],
-            "actual_output_tokens": r[3],
-            "actual_cache_read_tokens": r[4],
-            "actual_cache_write_tokens": r[5],
+            # Derived from the session's own before/after when it has them; the
+            # stored (backfilled) figure only for a row with no recorded size.
+            "saved_chars": _saved(r[2], r[3]) if r[2] > 0 and r[3] > 0 else r[1],
+            "actual_input_tokens": r[4],
+            "actual_output_tokens": r[5],
+            "actual_cache_read_tokens": r[6],
+            "actual_cache_write_tokens": r[7],
         }
         for r in reversed(rows)
     ]
@@ -1260,7 +1666,7 @@ def query_trend(project: str, bucket: str = "week", n: int = 12) -> list:
     # Fetch all sessions for this project ordered descending so we can stop
     # early once we have `n` distinct buckets without reading the full table.
     raw = conn.execute(
-        "SELECT ended_at, credited_saved_tokens FROM sessions "
+        "SELECT ended_at, raw_chars_sum, out_chars_sum, event_count FROM sessions "
         "WHERE project = ? ORDER BY ended_at DESC",
         (project,),
     ).fetchall()
@@ -1270,36 +1676,42 @@ def query_trend(project: str, bucket: str = "week", n: int = 12) -> list:
     # `n` distinct buckets -- equivalent to the SQL LIMIT but applied after the
     # Python-side bucketing so partial calendar-year weeks are counted correctly.
     agg: dict[str, dict] = {}
-    for ended_at, saved in raw:
+    for ended_at, raw_chars, out_chars, event_count in raw:
         key = _key(ended_at)
         if key not in agg:
             if len(agg) >= n:
                 # We have enough buckets; older rows are outside the window.
                 break
-            agg[key] = {"sessions": 0, "total_saved_tokens": 0}
+            agg[key] = {"sessions": 0, "total_raw_chars": 0, "total_out_chars": 0,
+                        "total_saved_chars": 0, "unsized_sessions": 0}
         agg[key]["sessions"] += 1
-        agg[key]["total_saved_tokens"] += saved
+        if raw_chars > 0 and out_chars > 0:
+            agg[key]["total_raw_chars"] += raw_chars
+            agg[key]["total_out_chars"] += out_chars
+        elif event_count > 0:
+            # Credited events but no recorded size (a pre-v6 row): left out of the
+            # totals and counted here instead, so the bucket doesn't pass a
+            # partial total off as complete (PR #446 review).
+            agg[key]["unsized_sessions"] += 1
+
+    for v in agg.values():
+        v["total_saved_chars"] = _saved(v["total_raw_chars"], v["total_out_chars"])
 
     # Return ascending (oldest-first) so the sparkline reads left-to-right.
-    return [
-        {"bucket": k, "sessions": v["sessions"], "total_saved_tokens": v["total_saved_tokens"]}
-        for k, v in reversed(list(agg.items()))
-    ]
+    return [{"bucket": k, **v} for k, v in reversed(list(agg.items()))]
 
 
 def query_all_projects() -> list:
     """
     Aggregates cross-project stats for the detail view's 'Across projects'
-    block. Computes avg_tokens_per_session and best_tool per project via the
-    existing sessions/session_tools data -- no new storage needed (issue #68).
+    block: total characters before/after/saved per project, plus best_tool via
+    the existing sessions/session_tools data -- no new storage needed (issue #68).
 
-    avg_tokens_per_session is computed in Python using round() to match the
-    same rounding rule the "Last N sessions" average uses (Python's
-    ties-to-even, not SQLite's half-away-from-zero ROUND(), which would give
-    inconsistent results for the same data across the two blocks).
-
-    best_tool is the tool with the highest total saved_tokens across all sessions
-    for a given project, derived from session_tools. Returns None when no
+    best_tool is the tool with the highest aggregate saving across all sessions
+    for a given project, derived from session_tools: its summed before minus its
+    summed after (clamped at 0, like every other saving here), NOT a sum of the
+    per-session saved_chars, which are each clamped and so overstate a tool that
+    grows content in some sessions. Rows with no recorded size are left out. Returns None when no
     session_tools rows exist for that project (e.g. all its sessions predate the
     per-tool breakdown schema), so callers can suppress the field rather than
     fabricating a value.
@@ -1309,34 +1721,35 @@ def query_all_projects() -> list:
         """
         SELECT
             s.project,
-            COUNT(*)                                                              AS sessions,
-            COALESCE(SUM(s.credited_saved_tokens), 0)                            AS total_saved_tokens,
+            COUNT(*)                                  AS sessions,
+            COALESCE(SUM(CASE WHEN {sized} THEN s.raw_chars_sum ELSE 0 END), 0) AS total_raw_chars,
+            COALESCE(SUM(CASE WHEN {sized} THEN s.out_chars_sum ELSE 0 END), 0) AS total_out_chars,
+            COALESCE(SUM(CASE WHEN {unsized} THEN 1 ELSE 0 END), 0)             AS unsized_sessions,
             (SELECT st.tool
              FROM session_tools st
              WHERE st.session_id IN (
                  SELECT session_id FROM sessions WHERE project = s.project
              )
              GROUP BY st.tool
-             ORDER BY SUM(st.saved_tokens) DESC
-             LIMIT 1)                                                             AS best_tool
+             ORDER BY MAX(0, SUM(CASE WHEN {tool_sized} THEN st.raw_chars_sum ELSE 0 END)
+                           - SUM(CASE WHEN {tool_sized} THEN st.out_chars_sum ELSE 0 END)) DESC,
+                      st.tool
+             LIMIT 1)                                 AS best_tool
         FROM sessions s
         GROUP BY s.project
-        ORDER BY 3 DESC
-        """
+        ORDER BY total_raw_chars - total_out_chars DESC, s.project
+        """.format(sized=_sized_sql("s."), unsized=_unsized_sql("s."), tool_sized=_sized_sql("st."))
     ).fetchall()
     conn.close()
     return [
         {
             "project": r[0],
             "sessions": r[1],
-            "total_saved_tokens": r[2],
-            # Computed in Python (not SQL ROUND()) so both displayed averages use
-            # the same ties-to-even rounding rule as format_detail_view's "Last N
-            # sessions" block -- SQLite's ROUND() is half-away-from-zero and would
-            # produce different results for the same inputs (e.g. 2.5 → 3 in SQL,
-            # 2 in Python), making the two blocks inconsistent for identical data.
-            "avg_tokens_per_session": round(r[2] / r[1]) if r[1] else 0,
-            "best_tool": r[3],  # None when no session_tools rows exist for the project
+            "total_raw_chars": r[2],
+            "total_out_chars": r[3],
+            "total_saved_chars": _saved(r[2], r[3]),
+            "unsized_sessions": r[4],
+            "best_tool": r[5],  # None when no session_tools rows exist for the project
         }
         for r in rows
     ]
@@ -1345,8 +1758,8 @@ def query_all_projects() -> list:
 def query_session_tool_breakdown(session_id: str) -> list:
     conn = _connect()
     rows = conn.execute(
-        "SELECT tool, event_count, saved_tokens, raw_tokens_sum, out_tokens_sum, credited_event_count "
-        "FROM session_tools WHERE session_id = ? ORDER BY saved_tokens DESC",
+        "SELECT tool, event_count, saved_chars, raw_chars_sum, out_chars_sum, credited_event_count "
+        "FROM session_tools WHERE session_id = ? ORDER BY saved_chars DESC",
         (session_id,),
     ).fetchall()
     conn.close()
@@ -1354,9 +1767,9 @@ def query_session_tool_breakdown(session_id: str) -> list:
         {
             "tool": r[0],
             "event_count": r[1],
-            "saved_tokens": r[2],
-            "raw_tokens_sum": r[3],
-            "out_tokens_sum": r[4],
+            "saved_chars": r[2],
+            "raw_chars_sum": r[3],
+            "out_chars_sum": r[4],
             "credited_event_count": r[5],
         }
         for r in rows
@@ -1369,9 +1782,9 @@ def query_session_agent_breakdown(session_id: str) -> list:
     (nothing was recorded to backfill from)."""
     conn = _connect()
     rows = conn.execute(
-        "SELECT is_subagent, agent_type, event_count, saved_tokens, raw_tokens_sum, out_tokens_sum, "
+        "SELECT is_subagent, agent_type, event_count, saved_chars, raw_chars_sum, out_chars_sum, "
         "credited_event_count FROM session_agents WHERE session_id = ? "
-        "ORDER BY saved_tokens DESC, is_subagent, agent_type",
+        "ORDER BY saved_chars DESC, is_subagent, agent_type",
         (session_id,),
     ).fetchall()
     conn.close()
@@ -1380,13 +1793,57 @@ def query_session_agent_breakdown(session_id: str) -> list:
             "is_subagent": r[0],
             "agent_type": r[1],
             "event_count": r[2],
-            "saved_tokens": r[3],
-            "raw_tokens_sum": r[4],
-            "out_tokens_sum": r[5],
+            "saved_chars": r[3],
+            "raw_chars_sum": r[4],
+            "out_chars_sum": r[5],
             "credited_event_count": r[6],
         }
         for r in rows
     ]
+
+
+_MODEL_ROW_COLUMNS = ("model", "event_count", "raw_chars_sum", "out_chars_sum", "saved_chars",
+                      "derived_tokens", "chars_per_token", "ratio_samples")
+
+
+def _model_rows(conn, session_id: str) -> list:
+    rows = conn.execute(
+        f"SELECT {', '.join(_MODEL_ROW_COLUMNS)} FROM session_models WHERE session_id = ?", (session_id,)
+    ).fetchall()
+    out = [dict(zip(_MODEL_ROW_COLUMNS, r, strict=True)) for r in rows]
+    # Named models by saving, the unattributed bucket last (same order as a fresh join).
+    out.sort(key=lambda r: (r["model"] == transcript_attribution_lib.UNATTRIBUTED, -r["saved_chars"], r["model"]))
+    return out
+
+
+def query_session_model_breakdown(session_id: str) -> list:
+    """Per-model rows for one finalized session (issue #440), same shape as
+    finalize_session's `by_model`. Empty for a session finalized before schema v9,
+    or without a transcript (nothing was recorded to backfill from)."""
+    conn = _connect()
+    try:
+        return _model_rows(conn, session_id)
+    finally:
+        conn.close()
+
+
+def query_recent_model_breakdown(project: str) -> Optional[dict]:
+    """The per-model rows of the project's most recent finalized session that has
+    any, as {"ended_at", "models"}; None when no session has. The detail view shows
+    it because the session in progress has no transcript to join yet."""
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT s.session_id, s.ended_at FROM sessions s WHERE s.project = ? "
+            "AND EXISTS (SELECT 1 FROM session_models m WHERE m.session_id = s.session_id) "
+            "ORDER BY s.ended_at DESC LIMIT 1",
+            (project,),
+        ).fetchone()
+        if not row:
+            return None
+        return {"ended_at": row[1], "models": _model_rows(conn, row[0])}
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1503,6 +1960,19 @@ def parse_session_token_counts(transcript_path) -> Optional[dict]:
     return {key: sum(p[key] for p in parts) for key in ("input", "output", "cache_read", "cache_write")}
 
 
+def read_transcript_attribution(transcript_path) -> Optional[dict]:
+    """The transcript index finalize_owned_session's `attribution` takes: each
+    tool call's model, turn and timestamp, plus per-model chars-per-token samples
+    (issue #440; see libs/transcript_attribution_lib.py). None when the path is
+    absent or unreadable. Always fails open -- never raises. Like
+    parse_session_token_counts it reads Claude Code's internal transcript format,
+    so the hook only calls it under the same opt-in."""
+    try:
+        return transcript_attribution_lib.read_transcript(transcript_path)
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Formatting -- shared by hooks/session_end_savings.py and the
 # savings_summary/savings_detail MCP tools, so both surfaces render
@@ -1515,6 +1985,41 @@ def _fmt_tokens(n: int) -> str:
     if n >= 1000:
         return f"~{n / 1000:.1f}k".replace(".0k", "k")
     return f"~{n}" if n else "0"
+
+
+def _fmt_chars(n: int) -> str:
+    """An exact character count with thousands separators -- never abbreviated
+    or prefixed with "~", since (unlike the token estimate it replaces, #438) it
+    is a real count."""
+    return f"{n:,}"
+
+
+def _reduction_pct(raw: int, out: int) -> Optional[int]:
+    """Percent reduction from `raw` to `out` characters, clamped at 0 (an LLM
+    summary CAN end up longer than a small raw chunk, which would otherwise show
+    a negative "reduction"). None when there is no raw size to compare against,
+    so a caller shows "n/a" instead of a fabricated figure."""
+    return max(0, round(100 * (1 - out / raw))) if raw else None
+
+
+def _fmt_reduction(raw: int, out: int) -> str:
+    pct = _reduction_pct(raw, out)
+    return f"{pct}%" if pct is not None else "n/a"
+
+
+def _json_pct(raw, out):
+    """The percent reduction for a JSON/CSV export: an int, or None (JSON null /
+    an empty CSV cell) when there is no recorded before size to compare with."""
+    return _reduction_pct(int(raw or 0), int(out or 0))
+
+
+def _unsized_note(unsized: int, sessions: int, noun: str = "sessions") -> str:
+    """The line that says some of the history has no recorded size and is NOT in
+    the totals above it (rows from before schema v6), so a partial total is never
+    presented as a complete one (PR #446 review). Empty when nothing is left out."""
+    if not unsized:
+        return ""
+    return f"  Note: {unsized} of {sessions} {noun} have no recorded size and are left out of the figures above"
 
 
 # Relative cost labels shown in the actual-token breakdown table.
@@ -1560,10 +2065,10 @@ def _format_actual_token_block(session_agg: dict, project: str = "") -> list:
         "",
     ]
 
-    saved = session_agg.get("credited_saved_tokens", 0) or 0
-    if saved:
-        rate = f"{100 * saved / total:.1f}%"
-        lines.append(f"  Local compression avoided  {_fmt_tokens(saved):>9} est.  ({rate} of total processed)")
+    # Deliberately no "local compression avoided ... % of total processed" line
+    # here (issue #436): it divided an ESTIMATE (chars/3.5 credited savings) by
+    # a MEASUREMENT (real usage from the transcript) without saying so. The
+    # compression figure already appears in the savings summary itself.
 
     # Cache efficiency ratio: how many times more cache-read tokens than fresh
     # input. A high ratio means skills/CLAUDE.md are producing stable, cacheable
@@ -1595,121 +2100,168 @@ def _sparkline(values: list) -> str:
     return "".join(_SPARK_CHARS[min(7, int((v - lo) / span * 7))] for v in values)
 
 
+def _format_model_block(rows: list, heading: str, attribution: Optional[dict] = None) -> list:
+    """Lines for the per-model split (issue #440), or [] when there are none. The
+    characters before and after are exact counts; the token line under a model is
+    DERIVED and says so, with the ratio and sample size it came from. It is absent
+    for a model with too few samples to derive a ratio -- not shown as 0."""
+    if not rows:
+        return []
+    lines = ["", heading]
+    for r in rows:
+        unattributed = r["model"] == transcript_attribution_lib.UNATTRIBUTED
+        label = "unattributed" if unattributed else r["model"]
+        lines.append(
+            f"  {label:<24} {r['event_count']:>3} events  {_fmt_chars(r['raw_chars_sum'])} → "
+            f"{_fmt_chars(r['out_chars_sum'])} chars  {_fmt_reduction(r['raw_chars_sum'], r['out_chars_sum'])} reduction"
+        )
+        if r.get("derived_tokens") is not None and r.get("chars_per_token"):
+            lines.append(
+                f"    derived: {_fmt_tokens(r['derived_tokens'])} tokens kept out of context "
+                f"(characters saved ÷ {r['chars_per_token']:.2f} chars/token observed in this session, "
+                f"{r.get('ratio_samples', 0)} samples; each saving counted once per request that carried it; "
+                f"not a measurement)"
+            )
+    unjoined = (attribution or {}).get("unjoined", 0)
+    if unjoined:
+        lines.append(f"  Note: {unjoined} event(s) could not be matched to a transcript turn (listed as unattributed)")
+    orphans = (attribution or {}).get("marker_without_event", [])
+    if orphans:
+        lines.append(f"  Note: {len(orphans)} compressed result(s) in the transcript have no ledger event")
+    return lines
+
+
 def format_simple_view(session_agg: dict, project_summary: dict) -> str:
-    saved = session_agg.get("credited_saved_tokens", 0)
     events = session_agg.get("event_count", 0)
-    raw_sum = session_agg.get("raw_tokens_sum", 0)
-    out_sum = session_agg.get("out_tokens_sum", 0)
-    # Clamped like saved_tokens already is (record_event's max(0, raw-out)) --
-    # an LLM summary CAN end up longer than a small raw chunk, which would
-    # otherwise display a negative "reduction" alongside a 0-token saved
-    # figure, an inconsistent and confusing pairing.
-    pct = max(0, round(100 * (1 - out_sum / raw_sum))) if raw_sum else 0
-    overhead = session_agg.get("overhead_tokens", 0)
+    raw_sum = session_agg.get("raw_chars_sum", 0)
+    out_sum = session_agg.get("out_chars_sum", 0)
     fetch_count = session_agg.get("fetch_url_count", 0)
     project = session_agg.get("project") or project_summary.get("project", "")
 
     lines = [
-        "ClaudeRunway · Token Savings",
+        "ClaudeRunway · Compression Savings",
         "",
         f"This session · {project}",
-        f"  Context tokens avoided   {_fmt_tokens(saved):>8}   ({events} events{f', {pct}% reduction' if raw_sum else ''})",
+        f"  Characters before        {_fmt_chars(raw_sum):>12}",
+        f"  Characters after         {_fmt_chars(out_sum):>12}",
+        f"  Reduction                {_fmt_reduction(raw_sum, out_sum):>12}   ({events} events)",
     ]
-    if overhead:
-        lines.append(f"  Tool overhead            {_fmt_tokens(overhead):>8}/turn  (mostly cached after turn 1)")
     if fetch_count:
-        lines.append(f"  fetch_url                {fetch_count:>8} calls  (not credited — WebFetch already compresses server-side)")
+        lines.append(f"  fetch_url                {fetch_count:>12} calls  (not credited — WebFetch already compresses server-side)")
 
+    lines += _format_model_block(session_agg.get("by_model") or [], "By model · this session", session_agg.get("attribution"))
     lines += _format_actual_token_block(session_agg, project)
 
+    p_raw = project_summary.get("total_raw_chars", 0)
+    p_out = project_summary.get("total_out_chars", 0)
     lines += [
         "",
         "This project · all time",
-        f"  Sessions tracked         {project_summary.get('sessions', 0):>8}",
-        f"  Total tokens avoided     {_fmt_tokens(project_summary.get('total_saved_tokens', 0)):>8}",
-        f"  Best session             {_fmt_tokens(project_summary.get('best_session_tokens', 0)):>8}",
+        f"  Sessions tracked         {project_summary.get('sessions', 0):>12}",
+        f"  Characters before        {_fmt_chars(p_raw):>12}",
+        f"  Characters after         {_fmt_chars(p_out):>12}",
+        f"  Reduction                {_fmt_reduction(p_raw, p_out):>12}",
+        f"  Best session (saved)     {_fmt_chars(project_summary.get('best_session_chars', 0)):>12}",
     ]
+    note = _unsized_note(project_summary.get("unsized_sessions", 0), project_summary.get("sessions", 0))
+    if note:
+        lines.append(note)
     return "\n".join(lines)
 
 
-def format_detail_view(session_agg: dict, project_summary: dict, tool_breakdown: list, last_n: list, all_projects: list) -> str:
-    saved = session_agg.get("credited_saved_tokens", 0)
+def format_detail_view(session_agg: dict, project_summary: dict, tool_breakdown: list, last_n: list, all_projects: list,
+                       model_breakdown: Optional[dict] = None) -> str:
     events = session_agg.get("event_count", 0)
-    raw_sum = session_agg.get("raw_tokens_sum", 0)
-    out_sum = session_agg.get("out_tokens_sum", 0)
-    pct = max(0, round(100 * (1 - out_sum / raw_sum))) if raw_sum else 0
+    raw_sum = session_agg.get("raw_chars_sum", 0)
+    out_sum = session_agg.get("out_chars_sum", 0)
     project = session_agg.get("project") or project_summary.get("project", "")
 
     lines = [
-        "ClaudeRunway · Token Savings — Detail",
+        "ClaudeRunway · Compression Savings — Detail",
         "",
         f"This session · {project}",
-        f"  Context tokens avoided  {_fmt_tokens(saved)}  ({events} events{f', {pct}% reduction' if raw_sum else ''})",
+        f"  Characters before  {_fmt_chars(raw_sum)}  ·  after  {_fmt_chars(out_sum)}  ·  "
+        f"{_fmt_reduction(raw_sum, out_sum)} reduction  ({events} events)",
     ]
 
     lines += _format_actual_token_block(session_agg, project)
 
+    # This session's own split when it has one (a finalized aggregate); otherwise
+    # the most recent finished session's, since a session in progress has no
+    # transcript to join yet (issue #440).
+    if session_agg.get("by_model"):
+        lines += _format_model_block(session_agg["by_model"], "By model · this session", session_agg.get("attribution"))
+    elif model_breakdown and model_breakdown.get("models"):
+        lines += _format_model_block(
+            model_breakdown["models"], f"By model · most recent finished session ({str(model_breakdown.get('ended_at', ''))[:10]})")
+
     if tool_breakdown:
-        max_saved = max((t["saved_tokens"] for t in tool_breakdown), default=0) or 1
+        max_saved = max((t["saved_chars"] for t in tool_breakdown), default=0) or 1
         lines += ["", "By tool"]
         for t in tool_breakdown:
             credited_event_count = t.get("credited_event_count", 0)
             # credited_event_count > 0: row has real v3+ per-tool aggregates, so
-            # both the credited/uncredited distinction AND the avg % are reliable.
-            # saved_tokens > 0: heuristic fallback for v2-era rows migrated to v3
-            # (credited_event_count backfilled to 0 but saved_tokens is real) --
-            # these can be rendered as credited, but the avg % is suppressed
-            # because out_tokens_sum is also 0 (backfilled), so any percentage
-            # derived from it would be fabricated (raw=X, out=0 → 100%, wrong).
-            credited = credited_event_count > 0 or t["saved_tokens"] > 0
+            # both the credited/uncredited distinction AND the reduction % are
+            # reliable. saved_chars > 0: heuristic fallback for v2-era rows
+            # migrated to v3 (credited_event_count backfilled to 0 but the saved
+            # figure is real) -- these can be rendered as credited, but the
+            # reduction % is suppressed because out_chars_sum is also 0
+            # (backfilled), so any percentage derived from it would be
+            # fabricated (raw=X, out=0 -> 100%, wrong).
+            credited = credited_event_count > 0 or t["saved_chars"] > 0
             if credited:
-                bar = _bar(t["saved_tokens"] / max_saved)
-                raw = t.get("raw_tokens_sum", 0)
-                out = t.get("out_tokens_sum", 0)
-                # Only compute avg % when credited_event_count is available --
-                # if it's 0 (backfilled v2 row), out_tokens_sum is also 0 and
+                bar = _bar(t["saved_chars"] / max_saved)
+                raw = t.get("raw_chars_sum", 0)
+                out = t.get("out_chars_sum", 0)
+                # Only compute the % when credited_event_count is available --
+                # if it's 0 (backfilled v2 row), out_chars_sum is also 0 and
                 # computing 1 - 0/raw would yield a fabricated 100%, not a real
                 # measurement. Omitting the metric is more honest than a wrong %.
                 if raw and credited_event_count > 0:
-                    avg_pct: Optional[int] = max(0, round(100 * (1 - out / raw)))
+                    pct_str = f"  {_fmt_reduction(raw, out)} reduction"
+                    size_str = f"{_fmt_chars(raw)} → {_fmt_chars(out)} chars"
+                    shown_events = credited_event_count  # the events the figures beside it cover
                 else:
-                    avg_pct = None
-                pct_str = f"  {avg_pct}% avg reduction" if avg_pct is not None else ""
-                lines.append(f"  {t['tool']:<16} {t['event_count']:>3} events  {_fmt_tokens(t['saved_tokens']):>8}  {bar}{pct_str}")
+                    pct_str = ""
+                    size_str = f"{_fmt_chars(t['saved_chars'])} chars saved"
+                    shown_events = t["event_count"]
+                lines.append(f"  {t['tool']:<16} {shown_events:>3} events  {size_str}  {bar}{pct_str}")
             else:
                 lines.append(f"  {t['tool']:<16} {t['event_count']:>3} calls  {'—':>8}  (not credited)")
 
     # Issue #365: shown only when at least one subagent earned a POSITIVE saving
     # this session, so a session with no delegation renders exactly as before.
-    # Gated on saved_tokens > 0, not merely "a subagent row exists": a subagent
+    # Gated on saved_chars > 0, not merely "a subagent row exists": a subagent
     # whose only activity was uncredited (fetch_url) or whose credited events
     # saved nothing still gets a row in by_agent, and listing it would print a
-    # misleading "0 events / 0 tokens" line (Copilot review on PR #367). The same
+    # misleading "0 events / 0 chars" line (Copilot review on PR #367). The same
     # filter applies to the per-type lines below. Counts are credited events,
     # matching the "N events" headline above (not total calls, which include
     # uncredited fetch_url activity).
     by_agent = session_agg.get("by_agent") or []
-    subagent_rows = [a for a in by_agent if a.get("is_subagent") and a.get("saved_tokens", 0) > 0]
+    subagent_rows = [a for a in by_agent if a.get("is_subagent") and a.get("saved_chars", 0) > 0]
     if subagent_rows:
         main_rows = [a for a in by_agent if not a.get("is_subagent")]
-        main_saved = sum(a.get("saved_tokens", 0) for a in main_rows)
+        main_raw = sum(a.get("raw_chars_sum", 0) for a in main_rows)
+        main_out = sum(a.get("out_chars_sum", 0) for a in main_rows)
         main_events = sum(a.get("credited_event_count", 0) for a in main_rows)
         lines += ["", "Main session vs subagents",
-                  f"  {'main session':<24} {main_events:>3} events  {_fmt_tokens(main_saved):>8}"]
+                  f"  {'main session':<24} {main_events:>3} events  {_fmt_chars(main_raw)} → {_fmt_chars(main_out)} chars"]
         for a in subagent_rows:
             label = f"subagent · {a['agent_type']}" if a.get("agent_type") else "subagent"
             lines.append(
-                f"  {label:<24} {a.get('credited_event_count', 0):>3} events  {_fmt_tokens(a.get('saved_tokens', 0)):>8}"
+                f"  {label:<24} {a.get('credited_event_count', 0):>3} events  "
+                f"{_fmt_chars(a.get('raw_chars_sum', 0))} → {_fmt_chars(a.get('out_chars_sum', 0))} chars"
             )
 
     if last_n:
-        values = [s["saved_tokens"] for s in last_n]
+        values = [s["saved_chars"] for s in last_n]
         avg = round(sum(values) / len(values)) if values else 0
         best = max(values) if values else 0
         lines += [
             "",
             f"Last {len(last_n)} sessions · {project}",
-            f"  tokens avoided  {_sparkline(values)}  avg {_fmt_tokens(avg)} · best {_fmt_tokens(best)}",
+            f"  characters saved  {_sparkline(values)}  avg {_fmt_chars(avg)} · best {_fmt_chars(best)}",
         ]
 
         # Show the actual Anthropic token breakdown for the most recent past
@@ -1732,7 +2284,6 @@ def format_detail_view(session_agg: dict, project_summary: dict, tool_breakdown:
                     "actual_output_tokens":     recent["actual_output_tokens"],
                     "actual_cache_read_tokens": recent["actual_cache_read_tokens"],
                     "actual_cache_write_tokens": recent["actual_cache_write_tokens"],
-                    "credited_saved_tokens":    recent["saved_tokens"],
                 }
                 lines += _format_actual_token_block(past_agg, f"{project} · {date}")
                 break  # only the most recent session with data
@@ -1742,25 +2293,29 @@ def format_detail_view(session_agg: dict, project_summary: dict, tool_breakdown:
         # Column width fits the longest project name (minimum 5 for "Total").
         col_w = max(max(len(p["project"]) for p in all_projects), 5)
         for p in all_projects:
-            avg = p.get("avg_tokens_per_session")
             best = p.get("best_tool")
-            # Append avg and best-tool when present -- both are optional so
-            # old-shape dicts (e.g. passed by tests that predate issue #68)
-            # and projects whose session_tools rows are absent render safely.
-            suffix = ""
-            if avg is not None:
-                suffix += f"  avg {_fmt_tokens(avg)}/session"
-            if best:
-                suffix += f"  best: {best}"
-            lines.append(f"  {p['project']:<{col_w}} {p['sessions']:>3} sessions  {_fmt_tokens(p['total_saved_tokens']):>8}{suffix}")
+            # best-tool is optional -- old-shape dicts and projects whose
+            # session_tools rows are absent render safely without it.
+            suffix = f"  best: {best}" if best else ""
+            if p.get("unsized_sessions"):
+                suffix += f"  ({p['unsized_sessions']} unsized session(s) left out)"
+            raw = p.get("total_raw_chars", 0)
+            out = p.get("total_out_chars", 0)
+            lines.append(
+                f"  {p['project']:<{col_w}} {p['sessions']:>3} sessions  "
+                f"{_fmt_chars(raw)} → {_fmt_chars(out)} chars  {_fmt_reduction(raw, out)} reduction{suffix}"
+            )
         # Grand total (#95) -- answers "how much has this toolkit saved me
         # overall" directly instead of making the reader add up every row by
         # hand. Deliberately inside the `if all_projects:` guard so an empty
         # list still means no total row, same as the per-project loop above.
         total_sessions = sum(p["sessions"] for p in all_projects)
-        total_saved = sum(p["total_saved_tokens"] for p in all_projects)
-        lines.append(f"  {'—' * col_w} {'—' * 3} {'—' * 9} {'—' * 8}")
-        lines.append(f"  {'Total':<{col_w}} {total_sessions:>3} sessions  {_fmt_tokens(total_saved):>8}")
+        total_raw = sum(p.get("total_raw_chars", 0) for p in all_projects)
+        total_out = sum(p.get("total_out_chars", 0) for p in all_projects)
+        lines.append(
+            f"  {'Total':<{col_w}} {total_sessions:>3} sessions  "
+            f"{_fmt_chars(total_raw)} → {_fmt_chars(total_out)} chars  {_fmt_reduction(total_raw, total_out)} reduction"
+        )
 
     return "\n".join(lines)
 
@@ -1770,11 +2325,12 @@ def format_trend_view(trend_rows: list, project: str, bucket: str = "week") -> s
     Renders a day/week-bucketed trend view for one project.
 
     trend_rows is the list returned by query_trend (ascending, oldest first).
-    Each row: {bucket, sessions, total_saved_tokens}.
+    Each row: {bucket, sessions, total_raw_chars, total_out_chars, total_saved_chars}.
 
     Shows:
-      - a sparkline across all buckets (reuses _sparkline)
-      - a table of recent buckets with session count and token totals
+      - a sparkline across all buckets (reuses _sparkline) of characters saved
+      - a table of recent buckets with session count, characters before/after
+        and percent reduction
       - a grand-total line at the bottom
 
     When trend_rows is empty, returns a short "no history yet" message rather
@@ -1786,34 +2342,43 @@ def format_trend_view(trend_rows: list, project: str, bucket: str = "week") -> s
     if not trend_rows:
         return f"{header}\n\n  No session history yet for this project."
 
-    values = [r["total_saved_tokens"] for r in trend_rows]
+    values = [r["total_saved_chars"] for r in trend_rows]
     spark = _sparkline(values)
 
     total_sessions = sum(r["sessions"] for r in trend_rows)
-    total_saved = sum(r["total_saved_tokens"] for r in trend_rows)
+    total_raw = sum(r["total_raw_chars"] for r in trend_rows)
+    total_out = sum(r["total_out_chars"] for r in trend_rows)
+    total_unsized = sum(r.get("unsized_sessions", 0) for r in trend_rows)
 
     # Column widths: bucket strings are at most 10 chars (YYYY-MM-DD) or
     # 8 chars (YYYY-Www); 16 chars gives comfortable padding for both.
+    rule = f"  {'-' * 16} {'-' * 8}  {'-' * 14}  {'-' * 14}  {'-' * 9}"
     lines = [
         header,
         "",
-        f"  {spark}  ({len(trend_rows)} {bucket}s · {total_sessions} sessions)",
+        f"  {spark}  ({len(trend_rows)} {bucket}s · {total_sessions} sessions · characters saved)",
         "",
-        f"  {'Bucket':<16} {'Sessions':>8}  {'Tokens avoided':>14}",
-        f"  {'-' * 16} {'-' * 8}  {'-' * 14}",
+        f"  {'Bucket':<16} {'Sessions':>8}  {'Chars before':>14}  {'Chars after':>14}  {'Reduction':>9}",
+        rule,
     ]
     for r in trend_rows:
         lines.append(
-            f"  {r['bucket']:<16} {r['sessions']:>8}  {_fmt_tokens(r['total_saved_tokens']):>14}"
+            f"  {r['bucket']:<16} {r['sessions']:>8}  {_fmt_chars(r['total_raw_chars']):>14}  "
+            f"{_fmt_chars(r['total_out_chars']):>14}  {_fmt_reduction(r['total_raw_chars'], r['total_out_chars']):>9}"
         )
     lines += [
-        f"  {'-' * 16} {'-' * 8}  {'-' * 14}",
-        f"  {'Total':<16} {total_sessions:>8}  {_fmt_tokens(total_saved):>14}",
+        rule,
+        f"  {'Total':<16} {total_sessions:>8}  {_fmt_chars(total_raw):>14}  {_fmt_chars(total_out):>14}  "
+        f"{_fmt_reduction(total_raw, total_out):>9}",
     ]
+    note = _unsized_note(total_unsized, total_sessions)
+    if note:
+        lines.append(note)
     return "\n".join(lines)
 
 
-def format_json(session_agg: dict, project_summary: dict, tool_breakdown: list, last_n: list, all_projects: list) -> str:
+def format_json(session_agg: dict, project_summary: dict, tool_breakdown: list, last_n: list, all_projects: list,
+                model_breakdown: Optional[dict] = None) -> str:
     """
     Machine-readable JSON export of all savings data.  Mirrors the same five
     data blocks that format_detail_view renders as text, serialised as a
@@ -1832,12 +2397,12 @@ def format_json(session_agg: dict, project_summary: dict, tool_breakdown: list, 
     doc = {
         "session": {
             "project": session_raw.get("project") or project_summary.get("project", ""),
-            "credited_saved_tokens": _int(session_raw.get("credited_saved_tokens")),
-            "raw_tokens_sum": _int(session_raw.get("raw_tokens_sum")),
-            "out_tokens_sum": _int(session_raw.get("out_tokens_sum")),
+            "raw_chars_sum": _int(session_raw.get("raw_chars_sum")),
+            "out_chars_sum": _int(session_raw.get("out_chars_sum")),
+            "credited_saved_chars": _int(session_raw.get("credited_saved_chars")),
+            "reduction_percent": _json_pct(session_raw.get("raw_chars_sum"), session_raw.get("out_chars_sum")),
             "event_count": _int(session_raw.get("event_count")),
             "fetch_url_count": _int(session_raw.get("fetch_url_count")),
-            "overhead_tokens": _int(session_raw.get("overhead_tokens")),
             # actual_* are always 0 for a live session (transcript is only
             # parsed at SessionEnd); included here so JSON consumers don't
             # need to special-case their absence.
@@ -1849,16 +2414,21 @@ def format_json(session_agg: dict, project_summary: dict, tool_breakdown: list, 
         "project_summary": {
             "project": project_summary.get("project", ""),
             "sessions": _int(project_summary.get("sessions")),
-            "total_saved_tokens": _int(project_summary.get("total_saved_tokens")),
-            "best_session_tokens": _int(project_summary.get("best_session_tokens")),
+            "total_raw_chars": _int(project_summary.get("total_raw_chars")),
+            "total_out_chars": _int(project_summary.get("total_out_chars")),
+            "total_saved_chars": _int(project_summary.get("total_saved_chars")),
+            "reduction_percent": _json_pct(project_summary.get("total_raw_chars"), project_summary.get("total_out_chars")),
+            "best_session_chars": _int(project_summary.get("best_session_chars")),
+            "unsized_sessions": _int(project_summary.get("unsized_sessions")),
         },
         "tool_breakdown": [
             {
                 "tool": t.get("tool", ""),
                 "event_count": _int(t.get("event_count")),
-                "saved_tokens": _int(t.get("saved_tokens")),
-                "raw_tokens_sum": _int(t.get("raw_tokens_sum")),
-                "out_tokens_sum": _int(t.get("out_tokens_sum")),
+                "raw_chars_sum": _int(t.get("raw_chars_sum")),
+                "out_chars_sum": _int(t.get("out_chars_sum")),
+                "saved_chars": _int(t.get("saved_chars")),
+                "reduction_percent": _json_pct(t.get("raw_chars_sum"), t.get("out_chars_sum")),
                 "credited_event_count": _int(t.get("credited_event_count")),
             }
             for t in (tool_breakdown or [])
@@ -1866,7 +2436,7 @@ def format_json(session_agg: dict, project_summary: dict, tool_breakdown: list, 
         "last_n_sessions": [
             {
                 "ended_at": s.get("ended_at", ""),
-                "saved_tokens": _int(s.get("saved_tokens")),
+                "saved_chars": _int(s.get("saved_chars")),
                 "actual_input_tokens":      _int(s.get("actual_input_tokens")),
                 "actual_output_tokens":     _int(s.get("actual_output_tokens")),
                 "actual_cache_read_tokens": _int(s.get("actual_cache_read_tokens")),
@@ -1878,8 +2448,11 @@ def format_json(session_agg: dict, project_summary: dict, tool_breakdown: list, 
             {
                 "project": p.get("project", ""),
                 "sessions": _int(p.get("sessions")),
-                "total_saved_tokens": _int(p.get("total_saved_tokens")),
-                "avg_tokens_per_session": _int(p.get("avg_tokens_per_session")),
+                "total_raw_chars": _int(p.get("total_raw_chars")),
+                "total_out_chars": _int(p.get("total_out_chars")),
+                "total_saved_chars": _int(p.get("total_saved_chars")),
+                "reduction_percent": _json_pct(p.get("total_raw_chars"), p.get("total_out_chars")),
+                "unsized_sessions": _int(p.get("unsized_sessions")),
                 # best_tool may genuinely be None when no session_tools rows exist --
                 # kept as null in JSON so consumers can distinguish "no data" from
                 # an empty string, unlike the text view which just omits it silently.
@@ -1888,6 +2461,29 @@ def format_json(session_agg: dict, project_summary: dict, tool_breakdown: list, 
             for p in (all_projects or [])
         ],
     }
+    # Only when there is a split to report, so the document keeps its old shape
+    # for everyone else (issue #440). `derived_tokens`/`chars_per_token` are null
+    # when not derived; the characters are exact, the tokens are derived.
+    models = session_raw.get("by_model") or (model_breakdown or {}).get("models") or []
+    if models:
+        doc["model_breakdown"] = {
+            "source": "this_session" if session_raw.get("by_model") else "most_recent_finished_session",
+            "ended_at": None if session_raw.get("by_model") else (model_breakdown or {}).get("ended_at"),
+            "models": [
+                {
+                    "model": m.get("model", ""),
+                    "event_count": _int(m.get("event_count")),
+                    "raw_chars_sum": _int(m.get("raw_chars_sum")),
+                    "out_chars_sum": _int(m.get("out_chars_sum")),
+                    "saved_chars": _int(m.get("saved_chars")),
+                    "reduction_percent": _json_pct(m.get("raw_chars_sum"), m.get("out_chars_sum")),
+                    "derived_tokens": m.get("derived_tokens"),
+                    "chars_per_token": m.get("chars_per_token"),
+                    "ratio_samples": _int(m.get("ratio_samples")),
+                }
+                for m in models
+            ],
+        }
     return json.dumps(doc, indent=2)
 
 
@@ -1898,15 +2494,18 @@ def format_csv(session_agg: dict, project_summary: dict, tool_breakdown: list, l
     ``table`` selects which data slice to emit:
 
     * ``"session"``  — one-row summary of the current session (default).
-      Columns: project, credited_saved_tokens, raw_tokens_sum, out_tokens_sum,
-               event_count, fetch_url_count, overhead_tokens,
-               project_total_saved_tokens, project_sessions, project_best_session.
+      Columns: project, raw_chars_sum, out_chars_sum, credited_saved_chars,
+               reduction_percent, event_count, fetch_url_count,
+               project_total_raw_chars, project_total_out_chars,
+               project_total_saved_chars, project_reduction_percent, project_sessions,
+               project_best_session_chars, project_unsized_sessions.
+      (A reduction_percent cell is empty when there is no recorded before size.)
     * ``"tools"``    — per-tool breakdown rows.
-      Columns: tool, event_count, saved_tokens, raw_tokens_sum, out_tokens_sum,
-               credited_event_count.
+      Columns: tool, event_count, raw_chars_sum, out_chars_sum, saved_chars,
+               reduction_percent, credited_event_count.
     * ``"projects"`` — cross-project all-time rows.
-      Columns: project, sessions, total_saved_tokens, avg_tokens_per_session,
-               best_tool.
+      Columns: project, sessions, total_raw_chars, total_out_chars,
+               total_saved_chars, reduction_percent, unsized_sessions, best_tool.
 
     Uses stdlib ``csv``, so quoting follows RFC 4180 and callers don't need to
     worry about values that contain commas or quotes.
@@ -1920,6 +2519,10 @@ def format_csv(session_agg: dict, project_summary: dict, tool_breakdown: list, l
 
     def _int(v) -> int:  # type: ignore[no-untyped-def]
         return int(v) if v is not None else 0
+
+    def _csv_pct(raw, out) -> "int | str":  # type: ignore[no-untyped-def]
+        pct = _json_pct(raw, out)
+        return "" if pct is None else pct
 
     def _safe_str(v: Optional[str]) -> str:
         """
@@ -1951,49 +2554,59 @@ def format_csv(session_agg: dict, project_summary: dict, tool_breakdown: list, l
     if table == "session":
         session_raw = session_agg or {}
         w.writerow([
-            "project", "credited_saved_tokens", "raw_tokens_sum", "out_tokens_sum",
-            "event_count", "fetch_url_count", "overhead_tokens",
-            "project_total_saved_tokens", "project_sessions", "project_best_session",
+            "project", "raw_chars_sum", "out_chars_sum", "credited_saved_chars",
+            "reduction_percent", "event_count", "fetch_url_count",
+            "project_total_raw_chars", "project_total_out_chars",
+            "project_total_saved_chars", "project_reduction_percent", "project_sessions",
+            "project_best_session_chars", "project_unsized_sessions",
         ])
         w.writerow([
             _safe_str(session_raw.get("project") or project_summary.get("project", "")),
-            _int(session_raw.get("credited_saved_tokens")),
-            _int(session_raw.get("raw_tokens_sum")),
-            _int(session_raw.get("out_tokens_sum")),
+            _int(session_raw.get("raw_chars_sum")),
+            _int(session_raw.get("out_chars_sum")),
+            _int(session_raw.get("credited_saved_chars")),
+            _csv_pct(session_raw.get("raw_chars_sum"), session_raw.get("out_chars_sum")),
             _int(session_raw.get("event_count")),
             _int(session_raw.get("fetch_url_count")),
-            _int(session_raw.get("overhead_tokens")),
-            _int(project_summary.get("total_saved_tokens")),
+            _int(project_summary.get("total_raw_chars")),
+            _int(project_summary.get("total_out_chars")),
+            _int(project_summary.get("total_saved_chars")),
+            _csv_pct(project_summary.get("total_raw_chars"), project_summary.get("total_out_chars")),
             _int(project_summary.get("sessions")),
-            _int(project_summary.get("best_session_tokens")),
+            _int(project_summary.get("best_session_chars")),
+            _int(project_summary.get("unsized_sessions")),
         ])
 
     elif table == "tools":
         w.writerow([
-            "tool", "event_count", "saved_tokens", "raw_tokens_sum",
-            "out_tokens_sum", "credited_event_count",
+            "tool", "event_count", "raw_chars_sum", "out_chars_sum",
+            "saved_chars", "reduction_percent", "credited_event_count",
         ])
         for t in (tool_breakdown or []):
             w.writerow([
                 _safe_str(t.get("tool", "")),
                 _int(t.get("event_count")),
-                _int(t.get("saved_tokens")),
-                _int(t.get("raw_tokens_sum")),
-                _int(t.get("out_tokens_sum")),
+                _int(t.get("raw_chars_sum")),
+                _int(t.get("out_chars_sum")),
+                _int(t.get("saved_chars")),
+                _csv_pct(t.get("raw_chars_sum"), t.get("out_chars_sum")),
                 _int(t.get("credited_event_count")),
             ])
 
     elif table == "projects":
         w.writerow([
-            "project", "sessions", "total_saved_tokens",
-            "avg_tokens_per_session", "best_tool",
+            "project", "sessions", "total_raw_chars", "total_out_chars",
+            "total_saved_chars", "reduction_percent", "unsized_sessions", "best_tool",
         ])
         for p in (all_projects or []):
             w.writerow([
                 _safe_str(p.get("project", "")),
                 _int(p.get("sessions")),
-                _int(p.get("total_saved_tokens")),
-                _int(p.get("avg_tokens_per_session")),
+                _int(p.get("total_raw_chars")),
+                _int(p.get("total_out_chars")),
+                _int(p.get("total_saved_chars")),
+                _csv_pct(p.get("total_raw_chars"), p.get("total_out_chars")),
+                _int(p.get("unsized_sessions")),
                 # best_tool is None when no session_tools data exists -- emit as
                 # empty string so consumers see a blank cell, not the literal "None".
                 _safe_str(p.get("best_tool") or ""),

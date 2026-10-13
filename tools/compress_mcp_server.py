@@ -91,12 +91,10 @@ from local_compress_lib import (
     DEFAULT_WEB_FOCUS,  # defined in the lib so _looks_non_selective can see it
     compress as _compress_impl,
     derive_compact_label,
-    estimate_tokens,
     fetch_loaded_models,
     redact_credentials,
 )
 from memory_bank_lib import COMPACT_SOURCE
-from mcp_tool_introspect import describe_tools, tool_count
 from qdrant_retry import call_with_retry
 
 # savings_ledger is optional at import time (e.g. an older checkout of just
@@ -198,7 +196,7 @@ def _append_savings_footer(outer_text: str, inner_result: str, tool: str, raw_te
     inner_result is what compress() returned (used only for that detection);
     outer_text is the full string this tool actually returns to Claude
     (which may wrap inner_result with an exit-code/fetch-size line) -- the
-    footer is appended there, and out_tokens is measured on it, since that's
+    footer is appended there, and out_chars is measured on it, since that's
     what Claude will actually see.
 
     hooks/compress_output.py is the one that STRIPS this footer before
@@ -227,44 +225,15 @@ def _append_savings_footer(outer_text: str, inner_result: str, tool: str, raw_te
     redacted_source, _ = redact_credentials(source) if source else ("", 0)
     footer = json.dumps({
         "tool": tool,
-        "raw_tokens": estimate_tokens(raw_text),
-        "out_tokens": estimate_tokens(outer_text),
+        # Exact character counts (issues #437, #438). The chars / 3.5 token
+        # estimates this footer used to carry are gone: a token count depends on
+        # the model's vocabulary, which is not public.
+        "raw_chars": len(raw_text),
+        "out_chars": len(outer_text),
         "credited": credited,
         "source": redacted_source[:200],
     })
     return f"{outer_text}\n<!--CLAUDE_RUNWAY_SAVINGS:{footer}-->"
-
-
-def _log_fixed_overhead():
-    """
-    Estimates the fixed per-turn context cost of this server's tool schemas
-    (name + signature + docstring, as a proxy for the real JSON schema
-    Claude Code sends) and stashes it via savings_ledger.set_meta so
-    hooks/session_end_savings.py and the savings_summary/savings_detail
-    tools can report it without recomputing it or importing this module.
-    Runs once at startup -- self-updating on every restart, so it never
-    goes stale the way a hardcoded constant would if a tool's docstring or
-    signature changes. Best-effort: never blocks server startup.
-
-    Enumerates this server's own @mcp.tool()-decorated functions via
-    libs/mcp_tool_introspect.py (a shared utility, issue #52/GROW-05)
-    instead of a hardcoded tuple -- a fixed tuple silently went stale here
-    once already (issue #22: written against 5 tools, never updated when
-    compact_store/compact_find/savings_summary/savings_detail shipped,
-    understating the real overhead for months). See that module's own
-    docstring for why it reaches into MCPServer's private "_tool_manager"
-    attribute instead of the public (but async) list_tools().
-    """
-    if not TRACK_SAVINGS:
-        return
-    assert savings_ledger is not None  # TRACK_SAVINGS implies this (see module top)
-    try:
-        blob = describe_tools(mcp)
-        overhead = estimate_tokens(blob)
-        savings_ledger.set_meta("schema_overhead_tokens", str(overhead))
-        print(f"[claude-runway] local-compress schema overhead ~{overhead} tokens ({tool_count(mcp)} tools)", file=sys.stderr)
-    except Exception as e:
-        print(f"[claude-runway] could not estimate schema overhead: {e}", file=sys.stderr)
 
 
 @mcp.tool()
@@ -1846,13 +1815,18 @@ def _require_savings_tracking() -> Optional[str]:
 @mcp.tool()
 def savings_summary(project: Optional[str] = None, format: str = "text") -> str:
     """
-    SIMPLE view of the opt-in savings tracker: this session's estimated
-    context tokens avoided by local compression, plus this project's
-    all-time totals. Called by /my-savings with no argument.
+    SIMPLE view of the opt-in savings tracker: this session's characters
+    before and after local compression and the percent reduction, plus this
+    project's all-time totals. Called by /my-savings with no argument.
 
-    This is an ONLINE ESTIMATE of a counterfactual (what raw content would
-    have cost vs. the compressed result actually used), not a controlled
-    A/B measurement -- see EVALUATION.md's Track D for that distinction.
+    Character counts recorded from now on are exact; older all-time history may
+    include approximate figures (rows from before schema v6, or stale token-only
+    footers, were reconstructed as tokens x 3.5) or rows with no size at all,
+    which are left out and counted as unsized. What they would have cost in tokens is not
+    estimated (a token count depends on the model's vocabulary, which is not
+    public). The counterfactual itself -- what the raw content would have cost
+    vs. the compressed result actually used -- is still observed online, not a
+    controlled A/B measurement; see EVALUATION.md's Track D for that distinction.
     Only local-compression events are credited; qdrant-find activity is
     intentionally never counted here (its counterfactual isn't observable).
 
@@ -1890,7 +1864,7 @@ def savings_summary(project: Optional[str] = None, format: str = "text") -> str:
         # `session_agg["project"] = project` str assignment below type-checks.
         session_agg: dict = (
             savings_ledger.get_live_session_aggregate(session_id) if session_id
-            else {"credited_saved_tokens": 0, "raw_tokens_sum": 0, "out_tokens_sum": 0, "event_count": 0, "fetch_url_count": 0, "overhead_tokens": savings_ledger.get_schema_overhead_tokens()}
+            else {"credited_saved_chars": 0, "raw_chars_sum": 0, "out_chars_sum": 0, "event_count": 0, "fetch_url_count": 0}
         )
         session_agg["project"] = project
         project_summary = savings_ledger.query_project_summary(project)
@@ -1910,8 +1884,9 @@ def savings_summary(project: Optional[str] = None, format: str = "text") -> str:
 def savings_detail(project: Optional[str] = None, format: str = "text", csv_table: str = "session") -> str:
     """
     DETAIL view of the opt-in savings tracker: this session's per-tool
-    breakdown, a sparkline of the last 10 sessions for this project, and a
-    cross-project comparison of total tokens avoided. Called by
+    breakdown, the per-model split of the most recent finished session (exact
+    characters before and after, plus a token figure labelled as derived), a sparkline of the last 10 sessions for this project, and a
+    cross-project comparison of characters before and after compression. Called by
     `/my-savings detail`. See savings_summary's docstring for the same
     counterfactual-estimate caveat.
 
@@ -1949,41 +1924,44 @@ def savings_detail(project: Optional[str] = None, format: str = "text", csv_tabl
         session_agg: dict
         if session_id:
             session_agg = savings_ledger.get_live_session_aggregate(session_id)
-            # Sorted by saved_tokens descending -- by_tool.items() is otherwise in
+            # Sorted by saved_chars descending -- by_tool.items() is otherwise in
             # dict insertion order (first-tool-seen order), which would make the
             # ordering inconsistent with query_session_tool_breakdown's explicit
-            # "ORDER BY saved_tokens DESC" for a finalized (post-SessionEnd) session.
+            # "ORDER BY saved_chars DESC" for a finalized (post-SessionEnd) session.
             tool_breakdown = sorted(
                 (
                     {
                         "tool": t,
                         "event_count": a["event_count"],
-                        "saved_tokens": a["saved_tokens"],
-                        # raw/out/credited_event_count feed avg % reduction and
+                        "saved_chars": a["saved_chars"],
+                        # raw/out/credited_event_count feed the reduction % and
                         # credited-vs-uncredited detection in format_detail_view --
                         # all three must be forwarded here or the live (pre-SessionEnd)
                         # path silently suppresses the metric.
-                        "raw_tokens_sum": a.get("raw_tokens_sum", 0),
-                        "out_tokens_sum": a.get("out_tokens_sum", 0),
+                        "raw_chars_sum": a.get("raw_chars_sum", 0),
+                        "out_chars_sum": a.get("out_chars_sum", 0),
                         "credited_event_count": a.get("credited_event_count", 0),
                     }
                     for t, a in session_agg.get("by_tool", {}).items()
                 ),
-                key=lambda t: t["saved_tokens"],
+                key=lambda t: t["saved_chars"],
                 reverse=True,
             )
         else:
-            session_agg = {"credited_saved_tokens": 0, "raw_tokens_sum": 0, "out_tokens_sum": 0, "event_count": 0, "fetch_url_count": 0, "overhead_tokens": savings_ledger.get_schema_overhead_tokens()}
+            session_agg = {"credited_saved_chars": 0, "raw_chars_sum": 0, "out_chars_sum": 0, "event_count": 0, "fetch_url_count": 0}
             tool_breakdown = []
         session_agg["project"] = project
         project_summary = savings_ledger.query_project_summary(project)
         last_n = savings_ledger.query_last_n_sessions(project, n=10)
         all_projects = savings_ledger.query_all_projects()
+        # The session in progress has no transcript to join yet, so the per-model
+        # split comes from the most recent finished session (issue #440).
+        model_breakdown = savings_ledger.query_recent_model_breakdown(project)
         if format == "json":
-            return savings_ledger.format_json(session_agg, project_summary, tool_breakdown, last_n, all_projects)
+            return savings_ledger.format_json(session_agg, project_summary, tool_breakdown, last_n, all_projects, model_breakdown)
         if format == "csv":
             return savings_ledger.format_csv(session_agg, project_summary, tool_breakdown, last_n, all_projects, table=csv_table)
-        return savings_ledger.format_detail_view(session_agg, project_summary, tool_breakdown, last_n, all_projects)
+        return savings_ledger.format_detail_view(session_agg, project_summary, tool_breakdown, last_n, all_projects, model_breakdown)
     except Exception as e:
         # Same reasoning as savings_summary's try/except -- best-effort feature,
         # must not fail the tool call over a DB problem.
@@ -1993,8 +1971,8 @@ def savings_detail(project: Optional[str] = None, format: str = "text", csv_tabl
 @mcp.tool()
 def savings_trend(project: Optional[str] = None, bucket: str = "week", n: int = 12) -> str:
     """
-    TREND view of the opt-in savings tracker: tokens avoided aggregated by
-    day or week rather than individual sessions, so patterns are visible even
+    TREND view of the opt-in savings tracker: characters before and after
+    compression, aggregated by day or week rather than individual sessions, so patterns are visible even
     once a project has accumulated enough history that per-session rows are
     too noisy to read. Called by `/my-savings trend`.
 
@@ -2209,5 +2187,4 @@ def record_metric(
 
 
 if __name__ == "__main__":
-    _log_fixed_overhead()
     mcp.run()

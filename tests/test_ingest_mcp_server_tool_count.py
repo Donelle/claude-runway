@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tests for ingest_mcp_server.py's _log_registered_tool_count() -- issue
 #52/GROW-05's Track A counterpart to compress_mcp_server.py's
-_log_fixed_overhead(). Before this, EVALUATION.md's Track A section had
+_log_fixed_overhead() (since removed, issue #439). Before this, EVALUATION.md's Track A section had
 no live self-reporting mechanism at all for the codebase-indexer server's
 tool count, which is exactly why it drifted stale twice (issue #23's
 "6 total" correction, then a further drift to 7 once
