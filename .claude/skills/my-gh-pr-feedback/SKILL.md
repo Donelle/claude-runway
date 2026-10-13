@@ -98,7 +98,7 @@ gh api repos/Donelle/claude-runway/pulls/{pr}/comments/{comment_id}/replies --me
 ```
 Note the `{pr}` segment — a real mistake made in this session: the endpoint is `pulls/{pr}/comments/{id}/replies`, not `pulls/comments/{id}/replies`; omitting the PR number 404s.
 
-**If an error-comment spam loop happens anyway** (from any source — not just a `@copilot` mention this skill might have missed catching, since a human reviewer or another automation could still trigger the same GitHub-side failure), stop immediately rather than retrying or reposting — it's a GitHub-side backend failure (see [community discussion #188531](https://github.com/orgs/community/discussions/188531)), not something fixable from this side. Clean up the error comments:
+**If an error-comment spam loop happens anyway** (from any source — not just a `@copilot` mention this skill might have missed catching, since a human reviewer or another automation could still trigger the same GitHub-side failure), stop immediately rather than retrying or reposting — it's a GitHub-side backend failure (see [GitHub community discussion of this failure](https://github.com/orgs/community/discussions/188531)), not something fixable from this side. Clean up the error comments:
 ```bash
 gh api repos/Donelle/claude-runway/issues/comments/{id} --method DELETE
 ```

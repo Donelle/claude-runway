@@ -11,7 +11,7 @@ Project-scoped to this repo: hardcodes `Donelle/claude-runway`, README.md as the
 
 ## Usage
 ```
-/my-gh-pr 12345
+/my-gh-pr <issue-number>
 ```
 The issue number is required — unlike `/my-pr-review-feedback`, there's no reliable way to reverse-lookup "which issue is this branch for" without asking, so don't guess it from the branch name.
 
@@ -43,7 +43,7 @@ The issue number is required — unlike `/my-pr-review-feedback`, there's no rel
 6. **Generate three artifacts in `.plans/`** (reminder: `.plans/` is globally gitignored on this machine, so these are a working/documentation trail, not something that ends up in the diff):
    - `{N}-research.md` — what was actually investigated to understand the bug/feature: specific files read, the mechanism confirmed (or ruled out), any repro performed. If `/my-gh-code-it` already ran, most of this is the issue body's own **Location**/**Verdict** sections plus whatever else came up during implementation — summarize and extend, don't restate verbatim.
    - `{N}-plan.md` — should already exist from `/my-gh-code-it`; update it if the implementation diverged from the original plan, rather than leaving it stale.
-   - `{N}-validate.md` — actual verification evidence: the real output of the venv's python running `-m unittest discover -s tests` with pass/fail counts (not "tests pass"), `git diff --stat` against `main` for the files-changed list, and an explicit plan-vs-implementation comparison (what matched, what changed and why). The venv's interpreter is `.venv/Scripts/python` on a Windows checkout and `.venv/bin/python` on Linux/macOS (`uv venv` creates one or the other, never both — issue #286), so describe it as the venv's python rather than hardcoding either path.
+   - `{N}-validate.md` — actual verification evidence: the real output of the venv's python running `-m unittest discover -s tests` with pass/fail counts (not "tests pass"), `git diff --stat` against `main` for the files-changed list, and an explicit plan-vs-implementation comparison (what matched, what changed and why). The venv's interpreter is `.venv/Scripts/python` on a Windows checkout and `.venv/bin/python` on Linux/macOS (`uv venv` creates one or the other, never both), so describe it as the venv's python rather than hardcoding either path.
 
 7. **Quality bar for artifacts** (same standard as `/my-post-pr`):
    - Research names specific files and line numbers, not just modules

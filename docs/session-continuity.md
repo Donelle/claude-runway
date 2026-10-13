@@ -19,7 +19,7 @@ The optional label argument to `/my-compact` (e.g. `/my-compact "auth refactor"`
 claude-runway-setup init --install-skills   # installs/updates every product skill, including these two
 ```
 
-(Or, from a clone: `python tools/setup_project.py init --install-skills`.) This installs/updates ALL of this repo's product skills at once (not just these two) — missing ones are installed, changed ones are updated, identical ones are left alone (issue [#14](https://github.com/Donelle/claude-runway/issues/14)). Works the same way whether you cloned this repo or installed it via pipx/`uv tool install` (see [Installation](installation.md)'s "Alternative" callout) — `skills/` ships in the package either way. Equivalent manual copy, if you'd rather not run the CLI:
+(Or, from a clone: `python tools/setup_project.py init --install-skills`.) This installs/updates ALL of this repo's product skills at once (not just these two) — missing ones are installed, changed ones are updated, identical ones are left alone. Works the same way whether you cloned this repo or installed it via pipx/`uv tool install` (see [Installation](installation.md)'s "Alternative" callout) — `skills/` ships in the package either way. Equivalent manual copy, if you'd rather not run the CLI:
 
 ```bash
 mkdir -p ~/.claude/skills/my-compact ~/.claude/skills/my-resume

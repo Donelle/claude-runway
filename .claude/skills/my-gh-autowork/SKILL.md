@@ -108,7 +108,7 @@ Project-scoped to this repo (hardcodes `Donelle/claude-runway`, `.venv`-based te
       prose summary — every subagent report already includes this per the Final report
       section below, this just means reading it rather than asking for a new format.
       **Do not copy `duration_ms`, token or tool-use figures out of the Agent call's
-      `usage` block by hand** (issue #455: nothing enforced that, 22 of 91 rows had none,
+      `usage` block by hand** (nothing enforced that, 22 of 91 rows had none,
       and the single total it gave had no cache split). Take the subagent's `agentId`
       from that Agent result (or the Agent call's tool-use id) and run, from the repo
       root (stdlib only, no venv needed):
@@ -191,9 +191,9 @@ Project-scoped to this repo (hardcodes `Donelle/claude-runway`, `.venv`-based te
 
 Step 2b's rule — a `BLOCKED` stops the whole run — still holds. This section only covers what happens *after* that stop, when the human has looked at the round history and wants the PR finished. It applies to exactly one kind of `BLOCKED`: the subagent's Step 22 cap (`hit the 5-round review-feedback cap on PR #<PR>`) where the unresolved round-6 findings are small, concrete and checkable (a stale docstring, a missed rename, a narrow edge case). It does **not** apply to a `BLOCKED` for a design question, an ambiguous requirement, a ticket already in progress, a closed ticket, or Step 25's "same concern resurfaced after a reply" stop — those need a human decision, and a follow-up subagent would just be guessing on their behalf.
 
-**Never automatic, never past the cap without authorization.** Start a follow-up only when the user has authorized continuing — either for this PR ("fix them", "finish #446"), or in advance for the run, by explicitly telling the orchestrator to use its own judgment and keep going; in that second case the orchestrator may start the follow-up itself, without asking again. Without one of those, report the `BLOCKED` and stop, exactly as Step 2b says. A follow-up that hits its own cap is another `BLOCKED` that needs a fresh authorization; it does not chain into a third subagent on its own.
+**Never automatic, never past the cap without authorization.** Start a follow-up only when the user has authorized continuing — either for this PR ("fix them", "finish that PR"), or in advance for the run, by explicitly telling the orchestrator to use its own judgment and keep going; in that second case the orchestrator may start the follow-up itself, without asking again. Without one of those, report the `BLOCKED` and stop, exactly as Step 2b says. A follow-up that hits its own cap is another `BLOCKED` that needs a fresh authorization; it does not chain into a third subagent on its own.
 
-**The pattern that worked** (the 2026-10-12/13 run: PR #446 merged after one extra round, and a second capped PR also merged this way): a fresh, single-purpose `Agent` call, `subagent_type: "general-purpose"`, `isolation: "worktree"` — same two settings, for the same reasons, as Step 2a — whose prompt says:
+**The pattern that worked** (the 2026-10-12/13 run: a capped PR merged after one extra round, and a second capped PR also merged this way): a fresh, single-purpose `Agent` call, `subagent_type: "general-purpose"`, `isolation: "worktree"` — same two settings, for the same reasons, as Step 2a — whose prompt says:
 - It is finishing an existing PR, not starting a ticket: skip Step 0's pick, Step 8's already-in-progress gate (that gate would report this very PR as in progress), Steps 9–10's assignee/type/branch creation, Step 17's `gh pr create` and Step 18's artifact comments. Give it the issue number, the PR number, the PR's branch name and the round history from the `BLOCKED` report.
 - Check out the PR's own branch under a throwaway local name, since the real branch name may still be held by the original subagent's worktree: `git fetch origin <branch> && git checkout -B <throwaway> origin/<branch>`, and push every fix with `git push origin HEAD:<branch>` so it lands on the PR (and triggers `review_on_push`) rather than on a new remote branch.
 - Bootstrap the venv as in Step 15. The review loop's own setup assumes a brand-new PR, so the prompt has to override three parts of it explicitly rather than say "run Steps 19–25 as written":
@@ -253,7 +253,7 @@ call out separately).
 
 **Do NOT skip any numbered step below because the change looks small, and do not skip a
 step because it is "just a git command."** Confirmed live across the 2026-10-05/06 run
-(issues #329-#331, #334, #335): one subagent skipped Step 1's full README read and its
+(five tickets): one subagent skipped Step 1's full README read and its
 `sync_repo` call ("the change was small and self-contained"), and another skipped Step 29's
 final `git fetch origin main && git log origin/main -1` confirmation because it was a git
 command. Both steps exist for reasons stated where they appear (a stale index, an
@@ -457,21 +457,21 @@ under `~/.claude/skills/`, not guaranteed to exist on whichever machine is runni
     uv pip install --python "$PYTHON" -r requirements-dev.txt --index-url https://pypi.org/simple
     ```
     **`--python "$PYTHON"` on every `uv pip install` is required, not optional.**
-    Confirmed live (issue #332's run, 2026-10-06): without it, `uv pip install` run from
+    Confirmed live (2026-10-06 run): without it, `uv pip install` run from
     inside a worktree resolved to the PRIMARY checkout's `.venv` instead of this
     worktree's own, so the install was a no-op against the wrong venv and ruff and
     Pyright were then missing from the worktree's own venv. (The second/third lines are
     cheap no-ops if already satisfied, so it's fine to always run them rather than trying
     to detect exactly what's missing.) The interpreter path is resolved once, in the same
     block, right after the venv exists — Windows venv uses `Scripts/`, Linux/macOS uses
-    `bin/`. ruff and Pyright (issue #297 — replaces mypy so the editor's Pylance
+    `bin/`. ruff and Pyright (replaces mypy so the editor's Pylance
     extension and this gate agree) are each invoked via `$PYTHON -m ruff`/`$PYTHON -m
     pyright` rather than as direct `$RUFF`/`$PYRIGHT` binaries, so only one allow rule
     (`.venv/Scripts/python` or `.venv/bin/python`) is needed instead of three.
 
     Then run and require all three clean before proceeding. **`--pythonpath
-    $PYTHON` on the Pyright call is required, not optional** (Copilot review,
-    PR #319): `pyproject.toml`'s `[tool.pyright]` deliberately has no
+    $PYTHON` on the Pyright call is required, not optional** (found in a Copilot
+    review): `pyproject.toml`'s `[tool.pyright]` deliberately has no
     `venvPath`/`venv` setting (a hardcoded `.venv` there broke CI, which
     never creates one), so without `--pythonpath` Pyright falls back to
     whatever Python is first on `PATH` and reports every third-party import
@@ -494,7 +494,7 @@ under `~/.claude/skills/`, not guaranteed to exist on whichever machine is runni
     "exact"), and make every hit consistent with the change in this same commit. Keep the
     `-e`: without it, `git grep` parses a flag-shaped pattern such as `"--old-option"` as
     one of its own options (quoting doesn't help) and fails with `unknown option`.
-    Confirmed live: in the 2026-10-12/13 run, issues #439, #440 and #449 each lost review
+    Confirmed live: in the 2026-10-12/13 run, three tickets each lost review
     rounds to Copilot finding one stale docstring, README cell or help string after
     another, one per round, all of which a single sweep before the first push would have
     caught. Each such round still counts toward Step 4's 5-round cap, so a missed sweep
@@ -682,7 +682,7 @@ actionable) does NOT increment it, since no fix cycle happens there.
     findings" (or "generated no new comments") can still list concrete "previously
     missed" or suppressed items in its body. Treat any concrete, checkable claim anywhere
     in the review as a finding regardless of the headline count: go to Step 22 for it, and
-    it counts toward the round cap like any other finding. Confirmed live on PR #446: a
+    it counts toward the round cap like any other finding. Confirmed live on a past PR: a
     review headlined "0 open findings" listed three "previously missed" items in its body
     (`best_session_chars`, `best_tool` and a docstring), all three valid, and the subagent
     had to decide on its own whether they counted. Only a review with no concrete claim
@@ -742,7 +742,7 @@ actionable) does NOT increment it, since no fix cycle happens there.
       trace every caller/writer of the field, not just the function the reviewer quoted.
       A value no real path can produce is not a bug, and a deliberate, documented contract
       (e.g. "0 means unknown") is not a bug either; reply with the call paths you checked.
-      Confirmed live on PR #446's follow-up: a review claimed a valid 500 → 0 session would
+      Confirmed live on a past PR's follow-up: a review claimed a valid 500 → 0 session would
       be mistaken for an unsized row, but every recorder measures output that includes a
       non-empty `[compressed N -> M chars` header, so 0 can't occur for a real
       compression, and "0 means unknown" was the documented contract.
