@@ -331,6 +331,13 @@ class MetricsLoggingContentRequirements(unittest.TestCase):
         # old compact_store prose did for that tool's own two failure shapes.
         self.assertIn('"Error:"', self.content)
 
+    def test_cost_figures_come_from_the_transcript_cli_not_hand_copying(self):
+        # Issue #455: the orchestrator passes an agent id and the tool computes
+        # wall clock/tokens/tool calls, so rows can't go missing or be mistyped.
+        self.assertIn("tools/autowork_cost.py record", self.content)
+        self.assertIn("--agent-id", self.content)
+        self.assertIn("Do not copy", self.content)
+
     def test_session_id_carries_per_attempt_timestamp(self):
         # The per-attempt HHMMSS timestamp is now stored as session_id (not
         # a label field, since the append-only store doesn't upsert) --

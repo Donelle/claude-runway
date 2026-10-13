@@ -107,10 +107,31 @@ Project-scoped to this repo (hardcodes `Donelle/claude-runway`, `.venv`-based te
       reproduced/fixed vs. declined, per finding) yourself from the report's own existing
       prose summary — every subagent report already includes this per the Final report
       section below, this just means reading it rather than asking for a new format.
-      Combine that with the model and timestamp noted in 2a and this Agent call's own
-      `usage` block (`duration_ms` / 1000 → `wall_clock_s`, `subagent_tokens`, `tool_uses`
-      → `tool_calls`), then call the `record_metric` tool (from the `local-compress` MCP
-      server — the same server that hosts `get_metrics`/`savings_summary`):
+      **Do not copy `duration_ms`, token or tool-use figures out of the Agent call's
+      `usage` block by hand** (issue #455: nothing enforced that, 22 of 91 rows had none,
+      and the single total it gave had no cache split). Take the subagent's `agentId`
+      from that Agent result (or the Agent call's tool-use id) and run, from the repo
+      root (stdlib only, no venv needed):
+      ```
+      python3 tools/autowork_cost.py record --issue <n> --outcome <merged|blocked|failed> \
+        --agent-id <agentId> [--pr <pr>] --rounds <N> --manual-interventions <N> \
+        --findings '[{"category": "...", "reproduced": true, "fixed": true}]'
+      ```
+      It reads that subagent's own transcript (`<session>/subagents/agent-<agentId>.jsonl`)
+      and writes the same `autowork` row `record_metric` used to, with `wall_clock_s`,
+      `subagent_tokens` (input + cache creation + output, the scale the older rows used),
+      `tool_calls` and `model` computed, plus a `cost` object splitting every counter per
+      model (cache reads included). If the transcript can't be found it still records the
+      row, marked `cost.available=false`, and says so on stderr. **One attempt, one row:**
+      a re-attempt or a follow-up subagent has its own agent id and gets its own row; never
+      merge them. Its output is `OK` or an `Error: ...` string, treated exactly like
+      `record_metric`'s below. `python3 tools/autowork_cost.py report` shows per-ticket and
+      per-model totals and the cache-read share; `backfill`/`compare` are one-off tools for
+      the older rows (see `docs/metrics.md`). The cost is the subagent's only, not this
+      orchestrator's own session.
+
+      `record_metric` still works for anything this CLI can't cover (e.g. no agent id at
+      all), with the same metadata shape minus the computed figures:
       ```
       record_metric(
         metric_id="autowork",
@@ -118,7 +139,6 @@ Project-scoped to this repo (hardcodes `Donelle/claude-runway`, `.venv`-based te
         value=1.0,
         metadata=<JSON string: {"issue": n, "pr": pr_or_null, "outcome": "...",
                     "model": "...", "rounds": N, "manual_interventions": N,
-                    "wall_clock_s": N, "subagent_tokens": N, "tool_calls": N,
                     "findings": [{"category": "...", "reproduced": bool, "fixed": bool}]}>,
         session_id=f"issue-{n}-{HHMMSS}"
       )
