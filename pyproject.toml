@@ -129,11 +129,12 @@ include = ["libs", "tools", "hooks"]
 # sys.path search anymore (nothing in site-packages puts <env>/src on
 # sys.path automatically). `claude_runway` (see that package, and setup.py's
 # data_files) is a tiny real site-packages package that exists purely to
-# bridge this gap: each entry point below calls into it, it puts <env>/src
-# on sys.path (located via sys.prefix, the one thing that sits at the same
-# relative place on Windows/macOS/Linux), then imports and calls the real
-# tools/*.py `main()` exactly as before -- behavior is unchanged, only how
-# entry_points resolves it. See claude_runway/__init__.py for the shim.
+# bridge this gap: each entry point below calls into it, it locates <env>/src
+# via sys.prefix (the one thing that sits at the same relative place on
+# Windows/macOS/Linux), loads the real tools/*.py by explicit file path
+# (issue #290; nothing is added to sys.path) and calls its `main()` exactly
+# as before -- behavior is unchanged, only how entry_points resolves it. See
+# claude_runway/__init__.py for the shim.
 claude-runway-ingest = "claude_runway:ingest_main"
 claude-runway-setup = "claude_runway:setup_main"
 claude-runway-doctor = "claude_runway:doctor_main"
@@ -169,19 +170,15 @@ packages = ["claude_runway"]
 # skill subdirectory rather than one shared "skills" target).
 #
 # None of these five directories has (or needs) an __init__.py.
-# libs/, hooks/, templates/, and skills/ are never imported as a Python
-# package by dotted name anywhere in this repo -- each script/hook resolves
-# libs/'s content via __file__ + sys.path and a bare (non-dotted) import
-# (e.g. `from qdrant_ingest_lib import ...`), hooks/ is only ever invoked as
-# a standalone script, and templates/skills aren't Python at all.
-# `tools/` is the one exception (Copilot review, PR #228): claude_runway's
-# shim DOES import it by dotted name (`from tools.ingest_to_qdrant import
-# main`, etc.) once <env>/src is added to sys.path -- this works with no
-# __init__.py because Python's PEP 420 implicit-namespace-package support
-# lets a plain directory be imported this way. mypy (`mypy.ini`'s old
-# `mypy_path = libs`) used to be specifically why libs/ had to stay
-# import-nameless, not tools/ -- adding an __init__.py to libs/ specifically
-# made mypy see libs/qdrant_retry.py under two module identities at once
+# libs/, tools/, hooks/, templates/, and skills/ are never imported as a
+# Python package by dotted name anywhere in this repo -- each script/hook
+# resolves libs/'s content via __file__ + sys.path and a bare (non-dotted)
+# import (e.g. `from qdrant_ingest_lib import ...`), tools/ and hooks/ are
+# only ever run as standalone scripts (claude_runway's shim loads tools/*.py
+# by explicit file path, issue #290), and templates/skills aren't Python at
+# all. mypy (`mypy.ini`'s old `mypy_path = libs`) used to be specifically
+# why libs/ had to stay import-nameless -- adding an __init__.py to libs/
+# specifically made mypy see libs/qdrant_retry.py under two module identities at once
 # (confirmed live in this issue's own testing predecessor, issue #50/PR
 # #136's own history; see that repo history for the "Source file found
 # twice under different module names" mypy error an __init__.py there

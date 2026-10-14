@@ -271,8 +271,9 @@ def main() -> None:
     Entry point for both `python tools/ingest_to_qdrant.py` (the
     `if __name__` guard below) and the `claude-runway-ingest` console
     script pip/pipx/uvx installs (issue #50) -- pulled out into its own
-    function purely so `[project.scripts]` in pyproject.toml has something
-    to point `module:function` at; behavior is unchanged either way.
+    function so the `claude_runway:ingest_main` shim that
+    `[project.scripts]` in pyproject.toml points at (issue #206) has
+    something to call; behavior is unchanged either way.
     """
     asyncio.run(ingest(parse_args()))
 

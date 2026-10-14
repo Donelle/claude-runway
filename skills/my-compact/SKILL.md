@@ -14,7 +14,7 @@ Run this when the conversation is growing long and you want to continue in a fre
 
 2. **Determine the label**:
    - If an argument was provided: use it as-is (e.g., `"auth middleware refactor"`)
-   - If no argument: omit `label` from the `compact_store` call (or pass `""`). The server derives it automatically from the first sentence of "## What we were working on" (issue #72), so you do not need to extract it.
+   - If no argument: omit `label` from the `compact_store` call (or pass `""`). The server derives it automatically from the first sentence of "## What we were working on", so you do not need to extract it.
 
 3. **Build a structured conversation summary** by filling in this exact template from what you can see in context:
 
@@ -63,7 +63,7 @@ LABEL: <label from step 2, or omit/leave blank if using server-side derivation>
 5. **Store in the dedicated compacts collection** by calling `compact_store` with:
    - `information`: the output from step 4 (or step 3 if step 4 was skipped)
    - `project`: the working directory name from step 1
-   - `label`: the label from step 2 — omit this parameter (or pass `""`) if no argument was given; the server derives it automatically from the summary (issue #72)
+   - `label`: the label from step 2 — omit this parameter (or pass `""`) if no argument was given; the server derives it automatically from the summary
    - `date`: today's date
 
    Note: `compact_store` uses a dedicated per-project Qdrant collection (e.g. `conversation-compacts-ProjectX`), isolated from the codebase index. Do NOT use `qdrant-store` here — that writes to the shared codebase collection where compacts get buried under code chunks.
@@ -72,7 +72,7 @@ LABEL: <label from step 2, or omit/leave blank if using server-side derivation>
    two shapes: a success string starting with `Stored compact in '...'`, or an error string
    starting with `Error:` (currently only a non-ISO `date`, but treat any `Error:`-prefixed
    return the same way — future error paths shouldn't need this check updated). Do NOT
-   assume success and confirm regardless — issue #115 was exactly this: a silent
+   assume success and confirm regardless — this has happened before: a silent
    `date`-validation failure looked identical to a real save, so the user saw a normal
    "stored successfully" confirmation and the compact was never actually stored.
    - **If it starts with `Error:`** — stop here. Show the user the exact error text and do

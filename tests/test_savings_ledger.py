@@ -262,7 +262,7 @@ def _old_schema_db_path(db_path: Path) -> None:
 
 class SchemaMigration(SavingsLedgerTestCase):
     """Issue #30/#69: a pre-existing savings.db from before
-    raw_chars_sum/out_chars_sum/overhead_tokens existed must not make
+    raw_chars_sum/out_chars_sum existed must not make
     finalize_session raise sqlite3.OperationalError -- and the migration
     scaffold itself must be safe to run against a DB that already has the
     columns but hasn't been through PRAGMA user_version tracking yet."""
@@ -384,7 +384,7 @@ class MigrationTransactionSafety(SavingsLedgerTestCase):
     def test_missing_migration_entry_raises_and_rolls_back_everything(self):
         _old_schema_db_path(self._db_path())
         # Derived, not hardcoded: the first version past the last registered
-        # migration (6 once #365 registered v5) is always "unregistered".
+        # migration is always "unregistered".
         unregistered = max(L._MIGRATIONS) + 1
         with mock.patch.object(L, "SCHEMA_VERSION", unregistered):
             # _MIGRATIONS has no entry for this version -- deliberately left
@@ -393,8 +393,8 @@ class MigrationTransactionSafety(SavingsLedgerTestCase):
                 L.finalize_session("sess1", "myproject")
 
         conn = sqlite3.connect(str(self._db_path()))
-        # Rolled back entirely -- migrations 1-3 (which ran FIRST and would
-        # have succeeded) must not have stuck, since the whole sequence is
+        # Rolled back entirely -- the registered migrations (which ran FIRST and
+        # would have succeeded) must not have stuck, since the whole sequence is
         # one transaction.
         self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 0)
         columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()}
@@ -630,7 +630,8 @@ class PerToolAvgPctFormat(unittest.TestCase):
 
     def test_avg_pct_zero_raw_does_not_crash(self):
         # Old DB rows backfilled with raw_chars_sum=0 must display gracefully.
-        # saved_chars=200 ensures the credited branch is taken (heuristic fallback).
+        # credited_event_count=5 puts the tool in the credited branch; raw=0 then
+        # suppresses the percentage.
         breakdown = [{"tool": "hook:Bash", "event_count": 5, "saved_chars": 200,
                       "raw_chars_sum": 0, "out_chars_sum": 0, "credited_event_count": 5}]
         out = self._render(breakdown)
@@ -699,8 +700,10 @@ class PerToolAvgPctFormat(unittest.TestCase):
 
 
 class SchemaMigrationV2V3(SavingsLedgerTestCase):
-    """Schema migrations: v2 adds raw_chars_sum; v3 adds out_chars_sum and
-    credited_event_count to session_tools (issue #65 and follow-up).
+    """Schema migrations: v2 adds the raw-size column and v3 the out-size column
+    plus credited_event_count to session_tools (issue #65 and follow-up); v6/v7
+    later turn the size columns into raw_chars_sum/out_chars_sum, which these
+    tests assert on.
     Mirrors the shape of existing SchemaMigration tests for v1.
     """
 
@@ -737,7 +740,7 @@ class SchemaMigrationV2V3(SavingsLedgerTestCase):
             """
         )
         conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-        # Mark it as at v1 so only v2 and v3 migrations run.
+        # Mark it as at v1 so the migrations from v2 onward run.
         conn.execute("PRAGMA user_version = 1")
         conn.execute("INSERT INTO session_tools VALUES ('old-sess', 'hook:Bash', 5, 300)")
         conn.commit()
@@ -1874,7 +1877,7 @@ class SessionAgentsRollup(SavingsLedgerTestCase):
         conn.commit()
         conn.close()
 
-        L.finalize_session("new", "p")  # opens the DB -> runs the v5 migration
+        L.finalize_session("new", "p")  # opens the DB -> runs the v5 (and later) migrations
 
         conn = sqlite3.connect(str(db_path))
         self.assertTrue(L._table_exists(conn, "session_agents"))
@@ -1929,8 +1932,8 @@ class FormatDetailViewByAgent(unittest.TestCase):
     def test_block_absent_when_the_only_subagent_activity_saved_nothing(self):
         # Regression for the Copilot review on PR #367: a subagent whose only
         # activity was uncredited (e.g. fetch_url) has a by_agent row with 0
-        # saved / 0 credited events -- that must NOT render a "0 events / 0
-        # tokens" block, even though the main session did earn savings.
+        # saved / 0 credited events -- that must NOT render a block of
+        # zeros, even though the main session did earn savings.
         out = self._render([self._row(0, "", 900, 1), self._row(1, "Explore", 0, 0)])
         self.assertNotIn("Main session vs subagents", out)
         self.assertNotIn("subagent · Explore", out)
@@ -2811,7 +2814,7 @@ class ExactCharCountsAndToolUseId(SavingsLedgerTestCase):
 
     def test_v5_database_migrates_with_tokens_times_3_5_backfill(self):
         self._make_v5_db()
-        conn = L._connect()  # runs the v6 migration (backfill), then v7 (drops the token columns)
+        conn = L._connect()  # runs the v6 migration (backfill), then v7 (drops the token columns), then v8/v9
         self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], L.SCHEMA_VERSION)
         sess = {r[0]: r[1:] for r in conn.execute(
             "SELECT session_id, raw_chars_sum, out_chars_sum, credited_saved_chars FROM sessions")}

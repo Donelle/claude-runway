@@ -94,7 +94,7 @@ class SkillContentRequirements(unittest.TestCase):
 
     def test_preflight_stops_on_missing_permissions(self):
         # Must instruct a hard stop, matching the existing dogfood-preflight pattern.
-        # Window is 2500 (was 2000) to accommodate the issue #230 note appended to the
+        # The 2500-char window leaves room for the issue #230 note in the
         # preflight's explanatory paragraph without pushing STOP out of sight.
         section = self.content[self.content.find("Baseline Bash permission preflight"):]
         self.assertIn("STOP", section[:2500])
@@ -623,6 +623,125 @@ class RunLessonsContentRequirements(unittest.TestCase):
         self.assertEqual(numbered, set(range(1, 30)), "template items must stay numbered 1-29")
         for ref in re.findall(r"\bSteps? (\d+)", self.template):
             self.assertIn(int(ref), numbered | {0}, f"dangling cross-reference: Step {ref}")
+
+
+class ShortCopilotWaitContentRequirements(unittest.TestCase):
+    """Step 19's wait must stay a few short calls to the tested helper: one long sleep
+    outlasts the subagent's prompt cache (about five minutes) and forces a full
+    context re-write on the next request."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(SKILL_PATH, encoding="utf-8") as f:
+            cls.content = f.read()
+        cls.template = _normalized(_template(cls.content))
+
+    def test_no_inline_sleep_loop_comes_back(self):
+        self.assertNotIn("{1..36}", self.content)
+        self.assertNotIn("sleep 15", self.content)
+        self.assertNotIn("36 iterations", self.content)
+        self.assertNotRegex(self.content, r"for i in \{1\.\.\d+\}")
+
+    def test_template_uses_the_helper_in_short_calls(self):
+        self.assertIn("tools/poll_copilot_review.py", self.template)
+        self.assertIn("THREE short Bash calls", self.template)
+        self.assertIn("`NOT_YET`", self.template)
+        self.assertIn("the third `NOT_YET` in a row", self.template)
+        self.assertIn("same `HEAD_SHA`", self.template)
+
+    def test_timeout_is_still_failed_and_never_clean(self):
+        self.assertIn("NOT the same as \"clean\"", self.template)
+        self.assertIn("OUTCOME: FAILED (issue #<N>) — Copilot's review did not arrive within 9 minutes", self.template)
+
+    def test_head_sha_rules_survive(self):
+        self.assertIn("full 40-character SHA", self.template)
+        self.assertIn("never an abbreviated one", self.template)
+
+    def test_helper_per_call_wait_stays_under_the_cache_lifetime(self):
+        import sys
+        sys.path.insert(0, os.path.join(REPO_ROOT, "libs"))
+        import copilot_review_poll_lib as P
+        # The cache lapses after about five minutes; one call must stay well under it.
+        self.assertLess(P.MAX_CALL_SECONDS, 300)
+        self.assertLessEqual(P.DEFAULT_ITERATIONS * P.DEFAULT_INTERVAL_S, P.MAX_CALL_SECONDS)
+        # ...while the whole window stays about nine minutes.
+        self.assertEqual(P.MAX_CALLS * P.DEFAULT_ITERATIONS * P.DEFAULT_INTERVAL_S, 540)
+
+    def test_follow_up_pattern_reuses_the_short_waits(self):
+        start = self.content.find("## Continuing after a BLOCKED at the round cap")
+        section = _normalized(self.content[start : self.content.find("## Subagent Prompt Template")])
+        self.assertIn("tools/poll_copilot_review.py", section)
+        self.assertIn("rather than one long sleep", section)
+
+
+AGENT_PATH = os.path.join(REPO_ROOT, ".claude", "agents", "autowork-ticket.md")
+
+
+def _agent_frontmatter():
+    with open(AGENT_PATH, encoding="utf-8") as fh:
+        text = fh.read()
+    match = re.match(r"---\n(.*?)\n---\n", text, re.DOTALL)
+    assert match, "agent file has no frontmatter"
+    fields = {}
+    for line in match.group(1).splitlines():
+        key, _, value = line.partition(":")
+        fields[key.strip()] = value.strip()
+    return fields
+
+
+class AutoworkAgentTypeTests(unittest.TestCase):
+    """The autowork subagent type's tool allow-list must cover everything the template uses."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(SKILL_PATH, encoding="utf-8") as fh:
+            cls.content = fh.read()
+        fence = "````"
+        start = cls.content.index(fence) + len(fence)
+        cls.template = cls.content[start : cls.content.index(fence, start)]
+        fields = _agent_frontmatter()
+        cls.fields = fields
+        cls.tools = {t.strip() for t in fields["tools"].split(",") if t.strip()}
+
+    def test_name_matches_what_the_skill_launches(self):
+        self.assertEqual(self.fields["name"], "autowork-ticket")
+        self.assertIn('`subagent_type: "autowork-ticket"`, `isolation: "worktree"`', self.content)
+
+    def test_allow_list_covers_the_basics_the_procedure_uses(self):
+        # Bash (git/gh/uv/tests), Read/Edit/Write (files and plans), ToolSearch (the only way
+        # to load deferred MCP tools), and sync_repo (Step 1).
+        for tool in ("Bash", "Read", "Edit", "Write", "ToolSearch", "mcp__codebase-indexer__sync_repo"):
+            self.assertIn(tool, self.tools)
+
+    def test_every_mcp_tool_the_template_names_is_allowed(self):
+        self.assertIn("sync_repo", self.template)
+        for name in set(re.findall(r"mcp__[A-Za-z0-9_-]+__[A-Za-z0-9_-]+", self.template)):
+            self.assertIn(name, self.tools)
+
+    def test_every_builtin_tool_the_template_names_is_allowed(self):
+        builtins = ("Bash", "Read", "Edit", "Write", "Glob", "Grep", "ToolSearch", "Skill")
+        for tool in builtins:
+            if re.search(r"`%s`|\b%s tool\b" % (tool, tool), self.template):
+                self.assertIn(tool, self.tools)
+
+    def test_agent_and_artifact_tools_are_left_out(self):
+        for tool in self.tools:
+            self.assertNotIn(tool, ("Agent", "Task", "ScheduleWakeup"))
+            self.assertFalse(tool.startswith("Artifact"), tool)
+
+    def test_template_never_asks_the_subagent_to_start_agents_or_artifacts(self):
+        self.assertNotIn("subagent_type", self.template)
+        self.assertNotIn("Artifact", self.template)
+
+    def test_fallback_is_only_for_an_unknown_agent_type(self):
+        section = _normalized(self.content)
+        self.assertIn("unknown-agent-type error", section)
+        self.assertIn('`subagent_type: "general-purpose"` for this run', section)
+        self.assertIn("Never fall back on any other error", section)
+
+    def test_no_other_place_launches_general_purpose(self):
+        # Only the fallback instruction may still name general-purpose as a launch type.
+        self.assertEqual(self.content.count('subagent_type: "general-purpose"'), 1)
 
 
 if __name__ == "__main__":

@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Tests for libs/qdrant_ingest_lib.py chunking.
+"""Tests for libs/qdrant_ingest_lib.py: chunking, file iteration, manifest/hash
+helpers, fastembed cache warm-up, and shared ingest defaults.
 
 Stdlib-only (unittest, no pytest) and no network -- the chunkers are pure
 functions over text, so this needs neither Qdrant nor an embedding model:
 
     .venv/bin/python -m unittest discover -s tests
 
-Why this file exists: all four bugs pinned here were SILENT. Nothing errors
+Why the chunking tests exist: the four bugs pinned first here were SILENT. Nothing errors
 when a chunker splits in the wrong place, skips lines, or explodes chunk
 count -- the index just quietly contains worse content (or costs far more to
 build), and a later qdrant-find returns a comment line instead of an answer.
@@ -1317,8 +1318,8 @@ class McpToolsValidateChunkParamsBeforeAnyWork(unittest.TestCase):
 
 class IndexRepoDocumentsTheOrphanedChunkLimitation(unittest.TestCase):
     """Issue #31: index_repo(reset=False) never detects/removes chunks for
-    files deleted from the repo, unlike sync_repo. Decided (see .plans/31-
-    plan.md) to document this loudly rather than change the behavior --
+    files deleted from the repo, unlike sync_repo. Decided to document this
+    loudly rather than change the behavior --
     sync_repo already exists specifically for ongoing/incremental
     re-indexing and already tracks a manifest to handle deletions
     correctly; index_repo is the bulk/first-time/full-rebuild tool. This

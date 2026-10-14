@@ -83,6 +83,17 @@ MATCH_SLACK_S = 600
 # stale transcript of the same issue stand in for a missing one.
 MATCH_LOOKBACK_S = 3600
 
+# COLD-CACHE REBUILD (documented in docs/metrics.md): a request that wrote a large
+# cache block and read nothing, arriving more than REBUILD_GAP_S after the previous
+# request started. The prompt cache appears to lapse after about five minutes idle,
+# so a long single Bash wait makes the next request re-write the whole context at
+# the (dearer) cache-write rate. The first request of a run is never a rebuild (it
+# has no previous request and always writes). "Large" is REBUILD_MIN_CREATION
+# tokens, well under a real context (a subagent starts near 56k) and well over the
+# few hundred tokens an ordinary turn adds.
+REBUILD_GAP_S = 300
+REBUILD_MIN_CREATION = 10_000
+
 
 def _count(v) -> int:
     return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else 0
@@ -113,6 +124,27 @@ def issue_of(prompt: str, description: str) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
+def cache_stats(requests: list) -> dict:
+    """`requests` is [(start_ts or None, cache_creation_tokens, cache_read_tokens)] in
+    transcript order, one per distinct API response. Returns
+    {"longest_gap_s": int|None, "cold_rebuilds": int}: the longest start-to-start gap
+    between consecutive requests that both have a timestamp, and the number of
+    requests meeting the rebuild definition above."""
+    longest = None
+    rebuilds = 0
+    prev = None
+    for ts, creation, read in requests:
+        if ts is not None and prev is not None:
+            gap = ts - prev
+            if longest is None or gap > longest:
+                longest = gap
+            if gap > REBUILD_GAP_S and read == 0 and creation >= REBUILD_MIN_CREATION:
+                rebuilds += 1
+        if ts is not None:
+            prev = ts
+    return {"longest_gap_s": round(longest) if longest is not None else None, "cold_rebuilds": rebuilds}
+
+
 def parse_attempt(jsonl_path) -> Optional[dict]:
     """One subagent file -> an attempt dict, or None when it has no assistant turn.
     {"agent_id", "tool_use_id", "description", "issue", "kind", "first_ts",
@@ -135,6 +167,7 @@ def parse_attempt(jsonl_path) -> Optional[dict]:
         pass
 
     usage_by_id: dict = {}   # message.id -> {"model", **fields}
+    start_by_id: dict = {}   # message.id -> earliest timestamp (the request's start)
     anon = 0
     tool_ids: set = set()
     thinking_chars = 0
@@ -172,6 +205,8 @@ def parse_attempt(jsonl_path) -> Optional[dict]:
             slot = usage_by_id.setdefault(mid, {"model": model, **{k: 0 for k in _FIELDS}})
             for src, dst in _TOKEN_KEYS:
                 slot[dst] = max(slot[dst], _count(usage.get(src)))
+            if ts is not None:
+                start_by_id[mid] = min(ts, start_by_id.get(mid, ts))
         content = message.get("content")
         if isinstance(content, list):
             for block in content:
@@ -199,6 +234,8 @@ def parse_attempt(jsonl_path) -> Optional[dict]:
         "kind": "followup" if re.search(r"follow-?up", description, re.IGNORECASE) else "attempt",
         "first_ts": first_ts, "last_ts": last_ts, "wall_clock_s": wall,
         "tool_calls": len(tool_ids), "thinking_chars": thinking_chars, "by_model": by_model,
+        **cache_stats([(start_by_id.get(mid), slot["cache_creation_tokens"], slot["cache_read_tokens"])
+                       for mid, slot in usage_by_id.items()]),
     }
 
 
@@ -263,6 +300,9 @@ def cost_metadata(attempt: dict, source: str = "transcript") -> dict:
         "agent_id": attempt["agent_id"], "tool_use_id": attempt["tool_use_id"], "kind": attempt["kind"],
         "by_model": attempt["by_model"], "cache_read_share": t["cache_read_share"],
         "thinking_chars": attempt["thinking_chars"],
+        # Stored at record time because the report reads rows, not transcripts. Rows
+        # written before these fields existed simply lack them (shown as n/a).
+        "longest_gap_s": attempt.get("longest_gap_s"), "cold_rebuilds": attempt.get("cold_rebuilds"),
     }
 
 
@@ -469,7 +509,8 @@ def build_report(rows: list) -> dict:
             t = totals(cost["by_model"])
             entry.update(status="split", total_tokens=t["total_tokens"], cache_read_share=t["cache_read_share"],
                          tool_calls=source_meta.get("tool_calls"), wall_clock_s=source_meta.get("wall_clock_s"),
-                         kind=cost.get("kind"))
+                         kind=cost.get("kind"), cache_creation_tokens=t["cache_creation_tokens"],
+                         longest_gap_s=cost.get("longest_gap_s"), cold_rebuilds=cost.get("cold_rebuilds"))
             for model, r in cost["by_model"].items():
                 acc = per_model.setdefault(model, {"tickets": 0, "requests": 0, **{k: 0 for k in _FIELDS}})
                 acc["tickets"] += 1
@@ -508,7 +549,8 @@ def format_report(rep: dict) -> str:
     for t in rep["tickets"]:
         if t["status"] == "split":
             lines.append(f"  #{t['issue']} {t['event_type']}  {_n(t['total_tokens'])} tokens, cache reads {_pct(t['cache_read_share'])}, "
-                         f"{_n(t['tool_calls'])} tool calls, {_n(t['wall_clock_s'])}s ({t['session_id']})")
+                         f"{_n(t['tool_calls'])} tool calls, {_n(t['wall_clock_s'])}s, cache creation {_n(t['cache_creation_tokens'])}, "
+                         f"longest gap {_n(t['longest_gap_s'])}s, cold-cache rebuilds {_n(t['cold_rebuilds'])} ({t['session_id']})")
         elif t["status"] == "legacy":
             lines.append(f"  #{t['issue']} {t['event_type']}  {_n(t['total_tokens'])} tokens (hand-copied total, no model or cache split) ({t['session_id']})")
         elif t["status"] == "unavailable":

@@ -274,10 +274,7 @@ class RememberPointTest(_PatchRetryMixin, unittest.TestCase):
         # exactly as given, not coerced/clamped -- this lower-level helper
         # trusts the value verbatim; validation (rejecting negative/
         # non-finite weights) happens at the remember() tool boundary
-        # instead (PR #199 review, fourth pass: an earlier version of this
-        # comment claimed weight validation was out of scope for this
-        # ticket entirely, which went stale once that validation was added
-        # in a later round -- see RememberWeightValidationTest in
+        # instead (see RememberWeightValidationTest in
         # tests/test_memory_bank_mcp_server.py for that coverage).
         client = MagicMock()
         client.collection_exists.return_value = True
@@ -454,8 +451,8 @@ class RecallPointsTest(_PatchRetryMixin, unittest.TestCase):
 
         # Issue #177: no metadata.weight on this point -> defaults to
         # DEFAULT_WEIGHT (1.0), a true no-op, and effective_score is the
-        # NORMALIZED score (raw similarity rescaled to [0, 1], PR #199
-        # review) scaled by that default -- not the raw score directly.
+        # normalized score (raw similarity floored at 0, issue #272)
+        # scaled by that default.
         self.assertEqual(hit["weight"], mb.DEFAULT_WEIGHT)
         self.assertEqual(hit["effective_score"], mb._normalize_similarity(0.9) * mb.DEFAULT_WEIGHT)
 
@@ -556,10 +553,8 @@ class RecallPointsWeightRerankingTest(_PatchRetryMixin, unittest.TestCase):
     def test_missing_weight_on_a_hit_defaults_to_1_0(self):
         # A legacy point with no metadata.weight at all must default to
         # DEFAULT_WEIGHT (1.0), not an implicit penalty or boost -- its
-        # effective_score is normalize_similarity(score) * 1.0 (PR #199
-        # review, third pass: NOT the raw score directly, since weight=1.0
-        # is a no-op for RANKING among equally-weighted hits, not for the
-        # raw score's own numeric value -- see recall_points' docstring).
+        # effective_score is _normalize_similarity(score) * 1.0 (not the raw
+        # score directly -- see recall_points' docstring).
         client = MagicMock()
         client.collection_exists.return_value = True
         response = MagicMock()

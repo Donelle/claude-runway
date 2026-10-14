@@ -49,8 +49,9 @@ though SHADOW_FILE uses the SAME sessions directory that module's own
 `_sessions_dir()` resolves to. This is a directory-CONVENTION match, not a
 code dependency: this module's own `session_*.jsonl` marker files never
 share a filename with, read, or write `savings_ledger`'s bare
-`<session_id>.jsonl` event logs, and wiring the two together is explicitly
-tracked separately (issue #213) rather than done here.
+`<session_id>.jsonl` event logs. The dependency runs one way only:
+`savings_ledger` imports this module (for `SESSION_MARKER_PREFIX`, the
+SHADOW_FILE lookup and the marker TTL), never the reverse.
 
 Cleanup (two layers, both driven by `hooks/record_session_id.py`):
   - Layer 1 (graceful): a `SessionEnd` registration of the same hook script

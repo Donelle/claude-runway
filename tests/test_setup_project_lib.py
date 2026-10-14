@@ -619,8 +619,8 @@ class RunSetupEndToEnd(unittest.TestCase):
 
     def test_rerun_with_no_compact_collection_flag_does_not_drift_between_runs(self):
         # Regression for the finding from PR #130 review: a plain re-run
-        # (no new flags -- the exact "safe to re-run" workflow this
-        # module's own docstring advertises) of an already-configured
+        # (no new flags -- the exact "safe to re-run" workflow
+        # tools/setup_project.py's own docstring advertises) of an already-configured
         # project that has only ever used the shared default must produce
         # the SAME value both times, or its stored conversation-compact
         # history becomes unreachable (see compress_mcp_server.py's
@@ -684,9 +684,9 @@ class RunSetupEndToEnd(unittest.TestCase):
         second = run_setup(
             self.target_repo, REPO_ROOT, home_dir=Path("/home/user"), include_compress=False, include_hooks=True
         )
-        # record_session_id.py moved to SessionStart (issue #231): PostToolUse
-        # loses the '.*' core block, leaving only the (now-stripped) compress
-        # block → empty list. SessionStart has the core record_session_id.py
+        # record_session_id.py lives under SessionStart (issue #231), so
+        # PostToolUse held only the compress block, now stripped → empty
+        # list. SessionStart has the core record_session_id.py
         # block. SessionEnd has record_session_id.py only (no savings hook).
         self.assertEqual(len(second.settings_json["hooks"]["SessionStart"]), 1)
         self.assertEqual(len(second.settings_json["hooks"]["PostToolUse"]), 0)

@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""Table tests for libs/local_compress_lib.py's focus-shape detection.
+"""Tests for libs/local_compress_lib.py. The first group are table tests for
+focus-shape detection; later groups cover identifier/credential/section
+preservation, compact-label derivation, the compression cache, and LM Studio
+model resolution and timeout handling.
 
-Stdlib-only and no network -- both predicates under test are pure functions
-over the focus string, so this needs neither LM Studio nor Qdrant:
+Needs neither LM Studio nor Qdrant: the focus predicates are pure functions
+over the focus string, and the compress() tests inject stub model calls (the
+only sockets are loopback servers started by the tests themselves):
 
     .venv/bin/python -m unittest discover -s tests
 
@@ -951,7 +955,8 @@ class SplitProseBulletRuns(unittest.TestCase):
     def test_leading_blanks_preserved_in_prose_run_text(self):
         """Blank lines that split_prose_bullet_runs attaches to a prose run
         must actually appear at the start of the run's text, so the
-        _compress_each_section leading_blanks extraction below works correctly:
+        _compress_each_section leading_blanks extraction (in libs/local_compress_lib.py)
+        works correctly:
         leading_blanks = run_text[: len(run_text) - len(run_text.lstrip('\\n'))]
         """
         body = "- fact A\n\nProse after blank."
@@ -1020,8 +1025,9 @@ class CompressEarlyReturnDisclosure(unittest.TestCase):
     injection is needed, unlike SectionCompressionEndToEnd below."""
 
     def setUp(self):
-        # The _run_preserving tests DO stub resolve_model/complete/client --
-        # clear the cache so prior test results don't bypass those stubs.
+        # Nothing here stubs the model, and the early return precedes the
+        # compression cache lookup; clearing is defensive hygiene so another
+        # class's cached results can never leak into this one.
         clear_compression_cache()
 
     def tearDown(self):
@@ -2812,7 +2818,7 @@ class CompressionCache(unittest.TestCase):
         )
 
     def test_normal_sized_value_is_still_cached(self):
-        """Regression guard: the byte cap must not affect normally sized results."""
+        """Regression guard: the size cap must not affect normally sized results."""
         import local_compress_lib as L
 
         key = _compression_cache_key("text", "focus", "model", None, False, False)

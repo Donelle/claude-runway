@@ -169,15 +169,12 @@ COMPACT_MODEL_MISMATCH_HINT = (
     "supported: it orphans the stored compacts."
 )
 
-# Issue #39: fetch_url used to call requests.get() with no stream=True, no
-# Content-Length check, and no size cap of any kind -- resp.text/resp.content
-# both materialize the ENTIRE body into memory unconditionally before
-# max_total_chars (a post-extraction cap) ever gets a chance to run.
-# timeout_seconds is a per-read/connect timeout, not a total-duration cap, so
-# a large file streamed at steady throughput never trips it -- a URL that
-# happens to resolve to a multi-GB file (a redirect to a video/zip/dataset, a
-# poorly-bounded API response, or simply the wrong link) would fully download
-# into memory first. 10 MB is comfortably above any real HTML/article page
+# Issue #39: cap on how much of a fetch_url response body is ever read into
+# memory. max_total_chars is a post-extraction cap and timeout_seconds is a
+# per-read/connect timeout, not a total-duration cap, so neither stops a URL
+# that resolves to a multi-GB file (a redirect to a video/zip/dataset, a
+# poorly-bounded API response, or simply the wrong link) from downloading in
+# full first. 10 MB is comfortably above any real HTML/article page
 # (fetch_url's actual target) and comfortably below "this is clearly not an
 # article anymore."
 MAX_FETCH_URL_BYTES = 10 * 1024 * 1024
@@ -1119,18 +1116,13 @@ async def compact_store(
                 # scroll-path fallback (.get("information", .get("document",
                 # ""))) still checks for it on entries stored before this fix.
                 # payload's "project" is the RAW argument (issue #37 round
-                # 2) -- it doesn't need to agree with any particular casing
-                # scheme, because nothing downstream expects it to already
-                # BE normalized: _collections_for_project reads this exact
-                # raw value back to decide whether a collection matches a
-                # project (case-insensitively), and compact_find's default
+                # 2) -- nothing downstream expects it to be normalized:
+                # _collections_for_project reads this exact raw value back
+                # to decide whether a collection matches a project
+                # (case-insensitively), and compact_find's default
                 # (non-explicit-collection) read path applies its OWN
-                # case-insensitive PER-ENTRY filter against this same raw
-                # value (round 3, flagged in PR review on #123 -- an
-                # earlier version of this comment claimed no filter was
-                # applied at all, which stopped being true once that
-                # per-entry filter was added). The exact literal value is
-                # also useful as a human-readable record of what this
+                # case-insensitive PER-ENTRY filter against it. The exact
+                # literal value is also a human-readable record of what this
                 # specific call actually passed.
                 # metadata.source (issue #282) is what index_repo/sync_repo's
                 # delete filters exclude on (mb.memory_bank_exclusion_filter),
@@ -1390,20 +1382,15 @@ async def compact_find(
         # to already be scoped to this one project) -- but see the
         # case-insensitive PER-ENTRY filter applied below, after fetching,
         # which is the actual isolation guarantee for this path (issue
-        # #37 round 3, flagged in PR review on #123). Every match
-        # _collections_for_project returns -- INCLUDING the canonical
-        # one -- is only PROVEN project-exclusive by inspecting stored
-        # data, not by any persisted metadata that distinguishes a
-        # dedicated collection from a shared one someone deliberately (or
-        # accidentally) wrote into via compact_store's own `collection`
-        # override: an earlier version of this comment treated the
-        # canonical collection as exempt from that risk ("trusted by
-        # construction"), which held for RESOLUTION (deciding a
-        # collection belongs to this project) but not for ISOLATION
-        # (nothing stops another project's points from landing inside it)
-        # -- round 6's review caught the semantic query path still acting
-        # on that stale exemption (see its own comment at the MatchAny
-        # filter below). Without a per-entry check here too, such a
+        # #37, PR #123 review round 3). Every match _collections_for_project returns --
+        # INCLUDING the canonical one -- is only PROVEN project-exclusive
+        # by inspecting stored data, not by any persisted metadata that
+        # distinguishes a dedicated collection from a shared one someone
+        # deliberately (or accidentally) wrote into via compact_store's own
+        # `collection` override: the canonical collection is "trusted" for
+        # RESOLUTION (deciding a collection belongs to this project) but
+        # not for ISOLATION (nothing stops another project's points from
+        # landing inside it). Without a per-entry check here too, such a
         # collection could leak another project's entries into this
         # result.
         col_list = _collections_for_project(client, project)
@@ -1444,22 +1431,16 @@ async def compact_find(
             # returned page with points a client-side filter would then
             # remove, silently reporting no matches despite this
             # project's own (lower-ranked) real entries still sitting in
-            # that same collection (flagged in PR review on #123, round
-            # 5 -- an earlier version tried a bigger but still
-            # fundamentally capped over-fetch instead, which the review
-            # correctly pointed out just moves the same bug to a larger
-            # threshold rather than eliminating it). This filter is now
-            # built and applied for EVERY collection in col_list,
-            # including the canonical one -- an earlier version exempted
-            # the canonical collection as "trusted by construction," but
-            # `collection` is a caller-controlled override on
-            # compact_store's WRITE side too, so nothing actually
-            # prevents another project's points from being written under
-            # this exact canonical name; without a filter here, those
-            # foreign points could rank ahead of the real ones and
-            # reproduce the identical truncation-before-filter bug this
-            # exemption was meant to sidestep (flagged in PR review on
-            # #123, round 6). Every collection gets an EXACT MatchAny
+            # that same collection (a bigger over-fetch would only move
+            # that bug to a larger threshold, not remove it). This filter
+            # is built and applied for EVERY collection in col_list,
+            # including the canonical one, because `collection` is a
+            # caller-controlled override on compact_store's WRITE side
+            # too, so nothing prevents another project's points from being
+            # written under this exact canonical name; without a filter
+            # here, those foreign points could rank ahead of the real ones
+            # and reproduce the same truncation-before-filter bug (issue
+            # #37, PR #123 review rounds 5-6). Every collection gets an EXACT MatchAny
             # filter built from its own actual stored project values
             # (there can be more than one casing variant within a single
             # collection -- see _collection_project_values), so Qdrant
@@ -1723,8 +1704,9 @@ async def compact_prune(
         # (`(keep_last_n is None) == (older_than_days is None)`) guarantees
         # older_than_days is not None here, but a type checker can't narrow
         # through that separate boolean comparison (issue #297 -- same
-        # limitation this file's chars_limited/max_chars comment describes
-        # elsewhere in this codebase), hence the explicit assert.
+        # limitation the chars_limited/max_chars comment in
+        # libs/local_compress_lib.py's compress() describes), hence the
+        # explicit assert.
         assert older_than_days is not None
         today = _dt.date.today()
         try:
@@ -1894,7 +1876,9 @@ def savings_detail(project: Optional[str] = None, format: str = "text", csv_tabl
 
     format controls the output format:
       "text" (default) — human-readable text, same as before.
-      "json"           — JSON object with all five data blocks.
+      "json"           — JSON object with the data blocks (including the
+                         per-model split when there is one, but not the
+                         text view's main-vs-subagent breakdown).
       "csv"            — CSV whose content depends on csv_table (see below).
 
     csv_table selects which table to export when format="csv":
@@ -2112,9 +2096,11 @@ def record_metric(
     """
     Writes one append-only event to the shared cross-tool metrics store
     (issue #210 — the write counterpart to get_metrics). Any domain in
-    this toolkit can call this to record an event; the primary consumer
-    as of this ticket is my-gh-autowork's per-ticket outcome logging
-    (cut over from compact_store by this ticket).
+    this toolkit can call this to record an event. my-gh-autowork's
+    per-ticket outcome logging was the first consumer (cut over from
+    compact_store by this ticket); it now goes through
+    tools/autowork_cost.py record, which writes the same metric_id="autowork"
+    rows, and this tool remains for anything that CLI can't cover.
 
     metric_id: the domain (e.g. "autowork", "memory-bank") — caller-defined,
       no fixed enum.
