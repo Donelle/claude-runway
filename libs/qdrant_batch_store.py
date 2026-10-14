@@ -1,6 +1,5 @@
 """
-Batched embed+upsert for QdrantConnector-based indexing (issue #75/#76
-follow-up, supersedes issue #53's batching proposal).
+Batched embed+upsert for `QdrantConnector`-based indexing.
 
 FOUND BY REAL-WORLD TESTING: bumping call_with_retry from 1 retry to
 MAX_ATTEMPTS=4 (see qdrant_retry.py) made ZERO difference to a connection
@@ -16,19 +15,12 @@ being hit at a consistent cumulative connection/request count. No amount of
 retrying helps once you're actually at that ceiling; only reducing the
 NUMBER of round-trips does.
 
-QdrantConnector.store() (from mcp_server_qdrant) only accepts one Entry per
-call -- confirmed directly by reading its source, and previously tracked as
-issue #53 (a batching *performance* proposal; this makes it a correctness
-fix instead). There is no public batch API on QdrantConnector, so this
-deliberately reaches into its "private" (single-underscore) attributes --
-_client (the underlying AsyncQdrantClient), _embedding_provider,
-_default_collection_name, _ensure_collection_exists -- rather than
-constructing a second, redundant AsyncQdrantClient/connection pool of its
-own. This is a real, flagged tradeoff: these are simple, stable attribute
-names in a small library as of the version this was written against, but a
-future mcp_server_qdrant upgrade could rename them without notice, unlike a
-supported public API. Worth revisiting if mcp_server_qdrant ever adds its
-own batch method.
+`QdrantConnector.store()` accepts one Entry per call, so a large index would
+make one embed + one upsert HTTP round-trip per chunk. This module batches
+them through the connector's public `client`, `embedding_provider`,
+`default_collection_name` and `ensure_collection_exists` (the connector is
+this repo's own, in qdrant_connector.py), rather than constructing a second,
+redundant AsyncQdrantClient/connection pool of its own.
 
 embed_documents() already natively batches (passes the whole list straight
 to FastEmbed's own batch-optimized passage_embed) -- embedding a batch of
@@ -36,18 +28,12 @@ N documents in one call is also a real CPU throughput win, not just an API
 convenience, on top of collapsing N upsert HTTP round-trips into one.
 """
 
-import uuid
 from typing import Awaitable, Callable, Optional
 
 from qdrant_client import models
 
+from qdrant_connector import METADATA_PATH, make_point
 from qdrant_retry import async_call_with_retry
-
-# Must match mcp_server_qdrant.settings.METADATA_PATH exactly -- confirmed
-# by reading its value directly rather than guessing ('metadata'). A
-# mismatch here wouldn't error, it would just silently write payloads
-# QdrantConnector.search()/qdrant-find can't read metadata back out of.
-METADATA_PATH = "metadata"
 
 # Chosen to comfortably clear the connection-exhaustion ceiling this module
 # exists to avoid (the failure this replaces happened at ~5,249 individual
@@ -58,24 +44,21 @@ UPSERT_BATCH_SIZE = 250
 
 # Must match the nested key sync_repo's own delete-by-filter already uses
 # (tools/ingest_mcp_server.py's models.FieldCondition(key="metadata.file_path",
-# ...)) -- confirmed by reading the payload shape directly rather than
-# guessing: store()/store_batch() write {"document": ..., METADATA_PATH:
+# ...)): store()/store_batch() write {"document": ..., METADATA_PATH:
 # entry.metadata}, and entry.metadata itself has a "file_path" key (see
 # qdrant_ingest_lib.py's chunk_file), so the indexable field is the NESTED
-# "metadata.file_path", not the bare "file_path" issue #54's own proposal
-# text suggested.
+# "metadata.file_path", not the bare "file_path".
 FILE_PATH_INDEX_FIELD = f"{METADATA_PATH}.file_path"
 
 # Passed to QdrantConnector(..., field_indexes=FIELD_INDEXES) so a BRAND NEW
 # collection gets this index automatically the moment
-# QdrantConnector._ensure_collection_exists() creates it. Confirmed by
-# reading mcp_server_qdrant's installed source directly (issue #54): that
-# method only ever applies field_indexes on the branch where the collection
-# doesn't already exist yet -- it's never re-applied to a collection that's
-# already there. That's the common case in practice (every repo indexed
-# before this fix shipped), which is why ensure_file_path_index() below
-# exists as a separate, explicit backfill -- this constant alone does not
-# fix an already-existing collection.
+# QdrantConnector.ensure_collection_exists() creates it. That method only
+# ever applies field_indexes on the branch where the collection doesn't
+# already exist yet -- it's never re-applied to a collection that's already
+# there. That's the common case in practice (every repo indexed before this
+# index existed), which is why ensure_file_path_index() below exists as a
+# separate, explicit backfill -- this constant alone does not fix an
+# already-existing collection.
 FIELD_INDEXES = {FILE_PATH_INDEX_FIELD: models.PayloadSchemaType.KEYWORD}
 
 
@@ -88,7 +71,7 @@ async def store_batch(
     progress_callback: Optional[Callable[[int, int], Awaitable[None]]] = None,
 ) -> int:
     """
-    Embeds and upserts `entries` (a list of mcp_server_qdrant.qdrant.Entry)
+    Embeds and upserts `entries` (a list of qdrant_connector.Entry)
     in batches of `batch_size`, instead of QdrantConnector.store()'s one
     embed+upsert HTTP round-trip per entry. Returns the number of entries
     stored (== len(entries) on success). Each batch's upsert call is
@@ -105,29 +88,24 @@ async def store_batch(
     if not entries:
         return 0
 
-    collection_name = collection_name or connector._default_collection_name
+    collection_name = collection_name or connector.default_collection_name
     assert collection_name is not None
-    await connector._ensure_collection_exists(collection_name)
+    await connector.ensure_collection_exists(collection_name)
 
-    vector_name = connector._embedding_provider.get_vector_name()
+    vector_name = connector.embedding_provider.get_vector_name()
     stored = 0
     for i in range(0, len(entries), batch_size):
         batch = entries[i:i + batch_size]
         contents = [entry.content for entry in batch]
-        embeddings = await connector._embedding_provider.embed_documents(contents)
+        embeddings = await connector.embedding_provider.embed_documents(contents)
         points = [
-            models.PointStruct(
-                id=uuid.uuid4().hex,
-                vector={vector_name: embedding},
-                payload={"document": entry.content, METADATA_PATH: entry.metadata},
-            )
+            make_point(vector_name, embedding, entry)
             # strict=False: identical to pre-ruff behavior (a bare zip()
-            # already silently truncates to the shorter iterable) -- see
-            # issue #297's hard constraint against changing runtime behavior
-            # while adopting ruff's B905 rule.
+            # already silently truncates to the shorter iterable); ruff's
+            # B905 adoption must not change runtime behavior.
             for entry, embedding in zip(batch, embeddings, strict=False)
         ]
-        await async_call_with_retry(connector._client.upsert, collection_name=collection_name, points=points)
+        await async_call_with_retry(connector.client.upsert, collection_name=collection_name, points=points)
         stored += len(batch)
         if progress_callback is not None:
             await progress_callback(stored, len(entries))
@@ -159,7 +137,7 @@ def ensure_file_path_index(client, collection_name: str) -> bool:
     here instead.
 
     Callers must confirm collection_name already exists before calling this
-    -- same precondition QdrantConnector's own _ensure_collection_exists
+    -- same precondition QdrantConnector's own ensure_collection_exists
     has; get_collection() errors on a missing collection rather than
     returning something falsy.
 

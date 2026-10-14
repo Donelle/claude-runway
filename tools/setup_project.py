@@ -86,29 +86,9 @@ def _pip_installed_venv_python() -> Optional[Path]:
     own venv elsewhere, and `sys.executable` (whichever interpreter is
     actually running this console script right now) is the only
     generally-correct answer in that case, since that's exactly the
-    environment `pip install claude-runway`'s own dependencies (including
-    `mcp-server-qdrant`, whose console-script `mcp_server_qdrant_path`
-    expects as a SIBLING of this same interpreter) were installed into --
-    confirmed live for `uv tool install` specifically: its own venv exposes
-    ONLY the installed package's own 3 console scripts on the shared `PATH`
-    shim directory, keeping `mcp-server-qdrant` (a dependency, not this
-    package's own entry point) reachable only as that real sibling-of-
-    `sys.executable` file inside the tool's private venv -- so this is not
-    just the simplest option, it's the only one that would have found it at
-    all without extra machinery (a `shutil.which()`-based lookup would NOT
-    find it, since pipx/uv tool deliberately don't expose it globally).
-
-    Deliberately NOT handling: a bare `pip install`/`pip install --user`
-    outside a dedicated venv (PR #136 review, Copilot) -- there,
-    `sys.executable` can be a shared system interpreter while the installed
-    console scripts land in a completely different directory (e.g.
-    `~/.local/bin` under `--user`), breaking the "sibling of the
-    interpreter" assumption `mcp_server_qdrant_path` relies on. This isn't
-    silently unhandled: it's out of scope, since neither the issue nor
-    `docs/installation.md`'s own "Alternative" callout documents or recommends that install
-    method -- pipx/`uv tool install` are the only ones actually promised to
-    work, and both were verified to satisfy this function's assumption
-    directly (see the previous paragraph).
+    environment `pip install claude-runway`'s own dependencies were
+    installed into, and every MCP server in the generated `.mcp.json` runs
+    its script under that one interpreter.
 
     Returns None (meaning: let `run_setup` fall back to its own pure
     `venv_python_path` default) when `TOOLS_REPO_DIR/.venv` already exists --
@@ -204,7 +184,7 @@ def _redact_secrets(mcp_servers: dict) -> dict:
 
 _QDRANT_MCP_JSON_COMMIT_CAUTION = (
     "  - WARNING: --qdrant-api-key was set, so .mcp.json now contains that credential in PLAINTEXT "
-    "across four env blocks (qdrant/codebase-indexer/memory-bank/local-compress). Do NOT commit .mcp.json as-is "
+    "across three env blocks (qdrant/codebase-indexer/memory-bank). Do NOT commit .mcp.json as-is "
     "if this repo is or will be shared -- either keep .mcp.json out of version control for this "
     "project (add it to .gitignore) or manage the key through your own untracked mechanism instead "
     "of committing it."
@@ -217,7 +197,9 @@ _DEFAULT_LMSTUDIO_URL = "http://localhost:1234/v1"
 def _hook_env_reminders(args: argparse.Namespace) -> list:
     """
     --track-savings/--lmstudio-model/--lmstudio-url/--savings-db only reach
-    the local-compress MCP server's env block in the generated .mcp.json --
+    the MCP servers' env blocks in the generated .mcp.json (local-compress,
+    for the two LM Studio values also qdrant, and for --track-savings/
+    --savings-db the opt-in analytics block) --
     they do NOT reach compress_output.py/session_end_savings.py, the
     hook scripts written into .claude/settings.json, since Claude Code hook
     entries have no env field of their own and instead inherit the shell's
@@ -232,11 +214,34 @@ def _hook_env_reminders(args: argparse.Namespace) -> list:
         reminders.append("CLAUDE_RUNWAY_TRACK_SAVINGS=1")
     if args.savings_db:
         reminders.append(f"CLAUDE_RUNWAY_SAVINGS_DB={args.savings_db}")
+    # CLAUDE_RUNWAY_METRICS_DB is deliberately not here: no hook reads it, so it
+    # is not a hook-side reminder (and this list is skipped under --qdrant-only,
+    # where the override is still written). See _metrics_db_reminder.
     if args.lmstudio_model:
         reminders.append(f"CLAUDE_RUNWAY_LMSTUDIO_MODEL={args.lmstudio_model}")
     if args.lmstudio_url != _DEFAULT_LMSTUDIO_URL:
         reminders.append(f"CLAUDE_RUNWAY_LMSTUDIO_URL={args.lmstudio_url}")
     return reminders
+
+
+def _metrics_db_reminder(args: argparse.Namespace) -> str:
+    """
+    The note printed for `--metrics-db`, or "" when it was not passed. Separate
+    from `_hook_env_reminders` because the reason is different: no hook reads
+    the metrics database, but the reporting CLIs run from a shell
+    (`tools/autowork_cost.py` and friends) read `CLAUDE_RUNWAY_METRICS_DB` from
+    the shell, and the override is written into the memory-bank block (and the
+    analytics block with --track-savings) in EVERY init mode, `--qdrant-only`
+    included, so the note must not depend on the hook-side suppression either.
+    """
+    if not args.metrics_db:
+        return ""
+    return (
+        f"\nNote: --metrics-db wrote CLAUDE_RUNWAY_METRICS_DB={args.metrics_db} into the memory-bank "
+        "server's env block (and the analytics block, with --track-savings). The reporting CLIs run from "
+        "a shell (e.g. tools/autowork_cost.py) read it from the shell environment, so export the same "
+        "value there too, or they will read the default database and miss these events."
+    )
 
 
 def _quote_command(argv: list, *, windows: bool) -> str:
@@ -352,6 +357,7 @@ def cmd_init(args: argparse.Namespace) -> None:
         lmstudio_model=args.lmstudio_model,
         track_savings=args.track_savings,
         savings_db=args.savings_db,
+        metrics_db=args.metrics_db,
         compact_collection=args.compact_collection,
         memory_bank_collection=args.memory_bank_collection,
         memory_bank_id=args.memory_bank_id,
@@ -359,11 +365,6 @@ def cmd_init(args: argparse.Namespace) -> None:
         memory_bank_embedding_model=args.memory_bank_embedding_model,
         include_compress=not args.qdrant_only,
         include_hooks=include_hooks,
-        # Issue #221: warm/verify the fastembed cache (and set
-        # HF_HUB_OFFLINE=1 if that succeeds) on every REAL run -- but never
-        # on --dry-run, which promises "nothing written" and shouldn't have
-        # network/disk side effects just to preview what would happen.
-        attempt_fastembed_warmup=not args.dry_run,
         # clean_hooks_if_unused's own special-case path is only relevant
         # when include_hooks=False (--skip-hooks now, exclusively) -- since
         # --qdrant-only keeps include_hooks=True (issue #198: core hooks are
@@ -400,13 +401,16 @@ def cmd_init(args: argparse.Namespace) -> None:
         print(
             "\nNote: "
             + ", ".join(reminders)
-            + " only configure(s) the local-compress MCP server's env block. "
+            + " only configure(s) the MCP servers' env blocks (qdrant for the LM Studio values, local-compress for all of them). "
             "The generated PostToolUse/SessionEnd hooks have no env block of their own -- "
             "they inherit your shell's environment unfiltered instead. Export the same "
             "value(s) at the shell level too (e.g. in ~/.zshrc/~/.bashrc, wherever `claude` "
             "is launched from), or the hooks will silently keep using their own defaults. "
             "See README.md's 'Environment variables' section."
         )
+    metrics_reminder = _metrics_db_reminder(args)
+    if metrics_reminder:
+        print(metrics_reminder)
 
     # Use the ACTUAL resolved collection name/Qdrant URL/include-exclude
     # filters from this run, not a generic placeholder -- found in PR #113
@@ -700,7 +704,7 @@ def parse_args() -> argparse.Namespace:
         "--qdrant-api-key",
         default="",
         help="API key for an authenticated remote Qdrant instance; leave blank for unauthenticated local "
-        "Qdrant. Applied to all four servers' QDRANT_API_KEY -- not 'sticky': pass it on every run, "
+        "Qdrant. Applied to the qdrant, codebase-indexer and memory-bank servers' QDRANT_API_KEY -- not 'sticky': pass it on every run, "
         "the same as --qdrant-url/--collection-name, or a rerun without it resets these servers back "
         "to unauthenticated. WARNING: writes the key in PLAINTEXT into .mcp.json -- do not commit that "
         "file as-is if this repo is shared; this script will print a reminder instead of the usual "
@@ -731,11 +735,23 @@ def parse_args() -> argparse.Namespace:
     init.add_argument(
         "--lmstudio-model",
         default="",
-        help="Exact model id loaded in LM Studio; leave blank to auto-detect (only works if exactly one model is loaded)",
+        help="Exact model id loaded in LM Studio; leave blank to auto-detect (only works if exactly one model is loaded). "
+        "Written to the local-compress block and to the qdrant block (compact_store compresses with it)",
     )
-    init.add_argument("--track-savings", action="store_true", help="Enable the opt-in savings tracker")
+    init.add_argument(
+        "--track-savings",
+        action="store_true",
+        help="Enable the opt-in savings tracker. Also writes the opt-in `analytics` server (savings_summary/"
+        "savings_detail/savings_trend, get_metrics, record_metric); without this flag that block is not written",
+    )
     init.add_argument(
         "--savings-db", default="", help="Override the savings tracker DB path (leave blank for the default)"
+    )
+    init.add_argument(
+        "--metrics-db",
+        default="",
+        help="Override the shared metrics DB path (leave blank for the default). Written into the `memory-bank` "
+        "block (it writes into that store) and, with --track-savings, the `analytics` block, so both use one file",
     )
     init.add_argument(
         "--memory-bank-collection",
@@ -762,7 +778,7 @@ def parse_args() -> argparse.Namespace:
         "--compact-collection",
         default="",
         help="Base Qdrant collection name the my-compact/my-resume skills store conversation compacts under "
-        "(compress_mcp_server.py's COMPACT_COLLECTION); leave blank to use the shared 'conversation-compacts' "
+        "(qdrant_mcp_server.py's COMPACT_COLLECTION, in the qdrant block); leave blank to use the shared 'conversation-compacts' "
         "default. NOT 'sticky' to a per-project value on its own (matches every other option here): omitting "
         "this flag ALWAYS resolves to 'conversation-compacts' regardless of what a project's .mcp.json currently "
         "has, so a re-run is only a no-op for a project that has never customized this (via /my-setup-clauderunway's "
@@ -770,7 +786,7 @@ def parse_args() -> argparse.Namespace:
         "later raw-CLI re-run resets it back to 'conversation-compacts', orphaning that project's existing "
         "conversation-compact history from compact lookup. Repeat the same --compact-collection value on every "
         "re-run for such a project, or go through /my-setup-clauderunway instead, which extracts and re-passes "
-        "the current value automatically. compress_mcp_server.py still appends its own "
+        "the current value automatically. qdrant_mcp_server.py still appends its own "
         "-<sanitized-project> suffix on top of whichever base this resolves to, at runtime "
         "(this base is a shared prefix; per-project isolation comes from payload filtering, not name uniqueness) "
         "-- so the final on-disk collection name is "

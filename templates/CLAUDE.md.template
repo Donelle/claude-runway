@@ -7,7 +7,7 @@
 
 ## Vector memory (Qdrant MCP)
 
-Two tools: `qdrant-find` (semantic search) and `qdrant-store` (save a note for later retrieval), plus `index_repo`/`sync_repo`/`preview_index`/`get_collection_info`/`find_in_collection`/`list_collections` from the codebase-indexer server.
+Five tools from the `qdrant` server: `qdrant-find` (semantic search) and `qdrant-store` (save a note for later retrieval) for this project's own knowledge, and `compact_store`/`compact_find`/`compact_prune` for conversation compacts (see below), plus `index_repo`/`sync_repo`/`preview_index`/`get_collection_info`/`find_in_collection`/`set_collection_description`/`list_collections` from the codebase-indexer server.
 
 Prefer `qdrant-find` over Grep/Read for conceptual lookups — "where is X handled," "how does Y work," "what did we decide about Z." Use Grep directly for exact identifiers, error strings, or known symbols.
 
@@ -19,7 +19,9 @@ Run sync_repo at the start of a session (or after a batch of edits) to keep the 
 
 Dedup within a session: if the same conceptual question resurfaces, reuse the earlier qdrant-find result instead of re-querying.
 
-**Cross-repo lookups:** `qdrant-find` only ever searches THIS project's own collection. When a question genuinely requires another already-indexed repo's codebase — e.g. working in a frontend repo but needing to understand how the backend it calls actually implements an endpoint — use `find_in_collection(query, collection)` instead. If the user names an exact collection directly in their prompt, pass it through as given rather than guessing. Call `list_collections` first if you don't know the other repo's exact collection name. Don't reach for this for questions answerable from this project's own collection; it's specifically for when the answer lives in a different repo's code.
+**Conversation compacts:** `compact_store` saves a summary of the current conversation into this project's own compact collection, compressing it on the local model first when LM Studio is available and storing it as given when it is not. `compact_find` lists a project's saved compacts newest first, or searches them when given a `query`. `compact_prune` deletes old compacts by `keep_last_n` or `older_than_days`, and only reports what it would delete unless you pass `dry_run=False`. `/my-compact` and `/my-resume` call `compact_store` and `compact_find` for you, so you rarely call them by hand. Never use them for notes about the code: that is what `qdrant-store`/`qdrant-find` are for, and compacts stored there would be buried under code chunks.
+
+**Cross-repo lookups:** `qdrant-find` only ever searches THIS project's own collection. When a question genuinely requires another already-indexed repo's codebase — e.g. working in a frontend repo but needing to understand how the backend it calls actually implements an endpoint — use `find_in_collection(query, collection)` instead. If the user names an exact collection directly in their prompt, pass it through as given rather than guessing. Call `list_collections` first if you don't know the other repo's exact collection name. Don't reach for this for questions answerable from this project's own collection; it's specifically for when the answer lives in a different repo's code. `set_collection_description(collection, description)` sets the one-line hint `list_collections` shows for a collection; call it only when the user asks, since this project's own hint normally comes from `COLLECTION_DESCRIPTION` in `.mcp.json`.
 
 ## Durable memory (memory-bank MCP)
 
@@ -41,7 +43,7 @@ A fourth tool, `transfer_memories(source_collection, dry_run=True)`, copies memo
 
 ## Local compression (LM Studio MCP)
 
-Four tools: `compress_file`, `compress_command_output`, `fetch_url` (use these), and `compress_text` (narrow case only — see below).
+Five tools from the `local-compress` server: `compress_file`, `compress_command_output`, `fetch_url` (use these), `compress_text` (narrow case only — see below), and `list_local_models` (a status check). The savings and metrics tools are not on this server: they live on the opt-in `analytics` server (see the Analytics section, when present).
 
 Prefer `compress_command_output` over Bash when a command is expected to produce large, mostly-mechanical output — test suites, builds, verbose linters — and you want to know the gist or whether it failed, not read the full log. Prefer `compress_file` over Read for large mechanical files already on disk (saved logs, big diffs) under the same condition. Prefer `fetch_url` over WebFetch when you want the page reviewed and summarized by the local model instead of by WebFetch's own Anthropic-hosted extraction step — `fetch_url` lets you steer what to extract via `focus`, and does the fetch, extraction, and summarization entirely server-side/locally. Do NOT use `fetch_url` for pages needing auth, JavaScript rendering, or session handling — use WebFetch for those. All three run/read/fetch server-side, so the raw content never enters your context — only the summary does. That's what makes these save tokens; reading the output yourself first and then trying to compress it does not.
 
@@ -52,3 +54,26 @@ Do NOT use either for source code you intend to edit — read that directly with
 compress_text does not save tokens if you already had to read something into context to call it — only use it for content you legitimately already hold (e.g. your own long draft), not as a way to compress something you just read or ran.
 
 If list_local_models reports LM Studio isn't reachable or no model is loaded, fall back to reading/running things directly rather than blocking on it.
+
+## Analytics (opt-in MCP server)
+
+Include this section only if the project's `.mcp.json` has an `analytics` server. `init --track-savings` writes that block; without the flag it is not written, and then these tools do not exist: calling one is an unknown-tool error, **not** an empty result or "no data yet". Do not conclude savings or metrics are zero because a call failed.
+
+Five read/write tools from the `analytics` server, all backed by local SQLite files (no model, no Qdrant):
+
+- `savings_summary`, `savings_detail`, `savings_trend`: the savings tracker's simple, detail and trend views (characters before and after local compression, per session, per tool and per project). `/my-savings` calls them. They answer "what is the compression saving me?", and say tracking is off (an explanation, not an error) when `CLAUDE_RUNWAY_TRACK_SAVINGS` is not set.
+- `get_metrics(metric_id, view=...)`: reads the shared cross-tool metrics store (views `summary`, `by_event_type`, `trend`, `detail`). `/my-metrics` calls it. The metric ids with a writer today are `autowork` (per-ticket outcome rows from `/my-gh-autowork`, including the `ticket_cost` rows `tools/autowork_cost.py record` writes) and `memory-bank` (a tally of `remember`/`recall`/`forget` calls). Any other id returns "no events recorded yet". Savings are a separate store: read them through the savings tools, not `get_metrics`.
+- `record_metric(metric_id, event_type, ...)`: appends one event to that metrics store. Only for a caller that has something to log and no CLI for it; routine recording needs no call from you, because savings events are written by the compression server and the hooks, and memory-bank counts its own calls.
+
+Reporting CLIs that sit beside these tools and answer what they cannot (run them from the claude-runway checkout; they read files, they never call a model):
+
+- `tools/memory_bank_report.py`: memory-bank usage: the dead-memory ratio and the recall payload trend, per project.
+- `tools/autowork_cost.py report`: per-ticket cost of `/my-gh-autowork` runs from subagent transcripts: tokens by model, cache-read share, tool calls and wall clock.
+- `tools/context_breakdown.py`: what a subagent's starting context is made of and why it grows (subcommands `start`, `calibrate`, `growth`, `reads`).
+- `tools/report_tool_counts.py`: how many tools each claude-runway MCP server exposes and how big their descriptions are.
+
+## Setup and diagnostics (claude-runway skills and CLIs)
+
+Include this section only for a project that has the claude-runway skills installed. Slash commands, each answering one question: `/my-setup-clauderunway` (configure or upgrade this project's `.mcp.json` and `.claude/settings.json`; needs `CLAUDE_RUNWAY_DIR` exported), `/my-compact` and `/my-resume` (save and restore a conversation, see the compacts paragraph above), `/my-savings` and `/my-metrics` (read the `analytics` server, see above).
+
+Two CLIs, run from the claude-runway checkout (they read files and never call a model), to diagnose a setup: `tools/doctor.py <project>` reports whether `.mcp.json`'s `local-compress` env block and the live shell disagree on the `CLAUDE_RUNWAY_*` variables that must match ("why is compression not happening?"), and `tools/measure_startup_context.py` measures what the MCP servers add to a session's starting context from real transcripts ("what does this toolkit cost me before I type anything?").

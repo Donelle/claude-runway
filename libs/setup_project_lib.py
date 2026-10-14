@@ -13,30 +13,8 @@ themselves.
 
 Deliberately patches KNOWN fields structurally (dict/list traversal) rather
 than doing a blind string find-and-replace of the placeholder tokens over
-the raw template text. This matters for one field specifically:
-`mcp.json.template`'s `qdrant` server has `"command":
-"REPLACE-WITH-VENV-PYTHON/bin/mcp-server-qdrant"`, but `docs/installation.md`'s own
-step 3 instructs substituting `REPLACE-WITH-VENV-PYTHON`
-everywhere with the *full python interpreter path* (e.g.
-`.../.venv/bin/python`). Doing that literal substitution on this one field
-produces a broken, doubled path: `.../.venv/bin/python/bin/mcp-server-qdrant`
--- the sibling console-script is installed as a SIBLING of the interpreter
-in the same `bin`/`Scripts` directory, not something reachable by
-appending a path segment onto the interpreter's own path. A human
-following the README instructions verbatim would produce this exact
-broken config. See `mcp_server_qdrant_path()` below for the fix.
-
-That console-script's name is also easy to get wrong independently of the
-doubled-path bug above: `pip install mcp-server-qdrant` registers the
-entry point as the HYPHENATED `mcp-server-qdrant` (which is also what the
-template's own literal text above now correctly spells) -- the underscored
-`mcp_server_qdrant` is only the Python *import* package name (`from
-mcp_server_qdrant.main import main`), never a file that exists on disk in
-the venv's `bin`/`Scripts` directory. Found in PR #113 review and confirmed
-directly (`ls .venv/bin/` shows `mcp-server-qdrant`, not
-`mcp_server_qdrant`) -- only the Python function/variable names in this
-file use underscores, per Python naming convention, which is unrelated to
-the actual script filename on disk.
+the raw template text, so each field gets exactly the value meant for it
+(and `find_unresolved_placeholders` can prove nothing was missed).
 """
 
 from __future__ import annotations
@@ -46,18 +24,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional
-
-# Flat import, not a package-relative one: every libs/*.py module lives in
-# the same libs/ directory, which callers (tools/setup_project.py, test
-# harnesses) add to sys.path directly rather than treating libs/ as a real
-# Python package -- see e.g. libs/memory_bank_lib.py's own
-# `from qdrant_retry import ...`. qdrant_ingest_lib.py stays importable
-# without `fastembed`/`qdrant-client` installed (warm_fastembed_cache
-# imports fastembed lazily, inside the function, only when actually
-# called), so this doesn't add a real dependency to this otherwise
-# dependency-free module.
-from qdrant_ingest_lib import warm_fastembed_cache
+from typing import Optional
 
 
 def default_collection_name(repo_path: Path) -> str:
@@ -66,7 +33,7 @@ def default_collection_name(repo_path: Path) -> str:
     directory name, e.g. "My Cool App!" -> "my-cool-app".
 
     This is only a convenience DEFAULT, not a collision-proofed identifier.
-    tools/compress_mcp_server.py's `_sanitize_project` is not one either: it
+    tools/qdrant_mcp_server.py's `_sanitize_project` is not one either: it
     appends no hash, so names differing only in punctuation/whitespace map to
     the same conversation-compacts collection, and per-project isolation there
     comes from payload filtering on read/prune. Here the collection name is a
@@ -92,21 +59,6 @@ def venv_python_path(tools_repo_dir: Path, *, windows: bool = False) -> Path:
     if windows:
         return tools_repo_dir / ".venv" / "Scripts" / "python.exe"
     return tools_repo_dir / ".venv" / "bin" / "python"
-
-
-def mcp_server_qdrant_path(venv_python: Path) -> Path:
-    """
-    Path to the `mcp-server-qdrant` console-script pip installs as a SIBLING
-    of the venv's python interpreter (same `bin`/`Scripts` directory) -- see
-    this module's docstring for why this can't just be a
-    "REPLACE-WITH-VENV-PYTHON/bin/mcp-server-qdrant" text-substitution the
-    way the raw template literally spells it: substituting the full
-    interpreter path there produces a broken, doubled path, since the
-    sibling console-script is never reachable by appending a segment onto
-    the interpreter's own path.
-    """
-    suffix = ".exe" if venv_python.suffix.lower() == ".exe" else ""
-    return venv_python.parent / f"mcp-server-qdrant{suffix}"
 
 
 def load_json(path: Path) -> dict:
@@ -144,18 +96,6 @@ def find_unresolved_placeholders(value: object) -> list:
     return found
 
 
-def resolved_fastembed_cache_path(home_dir: Path) -> Path:
-    """
-    Single source of truth for where a generated `.mcp.json`'s `qdrant`
-    server's `FASTEMBED_CACHE_PATH` points -- factored out of
-    `build_mcp_servers` (issue #221) so `run_setup`'s own fastembed-warm-up
-    step (which needs this SAME path to warm/verify before deciding whether
-    `HF_HUB_OFFLINE=1` is safe to write) can't drift from what actually gets
-    written into the config.
-    """
-    return home_dir / ".claude" / "claude-runway" / "fastembed-cache"
-
-
 def build_mcp_servers(
     template: dict,
     *,
@@ -172,11 +112,11 @@ def build_mcp_servers(
     lmstudio_model: str = "",
     track_savings: bool = False,
     savings_db: str = "",
+    metrics_db: str = "",
     compact_collection: str = "",
     memory_bank_collection: str = "",
     memory_bank_id: str = "",
     include_compress: bool = True,
-    hf_hub_offline: bool = False,
     embedding_model: str = "",
     memory_bank_embedding_model: str = "",
     compact_embedding_model: str = "",
@@ -184,13 +124,13 @@ def build_mcp_servers(
     """
     Returns a fresh `mcpServers` dict (deep-copied from `template`, never
     mutated in place) with every placeholder in the qdrant/codebase-indexer/
-    local-compress blocks resolved to a real value. Paths are emitted as
+    memory-bank/local-compress blocks resolved to a real value. Paths are emitted as
     forward-slash (`Path.as_posix()`) to match the templates' own style,
     which uses forward slashes even in its Windows-facing example paths.
 
     `compact_collection`, if blank, defaults to the template's own historical
     "conversation-compacts" -- a single bucket shared by every project on
-    the machine. This is a shared base prefix: compress_mcp_server.py
+    the machine. This is a shared base prefix: qdrant_mcp_server.py
     appends the sanitized project name at runtime, and per-project isolation
     comes from its payload filtering on read/prune, not from the name being
     unique (see `_collections_for_project`'s sibling-scan there, which finds other
@@ -201,10 +141,10 @@ def build_mcp_servers(
     already-configured project the moment its `.mcp.json` gets regenerated
     (a plain re-run with no new flags, the exact "safe to re-run" workflow
     this script's own module docstring advertises) -- since every project's
-    `local-compress.env.COMPACT_COLLECTION` has only ever held this one
-    constant so far (this function never touched the key at all before
-    PR #130), and `merge_mcp_json` replaces the whole `local-compress` block
-    wholesale, not a per-key deep merge. Changing the *base prefix* silently
+    `COMPACT_COLLECTION` (then in the `local-compress` env, now in the `qdrant`
+    env) has only ever held this one constant so far (this function never
+    touched the key at all before PR #130), and `merge_mcp_json` replaces the
+    whole server block wholesale, not a per-key deep merge. Changing the *base prefix* silently
     orphans that project's entire conversation-compact history: the
     sibling-scan and canonical-name computation both key off this exact
     string, so the moment it changes, `/my-resume` can no longer find
@@ -223,7 +163,7 @@ def build_mcp_servers(
     Whatever `compact_collection` resolves to is deliberately never left
     blank in the generated env block, regardless of source: relying on
     `os.environ.get("COMPACT_COLLECTION", "conversation-compacts")`'s own
-    fallback in compress_mcp_server.py isn't enough on its own, since that
+    fallback in qdrant_mcp_server.py isn't enough on its own, since that
     fallback only fires when the key is genuinely ABSENT, not when it's
     present-but-empty -- an explicit `.mcp.json` env entry set to `""`
     would otherwise build a collection name with a leading stray hyphen
@@ -258,44 +198,34 @@ def build_mcp_servers(
     here) preserves the existing identity independent of whatever
     `collection_name` resolves to on that run.
 
-    `qdrant_api_key` is applied to all four servers' `QDRANT_API_KEY`
-    (confirmed the correct, shared env var name across `mcp-server-qdrant`'s
-    own `QdrantSettings` -- `validation_alias="QDRANT_API_KEY"` -- and this
-    repo's own `ingest_mcp_server.py`/`compress_mcp_server.py`, which read
-    the exact same variable so a single project's `.mcp.json` keeps every
-    Qdrant-talking server aligned). Found in PR #113 review: since this
-    script previously always replaced these servers' `env` blocks wholesale
-    with values it computed, an authenticated remote-Qdrant setup's
-    manually-added `QDRANT_API_KEY` (a field the qdrant/codebase-indexer
-    blocks didn't even have here before this fix) was silently dropped on
-    every rerun, and local-compress's own copy was reset back to the
-    template's blank default. Passing `--qdrant-api-key` explicitly on every
+    `qdrant_api_key` is applied to the three Qdrant-talking servers'
+    `QDRANT_API_KEY` (`qdrant`, `codebase-indexer` and `memory-bank`, which
+    all read the exact same variable so a single project's `.mcp.json` keeps
+    every one of them aligned). Found in PR #113 review: since this script
+    previously always replaced these servers' `env` blocks wholesale with
+    values it computed, an authenticated remote-Qdrant setup's
+    manually-added `QDRANT_API_KEY` was silently dropped on every rerun. Passing `--qdrant-api-key` explicitly on every
     run (the same pattern already used for `--qdrant-url`/`--collection-
     name`/etc. -- none of this CLI's other options are "sticky" either) is
     what keeps it from reverting.
 
-    `hf_hub_offline` (issue #221) is deliberately NOT something this
-    function decides for itself -- it stays a pure computation over an
-    already-decided bool, computed by `run_setup`'s own fastembed-warm-up
-    step (see `qdrant_ingest_lib.warm_fastembed_cache`) BEFORE calling this
-    function, since deciding it here would require this function to make a
-    live network call / touch disk beyond the template, breaking the "pure,
-    no network/disk side effects" property every existing test of this
-    function (and every OTHER caller) already relies on. When True, writes
-    `HF_HUB_OFFLINE=1` into the qdrant server's env block -- confirmed
-    directly that this cuts `mcp-server-qdrant`'s own startup from ~59.6s to
-    ~2.0s against an already-warm cache, by skipping the live
-    huggingface.co revision-resolution call `fastembed`'s `TextEmbedding`
-    otherwise always makes even on a cache hit. Never left unset either way
-    (same "present-but-blank, not absent" convention as
-    `CLAUDE_RUNWAY_TRACK_SAVINGS`/`compact_collection`/etc. above) --
-    `False` writes an explicit empty string, not a missing key.
-
-    `compact_embedding_model` (issue #397) is the `local-compress` block's own
-    `EMBEDDING_MODEL`, deliberately separate from `embedding_model`: compacts
-    are stored under a model-named vector, so changing it orphans an existing
+    `compact_embedding_model` is the `qdrant` block's `COMPACT_EMBEDDING_MODEL`
+    (it was the `local-compress` block's `EMBEDDING_MODEL` before the compact
+    tools moved), deliberately separate from `embedding_model`: compacts are
+    stored under a model-named vector, so changing it orphans an existing
     install's compacts. Blank leaves the template default. `run_setup` decides
     what to pass (see `resolve_compact_embedding_model`).
+
+    `track_savings` also decides whether the opt-in `analytics` block is
+    emitted at all (it is dropped from the result otherwise); `savings_db` and
+    `metrics_db` reach that block only when non-blank. A non-blank
+    `metrics_db` is also written into the `memory-bank` block, which writes
+    into the same shared store, so the two stay on one file.
+
+    The `qdrant` block also carries `lmstudio_url`/`lmstudio_model`, which
+    only `compact_store` uses (to compress a summary before storing it), so a
+    `--qdrant-only` setup (`include_compress=False`) still writes them: the
+    server stores uncompressed when LM Studio is not there.
 
     `embedding_model` (issue #279), if blank, leaves the template's own
     `EMBEDDING_MODEL` default in place; otherwise it is written into the two
@@ -320,12 +250,19 @@ def build_mcp_servers(
     tools_repo_str = Path(tools_repo_dir).as_posix()
 
     qdrant = servers["qdrant"]
-    qdrant["command"] = mcp_server_qdrant_path(venv_python).as_posix()
+    qdrant["command"] = venv_python_str
+    qdrant["args"] = [f"{tools_repo_str}/tools/qdrant_mcp_server.py"]
     qdrant["env"]["QDRANT_URL"] = qdrant_url
     qdrant["env"]["QDRANT_API_KEY"] = qdrant_api_key
     qdrant["env"]["COLLECTION_NAME"] = collection_name
-    qdrant["env"]["FASTEMBED_CACHE_PATH"] = resolved_fastembed_cache_path(home_dir).as_posix()
-    qdrant["env"]["HF_HUB_OFFLINE"] = "1" if hf_hub_offline else ""
+    qdrant["env"]["COMPACT_COLLECTION"] = compact_collection or "conversation-compacts"
+    qdrant["env"]["CLAUDE_RUNWAY_LMSTUDIO_URL"] = lmstudio_url
+    qdrant["env"]["CLAUDE_RUNWAY_LMSTUDIO_MODEL"] = lmstudio_model
+    # The compact embedding model is its own value, never blindly the
+    # template's: changing it orphans existing compacts. Blank leaves the
+    # template default (a brand-new install).
+    if compact_embedding_model:
+        qdrant["env"]["COMPACT_EMBEDDING_MODEL"] = compact_embedding_model
 
     resolved_memory_bank_collection = memory_bank_collection or "memory-bank"
     resolved_memory_bank_id = memory_bank_id or collection_name
@@ -353,6 +290,16 @@ def build_mcp_servers(
     # `embedding_model`. The memory-bank collection is ONE shared collection
     # locked to the model that first created it, so a change made for the
     # per-project code collections must never reach it.
+    # `memory-bank` writes its call tally (metric_id="memory-bank") into the same
+    # shared metrics database the `analytics` server reads, so a non-default
+    # path has to reach both blocks, or a launch without the shell export
+    # (a GUI, say) leaves the two on different files and `/my-metrics
+    # memory-bank` silently reports partial data. Written only when given (a
+    # blank value would mask an inherited shell value), and regardless of
+    # `track_savings`, since the memory-bank server needs it either way.
+    if metrics_db:
+        memory_bank["env"]["CLAUDE_RUNWAY_METRICS_DB"] = metrics_db
+
     if embedding_model:
         for block in (qdrant, indexer):
             block["env"]["EMBEDDING_MODEL"] = embedding_model
@@ -365,18 +312,28 @@ def build_mcp_servers(
         compress["args"] = [f"{tools_repo_str}/tools/compress_mcp_server.py"]
         compress["env"]["CLAUDE_RUNWAY_LMSTUDIO_URL"] = lmstudio_url
         compress["env"]["CLAUDE_RUNWAY_LMSTUDIO_MODEL"] = lmstudio_model
-        compress["env"]["QDRANT_URL"] = qdrant_url
-        compress["env"]["QDRANT_API_KEY"] = qdrant_api_key
         compress["env"]["CLAUDE_RUNWAY_TRACK_SAVINGS"] = "1" if track_savings else ""
         compress["env"]["CLAUDE_RUNWAY_SAVINGS_DB"] = savings_db
-        compress["env"]["COMPACT_COLLECTION"] = compact_collection or "conversation-compacts"
-        # Issue #397: the compact embedding model is its own value, never
-        # blindly the template's -- changing it orphans existing compacts.
-        # Blank leaves the template default (a brand-new install).
-        if compact_embedding_model:
-            compress["env"]["EMBEDDING_MODEL"] = compact_embedding_model
     else:
         del servers["local-compress"]
+
+    # The `analytics` server (savings_summary/savings_detail/savings_trend,
+    # get_metrics, record_metric) is opt-in: it is written only when savings
+    # tracking is on, and only alongside local-compress (the tracker records
+    # compression events, which need that server and its hooks). Both DB keys
+    # are written only when overridden: a blank value would mask the
+    # inherited shell value instead of falling through to the default path.
+    if track_savings and include_compress:
+        analytics = servers["analytics"]
+        analytics["command"] = venv_python_str
+        analytics["args"] = [f"{tools_repo_str}/tools/analytics_mcp_server.py"]
+        analytics["env"]["CLAUDE_RUNWAY_TRACK_SAVINGS"] = "1"
+        if savings_db:
+            analytics["env"]["CLAUDE_RUNWAY_SAVINGS_DB"] = savings_db
+        if metrics_db:
+            analytics["env"]["CLAUDE_RUNWAY_METRICS_DB"] = metrics_db
+    else:
+        del servers["analytics"]
 
     return servers
 
@@ -454,33 +411,60 @@ def resolve_memory_bank_embedding_model(explicit: str, existing_mcp: dict, templ
     return (explicit or "").strip() or existing_memory_bank_model(existing_mcp) or template_default
 
 
-# What an install that predates the local-compress `EMBEDDING_MODEL` setting
-# (issue #397) actually stored its compacts with -- must match
-# `compress_mcp_server.LEGACY_COMPACT_EMBEDDING_MODEL`. Full model id, never
-# the short name.
+# What an install that predates the compact embedding-model setting actually
+# stored its compacts with -- must match
+# `qdrant_mcp_server.LEGACY_COMPACT_EMBEDDING_MODEL`. Full model id, never the
+# short name.
 LEGACY_COMPACT_EMBEDDING_MODEL = "BAAI/bge-small-en"
+
+
+def _server_env(existing_mcp: dict, name: str) -> "Optional[dict]":
+    """The `env` dict of the named server block in an existing `.mcp.json`, or
+    None when the block or its env is missing or oddly shaped."""
+    servers = existing_mcp.get("mcpServers") if isinstance(existing_mcp, dict) else None
+    block = servers.get(name) if isinstance(servers, dict) else None
+    env = block.get("env") if isinstance(block, dict) else None
+    return env if isinstance(env, dict) else None
+
+
+def _non_blank(env: "Optional[dict]", key: str) -> str:
+    value = env.get(key) if env is not None else None
+    return value.strip() if isinstance(value, str) else ""
 
 
 def resolve_compact_embedding_model(existing_mcp: dict, project_model: str) -> str:
     """
-    Which `EMBEDDING_MODEL` a (re-)run of `init` writes into `local-compress`
-    (issue #397). Unlike the code-index model there is no explicit-override
-    flag: changing it only ever orphans stored compacts, so a re-run must
-    never do that on its own:
-      1. an existing `local-compress` block's own non-blank value is kept;
-      2. an existing block WITHOUT one predates the setting, so its compacts
-         were stored under the legacy model -- pin that;
-      3. no block at all (a brand-new install) uses the project model.
+    Which `COMPACT_EMBEDDING_MODEL` a (re-)run of `init`, and the migration that
+    moves the compact tools onto the `qdrant` server, writes. Unlike the
+    code-index model there is no explicit-override flag: changing it only ever
+    orphans stored compacts, so a re-run must never do that on its own:
+      1. an existing `qdrant` block's own non-blank `COMPACT_EMBEDDING_MODEL`
+         is kept (the compact tools already live there);
+      2. otherwise, an existing `local-compress` block is where a pre-move
+         install's compacts were configured: its non-blank `EMBEDDING_MODEL`
+         is kept;
+      3. otherwise, ANY existing toolkit config (a `qdrant` or `local-compress`
+         block) is pinned to the legacy model. A missing `local-compress`
+         block does not prove no compact was ever stored: a full setup later
+         re-run with `--qdrant-only` deletes that block but leaves its
+         compacts in Qdrant, and every compact stored before this setting
+         existed was embedded with the legacy model. Guessing wrong the other
+         way orphans them; guessing legacy for a project that never stored a
+         compact costs nothing, since its first compact simply creates the
+         collection under that model;
+      4. only a config with neither block (genuinely empty, or holding just
+         unrelated servers) uses the project model.
     """
+    qdrant_value = _non_blank(_server_env(existing_mcp, "qdrant"), "COMPACT_EMBEDDING_MODEL")
+    if qdrant_value:
+        return qdrant_value
+    compress_value = _non_blank(_server_env(existing_mcp, "local-compress"), "EMBEDDING_MODEL")
+    if compress_value:
+        return compress_value
     servers = existing_mcp.get("mcpServers") if isinstance(existing_mcp, dict) else None
-    block = servers.get("local-compress") if isinstance(servers, dict) else None
-    if not isinstance(block, dict):
-        return project_model
-    env = block.get("env")
-    value = env.get("EMBEDDING_MODEL") if isinstance(env, dict) else None
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    return LEGACY_COMPACT_EMBEDDING_MODEL
+    if isinstance(servers, dict) and any(isinstance(servers.get(name), dict) for name in ("qdrant", "local-compress")):
+        return LEGACY_COMPACT_EMBEDDING_MODEL
+    return project_model
 
 
 # (event, script filename) for every hook this toolkit's templates define,
@@ -620,7 +604,7 @@ def build_settings_hooks(
 # toolkit-owned server a prior run added but this run omits (e.g.
 # `--qdrant-only` after a previous run had configured local-compress) --
 # see merge_mcp_json's docstring.
-_OWNED_MCP_SERVER_KEYS = ("qdrant", "codebase-indexer", "memory-bank", "local-compress")
+_OWNED_MCP_SERVER_KEYS = ("qdrant", "codebase-indexer", "memory-bank", "local-compress", "analytics")
 
 
 def merge_mcp_json(existing: dict, generated_servers: dict, *, owned_keys: tuple = _OWNED_MCP_SERVER_KEYS) -> dict:
@@ -1009,6 +993,7 @@ def run_setup(
     lmstudio_model: str = "",
     track_savings: bool = False,
     savings_db: str = "",
+    metrics_db: str = "",
     compact_collection: str = "",
     memory_bank_collection: str = "",
     memory_bank_id: str = "",
@@ -1017,38 +1002,17 @@ def run_setup(
     clean_hooks_if_unused: bool = False,
     home_dir: Optional[Path] = None,
     templates_dir: Optional[Path] = None,
-    attempt_fastembed_warmup: bool = False,
-    fastembed_warmup_fn: Optional[Callable[..., bool]] = None,
     embedding_model: str = "",
     memory_bank_embedding_model: str = "",
 ) -> SetupResult:
     """
-    Pure computation (no disk writes to `target_repo`, with one deliberate
-    exception -- see `attempt_fastembed_warmup` below) of the final
+    Pure computation (no disk writes to `target_repo`) of the final
     `.mcp.json`/`.claude/settings.json` contents for `target_repo`. The
     caller (the CLI in tools/setup_project.py) is responsible for actually
     writing the result or printing it for --dry-run. Reads the target repo's
     CURRENT files if they already exist, so re-running this (or running it
     against a repo with pre-existing unrelated config) merges rather than
     clobbers -- see merge_mcp_json/merge_settings_hooks.
-
-    `attempt_fastembed_warmup` (issue #221, default False -- opt-in, so
-    every EXISTING caller/test of this function keeps its current
-    network/disk-free behavior unchanged) is that one deliberate exception:
-    when True, this calls `qdrant_ingest_lib.warm_fastembed_cache` (or
-    `fastembed_warmup_fn` if given -- tests inject a fake here so they never
-    import real `fastembed` or touch the network) BEFORE building the
-    qdrant server's env block, using the SAME `EMBEDDING_MODEL` string this
-    run is about to write (issue #279: `embedding_model` if passed, else the
-    one already in the target's existing `.mcp.json`, else the template's
-    default -- see `resolve_embedding_model`) and the SAME
-    `FASTEMBED_CACHE_PATH` this run is about to write (via
-    `resolved_fastembed_cache_path`) -- so the thing that gets
-    warmed/verified is always the thing the generated config actually
-    points at. The CLI passes `attempt_fastembed_warmup=not args.dry_run`: a
-    preview shouldn't have network/disk side effects. Whether this succeeds
-    or not, a `changes` entry records the outcome so both --dry-run and a
-    real run surface it.
 
     `embedding_model` (issue #279, CLI `--embedding-model`) is the one
     setting that IS sticky across re-runs: blank means "keep whatever the
@@ -1061,8 +1025,7 @@ def run_setup(
     independent of `embedding_model`: blank keeps the block's existing value
     (template default for a block that does not exist). A non-blank value that
     differs from the existing one adds a WARNING, because the shared collection
-    is locked to the model that created it. Its model is warmed into the
-    fastembed cache too when `attempt_fastembed_warmup` is on.
+    is locked to the model that created it.
 
     `include_hooks=False` corresponds to the CLI's `--skip-hooks`: don't
     touch `.claude/settings.json` at all, even if it already has this
@@ -1111,29 +1074,6 @@ def run_setup(
         memory_bank_embedding_model, existing_mcp, template_memory_bank_model
     )
 
-    # Issue #221: decide -- BEFORE building the qdrant server's env block --
-    # whether it's safe to set HF_HUB_OFFLINE=1, so mcp-server-qdrant's own
-    # startup never pays for a live huggingface.co round-trip against a
-    # model that's already fully cached. Uses the exact same
-    # EMBEDDING_MODEL/FASTEMBED_CACHE_PATH values this run is about to
-    # write, so what gets warmed/verified always matches what the generated
-    # config actually points at. Opt-in (default False) and injectable
-    # (fastembed_warmup_fn) so every existing caller/test is unaffected.
-    hf_hub_offline = False
-    memory_bank_warm = False
-    if attempt_fastembed_warmup:
-        warmup_fn = fastembed_warmup_fn or warm_fastembed_cache
-        fastembed_cache_path = resolved_fastembed_cache_path(home_dir)
-        hf_hub_offline = bool(warmup_fn(resolved_embedding_model, fastembed_cache_path))
-        # Issue #428: the memory-bank server loads its own model, so warm that
-        # one too (skipped when it is the same model, already warmed above).
-        # Its outcome never affects HF_HUB_OFFLINE, which is the qdrant
-        # server's setting only.
-        if resolved_memory_bank_model == resolved_embedding_model:
-            memory_bank_warm = hf_hub_offline
-        else:
-            memory_bank_warm = bool(warmup_fn(resolved_memory_bank_model, fastembed_cache_path))
-
     generated_servers = build_mcp_servers(
         mcp_template,
         collection_name=resolved_collection_name,
@@ -1149,11 +1089,11 @@ def run_setup(
         lmstudio_model=lmstudio_model,
         track_savings=track_savings,
         savings_db=savings_db,
+        metrics_db=metrics_db,
         compact_collection=compact_collection,
         memory_bank_collection=memory_bank_collection,
         memory_bank_id=memory_bank_id,
         include_compress=include_compress,
-        hf_hub_offline=hf_hub_offline,
         embedding_model=resolved_embedding_model,
         memory_bank_embedding_model=resolved_memory_bank_model,
         compact_embedding_model=resolve_compact_embedding_model(existing_mcp, resolved_embedding_model),
@@ -1194,20 +1134,6 @@ def run_setup(
             f"Preserved the existing memory-bank EMBEDDING_MODEL '{previous_memory_bank_model}' (pass "
             f"--memory-bank-embedding-model to change it)."
         )
-    if attempt_fastembed_warmup and not memory_bank_warm:
-        changes.append(
-            f"Could not confirm the fastembed cache is warm for the memory-bank model "
-            f"'{resolved_memory_bank_model}'; its first start may download it. Safe to re-run this setup to retry."
-        )
-    if attempt_fastembed_warmup:
-        changes.append(
-            "Confirmed the fastembed cache is warm; HF_HUB_OFFLINE=1 set for the qdrant server (issue #221)."
-            if hf_hub_offline
-            else "Could not confirm the fastembed cache is fully warm -- HF_HUB_OFFLINE left blank, so the "
-            "qdrant server's startup may still occasionally pay for a slow huggingface.co round-trip "
-            "(issue #221). Safe to re-run this setup later to retry."
-        )
-
     # Issue #175: memory-bank reserves "general" as its cross-project
     # sentinel (metadata.repo) -- a project whose own MEMORY_BANK_ID
     # resolves to exactly that string would be indistinguishable from

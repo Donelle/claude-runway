@@ -1,6 +1,6 @@
 # Cross-repo lookups
 
-`qdrant-find` is locked to whichever collection is configured in the CURRENT project's `.mcp.json` — there's no way to pass it a different collection name, since `mcp-server-qdrant` bakes `COLLECTION_NAME` into the tool at server startup when that env var is set. That's fine for searching your own repo, but doesn't help when a question in one repo genuinely needs another already-indexed repo's codebase to answer — e.g. working in a frontend repo and needing to understand how the backend it calls implements an endpoint.
+`qdrant-find` is locked to whichever collection is configured in the CURRENT project's `.mcp.json` — there's no way to pass it a different collection name, since the `qdrant` server fixes `COLLECTION_NAME` from its env block at startup and the tool takes no collection argument. That's fine for searching your own repo, but doesn't help when a question in one repo genuinely needs another already-indexed repo's codebase to answer — e.g. working in a frontend repo and needing to understand how the backend it calls implements an endpoint.
 
 For that, `ingest_mcp_server.py` (the `codebase-indexer` server) also exposes:
 

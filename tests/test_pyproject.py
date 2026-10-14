@@ -107,8 +107,18 @@ class PyprojectTomlIsWellFormed(unittest.TestCase):
         # exactly) -- just pins that the same core packages
         # tools/ingest_to_qdrant.py actually imports are declared here too.
         deps = " ".join(self.data["project"]["dependencies"])
-        for expected in ("mcp", "mcp-server-qdrant", "qdrant-client", "fastembed", "pydantic_settings"):
+        for expected in ("mcp", "qdrant-client", "fastembed", "pydantic_settings"):
             self.assertIn(expected, deps)
+
+    def test_third_party_qdrant_server_packages_are_not_dependencies(self):
+        # This repo serves `qdrant` from its own tools/qdrant_mcp_server.py, so
+        # neither the third-party server package nor the compatibility pin that
+        # only existed for it may come back in either install file.
+        deps = [d.lower() for d in self.data["project"]["dependencies"]]
+        requirements = open(os.path.join(REPO_ROOT, "requirements.txt"), encoding="utf-8").read().lower()
+        for banned in ("mcp-server-qdrant", "fastmcp"):
+            self.assertFalse(any(d.startswith(banned) for d in deps), banned)
+            self.assertNotIn(banned, requirements)
 
     def test_local_compress_dependencies_are_base_not_optional(self):
         # PR #136 review (Copilot): claude-runway-setup's OWN default

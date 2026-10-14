@@ -2,8 +2,9 @@
 Storage + formatting for ClaudeRunway's opt-in savings tracker. Used by:
   - hooks/compress_output.py   (sole ledger WRITER -- see below for why)
   - hooks/session_end_savings.py    (rolls a session's ledger into SQLite, emits a summary)
-  - tools/compress_mcp_server.py     (the savings_summary/savings_detail/savings_trend tools read it;
-                                      the 3 credited tools themselves do NOT import this module --
+  - tools/analytics_mcp_server.py    (the savings_summary/savings_detail/savings_trend tools read it;
+                                      an opt-in server: recording never depends on it)
+  - tools/compress_mcp_server.py     (the credited tools do NOT write this module's ledger --
                                       their footer helper only measures character counts)
   - skills/my-savings/SKILL.md      (reads, via the savings_summary/savings_detail MCP tools)
 

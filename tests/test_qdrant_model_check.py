@@ -71,7 +71,7 @@ class CheckEmbeddingModelMismatchTest(unittest.TestCase):
     def tearDown(self):
         self._patcher.stop()
 
-    # --- Named-vector collections (mcp-server-qdrant's format) ---
+    # --- Named-vector collections (the format the repo's own connector writes) ---
 
     def test_named_vector_matching_name_and_size_returns_none(self):
         provider = _make_provider("fast-all-minilm-l6-v2", 384)

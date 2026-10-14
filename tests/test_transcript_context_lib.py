@@ -184,6 +184,42 @@ class LoadedSchemaTests(TranscriptFixture):
         self.assertEqual(T.loaded_schema_chars(self.write([_assistant()])), {})
 
 
+class OptionalServerTests(TranscriptFixture):
+    CORE = ["mcp__qdrant__qdrant-find", "mcp__codebase-indexer__sync_repo",
+            "mcp__memory-bank__recall", "mcp__local-compress__compress_file"]
+
+    def test_constants_keep_core_four_and_list_analytics_as_optional(self):
+        self.assertEqual(len(T.TOOLKIT_SERVERS), 4)
+        self.assertNotIn("analytics", T.TOOLKIT_SERVERS)
+        self.assertEqual(T.OPTIONAL_TOOLKIT_SERVERS, ("analytics",))
+
+    def test_analytics_tools_are_toolkit_tools(self):
+        names = ["mcp__analytics__get_metrics", "mcp__analytics__savings_summary", "WebFetch"]
+        self.assertEqual(T.toolkit_tool_names(names), {"mcp__analytics__get_metrics", "mcp__analytics__savings_summary"})
+
+    def test_a_loaded_analytics_schema_contributes_its_size(self):
+        p = self.write([_record({"mcp__analytics__get_metrics": "x" * 100})])
+        self.assertEqual(set(T.loaded_schema_chars(p)), {"mcp__analytics__get_metrics"})
+
+    def test_a_call_to_an_analytics_tool_counts_as_toolkit_use(self):
+        p = self.write([_delta(added=["WebFetch"]),
+                        _assistant(content=_tool_use("mcp__analytics__get_metrics"))])
+        self.assertEqual(T.toolkit_tools_used(p), {"mcp__analytics__get_metrics"})
+        self.assertEqual(T.summarize(p)["toolkit_used_not_deferred"], ["mcp__analytics__get_metrics"])
+
+    def test_summarize_and_compare_count_deferred_analytics_tools(self):
+        w = self.write([_delta(added=["mcp__analytics__get_metrics"]), _assistant(read=1000)])
+        wo = self.write([_delta(added=["WebFetch"]), _assistant(read=500)])
+        s = T.summarize(w)
+        self.assertEqual(s["toolkit_deferred_count"], 1)
+        self.assertEqual(s["toolkit_servers_deferred"], ["analytics"])
+        res = T.compare([w], [wo])["models"]["m1"]
+        self.assertEqual(res["with_toolkit_deferred"], [1])
+
+    def test_explicit_servers_argument_still_restricts_matching(self):
+        self.assertEqual(T.toolkit_tool_names(["mcp__analytics__get_metrics"], T.TOOLKIT_SERVERS), set())
+
+
 class CompareTests(TranscriptFixture):
     def test_difference_is_with_minus_without_per_model(self):
         w1 = self.write([_delta(added=["mcp__qdrant__qdrant-find"]), _assistant(model="m1", read=1000)])
@@ -277,6 +313,21 @@ class CliTests(TranscriptFixture):
         self.assertRegex(out, r"qdrant: 1")
         self.assertRegex(out, r"memory-bank: 0")
         self.assertRegex(out, r"all 4 servers: 0")
+
+    def test_survey_all_servers_line_ignores_the_optional_analytics_server(self):
+        # A session with the four core servers and no analytics still counts as "all 4";
+        # analytics is listed on its own line with its own count.
+        proj = self.dir / "proj"
+        proj.mkdir()
+        core = OptionalServerTests.CORE
+        (proj / "core.jsonl").write_text("\n".join(json.dumps(e) for e in [
+            _delta(added=core), _assistant(read=100)]), encoding="utf-8")
+        (proj / "tracked.jsonl").write_text("\n".join(json.dumps(e) for e in [
+            _delta(added=core + ["mcp__analytics__get_metrics"]), _assistant(read=100)]), encoding="utf-8")
+        _, out = self._run(["--survey", str(self.dir)])
+        self.assertRegex(out, r"all 4 servers: 2")
+        self.assertRegex(out, r"analytics \(optional[^)]*\): 1")
+        self.assertNotIn("all_four", out)
 
     def test_survey_does_not_guess_a_session_that_called_a_toolkit_tool_into_either_group(self):
         # Its server may simply have connected after the first turn, so a call with no

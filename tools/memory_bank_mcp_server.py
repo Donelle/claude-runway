@@ -13,7 +13,7 @@ a correction a reviewer made -- the kind of thing worth surviving a
 Project minimum: Python 3.12 (policy floor; the dependency chain supports >=3.10).
 
 Setup:
-    pip install "mcp[cli]" mcp-server-qdrant qdrant-client --break-system-packages
+    pip install "mcp[cli]" qdrant-client fastembed pydantic_settings --break-system-packages
 
 Register in .mcp.json (see templates/mcp.json.template's "memory-bank"
 block). Reuses the same QDRANT_URL/QDRANT_API_KEY/EMBEDDING_MODEL env var
@@ -41,7 +41,7 @@ from typing import Optional
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "libs"))
 
 from mcp.server.mcpserver import MCPServer, Context
-from mcp_server_qdrant.embeddings.fastembed import FastEmbedProvider
+from qdrant_embeddings import FastEmbedProvider
 from qdrant_client import QdrantClient
 
 from qdrant_ingest_lib import ensure_persistent_fastembed_cache

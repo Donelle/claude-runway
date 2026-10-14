@@ -60,7 +60,7 @@ unlikely even though back-to-back pairs eventually happen over a long
 enough single-retry sequence.
 
 Deliberately a separate module from qdrant_ingest_lib.py, which documents
-itself as intentionally dependency-free (no qdrant-client/mcp_server_qdrant
+itself as intentionally dependency-free (no qdrant-client/fastembed
 imports) for easy unit testing. This module's whole purpose is retrying an
 HTTP-level failure, so importing httpx here is unavoidable.
 """
@@ -73,7 +73,7 @@ from qdrant_client.http.exceptions import ResponseHandlingException
 
 # Both exception types are confirmed reachable from this code: QdrantClient
 # (sync) uses httpx.Client internally, and QdrantConnector (async, from
-# mcp_server_qdrant) uses AsyncQdrantClient (async httpx) internally. In
+# libs/qdrant_connector.py) uses AsyncQdrantClient (async httpx) internally. In
 # practice both arrive wrapped in ResponseHandlingException -- see
 # _is_transient below -- but the raw types are also checked directly in
 # case some call path ever raises them unwrapped.

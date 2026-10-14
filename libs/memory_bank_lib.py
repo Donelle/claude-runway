@@ -79,7 +79,7 @@ WEIGHT_FIELD = "metadata.weight"
 
 MEMORY_BANK_SOURCE = "memory-bank"
 
-# metadata.source value compress_mcp_server.compact_store stamps on every
+# metadata.source value qdrant_mcp_server.compact_store stamps on every
 # conversation-compact point (issue #282). Lives here beside
 # MEMORY_BANK_SOURCE so the writer and the indexer's delete guard
 # (memory_bank_exclusion_filter) share one constant and can't drift apart.

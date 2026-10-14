@@ -3,9 +3,16 @@ Shared, MCP-independent compression logic used by both:
   - compress_mcp_server.py     (MCP server exposing compress_file/compress_command_output/etc.)
   - hooks/compress_output.py  (PostToolUse hook that compresses ANY large tool output)
 
-Kept free of the `mcp` package dependency on purpose -- the hook script only
-needs `openai`, not the full MCP SDK, since it's invoked as a plain command
-hook, not an MCP server. ctx is accepted as a loosely-typed optional object
+Kept free of the `mcp` package dependency on purpose -- the hook script needs
+no MCP SDK, since it's invoked as a plain command hook, not an MCP server. It
+is also free of any model-client SDK import: this
+module is stdlib-only, so it imports in an environment without `openai`
+installed (a Qdrant-only install, or a caller that only needs
+`estimate_tokens`/`fetch_loaded_models`). The caller builds the model client
+(libs/lmstudio_client.py) and passes it to compress() as `client`; this module
+only calls `client.chat.completions.create(...)` and treats
+CompletionTimeout, which that client raises for a timed-out request, as the
+"timed out" failure. ctx is accepted as a loosely-typed optional object
 with an async report_progress(progress, total, message) method; pass None
 when there's no MCP Context available (e.g. from the hook).
 """
@@ -20,7 +27,17 @@ import threading
 import urllib.request
 from typing import Optional, Tuple
 
-from openai import APITimeoutError, OpenAI
+
+class CompletionTimeout(Exception):
+    """A model request did not finish within its time budget.
+
+    The neutral, library-owned stand-in for a client SDK's own timeout
+    exception: whichever client the caller passes in must raise this (and
+    only this) for a timeout, so this module can tell "timed out" from "could
+    not connect" without importing the SDK. libs/lmstudio_client.py does that
+    translation for the `openai` client.
+    """
+
 
 DEFAULT_BASE_URL = os.environ.get("CLAUDE_RUNWAY_LMSTUDIO_URL", "http://localhost:1234/v1")
 DEFAULT_MODEL = os.environ.get("CLAUDE_RUNWAY_LMSTUDIO_MODEL")  # intentionally no fallback -- resolve_model() auto-detects when unset
@@ -501,7 +518,8 @@ def section_has_mixed_runs(body: str) -> bool:
 # synchronously in Claude Code's own tool-result path, so a hang there stalls
 # the whole session, not just one tool call (issue #301).
 #
-# The invariant, stated once: every client this module builds is BOUNDED -- a
+# The invariant, stated once: every client built for this module (by
+# libs/lmstudio_client.py, which reads the constants below) is BOUNDED -- a
 # finite timeout and max_retries=0. A non-streaming completion only returns
 # once generation finishes, so `timeout` here is effectively the total budget
 # for one request. Retries are off because a local server that timed out or
@@ -509,7 +527,7 @@ def section_has_mixed_runs(body: str) -> bool:
 # multiply the stall), and every caller already fails open on an error.
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 60.0
 REQUEST_TIMEOUT_ENV_VAR = "CLAUDE_RUNWAY_LMSTUDIO_TIMEOUT_SECONDS"
-_CLIENT_MAX_RETRIES = 0
+CLIENT_MAX_RETRIES = 0
 
 
 def resolve_request_timeout() -> float:
@@ -528,38 +546,18 @@ def resolve_request_timeout() -> float:
         value = float(raw.strip())
     except ValueError:
         return DEFAULT_REQUEST_TIMEOUT_SECONDS
-    return value if _is_bounded_timeout(value) else DEFAULT_REQUEST_TIMEOUT_SECONDS
+    return value if is_bounded_timeout(value) else DEFAULT_REQUEST_TIMEOUT_SECONDS
 
 
-def _is_bounded_timeout(value: float) -> bool:
+def is_bounded_timeout(value: float) -> bool:
     """
     The single definition of a usable timeout, applied to BOTH the env var
-    and an explicit `client(timeout=...)` argument so neither path can
-    smuggle in an unbounded client (PR #361 review): finite and > 0. The
+    and an explicit `build_client(timeout=...)` argument
+    (libs/lmstudio_client.py) so neither path can smuggle in an unbounded client (PR #361 review): finite and > 0. The
     SDK would treat inf as no bound, and 0/negative/nan as broken or
     immediate-fail.
     """
     return math.isfinite(value) and value > 0
-
-
-def client(base_url: Optional[str], timeout: Optional[float] = None) -> OpenAI:
-    """
-    Builds the bounded OpenAI client described above. `timeout` overrides
-    the resolved per-request budget for a caller that needs a shorter one
-    (fetch_loaded_models' /v1 fallback, PR #318 review, passes its short
-    probe timeout so the WebFetch redirect hook's reachability check doesn't
-    fall back to a long default); when omitted, resolve_request_timeout()
-    supplies it. An explicit value that isn't finite and > 0 is ignored in
-    favor of the resolved budget (same rule as the env var). max_retries is always 0, including for that short-timeout
-    caller. The one-arg `client(b)` signature stays valid because test
-    stand-ins across this repo patch `client` with a one-arg lambda.
-    """
-    return OpenAI(
-        base_url=base_url or DEFAULT_BASE_URL,
-        api_key="lm-studio",
-        timeout=timeout if timeout is not None and _is_bounded_timeout(timeout) else resolve_request_timeout(),
-        max_retries=_CLIENT_MAX_RETRIES,
-    )
 
 
 def split_sections(text: str):
@@ -712,6 +710,62 @@ def derive_compact_label(information: str) -> str:
         label = first_line
 
     return label[:_COMPACT_LABEL_MAX_CHARS].strip()
+
+
+# What the qdrant server's `compact_store` asks the local model for when it
+# compresses a conversation summary before storing it. This is the text the
+# /my-compact skill used to pass as `compress_text`'s `focus`; it lives here
+# now so the compression happens in one call inside `compact_store` instead of
+# a second tool call that sent the whole summary through Claude's output twice.
+# `compact_store` also sets preserve_identifiers and preserve_sections, which
+# are required for a handoff artifact (see compress()'s docstring for the
+# measured failures that motivated both).
+COMPACT_FOCUS = (
+    "Create a high-density handoff summary for resuming this session in a new agent instance.\n\n"
+    "CRITICAL EXTRACTION REQUIREMENTS:\n"
+    "1. Verbatim Technical Identifiers: Retain exact file paths, class/function/variable names, "
+    "CLI commands, and database schema keys without modification or generic substitution "
+    "(e.g., do NOT replace `src/utils/auth.ts` with \"the auth file\").\n"
+    "2. Session Goal & Intent: Core objective the user wants to achieve.\n"
+    "3. Decisions & Rationales: Agreed architectural choices, solutions implemented, and "
+    "explicitly rejected alternatives.\n"
+    "4. State & Next Steps: Current execution state, open errors/blockers, and immediate "
+    "actions needed to resume work immediately.\n"
+    "5. User Constraints & Rules: Specific guidelines, preferences, or boundaries established "
+    "by the user.\n\n"
+    "STYLE: Maximum signal-to-noise ratio. Eliminate conversational filler; keep the technical "
+    "specificity needed to continue the work. Tighten prose, do not drop facts."
+)
+
+# The two notices compress() prepends when preserve_sections is set and no
+# model request succeeded. What follows each is a blank line, the usual
+# "[compressed N -> M chars ...]" statistics header (it describes a run that did
+# nothing, so it is a false claim once the notice is gone), another blank line,
+# and the content, which is complete (just not summarized). A caller storing the
+# result strips both generated lines instead of treating the call as failed.
+_UNREACHABLE_PREFIX = "[LM Studio appears unreachable"
+_STATS_HEADER_PREFIX = "[compressed "
+
+
+def strip_total_outage_notice(result: str) -> Optional[str]:
+    """
+    If `result` is compress()'s total-outage fallback (every model request
+    failed), returns the preserved content (credentials already redacted)
+    without the outage notice AND without the generated "[compressed ...]"
+    statistics header that follows it, both of which are about a compression
+    that did not happen. Returns None when `result` is not that shape, so a
+    caller can tell "nothing was compressed" apart from a real result.
+    """
+    if not (result.startswith(_UNREACHABLE_PREFIX) or result.startswith(_ALL_TIMED_OUT_PREFIX)):
+        return None
+    _, sep, body = result.partition("\n\n")
+    if not sep:
+        return None
+    if body.startswith(_STATS_HEADER_PREFIX):
+        _, sep, body = body.partition("\n\n")
+        if not sep:
+            return None
+    return body
 
 
 # ---------------------------------------------------------------------------
@@ -1363,7 +1417,7 @@ def take_failure_kind() -> Optional[str]:
     return kind
 
 
-def complete(oai_client: OpenAI, model: str, system: str, content: str) -> Optional[str]:
+def complete(oai_client, model: str, system: str, content: str) -> Optional[str]:
     """Returns the completion text, or None if the request failed for any reason
     (connection error, model not found, etc.) -- callers must check for None
     rather than assume this always succeeds just because resolve_model did.
@@ -1372,9 +1426,11 @@ def complete(oai_client: OpenAI, model: str, system: str, content: str) -> Optio
     a dead LM Studio server is only caught here, at the actual request.
 
     On failure the reason is also recorded for take_failure_kind() (issue
-    #368): APITimeoutError is a SUBCLASS of APIConnectionError in the openai
-    SDK, so it is tested for explicitly rather than inferred from "not a
-    connection error"."""
+    #368): the client signals a timeout by raising CompletionTimeout (a
+    timeout may subclass a connection error in the client's own SDK, so the
+    client translates it explicitly rather than this function inferring it
+    from "not a connection error"). `oai_client` is any object with an
+    OpenAI-shaped `chat.completions.create(...)`; the caller builds it."""
     _failure_state.kind = None
     try:
         response = oai_client.chat.completions.create(
@@ -1385,7 +1441,7 @@ def complete(oai_client: OpenAI, model: str, system: str, content: str) -> Optio
             ],
             temperature=0,
         )
-    except APITimeoutError:
+    except CompletionTimeout:
         _failure_state.kind = "timeout"
         return None
     except Exception:
@@ -1433,7 +1489,7 @@ def _classify_relevant_with_reason(*args) -> Tuple[Optional[bool], Optional[str]
 
 
 def classify_relevant(
-    oai_client: OpenAI, model: str, focus: str, chunk: str, chunk_index: int = 1, chunk_count: int = 1,
+    oai_client, model: str, focus: str, chunk: str, chunk_index: int = 1, chunk_count: int = 1,
     truncated: bool = False,
 ) -> Optional[bool]:
     """
@@ -1554,15 +1610,17 @@ def _http_get_json(url: str, timeout: float):
     """
     Minimal stdlib-only GET-and-parse-JSON helper for fetch_loaded_models'
     /api/v0/models probe below -- deliberately NOT `requests` (PR #318
-    review, high severity): both hooks/compress_output.py and
-    hooks/redirect_webfetch_to_fetch_url.py document a standalone install
-    path of `pip install openai` ONLY, and both import this module directly
-    (not through compress_mcp_server.py's own requirements.txt, which does
-    include `requests` for fetch_url). Each hook fails OPEN on any
-    ImportError, so a new top-level third-party dependency here would have
-    silently disabled compression/redirect in a clean environment following
-    those documented instructions, with no error ever surfacing. urllib is
-    part of the standard library, so this adds no new dependency at all.
+    review, high severity): this module is deliberately standard-library-only
+    (it imports no client SDK; libs/lmstudio_client.py is the only module that
+    imports `openai`), and both hooks/compress_output.py and
+    hooks/redirect_webfetch_to_fetch_url.py import it directly (not through
+    compress_mcp_server.py's own requirements.txt, which does include
+    `requests` for fetch_url). Each hook fails OPEN on any ImportError, so a
+    new top-level third-party dependency here would silently disable
+    compression/redirect in an environment that lacks it, with no error ever
+    surfacing; the redirect hook in particular needs nothing but this module.
+    urllib is part of the standard library, so this adds no new dependency
+    at all.
 
     Raises urllib.error.HTTPError on a non-2xx response (e.g. a real 404,
     exactly like `requests`' `raise_for_status()` would) and
@@ -1595,9 +1653,9 @@ def fetch_loaded_models(base_url: Optional[str], timeout: float = LM_STUDIO_V0_T
 
     /v1/models is still the ultimate source of truth for "is LM Studio
     reachable at all" -- if /api/v0 fails AND the /v1 fallback also raises,
-    that exception propagates to the caller unchanged, matching the exact
-    contract every existing caller's `except` block already relies on (a bare
-    `client(base_url).models.list()` call used to be what they wrapped).
+    that exception propagates to the caller (an OSError/URLError for an
+    unreachable server, ValueError/KeyError for an unusable response), which
+    every existing caller's `except Exception` block already handles.
 
     Filtering rule (from the issue's real repro): check `state == "loaded"`
     FIRST, not `type`. The issue's repro showed `type` alone is unreliable --
@@ -1652,13 +1710,15 @@ def fetch_loaded_models(base_url: Optional[str], timeout: float = LM_STUDIO_V0_T
         # to /v1/models unchanged so behavior there doesn't regress. If LM
         # Studio is genuinely unreachable, this raises too -- callers already
         # catch that.
-        # PR #318 review: pass `timeout` through here too -- a caller like
-        # the WebFetch redirect hook relies on a short timeout to fail open
-        # promptly; without this, a hung/unreachable server would fall
-        # through to the OpenAI SDK's own (much longer) default timeout on
-        # this fallback path, silently defeating that caller's short budget.
-        models = client(base_url, timeout=timeout).models.list()
-        return [m.id for m in models.data], "v1"
+        # Plain GET of {base}/models with the same short `timeout` (PR #318
+        # review: a caller like the WebFetch redirect hook relies on a short
+        # timeout to fail open promptly). Done with urllib rather than an
+        # `openai` client's models.list() so this module needs no client SDK;
+        # the response shape is the OpenAI-compatible {"data": [{"id": ...}]}.
+        payload = _http_get_json(f"{effective_base.rstrip('/')}/models", timeout)
+        if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+            raise ValueError(f"/models returned an unexpected shape: {payload!r}") from None
+        return [m["id"] for m in payload["data"]], "v1"
 
 
 def resolve_model(explicit_model: Optional[str], base_url: Optional[str]):
@@ -1994,9 +2054,15 @@ async def compress(
     preserve_identifiers: bool = False,
     preserve_sections: bool = False,
     ctx=None,
+    *,
+    client,
 ) -> str:
     """
-    Shared map-reduce compression logic. Returns the ORIGINAL text unchanged
+    Shared map-reduce compression logic. `client` is required and is built by
+    the caller (libs/lmstudio_client.py's build_client): any object with an
+    OpenAI-shaped `chat.completions.create(...)` that raises CompletionTimeout
+    for a timed-out request. This module never imports a client SDK.
+ Returns the ORIGINAL text unchanged
     if it's under skip_if_under_chars, or an "Error: ..." string (never
     raises) if compression can't proceed -- callers should treat a return
     value starting with "Error:" as a signal to fall back to the original
@@ -2269,7 +2335,7 @@ async def compress(
         return cached
 
     original_len = len(text)
-    oai_client = client(base_url)
+    oai_client = client
 
     if preserve_sections:
         section_result = await _compress_each_section(
@@ -2316,7 +2382,7 @@ async def compress(
     # When classification is needed (selective focus, not already scoped by
     # max_chars), fire all chunks concurrently rather than waiting for each
     # round-trip before starting the next. classify_relevant() is synchronous
-    # (uses the blocking openai client), so we dispatch each call on the
+    # (uses the caller's blocking client), so we dispatch each call on the
     # default thread-pool executor and gather the results -- same semantics
     # as running them in parallel threads, but compatible with the surrounding
     # async function. See issue #59.

@@ -60,12 +60,6 @@ requires-python = ">=3.10"
 # than the existing documented clone-based default for exactly this reason.
 dependencies = [
     "mcp[cli]>=2.0.0",
-    # fastmcp>=4.0.0: fastmcp<4.0.0 requires mcp<2.0.0 and uses the renamed
-    # McpError class. The mcp>=2.0.0 bound above enforces this transitively
-    # on fresh installs; an explicit lower bound here covers existing
-    # environments that upgrade mcp without upgrading fastmcp.
-    "fastmcp>=4.0.0",
-    "mcp-server-qdrant",
     "qdrant-client",
     "fastembed",
     "pydantic_settings",

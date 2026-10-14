@@ -130,8 +130,12 @@ Project-scoped to this repo (hardcodes `Donelle/claude-runway`, `.venv`-based te
       the older rows (see `docs/metrics.md`). The cost is the subagent's only, not this
       orchestrator's own session.
 
-      `record_metric` still works for anything this CLI can't cover (e.g. no agent id at
-      all), with the same metadata shape minus the computed figures:
+      `record_metric` (a tool of the opt-in `analytics` MCP server, which exists only when
+      the project's `.mcp.json` has an `analytics` block, i.e. `init --track-savings` wrote
+      it) still works for anything this CLI can't cover (e.g. no agent id at all), with the
+      same metadata shape minus the computed figures. If that server isn't connected the
+      call fails as an unknown tool; that is a logging failure like any other below (use
+      the CLI instead, which needs no server), never a reason to change the run:
       ```
       record_metric(
         metric_id="autowork",
@@ -148,7 +152,7 @@ Project-scoped to this repo (hardcodes `Donelle/claude-runway`, `.venv`-based te
       metrics store is append-only, so two calls never collide the way an upsert-on-a-
       fixed-key store would — every call creates a new row regardless; the per-attempt
       timestamp is stored as `session_id` in the raw table, and `get_metrics`/`/my-metrics`
-      can filter `view="summary"`/`"by_event_type"` down to this exact `session_id` to
+      (also `analytics` server tools) can filter `view="summary"`/`"by_event_type"` down to this exact `session_id` to
       inspect one specific attempt. `manual_interventions` counts any `SendMessage` resume
       THIS orchestrator had to send this same subagent to get a compliant final report (0
       for a clean single-call ticket — this field exists because a subagent has stalled
@@ -157,7 +161,7 @@ Project-scoped to this repo (hardcodes `Donelle/claude-runway`, `.venv`-based te
       **This logging step is best-effort and additive — it must never change what the
       outer 2b/2c control flow does next, only whether a metrics entry got recorded.**
       `record_metric` returns either `"OK"` or a string starting with `"Error:"` — treat
-      either a raised exception OR an `"Error:"` return as "logging failed," note it, and
+      a raised exception, an `"Error:"` return, OR the tool being unavailable as "logging failed," note it, and
       move on to whatever 2b/2c already say to do for this ticket's actual outcome.
       Concretely: for a `MERGED` result in an `all` run, still continue to the next ticket
       even if logging failed; for a `BLOCKED`/`FAILED` result, still **stop the whole run

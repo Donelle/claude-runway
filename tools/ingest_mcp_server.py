@@ -8,11 +8,11 @@ running ingest_to_qdrant.py by hand every time.
 Project minimum: Python 3.12 (policy floor; the dependency chain supports >=3.10).
 
 Setup:
-    pip install "mcp[cli]" mcp-server-qdrant qdrant-client --break-system-packages
+    pip install "mcp[cli]" qdrant-client fastembed pydantic_settings --break-system-packages
 
 Register in .mcp.json (adjust the path to wherever you save this file). Set
 QDRANT_URL / COLLECTION_NAME / EMBEDDING_MODEL here -- these are the SAME env
-var names mcp-server-qdrant itself reads, so one project config drives both
+var names tools/qdrant_mcp_server.py reads, so one project config drives both
 servers and they can't drift apart:
 {
   "mcpServers": {
@@ -50,8 +50,8 @@ from typing import Optional
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "libs"))
 
 from mcp.server.mcpserver import MCPServer, Context
-from mcp_server_qdrant.qdrant import QdrantConnector, Entry
-from mcp_server_qdrant.embeddings.fastembed import FastEmbedProvider
+from qdrant_connector import QdrantConnector, Entry
+from qdrant_embeddings import FastEmbedProvider
 from qdrant_client import QdrantClient, models
 
 from qdrant_ingest_lib import (
@@ -125,7 +125,7 @@ def _save_manifest(repo: Path, manifest: dict) -> None:
         json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
     )
 
-# Same env var names mcp-server-qdrant reads, so a single project .mcp.json
+# Same env var names tools/qdrant_mcp_server.py reads, so a single project .mcp.json
 # config keeps this server and the qdrant-find/qdrant-store server aligned.
 # Resolved through qdrant_ingest_lib.ingest_env_defaults (issue #276) -- the
 # same helper ingest_to_qdrant.py's argparse defaults come from, so the two
@@ -136,7 +136,7 @@ DEFAULT_QDRANT_API_KEY = _ENV_DEFAULTS["qdrant_api_key"]
 DEFAULT_COLLECTION = os.environ.get("COLLECTION_NAME")
 DEFAULT_EMBEDDING_MODEL = _ENV_DEFAULTS["embedding_model"]
 
-# Optional, this repo's own -- not read by mcp-server-qdrant. Declared once
+# Optional, this repo's own -- not read by the qdrant server. Declared once
 # alongside COLLECTION_NAME so a project's description doesn't require a
 # one-off set_collection_description call (issue #83); applied by
 # _sync_static_collection_description() below.
@@ -172,7 +172,7 @@ DEFAULT_EXTRA_EXCLUDE_DIRS = parse_csv_set(_ENV_DEFAULTS["exclude_dirs"])
 def _sync_static_collection_description(collection: Optional[str], qdrant_url: str, qdrant_api_key: Optional[str]) -> None:
     """
     Applies COLLECTION_DESCRIPTION (this project's own .mcp.json env var,
-    not read by mcp-server-qdrant) to the collection's native Qdrant
+    not read by the qdrant server) to the collection's native Qdrant
     metadata + the local hint cache from libs/qdrant_collection_hints.py,
     if it's configured and doesn't already match (issue #83). This is what
     lets a description be declared once in .mcp.json instead of requiring
@@ -200,7 +200,7 @@ def _sync_static_collection_description(collection: Optional[str], qdrant_url: s
     fresh-collection case themselves in the COMMON case -- but NOT
     guaranteed: store_batch itself returns immediately without creating the
     collection when entries is empty (libs/qdrant_batch_store.py's own
-    `if not entries: return 0`, before _ensure_collection_exists is ever
+    `if not entries: return 0`, before ensure_collection_exists is ever
     called) -- reachable from index_repo on an empty/no-matching-files repo,
     or from sync_repo when only files were REMOVED (changed is empty, so
     _chunk_changed_files() produces no entries, but the "nothing to do"

@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Tests for libs/qdrant_batch_store.py (issue #75/#76 follow-up).
+"""Tests for libs/qdrant_batch_store.py.
 
 Stdlib-only (unittest, no pytest), no network -- uses a fake
-QdrantConnector-shaped object (exposing the same "private" attributes
-store_batch deliberately reaches into -- see the module docstring) instead
-of a real one, since a real QdrantConnector needs a live Qdrant instance.
+QdrantConnector-shaped object (exposing the public attributes
+store_batch builds on -- see the module docstring) instead of a real one, since a real QdrantConnector needs a live Qdrant instance.
 End-to-end verification against a real Qdrant instance (point counts,
 search correctness at 5,500-entry scale matching the actual failure point)
 was done manually during development -- see the PR/issue discussion; these
@@ -33,7 +32,7 @@ from qdrant_batch_store import (  # noqa: E402
 
 
 class _Entry:
-    """Stands in for mcp_server_qdrant.qdrant.Entry -- store_batch only
+    """Stands in for qdrant_connector.Entry -- store_batch only
     reads .content/.metadata, so a plain object is enough."""
 
     def __init__(self, content, metadata=None):
@@ -70,17 +69,16 @@ class _FakeAsyncClient:
 
 
 class _FakeConnector:
-    """Exposes exactly the attributes store_batch reaches into -- see
-    qdrant_batch_store.py's module docstring for why those are "private"
-    (single-underscore) on the real QdrantConnector."""
+    """Exposes exactly the public attributes store_batch uses on the real
+    QdrantConnector (see qdrant_connector.py)."""
 
     def __init__(self, collection_name="test-collection", **client_kwargs):
-        self._default_collection_name = collection_name
-        self._embedding_provider = _FakeEmbeddingProvider()
-        self._client = _FakeAsyncClient(**client_kwargs)
+        self.default_collection_name = collection_name
+        self.embedding_provider = _FakeEmbeddingProvider()
+        self.client = _FakeAsyncClient(**client_kwargs)
         self.ensure_calls = []
 
-    async def _ensure_collection_exists(self, collection_name):
+    async def ensure_collection_exists(self, collection_name):
         self.ensure_calls.append(collection_name)
 
 
@@ -126,7 +124,7 @@ class StoreBatch(unittest.TestCase):
         stored = _run(store_batch(connector, []))
         self.assertEqual(stored, 0)
         self.assertEqual(connector.ensure_calls, [])
-        self.assertEqual(connector._client.upsert_calls, [])
+        self.assertEqual(connector.client.upsert_calls, [])
 
     def test_all_entries_stored_across_multiple_batches(self):
         connector = _FakeConnector()
@@ -136,8 +134,8 @@ class StoreBatch(unittest.TestCase):
         # 23 entries at batch_size=10 -> 3 upsert calls (10, 10, 3), not 23
         # individual ones -- this IS the fix: collapsing N round-trips into
         # ceil(N/batch_size).
-        self.assertEqual(len(connector._client.upsert_calls), 3)
-        total_points = sum(len(points) for _, points in connector._client.upsert_calls)
+        self.assertEqual(len(connector.client.upsert_calls), 3)
+        total_points = sum(len(points) for _, points in connector.client.upsert_calls)
         self.assertEqual(total_points, 23)
 
     def test_ensures_collection_exists_exactly_once_not_per_batch(self):
@@ -150,28 +148,28 @@ class StoreBatch(unittest.TestCase):
         connector = _FakeConnector(collection_name="my-default-collection")
         _run(store_batch(connector, [_Entry("x")]))
         self.assertEqual(connector.ensure_calls, ["my-default-collection"])
-        self.assertEqual(connector._client.upsert_calls[0][0], "my-default-collection")
+        self.assertEqual(connector.client.upsert_calls[0][0], "my-default-collection")
 
     def test_explicit_collection_name_overrides_default(self):
         connector = _FakeConnector(collection_name="default-coll")
         _run(store_batch(connector, [_Entry("x")], collection_name="other-coll"))
         self.assertEqual(connector.ensure_calls, ["other-coll"])
-        self.assertEqual(connector._client.upsert_calls[0][0], "other-coll")
+        self.assertEqual(connector.client.upsert_calls[0][0], "other-coll")
 
     def test_point_payload_and_vector_shape_matches_qdrant_connector(self):
         """Payload/vector shape must exactly match what
-        mcp_server_qdrant.qdrant.QdrantConnector.store()/search() write and
+        qdrant_connector.QdrantConnector.store()/search() write and
         read -- a mismatch wouldn't error, it would just silently write
         payloads search()/qdrant-find can't parse metadata back out of."""
         connector = _FakeConnector()
         entry = _Entry("hello world", {"file_path": "a.py", "line_range": "1-2"})
         _run(store_batch(connector, [entry]))
-        _, points = connector._client.upsert_calls[0]
+        _, points = connector.client.upsert_calls[0]
         self.assertEqual(len(points), 1)
         point = points[0]
         self.assertEqual(point.payload["document"], "hello world")
         self.assertEqual(point.payload[METADATA_PATH], {"file_path": "a.py", "line_range": "1-2"})
-        self.assertIn(connector._embedding_provider.vector_name, point.vector)
+        self.assertIn(connector.embedding_provider.vector_name, point.vector)
 
     def test_embed_documents_called_with_the_whole_batch_at_once(self):
         """embed_documents natively batches -- confirms store_batch passes
@@ -181,7 +179,7 @@ class StoreBatch(unittest.TestCase):
         connector = _FakeConnector()
         entries = [_Entry(f"doc {i}") for i in range(7)]
         _run(store_batch(connector, entries, batch_size=100))
-        self.assertEqual(connector._embedding_provider.embed_calls, [[f"doc {i}" for i in range(7)]])
+        self.assertEqual(connector.embedding_provider.embed_calls, [[f"doc {i}" for i in range(7)]])
 
     def test_progress_callback_invoked_after_each_batch_with_running_total(self):
         connector = _FakeConnector()
@@ -202,12 +200,12 @@ class StoreBatch(unittest.TestCase):
     @patch("qdrant_retry.asyncio.sleep", new_callable=AsyncMock)
     def test_transient_upsert_failure_is_retried_via_qdrant_retry(self, mock_sleep):
         """Confirms store_batch actually wires each batch's upsert through
-        async_call_with_retry, not just calling connector._client.upsert
+        async_call_with_retry, not just calling connector.client.upsert
         directly -- a batch failing once shouldn't lose the whole run."""
         connector = _FakeConnector(fail_first_n_upserts=1)
         stored = _run(store_batch(connector, [_Entry("x"), _Entry("y")]))
         self.assertEqual(stored, 2)
-        self.assertEqual(len(connector._client.upsert_calls), 1, "one logical batch, despite the underlying retry")
+        self.assertEqual(len(connector.client.upsert_calls), 1, "one logical batch, despite the underlying retry")
 
     @patch("qdrant_retry.asyncio.sleep", new_callable=AsyncMock)
     def test_wrapped_transient_failure_is_also_retried(self, mock_sleep):

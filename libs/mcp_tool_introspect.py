@@ -28,10 +28,10 @@ estimate.)
 
 Deliberately STDLIB-ONLY (no third-party imports, not even
 `local_compress_lib.py`) so importing this from
-`ingest_mcp_server.py`'s side doesn't drag in `openai` for a project that
-only wants the Qdrant memory piece -- same reasoning `libs/doctor_lib.py`'s
-own docstring already gives for not importing `local_compress_lib.py`
-directly.
+`ingest_mcp_server.py`'s side doesn't drag in the compression stack for a
+project that only wants the Qdrant memory piece -- same reasoning
+`libs/doctor_lib.py`'s own docstring already gives for not importing
+`local_compress_lib.py` directly.
 """
 
 import inspect
