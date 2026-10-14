@@ -44,6 +44,7 @@ from setup_project_lib import (  # noqa: E402
     merge_mcp_json,
     merge_settings_hooks,
     plan_skill_installs,
+    split_skill_frontmatter,
     resolved_fastembed_cache_path,
     run_setup,
     strip_toolkit_hooks,
@@ -903,25 +904,121 @@ class RunSetupEndToEnd(unittest.TestCase):
         new_model = "sentence-transformers/all-mpnet-base-v2"
         result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"), embedding_model=new_model)
         models = self._models(result)
-        # Per-project code collections move to the new model; the shared memory-bank
-        # server stays on the model its collection is locked to.
+        # Per-project code collections move to the new model; memory-bank's model is
+        # its own value (issue #428) and is untouched.
         self.assertEqual(models["qdrant"], new_model)
         self.assertEqual(models["codebase-indexer"], new_model)
         self.assertEqual(models["memory-bank"], self._CUSTOM_MODEL)
         self.assertTrue(any("EMBEDDING_MODEL changed" in c and "WARNING" in c for c in result.changes))
+        self.assertFalse(any("memory-bank EMBEDDING_MODEL changed" in c for c in result.changes))
 
-    def test_explicit_model_change_without_memory_bank_block_keeps_previous_shared_model(self):
-        # No memory-bank block: the shared collection is still locked to the old model,
-        # so the newly created server must not take the new one.
-        self._write_customized_existing_config(self._CUSTOM_MODEL)
+    def _drop_memory_bank_block(self):
         cfg = json.loads((self.target_repo / ".mcp.json").read_text())
         del cfg["mcpServers"]["memory-bank"]
         (self.target_repo / ".mcp.json").write_text(json.dumps(cfg))
-        new_model = "sentence-transformers/all-mpnet-base-v2"
-        result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"), embedding_model=new_model)
+
+    def _set_memory_bank_model(self, model):
+        cfg = json.loads((self.target_repo / ".mcp.json").read_text())
+        cfg["mcpServers"]["memory-bank"]["env"]["EMBEDDING_MODEL"] = model
+        (self.target_repo / ".mcp.json").write_text(json.dumps(cfg))
+
+    _OTHER_MODEL = "sentence-transformers/all-mpnet-base-v2"
+
+    def test_explicit_model_change_without_memory_bank_block_uses_template_default(self):
+        # Issue #428: no memory-bank block means memory-bank's model comes from the
+        # template default, never from the code-side model.
+        self._write_customized_existing_config(self._CUSTOM_MODEL)
+        self._drop_memory_bank_block()
+        result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"), embedding_model=self._OTHER_MODEL)
         models = self._models(result)
-        self.assertEqual(models["qdrant"], new_model)
+        self.assertEqual(models["qdrant"], self._OTHER_MODEL)
+        self.assertEqual(models["memory-bank"], MCP_TEMPLATE["mcpServers"]["memory-bank"]["env"]["EMBEDDING_MODEL"])
+
+    def test_no_memory_bank_block_does_not_inherit_custom_code_model(self):
+        # A re-run (no flags) against a config whose code blocks are customized but
+        # which has no memory-bank block must not copy the code-side model across.
+        self._write_customized_existing_config(self._CUSTOM_MODEL)
+        self._drop_memory_bank_block()
+        models = self._models(run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user")))
+        self.assertEqual(models["qdrant"], self._CUSTOM_MODEL)
+        self.assertEqual(models["memory-bank"], MCP_TEMPLATE["mcpServers"]["memory-bank"]["env"]["EMBEDDING_MODEL"])
+
+    def test_code_side_model_is_never_read_from_memory_bank_block(self):
+        # Issue #428: only the memory-bank block has a custom model; the code side
+        # must fall back to the template default rather than read it.
+        first = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
+        cfg = first.mcp_json
+        cfg["mcpServers"]["memory-bank"]["env"]["EMBEDDING_MODEL"] = self._CUSTOM_MODEL
+        for s in ("qdrant", "codebase-indexer"):
+            del cfg["mcpServers"][s]["env"]["EMBEDDING_MODEL"]
+        (self.target_repo / ".mcp.json").write_text(json.dumps(cfg))
+        models = self._models(run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user")))
+        default = MCP_TEMPLATE["mcpServers"]["qdrant"]["env"]["EMBEDDING_MODEL"]
+        self.assertEqual(models["qdrant"], default)
+        self.assertEqual(models["codebase-indexer"], default)
         self.assertEqual(models["memory-bank"], self._CUSTOM_MODEL)
+
+    def test_explicit_memory_bank_model_overrides_and_warns_without_touching_code_side(self):
+        self._write_customized_existing_config(self._CUSTOM_MODEL)
+        result = run_setup(
+            self.target_repo, REPO_ROOT, home_dir=Path("/home/user"), memory_bank_embedding_model=self._OTHER_MODEL
+        )
+        models = self._models(result)
+        self.assertEqual(models["memory-bank"], self._OTHER_MODEL)
+        self.assertEqual(models["qdrant"], self._CUSTOM_MODEL)
+        self.assertEqual(models["codebase-indexer"], self._CUSTOM_MODEL)
+        self.assertTrue(
+            any("memory-bank EMBEDDING_MODEL changed" in c and "WARNING" in c and "EVERY project" in c
+                for c in result.changes)
+        )
+        self.assertFalse(any(c.startswith("WARNING: EMBEDDING_MODEL changed") for c in result.changes))
+
+    def test_explicit_memory_bank_model_same_as_existing_does_not_warn(self):
+        self._write_customized_existing_config(self._CUSTOM_MODEL)
+        result = run_setup(
+            self.target_repo, REPO_ROOT, home_dir=Path("/home/user"), memory_bank_embedding_model=self._CUSTOM_MODEL
+        )
+        self.assertFalse(any("WARNING" in c for c in result.changes))
+
+    def test_explicit_memory_bank_model_on_fresh_target_does_not_warn(self):
+        result = run_setup(
+            self.target_repo, REPO_ROOT, home_dir=Path("/home/user"), memory_bank_embedding_model=self._CUSTOM_MODEL
+        )
+        self.assertEqual(self._models(result)["memory-bank"], self._CUSTOM_MODEL)
+        self.assertFalse(any("WARNING" in c for c in result.changes))
+
+    def test_rerun_preserves_memory_bank_model_when_code_model_differs(self):
+        self._write_customized_existing_config(self._CUSTOM_MODEL)
+        self._set_memory_bank_model(self._OTHER_MODEL)
+        models = self._models(run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user")))
+        self.assertEqual(models["memory-bank"], self._OTHER_MODEL)
+        self.assertEqual(models["qdrant"], self._CUSTOM_MODEL)
+
+    def test_warmup_also_warms_a_different_memory_bank_model(self):
+        self._write_customized_existing_config(self._CUSTOM_MODEL)
+        self._set_memory_bank_model(self._OTHER_MODEL)
+        calls = []
+
+        def _fake_warmup(model_name, cache_dir):
+            calls.append(model_name)
+            return True
+
+        result = run_setup(
+            self.target_repo, REPO_ROOT, home_dir=Path("/home/user"),
+            attempt_fastembed_warmup=True, fastembed_warmup_fn=_fake_warmup,
+        )
+        self.assertEqual(calls, [self._CUSTOM_MODEL, self._OTHER_MODEL])
+        self.assertFalse(any("memory-bank model" in c for c in result.changes))
+
+    def test_memory_bank_warmup_failure_is_reported_but_keeps_hf_hub_offline(self):
+        self._write_customized_existing_config(self._CUSTOM_MODEL)
+        self._set_memory_bank_model(self._OTHER_MODEL)
+        result = run_setup(
+            self.target_repo, REPO_ROOT, home_dir=Path("/home/user"),
+            attempt_fastembed_warmup=True, fastembed_warmup_fn=lambda model, cache_dir: model != self._OTHER_MODEL,
+        )
+        self.assertEqual(result.mcp_json["mcpServers"]["qdrant"]["env"]["HF_HUB_OFFLINE"], "1")
+        self.assertTrue(any(self._OTHER_MODEL in c and "memory-bank model" in c for c in result.changes))
 
     def test_explicit_embedding_model_same_as_existing_does_not_warn(self):
         self._write_customized_existing_config(self._CUSTOM_MODEL)
@@ -935,7 +1032,9 @@ class RunSetupEndToEnd(unittest.TestCase):
         result = run_setup(
             self.target_repo, REPO_ROOT, home_dir=Path("/home/user"), embedding_model=self._CUSTOM_MODEL
         )
-        self.assertEqual(set(self._models(result).values()), {self._CUSTOM_MODEL})
+        models = self._models(result)
+        self.assertEqual({models["qdrant"], models["codebase-indexer"]}, {self._CUSTOM_MODEL})
+        self.assertEqual(models["memory-bank"], MCP_TEMPLATE["mcpServers"]["memory-bank"]["env"]["EMBEDDING_MODEL"])
         self.assertFalse(any("WARNING" in c for c in result.changes))
 
     def test_existing_config_without_embedding_model_falls_back_to_template(self):
@@ -954,7 +1053,8 @@ class RunSetupEndToEnd(unittest.TestCase):
         cfg["mcpServers"]["codebase-indexer"]["env"]["EMBEDDING_MODEL"] = self._CUSTOM_MODEL
         (self.target_repo / ".mcp.json").write_text(json.dumps(cfg))
         result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
-        self.assertEqual(set(self._models(result).values()), {self._CUSTOM_MODEL})
+        models = self._models(result)
+        self.assertEqual({models["qdrant"], models["codebase-indexer"]}, {self._CUSTOM_MODEL})
 
     def test_warmup_uses_the_preserved_embedding_model(self):
         # The cache warm-up must warm the model that is actually written,
@@ -1069,6 +1169,118 @@ class PlanSkillInstalls(unittest.TestCase):
         by_name = {p.name: p for p in plans}
         self.assertEqual(by_name["skill-a"].action, "update")
         self.assertEqual(by_name["skill-b"].action, "install")
+
+
+class SkillFrontmatterHandling(unittest.TestCase):
+    """Issue #449: shipped skills have no frontmatter, installed ones do. The
+    installed copy's frontmatter is preserved and only the body is compared,
+    so there is no perpetual false "update" and no frontmatter is deleted."""
+
+    FM = b'---\nname: skill-a\ndescription: "hand edited description"\n---\n\n'
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.tools_repo_dir = Path(self._tmpdir.name) / "tools-repo"
+        self.skills_dir = Path(self._tmpdir.name) / "dest-skills"
+        (self.tools_repo_dir / "skills" / "skill-a").mkdir(parents=True)
+        self.src = self.tools_repo_dir / "skills" / "skill-a" / "SKILL.md"
+        self.src.write_bytes(b"# Skill: a\nbody v2\n")
+        (self.skills_dir / "skill-a").mkdir(parents=True)
+        self.dest = self.skills_dir / "skill-a" / "SKILL.md"
+
+    def _plan(self):
+        return plan_skill_installs(self.tools_repo_dir, self.skills_dir)[0]
+
+    def test_split_roundtrips_and_handles_no_frontmatter(self):
+        data = self.FM + b"# Skill: a\n"
+        prefix, body = split_skill_frontmatter(data)
+        self.assertEqual(prefix + body, data)
+        self.assertEqual(body, b"# Skill: a\n")
+        self.assertEqual(split_skill_frontmatter(b"# Skill: a\n"), (b"", b"# Skill: a\n"))
+        self.assertEqual(split_skill_frontmatter(b""), (b"", b""))
+
+    def test_bom_before_the_opening_fence_is_still_frontmatter(self):
+        # Copilot review on PR #451: a Windows editor's UTF-8 BOM must not
+        # make the block look absent (which would delete it on refresh).
+        bom = b"\xef\xbb\xbf"
+        data = bom + self.FM + b"# Skill: a\n"
+        prefix, body = split_skill_frontmatter(data)
+        self.assertEqual(prefix, bom + self.FM)
+        self.assertEqual(body, b"# Skill: a\n")
+        self.dest.write_bytes(bom + self.FM + b"stale\n")
+        plan = self._plan()
+        self.assertEqual(plan.action, "update")
+        self.assertEqual(plan.content.encode("utf-8"), bom + self.FM + b"# Skill: a\nbody v2\n")
+        self.dest.write_bytes(plan.content.encode("utf-8"))
+        self.assertEqual(self._plan().action, "up_to_date")
+
+    def test_unclosed_fence_is_not_frontmatter(self):
+        data = b"---\nname: x\n# Skill: a\n"
+        self.assertEqual(split_skill_frontmatter(data), (b"", data))
+
+    def test_installed_copy_with_frontmatter_and_same_body_is_up_to_date(self):
+        self.dest.write_bytes(self.FM + b"# Skill: a\nbody v2\n")
+        plan = self._plan()
+        self.assertEqual(plan.action, "up_to_date")
+        self.assertTrue(plan.frontmatter_preserved)
+
+    def test_installed_copy_without_frontmatter_and_same_body_is_up_to_date(self):
+        self.dest.write_bytes(b"# Skill: a\nbody v2\n")
+        plan = self._plan()
+        self.assertEqual(plan.action, "up_to_date")
+        self.assertFalse(plan.frontmatter_preserved)
+
+    def test_stale_body_updates_and_keeps_the_users_frontmatter(self):
+        self.dest.write_bytes(self.FM + b"# Skill: a\nbody v1 mentions EVALUATION.md\n")
+        plan = self._plan()
+        self.assertEqual(plan.action, "update")
+        self.assertEqual(plan.content.encode("utf-8"), self.FM + b"# Skill: a\nbody v2\n")
+        self.assertNotIn("EVALUATION.md", plan.content)
+
+    def test_stale_copy_without_frontmatter_gets_none_invented(self):
+        self.dest.write_bytes(b"old\n")
+        plan = self._plan()
+        self.assertEqual(plan.action, "update")
+        self.assertEqual(plan.content, "# Skill: a\nbody v2\n")
+
+    def test_hand_edited_body_is_reported_as_update(self):
+        self.dest.write_bytes(self.FM + b"# Skill: a\nbody v2 plus my edit\n")
+        self.assertEqual(self._plan().action, "update")
+
+    def test_crlf_installed_copy_keeps_crlf_frontmatter(self):
+        fm = self.FM.replace(b"\n", b"\r\n")
+        self.dest.write_bytes(fm + b"# Skill: a\nbody v2\n")
+        self.assertEqual(self._plan().action, "up_to_date")
+        self.dest.write_bytes(fm + b"stale\n")
+        plan = self._plan()
+        self.assertEqual(plan.action, "update")
+        self.assertTrue(plan.content.encode("utf-8").startswith(fm))
+
+    def test_non_utf8_frontmatter_round_trips(self):
+        fm = b'---\nname: skill-a\ndescription: "caf\xe9"\n---\n\n'
+        self.dest.write_bytes(fm + b"stale\n")
+        plan = self._plan()
+        self.assertEqual(plan.content.encode("utf-8", errors="surrogateescape"), fm + b"# Skill: a\nbody v2\n")
+
+    def test_source_gaining_frontmatter_never_overwrites_the_installed_block(self):
+        # Copilot review on PR #451: a shipped skill that later gains its own
+        # frontmatter must not replace the installed copy's frontmatter.
+        self.src.write_bytes(self.FM + b"body\n")
+        installed_fm = b"---\nname: other\ndescription: mine\n---\n\n"
+        self.dest.write_bytes(installed_fm + b"stale\n")
+        plan = self._plan()
+        self.assertEqual(plan.action, "update")
+        self.assertEqual(plan.content.encode("utf-8"), installed_fm + b"body\n")
+        # ...and once refreshed it is up to date, not a perpetual update.
+        self.dest.write_bytes(plan.content.encode("utf-8"))
+        self.assertEqual(self._plan().action, "up_to_date")
+
+    def test_source_with_frontmatter_installs_whole_when_installed_has_none(self):
+        self.src.write_bytes(self.FM + b"body\n")
+        self.dest.write_bytes(b"stale, no frontmatter\n")
+        plan = self._plan()
+        self.assertEqual(plan.content.encode("utf-8"), self.FM + b"body\n")
 
 
 class CompactEmbeddingModelOnInit(unittest.TestCase):

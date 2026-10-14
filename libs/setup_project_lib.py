@@ -297,10 +297,10 @@ def build_mcp_servers(
     what to pass (see `resolve_compact_embedding_model`).
 
     `embedding_model` (issue #279), if blank, leaves the template's own
-    `EMBEDDING_MODEL` default in place; otherwise it is written into every
-    Qdrant-talking block that carries the key (`qdrant`, `codebase-indexer`,
-    `memory-bank`) -- the same single-value-many-blocks handling as
-    `qdrant_url`, because those servers must all agree on one model. Like
+    `EMBEDDING_MODEL` default in place; otherwise it is written into the two
+    code-index blocks (`qdrant`, `codebase-indexer`), which must agree on one
+    model. It is never written into `memory-bank` (issue #428): that block's
+    model is `memory_bank_embedding_model`, a separate value. Like
     everything else here this function does not detect re-runs itself:
     deciding WHICH value to pass (explicit flag > the target's existing
     config > template default) is `run_setup`'s job, see
@@ -348,15 +348,15 @@ def build_mcp_servers(
     memory_bank["env"]["MEMORY_BANK_ID"] = resolved_memory_bank_id
     memory_bank["env"]["MEMORY_BANK_COLLECTION"] = resolved_memory_bank_collection
 
-    # The memory-bank collection is ONE shared collection locked to the model
-    # that first created it, so its server keeps that model even when an
-    # explicit --embedding-model changes the per-project code collections.
+    # Issue #428: memory-bank's model is its own value, never derived from
+    # `embedding_model`. The memory-bank collection is ONE shared collection
+    # locked to the model that first created it, so a change made for the
+    # per-project code collections must never reach it.
     if embedding_model:
         for block in (qdrant, indexer):
             block["env"]["EMBEDDING_MODEL"] = embedding_model
-    shared_model = memory_bank_embedding_model or embedding_model
-    if shared_model:
-        memory_bank["env"]["EMBEDDING_MODEL"] = shared_model
+    if memory_bank_embedding_model:
+        memory_bank["env"]["EMBEDDING_MODEL"] = memory_bank_embedding_model
 
     if include_compress:
         compress = servers["local-compress"]
@@ -380,16 +380,19 @@ def build_mcp_servers(
     return servers
 
 
-# Servers whose env carries `EMBEDDING_MODEL`, in the order
-# `existing_embedding_model` consults them.
-_EMBEDDING_MODEL_SERVERS = ("qdrant", "codebase-indexer", "memory-bank")
+# Code-index servers whose env carries `EMBEDDING_MODEL`, in the order
+# `existing_embedding_model` consults them. `memory-bank` is deliberately NOT
+# here (issue #428): its model belongs to a shared, cross-project collection
+# and is resolved on its own, see `resolve_memory_bank_embedding_model`.
+_EMBEDDING_MODEL_SERVERS = ("qdrant", "codebase-indexer")
 
 
 def existing_embedding_model(existing_mcp: dict) -> str:
     """
     Returns the `EMBEDDING_MODEL` already configured in an existing
-    `.mcp.json` document (first non-blank string found across the `qdrant`,
-    `codebase-indexer`, `memory-bank` blocks), or "" if none is set. Tolerant
+    `.mcp.json` document (first non-blank string found across the `qdrant`
+    and `codebase-indexer` blocks -- never `memory-bank`'s, issue #428), or ""
+    if none is set. Tolerant
     of missing/odd-shaped blocks -- a hand-edited file may lack any of them.
     """
     servers = existing_mcp.get("mcpServers") if isinstance(existing_mcp, dict) else None
@@ -420,6 +423,34 @@ def resolve_embedding_model(explicit: str, existing_mcp: dict, template_default:
     collection.
     """
     return (explicit or "").strip() or existing_embedding_model(existing_mcp) or template_default
+
+
+def existing_memory_bank_model(existing_mcp: dict) -> str:
+    """
+    Returns the `EMBEDDING_MODEL` in an existing `.mcp.json`'s `memory-bank`
+    block, or "" if there is no such block or it has no non-blank value.
+    Tolerant of missing/odd-shaped blocks, like `existing_embedding_model`.
+    """
+    servers = existing_mcp.get("mcpServers") if isinstance(existing_mcp, dict) else None
+    block = servers.get("memory-bank") if isinstance(servers, dict) else None
+    env = block.get("env") if isinstance(block, dict) else None
+    value = env.get("EMBEDDING_MODEL") if isinstance(env, dict) else None
+    return value.strip() if isinstance(value, str) else ""
+
+
+def resolve_memory_bank_embedding_model(explicit: str, existing_mcp: dict, template_default: str) -> str:
+    """
+    Which `EMBEDDING_MODEL` a (re-)run of `init` writes into `memory-bank`
+    (issue #428), from memory-bank's own sources only -- never the code-index
+    model, because the shared collection is locked to whichever model created
+    it and a change made for code search must not make `remember`/`recall`
+    fail for every project:
+      1. an explicit `--memory-bank-embedding-model` value;
+      2. otherwise the existing `memory-bank` block's own value;
+      3. otherwise the template's default (a brand-new install, or a config
+         with no memory-bank block).
+    """
+    return (explicit or "").strip() or existing_memory_bank_model(existing_mcp) or template_default
 
 
 # What an install that predates the local-compress `EMBEDDING_MODEL` setting
@@ -743,17 +774,63 @@ def default_skills_dir(home_dir: Path) -> Path:
     return home_dir / ".claude" / "skills"
 
 
+def split_skill_frontmatter(data: bytes) -> "tuple[bytes, bytes]":
+    """
+    Splits a SKILL.md's raw bytes into `(frontmatter_prefix, body)` (issue
+    #449). `frontmatter_prefix` is everything from the opening `---` line
+    through the closing `---` line PLUS the blank line(s) after it, so
+    `frontmatter_prefix + body == data` always holds; it is `b""` when
+    `data` has no frontmatter block.
+
+    Why this exists: the shipped `skills/*/SKILL.md` files carry NO
+    frontmatter (they start at `# Skill: <name>`), but a skill installed on
+    a user's machine needs `name`/`description` frontmatter to be listed,
+    so real installed copies start with a `---` ... `---` block the source
+    lacks. A raw byte comparison would therefore call such a copy "update"
+    on EVERY run. The decision (see `plan_skill_installs`): the installed
+    copy's frontmatter is the USER'S (it may carry a hand-edited
+    description), so it is preserved verbatim and only the body is compared
+    and replaced. Never delete it, never invent one.
+
+    Operates on bytes and tolerates CRLF line endings, so it is safe on a
+    copy saved by a Windows editor. An opening fence with no closing fence
+    is not frontmatter (returns `b""` prefix): there is no well-defined
+    boundary to preserve, so the whole file is treated as body.
+    """
+    # A UTF-8 BOM before the opening fence (common from Windows editors) is
+    # not part of the fence line: skip it for detection but keep its bytes in
+    # the returned prefix, so the file is still recognised as having
+    # frontmatter and a refresh keeps the BOM along with the block (Copilot
+    # review on PR #451).
+    bom = b"\xef\xbb\xbf" if data.startswith(b"\xef\xbb\xbf") else b""
+    lines = data[len(bom):].splitlines(keepends=True)
+    if not lines or lines[0].rstrip() != b"---":
+        return b"", data
+    close = next((i for i in range(1, len(lines)) if lines[i].rstrip() == b"---"), None)
+    if close is None:
+        return b"", data
+    end = close + 1
+    while end < len(lines) and lines[end].strip() == b"":
+        end += 1
+    prefix = bom + b"".join(lines[:end])
+    return prefix, data[len(prefix):]
+
+
 @dataclass
 class SkillInstallPlan:
     """
     One entry per skill directory found under `tools_repo_dir/skills/`
     (issue #205) -- `name` is the skill's directory name (e.g.
     "my-compact"), `action` is one of "install" (dest doesn't exist yet),
-    "up_to_date" (dest already holds byte-identical content -- nothing to
-    do), or "update" (dest exists but differs -- overwrite). `content` is
-    the shipped SKILL.md's full text, already read here so a caller can
-    write it without touching `source` again (and so --dry-run/tests never
-    need to re-read the file to report what WOULD be written).
+    "up_to_date" (dest already holds exactly what this plan would write --
+    nothing to do), or "update" (dest exists but differs -- overwrite).
+    `content` is the FULL text this plan would write to `dest`: the shipped
+    SKILL.md, preceded by the installed copy's own frontmatter block when it
+    has one (issue #449, `frontmatter_preserved`), already computed here so a
+    caller can write it without touching `source` again (and so
+    --dry-run/tests never need to re-read the file to report what WOULD be
+    written). Bytes that are not valid UTF-8 inside a preserved frontmatter
+    block round-trip via `surrogateescape` (see `SKILL_TEXT_ERRORS`).
     """
 
     name: str
@@ -761,12 +838,22 @@ class SkillInstallPlan:
     source: Path
     dest: Path
     content: str
+    frontmatter_preserved: bool = False
+
+
+# The one error handler used to decode/encode skill text, shared with
+# tools/setup_project.py's _atomic_write so a preserved frontmatter block
+# that is not valid UTF-8 survives the round trip instead of crashing the
+# run or being silently dropped (issue #449). For valid UTF-8 it behaves
+# exactly like plain "strict".
+SKILL_TEXT_ERRORS = "surrogateescape"
 
 
 def plan_skill_installs(tools_repo_dir: Path, skills_dir: Path) -> list:
     """
     Read-only planning step for `claude-runway-setup init --install-skills`
-    (issue #205) -- scans `tools_repo_dir/skills/*/SKILL.md` (the shipped
+    (issue #205) and, since issue #449, `upgrade`'s skill refresh -- scans
+    `tools_repo_dir/skills/*/SKILL.md` (the shipped
     source of truth: the SAME path for a clone and a pipx/`uv tool install`,
     since `skills/` is now packaged as a sibling of `libs/tools/templates/
     hooks` under `[tool.setuptools] packages` in pyproject.toml, exactly the
@@ -776,6 +863,18 @@ def plan_skill_installs(tools_repo_dir: Path, skills_dir: Path) -> list:
     writes anything itself. Mirrors `run_setup`'s own "pure computation, the
     CLI does the actual writing" split, so this stays trivially testable
     with only tmp directories, no mocking of file I/O needed.
+
+    Frontmatter rule (issue #449): when the shipped source has no
+    frontmatter but the installed copy does, the installed copy's
+    frontmatter block is preserved and only the body is compared/replaced
+    (`split_skill_frontmatter`). So an installed copy that differs from the
+    shipped one ONLY by its frontmatter is "up_to_date" (no perpetual false
+    "update"), and an "update" rewrites the body while keeping the user's
+    frontmatter. A fresh "install" writes the shipped source as-is (no
+    frontmatter is invented). If the shipped source itself ever gains
+    frontmatter, an installed copy's own block STILL wins (the shipped block
+    is not written over it); only an installed copy with no frontmatter gets
+    the shipped file whole.
 
     Only `SKILL.md` files are considered; a skill directory without one
     (shouldn't happen for anything shipped by this repo, but a defensive
@@ -813,8 +912,10 @@ def plan_skill_installs(tools_repo_dir: Path, skills_dir: Path) -> list:
         # right back with no text-mode translation on either end, keeps
         # this byte-for-byte round-trippable regardless of platform or
         # what line-ending style the shipped SKILL.md actually uses.
-        content = source.read_bytes().decode("utf-8")
+        source_bytes = source.read_bytes()
+        content = source_bytes.decode("utf-8")
         dest = skills_dir / skill_dir.name / "SKILL.md"
+        preserved = False
         if not dest.exists():
             action = "install"
         else:
@@ -828,11 +929,29 @@ def plan_skill_installs(tools_repo_dir: Path, skills_dir: Path) -> list:
             # (already read above), so encoding it once and comparing bytes
             # is both simpler and more precise than a lossy decode (e.g.
             # errors="replace") would be.
-            if dest.read_bytes() == content.encode("utf-8"):
+            dest_bytes = dest.read_bytes()
+            # Issue #449: the installed copy's own frontmatter always wins.
+            # It is carried over in front of the shipped BODY -- if a future
+            # shipped source gains frontmatter of its own, that block is
+            # dropped from what is written (an installed copy already has
+            # one, which is the user's to keep), so a refresh can never
+            # replace or delete it. An installed copy with NO frontmatter
+            # gets the shipped file whole, frontmatter included if any.
+            prefix = split_skill_frontmatter(dest_bytes)[0]
+            if prefix:
+                source_body = split_skill_frontmatter(source_bytes)[1]
+                content = prefix.decode("utf-8", errors=SKILL_TEXT_ERRORS) + source_body.decode("utf-8")
+                preserved = True
+            if dest_bytes == content.encode("utf-8", errors=SKILL_TEXT_ERRORS):
                 action = "up_to_date"
             else:
                 action = "update"
-        plans.append(SkillInstallPlan(name=skill_dir.name, action=action, source=source, dest=dest, content=content))
+        plans.append(
+            SkillInstallPlan(
+                name=skill_dir.name, action=action, source=source, dest=dest, content=content,
+                frontmatter_preserved=preserved,
+            )
+        )
     return plans
 
 
@@ -900,6 +1019,7 @@ def run_setup(
     attempt_fastembed_warmup: bool = False,
     fastembed_warmup_fn: Optional[Callable[..., bool]] = None,
     embedding_model: str = "",
+    memory_bank_embedding_model: str = "",
 ) -> SetupResult:
     """
     Pure computation (no disk writes to `target_repo`, with one deliberate
@@ -934,6 +1054,14 @@ def run_setup(
     target's existing `.mcp.json` already has" (template default for a
     brand-new project), never "reset to the template default". A non-blank
     value that differs from the existing one adds a WARNING to `changes`.
+
+    `memory_bank_embedding_model` (issue #428, CLI `--memory-bank-embedding-model`)
+    is the same sticky setting for the `memory-bank` block ONLY, and is fully
+    independent of `embedding_model`: blank keeps the block's existing value
+    (template default for a block that does not exist). A non-blank value that
+    differs from the existing one adds a WARNING, because the shared collection
+    is locked to the model that created it. Its model is warmed into the
+    fastembed cache too when `attempt_fastembed_warmup` is on.
 
     `include_hooks=False` corresponds to the CLI's `--skip-hooks`: don't
     touch `.claude/settings.json` at all, even if it already has this
@@ -974,19 +1102,13 @@ def run_setup(
     template_embedding_model = mcp_template["mcpServers"]["qdrant"]["env"]["EMBEDDING_MODEL"]
     previous_embedding_model = existing_embedding_model(existing_mcp)
     resolved_embedding_model = resolve_embedding_model(embedding_model, existing_mcp, template_embedding_model)
-    existing_memory_bank_model = (
-        (existing_mcp.get("mcpServers", {}).get("memory-bank", {}).get("env", {}) or {}).get("EMBEDDING_MODEL") or ""
+    # Issue #428: memory-bank's model is resolved from its own sources only
+    # (explicit flag > its own existing block > template default).
+    template_memory_bank_model = mcp_template["mcpServers"]["memory-bank"]["env"]["EMBEDDING_MODEL"]
+    previous_memory_bank_model = existing_memory_bank_model(existing_mcp)
+    resolved_memory_bank_model = resolve_memory_bank_embedding_model(
+        memory_bank_embedding_model, existing_mcp, template_memory_bank_model
     )
-    # Only an explicit change of model (the drop-and-reindex case) keeps the shared
-    # memory-bank server on its locked model; a plain re-run is unchanged.
-    explicit_model_change = bool(embedding_model) and bool(previous_embedding_model) and (
-        resolved_embedding_model != previous_embedding_model
-    )
-    # A project with no memory-bank block still shares a collection locked to the
-    # model it was created under, which is the previous code model.
-    shared_memory_bank_model = resolved_embedding_model
-    if explicit_model_change:
-        shared_memory_bank_model = existing_memory_bank_model or previous_embedding_model
 
     # Issue #221: decide -- BEFORE building the qdrant server's env block --
     # whether it's safe to set HF_HUB_OFFLINE=1, so mcp-server-qdrant's own
@@ -997,10 +1119,19 @@ def run_setup(
     # config actually points at. Opt-in (default False) and injectable
     # (fastembed_warmup_fn) so every existing caller/test is unaffected.
     hf_hub_offline = False
+    memory_bank_warm = False
     if attempt_fastembed_warmup:
         warmup_fn = fastembed_warmup_fn or warm_fastembed_cache
         fastembed_cache_path = resolved_fastembed_cache_path(home_dir)
         hf_hub_offline = bool(warmup_fn(resolved_embedding_model, fastembed_cache_path))
+        # Issue #428: the memory-bank server loads its own model, so warm that
+        # one too (skipped when it is the same model, already warmed above).
+        # Its outcome never affects HF_HUB_OFFLINE, which is the qdrant
+        # server's setting only.
+        if resolved_memory_bank_model == resolved_embedding_model:
+            memory_bank_warm = hf_hub_offline
+        else:
+            memory_bank_warm = bool(warmup_fn(resolved_memory_bank_model, fastembed_cache_path))
 
     generated_servers = build_mcp_servers(
         mcp_template,
@@ -1023,7 +1154,7 @@ def run_setup(
         include_compress=include_compress,
         hf_hub_offline=hf_hub_offline,
         embedding_model=resolved_embedding_model,
-        memory_bank_embedding_model=shared_memory_bank_model,
+        memory_bank_embedding_model=resolved_memory_bank_model,
         compact_embedding_model=resolve_compact_embedding_model(existing_mcp, resolved_embedding_model),
     )
     unresolved = find_unresolved_placeholders(generated_servers)
@@ -1041,13 +1172,31 @@ def run_setup(
             f"WARNING: EMBEDDING_MODEL changed from '{previous_embedding_model}' to "
             f"'{resolved_embedding_model}'. Vectors already indexed under the old model are "
             f"incompatible: drop the project's collection (directly in Qdrant) and re-run "
-            f"index_repo. The shared memory-bank server keeps '{shared_memory_bank_model}', "
-            f"the model its collection is locked to; this run does not change it."
+            f"index_repo. The memory-bank server's model is separate and is not changed by "
+            f"--embedding-model."
         )
     elif previous_embedding_model and previous_embedding_model != template_embedding_model:
         changes.append(
             f"Preserved the existing EMBEDDING_MODEL '{previous_embedding_model}' (pass "
             f"--embedding-model to change it)."
+        )
+    if previous_memory_bank_model and resolved_memory_bank_model != previous_memory_bank_model:
+        # Only reachable via an explicit --memory-bank-embedding-model.
+        changes.append(
+            f"WARNING: the memory-bank EMBEDDING_MODEL changed from '{previous_memory_bank_model}' to "
+            f"'{resolved_memory_bank_model}'. Its collection ('{resolved_memory_bank_collection}') is shared "
+            f"by every project and locked to the model that created it, so remember/recall will fail "
+            f"for EVERY project using it until that collection is rebuilt (or they all move to the new model)."
+        )
+    elif previous_memory_bank_model and previous_memory_bank_model != template_memory_bank_model:
+        changes.append(
+            f"Preserved the existing memory-bank EMBEDDING_MODEL '{previous_memory_bank_model}' (pass "
+            f"--memory-bank-embedding-model to change it)."
+        )
+    if attempt_fastembed_warmup and not memory_bank_warm:
+        changes.append(
+            f"Could not confirm the fastembed cache is warm for the memory-bank model "
+            f"'{resolved_memory_bank_model}'; its first start may download it. Safe to re-run this setup to retry."
         )
     if attempt_fastembed_warmup:
         changes.append(
