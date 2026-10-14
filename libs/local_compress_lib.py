@@ -798,7 +798,7 @@ def strip_total_outage_notice(result: str) -> Optional[str]:
 #     in-process cache already covers the same-process case (e.g. the MCP server
 #     compresses the same file twice in one session).
 #   - In practice, each process's own in-memory cache is sufficient for the
-#     within-session deduplication this issue targets. A future cross-process
+#     within-session deduplication this cache targets. A future cross-process
 #     cache can be layered on top if measured to matter.
 #
 # model is included in the key: the same content compressed with a different
@@ -1426,7 +1426,7 @@ def complete(oai_client, model: str, system: str, content: str) -> Optional[str]
     a dead LM Studio server is only caught here, at the actual request.
 
     On failure the reason is also recorded for take_failure_kind():
-    #the client signals a timeout by raising CompletionTimeout (a
+    the client signals a timeout by raising CompletionTimeout (a
     timeout may subclass a connection error in the client's own SDK, so the
     client translates it explicitly rather than this function inferring it
     from "not a connection error"). `oai_client` is any object with an

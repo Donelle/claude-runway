@@ -647,7 +647,7 @@ class PipInstalledVenvPython(unittest.TestCase):
 
     def test_returns_none_when_tools_repo_dir_has_a_venv(self):
         # None tells run_setup to use ITS OWN pure default -- the
-        # documented clone workflow, unchanged by this issue.
+        # documented clone workflow, which is unchanged.
         fake_tools_repo_dir = Path(self._tmpdir.name)
         (fake_tools_repo_dir / ".venv").mkdir()
         with mock.patch.object(self.mod, "TOOLS_REPO_DIR", fake_tools_repo_dir):
@@ -661,7 +661,7 @@ class PipInstalledVenvPython(unittest.TestCase):
 
 class PipInstalledLayoutReminder(unittest.TestCase):
     """cmd_init's printed reminders adapt for a pip/pipx/uvx install:
-    #there's no local clone to say "venv activated" about, and
+    there's no local clone to say "venv activated" about, and
     claude-runway-ingest is on PATH instead of a `python tools/....py` path
     that wouldn't even exist in that layout. Mocks `_pip_installed_venv_python`
     directly (rather than manipulating a real `.venv` next to this repo's own

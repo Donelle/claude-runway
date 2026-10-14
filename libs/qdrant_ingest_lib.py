@@ -570,7 +570,7 @@ def brace_boundary_indexes(lines, ext: str = "") -> set:
 
     `ext` is the lowercase file extension (e.g. `".php"`) passed through to
     `_strip_c_style_line` for PHP-specific `#` line-comment handling.
-    #All other extensions leave `#` untouched (see _strip_c_style_line).
+    All other extensions leave `#` untouched (see _strip_c_style_line).
 
     Strings and comments (including backtick template/raw-string literals
     -- see _strip_c_style_line) are stripped first so a brace inside one is
@@ -1108,7 +1108,7 @@ def ensure_persistent_fastembed_cache() -> None:
     (tempfile.gettempdir()/"fastembed_cache"), which gets wiped on reboot or
     periodic temp cleanup -- silently reintroducing a network dependency on
     huggingface.co the next time a FastEmbedProvider is constructed.
-    #Point it at a persistent, toolkit-owned directory instead, unless
+    Point it at a persistent, toolkit-owned directory instead, unless
     the caller already set their own value -- .mcp.json's codebase-indexer
     env block or a shell export both take priority via setdefault().
 

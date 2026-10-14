@@ -450,7 +450,7 @@ class TranscriptScanStrategy(SessionIdLibTestCase):
     def test_containment_guard_symlink_loop_runtimeerror_returns_none(self):
         # Copilot review: on Python 3.10-3.12 Path.resolve()
         # raises RuntimeError (NOT OSError) on a symlink loop. The containment
-        # guard added for this issue must catch that too, or it would newly
+        # guard must catch that too, or it would newly
         # violate session_id()'s never-raises contract (before the guard,
         # is_dir() just returned False for this case). Verified live that a real
         # symlink loop raises RuntimeError; here we force it deterministically.

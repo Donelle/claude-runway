@@ -20,7 +20,7 @@ Deliberately NOT the home for savings_ledger.py's `savings.db` or
 memory_events_lib.py's `memory-events.db` -- both are genuinely tailored
 schemas that already work well for their one specific domain each,
 migrating them onto this generic store is an explicit follow-up, not part
-of this ticket (see the "Explicitly out of scope" section).
+of this module's scope.
 my-gh-autowork's per-ticket outcome logging writes into
 this store (`metric_id="autowork"`), as does memory_events_lib's
 `record_memory_metric` (`metric_id="memory-bank"`).

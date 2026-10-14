@@ -160,7 +160,7 @@ def current_session_id(project: Optional[str] = None) -> Optional[str]:
     "most recent regardless of project," and that a caller wanting that
     different, unfiltered meaning "must implement that itself." Implementing
     it here is exactly that -- with one change since the original:
-    #session_id_lib's `session_<id>.jsonl` shadow markers share this
+    session_id_lib's `session_<id>.jsonl` shadow markers share this
     directory by default and are refreshed on every lifecycle event, far
     more often than a ledger is written, so the newest `*.jsonl` was often a
     marker and its stem (`"session_<id>"`) came back as a session id. Markers
@@ -306,7 +306,7 @@ def read_session_events(session_id: str) -> list:
 
 def _parse_event_lines(lines) -> list:
     """Shared by read_session_events() and recover_orphaned_sessions(),
-    #which parses a claimed ledger under a different filename."""
+    which parses a claimed ledger under a different filename."""
     events = []
     for line in lines:
         line = line.strip()

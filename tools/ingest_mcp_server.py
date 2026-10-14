@@ -305,7 +305,7 @@ def _valid_search_limit(value: object) -> Optional[int]:
 def _resolve_search_limit(client: QdrantClient, collection: str, qdrant_url: str) -> int:
     """
     Resolves find_in_collection's limit when the caller passed none:
-    #local cache first, then live Qdrant collection
+    local cache first, then live Qdrant collection
     metadata (`search_limit`, the source of truth written by
     _recompute_search_limit), then DEFAULT_SEARCH_LIMIT. A live hit
     backfills the cache; a miss deliberately does not (same "cache only
@@ -425,7 +425,7 @@ async def index_repo(
 
     When reset=False and the collection already contains data, this tool
     returns a warning before starting the expensive embedding work
-    #so you can cancel/reset/use sync_repo rather than discovering
+    so you can cancel/reset/use sync_repo rather than discovering
     duplicate risk after the full embed-and-store loop has already run.
     Pass force=True to bypass this pre-flight check and add content to
     the existing index deliberately. force has no effect when reset=True.

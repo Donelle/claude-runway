@@ -82,7 +82,7 @@ def _pip_installed_venv_python() -> Optional[Path]:
     install (the two methods `docs/installation.md`'s "Alternative" callout actually
     documents): there IS no `.venv` sibling directory next to the installed
     `tools`/`libs` directories (wheel data files under `<env>/src`)
-    #-- pipx/uv tool manage their
+    -- pipx/uv tool manage their
     own venv elsewhere, and `sys.executable` (whichever interpreter is
     actually running this console script right now) is the only
     generally-correct answer in that case, since that's exactly the
@@ -339,7 +339,7 @@ def cmd_init(args: argparse.Namespace) -> None:
     include_hooks = not args.skip_hooks
     # None when TOOLS_REPO_DIR/.venv exists (the documented clone workflow --
     # see _pip_installed_venv_python's docstring): run_setup then falls back
-    # to its own pure venv_python_path default exactly as before this issue,
+    # to its own pure venv_python_path default exactly as before,
     # so this is a no-op for every existing user/test of that flow.
     venv_python_override = _pip_installed_venv_python()
     result = run_setup(

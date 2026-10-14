@@ -16,7 +16,7 @@ and not a fit for this.)
 The marker is Qdrant collection metadata, the same mechanism
 `set_collection_description` uses. `update_collection(metadata=...)` merges
 top-level keys rather than replacing the dict (confirmed against a live
-Qdrant instance for this issue, and noted in `set_collection_description`'s
+Qdrant instance, and noted in `set_collection_description`'s
 docstring), so writing the marker cannot erase
 a stored `description`/`search_limit` hint, and writing those cannot erase
 the marker.

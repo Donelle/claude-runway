@@ -1069,7 +1069,7 @@ def _compact_find_entry_count(tool_response):
 def _dispatch(payload):
     """Everything main() does after the payload has been parsed off stdin --
     split out so main() can wrap this whole body in one try/except
-    #without also swallowing the json.load try/except above it, which
+    without also swallowing the json.load try/except above it, which
     has to stay narrowly scoped to the parse step itself."""
     _debug_log(payload)
 

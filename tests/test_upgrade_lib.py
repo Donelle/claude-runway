@@ -8,7 +8,7 @@ tests/test_setup_project_lib.py's RunSetupEndToEnd uses for run_setup():
 
     .venv/bin/python -m unittest discover -s tests
 
-Covers, per this ticket's own test-strategy section: each migration's
+Covers each migration's
 `detect` in both its "before" and "after" states; `apply` making exactly the
 one stated change (diffed against the input); `run_upgrade(auto_yes=True)`
 applying every pending migration and skipping ones already applied;

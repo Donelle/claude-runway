@@ -318,7 +318,7 @@ def get_metrics(metric_id: str, view: str = "summary", bucket: str = "week", n: 
       narrows view="summary"/"by_event_type"/"detail" down to rows matching
       this exact session_id AND metric_id — e.g. one specific
       `my-gh-autowork` attempt's own `f"issue-{n}-{HHMMSS}"` marker,
-      #instead of that metric_id's entire history. Omitting it (the
+      instead of that metric_id's entire history. Omitting it (the
       default) keeps today's metric_id-only aggregate/listing unchanged.
       Ignored for view="trend" — per-session filtering doesn't compose with
       time-bucketed grouping, so a session_id passed alongside view="trend" has no effect
@@ -378,7 +378,7 @@ def record_metric(
     (the write counterpart to get_metrics). Any domain in
     this toolkit can call this to record an event. my-gh-autowork's
     per-ticket outcome logging was the first consumer (cut over from
-    compact_store by this ticket); it now goes through
+    compact_store); it now goes through
     tools/autowork_cost.py record, which writes the same metric_id="autowork"
     rows, and this tool remains for anything that CLI can't cover.
 

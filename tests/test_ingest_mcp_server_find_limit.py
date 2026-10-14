@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Tests for find_in_collection's limit resolution.
-#Stdlib-only, no network: QdrantClient, the cache, the embedding
+Stdlib-only, no network: QdrantClient, the cache, the embedding
 provider and the connector are all mocked.
 
     .venv/bin/python -m unittest discover -s tests

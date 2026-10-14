@@ -749,7 +749,7 @@ def strip_toolkit_hooks(existing: dict) -> dict:
 def default_skills_dir(home_dir: Path) -> Path:
     """
     Default install destination for `plan_skill_installs` below
-    #-- `~/.claude/skills/`, the SAME user-level location
+    -- `~/.claude/skills/`, the SAME user-level location
     `docs/session-continuity.md`/`docs/savings-tracker.md` already document
     installing skills to by hand ("install globally... only once"), and
     what `/my-resume`'s own per-project scoping (by current directory name,
@@ -762,7 +762,7 @@ def default_skills_dir(home_dir: Path) -> Path:
 def split_skill_frontmatter(data: bytes) -> "tuple[bytes, bytes]":
     """
     Splits a SKILL.md's raw bytes into `(frontmatter_prefix, body)`.
-    #`frontmatter_prefix` is everything from the opening `---` line
+    `frontmatter_prefix` is everything from the opening `---` line
     through the closing `---` line PLUS the blank line(s) after it, so
     `frontmatter_prefix + body == data` always holds; it is `b""` when
     `data` has no frontmatter block.

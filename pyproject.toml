@@ -83,8 +83,8 @@ fallback_version = "0.0.0+unknown"
 
 [tool.ruff.lint]
 # Starting narrow -- pyflakes (F) + flake8-bugbear (B). More
-# rule groups get added later, one at a time, each its own reviewed PR per
-# that issue's hard constraint: adopting/expanding the linter must never
+# rule groups get added later, one at a time, each its own reviewed PR, under
+# one hard constraint: adopting/expanding the linter must never
 # change runtime behavior on its own.
 select = ["F", "B"]
 
@@ -148,7 +148,7 @@ packages = ["claude_runway"]
 # setuptools packages anymore (previously
 # `packages = ["libs", "tools", "templates", "hooks", "skills"]` put all
 # five directly in site-packages, the generic top-level-namespace layout
-# this issue moves away from). setup.py's `data_files()` instead globs each
+# this project moved away from). setup.py's `data_files()` instead globs each
 # directory and ships them as wheel DATA files under
 # <env>/src/{libs,tools,hooks,templates,skills} -- installed as siblings of
 # each other under a dedicated `src/` directory, exactly as they are in

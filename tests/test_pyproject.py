@@ -15,7 +15,7 @@ way the old version of this file did; the wheel-content tests below
 actually build a wheel and inspect it, which is the only thing that can
 catch setup.py itself regressing (e.g. back to a single shared "src/skills"
 target, which silently drops every skill but one -- confirmed live during
-this issue's own development, see setup.py's docstring).
+development, see setup.py's docstring).
 
 Stdlib-only for the TOML-parsing tests (tomllib, Python 3.11+) -- skips
 itself on an older interpreter rather than adding a new third-party
@@ -84,7 +84,7 @@ class PyprojectTomlIsWellFormed(unittest.TestCase):
         # libs/tools/templates/hooks/skills moved OUT of
         # `[tool.setuptools] packages` (previously all five, plus this one
         # implicitly via site-packages, were top-level packages -- the
-        # generic-namespace layout this issue replaces). claude_runway is
+        # generic-namespace layout this one replaces). claude_runway is
         # the one real, importable site-packages package left -- it exists
         # purely to bridge [project.scripts] to the data-files layout (see
         # claude_runway/__init__.py's own docstring).
@@ -271,7 +271,7 @@ class BuiltWheelHasExpectedDataLayout(unittest.TestCase):
                 )
 
     def test_every_skill_subdirectory_ships_distinctly_not_collapsed(self):
-        # Regression guard for the exact bug found during this issue's own
+        # Regression guard for the exact bug found during
         # development: a single shared "src/skills" data_files target
         # copies every matched SKILL.md into the SAME target directory by
         # basename alone, silently collapsing every skill but the

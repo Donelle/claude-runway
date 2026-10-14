@@ -6,7 +6,7 @@ points. Exists purely to bridge a gap `[project.scripts]`
 otherwise can't close: pyproject.toml ships libs/tools/hooks/templates/
 skills as wheel DATA files under <env>/src/{libs,tools,hooks,templates,
 skills} (see setup.py), not as `[tool.setuptools] packages` -- so, unlike
-before this issue, `tools` is no longer importable on sys.path just because
+the earlier layout, `tools` is no longer importable on sys.path just because
 the package installed successfully. Python's own console-script mechanism
 still needs SOME real, importable site-packages module for an entry point
 to resolve at all, so this package is that module: it puts <env>/src on

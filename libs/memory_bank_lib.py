@@ -101,9 +101,9 @@ DEFAULT_WEIGHT = 1.0
 # docstring for the full semantics and why) has to happen against a wider raw-similarity pool than
 # the final `limit`, or a genuinely high-weight but lower-raw-similarity
 # match could get cut by Qdrant's own similarity-only ordering before
-# re-ranking ever sees it. 3x is a fixed implementation choice (the ticket
-# calls out the two-stage SHAPE -- fetch pool, re-rank, truncate -- as the
-# spec decision, not this exact multiplier).
+# re-ranking ever sees it. 3x is a fixed implementation choice (the
+# two-stage SHAPE -- fetch pool, re-rank, truncate -- is the
+# design decision, not this exact multiplier).
 _RECALL_OVERFETCH_MULTIPLIER = 3
 
 

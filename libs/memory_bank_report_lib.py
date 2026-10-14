@@ -30,7 +30,7 @@ report's own output, so nobody reads more into the numbers than they hold
 - No column records a hit's `score`/`effective_score`, or the size of the
   response a call returned. Payload is therefore reported as a HIT COUNT,
   not bytes/tokens, and the score trend can't be computed at all without a
-  schema change, which this ticket explicitly rules out.
+  schema change, which this report deliberately avoids.
 - A "dead" memory may also have been `forget`-ed (not logged in this table)
   or be too new to have had a chance to be recalled -- `min_age_days` exists
   for the second case; nothing in the existing data distinguishes the first.

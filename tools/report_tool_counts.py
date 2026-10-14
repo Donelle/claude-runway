@@ -26,7 +26,7 @@ enumerate its own tools, which is a real regression worth failing the
 build on.
 
 Reports a size, not just a count, because a count alone says little:
-#tool schemas differ in size. The size is in
+tool schemas differ in size. The size is in
 CHARACTERS, not tokens: a token count depends on the model's
 vocabulary, which is not public, and the chars / 3.5 estimate this script used
 to print was presented as a per-turn cost that real transcripts show is not

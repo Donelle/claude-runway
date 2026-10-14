@@ -133,7 +133,7 @@ def ensure_file_path_index(client, collection_name: str) -> bool:
     unconditionally calling create_payload_index every time: Qdrant builds
     a payload index by scanning every existing point once, so blindly
     reissuing this call on every sync_repo run would just move the exact
-    full-scan cost this issue exists to eliminate from the delete path to
+    full-scan cost the index exists to eliminate from the delete path to
     here instead.
 
     Callers must confirm collection_name already exists before calling this
