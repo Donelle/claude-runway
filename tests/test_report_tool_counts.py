@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Tests for tools/report_tool_counts.py -- the CLI (issue #52/GROW-05)
+"""Tests for tools/report_tool_counts.py -- the CLI (GROW-05)
 that EVALUATION.md's Track A/B prose and the CI lint step both point at
 instead of a hardcoded tool count/token estimate. Verifies it reports a
-live, nonzero count AND schema size (in characters, issue #439) for each
+live, nonzero count AND schema size (in characters) for each
 real server (all four are this repo's own) and
 correctly signals failure (nonzero exit) if a server can't be
 constructed/enumerated, rather than silently reporting zero -- a silent
@@ -128,7 +128,7 @@ class MainReportsAllServersAndExitsCleanly(unittest.TestCase):
         self.assertNotIn("standalone", output)
         self.assertIn("tools", output)
         self.assertIn("tool-description characters (schema proxy)", output)
-        # Issue #439: no token estimate is printed any more.
+        # No token estimate is printed any more.
         self.assertNotIn("schema tokens", output)
 
     def test_main_reports_a_specific_live_count_matching_direct_introspection(self):

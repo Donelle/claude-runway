@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for libs/transcript_attribution_lib.py (issue #440): the join of
+"""Tests for libs/transcript_attribution_lib.py: the join of
 compression events to the transcript's model and turn, the per-model chars-per-
 token ratio, and the per-request counting across a compaction.
 

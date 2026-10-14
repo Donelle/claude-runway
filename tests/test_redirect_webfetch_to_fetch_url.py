@@ -11,7 +11,7 @@ LM Studio calls:
 
     .venv/bin/python -m unittest discover -s tests
 
-Issue #29: _lmstudio_reachable only checked that LM Studio responded at all,
+_lmstudio_reachable only checked that LM Studio responded at all,
 not that a model could actually be resolved -- so in a 0-or-2+-model state
 with nothing pinned, this hook would deny WebFetch and fetch_url would then
 fail too, for the exact same reason. These tests pin the fixed decision tree
@@ -23,7 +23,7 @@ with a model pinned (the pin must not bypass reachability itself, since
 resolve_model's own pinned branch never checks it -- see the fix's
 docstring for why that matters specifically for this hook).
 
-Issue #296: _lmstudio_reachable used to call `.models.list()` (the
+_lmstudio_reachable used to call `.models.list()` (the
 OpenAI-compatible /v1/models endpoint) directly and count every entry it
 returned as "loaded" -- but /v1/models lists every DOWNLOADED model
 regardless of whether it's actually loaded (LM Studio's JIT-loading
@@ -37,7 +37,7 @@ calls, since fetch_loaded_models' own behavior is covered by
 test_local_compress_lib.py -- this file only needs to confirm
 _lmstudio_reachable's decision tree built on top of it.
 
-Issue #64: _DeniedUrlCache records denied URLs with a timestamp so a retry
+_DeniedUrlCache records denied URLs with a timestamp so a retry
 WebFetch call for the same URL within the TTL is allowed through (fetch_url
 was presumably tried and failed between the two calls). After allowing, the
 entry is deleted (one-shot skip) so the next call is denied again normally.
@@ -137,7 +137,7 @@ class LmstudioReachable(unittest.TestCase):
         self.assertFalse(hook._lmstudio_reachable(None))
 
     def test_stale_env_var_with_pin_returns_false(self):
-        # PR #131 review (Copilot) on issue #41's fix: resolve_model() now
+        # Review (Copilot) on the fix: resolve_model() now
         # checks stale_env_warning() unconditionally, BEFORE its
         # explicit_model/DEFAULT_MODEL short-circuits -- so a pinned model
         # no longer bypasses a stale-env hard-fail there. This hook's
@@ -153,7 +153,7 @@ class LmstudioReachable(unittest.TestCase):
         self.assertFalse(hook._lmstudio_reachable(None))
 
     def test_v1_fallback_source_still_applies_same_count_rule(self):
-        # Issue #296: when fetch_loaded_models had to fall back to /v1/models
+        # When fetch_loaded_models had to fall back to /v1/models
         # (source="v1"), _lmstudio_reachable applies the exact same "exactly
         # one -> True" rule to whatever ids it got back -- it doesn't special
         # case the fallback source, since resolve_model itself doesn't either.
@@ -164,7 +164,7 @@ class LmstudioReachable(unittest.TestCase):
 
 
 class DeniedUrlCache(unittest.TestCase):
-    """Tests for _DeniedUrlCache — the TTL-based failed-URL cache (issue #64).
+    """Tests for _DeniedUrlCache — the TTL-based failed-URL cache.
 
     Each test uses a temporary file-backed SQLite DB (not in-memory) so the
     cache implementation can open and close connections normally without the DB

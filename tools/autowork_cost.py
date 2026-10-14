@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CLI for /my-gh-autowork's transcript-derived per-ticket cost (issue #455). Stdlib
+CLI for /my-gh-autowork's transcript-derived per-ticket cost. Stdlib
 only. Reads subagent transcripts under ~/.claude/projects (or --projects-root) and
 writes the shared metrics store (metric_id="autowork").
 

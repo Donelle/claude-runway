@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 MCP server exposing `remember`/`recall`/`forget` -- durable, cross-session
-knowledge storage independent of the code index (issue #175) -- plus
-`transfer_memories` (issue #336), which copies a legacy collection's
+knowledge storage independent of the code index -- plus
+`transfer_memories`, which copies a legacy collection's
 in-scope memories into the shared collection. Where
 `codebase-indexer` remembers what a repo's CODE looks like, this server
 remembers what a project (or, via `general=True`, every project) has
@@ -18,13 +18,12 @@ Setup:
 Register in .mcp.json (see templates/mcp.json.template's "memory-bank"
 block). Reuses the same QDRANT_URL/QDRANT_API_KEY/EMBEDDING_MODEL env var
 names the qdrant/codebase-indexer servers read, but EMBEDDING_MODEL here is
-its OWN value, set independently of theirs (issue #428) because it must match
+its OWN value, set independently of theirs because it must match
 the shared collection's model, not the project's code index -- and
 MEMORY_BANK_COLLECTION
 is its own, separate collection name: every project shares ONE memory-bank
 collection (not each project's own code-index collection), tagged by writing
-project (see libs/memory_bank_lib.py's module docstring for why, and
-issue #175's comments for the design history behind that choice).
+project (see libs/memory_bank_lib.py's module docstring for why).
 
 IMPORTANT: this server uses stdio transport, meaning stdout is reserved for
 MCP protocol messages. Nothing in this file should ever call print() --
@@ -53,7 +52,7 @@ import memory_bank_lib as mb
 import memory_events_lib as mev
 
 # Must run before any FastEmbedProvider(...) construction below -- see
-# ingest_mcp_server.py's identical call and issue #77 for why.
+# ingest_mcp_server.py's identical call for why.
 ensure_persistent_fastembed_cache()
 
 # Same env var names the qdrant/codebase-indexer servers already read, so a
@@ -74,11 +73,11 @@ DEFAULT_MEMORY_BANK_COLLECTION = os.environ.get("MEMORY_BANK_COLLECTION", "memor
 # they're independent settings -- nothing enforces they stay identical.
 DEFAULT_MEMORY_BANK_ID = os.environ.get("MEMORY_BANK_ID")
 
-# Issue #179: this server has no access to Claude Code's own session_id --
+# This server has no access to Claude Code's own session_id --
 # only hooks get one, via their stdin payload (see
 # tools/compress_mcp_server.py's _append_savings_footer docstring for the
 # identical constraint on the local-compress server). Delegates to
-# libs/session_id_lib.py's SessionIdStrategy.PROXY (issue #198/#214) rather
+# libs/session_id_lib.py's SessionIdStrategy.PROXY rather
 # than minting its own uuid.uuid4().hex here -- same process-lifetime,
 # cached-once, thread-safe proxy behavior, just no longer duplicated: see
 # that module's docstring for the full four-strategy rationale (this MCP
@@ -90,7 +89,7 @@ _raw_session_id = _resolve_session_id(SessionIdStrategy.PROXY)
 # dispatches to) always returns a str unconditionally, never None. Narrowing
 # that here via an explicit annotation (rather than threading Optional[str]
 # through every record_memory_event call below, or leaving the type checker
-# (mypy originally, Pyright since issue #297 -- both behave the same way
+# (mypy originally, Pyright -- both behave the same way
 # here) widen _SESSION_ID's type back to Optional[str] at every OTHER use
 # site, which a bare assert right after the assignment does not prevent for
 # a module-level global) keeps this module's own session_id type exactly
@@ -101,12 +100,12 @@ _SESSION_ID: str = _raw_session_id
 
 # Per-session call-sequence counter for memory_events_lib's `turn` field --
 # incremented once per remember()/recall() TOOL INVOCATION (see _next_turn),
-# not once per event row logged, and (PR #197 review) regardless of whether
+# not once per event row logged, and regardless of whether
 # that particular call ends up actually logging anything -- a validation
 # error, a missing collection, or an empty recall still consumed a turn
 # number, matching "the Nth memory-bank call this session," not "the Nth
 # LOGGED memory-bank call." forget() never advances this, since forget
-# events aren't tracked at all (issue #179 scope).
+# events aren't tracked at all.
 _turn_counter = itertools.count(1)
 
 
@@ -170,7 +169,7 @@ async def remember(
     point and `remember` it again.
     """
     # turn is captured HERE, unconditionally, before any of the fallible
-    # steps below (repo resolution, the actual write) -- PR #197 review: a
+    # steps below (repo resolution, the actual write) -- a
     # previous version only called _next_turn() deep inside the
     # tracking-enabled branch, AFTER a successful write, so a validation
     # error or a schema mismatch silently skipped a turn number instead of
@@ -180,7 +179,7 @@ async def remember(
     tracking = mev.tracking_enabled()
     turn = _next_turn() if tracking else None
     if tracking:
-        # Issue #211: a plain per-call-attempt tally into metrics.db,
+        # a plain per-call-attempt tally into metrics.db,
         # separate from the rich mev.record_memory_event(...) call below --
         # fired here, before ANY of the fallible steps that follow (weight
         # validation, repo resolution, the actual write), so an invalid
@@ -190,13 +189,13 @@ async def remember(
 
     # Rejected here, at the tool boundary, same as recall()'s `limit < 1`
     # check below -- before resolve_repo/QdrantClient/embedding provider, so
-    # an invalid weight never pays for any of that (PR #199 review): a
+    # an invalid weight never pays for any of that: a
     # negative weight isn't just "unusual," it actively BREAKS the ranking
     # invariant recall_points' effective_score depends on (weight=0 must be
     # a true floor, weight>1 must only ever boost -- both assume weight>=0).
     #
-    # `math.isfinite(weight)` is checked FIRST, not just `weight < 0` (PR
-    # #199 review, second pass): `float("inf") < 0` and `float("nan") < 0`
+    # `math.isfinite(weight)` is checked FIRST, not just `weight < 0`:
+    # `float("inf") < 0` and `float("nan") < 0`
     # are both False in Python, so `inf`/`nan` (both reachable from ordinary
     # JSON-RPC numeric input -- e.g. the JSON literal `1e999` parses to
     # `inf`) silently passed the negativity check alone. `inf` would then
@@ -218,7 +217,7 @@ async def remember(
     client = QdrantClient(url=DEFAULT_QDRANT_URL, api_key=DEFAULT_QDRANT_API_KEY)
     embedding_provider = FastEmbedProvider(DEFAULT_EMBEDDING_MODEL)
 
-    # No separate top-level mismatch check here (PR #178 review): ensure_collection
+    # No separate top-level mismatch check here: ensure_collection
     # (called by remember_point below) now does an equivalent check itself, positioned
     # right before the actual write rather than earlier -- checking here too would just
     # be a redundant round-trip with a WIDER race window, not extra safety.
@@ -231,7 +230,7 @@ async def remember(
         return mismatch
     if tracking:
         # summary_created_at is the EXACT value remember_point itself
-        # stamped into metadata.created_at (PR #197 review) -- a previous
+        # stamped into metadata.created_at -- a previous
         # version re-sampled time.time() here instead, which under
         # call_with_retry's retries (up to 4 attempts, each with a backoff)
         # could diverge from the real stamped value by much more than a
@@ -271,29 +270,29 @@ async def recall(
     directly), or all_repos=True to search across every project at once.
     Don't guess a repo name -- only pass one the user actually named, or
     call list_collections-equivalent context if unsure (there is no
-    discovery tool for repo names here by design -- see issue #175 for why
-    automatic cross-repo discovery was rejected).
+    discovery tool for repo names here by design: automatic
+    cross-repo discovery was rejected).
 
     kind narrows further if given. limit caps how many hits come back.
 
     Results are ranked by `effective_score` (`max(0, raw similarity) *
     weight`; ties broken by weight>0 then raw similarity, so weight=0 is last), not raw similarity alone
-    (issue #177) -- a memory `remember`ed with a higher `weight` can outrank
+    -- a memory `remember`ed with a higher `weight` can outrank
     a more similarly-worded but lower-weight (or stale/superseded) one, but
     only proportionally (weight=2.0 lets a hit with half the similarity tie),
-    and never when its similarity is non-positive (issue #272). Each result includes both `score` (raw
+    and never when its similarity is non-positive. Each result includes both `score` (raw
     similarity) and `effective_score` (what ranking actually used) so this
     is inspectable, not hidden.
     """
     # Captured HERE, unconditionally, for the same reason remember() above
-    # does (PR #197 review): turn must count every recall() INVOCATION --
+    # does: turn must count every recall() INVOCATION --
     # a validation error, a missing collection, an embedding mismatch, or a
     # genuinely empty result set are all still "a call this session," even
     # though none of them reach the logging branch below.
     tracking = mev.tracking_enabled()
     turn = _next_turn() if tracking else None
     if tracking:
-        # Issue #211: a plain per-call-attempt tally into metrics.db, fired
+        # a plain per-call-attempt tally into metrics.db, fired
         # unconditionally for every recall() invocation (unlike the per-hit
         # mev.record_memory_event(...) logging further down, which only
         # fires when there are actual results) -- a validation error, an
@@ -316,7 +315,7 @@ async def recall(
     if not call_with_retry(client.collection_exists, collection):
         # Return immediately rather than falling through to recall_points,
         # which does its OWN separate collection_exists check right before
-        # querying (PR #178 review): a concurrent remember() could create the
+        # querying: a concurrent remember() could create the
         # collection under a DIFFERENT embedding model in the gap between
         # this check and that one, making recall_points proceed past ITS
         # check and call query_points with the wrong vector name -- an
@@ -324,8 +323,8 @@ async def recall(
         # message. A collection that doesn't exist yet has no memories for
         # this caller regardless, so returning here is exactly what
         # recall_points would have reported anyway, without reopening that
-        # window. Checked BEFORE constructing FastEmbedProvider below (PR
-        # #178 review, second pass): that constructor eagerly loads/downloads
+        # window. Checked BEFORE constructing FastEmbedProvider below:
+        # that constructor eagerly loads/downloads
         # the ONNX model (TextEmbedding's default lazy_load=False), so
         # recalling against a not-yet-existing collection would otherwise pay
         # for a model load it never needed just to return "no results."
@@ -346,7 +345,7 @@ async def recall(
         return f"No memories found for '{query}'."
 
     if tracking:
-        # One turn value for this whole call (issue #179): "3rd memory-bank
+        # One turn value for this whole call: "3rd memory-bank
         # call this session" describes the CALL, not each individual hit --
         # a recall() returning 5 hits logs 5 rows that all share this same
         # turn number, not 5 separate turns. turn was already captured at
@@ -364,7 +363,7 @@ async def recall(
                 turn=turn,
             )
 
-    # JSON, not hand-rolled XML-ish text (PR #178 review, eighth pass):
+    # JSON, not hand-rolled XML-ish text:
     # summary/description/kind are arbitrary stored text (see
     # memory_bank_lib.py's module docstring -- kind is fully model-decided,
     # summary/description are never sanitized), so interpolating them into
@@ -400,7 +399,7 @@ def forget(
     confirm=True.
     """
     if mev.tracking_enabled():
-        # Issue #211: forget() has no existing memory_events_lib tracking at
+        # forget() has no existing memory_events_lib tracking at
         # all (its rich record_memory_event log deliberately excludes
         # "forget" -- see that module's docstring), so this is the first use
         # of mev here. Fired before the point_id/wipe_all validation below,
@@ -480,12 +479,12 @@ async def transfer_memories(
     # pays for nothing.
     caller_repo, error = mb.resolve_repo(DEFAULT_MEMORY_BANK_ID, general=False)
     if error:
-        # JSON like every other outcome of this tool (PR #422 review), so a
+        # JSON like every other outcome of this tool, so a
         # caller can parse every result the same way.
         return json.dumps({"source_collection": source_collection, "dry_run": dry_run, "error": error}, indent=2)
     assert caller_repo is not None  # resolve_repo returns a repo whenever error is None
 
-    # The configured key is only sent to the configured URL (PR #422 review):
+    # The configured key is only sent to the configured URL:
     # qdrant_url is tool input, so falling back to DEFAULT_QDRANT_API_KEY for
     # ANY url would hand this project's Qdrant credential to whatever host a
     # call names. A different endpoint gets only the key passed with it.

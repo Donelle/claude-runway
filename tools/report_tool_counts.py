@@ -7,7 +7,7 @@ tool schema -- see below) for every MCP server this repo's users connect (this r
 `ingest_mcp_server.py`/`memory_bank_mcp_server.py`) -- instead of a number
 hand-copied into EVALUATION.md that goes stale as tools are added. See
 libs/mcp_tool_introspect.py's docstring for the history of that exact
-failure mode (issues #22/#23), and issue #52/GROW-05 for why one shared,
+failure mode, and GROW-05 for why one shared,
 reusable utility was built rather than a third place to fix the same
 number by hand.
 
@@ -25,9 +25,9 @@ exit code here means one of the five servers failed to construct or
 enumerate its own tools, which is a real regression worth failing the
 build on.
 
-Reports a size, not just a count, because a count alone says little (PR
-#120 review, issue #52): tool schemas differ in size. The size is in
-CHARACTERS, not tokens (issue #439): a token count depends on the model's
+Reports a size, not just a count, because a count alone says little:
+tool schemas differ in size. The size is in
+CHARACTERS, not tokens: a token count depends on the model's
 vocabulary, which is not public, and the chars / 3.5 estimate this script used
 to print was presented as a per-turn cost that real transcripts show is not
 paid when Claude Code defers these tools. The blob measured is the

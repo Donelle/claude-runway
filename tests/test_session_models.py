@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for the per-model split in libs/savings_ledger.py (issue #440, schema
+"""Tests for the per-model split in libs/savings_ledger.py (schema
 v9): the migration from every earlier schema version, the roll-up into
 `session_models`, accumulation across a resumed session, and the display.
 
@@ -159,7 +159,7 @@ class SessionModelsV9(base.SavingsLedgerTestCase):
     # -- accumulation -----------------------------------------------------
 
     def test_a_resumed_session_adds_exact_characters_but_drops_the_derived_figure(self):
-        # PR #450 review: the first roll-up's events are gone, and the transcript
+        # The first roll-up's events are gone, and the transcript
         # has grown since, so a stored derived figure cannot be carried across.
         L.record_event("s1", "hook:Bash", 1000, 200, True, tool_use_id="ta")
         L.finalize_owned_session("s1", "p", attribution=_index())
@@ -181,7 +181,7 @@ class SessionModelsV9(base.SavingsLedgerTestCase):
         self.assertEqual(rows["model-b"][2], 1)
 
     def test_a_resume_invalidates_every_stored_row_and_the_returned_summary_rows(self):
-        # PR #450 review (round 2): model-b has no new event in the resume but its
+        # model-b has no new event in the resume but its
         # stored derived figure is just as stale; the summary must agree with the DB.
         samples = {"model-a": [2.0] * 5, "model-b": [3.0] * 5}
         L.record_event("s1", "hook:Bash", 1000, 200, True, tool_use_id="ta")
@@ -195,7 +195,7 @@ class SessionModelsV9(base.SavingsLedgerTestCase):
         self.assertTrue(all(r["derived_tokens"] is None for r in agg["by_model"]))
 
     def test_the_marker_cross_check_is_skipped_on_a_resume(self):
-        # PR #450 review: the transcript's marker results cover the whole session
+        # The transcript's marker results cover the whole session
         # but a resume's `events` hold only the new roll-up's.
         index = _index()
         index["marker_ids"] = {"ta", "tb"}
@@ -207,7 +207,7 @@ class SessionModelsV9(base.SavingsLedgerTestCase):
         self.assertEqual(second["attribution"]["marker_without_event"], [])
 
     def test_a_resume_without_a_transcript_drops_the_split_that_no_longer_adds_up(self):
-        # PR #450 review: 1,000 characters in the split beside 1,600 in the session.
+        # 1,000 characters in the split beside 1,600 in the session.
         L.record_event("s1", "hook:Bash", 1000, 200, True, tool_use_id="ta")
         L.finalize_owned_session("s1", "p", attribution=_index())
         self.assertEqual(len(self._rows()), 1)

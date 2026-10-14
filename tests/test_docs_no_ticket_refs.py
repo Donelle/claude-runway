@@ -1,12 +1,12 @@
-"""Guard: tracked Markdown must not cite backlog tickets or pull requests.
+"""Guard: tracked files must not cite backlog tickets or pull requests.
 
-The documentation is forward-facing. A reader installing or using the tool
-gets nothing from "fixed in #374" or "see PR 107", and such references go
-stale when a ticket closes or is renumbered. Every Markdown file the product
-ships (README, docs/, EVALUATION.md, skills/, .claude/skills/, .github/) is
+A reader installing, using or maintaining the tool gets nothing from
+"fixed in #374" or "see PR 107", and such references go stale when a ticket
+closes or is renumbered. Every tracked Markdown file (README, docs/,
+EVALUATION.md, skills/, .claude/skills/, .github/) and every other tracked
+text file (code, comments, docstrings, templates, CI and packaging config) is
 therefore kept free of them, and this test fails if one creeps back in.
-Code files are deliberately NOT checked: comments and docstrings there are
-not forward-facing, per the ticket that introduced this test.
+State the fact and the reason directly instead.
 
 What counts as a reference (the rules are intentionally narrow):
 
@@ -17,12 +17,14 @@ What counts as a reference (the rules are intentionally narrow):
     in a doc would mean rewording it.
   * ``issue 12``, ``issues #12``, ``PR 12``, ``PRs 12``, ``pull request 12``,
     ``ticket 12`` -- the word followed by a number, with an optional "#".
-  * ``upstream#12`` and ``owner/repo#12`` (the second is covered by ``#123``).
+  * ``owner/repo#12`` (covered by ``#123``).
   * ``/issues/123`` and ``/pull/123`` URL paths. API paths with a placeholder
     (``/issues/<N>/comments``) or without a number (``/issues/comments/<id>``)
     are not references and are allowed.
 
-Excluded: ``.plans/`` (gitignored, never shipped).
+Excluded: ``.plans/`` (gitignored, never shipped), and the fixture data
+listed in ``CODE_FIXTURE_ALLOWLIST`` below (numbers that are test input, not
+citations).
 """
 
 import os
@@ -41,7 +43,6 @@ TICKET_REF = re.compile(
       (?<!&)\#\d+                                   # #123 (not the &#123; entity)
     | \b(?:issues?|PRs?|pull\ requests?|tickets?)   # issue 12 / PR #12 / ticket 12
         \s*\#?\s*\d+
-    | \bupstream\#\d+                               # upstream#12
     | /(?:issues|pull)/\d+                          # .../issues/12, .../pull/12
     """,
     re.IGNORECASE | re.VERBOSE,
@@ -93,7 +94,7 @@ class TicketRefPatternTests(unittest.TestCase):
             "Copilot review, PR #319",
             "pull request 7",
             "PR 21",
-            "upstream#52089",
+            "owner/repo#52089",
             "anthropics/claude-code#52089",
             "[#205](https://github.com/Donelle/claude-runway/issues/205)",
             "https://github.com/Donelle/claude-runway/pull/12",
@@ -145,6 +146,72 @@ class NoTicketRefsInMarkdownTests(unittest.TestCase):
             [],
             "Markdown must not cite backlog tickets or PRs; state the fact directly "
             "instead (see this test's docstring for what counts):\n" + "\n".join(offenders),
+        )
+
+
+# Non-Markdown files whose matches are test input rather than citations. A value
+# of None allows every match in the file; a set allows only those exact strings.
+CODE_FIXTURE_ALLOWLIST: dict[str, set[str] | None] = {
+    # this file's own sample strings
+    "tests/test_docs_no_ticket_refs.py": None,
+    # prompts and descriptions fed to the autowork cost matcher
+    "tests/test_autowork_cost_lib.py": None,
+    # an identifier inside a compression fixture
+    "tests/test_local_compress_lib.py": {"PR 481200"},
+}
+
+
+def tracked_code_files(root: str = REPO_ROOT) -> list[str]:
+    """Repo-relative paths of every tracked non-Markdown file, minus ``.plans/``."""
+    try:
+        out = subprocess.run(
+            ["git", "ls-files"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=True,
+        ).stdout
+        paths = [p for p in out.splitlines() if p]
+    except (OSError, subprocess.CalledProcessError):
+        paths = []
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+            for name in filenames:
+                rel = os.path.relpath(os.path.join(dirpath, name), root)
+                paths.append(rel.replace(os.sep, "/"))
+    return sorted(p for p in paths if not p.endswith(".md") and not p.startswith(".plans/"))
+
+
+class NoTicketRefsInCodeTests(unittest.TestCase):
+    def test_tracked_code_found(self):
+        files = tracked_code_files()
+        self.assertIn("libs/savings_ledger.py", files)
+        self.assertFalse([f for f in files if f.endswith(".md")])
+
+    def test_no_ticket_or_pr_references_in_tracked_code(self):
+        offenders = []
+        for rel in tracked_code_files():
+            allowed = CODE_FIXTURE_ALLOWLIST.get(rel, set())
+            if allowed is None:
+                continue
+            path = os.path.join(REPO_ROOT, rel)
+            if not os.path.isfile(path):  # tracked but deleted in the working tree
+                continue
+            try:
+                with open(path, encoding="utf-8") as f:
+                    text = f.read()
+            except UnicodeDecodeError:  # binary file
+                continue
+            for lineno, match in find_ticket_refs(text):
+                if match not in allowed:
+                    offenders.append(f"{rel}:{lineno}: {match!r}")
+        self.assertEqual(
+            offenders,
+            [],
+            "Code, comments, docstrings and config must not cite backlog tickets or PRs; "
+            "state the fact directly instead (see this test's docstring for what counts):\n"
+            + "\n".join(offenders),
         )
 
 

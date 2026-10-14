@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Tests for tools/memory_bank_mcp_server.py's tool-layer argument
-validation and tool registration (issue #175).
+validation and tool registration.
 
 Stdlib-only (unittest, no pytest), no network -- these only cover
 validation that happens before any QdrantClient/FastEmbedProvider is ever
@@ -41,7 +41,7 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-# Issue #211: most tests in this module call remember()/recall()/forget()
+# Most tests in this module call remember()/recall()/forget()
 # with tracking left at its real default (True) and don't mock
 # mev.record_memory_metric -- only MemoryMetricCounterTest below does.
 # Without a module-wide redirect, those calls fall through to the REAL
@@ -58,7 +58,7 @@ _metrics_db_env_patch: "mock._patch_dict"
 
 
 def setUpModule():
-    # Issue #338: CLAUDE_RUNWAY_MEMORY_EVENTS_DB is redirected here too, for
+    # CLAUDE_RUNWAY_MEMORY_EVENTS_DB is redirected here too, for
     # the same reason as metrics.db above. Tests that patch tracking_enabled
     # to True without also mocking mev.record_memory_event (e.g.
     # MemoryMetricCounterTest) fall through to the REAL rich-event writer,
@@ -82,7 +82,7 @@ def tearDownModule():
 
 class ModuleDbRedirectTest(unittest.TestCase):
     def test_memory_events_db_is_redirected_away_from_the_real_file(self):
-        # Issue #338 regression: without this redirect, unmocked tracking
+        # Without this redirect, unmocked tracking
         # calls in this module wrote into the developer's real
         # ~/.claude/claude-runway/memory-events.db.
         resolved = _mbs.mev.resolve_db_path()
@@ -105,7 +105,7 @@ class ForgetArgumentValidationTest(unittest.TestCase):
 
 class RecallNonexistentCollectionTest(unittest.TestCase):
     def test_returns_immediately_without_calling_recall_points(self):
-        # Regression for PR #178 review (previously-suppressed finding): when
+        # Regression for a review finding (previously-suppressed finding): when
         # the collection doesn't exist yet, recall must return directly
         # rather than falling through to mb.recall_points, which does its
         # OWN separate collection_exists check -- a concurrent remember()
@@ -121,7 +121,7 @@ class RecallNonexistentCollectionTest(unittest.TestCase):
         mock_recall_points.assert_not_called()
 
     def test_does_not_construct_embedding_provider_when_collection_is_missing(self):
-        # Regression for PR #178 review (second pass, previously-suppressed
+        # Regression for a review finding (second pass, previously-suppressed
         # finding): FastEmbedProvider's constructor eagerly loads/downloads
         # the ONNX model (TextEmbedding's default lazy_load=False) -- a
         # recall against a not-yet-existing collection must never pay for
@@ -135,7 +135,7 @@ class RecallNonexistentCollectionTest(unittest.TestCase):
 
 
 class CollectionOverrideRemovedTest(unittest.TestCase):
-    """Regression for issue #188: remember/recall/forget used to accept a
+    """Regression: remember/recall/forget used to accept a
     caller-controlled `collection` kwarg with no validation, letting a call
     write/read/delete memory-bank points in a collection other than the one
     configured via MEMORY_BANK_COLLECTION -- bypassing index_repo/sync_repo's
@@ -157,7 +157,7 @@ class CollectionOverrideRemovedTest(unittest.TestCase):
 
 
 class MemoryEventLoggingTest(unittest.TestCase):
-    """Issue #179: remember()/recall() log a memory-events row via
+    """remember()/recall() log a memory-events row via
     memory_events_lib, guarded by its own tracking_enabled() switch --
     entirely separate from the point_id/description content itself."""
 
@@ -174,7 +174,7 @@ class MemoryEventLoggingTest(unittest.TestCase):
         self.assertEqual(kwargs["event_type"], "remember")
         self.assertEqual(kwargs["point_id"], "new-id")
         self.assertEqual(kwargs["kind"], "lesson")
-        # Issue #179, PR #197 review: summary_created_at must be the EXACT
+        # summary_created_at must be the EXACT
         # value remember_point stamped/returned, not a re-sampled time.time().
         self.assertEqual(kwargs["summary_created_at"], 1700000000.0)
 
@@ -200,7 +200,7 @@ class MemoryEventLoggingTest(unittest.TestCase):
         mock_record.assert_not_called()
 
     def test_remember_advances_turn_even_on_embedding_mismatch(self):
-        # Regression for PR #197 review: turn must be consumed for every
+        # Regression for a review finding: turn must be consumed for every
         # invocation, including ones that end up not logging anything --
         # otherwise a later successful call's turn number understates how
         # many memory-bank calls actually happened this session.
@@ -263,7 +263,7 @@ class MemoryEventLoggingTest(unittest.TestCase):
         mock_record.assert_not_called()
 
     def test_recall_advances_turn_even_when_no_results(self):
-        # Regression for PR #197 review: an empty recall still consumed a
+        # Regression for a review finding: an empty recall still consumed a
         # turn number -- it was a real memory-bank call, even though nothing
         # gets logged for it.
         p1, p2, p3, p4 = self._recall_setup([])
@@ -276,7 +276,7 @@ class MemoryEventLoggingTest(unittest.TestCase):
 
 
 class MemoryMetricCounterTest(unittest.TestCase):
-    """Issue #211: remember()/recall()/forget() all call
+    """remember()/recall()/forget() all call
     mev.record_memory_metric(...) -- a plain per-call-attempt tally into
     metrics.db, entirely separate from mev.record_memory_event's own rich
     per-point memory-events.db log covered by MemoryEventLoggingTest above.
@@ -376,7 +376,7 @@ class MemoryMetricCounterTest(unittest.TestCase):
 
 
 class RememberWeightValidationTest(unittest.TestCase):
-    """PR #199 review: a negative weight actively breaks recall_points'
+    """a negative weight actively breaks recall_points'
     ranking invariant (weight=0 must be a true floor, weight>1 must only
     ever boost -- both assume weight>=0), so it's rejected at the tool
     boundary before any Qdrant/embedding-provider work happens."""
@@ -392,7 +392,7 @@ class RememberWeightValidationTest(unittest.TestCase):
         mock_remember.assert_not_called()
 
     def test_positive_infinity_weight_rejected(self):
-        # Regression for PR #199 review (second pass): float("inf") < 0 is
+        # Regression for a review finding (second pass): float("inf") < 0 is
         # False in Python, so `inf` (reachable from ordinary JSON-RPC input,
         # e.g. the JSON literal 1e999 parses to inf) silently bypassed a
         # `weight < 0`-only check -- it must be caught by a finiteness check
@@ -405,7 +405,7 @@ class RememberWeightValidationTest(unittest.TestCase):
         mock_remember.assert_not_called()
 
     def test_nan_weight_rejected(self):
-        # Regression for PR #199 review (second pass): float("nan") < 0 is
+        # Regression for a review finding (second pass): float("nan") < 0 is
         # ALSO False in Python (every comparison with NaN is False), so NaN
         # silently bypassed a `weight < 0`-only check too, and would have
         # made sort() ordering in recall_points undefined.
@@ -425,7 +425,7 @@ class RememberWeightValidationTest(unittest.TestCase):
 
 
 class RememberWeightPassthroughTest(unittest.TestCase):
-    """Issue #177: remember()'s weight param must reach mb.remember_point
+    """remember()'s weight param must reach mb.remember_point
     unchanged, defaulting to mb.DEFAULT_WEIGHT (1.0) when not given."""
 
     def test_default_weight_passed_through(self):
@@ -450,8 +450,8 @@ class RememberWeightPassthroughTest(unittest.TestCase):
 
 
 class SessionIdDelegatesToSessionIdLibTest(unittest.TestCase):
-    """Issue #214: _SESSION_ID must come from libs/session_id_lib.py's
-    SessionIdStrategy.PROXY (issue #198) rather than this module minting its
+    """_SESSION_ID must come from libs/session_id_lib.py's
+    SessionIdStrategy.PROXY rather than this module minting its
     own uuid.uuid4().hex -- pure dedup, no behavior change. Asserting on the
     exact cached value (not just "looks like a uuid hex string") is what
     actually proves delegation happened: session_id_lib's PROXY strategy
@@ -472,7 +472,7 @@ class SessionIdDelegatesToSessionIdLibTest(unittest.TestCase):
 
 
 class TransferMemoriesToolTest(unittest.TestCase):
-    """Issue #336: transfer_memories' tool-layer wiring. The transfer logic
+    """transfer_memories' tool-layer wiring. The transfer logic
     itself is covered by test_memory_bank_lib.py's TransferPointsTest."""
 
     def _fake_report(self, dry_run=True):
@@ -512,7 +512,7 @@ class TransferMemoriesToolTest(unittest.TestCase):
         mock_client_cls.assert_called_once_with(url="http://other:6333", api_key="k")
 
     def test_default_key_not_sent_to_an_overridden_url(self):
-        # PR #422 review: qdrant_url is tool input, so the configured key must
+        # qdrant_url is tool input, so the configured key must
         # not follow it to another host.
         with patch.object(_mbs, "DEFAULT_QDRANT_API_KEY", "secret"), \
              patch("memory_bank_mcp_server.QdrantClient") as mock_client_cls, \
@@ -534,7 +534,7 @@ class TransferMemoriesToolTest(unittest.TestCase):
              patch("memory_bank_mcp_server.QdrantClient") as mock_client_cls, \
              patch.object(_mb, "transfer_points", new=AsyncMock()) as mock_transfer:
             result = _run(_mbs.transfer_memories(source_collection="legacy", dry_run=False))
-        # JSON like every other outcome (PR #422 review), not bare text.
+        # JSON like every other outcome, not bare text.
         report = __import__("json").loads(result)
         self.assertIn("MEMORY_BANK_ID", report["error"])
         self.assertEqual(report["source_collection"], "legacy")

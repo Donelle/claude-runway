@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for tools/doctor.py's CLI wiring (issue #49) -- argument parsing,
+"""Tests for tools/doctor.py's CLI wiring -- argument parsing,
 exit codes, and report formatting on top of libs/doctor_lib.py, which has
 its own dedicated tests in test_doctor_lib.py.
 
@@ -56,7 +56,7 @@ class DoctorCli(unittest.TestCase):
         self.assertIn("does not exist", buf.getvalue())
 
     def test_malformed_mcp_json_exits_one_not_zero(self):
-        # Regression for the finding from PR #119 review: a malformed
+        # Regression for a review finding: a malformed
         # .mcp.json (here, "mcpServers": null) previously either exited 0
         # (indistinguishable from a valid --qdrant-only setup) or crashed
         # outright with an uncaught AttributeError.
@@ -97,7 +97,7 @@ class DoctorCli(unittest.TestCase):
         self.assertIn("http://localhost:1234/v1", output)
 
     def test_stale_legacy_compress_hook_exits_one_and_points_at_upgrade(self):
-        # Issue #395: compress_bash_output.py was renamed; a settings.json
+        # compress_bash_output.py was renamed; a settings.json
         # still pointing at it must fail the doctor even with no env mismatch.
         self._write_mcp_json(local_compress_env=None)
         (self.target_repo / ".claude").mkdir()

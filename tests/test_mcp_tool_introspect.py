@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Tests for libs/mcp_tool_introspect.py -- the shared utility extracted
-in issue #52/GROW-05 so ingest_mcp_server.py, memory_bank_mcp_server.py, and
+(GROW-05) so ingest_mcp_server.py, memory_bank_mcp_server.py, and
 tools/report_tool_counts.py all enumerate an MCPServer's registered tools
 through one identical code path instead of duplicating (and independently
 drifting on) the same "mcp._tool_manager.list_tools()" logic in several
-places. (compress_mcp_server.py used it too until issue #439 removed its
-schema-size estimate.)
+places. (compress_mcp_server.py used it too until its
+schema-size estimate was removed.)
 
 Stdlib-only (unittest, no pytest) and no network -- exercises a small
 ad-hoc MCPServer instance built just for these tests, not either of the
@@ -52,7 +52,7 @@ class ListRegisteredToolsReflectsCurrentRegistrations(unittest.TestCase):
     def test_a_tool_added_after_the_first_query_is_picked_up_on_the_next_one(self):
         # The whole point of enumerating live instead of caching a count:
         # a tool registered later must show up without any code change to
-        # this module -- the exact regression class issues #22/#23 filed
+        # this module -- the exact regression class once filed
         # against the OLD hardcoded-tuple/hardcoded-doc-number approach.
         mcp = MCPServer("test-server")
         self.assertEqual(tool_count(mcp), 0)

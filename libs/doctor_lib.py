@@ -5,7 +5,7 @@ docs/environment-variables.md's table marks "both") between a target repo's
 `.mcp.json` `local-compress` env block (and the `qdrant` block, which holds
 the LM Studio values `compact_store` compresses with) and the live shell
 environment, flagging any mismatch instead of relying on a human to notice silently
-split behavior (issue #49, GROW-02 in `.plans/code-review-2026-08-18.md`).
+split behavior (GROW-02 in `.plans/code-review-2026-08-18.md`).
 Extends the same "loud instead of silent" idea `local_compress_lib.py`'s
 `stale_env_warning()` already applies to the *renamed*-var case, to the
 *dual-config-mismatch* case instead.
@@ -62,13 +62,13 @@ _AUTO_DETECT_MODEL = "(auto-detect -- no model pinned)"
 # - CLAUDE_RUNWAY_COMPRESS_THRESHOLD_CHARS: shell-only (compress_output.py
 #   is the sole reader); an .mcp.json copy is inert.
 # - CLAUDE_RUNWAY_CACHE_DB: read by both codebase-indexer MCP server AND
-#   redirect_webfetch_to_fetch_url.py hook (issue #64). Shell export is the
+#   redirect_webfetch_to_fetch_url.py hook. Shell export is the
 #   override channel (hooks have no env field in settings.json), not .mcp.json.
 #   doctor.py only checks the local-compress env block; flagging a mismatch
 #   for a var that's not a local-compress concern would be misleading.
 # - CLAUDE_RUNWAY_WEBFETCH_FAILED_URL_TTL: hook-only; no .mcp.json counterpart.
 # - CLAUDE_RUNWAY_LMSTUDIO_TIMEOUT_SECONDS: read by both halves via
-#   libs/lmstudio_client.py's build_client() (issue #301), but deliberately not declared in
+#   libs/lmstudio_client.py's build_client(), but deliberately not declared in
 #   the .mcp.json template: the MCP server inherits the shell value, and an
 #   absent .mcp.json key vs. a shell export is not a real divergence. Same
 #   shell-export-only channel as CLAUDE_RUNWAY_CACHE_DB above.
@@ -129,7 +129,7 @@ def _expand_and_anchor(raw: str, home_dir: Path) -> Path:
     `home_dir` parameter every other function in this module already
     accepts for testability (`run_doctor`'s callers, including tests, can
     inject a fake `home_dir` -- `expanduser()` would bypass that one case).
-    Found in PR #119 review: this is the one spot the fake-`home_dir`
+    Found in review: this is the one spot the fake-`home_dir`
     contract would have quietly broken without this manual expansion. Only
     handles the plain `~`/`~/...` forms (not `~otheruser/...`, which
     `expanduser()` resolves via a real system user-database lookup that
@@ -175,7 +175,7 @@ class MalformedMcpJsonError(Exception):
     JSON that simply omits `local-compress` -- e.g. a genuine
     `--qdrant-only` setup): both of those legitimately mean "nothing to
     check here," but a malformed/unreadable config is a real problem the
-    caller must not silently treat the same way. Found in PR #119 review:
+    caller must not silently treat the same way. Found in review:
     the previous code returned `None` for a malformed shape it hadn't
     anticipated too, which conflated "nothing configured" (exit 0) with
     "config is broken" (should exit nonzero) -- and for the shapes it
@@ -225,7 +225,7 @@ def load_server_env(mcp_json_path: Path, server_name: str) -> Optional[dict]:
     # genuinely absent key AND a key explicitly present with a JSON `null`
     # value, silently treating an explicit "local-compress": null as if
     # nothing were configured at all (exit 0) instead of the malformed
-    # config it actually is. Found in PR #119 review.
+    # config it actually is. Found in review.
     server = mcp_servers[server_name]
     if not isinstance(server, dict):
         raise MalformedMcpJsonError(
@@ -240,7 +240,7 @@ def load_server_env(mcp_json_path: Path, server_name: str) -> Optional[dict]:
     # Every value must be a string -- real MCP env blocks (and real shell
     # environments) are string-valued by definition; a JSON `null`/number/
     # bool/list/dict snuck in there is malformed, not a valid config this
-    # module can safely reason about. Found in PR #119 review: without
+    # module can safely reason about. Found in review: without
     # this, a non-string value either crashed downstream (e.g.
     # `CLAUDE_RUNWAY_TRACK_SAVINGS: 1` -- an int -- blew up inside
     # `_is_truthy_track_savings()`'s `.strip()` call) or was silently
@@ -306,7 +306,7 @@ class DoctorResult:
     # local-compress server (a `--qdrant-only` setup).
     qdrant_checked: bool = False
     config_error: Optional[str] = None
-    # Hook events in .claude/settings.json still invoking the pre-#395
+    # Hook events in .claude/settings.json still invoking the pre-rename
     # compress_bash_output.py (see find_legacy_compress_hook_events).
     legacy_compress_hook_events: list = field(default_factory=list)
 
@@ -315,7 +315,7 @@ def find_legacy_compress_hook_events(target_repo: Path) -> list:
     """
     Event names (e.g. "PostToolUse") in `target_repo`'s
     `.claude/settings.json` with a hook still invoking the old
-    `compress_bash_output.py` (renamed to `compress_output.py`, issue #395 --
+    `compress_bash_output.py` (renamed to `compress_output.py` --
     the old path no longer exists, so that hook now errors on every call).
     Best-effort and read-only: a missing/unreadable/oddly-shaped settings
     file yields `[]` rather than an error, since this check is an extra on

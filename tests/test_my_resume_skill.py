@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Tests for skills/my-resume/SKILL.md -- issue #71's proactive file pre-loading.
+"""Tests for skills/my-resume/SKILL.md -- the proactive file pre-loading.
 
 The skill is a markdown document of prose instructions, not a Python module, so
 the test strategy is twofold:
 
   1. Content checks: assert that the SKILL.md contains the key behavioural
-     requirements introduced in issue #71, the same way test_pyproject.py pins
+     requirements for proactive file pre-loading, the same way test_pyproject.py pins
      pyproject.toml content. A future editor who removes or rewrites the step
      will get an explicit failure here rather than a silent regression.
 
@@ -147,7 +147,7 @@ class SkillFileExists(unittest.TestCase):
 
 
 class SkillContentRequirements(unittest.TestCase):
-    """Pin the key behavioural requirements from issue #71 in the SKILL.md text."""
+    """Pin the key behavioural requirements in the SKILL.md text."""
 
     def setUp(self):
         with open(SKILL_PATH, encoding="utf-8") as f:

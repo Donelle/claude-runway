@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for hooks/record_session_id.py (issue #198).
+"""Tests for hooks/record_session_id.py.
 
 Stdlib-only (unittest, no pytest) and no disk beyond a temp dir -- redirects
 session_id_lib's own directory resolution the same way
@@ -72,7 +72,7 @@ class RecordSessionIdTestCase(unittest.TestCase):
 
 
 class SessionStartBehavior(RecordSessionIdTestCase):
-    """SessionStart is the canonical way to write the shadow marker (issue #231).
+    """SessionStart is the canonical way to write the shadow marker.
     Mirrors PostToolUseBehavior -- same write/sweep logic, different event."""
 
     def test_writes_no_stdout(self):
@@ -217,7 +217,7 @@ class SessionEndBehavior(RecordSessionIdTestCase):
 
 
 class SelfRefreshBeforeSweepOrdering(RecordSessionIdTestCase):
-    """The core safety contract (issue #198's proposal, item 4): a live
+    """The core safety contract (the proposal, item 4): a live
     session's own PostToolUse call must refresh its marker BEFORE any sweep
     runs, so it can never observe (and delete) itself as stale."""
 

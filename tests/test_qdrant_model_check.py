@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Tests for check_embedding_model_mismatch in libs/qdrant_model_check.py
-(issue #56; relocated here from tools/ingest_mcp_server.py -- issue #175 --
+(relocated here from tools/ingest_mcp_server.py
 so tools/memory_bank_mcp_server.py can reuse the identical check).
 
 Stdlib-only (unittest, no pytest) and no network -- all QdrantClient and
@@ -125,7 +125,7 @@ class CheckEmbeddingModelMismatchTest(unittest.TestCase):
         result = _qmc.check_embedding_model_mismatch(client, "col", provider)
         self.assertIsNotNone(result)
         self.assertIn("unnamed", result)
-        # PR #178 review (third pass): index_repo(reset=true) no longer
+        # index_repo(reset=true) no longer
         # recreates an existing collection's schema at all -- must recommend
         # dropping/recreating the collection directly, not reset=true.
         self.assertIn("Drop this collection", result)
@@ -174,7 +174,7 @@ class CheckEmbeddingModelMismatchTest(unittest.TestCase):
     # --- fail_closed=True: the destructive-delete callers (index_repo/CLI reset and sync_repo pre-delete checks) that must NOT fail open ---
 
     def test_fail_closed_returns_error_on_exception_instead_of_none(self):
-        # Regression for PR #178 review (fourth pass): a destructive-delete
+        # Regression for a review finding (fourth pass): a destructive-delete
         # caller must never treat "couldn't verify" the same as "confirmed
         # compatible" -- that's exactly the gap that let reset=True erase an
         # index before a genuine mismatch was ever actually detected.
@@ -217,7 +217,7 @@ class CheckEmbeddingModelMismatchTest(unittest.TestCase):
         self.assertIsNone(result)
 
     def test_unrecognized_vectors_config_shape_fails_closed(self):
-        # Regression for PR #178 review (seventh pass): a vectors_config
+        # Regression for a review finding (seventh pass): a vectors_config
         # shape that's neither None, dict, nor VectorParams (a future/other
         # qdrant-client type this function doesn't recognize) used to fall
         # through every branch with no explicit return, silently reaching

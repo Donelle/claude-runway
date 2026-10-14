@@ -118,7 +118,7 @@ def savings_summary(project: Optional[str] = None, format: str = "text") -> str:
         # project-filtered: a live session belonging to a DIFFERENT project
         # must never be picked here just because its JSONL is the most
         # recently touched file in the shared sessions dir -- see
-        # current_session_id's docstring and issue #35. Falling through to
+        # current_session_id's docstring. Falling through to
         # the zero-value aggregate below (same as the "no live session at
         # all" case) is what keeps the project label below always accurate.
         session_id = savings_ledger.current_session_id(project=project)
@@ -182,8 +182,7 @@ def savings_detail(project: Optional[str] = None, format: str = "text", csv_tabl
         return f"Error: unrecognised csv_table {csv_table!r}. Valid values: 'session', 'tools', 'projects'."
     try:
         project = project or savings_ledger.project_name_from_cwd(os.getcwd())
-        # See savings_summary's identical comment -- project-filtered lookup,
-        # issue #35.
+        # See savings_summary's identical comment -- project-filtered lookup.
         session_id = savings_ledger.current_session_id(project=project)
         # Annotated `dict` here too (see savings_summary's identical comment)
         # so the "project" key assignment below type-checks either way.
@@ -221,7 +220,7 @@ def savings_detail(project: Optional[str] = None, format: str = "text", csv_tabl
         last_n = savings_ledger.query_last_n_sessions(project, n=10)
         all_projects = savings_ledger.query_all_projects()
         # The session in progress has no transcript to join yet, so the per-model
-        # split comes from the most recent finished session (issue #440).
+        # split comes from the most recent finished session.
         model_breakdown = savings_ledger.query_recent_model_breakdown(project)
         if format == "json":
             return savings_ledger.format_json(session_agg, project_summary, tool_breakdown, last_n, all_projects, model_breakdown)
@@ -275,7 +274,7 @@ def savings_trend(project: Optional[str] = None, bucket: str = "week", n: int = 
 @mcp.tool()
 def get_metrics(metric_id: str, view: str = "summary", bucket: str = "week", n: int = 12, format: str = "text", session_id: Optional[str] = None) -> str:
     """
-    Reads the shared cross-tool metrics store (issue #208): ONE generic
+    Reads the shared cross-tool metrics store: ONE generic
     SQLite table any domain in this toolkit can write into via
     `libs/metrics_lib.py`'s `MetricsStore` class, aggregated here into
     whichever `view` is requested. Deliberately the ONLY new tool this
@@ -284,7 +283,7 @@ def get_metrics(metric_id: str, view: str = "summary", bucket: str = "week", n: 
     domain writing a new `metric_id` never needs a new tool, only a new
     value passed to this one.
 
-    As of issue #210, my-gh-autowork's per-ticket outcome logging writes
+    my-gh-autowork's per-ticket outcome logging writes
     into this store under metric_id="autowork". Any metric_id with no
     recorded events returns an honest "no events recorded yet" result.
 
@@ -298,7 +297,7 @@ def get_metrics(metric_id: str, view: str = "summary", bucket: str = "week", n: 
       "by_event_type"           — per-event_type breakdown, largest total
                        value first.
       "trend"                   — day/week-bucketed history (see `bucket`/`n`).
-      "detail"        (issue #249) — raw per-event rows, most-recent first,
+      "detail" — raw per-event rows, most-recent first,
                        with each row's `metadata` deserialized and rendered
                        (see `n` below for how many rows). This is the view
                        for the richer per-run detail a domain stores in
@@ -315,15 +314,14 @@ def get_metrics(metric_id: str, view: str = "summary", bucket: str = "week", n: 
       both rather than adding a second row-count parameter, since exactly
       one of the two meanings ever applies for a given call.
 
-    session_id (issue #248, extended to "detail" by issue #249), when given,
+    session_id (also honoured by "detail"), when given,
       narrows view="summary"/"by_event_type"/"detail" down to rows matching
       this exact session_id AND metric_id — e.g. one specific
-      `my-gh-autowork` attempt's own `f"issue-{n}-{HHMMSS}"` marker (issue
-      #210), instead of that metric_id's entire history. Omitting it (the
+      `my-gh-autowork` attempt's own `f"issue-{n}-{HHMMSS}"` marker,
+      instead of that metric_id's entire history. Omitting it (the
       default) keeps today's metric_id-only aggregate/listing unchanged.
       Ignored for view="trend" — per-session filtering doesn't compose with
-      time-bucketed grouping (out of scope for issue #248; see that issue
-      for why), so a session_id passed alongside view="trend" has no effect
+      time-bucketed grouping, so a session_id passed alongside view="trend" has no effect
       on the result.
 
     format controls the output format:
@@ -377,10 +375,10 @@ def record_metric(
 ) -> str:
     """
     Writes one append-only event to the shared cross-tool metrics store
-    (issue #210 — the write counterpart to get_metrics). Any domain in
+    (the write counterpart to get_metrics). Any domain in
     this toolkit can call this to record an event. my-gh-autowork's
     per-ticket outcome logging was the first consumer (cut over from
-    compact_store by this ticket); it now goes through
+    compact_store); it now goes through
     tools/autowork_cost.py record, which writes the same metric_id="autowork"
     rows, and this tool remains for anything that CLI can't cover.
 
@@ -406,8 +404,8 @@ def record_metric(
       sends.
     session_id: optional caller-supplied session identifier — stored on the
       row for later per-session filtering via get_metrics(view="summary"/
-      "by_event_type"/"detail", session_id=...) (issue #248, extended to
-      "detail" by issue #249).
+      "by_event_type"/"detail", session_id=...) (also honoured by
+      "detail").
 
     Returns "OK" on success, or an "Error:..." string on any failure —
     including input-validation failures (non-finite value, invalid metadata
@@ -440,7 +438,7 @@ def record_metric(
     # that triggered the logging. Map a False return to an "Error:..." string
     # so the SKILL.md "Error:" check can detect it, rather than unconditionally
     # returning "OK" even when the write silently failed (Copilot review on
-    # PR #247: an always-"OK" return made the SKILL.md error check unreachable
+    # An always-"OK" return made the SKILL.md error check unreachable
     # for the most important failure mode — an unwritable or locked db path).
     ok = store.record(
         metric_id=metric_id,

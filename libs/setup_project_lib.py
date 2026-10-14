@@ -4,8 +4,8 @@ defaults and patching `templates/mcp.json.template` /
 `templates/settings.json.template` into a real, ready-to-use `.mcp.json` /
 `.claude/settings.json` for a target project repo, instead of the manual
 copy-and-hand-edit flow docs/installation.md's steps 4/4b/4c otherwise require (step 5's manual
-CLAUDE.md edit is NOT covered here)
-(issue #48). Kept separate from `tools/setup_project.py` (the thin CLI) the
+CLAUDE.md edit is NOT covered here).
+Kept separate from `tools/setup_project.py` (the thin CLI) the
 same way `qdrant_ingest_lib.py`/`local_compress_lib.py` are kept separate
 from their own CLI/MCP-server callers -- pure functions here are what make
 this testable without touching disk beyond reading the template files
@@ -136,14 +136,14 @@ def build_mcp_servers(
     unique (see `_collections_for_project`'s sibling-scan there, which finds other
     collections for the same project by matching this exact prefix).
     Deliberately NOT derived from `collection_name` here the way
-    `COLLECTION_NAME` on the qdrant/codebase-indexer servers is: found in
-    PR #130 review that doing so silently changes this value on EVERY
+    `COLLECTION_NAME` on the qdrant/codebase-indexer servers is: found in review that
+    doing so silently changes this value on EVERY
     already-configured project the moment its `.mcp.json` gets regenerated
     (a plain re-run with no new flags, the exact "safe to re-run" workflow
     this script's own module docstring advertises) -- since every project's
     `COMPACT_COLLECTION` (then in the `local-compress` env, now in the `qdrant`
     env) has only ever held this one constant so far (this function never
-    touched the key at all before PR #130), and `merge_mcp_json` replaces the
+    touched the key at all originally), and `merge_mcp_json` replaces the
     whole server block wholesale, not a per-key deep merge. Changing the *base prefix* silently
     orphans that project's entire conversation-compact history: the
     sibling-scan and canonical-name computation both key off this exact
@@ -171,7 +171,7 @@ def build_mcp_servers(
 
     `memory_bank_collection`, if blank, defaults to the template's own
     literal `"memory-bank"` -- the ONE collection every project's
-    memory-bank server shares (issue #175), deliberately NOT derived from
+    memory-bank server shares, deliberately NOT derived from
     `collection_name` the same way `COLLECTION_NAME` is: every project on a
     machine needs to agree on this exact string for their memories to
     actually be shared/found across projects, so treating it as per-project
@@ -187,8 +187,8 @@ def build_mcp_servers(
     convenient one-time default for a brand-new project, since most
     projects have no reason to want it different. But unlike
     `memory_bank_collection` above, this IS meant to vary per project (it's
-    the per-project identity tag, not the shared storage location) -- found
-    in PR #178 review: an earlier version hardcoded this to always equal
+    the per-project identity tag, not the shared storage location) -- found in review:
+    an earlier version hardcoded this to always equal
     `collection_name` with no independent parameter at all, so a project
     that later changed `--collection-name` would silently retag all FUTURE
     memories under the new name while every EXISTING memory stayed under
@@ -201,7 +201,7 @@ def build_mcp_servers(
     `qdrant_api_key` is applied to the three Qdrant-talking servers'
     `QDRANT_API_KEY` (`qdrant`, `codebase-indexer` and `memory-bank`, which
     all read the exact same variable so a single project's `.mcp.json` keeps
-    every one of them aligned). Found in PR #113 review: since this script
+    every one of them aligned). Found in review: since this script
     previously always replaced these servers' `env` blocks wholesale with
     values it computed, an authenticated remote-Qdrant setup's
     manually-added `QDRANT_API_KEY` was silently dropped on every rerun. Passing `--qdrant-api-key` explicitly on every
@@ -227,10 +227,10 @@ def build_mcp_servers(
     `--qdrant-only` setup (`include_compress=False`) still writes them: the
     server stores uncompressed when LM Studio is not there.
 
-    `embedding_model` (issue #279), if blank, leaves the template's own
+    `embedding_model`, if blank, leaves the template's own
     `EMBEDDING_MODEL` default in place; otherwise it is written into the two
     code-index blocks (`qdrant`, `codebase-indexer`), which must agree on one
-    model. It is never written into `memory-bank` (issue #428): that block's
+    model. It is never written into `memory-bank`: that block's
     model is `memory_bank_embedding_model`, a separate value. Like
     everything else here this function does not detect re-runs itself:
     deciding WHICH value to pass (explicit flag > the target's existing
@@ -286,7 +286,7 @@ def build_mcp_servers(
     memory_bank["env"]["MEMORY_BANK_ID"] = resolved_memory_bank_id
     memory_bank["env"]["MEMORY_BANK_COLLECTION"] = resolved_memory_bank_collection
 
-    # Issue #428: memory-bank's model is its own value, never derived from
+    # memory-bank's model is its own value, never derived from
     # `embedding_model`. The memory-bank collection is ONE shared collection
     # locked to the model that first created it, so a change made for the
     # per-project code collections must never reach it.
@@ -340,7 +340,7 @@ def build_mcp_servers(
 
 # Code-index servers whose env carries `EMBEDDING_MODEL`, in the order
 # `existing_embedding_model` consults them. `memory-bank` is deliberately NOT
-# here (issue #428): its model belongs to a shared, cross-project collection
+# here: its model belongs to a shared, cross-project collection
 # and is resolved on its own, see `resolve_memory_bank_embedding_model`.
 _EMBEDDING_MODEL_SERVERS = ("qdrant", "codebase-indexer")
 
@@ -349,7 +349,7 @@ def existing_embedding_model(existing_mcp: dict) -> str:
     """
     Returns the `EMBEDDING_MODEL` already configured in an existing
     `.mcp.json` document (first non-blank string found across the `qdrant`
-    and `codebase-indexer` blocks -- never `memory-bank`'s, issue #428), or ""
+    and `codebase-indexer` blocks -- never `memory-bank`'s), or ""
     if none is set. Tolerant
     of missing/odd-shaped blocks -- a hand-edited file may lack any of them.
     """
@@ -367,8 +367,8 @@ def existing_embedding_model(existing_mcp: dict) -> str:
 
 def resolve_embedding_model(explicit: str, existing_mcp: dict, template_default: str) -> str:
     """
-    The rule for which `EMBEDDING_MODEL` a (re-)run of `init` writes
-    (issue #279), in priority order:
+    The rule for which `EMBEDDING_MODEL` a (re-)run of `init` writes,
+    in priority order:
       1. an explicit `--embedding-model` value (the caller opted in);
       2. otherwise the model already configured in the target's existing
          `.mcp.json` -- so a plain re-run preserves a hand-customized model
@@ -398,8 +398,8 @@ def existing_memory_bank_model(existing_mcp: dict) -> str:
 
 def resolve_memory_bank_embedding_model(explicit: str, existing_mcp: dict, template_default: str) -> str:
     """
-    Which `EMBEDDING_MODEL` a (re-)run of `init` writes into `memory-bank`
-    (issue #428), from memory-bank's own sources only -- never the code-index
+    Which `EMBEDDING_MODEL` a (re-)run of `init` writes into `memory-bank`,
+    from memory-bank's own sources only -- never the code-index
     model, because the shared collection is locked to whichever model created
     it and a change made for code search must not make `remember`/`recall`
     fail for every project:
@@ -468,12 +468,12 @@ def resolve_compact_embedding_model(existing_mcp: dict, project_model: str) -> s
 
 
 # (event, script filename) for every hook this toolkit's templates define,
-# split into two groups (issue #198, #231):
+# split into two groups:
 #   - _CORE_HOOK_SCRIPTS: written for EVERY project regardless of
 #     --qdrant-only/local-compress config -- today, just record_session_id.py
 #     (registered under SessionStart and SessionEnd), which keeps
 #     libs/session_id_lib.py's SHADOW_FILE strategy actually populated.
-#     SessionStart replaced PostToolUse (issue #231): the '.*' PostToolUse
+#     SessionStart replaced PostToolUse: the '.*' PostToolUse
 #     matcher fired on EVERY tool call (~400ms Python startup × N calls on
 #     Windows), while SessionStart fires exactly once per session lifecycle
 #     event (startup/resume/clear/compact/fork).
@@ -496,7 +496,7 @@ _COMPRESS_HOOK_SCRIPTS = (
 )
 _TOOLKIT_HOOK_SCRIPTS = _CORE_HOOK_SCRIPTS + _COMPRESS_HOOK_SCRIPTS
 
-# The compress hook's pre-#395 filename. Existing installs' settings.json
+# The compress hook's pre-rename filename. Existing installs' settings.json
 # still reference it, so it must stay RECOGNIZED as toolkit-owned (otherwise
 # `init` would treat that block as a user's own hook and append a second,
 # new-named block beside it, double-compressing every tool call). It is
@@ -559,7 +559,7 @@ def build_settings_hooks(
     don't blind-replace" approach.
 
     `_CORE_HOOK_SCRIPTS` are ALWAYS patched and kept, regardless of
-    `include_compress` (issue #198 -- record_session_id.py is base install).
+    `include_compress` (record_session_id.py is base install).
     `_COMPRESS_HOOK_SCRIPTS` are patched and kept only when
     `include_compress=True`; when False, their template blocks are dropped
     from the returned dict entirely (not merely left unpatched) -- the
@@ -615,8 +615,8 @@ def merge_mcp_json(existing: dict, generated_servers: dict, *, owned_keys: tuple
     `owned_keys` are ever added, overwritten, or removed.
 
     `owned_keys` is deliberately the full set this toolkit could ever
-    generate, not just `generated_servers`' keys THIS run: found in PR #113
-    review that omitting a key from `generated_servers` (e.g. running
+    generate, not just `generated_servers`' keys THIS run: found in review that omitting
+    a key from `generated_servers` (e.g. running
     `--qdrant-only` after an earlier run had configured `local-compress`)
     previously left that stale entry in place, since a plain dict `.update`
     only ever adds/overwrites keys it's given and never removes anything.
@@ -649,7 +649,7 @@ def _is_toolkit_owned_hook(hook: dict) -> bool:
     checkout, a venv recreated at a new path, or a future template matcher
     update -- unlike comparing the old entry's exact command/args strings
     (an earlier approach), which is what let a *stale* entry through
-    unrecognized: found in PR #113 review that re-running after any of
+    unrecognized: found in review that re-running after any of
     those changes appended a second block instead of replacing the first,
     leaving the stale one's now-nonexistent command wired up to fire on
     every matching event indefinitely.
@@ -667,8 +667,8 @@ def _strip_toolkit_owned_inner_hooks(block: dict) -> Optional[dict]:
     a single block's "hooks" list can hold more than one entry sharing the
     same matcher -- e.g. a user manually adding their own custom hook
     alongside this toolkit's `compress_output.py` entry in the SAME
-    block object, rather than as a separate top-level block. Found in PR
-    #113 review and confirmed by reproducing it directly: an earlier
+    block object, rather than as a separate top-level block. Found in review and
+    confirmed by reproducing it directly: an earlier
     whole-block check discarded that entire block -- including the user's
     unrelated custom entry -- the moment ANY inner hook in it matched a
     toolkit script name, silently deleting configuration this toolkit does
@@ -724,7 +724,7 @@ def strip_toolkit_hooks(existing: dict) -> dict:
 
     Unlike merge_settings_hooks (which ADDS/refreshes this toolkit's own
     entries), this ACTIVELY REMOVES them with nothing to replace them with --
-    used for `--qdrant-only`. Found in PR #113 review: `--qdrant-only`
+    used for `--qdrant-only`. Found in review: `--qdrant-only`
     correctly omitted `local-compress` from the generated `.mcp.json` (see
     merge_mcp_json), but previously left settings.json completely untouched
     either way, so a repo that had a prior FULL setup (local-compress +
@@ -748,8 +748,8 @@ def strip_toolkit_hooks(existing: dict) -> dict:
 
 def default_skills_dir(home_dir: Path) -> Path:
     """
-    Default install destination for `plan_skill_installs` below (issue
-    #205) -- `~/.claude/skills/`, the SAME user-level location
+    Default install destination for `plan_skill_installs` below
+    -- `~/.claude/skills/`, the SAME user-level location
     `docs/session-continuity.md`/`docs/savings-tracker.md` already document
     installing skills to by hand ("install globally... only once"), and
     what `/my-resume`'s own per-project scoping (by current directory name,
@@ -761,8 +761,8 @@ def default_skills_dir(home_dir: Path) -> Path:
 
 def split_skill_frontmatter(data: bytes) -> "tuple[bytes, bytes]":
     """
-    Splits a SKILL.md's raw bytes into `(frontmatter_prefix, body)` (issue
-    #449). `frontmatter_prefix` is everything from the opening `---` line
+    Splits a SKILL.md's raw bytes into `(frontmatter_prefix, body)`.
+    `frontmatter_prefix` is everything from the opening `---` line
     through the closing `---` line PLUS the blank line(s) after it, so
     `frontmatter_prefix + body == data` always holds; it is `b""` when
     `data` has no frontmatter block.
@@ -785,8 +785,7 @@ def split_skill_frontmatter(data: bytes) -> "tuple[bytes, bytes]":
     # A UTF-8 BOM before the opening fence (common from Windows editors) is
     # not part of the fence line: skip it for detection but keep its bytes in
     # the returned prefix, so the file is still recognised as having
-    # frontmatter and a refresh keeps the BOM along with the block (Copilot
-    # review on PR #451).
+    # frontmatter and a refresh keeps the BOM along with the block.
     bom = b"\xef\xbb\xbf" if data.startswith(b"\xef\xbb\xbf") else b""
     lines = data[len(bom):].splitlines(keepends=True)
     if not lines or lines[0].rstrip() != b"---":
@@ -805,13 +804,13 @@ def split_skill_frontmatter(data: bytes) -> "tuple[bytes, bytes]":
 class SkillInstallPlan:
     """
     One entry per skill directory found under `tools_repo_dir/skills/`
-    (issue #205) -- `name` is the skill's directory name (e.g.
+    -- `name` is the skill's directory name (e.g.
     "my-compact"), `action` is one of "install" (dest doesn't exist yet),
     "up_to_date" (dest already holds exactly what this plan would write --
     nothing to do), or "update" (dest exists but differs -- overwrite).
     `content` is the FULL text this plan would write to `dest`: the shipped
     SKILL.md, preceded by the installed copy's own frontmatter block when it
-    has one (issue #449, `frontmatter_preserved`), already computed here so a
+    has one (`frontmatter_preserved`), already computed here so a
     caller can write it without touching `source` again (and so
     --dry-run/tests never need to re-read the file to report what WOULD be
     written). Bytes that are not valid UTF-8 inside a preserved frontmatter
@@ -829,7 +828,7 @@ class SkillInstallPlan:
 # The one error handler used to decode/encode skill text, shared with
 # tools/setup_project.py's _atomic_write so a preserved frontmatter block
 # that is not valid UTF-8 survives the round trip instead of crashing the
-# run or being silently dropped (issue #449). For valid UTF-8 it behaves
+# run or being silently dropped. For valid UTF-8 it behaves
 # exactly like plain "strict".
 SKILL_TEXT_ERRORS = "surrogateescape"
 
@@ -837,7 +836,7 @@ SKILL_TEXT_ERRORS = "surrogateescape"
 def plan_skill_installs(tools_repo_dir: Path, skills_dir: Path) -> list:
     """
     Read-only planning step for `claude-runway-setup init --install-skills`
-    (issue #205) and, since issue #449, `upgrade`'s skill refresh -- scans
+    and `upgrade`'s skill refresh -- scans
     `tools_repo_dir/skills/*/SKILL.md` (the shipped
     source of truth: the SAME path for a clone and a pipx/`uv tool install`,
     since `skills/` is shipped as wheel data files (setup.py's `data_files()`)
@@ -849,7 +848,7 @@ def plan_skill_installs(tools_repo_dir: Path, skills_dir: Path) -> list:
     CLI does the actual writing" split, so this stays trivially testable
     with only tmp directories, no mocking of file I/O needed.
 
-    Frontmatter rule (issue #449): when the shipped source has no
+    Frontmatter rule: when the shipped source has no
     frontmatter but the installed copy does, the installed copy's
     frontmatter block is preserved and only the body is compared/replaced
     (`split_skill_frontmatter`). So an installed copy that differs from the
@@ -883,8 +882,8 @@ def plan_skill_installs(tools_repo_dir: Path, skills_dir: Path) -> list:
         source = skill_dir / "SKILL.md"
         if not source.is_file():
             continue
-        # Read as raw bytes then decode, NOT source.read_text() (Copilot
-        # review on PR #224): read_text() opens in universal-newlines text
+        # Read as raw bytes then decode, NOT source.read_text():
+        # read_text() opens in universal-newlines text
         # mode, which silently translates a CRLF source's line endings to
         # bare "\n" -- lossy on every platform, and specifically broken on
         # Windows once combined with _atomic_write's own text-mode write
@@ -904,7 +903,7 @@ def plan_skill_installs(tools_repo_dir: Path, skills_dir: Path) -> list:
         if not dest.exists():
             action = "install"
         else:
-            # Compare raw bytes, not decoded text (Copilot review on PR #224):
+            # Compare raw bytes, not decoded text:
             # a pre-existing dest SKILL.md a user hand-edited and saved in a
             # non-UTF-8 encoding would otherwise raise UnicodeDecodeError
             # here, crashing the entire --install-skills run before the
@@ -915,7 +914,7 @@ def plan_skill_installs(tools_repo_dir: Path, skills_dir: Path) -> list:
             # is both simpler and more precise than a lossy decode (e.g.
             # errors="replace") would be.
             dest_bytes = dest.read_bytes()
-            # Issue #449: the installed copy's own frontmatter always wins.
+            # The installed copy's own frontmatter always wins.
             # It is carried over in front of the shipped BODY -- if a future
             # shipped source gains frontmatter of its own, that block is
             # dropped from what is written (an installed copy already has
@@ -953,7 +952,7 @@ class SetupResult:
     pre-existing content at all. These exist specifically so a caller
     previewing changes (`tools/setup_project.py`'s `--dry-run`) never has
     to print the full merged document just to show what changed. Found in
-    PR #113 review: printing `mcp_json`/`settings_json` directly for
+    Printing `mcp_json`/`settings_json` directly for
     --dry-run meant any unrelated MCP server's secret (an API token sitting
     in that server's own `env` block, merged in unchanged from the target's
     EXISTING `.mcp.json`) got printed to the terminal/CI log right along
@@ -962,7 +961,7 @@ class SetupResult:
     module's own explicit design goal (see merge_mcp_json/
     merge_settings_hooks). `generated_settings_hooks` is None only for
     --skip-hooks's "leave settings.json alone entirely" -- NOT for
-    --qdrant-only (issue #198): that mode still generates and returns the
+    --qdrant-only: that mode still generates and returns the
     CORE record_session_id.py hooks (they're written/kept either way, not
     local-compress-gated), it just omits the compress-dependent blocks
     from what it builds. So --qdrant-only's `changes` entry summarizes a
@@ -1014,13 +1013,13 @@ def run_setup(
     against a repo with pre-existing unrelated config) merges rather than
     clobbers -- see merge_mcp_json/merge_settings_hooks.
 
-    `embedding_model` (issue #279, CLI `--embedding-model`) is the one
+    `embedding_model` (CLI `--embedding-model`) is the one
     setting that IS sticky across re-runs: blank means "keep whatever the
     target's existing `.mcp.json` already has" (template default for a
     brand-new project), never "reset to the template default". A non-blank
     value that differs from the existing one adds a WARNING to `changes`.
 
-    `memory_bank_embedding_model` (issue #428, CLI `--memory-bank-embedding-model`)
+    `memory_bank_embedding_model` (CLI `--memory-bank-embedding-model`)
     is the same sticky setting for the `memory-bank` block ONLY, and is fully
     independent of `embedding_model`: blank keeps the block's existing value
     (template default for a block that does not exist). A non-blank value that
@@ -1034,7 +1033,7 @@ def run_setup(
     lower-level cleanup path (see `strip_toolkit_hooks`), still supported
     for a caller that wants "leave settings.json alone UNLESS it already has
     stale toolkit hooks, in which case remove them" -- but the CLI itself no
-    longer needs it (issue #198): `--qdrant-only` now keeps
+    longer needs it: `--qdrant-only` now keeps
     `include_hooks=True` (record_session_id.py is CORE/base install and must
     still be written) and instead passes `include_compress=False` into the
     `include_hooks=True` branch below, whose `build_settings_hooks(
@@ -1057,7 +1056,7 @@ def run_setup(
 
     mcp_template = load_json(templates_dir / "mcp.json.template")
 
-    # Issue #279: read the target's existing .mcp.json BEFORE deciding the
+    # Read the target's existing .mcp.json BEFORE deciding the
     # embedding model (and before the warm-up below, which must warm the
     # model that will actually be written). See resolve_embedding_model for
     # the explicit > existing > template rule.
@@ -1066,7 +1065,7 @@ def run_setup(
     template_embedding_model = mcp_template["mcpServers"]["qdrant"]["env"]["EMBEDDING_MODEL"]
     previous_embedding_model = existing_embedding_model(existing_mcp)
     resolved_embedding_model = resolve_embedding_model(embedding_model, existing_mcp, template_embedding_model)
-    # Issue #428: memory-bank's model is resolved from its own sources only
+    # memory-bank's model is resolved from its own sources only
     # (explicit flag > its own existing block > template default).
     template_memory_bank_model = mcp_template["mcpServers"]["memory-bank"]["env"]["EMBEDDING_MODEL"]
     previous_memory_bank_model = existing_memory_bank_model(existing_mcp)
@@ -1134,11 +1133,11 @@ def run_setup(
             f"Preserved the existing memory-bank EMBEDDING_MODEL '{previous_memory_bank_model}' (pass "
             f"--memory-bank-embedding-model to change it)."
         )
-    # Issue #175: memory-bank reserves "general" as its cross-project
+    # memory-bank reserves "general" as its cross-project
     # sentinel (metadata.repo) -- a project whose own MEMORY_BANK_ID
     # resolves to exactly that string would be indistinguishable from
     # genuinely general knowledge. Checked against resolved_memory_bank_id,
-    # NOT resolved_collection_name (PR #178 review, fifth pass) -- since
+    # NOT resolved_collection_name -- since
     # memory_bank_id is now an independently-settable value, it's the one
     # that actually ends up as the repo tag; collection_name is only its
     # DEFAULT when memory_bank_id isn't passed. Warn rather than silently
@@ -1151,7 +1150,7 @@ def run_setup(
             "with a different value."
         )
 
-    # Found in PR #178 review: a target repo directory named e.g. "memory-bank"
+    # Found in review: a target repo directory named e.g. "memory-bank"
     # with both COLLECTION_NAME and MEMORY_BANK_COLLECTION left at their
     # defaults resolves them to the SAME string -- tools/ingest_mcp_server.py's
     # reserved-collection-name guard then refuses EVERY index_repo/sync_repo

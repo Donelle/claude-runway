@@ -53,7 +53,7 @@ def _load_qdrant_mcp_server(stub_compression=True):
 
 class SanitizeProjectCollectionName(unittest.TestCase):
     """_sanitize_project maps a project string to a stable, valid Qdrant
-    collection-name segment. It deliberately appends NO hash suffix (issue #45's
+    collection-name segment. It deliberately appends NO hash suffix (the
     hash was dropped so the name stays readable and one project string always
     maps to the same plain collection name), so punctuation variants collapse
     together.
@@ -87,7 +87,7 @@ class SanitizeProjectCollectionName(unittest.TestCase):
         self.assertEqual(mod._sanitize_project("claude-runway"), "claude-runway")
 
     def test_casing_variants_collapse_to_the_same_collection(self):
-        # Regression coverage for issue #37: casing variants of the exact
+        # Regression coverage: casing variants of the exact
         # same project string must sanitize IDENTICALLY, or a casing drift
         # between /my-compact and /my-resume points at a nonexistent
         # collection.
@@ -161,7 +161,7 @@ def _make_fake_qdrant_client_class():
             for p in points:
                 # Real Qdrant upsert semantics: a point sharing an existing
                 # id overwrites it in place rather than adding a second one
-                # -- this is exactly the behavior issue #36's fix relies on.
+                # -- this is exactly the behavior the fix relies on.
                 col[p.id] = p
 
         def _matching(self, collection_name, qdrant_filter):
@@ -220,7 +220,7 @@ def _run(coro):
 
 
 class CompactPointIdIsDeterministic(unittest.TestCase):
-    """Regression coverage for issue #36's core fix: the point id must be a
+    """Regression coverage for the core fix: the point id must be a
     pure function of (project, label, date) so a retried compact_store call
     lands on the SAME id -- otherwise there's nothing to dedupe against."""
 
@@ -249,7 +249,7 @@ class CompactPointIdIsDeterministic(unittest.TestCase):
 
 
 class CompactStoreIsIdempotent(unittest.TestCase):
-    """Regression coverage for issue #36: a retried compact_store call with
+    """Regression coverage: a retried compact_store call with
     identical project/label/date must overwrite the earlier point (same id)
     instead of inserting a second, indistinguishable one."""
 
@@ -291,7 +291,7 @@ class CompactStoreIsIdempotent(unittest.TestCase):
         self.assertEqual(point.payload["information"], "retried content (should overwrite, not duplicate)")
 
     def test_payload_carries_compact_source_marker(self):
-        # Issue #282: the indexer's reset/delete guard excludes on
+        # The indexer's reset/delete guard excludes on
         # metadata.source, so compact points must carry the shared constant.
         mod, client_cls = self._patched_module()
         _run(mod.compact_store(information="x", project="my-project", label="l", date="2026-08-27"))
@@ -322,7 +322,7 @@ class CompactStoreIsIdempotent(unittest.TestCase):
 
 
 class CompactStoreServerSideLabelDerivation(unittest.TestCase):
-    """Issue #72: compact_store derives a label server-side when the caller
+    """compact_store derives a label server-side when the caller
     omits it or passes blank, reducing label-quality variance across models."""
 
     def _patched_module(self):
@@ -406,7 +406,7 @@ class CompactStoreServerSideLabelDerivation(unittest.TestCase):
 
 
 class CompactFindSurfacesPointId(unittest.TestCase):
-    """Regression coverage for issue #36's second gap: compact_find's
+    """Regression coverage for the second gap: compact_find's
     output must include enough of each point's own id for /my-resume's
     selection UI to disambiguate entries that otherwise render identically
     (same date and label)."""
@@ -441,7 +441,7 @@ class CompactFindSurfacesPointId(unittest.TestCase):
 
 
 class CompactFindIsCaseInsensitiveToProject(unittest.TestCase):
-    """Regression coverage for issue #37: compact_find must find a compact
+    """Regression coverage: compact_find must find a compact
     stored under a differently-cased project string -- casing is the one
     kind of project-name drift the fix closes directly (rather than via
     the sibling-candidate fallback), since /my-compact and /my-resume can
@@ -471,7 +471,7 @@ class CompactFindIsCaseInsensitiveToProject(unittest.TestCase):
 
 
 class CompactFindSuggestsSiblingProjects(unittest.TestCase):
-    """Regression coverage for issue #37's sibling-candidate fallback: when
+    """Regression coverage for the sibling-candidate fallback: when
     a project genuinely has nothing (not just a casing mismatch, which is
     handled separately -- a truly different project name, e.g. after a
     working-directory rename), compact_find should surface OTHER projects
@@ -520,7 +520,7 @@ class CompactFindSuggestsSiblingProjects(unittest.TestCase):
 
 
 class CollectionsForProjectFindsEveryCasingVariant(unittest.TestCase):
-    """Regression coverage for TWO real bugs flagged in PR review on #123:
+    """Regression coverage for TWO real bugs flagged in PR review:
 
     1. (Round 1's own bug) Unconditionally case-folding _sanitize_project's
        output would silently orphan every ALREADY-EXISTING project name
@@ -571,8 +571,8 @@ class CollectionsForProjectFindsEveryCasingVariant(unittest.TestCase):
     def test_finds_a_collection_under_a_name_the_canonical_algorithm_would_never_derive(self):
         # THE actual round-2 regression case: a collection stored under a
         # name that has nothing to do with _sanitize_project's current
-        # algorithm at all (simulating history from before issue #37
-        # existed in any form) must still be discovered, purely by reading
+        # algorithm at all (simulating history from before casing-variant
+        # handling existed in any form) must still be discovered, purely by reading
         # its own stored `project` payload -- proving this fix doesn't
         # depend on the collection name being algorithmically related to
         # the query in any way, unlike the round-1 fix it replaced.
@@ -679,8 +679,8 @@ class CollectionsForProjectFindsEveryCasingVariant(unittest.TestCase):
 
 
 class MostRecentSiblingEntryPaginatesFully(unittest.TestCase):
-    """Regression coverage for a real pagination bug flagged in PR review
-    on #123: _most_recent_sibling_entry used to read only a single
+    """Regression coverage for a real pagination bug flagged in PR review:
+    _most_recent_sibling_entry used to read only a single
     100-point scroll page. scroll's page order is by point id, not by
     date, so a collection with more than 100 points could have its actual
     most-recently-dated entry sitting on a LATER page -- a single-page
@@ -717,7 +717,7 @@ class MostRecentSiblingEntryPaginatesFully(unittest.TestCase):
 
 class CompactFindDoesNotLeakOtherProjectsFromAnUnprovenCollection(unittest.TestCase):
     """Regression coverage for a real cross-project leakage bug flagged in
-    PR review on #123 (round 3): _collections_for_project only proves a
+    PR review (round 3): _collections_for_project only proves a
     candidate collection contains AT LEAST ONE matching point -- finding
     one match proves containment, not exclusivity, so a collection that
     ACTUALLY holds multiple different projects' entries (an explicitly
@@ -784,7 +784,7 @@ class CompactFindDoesNotLeakOtherProjectsFromAnUnprovenCollection(unittest.TestC
 
 class AuthoritativeResolutionPropagatesFailuresInsteadOfHidingThem(unittest.TestCase):
     """Regression coverage for a real error-handling bug flagged in PR
-    review on #123 (round 3): _collections_for_project (authoritative
+    review (round 3): _collections_for_project (authoritative
     resolution for compact_store/compact_find) used to swallow a failed
     get_collections() call and proceed as if no other collections
     existed -- which could make compact_store create a second,
@@ -819,7 +819,7 @@ class AuthoritativeResolutionPropagatesFailuresInsteadOfHidingThem(unittest.Test
 
 class CollectionMatchingScansEveryPointNotJustTheNewest(unittest.TestCase):
     """Regression coverage for a real omission bug flagged in PR review on
-    #123 (round 4): _collections_for_project used to decide whether a
+    _collections_for_project used to decide whether a
     sibling collection belonged to a project by checking only that
     collection's MOST RECENT point. In a genuinely shared collection where
     a DIFFERENT project's entry happens to have a LATER date, this project's
@@ -880,7 +880,7 @@ class CollectionMatchingScansEveryPointNotJustTheNewest(unittest.TestCase):
 
 class CompactFindQueryPathFiltersBeforeQdrantTruncates(unittest.TestCase):
     """Regression coverage for a truncation-before-filter bug flagged in PR
-    review on #123 (rounds 4 AND 5): the semantic query path used to ask
+    review (rounds 4 AND 5): the semantic query path used to ask
     Qdrant for exactly `limit` results per collection and only THEN apply
     the case-insensitive per-entry project filter client-side. A shared
     collection holding more than `limit` entries that rank ahead of a
@@ -927,7 +927,7 @@ class CompactFindQueryPathFiltersBeforeQdrantTruncates(unittest.TestCase):
 
 
 class CandidateHintSkipsPastEmptySiblingsToFindRealOnes(unittest.TestCase):
-    """Regression coverage for a real bug flagged in PR review on #123 (round
+    """Regression coverage for a real bug flagged in PR review (round
     6): _sibling_compact_collections used to cap the RAW list of sibling
     collection names to 3 BEFORE _candidate_hint ever got a chance to probe
     and skip the ones that turn out empty. compact_store creates a collection
@@ -964,7 +964,7 @@ class CandidateHintSkipsPastEmptySiblingsToFindRealOnes(unittest.TestCase):
 
 class CompactFindFiltersTheCanonicalCollectionToo(unittest.TestCase):
     """Regression coverage for a real truncation-before-filter bug flagged in
-    PR review on #123 (round 6): the semantic query path's exact MatchAny
+    PR review (round 6): the semantic query path's exact MatchAny
     filter (round 5's fix) was applied to every resolved collection EXCEPT
     the canonical one, which was treated as "trusted by construction" and
     queried with no filter at all. But `collection` is a caller-controlled
@@ -1004,7 +1004,7 @@ class CompactFindFiltersTheCanonicalCollectionToo(unittest.TestCase):
 
 
 class CompactPruneTests(unittest.TestCase):
-    """Tests for compact_prune (issue #70): a retention/cleanup tool for
+    """Tests for compact_prune: a retention/cleanup tool for
     stored conversation compacts, with dry_run-by-default safety.
 
     Uses the same _FakeQdrantClient/_FakeEmbeddingProvider pattern as

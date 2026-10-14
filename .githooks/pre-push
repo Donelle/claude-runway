@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Local pre-push gate (issue #297): report-only ruff (F, B) + Pyright
+# Local pre-push gate: report-only ruff (F, B) + Pyright
 # (standard mode), run from this repo's own .venv -- never `--fix`/
 # `--unsafe-fixes`, since adopting/running the linter must never itself
 # change runtime behavior (see pyproject.toml's [tool.ruff.lint] comment).
@@ -25,7 +25,7 @@ cd "$REPO_ROOT"
 # Windows venvs use Scripts/ and name every console-script entry point
 # <name>.exe (pip's standard behavior for Windows console_scripts, not just
 # python.exe itself) -- Linux/macOS use bin/ with no suffix. Copilot review
-# (PR #319) caught that an earlier version of this hook found python.exe
+# caught that an earlier version of this hook found python.exe
 # correctly but then checked/executed extensionless "Scripts/ruff"/
 # "Scripts/pyright", which never exist on Windows, silently blocking every
 # push there.
@@ -50,7 +50,7 @@ echo "pre-push: ruff check (F, B)..."
 "$RUFF" check libs tools hooks tests
 
 echo "pre-push: pyright..."
-# --pythonpath explicitly (Copilot review, PR #319): pyproject.toml's
+# --pythonpath explicitly: pyproject.toml's
 # [tool.pyright] deliberately has no venvPath/venv (see its own comment) --
 # passing the interpreter directly here is what actually resolves
 # third-party imports against this repo's own .venv, portably regardless of

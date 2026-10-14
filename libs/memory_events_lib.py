@@ -1,6 +1,6 @@
 """
 Passive, append-only usage log for memory-bank's `recall`/`remember` calls
-(issue #179) -- a dedicated `~/.claude/claude-runway/memory-events.db`,
+-- a dedicated `~/.claude/claude-runway/memory-events.db`,
 deliberately SEPARATE from `libs/savings_ledger.py`'s `savings.db`. That
 file's schema is built around session-level TOKEN aggregates (a different
 concern); this one is per-POINT access tracking (which memories get
@@ -12,7 +12,7 @@ would only matter alongside an autonomous-removal feature that doesn't exist
 yet; today `forget` always requires explicit human confirm=True, so there's
 nothing passive to observe.
 
-Issue #211 adds a SEPARATE, much simpler counter alongside the above:
+There is also a SEPARATE, much simpler counter alongside the above:
 `record_memory_metric()` below writes a plain per-call-attempt tally
 (`metric_id="memory-bank"`, `event_type` in `("recall", "remember",
 "forget")`) into `libs/metrics_lib.py`'s shared, generic `metrics.db` --
@@ -23,8 +23,8 @@ excluded from `record_memory_event`/`memory-events.db` above: a plain call
 count for `forget` costs nothing extra (no autonomous-removal feature is
 needed to justify it, unlike the rich per-point log this module already
 argues against for `forget`), and answering "how often is forget called"
-is exactly what issue #211 exists to give `/my-metrics`'s `memory-bank`
-branch (#208) real data to read.
+is exactly what that counter exists to give `/my-metrics`'s `memory-bank`
+branch real data to read.
 
 Why append-only INSERT, not an in-place counter on the Qdrant point itself:
 mutating a point's payload (read-current-count, increment, write-back) is a
@@ -44,7 +44,7 @@ MCP server subprocess is spawned fresh per Claude Code session (one process
 per session -- see `libs/qdrant_collection_hints.py`'s docstring for the
 same observation), so the caller resolves one process-lifetime UUID at
 import time via `libs/session_id_lib.py`'s `SessionIdStrategy.PROXY`
-(issue #198/#214, rather than minting its own `uuid.uuid4().hex` inline)
+(rather than minting its own `uuid.uuid4().hex` inline)
 and passes it in as `session_id` on every call here -- a documented proxy
 for "this session," not Claude Code's own internal id.
 
@@ -110,7 +110,7 @@ def resolve_db_path() -> Path:
 
 _VALID_EVENT_TYPES = ("recall", "remember")
 
-# Issue #211: the simple metrics.db counter covers all THREE memory-bank
+# The simple metrics.db counter covers all THREE memory-bank
 # tools (unlike _VALID_EVENT_TYPES above, which deliberately excludes
 # "forget" for the rich memory_events table -- see this module's docstring
 # for why the two lists differ).
@@ -124,7 +124,7 @@ def _connect() -> sqlite3.Connection:
     here since every single event call re-runs these `CREATE TABLE IF NOT
     EXISTS`/`CREATE INDEX IF NOT EXISTS` statements), the connection this
     function already opened is explicitly closed before the error
-    propagates (PR #197 review) -- otherwise a caller whose `try` only
+    propagates -- otherwise a caller whose `try` only
     wraps the call to `_connect()` itself (as `record_memory_event` below
     does) would never get a handle back to close, leaking the open
     connection/file descriptor on every failed call.
@@ -189,7 +189,7 @@ def record_memory_event(
     """
     if event_type not in _VALID_EVENT_TYPES:
         raise ValueError(f"Unknown event_type {event_type!r}. Valid values: {_VALID_EVENT_TYPES}.")
-    # `conn` is closed in a `finally` (PR #197 review), not just after a
+    # `conn` is closed in a `finally`, not just after a
     # successful `with conn:` block -- `with conn:` only manages the
     # transaction (commit/rollback), it does NOT close the connection
     # itself, and a failure INSIDE that block (e.g. "database is locked"
@@ -225,12 +225,12 @@ def record_memory_event(
 
 def record_memory_metric(event_type: str, session_id: Optional[str] = None) -> None:
     """
-    Issue #211: append a plain per-call-attempt tally into `metrics.db` (via
+    Append a plain per-call-attempt tally into `metrics.db` (via
     `libs/metrics_lib.py`'s shared `MetricsStore`) -- `metric_id="memory-bank"`,
     this `event_type`, `value=1`, no metadata. Deliberately separate from
     `record_memory_event`/`memory-events.db` above (see this module's
     docstring): this is a plain call-count for `/my-metrics`'s `memory-bank`
-    branch (#208) to read, not the rich per-point access log that function
+    branch to read, not the rich per-point access log that function
     already provides.
 
     event_type must be one of `_VALID_METRIC_EVENT_TYPES` ("recall",

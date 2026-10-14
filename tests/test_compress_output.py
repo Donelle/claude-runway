@@ -33,7 +33,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 import compress_output as hook  # noqa: E402
 from compress_output import _is_exactness_critical  # noqa: E402
 
-# The other three stdin-reading hooks, imported for the issue #263 stdin-encoding
+# The other three stdin-reading hooks, imported for the stdin-encoding
 # regression tests at the bottom of this file. Each is a standalone script with
 # its own main(); none does network I/O on import.
 import record_session_id as record_session_id_hook  # noqa: E402
@@ -77,7 +77,7 @@ MUST_SKIP = [
     ("npm --version", "version pin"),
     ("pip freeze", "two-word command name"),
     ("az group show --query id -o tsv", "--query plus -o tsv"),
-    # --- long-form --output, and case variance in the format value (#33) ---
+    # --- long-form --output, and case variance in the format value ---
     ("aws s3api list-buckets --output json", "--output long form, space-separated"),
     ("az group show --output=yaml", "--output long form, = separated"),
     ("az role assignment list -o JSON", "uppercase format value on the short form"),
@@ -89,7 +89,7 @@ MUST_SKIP = [
     ("python x.py -h", "standalone -h"),
     ("df -h", "-h as its own token; tabular output that reads exact anyway"),
     ("gtk-app --help-all", "--help-all is still help output, so matching it is right"),
-    # --- gh api (issue #190): structured REST/GraphQL data, never prose ---
+    # --- gh api: structured REST/GraphQL data, never prose ---
     (
         "gh api repos/Donelle/claude-runway/pulls/190/comments --paginate",
         "plain gh api call with no --jq/--json at all (my-gh-pr-feedback's shape)",
@@ -106,7 +106,7 @@ MUST_SKIP = [
         "the real VAR=$(...) command-substitution shape used by my-gh-autowork's NEW_IDS diffing "
         "-- a start-anchored fix would have missed this",
     ),
-    # --- issue #268: wrappers that used to hide the command from `^` anchoring ---
+    # --- Wrappers that used to hide the command from `^` anchoring ---
     ('FILES=$(git diff --name-only); echo "$FILES"', "VAR=$(cmd) command substitution"),
     ("HASH=$(git rev-parse HEAD)", "captured hash in a substitution"),
     ("(git diff) 2>&1", "subshell wrapper"),
@@ -120,7 +120,7 @@ MUST_SKIP = [
     ("kubectl get pods -o=json", "-o=json spelling"),
     ("kubectl get pods -ojson", "attached -ojson spelling"),
     ("kubectl get pods -o=YAML", "case-insensitive value on the = spelling"),
-    # --- issue #269: the exemptions that must SURVIVE the false-positive fixes ---
+    # --- The exemptions that must SURVIVE the false-positive fixes ---
     ("env", "bare env listing"),
     ("env | sort", "env piped -- still a variable listing"),
     ("env -i FOO=1 git status", "env launching an exempt command"),
@@ -129,7 +129,7 @@ MUST_SKIP = [
     ("cat <<EOF\nbody\nEOF\ngit status", "exempt command AFTER a heredoc terminator"),
     ("kubectl get pods -o json | tee x.txt", "-o json as a real flag"),
     ('git status "x y"', "quoted arg must not hide a command-start exemption"),
-    # --- review round 1 on PR #390: forms the first fix wrongly un-exempted ---
+    # --- review round 1: forms the first fix wrongly un-exempted ---
     ("env --unset HOME git diff", "env option with a separate operand (--unset)"),
     ("env -C /tmp git diff", "env -C DIR operand"),
     ("env --chdir /tmp git diff", "env --chdir DIR operand"),
@@ -140,7 +140,7 @@ MUST_SKIP = [
     ("bash <<'EOF'\ngit diff\nEOF", "heredoc body fed to a shell interpreter is a script"),
     ("bash -c 'gh api repos/x/y/issues --paginate'", "gh api inside a quoted payload still executes"),
     ("cat <<EOF\nEOF\ngit diff\ncat <<EOF\nnotes\nEOF", "empty heredoc must end at its FIRST terminator"),
-    # --- review round 2 on PR #390 ---
+    # --- review round 2 ---
     ("cat <<EOF\n$(\ngit diff\n)\nEOF", "multiline substitution in an unquoted heredoc"),
     ("cat <<EOF\n`\ngit diff\n`\nEOF", "multiline backtick substitution"),
     ("cat <<'EOF' | bash\ngit diff\nEOF", "heredoc piped into an interpreter on the opener line"),
@@ -148,7 +148,7 @@ MUST_SKIP = [
     ("bash -c 'kubectl get pods -o json'", "quoted shell payload with a real -o json"),
     ("bash -c 'aws s3api list-buckets --output json'", "quoted shell payload with --output json"),
     ("bash -c 'git diff'", "quoted shell payload is itself an exempt command"),
-    # --- review round 3 on PR #390 ---
+    # --- review round 3 ---
     ('echo "<<EOF"\ngit diff\ncat <<EOF\nnotes\nEOF', "quoted << is not a heredoc opener"),
     ("echo hi # <<EOF\ngit diff\ncat <<EOF\nnotes\nEOF", "<< inside a comment is not an opener"),
     ("cat <<EOF-ONE\ngit diff\nEOF\nnotes\nEOF", "delimiter must be a complete token"),
@@ -158,7 +158,7 @@ MUST_SKIP = [
     ("env 'FOO=a b' git diff", "fully quoted env assignment word"),
     ('env CI=1 "git" diff', "quoted launched executable"),
     ('env GIT_CONFIG_GLOBAL="$(printf /dev/null)" git diff', "assignment value split at $("),
-    # --- review round 4 on PR #390 ---
+    # --- review round 4 ---
     ('env NOTE="say \\"hello world\\" now" git diff', "escaped quotes in an assignment value"),
     ("env LABEL=a\\ b git diff", "backslash-escaped space in an assignment value"),
     ("cat <<'DOC-TEXT'\nexample <<EOF\nDOC-TEXT\ngit diff\ncat <<EOF\nnotes\nEOF", "non-word delimiter"),
@@ -195,7 +195,7 @@ MUST_COMPRESS = [
     ("echo \"run git status\"", "exempt name only inside a quoted argument"),
     ("echo hi || dotnet build", "|| must split as one delimiter, not two empties"),
     ("", "empty command"),
-    # --- issue #268 near-misses: new splitting must not expose fake segments ---
+    # --- near-misses: new splitting must not expose fake segments ---
     ('dotnet test --filter "(id=1)"', "mid-segment paren must not split off `id=1`"),
     ("npm listen", "`npm list` must not match a longer word"),
     ("tool --foo-ojson x", "-ojson only counts as its own flag"),
@@ -206,12 +206,12 @@ MUST_COMPRESS = [
     ("grep -rh pattern src/", "same, bundled -rh"),
     ('echo "-h"', "-h inside a quoted argument, not preceded by whitespace"),
     ("python x.py --dry-run # compress-ok", "escape hatch beats the dry-run exemption"),
-    # --- case-insensitivity is scoped to the output-format value only (#33) ---
+    # --- case-insensitivity is scoped to the output-format value only ---
     ('curl -H "Accept: application/json" https://x', "-H is curl's header flag, not -h/help"),
-    # --- gh, but not `gh api`: unaffected by the issue #190 addition ---
+    # --- gh, but not `gh api`: unaffected by the `gh api` addition ---
     ('gh pr comment 190 --body "thanks!"', "gh subcommand other than api stays compressible"),
     ("gh pr view 190 -R x/y", "no --json, no api subcommand -- ordinary human-readable text"),
-    # --- issue #269: false positives that used to forfeit compression ---
+    # --- False positives that used to forfeit compression ---
     ("env CI=1 npm test", "env as a launcher, not a listing"),
     ("env -i PATH=/bin dotnet build", "env with options launching a non-exempt command"),
     ("cat <<EOF\nfoo\ngit status is a verification\nEOF", "heredoc body line starting with an exempt word"),
@@ -251,7 +251,7 @@ class ExactnessCritical(unittest.TestCase):
 class ExactnessCriticalIsLinearTime(unittest.TestCase):
     def test_adversarial_assignment_prefix_does_not_backtrack_exponentially(self):
         # `0="" 0="" ...` made the old `\S*`-based assignment prefix exponential
-        # (CodeQL flagged the env twin of it on PR #390); 30 words took many
+        # (CodeQL flagged the env twin of it); 30 words took many
         # seconds before, and is instant now. Bound is generous to avoid flakes.
         import time
 
@@ -262,7 +262,7 @@ class ExactnessCriticalIsLinearTime(unittest.TestCase):
 
 
 class CompileExtraExactPatterns(unittest.TestCase):
-    """Issue #192: CLAUDE_RUNWAY_EXTRA_EXACT_PATTERNS lets a project add its
+    """CLAUDE_RUNWAY_EXTRA_EXACT_PATTERNS lets a project add its
     own exactness-critical patterns on top of the built-in list, without
     editing this shared hook file. Tests _compile_extra_exact_patterns()
     directly against the real env var, restoring whatever was there
@@ -350,7 +350,7 @@ class ExtraExactPatternsAffectIsExactnessCritical(unittest.TestCase):
         # Matched anywhere (like _EXACT_FLAG_RE), not start-anchored (like
         # _EXACT_CMD_RE) -- so a project's pattern still fires even when
         # wrapped in shell command substitution, the same VAR=$(...) blind
-        # spot issue #190 found for a start-anchored `gh api` addition.
+        # spot found for a start-anchored `gh api` addition.
         hook._EXTRA_EXACT_PATTERNS = [re.compile(r"internal-hash-tool")]
         self.assertTrue(_is_exactness_critical('ID=$(internal-hash-tool --for record.json)'))
 
@@ -376,12 +376,12 @@ class _StubSavingsLedger:
 
 
 class RecordSavingsEventForwardsProject(unittest.TestCase):
-    """Issue #35: hooks/compress_output.py is savings_ledger's SOLE
+    """hooks/compress_output.py is savings_ledger's SOLE
     writer, so _record_savings_event forwarding its `project` argument
     through to record_event is what tags each transient event with its
-    project. Originally (issue #35) this is what let current_session_id()'s
+    project. Originally this is what let current_session_id()'s
     project-filtered lookup tell this session's events apart from an
-    unrelated project's; as of issue #213 that lookup reads session_id_lib's
+    unrelated project's; that lookup reads session_id_lib's
     shadow markers instead, so this forwarding is now informational/
     debugging coverage only -- see savings_ledger.record_event's docstring."""
 
@@ -407,14 +407,14 @@ class RecordSavingsEventForwardsProject(unittest.TestCase):
     def test_project_defaults_to_none_when_not_passed(self):
         # Regression guard: an omitted project must stay None, not silently
         # become an empty string or the literal word "None" -- honesty of
-        # the stored value matters even though (issue #213) this field no
+        # the stored value matters even though this field no
         # longer drives current_session_id()'s project-filtered lookup.
         hook._record_savings_event("sess-1", "hook:Bash", 1000, 100, True, "cmd")
         _, kwargs = self.stub.calls[0]
         self.assertIsNone(kwargs.get("project"))
 
     def test_forwards_agent_fields_to_record_event(self):
-        # Issue #365: which agent earned the saving rides along on the event.
+        # Which agent earned the saving rides along on the event.
         hook._record_savings_event(
             "sess-1", "hook:Bash", 1000, 100, True, "cmd",
             project="my-repo", agent_id="agent-1", agent_type="Explore",
@@ -424,7 +424,7 @@ class RecordSavingsEventForwardsProject(unittest.TestCase):
         self.assertEqual(kwargs.get("agent_type"), "Explore")
 
     def test_agent_fields_default_to_none(self):
-        # A main-session event must be recorded exactly as before #365.
+        # A main-session event must be recorded exactly as before agent attribution.
         hook._record_savings_event("sess-1", "hook:Bash", 1000, 100, True, "cmd")
         _, kwargs = self.stub.calls[0]
         self.assertIsNone(kwargs.get("agent_id"))
@@ -483,7 +483,7 @@ class MainDerivesProjectFromPayloadCwd(unittest.TestCase):
 
 
 class MainThreadsAgentFieldsToRecordEvent(unittest.TestCase):
-    """Issue #365: end-to-end through main() -- the payload's agent_id/agent_type
+    """end-to-end through main() -- the payload's agent_id/agent_type
     reach record_event on EVERY recording path (MCP footer, generic MCP, Bash),
     not just the one _record_savings_event unit test above covers. Uses the same
     stub ledger / fake compress as the neighboring classes, so no live model."""
@@ -582,7 +582,7 @@ class MainThreadsAgentFieldsToRecordEvent(unittest.TestCase):
 
 
 class MainThreadsCharsAndToolUseId(MainThreadsAgentFieldsToRecordEvent):
-    """Issues #437/#438: exact character counts and the PostToolUse `tool_use_id`
+    """Exact character counts and the PostToolUse `tool_use_id`
     reach record_event on every recording path. Inherits the stub/fake-compress
     setUp and _run_main helpers; its own inherited tests are re-run harmlessly."""
 
@@ -600,9 +600,9 @@ class MainThreadsCharsAndToolUseId(MainThreadsAgentFieldsToRecordEvent):
         self.assertEqual((args[2], args[3]), (3500, 350))
         self.assertEqual(kwargs.get("tool_use_id"), "toolu_abc")
 
-    def test_footer_written_before_437_is_stripped_but_not_recorded(self):
-        # A footer from an MCP server that predates #437 carries only the chars / 3.5
-        # estimates. There is no exact size to record (#438 dropped the estimate),
+    def test_footer_without_char_counts_is_stripped_but_not_recorded(self):
+        # A footer from an MCP server that predates character counts carries only the chars / 3.5
+        # estimates. There is no exact size to record (the estimate was dropped),
         # but the footer must still be stripped so Claude never sees it.
         footer = json.dumps({"tool": "compress_file", "raw_tokens": 1000, "out_tokens": 100,
                              "credited": True, "source": "f.log"})
@@ -678,11 +678,11 @@ async def _fake_compress(text, skip_if_under_chars=2000, **kwargs):
 
 
 class MainFallsBackToGenericForNonFooterMcpTools(unittest.TestCase):
-    """Issue #25: an MCP tool call that carries NO savings footer
+    """An MCP tool call that carries NO savings footer
     (mcp__qdrant__compact_find / compact_store, mcp__local-compress__list_local_models
     -- none of these ever call _append_savings_footer) must still get the same
     size-based compression every other matched tool gets, not a silent no-op
-    regardless of size. Exception (issue #302): every tool on the analytics
+    regardless of size. Exception: every tool on the analytics
     server (savings_summary/detail/trend, get_metrics, record_metric) and
     the qdrant server's compact_prune are deliberately a no-op at any size,
     since their numbers must be read verbatim. The qdrant server's qdrant-find
@@ -752,7 +752,7 @@ class MainFallsBackToGenericForNonFooterMcpTools(unittest.TestCase):
         self.assertEqual(len(self.stub.calls), 0)
 
     def test_self_compressing_tool_without_footer_is_never_double_compressed(self):
-        # PR #88 review (Copilot): compress_text never emits a footer at
+        # compress_text never emits a footer at
         # all, and compress_file/compress_command_output/fetch_url omit one
         # whenever tracking is off server-side even though real compression
         # already ran -- with the caller's own focus/preserve_identifiers/
@@ -778,7 +778,7 @@ class MainFallsBackToGenericForNonFooterMcpTools(unittest.TestCase):
                 self.assertEqual(len(self.stub.calls), 0)
 
     def test_exact_output_tools_are_never_generically_compressed(self):
-        # Issue #302: savings/metrics reports are exact numeric output read
+        # savings/metrics reports are exact numeric output read
         # verbatim; they must pass through untouched however large. They now
         # live on the analytics server, so the whole prefix is exempt.
         big = "row 1234567 tokens 89.5%\n" * 400
@@ -842,7 +842,7 @@ class MainFallsBackToGenericForNonFooterMcpTools(unittest.TestCase):
         self.assertFalse(hasattr(hook, "_EXACT_OUTPUT_MCP_TOOLS"))
 
     def test_footer_path_still_takes_priority_over_the_fallback(self):
-        # Regression guard for issue #35's existing footer-path behavior --
+        # Regression guard for the existing footer-path behavior --
         # confirms the refactor into _finish_compression_outcome() didn't
         # change what happens when a footer IS present.
         footer = json.dumps({
@@ -866,7 +866,7 @@ class MainFallsBackToGenericForNonFooterMcpTools(unittest.TestCase):
 
 
 class TimeoutErrorFlowsIntoTheWasntCompressedNote(unittest.TestCase):
-    """Issue #368: the hook embeds compress()'s "Error: ..." string verbatim, so
+    """The hook embeds compress()'s "Error: ..." string verbatim, so
     a timeout's "may be busy" wording must reach the user, not the misleading
     "check it's still running"."""
 
@@ -889,7 +889,7 @@ class TimeoutErrorFlowsIntoTheWasntCompressedNote(unittest.TestCase):
 
 
 class CompactFindMultiEntryIsNeverGenericallyCompressed(unittest.TestCase):
-    """Issue #193: compact_find's output is structured data /my-resume
+    """compact_find's output is structured data /my-resume
     parses for control flow (a "Found {N} compact(s)" header + N discrete
     dated/labeled entries), not prose to skim. Generic size-based
     compression collapses multiple entries into one flowing narrative
@@ -898,7 +898,7 @@ class CompactFindMultiEntryIsNeverGenericallyCompressed(unittest.TestCase):
     left completely untouched, regardless of size -- the same true no-op
     _SELF_COMPRESSING_MCP_TOOLS gets. N <= 1 (including no header at all,
     e.g. an error string) must still fall through to the ordinary
-    size-based path, unchanged from before this fix (issue #25's original
+    size-based path, unchanged from before this fix (the original
     intent: compact_find isn't unconditionally exempt)."""
 
     def setUp(self):
@@ -957,7 +957,7 @@ class CompactFindMultiEntryIsNeverGenericallyCompressed(unittest.TestCase):
 
     def test_single_entry_response_over_threshold_still_gets_compressed(self):
         # N == 1 has no multi-entry structure to lose -- must still follow
-        # the ordinary size-based fallback path (issue #25's intent).
+        # the ordinary size-based fallback path (the intent).
         response = self._multi_entry_response(1)
         self.assertGreater(len(response), hook.THRESHOLD)
         payload = {
@@ -1051,7 +1051,7 @@ class CompactFindEntryCountHelper(unittest.TestCase):
         self.assertIsNone(hook._compact_find_entry_count("just some other text"))
 
     def test_ignores_header_phrase_when_not_at_the_leaf_start(self):
-        # PR #194 review: the header regex must be anchored to the START of
+        # The header regex must be anchored to the START of
         # the leaf, not just matched anywhere in it -- otherwise a STORED
         # compact's own content quoting this exact phrase mid-string (e.g. a
         # past /my-compact session about debugging this very hook) would be
@@ -1066,7 +1066,7 @@ class CompactFindEntryCountHelper(unittest.TestCase):
 
 
 class HandleGenericGroupsBySiblingRecord(unittest.TestCase):
-    """Issue #38: sibling records (e.g. WebSearch's `results` list) must be
+    """Sibling records (e.g. WebSearch's `results` list) must be
     compressed independently, not concatenated into one blob whose result
     then overwrites only the largest field while every other record's field
     is silently blanked to "". Uses the same hook.compress monkeypatch
@@ -1164,7 +1164,7 @@ class HandleGenericGroupsBySiblingRecord(unittest.TestCase):
         self.assertEqual(updated["matches"], "")
 
     def test_nested_sibling_records_group_by_innermost_index(self):
-        # PR #107 review (Copilot): grouping by the FIRST list index in a
+        # Grouping by the FIRST list index in a
         # path (e.g. the 'sections' index) rather than the LAST/nearest one
         # would merge sections[0].results[3] and sections[0].results[4]
         # back into one group, reintroducing the exact cross-record
@@ -1196,7 +1196,7 @@ async def _raising_compress(text, skip_if_under_chars=2000, **kwargs):
     """Simulates an unexpected, non-network failure deep in compress()'s own
     pipeline (e.g. a bug in chunk_text/classify_relevant/split_sections) --
     unlike a network error, compress() has no try/except anywhere in its own
-    body to catch this (issue #44's related finding: compress()'s docstring
+    body to catch this (the related finding: compress()'s docstring
     promises "never raises," but that guarantee is upheld only incidentally,
     since it's complete()'s own internal try/except -- not anything in
     compress() itself -- that actually holds it)."""
@@ -1206,7 +1206,7 @@ async def _raising_compress(text, skip_if_under_chars=2000, **kwargs):
 
 
 class MainFailsOpenOnUnexpectedException(unittest.TestCase):
-    """Issue #44: main() only wrapped json.load(sys.stdin) in try/except --
+    """main() only wrapped json.load(sys.stdin) in try/except --
     everything after (_handle_bash/_handle_generic/_record_savings_event/
     _emit_updated, now factored into _dispatch()) ran completely unguarded,
     so any unexpected exception propagated as a raw traceback instead of the
@@ -1284,7 +1284,7 @@ class MainFailsOpenOnUnexpectedException(unittest.TestCase):
 
 
 class MainHandlesGenericMcpTools(unittest.TestCase):
-    """Issue #63: MCP tools from servers other than local-compress (e.g.
+    """MCP tools from servers other than local-compress (e.g.
     mcp__github__search_code) must go through
     _handle_generic when included in the matcher -- large responses get
     compressed, small ones are left untouched. The dispatch path is the
@@ -1405,7 +1405,7 @@ class MainHandlesGenericMcpTools(unittest.TestCase):
 def _windows_style_stdin(payload_bytes):
     """Return a text stream that mimics how Python opens stdin on a Western
     Windows install: a TextIOWrapper over the raw payload bytes whose encoding
-    is cp1252, NOT utf-8 (issue #263). Building it explicitly (rather than
+    is cp1252, NOT utf-8. Building it explicitly (rather than
     relying on the test runner actually being Windows) makes these tests
     deterministic on all three CI OSes -- cp1252 is a built-in codec
     everywhere. A hook's main() is expected to reconfigure this stream to
@@ -1439,7 +1439,7 @@ _UTF8_SENTINEL = "caf" + _E_ACUTE + " " + _ARROW + " " + _CTRL_0081 + " end"
 
 
 class HooksReconfigureStdinToUtf8(unittest.TestCase):
-    """Issue #263: all four stdin-reading hooks must force stdin to utf-8
+    """All four stdin-reading hooks must force stdin to utf-8
     before json.load, because Windows Python defaults stdin to the locale
     codepage (cp1252). Left unfixed, multi-byte UTF-8 decodes as mojibake
     (which compress_output would then splice back as the tool's output)
@@ -1564,14 +1564,14 @@ class HooksReconfigureStdinToUtf8(unittest.TestCase):
         # payload must parse under the cp1252-default stdin first.
         # Pinned off rather than assumed: with tracking on (e.g. a dogfood
         # shell exporting CLAUDE_RUNWAY_TRACK_SAVINGS=1), main() would go on to
-        # recover orphaned ledgers (issue #306) in the REAL sessions directory.
+        # recover orphaned ledgers in the REAL sessions directory.
         payload = {"session_id": "s", "cwd": "/repos/" + _UTF8_SENTINEL, "transcript_path": None}
         with mock.patch.dict(os.environ, {"CLAUDE_RUNWAY_TRACK_SAVINGS": ""}):
             self._run_hook_main(session_end_hook.main, payload)
 
 
 class InvalidThresholdEnvTests(unittest.TestCase):
-    """Issue #270: a malformed CLAUDE_RUNWAY_COMPRESS_THRESHOLD_CHARS used to
+    """a malformed CLAUDE_RUNWAY_COMPRESS_THRESHOLD_CHARS used to
     raise ValueError at import time, killing the hook on every matched call.
     Run in a real subprocess because the crash happens at module import."""
 

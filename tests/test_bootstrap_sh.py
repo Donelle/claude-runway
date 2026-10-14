@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Light static checks for scripts/bootstrap.sh (issue #31).
+"""Light static checks for scripts/bootstrap.sh.
 
 The script creates a venv and installs packages, which doesn't fit this
 suite's no-network rule, so only what can regress silently without that is

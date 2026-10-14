@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for libs/memory_bank_lib.py (issue #175).
+"""Tests for libs/memory_bank_lib.py.
 
 Stdlib-only (unittest, no pytest), no network -- uses MagicMock/AsyncMock
 stand-ins for QdrantClient/FastEmbedProvider, the same style
@@ -92,7 +92,7 @@ class IsMemoryBankCollectionNameTest(unittest.TestCase):
 class MemoryBankExclusionFilterTest(unittest.TestCase):
     def test_excludes_memory_bank_source(self):
         f = mb.memory_bank_exclusion_filter()
-        # Issue #282: conversation compacts are protected by the same fragment.
+        # Conversation compacts are protected by the same fragment.
         self.assertEqual(len(f.must_not), 2)
         for cond in f.must_not:
             self.assertEqual(cond.key, mb.SOURCE_FIELD)
@@ -159,7 +159,7 @@ class EnsureCollectionTest(_PatchRetryMixin, unittest.TestCase):
         self.assertIsNone(result)
 
     def test_concurrent_creation_conflict_with_mismatched_winner_returns_error(self):
-        # Regression for PR #178 review finding: two projects with DIFFERENT
+        # Regression for a review finding finding: two projects with DIFFERENT
         # EMBEDDING_MODEL values race the first remember() call. The loser's
         # create_collection raises (winner got there first); the PREVIOUS
         # version just re-checked existence and returned success unconditionally,
@@ -237,20 +237,20 @@ class RememberPointTest(_PatchRetryMixin, unittest.TestCase):
         self.assertIn("fast-x", point.vector)
         self.assertNotIn("created_at", meta)
 
-        # Issue #177: no weight passed -> stored as DEFAULT_WEIGHT (1.0), in
+        # No weight passed -> stored as DEFAULT_WEIGHT (1.0), in
         # the SAME initial upsert as source/kind/description/etc -- there is
         # no window where the point exists without a weight at all, unlike
         # created_at below.
         self.assertEqual(meta["weight"], mb.DEFAULT_WEIGHT)
 
         # pending=True is written in the SAME atomic upsert that creates the
-        # point (PR #178 review, sixth pass) -- there is no window where the
+        # point -- there is no window where the
         # point exists without it, unlike created_at below.
         self.assertIs(meta["pending"], True)
 
         # created_at is stamped -- and pending cleared -- in a SEPARATE call
-        # made AFTER the upsert above returns (PR #178 review, fifth and
-        # sixth passes) -- not included in the initial payload, so a value
+        # made AFTER the upsert above returns
+        # -- not included in the initial payload, so a value
         # read there is captured before that write's own round-trip
         # completes, reopening the exact race window wipe_memory_bank's
         # cutoff and pending exclusion exist to close.
@@ -263,14 +263,14 @@ class RememberPointTest(_PatchRetryMixin, unittest.TestCase):
         self.assertAlmostEqual(set_payload_kwargs["payload"]["created_at"], time.time(), delta=5)
         self.assertIs(set_payload_kwargs["payload"]["pending"], False)
 
-        # Issue #179, PR #197 review: the returned created_at must be the
+        # The returned created_at must be the
         # EXACT same value stamped into the set_payload call above, not a
         # separately re-sampled time.time() -- that's the whole point of
         # returning it at all.
         self.assertEqual(created_at, set_payload_kwargs["payload"]["created_at"])
 
     def test_explicit_weight_is_stored_verbatim(self):
-        # Issue #177: an explicit weight (not the default) must be stored
+        # An explicit weight (not the default) must be stored
         # exactly as given, not coerced/clamped -- this lower-level helper
         # trusts the value verbatim; validation (rejecting negative/
         # non-finite weights) happens at the remember() tool boundary
@@ -307,7 +307,7 @@ class RememberPointTest(_PatchRetryMixin, unittest.TestCase):
         return client, result
 
     def test_explicit_point_id_is_used_for_upsert_and_returned(self):
-        # Issue #334: a caller-supplied ID must be used verbatim for both the
+        # a caller-supplied ID must be used verbatim for both the
         # upsert and the follow-up set_payload, and returned unchanged.
         client, (point_id, _, error) = self._remember(point_id="deterministic-id")
         self.assertIsNone(error)
@@ -318,7 +318,7 @@ class RememberPointTest(_PatchRetryMixin, unittest.TestCase):
         self.assertEqual(sp["points"], ["deterministic-id"])
 
     def test_omitted_point_id_still_generates_random_uuid_hex(self):
-        # Issue #334: default behavior unchanged -- fresh random hex IDs.
+        # Default behavior unchanged -- fresh random hex IDs.
         _, (id1, _, _) = self._remember()
         _, (id2, _, _) = self._remember()
         self.assertRegex(id1, r"^[0-9a-f]{32}$")
@@ -403,7 +403,7 @@ class RecallPointsTest(_PatchRetryMixin, unittest.TestCase):
         self.assertEqual(must_kind_values, {"idea"})
 
     def test_excludes_pending_points(self):
-        # Regression for PR #178 review (seventh pass): a point is visible to
+        # Regression for a review finding (seventh pass): a point is visible to
         # search the instant remember_point's initial upsert returns, before
         # its follow-up call clears pending -- without this exclusion, recall
         # could surface a record that wipe_memory_bank can never remove
@@ -449,15 +449,15 @@ class RecallPointsTest(_PatchRetryMixin, unittest.TestCase):
         self.assertEqual(hit["score"], 0.9)
         self.assertEqual(hit["created_at"], 1700000000.0)
 
-        # Issue #177: no metadata.weight on this point -> defaults to
+        # No metadata.weight on this point -> defaults to
         # DEFAULT_WEIGHT (1.0), a true no-op, and effective_score is the
-        # normalized score (raw similarity floored at 0, issue #272)
+        # normalized score (raw similarity floored at 0)
         # scaled by that default.
         self.assertEqual(hit["weight"], mb.DEFAULT_WEIGHT)
         self.assertEqual(hit["effective_score"], mb._normalize_similarity(0.9) * mb.DEFAULT_WEIGHT)
 
     def test_created_at_is_none_for_a_legacy_point_missing_the_field(self):
-        # Issue #179: a point written before metadata.created_at existed at
+        # a point written before metadata.created_at existed at
         # all must not fabricate a value -- None is the honest signal that
         # this memory predates the field, not "created at time zero."
         client = MagicMock()
@@ -484,7 +484,7 @@ class RecallPointsTest(_PatchRetryMixin, unittest.TestCase):
 
 def _hit_point(point_id, score, weight=None):
     """A MagicMock query_points hit with the given raw score/weight, for
-    exercising recall_points' weight-based re-ranking (issue #177)."""
+    exercising recall_points' weight-based re-ranking."""
     point = MagicMock()
     point.id = point_id
     point.score = score
@@ -501,7 +501,7 @@ def _hit_point(point_id, score, weight=None):
 
 
 class NormalizeSimilarityTest(unittest.TestCase):
-    """Issue #177/#272: raw cosine similarity is floored at 0 (no offset)
+    """Raw cosine similarity is floored at 0 (no offset)
     BEFORE being multiplied by weight -- multiplying a possibly-negative raw
     score directly would invert the weight semantics, while a (raw+1)/2
     rescale gives every realistic hit a 0.5 floor that makes weight>=2.0 a
@@ -516,7 +516,7 @@ class NormalizeSimilarityTest(unittest.TestCase):
 
 
 class RecallPointsWeightRerankingTest(_PatchRetryMixin, unittest.TestCase):
-    """Issue #177: recall_points over-fetches by raw similarity, re-ranks by
+    """recall_points over-fetches by raw similarity, re-ranks by
     effective_score = normalize_similarity(score) * weight, then truncates
     to `limit`."""
 
@@ -566,12 +566,12 @@ class RecallPointsWeightRerankingTest(_PatchRetryMixin, unittest.TestCase):
         self.assertEqual(results[0]["effective_score"], mb._normalize_similarity(0.7))
 
     def test_negative_raw_similarity_does_not_invert_weight_ordering(self):
-        # Regression for PR #199 review: cosine similarity CAN be negative.
+        # Regression for a review finding: cosine similarity CAN be negative.
         # Multiplying a negative raw score directly by weight would let a
         # weight=0 "de-emphasized" hit (score=-0.8 -> -0.8*0=0) rank ABOVE a
         # normal weight=1 hit with a less-negative raw score (score=-0.1 ->
         # -0.1*1=-0.1). Flooring at 0 makes both score exactly 0; the tie is
-        # broken by raw score (issue #272), so "normal" (-0.1) still ranks
+        # broken by raw score, so "normal" (-0.1) still ranks
         # above "stale-deemphasized" (-0.8).
         client = MagicMock()
         client.collection_exists.return_value = True
@@ -599,7 +599,7 @@ class RecallPointsWeightRerankingTest(_PatchRetryMixin, unittest.TestCase):
         self.assertEqual([r["id"] for r in results], ["normal", "stale"])
 
     def test_weight_zero_is_last_even_against_negative_similarity_tie(self):
-        # PR #359 review: both score effective 0; raw-score tie-break alone
+        # Both score effective 0; raw-score tie-break alone
         # would put the weight=0 hit (raw 0.95) above the default hit (-0.1).
         client = MagicMock()
         client.collection_exists.return_value = True
@@ -613,7 +613,7 @@ class RecallPointsWeightRerankingTest(_PatchRetryMixin, unittest.TestCase):
         self.assertEqual([r["id"] for r in results], ["neg-default", "stale"])
 
     def test_default_weight_hits_keep_plain_similarity_order_including_negatives(self):
-        # Constraint from #272: default-weight ordering must not shift. All
+        # Constraint: default-weight ordering must not shift. All
         # negative scores floor to effective 0, so the raw-score tie-break
         # has to preserve their relative order.
         client = MagicMock()
@@ -629,7 +629,7 @@ class RecallPointsWeightRerankingTest(_PatchRetryMixin, unittest.TestCase):
         self.assertEqual([r["id"] for r in results], ["pos", "neg-high", "neg-low"])
 
     def test_high_weight_low_similarity_does_not_beat_high_similarity_default(self):
-        # Issue #272 regression: under the old (raw+1)/2 rescale,
+        # Under the old (raw+1)/2 rescale,
         # weight=2.0/raw=0.1 scored 2.0*0.55=1.1 and beat weight=1.0/raw=0.9
         # (0.95). Now it is 0.2 vs 0.9.
         client = MagicMock()
@@ -715,7 +715,7 @@ class CountMemoryBankPointsTest(_PatchRetryMixin, unittest.TestCase):
         self.assertEqual({c.key for c in must}, {mb.SOURCE_FIELD, mb.REPO_FIELD})
 
     def test_excludes_pending_points(self):
-        # Regression for PR #178 review (seventh pass): wipe_memory_bank's
+        # Regression for a review finding (seventh pass): wipe_memory_bank's
         # dry-run (confirm=False) calls this function, while its confirmed
         # path uses _own_repo_filter -- which already excludes pending. Without
         # this exclusion here too, the dry-run count and the immediately
@@ -819,7 +819,7 @@ class WipeMemoryBankTest(_PatchRetryMixin, unittest.TestCase):
         client.scroll.assert_not_called()
 
     def test_confirmed_deletes_exact_snapshotted_ids_scoped_to_own_repo(self):
-        # Regression for PR #178 review: the confirmed path now snapshots
+        # Regression for a review finding: the confirmed path now snapshots
         # exact point ids via scroll() and deletes precisely those, rather
         # than counting once and then deleting by a live filter (a separate,
         # later request that could pick up a point inserted in between).
@@ -869,7 +869,7 @@ class WipeMemoryBankTest(_PatchRetryMixin, unittest.TestCase):
         client.scroll.assert_not_called()
 
     def test_confirmed_scroll_filter_includes_created_at_cutoff(self):
-        # Regression for PR #178 review (second wipe-related pass): scroll()
+        # Regression for a review finding (second wipe-related pass): scroll()
         # has no cross-page snapshot guarantee, and point ids are random
         # UUIDs (not insertion-ordered), so a remember() landing mid-scroll
         # of a large (>1 page) wipe could otherwise sort into a not-yet-
@@ -899,7 +899,7 @@ class WipeMemoryBankTest(_PatchRetryMixin, unittest.TestCase):
         self.assertEqual(empty_conditions[0].is_empty.key, mb.CREATED_AT_FIELD)
 
     def test_confirmed_scroll_filter_excludes_pending_points(self):
-        # Regression for PR #178 review (sixth pass): the created_at cutoff
+        # Regression for a review finding (sixth pass): the created_at cutoff
         # above closes the mid-scroll-pagination gap, but a point can still
         # be mid-write (upserted with pending=True, created_at not yet
         # stamped) when a wipe's cutoff is captured. Excluding pending==True
@@ -1008,7 +1008,7 @@ class TransferPointIdTest(unittest.TestCase):
 
 
 class TransferPointsTest(_PatchRetryMixin, unittest.TestCase):
-    """Issue #336: transfer_points' repo boundary, check-before-write dedup,
+    """transfer_points' repo boundary, check-before-write dedup,
     dry-run, and per-point error handling. remember_point is mocked -- its own
     write behavior is covered by RememberPointTest above."""
 
@@ -1187,7 +1187,7 @@ class TransferPointsTest(_PatchRetryMixin, unittest.TestCase):
         return resp
 
     def test_source_alias_of_target_is_refused(self):
-        # PR #422 review: Qdrant resolves an alias anywhere a collection name
+        # Qdrant resolves an alias anywhere a collection name
         # goes, so an alias of memory-bank must not pass the self-transfer guard.
         client = self._client([self._rec("own1", self.ME)])
         client.get_aliases.return_value = self._aliases({self.SOURCE: self.TARGET})
@@ -1212,7 +1212,7 @@ class TransferPointsTest(_PatchRetryMixin, unittest.TestCase):
         self.assertEqual(report["migrated"]["project"], 1)
 
     def test_all_operations_use_resolved_backing_collections(self):
-        # PR #422 review (second pass): after the alias check, every Qdrant
+        # After the alias check, every Qdrant
         # call must use the resolved backing names, so repointing an alias
         # mid-run can't redirect the scroll or the writes.
         client = self._client([self._rec("own1", self.ME)])
@@ -1230,7 +1230,7 @@ class TransferPointsTest(_PatchRetryMixin, unittest.TestCase):
         self.assertEqual(remember.call_args.kwargs["point_id"], mb.transfer_point_id(self.SOURCE, "own1"))
 
     def test_pending_point_in_target_is_rewritten_not_counted_present(self):
-        # PR #422 review (second pass): an id left pending=True by a run whose
+        # An id left pending=True by a run whose
         # set_payload failed must be finished on the next run, not counted as
         # already_present forever (pending points are hidden from recall).
         client = self._client([self._rec("own1", self.ME), self._rec("own2", self.ME)])

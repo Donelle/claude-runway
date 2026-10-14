@@ -185,13 +185,13 @@ async def qdrant_store(information: str, metadata: Optional[dict[str, Any]] = No
 
 def _normalize_project(project: str) -> str:
     """
-    Case-fold a project string (issue #37), so "MyProject" and "myproject"
+    Case-fold a project string, so "MyProject" and "myproject"
     derive the identical CANONICAL collection name via _sanitize_project
     (its only caller). casefold() (not .lower()) is used deliberately --
     it's the Unicode-aware form intended for caseless comparison (e.g. it
     correctly equates German "ß" with "ss", which .lower() does not).
 
-    IMPORTANT (round 2 of issue #37, flagged in PR review on #123 as a
+    IMPORTANT (flagged in review as a
     docstring/implementation mismatch that a prior version of this
     function's docs left in place): this is NOT called anywhere else in
     compact_store/compact_find, and cross-casing identity for a project
@@ -220,7 +220,7 @@ def _sanitize_project(project: str) -> str:
     project's history (see _collections_for_project, which can be a legacy-named
     one) and falls back to this canonical name only for a brand-new project.
 
-    Case-folds `project` FIRST (issue #37), before the hyphen substitution,
+    Case-folds `project` FIRST, before the hyphen substitution,
     so "MyProject" and "myproject" collapse onto the identical sanitized
     string. Without this, a casing drift between /my-compact and
     /my-resume (different terminal profile, a renamed directory recreated
@@ -242,7 +242,7 @@ def _collections_for_project(client: QdrantClient, project: str) -> list:
     Every existing '<COMPACT_COLLECTION>-*' collection that already holds
     THIS logical project's history, case-insensitively.
 
-    Round 2 of issue #37 (flagged in PR review on #123): an earlier
+    Flagged in review: an earlier
     version of this fix picked exactly ONE collection per call (a
     "legacy vs. canonical" choice), which still silently fragmented
     history across a genuine casing drift -- reproduced directly: a
@@ -267,7 +267,7 @@ def _collections_for_project(client: QdrantClient, project: str) -> list:
     4). Comparing against REAL stored values (rather than re-deriving a
     name algorithmically, as the round-1 fix did) is what lets this find
     a match under ANY historical casing, not just the one non-case-folded
-    algorithm this file used before issue #37 -- there could in principle
+    algorithm this file originally used -- there could in principle
     be more than two differently-cased collections for the same project
     by now.
 
@@ -283,7 +283,7 @@ def _collections_for_project(client: QdrantClient, project: str) -> list:
     not an oversight.
 
     Deliberately does NOT swallow errors the way _sibling_compact_collections
-    (a pure best-effort DISPLAY hint) does (flagged in PR review on #123):
+    (a pure best-effort DISPLAY hint) does (flagged in PR review):
     this function's result feeds an AUTHORITATIVE decision -- which
     collection compact_store writes into, and what compact_find reports
     existing at all -- so silently treating a failed get_collections()
@@ -339,7 +339,7 @@ def _collection_contains_project(client: QdrantClient, collection_name: str, tar
     identity purely from its MOST RECENT point (via
     _most_recent_sibling_entry) -- wrong for a genuinely shared collection
     where a DIFFERENT project's entry happens to carry a LATER date than
-    this project's own (flagged in PR review on #123, round 4): that
+    this project's own (flagged in PR review, round 4): that
     older, real history would be silently excluded from the match
     entirely, so compact_find would omit it and compact_store could
     create a second, fragmenting canonical collection alongside a shared
@@ -380,8 +380,8 @@ def _collection_project_values(client: QdrantClient, collection_name: str, targe
     matches, regardless of the exact casing each individual call passed).
 
     Used to build an EXACT, Qdrant-SIDE MatchAny filter for a non-canonical
-    collection in compact_find's semantic query path (issue #37 round 5,
-    flagged in PR review on #123): an earlier version instead over-fetched
+    collection in compact_find's semantic query path
+    (flagged in review): an earlier version instead over-fetched
     a larger, but still fundamentally CAPPED, number of results and
     filtered client-side afterward -- which the review correctly pointed
     out just moves the truncation-before-filter bug to a bigger threshold
@@ -427,7 +427,7 @@ _COMPACT_ID_NAMESPACE = uuid.uuid5(
 def _compact_point_id(project: str, label: str, date: str) -> str:
     """
     Deterministic Qdrant point id for a compact, derived from
-    project+label+date (issue #36).
+    project+label+date.
 
     compact_store used to assign every stored compact a fresh uuid.uuid4(),
     which is why a retried /my-compact call (an MCP transport hiccup, or a
@@ -524,7 +524,7 @@ async def compact_store(
     etc.) are replaced with hyphens to satisfy Qdrant naming rules, so two
     names differing only in punctuation/whitespace (e.g. "my.project" vs
     "my-project") map to the SAME collection; there is no hash suffix.
-    `project` is also case-folded before any of the above (issue #37), so
+    `project` is also case-folded before any of the above, so
     "MyProject" and "myproject" are treated as the SAME project for any
     BRAND-NEW project. If a collection already exists for this project
     under ANY casing (checked by reading a stored entry's own `project`
@@ -544,7 +544,7 @@ async def compact_store(
     first. When LM Studio is unavailable the summary is stored uncompressed and
     the reply says so; the compact is never lost to a compression failure.
 
-    `label` is optional (issue #72): when omitted or blank, the label is
+    `label` is optional: when omitted or blank, the label is
     derived server-side from the "## What we were working on" section of
     `information` (the first sentence, up to 80 chars) using the same
     section-splitting logic that already parses the compact template.  This
@@ -552,7 +552,7 @@ async def compact_store(
     extract the first sentence on its own.  Pass an explicit `label` to
     override the derived value (e.g. from a /my-compact argument).
 
-    Idempotent (issue #36): the stored point's id is deterministically
+    Idempotent: the stored point's id is deterministically
     derived from project+label+date (see _compact_point_id), not a random
     uuid4. A retried call with the same three values upserts onto the same
     id instead of inserting a second, indistinguishable point, so an
@@ -569,7 +569,7 @@ async def compact_store(
     if not _re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
         return f"Error: date must be ISO format YYYY-MM-DD (got {date!r}). compact_find sorts lexicographically, so non-ISO dates produce incorrect ordering."
 
-    # Derive a label server-side when the caller didn't supply one (issue #72).
+    # Derive a label server-side when the caller didn't supply one.
     # Uses the same split_sections logic that parse_compact already applies,
     # so this is deterministic and consistent across every calling model.
     if not label.strip():
@@ -592,8 +592,8 @@ async def compact_store(
         col = collection
     else:
         # Reuse whichever existing collection (under ANY casing) already
-        # holds this project's history, case-insensitively (issue #37
-        # round 2 -- see _collections_for_project's docstring for why a
+        # holds this project's history, case-insensitively
+        # (see _collections_for_project's docstring for why a
         # single legacy-vs-canonical choice wasn't enough: it could still
         # fragment history across a genuine casing drift). Prefer the
         # canonical (case-folded) collection if it's among the matches,
@@ -610,7 +610,7 @@ async def compact_store(
     # model) and embed_documents() are both CPU-bound gaps during which
     # Docker Desktop's vpnkit can reap an idle pooled connection, so the
     # very next Qdrant call can raise a ResponseHandlingException on a
-    # connection the client believes is still healthy. See issue #75/#76 /
+    # connection the client believes is still healthy. See
     # libs/qdrant_retry.py, and ingest_mcp_server.py's identical pattern.
     created_here = False
     if not call_with_retry(client.collection_exists, col):
@@ -637,7 +637,7 @@ async def compact_store(
             if not call_with_retry(client.collection_exists, col):
                 raise
     if not created_here:
-        # Issue #397: an existing collection created under a different model
+        # An existing collection created under a different model
         # would otherwise get a SECOND vector name added by the upsert below
         # (or fail opaquely), leaving the old points unsearchable by this
         # model. Fails open on an inconclusive check, like find_in_collection.
@@ -646,17 +646,17 @@ async def compact_store(
         )
         if mismatch:
             return mismatch
-    # Issue #397: mark the collection internal on EVERY write (idempotent), so
+    # Mark the collection internal on EVERY write (idempotent), so
     # find_in_collection/list_collections can tell it isn't a search target.
     # Done on every write rather than only at creation so a legacy collection
     # gets marked on its next /my-compact. Fails open: a failed mark must not
     # lose the user's compact.
     mark_compact_collection(client, col)
     [embedding] = await embedding_provider.embed_documents([information])
-    # Deterministic, not random (issue #36) -- see _compact_point_id's
+    # Deterministic, not random -- see _compact_point_id's
     # docstring for why this is what makes a retry an overwrite instead of
-    # a duplicate insert. Uses the raw `project` argument, same as before
-    # issue #37 -- point-id dedup only ever needs to matter within a
+    # a duplicate insert. Uses the raw `project` argument, same as it always has
+    # -- point-id dedup only ever needs to matter within a
     # single call's own retries, which always pass identical arguments,
     # so there's no cross-casing dedup need here the way there is for
     # collection/payload resolution above.
@@ -672,8 +672,8 @@ async def compact_store(
                 # QdrantClient.add() used to write -- compact_find's
                 # scroll-path fallback (.get("information", .get("document",
                 # ""))) still checks for it on entries stored before this fix.
-                # payload's "project" is the RAW argument (issue #37 round
-                # 2) -- nothing downstream expects it to be normalized:
+                # payload's "project" is the RAW argument
+                # -- nothing downstream expects it to be normalized:
                 # _collections_for_project reads this exact raw value back
                 # to decide whether a collection matches a project
                 # (case-insensitively), and compact_find's default
@@ -681,7 +681,7 @@ async def compact_store(
                 # case-insensitive PER-ENTRY filter against it. The exact
                 # literal value is also a human-readable record of what this
                 # specific call actually passed.
-                # metadata.source (issue #282) is what index_repo/sync_repo's
+                # metadata.source is what index_repo/sync_repo's
                 # delete filters exclude on (mb.memory_bank_exclusion_filter),
                 # so a reset pointed at a compact collection can't wipe these.
                 payload={
@@ -700,7 +700,7 @@ async def compact_store(
 def _sibling_compact_collections(client: QdrantClient, exclude: list) -> list:
     """
     List other '<COMPACT_COLLECTION>-*' collections besides everything in
-    `exclude` (issue #37's recovery path). Used when NOTHING was found for
+    `exclude` (the recovery path). Used when NOTHING was found for
     a given project under any casing -- either this project was genuinely
     never compacted, or the project name has drifted entirely (a renamed
     directory, a different worktree checkout) from whatever it was when
@@ -720,7 +720,7 @@ def _sibling_compact_collections(client: QdrantClient, exclude: list) -> list:
     turn out empty or unprobeable -- `compact_store` creates a collection
     before it has any points, so an empty sibling is a realistic state,
     and 3 empty siblings could hide a 4th with real saved compacts from
-    ever being considered (flagged in PR review on #123, round 6). The
+    ever being considered (flagged in PR review, round 6). The
     actual display cap belongs in _candidate_hint below, applied AFTER
     filtering, not here.
     """
@@ -757,7 +757,7 @@ def _most_recent_sibling_entry(client: QdrantClient, collection_name: str):
     100-point page, which is ID-ordered, not date-ordered, so a
     collection with more than 100 points could have its actual
     most-recently-dated entry sitting on a later page and never get
-    considered (flagged in PR review on #123, round 1). Returns None (not
+    considered (flagged in PR review, round 1). Returns None (not
     an exception) only for the genuinely different case of a collection
     that scrolled successfully but turned out to be empty -- that's a
     real, valid result, not a failure.
@@ -786,14 +786,14 @@ def _candidate_hint(client: QdrantClient, exclude: list) -> str:
     collection name already considered for this call (so it's never
     re-offered as if it were a NEW candidate) -- a list, since the
     default (non-explicit-collection) path can have considered more than
-    one collection (issue #37 round 2's aggregation; see
+    one collection (the casing-variant aggregation; see
     _collections_for_project). Returns "" when no sibling collections
     exist or none of them have any entries, so callers can just
     concatenate this onto their base message unconditionally.
 
     This function treats a failed _most_recent_sibling_entry probe as
-    "skip this candidate" rather than letting it propagate (issue #37
-    round 3, flagged in PR review on #123) -- deliberately: this function
+    "skip this candidate" rather than letting it propagate
+    (flagged in review) -- deliberately: this function
     is a pure best-effort DISPLAY hint layered on top of an
     already-decided result (compact_find has already determined nothing
     matched before this ever runs), so one bad sibling collection
@@ -817,7 +817,7 @@ def _candidate_hint(client: QdrantClient, exclude: list) -> str:
     3, NOT an arbitrary round number: Claude Code's built-in
     AskUserQuestion tool hard-caps every question at 2-4 options total
     (confirmed directly against the CLI's own bundled schema, not just
-    the reviewer's claim on PR #123 -- verified via `strings` against the
+    the reviewer's claim -- verified via `strings` against the
     installed `claude` binary, which contains the literal schema
     description "2-4 options" and "do not exceed them even if the user
     requests more"). my-resume/SKILL.md's "If no match is found" flow
@@ -876,7 +876,7 @@ async def compact_find(
     '/my-resume auth refactor'. limit caps results in both cases.
 
     Each entry's header also includes a short suffix of its own Qdrant
-    point id (issue #36). Going forward, compact_store derives that id
+    point id. Going forward, compact_store derives that id
     deterministically from project+label+date, so a retried call with the
     SAME three values now overwrites the existing point instead of
     inserting a second one -- there is nothing left to disambiguate for
@@ -890,16 +890,16 @@ async def compact_find(
     id suffix here is what lets that UI (or a human reading raw output)
     tell those specific pre-existing entries apart.
 
-    `project` is case-folded before deriving the canonical collection name
-    (issue #37), so "MyProject" and "myproject" always land on the same
+    `project` is case-folded before deriving the canonical collection name,
+    so "MyProject" and "myproject" always land on the same
     NEW-style collection for a brand-new project. For a project with
     EXISTING history, this AGGREGATES entries across every
     '<COMPACT_COLLECTION>-*' collection that case-insensitively matches
     `project` -- not just one -- so a casing drift between /my-compact and
     /my-resume, or even multiple different historical casings accumulated
     over time, still surfaces everything instead of silently showing only
-    whichever single collection happened to match (round 2 of issue #37,
-    flagged in PR review on #123: picking exactly one collection could
+    whichever single collection happened to match
+    (flagged in review: picking exactly one collection could
     still fragment history across a genuine casing drift). See
     _collections_for_project. For a project with NO existing history under
     any casing, both the collection-not-found path and the
@@ -927,8 +927,8 @@ async def compact_find(
         )
         # See compact_store's identical comment -- every direct
         # QdrantClient call here is wrapped in call_with_retry for the
-        # same CPU-bound-gap-then-dropped-connection reason (issue
-        # #75/#76 / libs/qdrant_retry.py).
+        # same CPU-bound-gap-then-dropped-connection reason (see
+        # libs/qdrant_retry.py).
         if not call_with_retry(client.collection_exists, collection):
             return (
                 f"No compacts collection found ('{collection}') for project '{project}'. "
@@ -941,8 +941,8 @@ async def compact_find(
         # project_filter here (each collection this returns is EXPECTED
         # to already be scoped to this one project) -- but see the
         # case-insensitive PER-ENTRY filter applied below, after fetching,
-        # which is the actual isolation guarantee for this path (issue
-        # #37, PR #123 review round 3). Every match _collections_for_project returns --
+        # which is the actual isolation guarantee for this path.
+        # Every match _collections_for_project returns --
         # INCLUDING the canonical one -- is only PROVEN project-exclusive
         # by inspecting stored data, not by any persisted metadata that
         # distinguishes a dedicated collection from a shared one someone
@@ -970,7 +970,7 @@ async def compact_find(
     if query:
         # Semantic search — preserve relevance order, do not date-sort.
         embedding_provider = FastEmbedProvider(COMPACT_EMBEDDING_MODEL)
-        # Issue #397: a collection stored under another model has no vector
+        # a collection stored under another model has no vector
         # of this name, so the query below would fail opaquely or silently
         # miss everything. Report it clearly instead (fails open).
         for col in col_list:
@@ -999,8 +999,8 @@ async def compact_find(
             # too, so nothing prevents another project's points from being
             # written under this exact canonical name; without a filter
             # here, those foreign points could rank ahead of the real ones
-            # and reproduce the same truncation-before-filter bug (issue
-            # #37, PR #123 review rounds 5-6). Every collection gets an EXACT MatchAny
+            # and reproduce the same truncation-before-filter bug.
+            # Every collection gets an EXACT MatchAny
             # filter built from its own actual stored project values
             # (there can be more than one casing variant within a single
             # collection -- see _collection_project_values), so Qdrant
@@ -1195,7 +1195,7 @@ async def compact_prune(
     # qdrant_client stubs type scroll() results as list[Record] (which is not
     # an importable public type in every version we support) -- use a plain
     # untyped list and suppress the two attribute accesses a type checker
-    # (mypy originally, Pyright since issue #297) would otherwise flag below,
+    # (mypy originally, Pyright) would otherwise flag below,
     # the same pattern call_with_retry's own callers use throughout this file.
     all_points: list = []  # list of (collection_name, Record)
     for col in col_list:
@@ -1221,7 +1221,7 @@ async def compact_prune(
         return f"No compacts found for project '{project}' — nothing to prune."
 
     # `# type: ignore[no-untyped-def]` (mypy's complaint about `p`'s missing
-    # parameter annotation) is gone as of issue #297 -- confirmed Pyright
+    # parameter annotation) is gone -- confirmed Pyright
     # doesn't flag this at all, so there's nothing left to suppress here.
     def _parse_date(p) -> Optional[_dt.date]:
         """Parse the payload date field; return None for unparseable values."""
@@ -1263,7 +1263,7 @@ async def compact_prune(
         # more than older_than_days days before today. The XOR check above
         # (`(keep_last_n is None) == (older_than_days is None)`) guarantees
         # older_than_days is not None here, but a type checker can't narrow
-        # through that separate boolean comparison (issue #297 -- same
+        # through that separate boolean comparison (the same
         # limitation the chars_limited/max_chars comment in
         # libs/local_compress_lib.py's compress() describes), hence the
         # explicit assert.
@@ -1323,7 +1323,7 @@ async def compact_prune(
     by_col: dict[str, list] = {}
     for col, p in to_delete:
         # `# type: ignore[attr-defined]` (mypy's complaint about `p.id`) is
-        # gone as of issue #297 -- confirmed Pyright doesn't flag this at all.
+        # gone -- confirmed Pyright doesn't flag this at all.
         by_col.setdefault(col, []).append(p.id)
 
     for col, ids in by_col.items():

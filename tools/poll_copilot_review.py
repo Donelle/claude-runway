@@ -3,7 +3,7 @@
 One bounded wait for Copilot's review of a specific commit (used by /my-gh-autowork's
 subagent prompt, Step 19). Prints `review:<id>` lines for new reviews, or `NOT_YET`.
 
-    python tools/poll_copilot_review.py --pr 123 --head-sha <40-char sha> \
+    python tools/poll_copilot_review.py --pr <PR> --head-sha <40-char sha> \
         --me <your login> [--seen review:1,review:2] [--iterations 12] [--interval 15]
 
 Exit 0 with ids or NOT_YET; exit 2 for a bad argument (e.g. a short SHA); exit 1 with

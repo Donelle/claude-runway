@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for libs/metrics_lib.py (issue #208) -- the shared, generic
+"""Tests for libs/metrics_lib.py -- the shared, generic
 cross-tool metrics store: a MetricsStore class over ONE SQLite table any
 domain can write append-only events into.
 
@@ -120,7 +120,7 @@ class RecordRoundTrip(MetricsStoreTestCase):
         self.assertEqual(self._all_rows(), [])
 
     def test_record_returns_true_on_success(self):
-        # PR #247 review: record() previously returned None unconditionally,
+        # record() previously returned None unconditionally,
         # making the record_metric MCP tool's "Error:" check unreachable for
         # DB write failures. Now returns True on success so callers can
         # distinguish success from the False returned on any failure path.
@@ -164,7 +164,7 @@ class EventTimestampOverride(MetricsStoreTestCase):
         self.assertEqual(self._all_rows(), [])
 
     def test_shape_valid_but_calendar_invalid_timestamp_is_rejected(self):
-        """PR #246 review (Copilot): a regex checking only `\\d{4}-\\d{2}-\\d{2}
+        """a regex checking only `\\d{4}-\\d{2}-\\d{2}
         T\\d{2}:\\d{2}:\\d{2}Z` shape would accept "2026-99-99T99:99:99Z"
         (no such month/day/hour/minute/second) and persist it, which later
         crashes trend()'s datetime.fromisoformat parsing. strptime performs
@@ -180,7 +180,7 @@ class EventTimestampOverride(MetricsStoreTestCase):
         self.assertEqual(self._all_rows(), [])
 
     def test_non_zero_padded_timestamp_is_rejected(self):
-        """PR #246 review, round 2 (Copilot): datetime.strptime alone is
+        """datetime.strptime alone is
         lenient about zero-padding and happily parses "2026-8-5T01:02:03Z",
         which datetime.fromisoformat (what trend() actually calls) then
         rejects -- confirmed by reproduction. A strict round-trip
@@ -206,7 +206,7 @@ class EventTimestampOverride(MetricsStoreTestCase):
 
 
 class NonFiniteValueRejection(MetricsStoreTestCase):
-    """Regression for PR #222 review: a non-finite value (inf/-inf/nan)
+    """Regression for a review finding: a non-finite value (inf/-inf/nan)
     must never be persisted -- one such row poisons SUM(value) for every
     future summary()/by_event_type()/trend() read of that metric_id, and
     format_summary_view's int(v) check raises OverflowError on it."""
@@ -287,7 +287,7 @@ class RecordFailsOpen(unittest.TestCase):
                 result = store.record("autowork", "ticket_merged")
             except Exception as e:  # pragma: no cover -- must not happen
                 self.fail(f"record() raised instead of failing open: {e}")
-            # PR #247 review: record() now returns False on failure so the
+            # record() now returns False on failure so the
             # record_metric MCP tool's "Error:" check can actually fire.
             self.assertFalse(result)
 
@@ -336,10 +336,10 @@ class ByEventType(MetricsStoreTestCase):
 
 
 class SessionIdFilter(MetricsStoreTestCase):
-    """Issue #248: summary()/by_event_type() gained an optional session_id
+    """summary()/by_event_type() gained an optional session_id
     param so a caller can narrow an aggregate down to one specific session's
-    rows (e.g. one my-gh-autowork attempt's own issue-<n>-<HHMMSS> marker,
-    issue #210) instead of the metric_id's entire history. trend() is
+    rows (e.g. one my-gh-autowork attempt's own issue-<n>-<HHMMSS> marker)
+    instead of the metric_id's entire history. trend() is
     explicitly out of scope per the issue -- not covered here."""
 
     def test_summary_narrows_to_matching_session_id(self):
@@ -397,7 +397,7 @@ class SessionIdFilter(MetricsStoreTestCase):
 
 
 class Detail(MetricsStoreTestCase):
-    """Issue #249: detail() is the raw, per-event counterpart to summary()/
+    """detail() is the raw, per-event counterpart to summary()/
     by_event_type()'s aggregates -- individual rows, most-recent first, with
     metadata deserialized back into a dict. Deliberately generic (no
     domain-specific field names), so these tests use plain/arbitrary
@@ -488,7 +488,7 @@ class Detail(MetricsStoreTestCase):
         self.assertEqual(self.store.detail("no-such-metric"), [])
 
     def test_same_second_ties_still_return_most_recently_inserted(self):
-        # Copilot review on PR #255: event_timestamp only has one-second
+        # Copilot review: event_timestamp only has one-second
         # resolution, so many events genuinely can tie (e.g. an autowork
         # run's own log line). Ordering by event_timestamp alone doesn't
         # guarantee newest-first among ties -- reproduced live before the
@@ -501,7 +501,7 @@ class Detail(MetricsStoreTestCase):
         self.assertEqual(returned, [f"row-{i}" for i in range(14, 2, -1)])
 
     def test_negative_limit_raises_rather_than_returning_unbounded_history(self):
-        # Copilot review on PR #255: detail() is public library API, not
+        # Copilot review: detail() is public library API, not
         # gated solely behind get_metrics's own n-must-be-positive check.
         # SQLite treats a negative LIMIT as "no limit" -- confirmed live
         # before this validation existed: limit=-1 against 50 inserted rows
@@ -516,7 +516,7 @@ class Detail(MetricsStoreTestCase):
             self.store.detail("autowork", limit=0)
 
     def test_non_finite_nested_metadata_value_degrades_to_none(self):
-        # Copilot review on PR #255: record()'s own math.isfinite() guard
+        # Copilot review: record()'s own math.isfinite() guard
         # only covers the top-level `value` param, not numbers nested inside
         # `metadata` -- a non-finite float there round-trips through
         # json.loads()/json.dumps() unchanged (both lenient about NaN/
@@ -538,7 +538,7 @@ class Detail(MetricsStoreTestCase):
         self.assertEqual(rows[0]["metadata"], {"wall_clock_s": 12.5, "rounds": 5})
 
     def test_non_dict_json_metadata_degrades_to_none(self):
-        # Copilot review on PR #255: json.loads() succeeding only proves the
+        # Copilot review: json.loads() succeeding only proves the
         # stored text is valid JSON, not that it decodes to an object -- a
         # list or scalar is equally valid JSON. Reproduced live: a stored
         # list metadata value crashed format_detail_view() (which calls
@@ -677,7 +677,7 @@ class _NoFetchAllConnection:
 
 
 class TrendDoesNotMaterializeFullHistory(MetricsStoreTestCase):
-    """Regression for PR #222 review: trend() must not call fetchall() up
+    """Regression for a review finding: trend() must not call fetchall() up
     front -- that would load the metric_id's ENTIRE history into memory
     before the bucket-limiting loop even runs, scaling with total row count
     rather than with n. It must iterate the cursor directly instead, so
@@ -742,7 +742,7 @@ class FormattingHelpers(unittest.TestCase):
         self.assertIn("No events recorded yet", text)
 
     def test_format_summary_view_empty_with_session_id_names_the_session(self):
-        """Copilot review on PR #250 (round 4): an empty session_id-filtered
+        """Copilot review (round 4): an empty session_id-filtered
         result must not claim the metric_id itself has no events -- that's
         false when other sessions have data. The message must identify the
         specific session_id that came back empty instead."""

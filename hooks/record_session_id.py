@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Keeps `libs/session_id_lib.py`'s Type-2 (SHADOW_FILE) shadow marker fresh
-(issue #198) -- the one hook whose entire job is making SHADOW_FILE an
+-- the one hook whose entire job is making SHADOW_FILE an
 actually-populated, permanent strategy, rather than inert scanning logic
 pointed at a directory nothing writes to. Before this hook existed, the
 sessions directory was only ever populated as a side effect of the opt-in
@@ -18,14 +18,14 @@ this SAME script:
     resume, clear, compact, fork): writes this session's own marker ONCE,
     then -- rate-limited via a sentinel file, roughly once per hour --
     sweeps any marker older than `CLAUDE_RUNWAY_SESSION_MARKER_TTL_HOURS`
-    (default 168h / 1 week -- issue #233). Writing self BEFORE sweeping
+    (default 168h / 1 week). Writing self BEFORE sweeping
     guarantees a live session can never observe its own marker as stale
     and prune itself. Firing on
     ALL start types ensures correctness across the full session lifecycle:
     `startup`/`fork` create a new marker for a brand-new session_id;
     `resume`/`clear`/`compact` refresh the mtime for an already-known one.
-    SessionStart replaced the prior PostToolUse `.*` registration
-    (issue #231): the old design paid ~400ms Python subprocess startup
+    SessionStart replaced the prior PostToolUse `.*` registration:
+    the old design paid ~400ms Python subprocess startup
     overhead on Windows for EVERY tool call; the new one pays it exactly
     once per session lifecycle event regardless of session length.
     Existing projects with the old `.*` PostToolUse block still work --
@@ -104,7 +104,7 @@ def _handle_session_start(payload: dict) -> None:
 
 def _handle_post_tool_use(payload: dict) -> None:
     # Kept for backward compatibility: existing projects configured before
-    # issue #231 landed still have a PostToolUse '.*' registration that
+    # the SessionStart registration existed still have a PostToolUse '.*' registration that
     # fires this handler on every tool call.  It is functionally correct
     # (writing/refreshing the marker is idempotent) but adds unnecessary
     # latency on Windows (~400ms Python startup per tool call).  New setups
@@ -146,8 +146,8 @@ def main() -> None:
     # UTF-8, but Windows Python defaults stdin to the locale codepage
     # (cp1252), under which a cp1252-unmappable byte raises UnicodeDecodeError
     # -- a ValueError the guard below swallows into a silent fail-open, which
-    # would skip this session's shadow-marker write for exactly those payloads
-    # (issue #263). Guarded because a non-reconfigurable stream (e.g.
+    # would skip this session's shadow-marker write for exactly those payloads.
+    # Guarded because a non-reconfigurable stream (e.g.
     # io.StringIO in the unit tests) has no reconfigure(); fail open rather
     # than crash.
     _reconfigure = getattr(sys.stdin, "reconfigure", None)
@@ -164,7 +164,7 @@ def main() -> None:
     try:
         _dispatch(payload)
     except Exception:
-        # Unconditional fail-open (issue #198, same philosophy as
+        # Unconditional fail-open (same philosophy as
         # compress_output.py's top-level guard) -- this hook's job is a
         # pure side effect; a bug here must never surface as a broken tool
         # call or a broken session shutdown.

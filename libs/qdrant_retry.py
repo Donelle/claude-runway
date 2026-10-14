@@ -1,5 +1,5 @@
 """
-Retry helper for transient Qdrant connection drops (issue #75).
+Retry helper for transient Qdrant connection drops.
 
 Docker Desktop for Mac's userspace networking proxy (vpnkit) can silently
 close an idle pooled keep-alive HTTP connection to Qdrant during the
@@ -11,7 +11,7 @@ httpx.RemoteProtocolError ("Server disconnected without sending a
 response") or httpx.ConnectError on the next call that tries to reuse that
 dead connection.
 
-Confirmed via Qdrant's own container logs (see issue #75) that the failing
+Confirmed via Qdrant's own container logs that the failing
 request never reaches the container at all -- the connection is torn down
 between the client and the container, not by Qdrant. That makes retrying
 safe here: httpx evicts a connection from its pool once it fails, so a
@@ -114,7 +114,7 @@ def call_with_retry(fn, *args, **kwargs):
     # returns `fn(...)`'s result or raises (the last iteration always raises,
     # since `attempt == MAX_ATTEMPTS` is true on it). Without this, Pyright
     # infers an implicit `-> ... | None` return type from the "falls off the
-    # end of the loop" path it can't itself prove is dead code (issue #297),
+    # end of the loop" path it can't itself prove is dead code,
     # which then infects every caller that expects this to return `fn`'s
     # actual (non-Optional) return value.
     raise AssertionError("unreachable: call_with_retry's loop always returns or raises")

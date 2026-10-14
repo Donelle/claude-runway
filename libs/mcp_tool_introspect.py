@@ -8,23 +8,23 @@ tools are added over time.
 
 This exists because that exact drift already happened twice on this repo:
 
-- Issue #22 (BUG-02): `compress_mcp_server.py`'s `_log_fixed_overhead()`
+- `compress_mcp_server.py`'s `_log_fixed_overhead()`
   hardcoded a 5-tool tuple. `compact_store`/`compact_find`/
   `savings_summary`/`savings_detail` shipped later and were never added to
-  it -- the /my-savings "tool overhead" annotation (since removed, issue
-  #439) silently undercounted for months, with no error to notice.
-- Issue #23 (BUG-03): EVALUATION.md's Track A/B prose separately hardcoded
+  it -- the /my-savings "tool overhead" annotation (since removed)
+  silently undercounted for months, with no error to notice.
+- EVALUATION.md's Track A/B prose separately hardcoded
   "6 total" and "5 total" tool counts that drifted the same way.
 
-Issue #22's fix replaced compress_mcp_server.py's own hardcoded tuple with
+The fix replaced compress_mcp_server.py's own hardcoded tuple with
 an inline enumeration of `mcp._tool_manager.list_tools()`. This module
-extracts that same logic into one shared place (issue #52/GROW-05) so
+extracts that same logic into one shared place (GROW-05) so
 every caller that needs a live tool count -- `ingest_mcp_server.py`,
 `memory_bank_mcp_server.py`, `tools/report_tool_counts.py`, and
 EVALUATION.md's own "how to check this" prose -- goes through the identical
 code path and can't drift relative to each other. (`compress_mcp_server.py`
-was a caller until issue #439 removed its `_log_fixed_overhead()` schema-size
-estimate.)
+was a caller until its `_log_fixed_overhead()` schema-size
+estimate was removed.)
 
 Deliberately STDLIB-ONLY (no third-party imports, not even
 `local_compress_lib.py`) so importing this from

@@ -1,4 +1,4 @@
-"""Tests for libs/transcript_context_lib.py and tools/measure_startup_context.py (issue #439).
+"""Tests for libs/transcript_context_lib.py and tools/measure_startup_context.py.
 
 Stdlib-only, no network. The transcripts are small fixtures shaped like the real
 Claude Code format (the entry types and keys seen in real transcripts: an
@@ -89,15 +89,15 @@ class StartOfSessionTests(TranscriptFixture):
         self.assertEqual(T.start_of_session(p)["total"], 3)
 
     def test_undecodable_bytes_are_skipped_not_raised(self):
-        # A partially written / corrupt transcript must not abort a whole survey
-        # (PR #448 review): the bad bytes become an unparseable line and are skipped.
+        # A partially written / corrupt transcript must not abort a whole survey:
+        # the bad bytes become an unparseable line and are skipped.
         path = self.dir / "bad.jsonl"
         good = json.dumps(_assistant(inp=3)).encode("utf-8")
         path.write_bytes(b"\xff\xfe not utf-8\n" + good + b"\n")
         self.assertEqual(T.start_of_session(path)["total"], 3)
 
     def test_a_non_numeric_usage_counter_means_no_data_not_a_crash(self):
-        # Valid JSON, malformed counter (PR #448 review): the format is internal and
+        # Valid JSON, malformed counter: the format is internal and
         # may change, so this must read as "unavailable", never abort a survey.
         bad = {"type": "assistant", "message": {"model": "m", "usage": {"input_tokens": "lots"}}}
         self.assertIsNone(T.start_of_session(self.write([bad])))
@@ -106,7 +106,7 @@ class StartOfSessionTests(TranscriptFixture):
         self.assertIsNone(T.start_of_session(self.write([wrapped])))
 
     def test_a_missing_or_non_string_model_means_no_data_not_an_unknown_bucket(self):
-        # PR #448 review: an "unknown" bucket could mix models in compare(), and an
+        # An "unknown" bucket could mix models in compare(), and an
         # unhashable model value would crash it.
         for model in (None, "", ["x"], {"a": 1}, 7):
             bad = {"type": "assistant", "message": {"model": model, "usage": {"input_tokens": 3}}}
@@ -174,7 +174,7 @@ class LoadedSchemaTests(TranscriptFixture):
         self.assertLess(sizes["mcp__qdrant__qdrant-find"], 1000)
 
     def test_a_malformed_entries_container_is_skipped_not_raised(self):
-        # PR #448 review: valid JSON whose `entries` is not a list must not abort a survey.
+        # Valid JSON whose `entries` is not a list must not abort a survey.
         for bad in ("oops", 7, {"name": "mcp__qdrant__qdrant-find"}, True):
             p = self.write([{"type": "attachment", "attachment": {"type": "deferred_tools_record", "entries": bad}},
                             _record({"mcp__qdrant__qdrant-find": "d"})])
@@ -262,7 +262,7 @@ class CliTests(TranscriptFixture):
         self.assertIn("same model", out)
 
     def test_a_without_transcript_that_lists_toolkit_tools_is_rejected_with_no_number(self):
-        # PR #448 review: the controlled figure must not be printed from a session
+        # The controlled figure must not be printed from a session
         # whose own transcript shows the toolkit was connected.
         w = self.write([_delta(added=["mcp__qdrant__qdrant-find"]), _assistant(read=2000)])
         bad = self.write([_delta(added=["mcp__memory-bank__recall"]), _assistant(read=1500)])
@@ -274,7 +274,7 @@ class CliTests(TranscriptFixture):
         self.assertIn("names toolkit tools as deferred", err.getvalue())
 
     def test_a_without_transcript_that_called_a_toolkit_tool_is_rejected_too(self):
-        # PR #448 review: a call proves the toolkit was connected, even with no
+        # a call proves the toolkit was connected, even with no
         # first-turn deferred listing (up front, or connected later: neither is "removed").
         w = self.write([_delta(added=["mcp__qdrant__qdrant-find"]), _assistant(read=2000)])
         bad = self.write([_delta(added=["WebFetch"]),
@@ -309,7 +309,7 @@ class CliTests(TranscriptFixture):
         self.assertIn("OBSERVATIONAL", out)
         self.assertIn("+1,000 tokens", out)
         self.assertIn("1 of 3 session(s) that parsed recorded", out)
-        # Per-server completeness, not just "at least one tool" (PR #448 review).
+        # Per-server completeness, not just "at least one tool".
         self.assertRegex(out, r"qdrant: 1")
         self.assertRegex(out, r"memory-bank: 0")
         self.assertRegex(out, r"all 4 servers: 0")
@@ -345,7 +345,7 @@ class CliTests(TranscriptFixture):
 
     def test_survey_counts_schema_loads_from_sessions_outside_the_listed_group(self):
         # A deferred_tools_record is direct evidence of a load, so it counts even in a
-        # session the survey could not classify (PR #448 review).
+        # session the survey could not classify.
         proj = self.dir / "proj"
         proj.mkdir()
         (proj / "late.jsonl").write_text("\n".join(json.dumps(e) for e in [

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Tests for the search_limit recompute wired into sync_repo/index_repo
-(issue #331, part of #326). Stdlib-only, no network: QdrantClient, the cache
+"""Tests for the search_limit recompute wired into sync_repo/index_repo.
+Stdlib-only, no network: QdrantClient, the cache
 and the embed/store pipeline are all mocked.
 
     .venv/bin/python -m unittest discover -s tests

@@ -39,14 +39,14 @@ completely unusable until it's started again, which is a much worse outcome
 than the PostToolUse hook's failure mode (which just leaves already-fetched
 output uncompressed). "Isn't reachable" also covers "is reachable but no
 model could actually be resolved" (zero or 2+ models loaded, nothing
-pinned) -- see _lmstudio_reachable's docstring (issue #29): denying WebFetch
+pinned) -- see _lmstudio_reachable's docstring: denying WebFetch
 and then having fetch_url fail too for that reason breaks this exact same
 design goal just as badly as LM Studio being fully down.
 
 KNOWN LIMITATION (now addressed): this can't tell in advance whether a URL
 needs auth, JavaScript rendering, or session/cookie handling -- cases where
 fetch_url's plain unauthenticated GET will fail and WebFetch is actually
-required. The fix (issue #64): a small on-disk SQLite cache records each
+required. The fix: a small on-disk SQLite cache records each
 URL the hook denies, with a timestamp. When the hook sees that same URL
 again within the TTL (default: 1 hour, set by
 CLAUDE_RUNWAY_WEBFETCH_FAILED_URL_TTL in seconds), it allows WebFetch
@@ -318,7 +318,7 @@ def _lmstudio_reachable(base_url) -> bool:
     to) would actually succeed. Denying WebFetch and then having fetch_url
     fail too -- zero or 2+ models loaded, with nothing pinned -- defeats
     this hook's "a stopped local model never makes WebFetch unusable" design
-    goal exactly as badly as denying while LM Studio is fully down (issue #29).
+    goal exactly as badly as denying while LM Studio is fully down.
 
     Mirrors resolve_model's own decision order rather than calling it
     directly or duplicating its logic wholesale:
@@ -334,7 +334,7 @@ def _lmstudio_reachable(base_url) -> bool:
       2. An unmigrated old-named env var (stale_env_warning) means
          resolve_model would refuse with a hard error -- checked BEFORE the
          pinned-model check below, mirroring resolve_model's own order
-         (issue #41 moved resolve_model's stale check to run unconditionally
+         (resolve_model's stale check now runs unconditionally
          ahead of its explicit_model/DEFAULT_MODEL short-circuits; this hook
          must match that order or a pinned model with any other stale var
          set would report "reachable" here while fetch_url's own
@@ -352,7 +352,7 @@ def _lmstudio_reachable(base_url) -> bool:
     resolve_model's real behavior, and reuse the SAME fetch_loaded_models
     call already made for step 1 -- no second network round-trip.
 
-    Step 4 uses local_compress_lib.fetch_loaded_models (issue #296) instead
+    Step 4 uses local_compress_lib.fetch_loaded_models instead
     of a raw .models.list() count -- the OpenAI-compatible /v1/models
     endpoint lists every DOWNLOADED model regardless of whether it's
     actually loaded (LM Studio's default is JIT loading), so a bare
@@ -432,8 +432,8 @@ def main():
     # UTF-8, but Windows Python defaults stdin to the locale codepage
     # (cp1252), under which a cp1252-unmappable byte raises UnicodeDecodeError
     # -- a ValueError the guard below swallows into a silent fail-open, so the
-    # WebFetch redirect would stop firing for exactly those payloads (issue
-    # #263). Guarded because a non-reconfigurable stream (e.g. io.StringIO in
+    # WebFetch redirect would stop firing for exactly those payloads.
+    # Guarded because a non-reconfigurable stream (e.g. io.StringIO in
     # the unit tests) has no reconfigure(); fail open rather than crash.
     _reconfigure = getattr(sys.stdin, "reconfigure", None)
     if _reconfigure is not None:

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Tests for pyproject.toml/setup.py (issues #50, #206) -- pins the 3
+"""Tests for pyproject.toml/setup.py -- pins the 3
 console-script entry points the issue actually names (ingest_to_qdrant.py,
 setup_project.py, doctor.py), confirms the `claude_runway` shim package
 they now route through is declared and present, and builds a REAL wheel to
 confirm libs/tools/hooks/templates/skills land under
-<wheel>.data/data/src/{libs,tools,hooks,templates,skills} -- issue #206's
+<wheel>.data/data/src/{libs,tools,hooks,templates,skills} -- the
 whole point, replacing the old top-level `[tool.setuptools] packages`
 layout that put these five directly in site-packages.
 
@@ -15,7 +15,7 @@ way the old version of this file did; the wheel-content tests below
 actually build a wheel and inspect it, which is the only thing that can
 catch setup.py itself regressing (e.g. back to a single shared "src/skills"
 target, which silently drops every skill but one -- confirmed live during
-this issue's own development, see setup.py's docstring).
+development, see setup.py's docstring).
 
 Stdlib-only for the TOML-parsing tests (tomllib, Python 3.11+) -- skips
 itself on an older interpreter rather than adding a new third-party
@@ -59,18 +59,18 @@ class PyprojectTomlIsWellFormed(unittest.TestCase):
             self.data = tomllib.load(f)
 
     def test_declares_the_three_named_console_scripts_via_the_shim(self):
-        # Issue #206: these no longer point straight at tools.*:main --
+        # These no longer point straight at tools.*:main --
         # tools/ isn't an importable site-packages package anymore (it
         # ships as wheel data under <env>/src/tools instead), so each
         # entry point routes through the claude_runway shim, which loads the
-        # real <env>/src/tools/*.py by file path (issue #290) and calls its main().
+        # real <env>/src/tools/*.py by file path and calls its main().
         scripts = self.data["project"]["scripts"]
         self.assertEqual(scripts.get("claude-runway-ingest"), "claude_runway:ingest_main")
         self.assertEqual(scripts.get("claude-runway-setup"), "claude_runway:setup_main")
         self.assertEqual(scripts.get("claude-runway-doctor"), "claude_runway:doctor_main")
 
     def test_version_is_derived_from_the_repo_not_hardcoded(self):
-        # Issue #348: a hand-edited `version = "0.1.0"` made all 200+ commits
+        # a hand-edited `version = "0.1.0"` made all 200+ commits
         # build as the identical version. Pin that it's dynamic, that
         # setuptools-scm is what supplies it, and that a no-VCS-metadata
         # build still gets a (clearly-labelled) fallback instead of failing.
@@ -81,10 +81,10 @@ class PyprojectTomlIsWellFormed(unittest.TestCase):
         self.assertIn("fallback_version", self.data["tool"]["setuptools_scm"])
 
     def test_claude_runway_shim_is_the_only_declared_package(self):
-        # Issue #206: libs/tools/templates/hooks/skills moved OUT of
+        # libs/tools/templates/hooks/skills moved OUT of
         # `[tool.setuptools] packages` (previously all five, plus this one
         # implicitly via site-packages, were top-level packages -- the
-        # generic-namespace layout this issue replaces). claude_runway is
+        # generic-namespace layout this one replaces). claude_runway is
         # the one real, importable site-packages package left -- it exists
         # purely to bridge [project.scripts] to the data-files layout (see
         # claude_runway/__init__.py's own docstring).
@@ -94,7 +94,7 @@ class PyprojectTomlIsWellFormed(unittest.TestCase):
     def test_no_stale_package_data_section(self):
         # templates/*.template and skills/*/SKILL.md used to need
         # `[tool.setuptools.package-data]` globs because they were bundled
-        # INSIDE a declared package. Issue #206 ships them as data_files
+        # INSIDE a declared package. They now ship as data_files
         # instead (see setup.py) -- package-data has nothing left to do and
         # its presence would be a stale, confusing leftover of the old
         # layout, so pin its absence rather than silently letting it
@@ -121,7 +121,7 @@ class PyprojectTomlIsWellFormed(unittest.TestCase):
             self.assertNotIn(banned, requirements)
 
     def test_local_compress_dependencies_are_base_not_optional(self):
-        # PR #136 review (Copilot): claude-runway-setup's OWN default
+        # claude-runway-setup's OWN default
         # behavior (no --qdrant-only) generates a .mcp.json that enables
         # tools/compress_mcp_server.py and its hooks, pointed at this same
         # install's interpreter -- confirmed live that leaving
@@ -137,7 +137,7 @@ class PyprojectTomlIsWellFormed(unittest.TestCase):
         self.assertNotIn("compress", self.data["project"].get("optional-dependencies", {}))
 
     def test_pathspec_is_base_not_optional(self):
-        # PR #136 review (Copilot), second round: same class of finding as
+        # Review (Copilot), second round: same class of finding as
         # the compress trio above, but security-relevant rather than just a
         # startup crash. libs/qdrant_ingest_lib.py's respect_gitignore=True
         # default silently falls back to "don't filter at all" (no error) if
@@ -177,11 +177,11 @@ def _build_wheel() -> Optional[str]:
     "build/wheel not installed -- run `uv pip install -r requirements-dev.txt` to enable this test",
 )
 class BuiltWheelHasExpectedDataLayout(unittest.TestCase):
-    """Issue #206's core acceptance criterion: a real built wheel must ship
+    """The core acceptance criterion: a real built wheel must ship
     libs/tools/hooks/templates/skills as DATA files landing under
     <env>/src/{libs,tools,hooks,templates,skills} at install time (wheel
     spec: the "data" category installs relative to sys.prefix) -- not as
-    site-packages packages. Confirmed live (issue #206's own research) that
+    site-packages packages. Confirmed live that
     this "data" category's install-to-sys.prefix rule is a wheel-spec
     guarantee, not OS-specific, so inspecting the wheel's own RECORD/namelist
     here is a legitimate stand-in for actually installing it on each of
@@ -207,12 +207,12 @@ class BuiltWheelHasExpectedDataLayout(unittest.TestCase):
         return [n for n in self.names if ".data/data/src/" in n]
 
     def test_wheel_version_is_derived_not_the_old_hardcoded_0_1_0(self):
-        # Issue #348: the wheel's own filename/metadata carries the
+        # The wheel's own filename/metadata carries the
         # setuptools-scm version. In a checkout it must be the git-derived
         # one; only a build with no VCS metadata may use the fallback.
         version = os.path.basename(self.whl_path).split("-")[1]
         self.assertNotEqual(version, "0.1.0")
-        # Copilot review (PR #372): installs previously reported 0.1.0, and
+        # Copilot review: installs previously reported 0.1.0, and
         # PEP 440 sorts `0.0.1.devN`/`0.1.devN` BELOW that -- version-based
         # upgrade checks would treat the first SCM builds as older. The
         # `v0.1.0` baseline tag on main makes derived versions 0.1.1.devN.
@@ -253,7 +253,7 @@ class BuiltWheelHasExpectedDataLayout(unittest.TestCase):
                 )
 
     def test_memory_bank_files_are_present_in_the_built_wheel(self):
-        # Issue #182's guarantee (the memory-bank MCP server must ship the
+        # The guarantee (the memory-bank MCP server must ship the
         # same way ingest_mcp_server.py/compress_mcp_server.py do) still
         # holds under the new data_files layout -- confirm directly against
         # the real wheel rather than just the files existing on disk, which
@@ -271,7 +271,7 @@ class BuiltWheelHasExpectedDataLayout(unittest.TestCase):
                 )
 
     def test_every_skill_subdirectory_ships_distinctly_not_collapsed(self):
-        # Regression guard for the exact bug found during this issue's own
+        # Regression guard for the exact bug found during
         # development: a single shared "src/skills" data_files target
         # copies every matched SKILL.md into the SAME target directory by
         # basename alone, silently collapsing every skill but the

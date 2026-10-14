@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for libs/memory_events_lib.py (issue #179) -- the passive,
+"""Tests for libs/memory_events_lib.py -- the passive,
 append-only recall/remember usage log, deliberately kept as its own SQLite
 file separate from libs/savings_ledger.py's savings.db.
 
@@ -32,7 +32,7 @@ class ResolveDbPath(unittest.TestCase):
             self.assertEqual(ev.resolve_db_path(), expected)
 
     def test_default_is_a_different_file_than_savings_db_and_cache_db(self):
-        # The whole point of this module (issue #179's own explicit
+        # The whole point of this module (its explicit
         # rationale): never the same file as savings_ledger's or cache_db's,
         # so wiping one never touches the others.
         with mock.patch.dict(os.environ, {}, clear=False):
@@ -195,7 +195,7 @@ class RecordMemoryEventFailsOpen(unittest.TestCase):
 
 
 class ConnectionCleanupOnFailure(unittest.TestCase):
-    """Regression for PR #197 review: a failure AFTER sqlite3.connect()
+    """Regression for a review finding: a failure AFTER sqlite3.connect()
     succeeds (schema init, or the INSERT itself) must not leak the open
     connection -- neither `_connect()` nor `record_memory_event` can rely on
     a bare post-block `conn.close()` line, since an exception skips past it."""
@@ -247,7 +247,7 @@ class ConnectionCleanupOnFailure(unittest.TestCase):
 
 
 class RecordMemoryMetricTest(unittest.TestCase):
-    """Issue #211: record_memory_metric() writes a plain per-call-attempt
+    """record_memory_metric() writes a plain per-call-attempt
     tally into metrics.db via libs/metrics_lib.py's MetricsStore --
     deliberately separate from record_memory_event/memory-events.db above
     (that table stays entirely untouched by this function)."""
