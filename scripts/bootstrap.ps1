@@ -98,6 +98,20 @@ if (([string]($venvVersion | Select-Object -First 1)).Trim() -ne '3.12') {
     Stop-Bootstrap "The existing .venv uses Python $venvVersion instead of Python 3.12. Remove or rename '$venvPath' manually, then rerun this script."
 }
 
+# A .venv created by a previous run WITH uv has no pip, so re-running where uv
+# is no longer on PATH would fail at the first `python -m pip`. Seed pip into
+# it once instead (mirrors scripts/bootstrap.sh).
+if (-not $uvCommand) {
+    $null = & $venvPython -m pip --version 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host '> Seed pip into the existing .venv (it was created by uv, which is not on PATH now)'
+        & $venvPython -m ensurepip --upgrade
+        if ($LASTEXITCODE -ne 0) {
+            Stop-Bootstrap "The existing .venv has no pip and ensurepip failed. Install uv, or remove '$venvPath' and rerun this script."
+        }
+    }
+}
+
 if ($uvCommand) {
     Invoke-BootstrapCommand `
         -Description 'Install runtime requirements' `

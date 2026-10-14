@@ -20,7 +20,7 @@ SCRIPT = REPO_ROOT / "scripts" / "bootstrap.sh"
 class BootstrapShTests(unittest.TestCase):
     def test_exists_with_bash_shebang(self):
         self.assertTrue(SCRIPT.is_file())
-        self.assertEqual(SCRIPT.read_text().splitlines()[0], "#!/usr/bin/env bash")
+        self.assertEqual(SCRIPT.read_text(encoding="utf-8").splitlines()[0], "#!/usr/bin/env bash")
 
     def test_executable_bit_committed(self):
         if shutil.which("git") is None or not (REPO_ROOT / ".git").exists():
