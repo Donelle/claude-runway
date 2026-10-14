@@ -47,11 +47,11 @@ from typing import Callable, Optional
 # sys.path directly by callers, not treated as a real Python package).
 from setup_project_lib import (
     COMPRESS_HOOK_SCRIPT,
-    LEGACY_COMPACT_EMBEDDING_MODEL,
     LEGACY_COMPRESS_HOOK_SCRIPT,
     build_mcp_servers,
     build_settings_hooks,
     load_json,
+    resolve_compact_embedding_model,
 )
 
 
@@ -333,59 +333,134 @@ def _apply_record_session_id_hooks_missing(
 
 
 # ---------------------------------------------------------------------------
-# hf-hub-offline-missing (feature: #221)
+# qdrant-server-replaced (feature: own qdrant MCP server)
 # ---------------------------------------------------------------------------
+#
+# This migration replaces two earlier ones that no longer have anything to do:
+# `hf-hub-offline-missing` (the new server never needs HF_HUB_OFFLINE: the
+# embedding provider loads from the local cache without the network on its own)
+# and `local-compress-embedding-model-missing` (the compact embedding model now
+# lives in the `qdrant` block, and this migration carries it over, pinning the
+# legacy model exactly as that one did).
+
+_THIRD_PARTY_QDRANT_SCRIPT = "mcp-server-qdrant"
+_OWN_QDRANT_SCRIPT = "qdrant_mcp_server.py"
 
 
-def _detect_hf_hub_offline_missing(mcp_json: dict, settings_json: dict) -> bool:
-    return "HF_HUB_OFFLINE" not in mcp_json.get("mcpServers", {}).get("qdrant", {}).get("env", {})
-
-
-def _apply_hf_hub_offline_missing(mcp_json: dict, settings_json: dict, ctx: MigrationContext) -> "tuple[dict, dict]":
+def _launches_third_party_qdrant_server(block: object) -> bool:
     """
-    Adds `HF_HUB_OFFLINE: ""` (present-but-blank, matching the template's own
-    default) to the `qdrant` server's env block -- never unconditionally
-    `"1"` here, since that requires the warm-up confirmation `init` itself
-    performs (`run_setup`'s `attempt_fastembed_warmup`), which this migration
-    has no way to do without a live network/disk check of its own. Re-run
-    `init` afterward (see this migration's `note`) to have that confirmation
-    flip it to `"1"` once the cache is actually warm.
+    True when a `qdrant` server block still starts the third-party
+    `mcp-server-qdrant` console script -- as its `command` (what `init` wrote:
+    `<venv>/bin/mcp-server-qdrant`, `.exe` on Windows) or, for a hand-edited
+    launcher such as `uvx`/`pipx run`, as one of its `args`. Matched by
+    basename so it holds wherever the venv or tool environment lives.
     """
-    mcp_json = copy.deepcopy(mcp_json)
-    qdrant_env = mcp_json.setdefault("mcpServers", {}).setdefault("qdrant", {}).setdefault("env", {})
-    qdrant_env["HF_HUB_OFFLINE"] = ""
-    return mcp_json, settings_json
-
-
-# ---------------------------------------------------------------------------
-# local-compress-embedding-model-missing (feature: #397)
-# ---------------------------------------------------------------------------
-
-
-def _detect_compress_embedding_model_missing(mcp_json: dict, settings_json: dict) -> bool:
-    """True only when a `local-compress` server EXISTS and its env has no
-    non-blank EMBEDDING_MODEL. No local-compress block (a `--qdrant-only`
-    project) has nothing to fix."""
-    block = mcp_json.get("mcpServers", {}).get("local-compress")
-    if block is None:
+    if not isinstance(block, dict):
         return False
-    value = block.get("env", {}).get("EMBEDDING_MODEL")
-    return not (isinstance(value, str) and value.strip())
+    candidates = [block.get("command")] + list(block.get("args") or [])
+    for value in candidates:
+        if not isinstance(value, str):
+            continue
+        name = Path(value).name
+        if name.lower().endswith(".exe"):
+            name = name[: -len(".exe")]
+        if name == _THIRD_PARTY_QDRANT_SCRIPT:
+            return True
+    return False
 
 
-def _apply_compress_embedding_model_missing(
+def _detect_qdrant_server_replaced(mcp_json: dict, settings_json: dict) -> bool:
+    """False for a project with no `qdrant` block (nothing to rewrite) and for
+    one that already runs this repo's own server (nothing left to do), which is
+    what makes re-running `upgrade` a no-op."""
+    return _launches_third_party_qdrant_server(mcp_json.get("mcpServers", {}).get("qdrant"))
+
+
+def _env_str(env: object, key: str) -> str:
+    value = env.get(key) if isinstance(env, dict) else None
+    return value if isinstance(value, str) else ""
+
+
+# Pre-move servers that talk to Qdrant, in the order a missing value is looked
+# for. `init` wrote the same URL and key into all of them, but a hand-edited or
+# older config can have them in only one (the setup skill checks every one of
+# these blocks for the key for exactly that reason), and the compact tools now
+# reach Qdrant through the qdrant block alone.
+_QDRANT_USING_SERVERS = ("qdrant", "local-compress", "codebase-indexer", "memory-bank")
+
+
+def _first_qdrant_env_str(servers: dict, key: str) -> str:
+    """The first non-blank `key` found across the Qdrant-using pre-move blocks."""
+    for name in _QDRANT_USING_SERVERS:
+        block = servers.get(name)
+        value = _env_str(block.get("env") if isinstance(block, dict) else None, key)
+        if value.strip():
+            return value
+    return ""
+
+
+def _apply_qdrant_server_replaced(
     mcp_json: dict, settings_json: dict, ctx: MigrationContext
 ) -> "tuple[dict, dict]":
     """
-    Pins `EMBEDDING_MODEL` in the `local-compress` env to `BAAI/bge-small-en`
-    -- the model every existing install's compacts were actually stored with
-    (the server used to hardcode it) -- NEVER the new template default, which
-    would orphan that compact history (issue #397). Full model id, not the
-    short name. Only this one key is written.
+    Rewrites the `qdrant` block to start `tools/qdrant_mcp_server.py` under the
+    venv interpreter, with the env that server reads, reusing `build_mcp_servers`
+    (the SAME function `init` uses) so it cannot drift from a fresh `init`.
+    Only the `qdrant` KEY is taken from the result; every other server, and the
+    whole of `settings.json`, is left as it was.
+
+    What is carried over from the old config, so nothing a user set is reset:
+      - `QDRANT_URL`, `QDRANT_API_KEY`, `COLLECTION_NAME` and `EMBEDDING_MODEL`
+        from the old `qdrant` block (`COLLECTION_NAME`/`EMBEDDING_MODEL` fall
+        back to the `codebase-indexer` block's, which must agree with them;
+        the URL and key fall back through `local-compress`, `codebase-indexer`
+        and `memory-bank`, so a credential kept in only one of them survives);
+      - the conversation-compact settings from the `local-compress` block,
+        where the compact tools used to live: `COMPACT_COLLECTION`, the LM
+        Studio URL and model, and the compact embedding model. The model is
+        resolved by `resolve_compact_embedding_model`, so an install whose
+        compacts were stored before that setting existed is pinned to
+        `BAAI/bge-small-en`, never the new default, which would orphan them.
+        (The `local-compress` block itself is left alone: it keeps working, it
+        just no longer serves the compact tools, and `init` rewrites it.)
+
+    What is dropped, because the new server has no use for it: `HF_HUB_OFFLINE`,
+    `FASTEMBED_CACHE_PATH` (set in code now) and the `TOOL_FIND_DESCRIPTION`/
+    `TOOL_STORE_DESCRIPTION` texts (the descriptions live in the server).
     """
     mcp_json = copy.deepcopy(mcp_json)
-    env = mcp_json["mcpServers"]["local-compress"].setdefault("env", {})
-    env["EMBEDDING_MODEL"] = LEGACY_COMPACT_EMBEDDING_MODEL
+    servers = mcp_json.setdefault("mcpServers", {})
+    old_env = servers.get("qdrant", {}).get("env", {})
+    indexer_env = servers.get("codebase-indexer", {}).get("env", {})
+    compress_env = servers.get("local-compress", {}).get("env", {})
+    # The old qdrant block's own values win. A value missing from it is looked
+    # for in the other Qdrant-using blocks, so an authenticated install whose
+    # key lives only in local-compress (or the indexer) keeps it instead of
+    # having the moved compact tools write an empty one.
+    qdrant_url = _first_qdrant_env_str(servers, "QDRANT_URL") or "http://localhost:6333"
+    qdrant_api_key = _first_qdrant_env_str(servers, "QDRANT_API_KEY")
+
+    collection_name = _env_str(old_env, "COLLECTION_NAME") or _env_str(indexer_env, "COLLECTION_NAME") or "project"
+    embedding_model = _env_str(old_env, "EMBEDDING_MODEL") or _env_str(indexer_env, "EMBEDDING_MODEL")
+
+    template = load_json(Path(ctx.tools_repo_dir) / "templates" / "mcp.json.template")
+    template_model = template["mcpServers"]["qdrant"]["env"]["EMBEDDING_MODEL"]
+    generated = build_mcp_servers(
+        template,
+        collection_name=collection_name,
+        venv_python=ctx.venv_python,
+        tools_repo_dir=ctx.tools_repo_dir,
+        home_dir=Path.home(),
+        qdrant_url=qdrant_url,
+        qdrant_api_key=qdrant_api_key,
+        lmstudio_url=_env_str(compress_env, "CLAUDE_RUNWAY_LMSTUDIO_URL") or "http://localhost:1234/v1",
+        lmstudio_model=_env_str(compress_env, "CLAUDE_RUNWAY_LMSTUDIO_MODEL"),
+        compact_collection=_env_str(compress_env, "COMPACT_COLLECTION"),
+        embedding_model=embedding_model,
+        compact_embedding_model=resolve_compact_embedding_model(mcp_json, embedding_model or template_model),
+        include_compress=False,
+    )
+    servers["qdrant"] = generated["qdrant"]
     return mcp_json, settings_json
 
 
@@ -542,6 +617,131 @@ def _apply_compress_hook_renamed(mcp_json: dict, settings_json: dict, ctx: Migra
     return mcp_json, settings_json
 
 
+# ---------------------------------------------------------------------------
+# compress-hook-matcher-covers-compact-tools (follows qdrant-server-replaced)
+# ---------------------------------------------------------------------------
+
+# The alternative `templates/settings.json.template`'s compress-hook matcher
+# carries for the conversation-compact tools, now served by the `qdrant`
+# server. tests/test_upgrade_lib.py pins that the template contains exactly it.
+COMPACT_TOOLS_MATCHER = "mcp__qdrant__(?:compact_store|compact_find|compact_prune)$"
+_LOCAL_COMPRESS_MATCHER = "mcp__local-compress__.*"
+
+
+def _compress_hook_blocks_missing_compact_matcher(settings_json: dict) -> "list[dict]":
+    """
+    Blocks that run the compress hook (under its current or its legacy name)
+    with a matcher that lists the `local-compress` tools by the exact text
+    `init` writes but not the compact tools' new `mcp__qdrant__` alternative.
+    A matcher this toolkit did not write (no `mcp__local-compress__.*` in it)
+    is deliberately not matched: it is the user's own, and guessing where to
+    splice into it could break it.
+    """
+    found = []
+    for blocks in settings_json.get("hooks", {}).values():
+        for block in blocks:
+            matcher = block.get("matcher")
+            if not isinstance(matcher, str):
+                continue
+            runs_compress_hook = any(
+                _is_script_hook(h, COMPRESS_HOOK_SCRIPT) or _is_script_hook(h, LEGACY_COMPRESS_HOOK_SCRIPT)
+                for h in block.get("hooks", [])
+            )
+            if runs_compress_hook and _LOCAL_COMPRESS_MATCHER in matcher and COMPACT_TOOLS_MATCHER not in matcher:
+                found.append(block)
+    return found
+
+
+def _detect_compress_hook_matcher_missing_compact_tools(mcp_json: dict, settings_json: dict) -> bool:
+    return bool(_compress_hook_blocks_missing_compact_matcher(settings_json))
+
+
+def _apply_compress_hook_matcher_missing_compact_tools(
+    mcp_json: dict, settings_json: dict, ctx: MigrationContext
+) -> "tuple[dict, dict]":
+    """
+    Adds the compact tools' `mcp__qdrant__` alternative right after
+    `mcp__local-compress__.*` in each compress-hook matcher that lacks it. The
+    compact tools used to be `mcp__local-compress__` tools, so a matcher `init`
+    wrote before they moved stops reaching the hook for them after
+    `qdrant-server-replaced`, silently dropping their size-based compression
+    (and its savings events) until `init` is re-run. Touches nothing else: not
+    the hook's command or args, not any other alternative in the matcher, not
+    any other block or hook, and not a matcher the user wrote themselves.
+    """
+    settings_json = copy.deepcopy(settings_json)
+    for block in _compress_hook_blocks_missing_compact_matcher(settings_json):
+        block["matcher"] = block["matcher"].replace(
+            _LOCAL_COMPRESS_MATCHER, f"{_LOCAL_COMPRESS_MATCHER}|{COMPACT_TOOLS_MATCHER}", 1
+        )
+    return mcp_json, settings_json
+
+
+# ---------------------------------------------------------------------------
+# analytics-server-missing (follows the savings and metrics tools' move)
+# ---------------------------------------------------------------------------
+
+# The values `savings_ledger.tracking_enabled()` accepts, case-insensitive and
+# whitespace-trimmed. Duplicated rather than imported for the same reason
+# `doctor_lib` does: this module must not load the savings stack.
+_TRACK_SAVINGS_TRUTHY = frozenset({"1", "true", "yes"})
+
+
+def _local_compress_env(mcp_json: dict) -> dict:
+    servers = mcp_json.get("mcpServers")
+    block = servers.get("local-compress") if isinstance(servers, dict) else None
+    env = block.get("env") if isinstance(block, dict) else None
+    return env if isinstance(env, dict) else {}
+
+
+def _detect_analytics_server_missing(mcp_json: dict, settings_json: dict) -> bool:
+    """
+    True when this project's `local-compress` block has savings tracking on
+    (its `CLAUDE_RUNWAY_TRACK_SAVINGS` is a truthy string) but there is no
+    `analytics` block. That block now serves `savings_summary`/`savings_detail`/
+    `savings_trend`, `get_metrics` and `record_metric`, so `/my-savings` and
+    `/my-metrics` stop working after the tools leave `local-compress` until it
+    is added. A project with tracking off is deliberately not offered it: the
+    server is opt-in.
+    """
+    servers = mcp_json.get("mcpServers")
+    if isinstance(servers, dict) and "analytics" in servers:
+        return False
+    raw = _local_compress_env(mcp_json).get("CLAUDE_RUNWAY_TRACK_SAVINGS")
+    return isinstance(raw, str) and raw.strip().lower() in _TRACK_SAVINGS_TRUTHY
+
+
+def _apply_analytics_server_missing(
+    mcp_json: dict, settings_json: dict, ctx: MigrationContext
+) -> "tuple[dict, dict]":
+    """
+    Adds the `analytics` block, reusing `build_mcp_servers` (the SAME function
+    `init --track-savings` uses) so it cannot drift from a fresh `init`. Only
+    the `analytics` KEY is taken from the result; every other server, and the
+    whole of `settings.json`, is left as it was. A non-blank
+    `CLAUDE_RUNWAY_SAVINGS_DB` / `CLAUDE_RUNWAY_METRICS_DB` in the
+    `local-compress` block is carried over, so the server reads the same files
+    the tools read before they moved.
+    """
+    mcp_json = copy.deepcopy(mcp_json)
+    servers = mcp_json.setdefault("mcpServers", {})
+    compress_env = _local_compress_env(mcp_json)
+    template = load_json(Path(ctx.tools_repo_dir) / "templates" / "mcp.json.template")
+    generated = build_mcp_servers(
+        template,
+        collection_name="project",
+        venv_python=ctx.venv_python,
+        tools_repo_dir=ctx.tools_repo_dir,
+        home_dir=Path.home(),
+        track_savings=True,
+        savings_db=_env_str(compress_env, "CLAUDE_RUNWAY_SAVINGS_DB").strip(),
+        metrics_db=_env_str(compress_env, "CLAUDE_RUNWAY_METRICS_DB").strip(),
+        include_compress=True,
+    )
+    servers["analytics"] = generated["analytics"]
+    return mcp_json, settings_json
+
+
 # List order is both display and apply order when more than one migration is
 # pending; `detect` alone decides whether each one is shown at all. Order only
 # matters where one migration's guard depends on another:
@@ -599,37 +799,30 @@ MIGRATIONS: "list[Migration]" = [
         apply=_apply_record_session_id_hooks_missing,
     ),
     Migration(
-        id="hf-hub-offline-missing",
-        title="Add HF_HUB_OFFLINE to qdrant server env",
-        kind="add",
+        id="qdrant-server-replaced",
+        title="Run this repo's own qdrant MCP server instead of mcp-server-qdrant",
+        kind="update",
         description=(
-            "The qdrant MCP server contacts huggingface.co on every startup even with a fully cached model "
-            "-- this env var prevents that once the cache is confirmed populated (issue #221). Adds "
-            '"HF_HUB_OFFLINE": "" (blank) to .mcp.json qdrant.env.'
+            "The 'qdrant' server in .mcp.json still launches the third-party mcp-server-qdrant console "
+            "script. This repo now ships its own (tools/qdrant_mcp_server.py): same qdrant-find and "
+            "qdrant-store tools under the same names, plus the conversation-compact tools "
+            "(compact_store, compact_find, compact_prune) that /my-compact and /my-resume use, which "
+            "have moved there from local-compress. Rewrites the qdrant block to the new command and env, "
+            "keeping your Qdrant URL/key, collection and embedding model, and carrying over the compact "
+            "collection, LM Studio URL/model and compact embedding model from the local-compress block; "
+            "drops HF_HUB_OFFLINE, FASTEMBED_CACHE_PATH and the TOOL_*_DESCRIPTION entries, which the "
+            "new server no longer reads."
         ),
         note=(
-            "Re-run init to auto-set this to '1' once your fastembed cache is confirmed populated, or set it "
-            "manually if the model is already cached at FASTEMBED_CACHE_PATH."
+            "Restart Claude Code to load the new server. Your stored compacts stay readable: "
+            "COMPACT_EMBEDDING_MODEL is pinned to the model they were stored with (BAAI/bge-small-en for "
+            "installs that never set one). Do NOT change it once you have saved compacts. Re-run "
+            "`claude-runway-setup init` to also drop the compact settings the local-compress block no "
+            "longer uses; `/my-compact` and `/my-resume` copies installed under ~/.claude/skills/ are "
+            "refreshed by `upgrade` itself."
         ),
-        detect=_detect_hf_hub_offline_missing,
-        apply=_apply_hf_hub_offline_missing,
-    ),
-    Migration(
-        id="local-compress-embedding-model-missing",
-        title="Pin EMBEDDING_MODEL in local-compress server env",
-        kind="add",
-        description=(
-            "The local-compress server now reads EMBEDDING_MODEL (like the other MCP servers) to choose the "
-            "model conversation compacts are embedded with (issue #397); until now it was hardcoded. Adds "
-            '"EMBEDDING_MODEL": "BAAI/bge-small-en" to .mcp.json local-compress.env -- the model your '
-            "existing compacts were stored with, so none are orphaned."
-        ),
-        note=(
-            "Do NOT change this to another model once you have saved compacts: they are stored under a "
-            "model-named vector and would become unreadable. Set it in the .mcp.json env block, not a shell export."
-        ),
-        detect=_detect_compress_embedding_model_missing,
-        apply=_apply_compress_embedding_model_missing,
+        detect=_detect_qdrant_server_replaced,
+        apply=_apply_qdrant_server_replaced,
     ),
     Migration(
         id="record-session-id-sessionstart",
@@ -666,6 +859,42 @@ MIGRATIONS: "list[Migration]" = [
         detect=_detect_compress_hook_renamed,
         apply=_apply_compress_hook_renamed,
     ),
+    Migration(
+        id="compress-hook-matcher-covers-compact-tools",
+        title="Make the compress hook matcher cover the compact tools on the qdrant server",
+        kind="update",
+        description=(
+            "This project's .claude/settings.json compress hook matches the local-compress tools but not "
+            "mcp__qdrant__compact_store/compact_find/compact_prune, where the conversation-compact tools now "
+            "live, so their size-based compression stops after the qdrant server moves. Adds that "
+            "alternative to the matcher right after mcp__local-compress__.*; every other part of the matcher, "
+            "and every other hook, is left untouched. A matcher you wrote by hand (without "
+            "mcp__local-compress__.*) is never edited."
+        ),
+        note="",
+        detect=_detect_compress_hook_matcher_missing_compact_tools,
+        apply=_apply_compress_hook_matcher_missing_compact_tools,
+    ),
+    Migration(
+        id="analytics-server-missing",
+        title="Add the opt-in analytics MCP server to .mcp.json",
+        kind="add",
+        description=(
+            "This project tracks savings (CLAUDE_RUNWAY_TRACK_SAVINGS is on in its local-compress block), "
+            "but its .mcp.json has no 'analytics' server. The savings and metrics tools (savings_summary, "
+            "savings_detail, savings_trend, get_metrics, record_metric) have moved there from "
+            "local-compress, so /my-savings and /my-metrics stop working until it is added. Adds the "
+            "analytics block, carrying over any CLAUDE_RUNWAY_SAVINGS_DB / CLAUDE_RUNWAY_METRICS_DB "
+            "override from the local-compress block. Recording is unaffected either way: the "
+            "local-compress server and the hooks still write savings events without it."
+        ),
+        note=(
+            "Restart Claude Code to load the new server. A project that does not track savings is not "
+            "offered this; `init --track-savings` writes the block for a new setup."
+        ),
+        detect=_detect_analytics_server_missing,
+        apply=_apply_analytics_server_missing,
+    ),
 ]
 
 
@@ -701,9 +930,9 @@ def is_project_configured(target_repo: "Path | str") -> bool:
     missing `.mcp.json` is treated the same as one with no keys at all) and
     happily writes a BROKEN partial config: found in Copilot review on PR
     #227 and confirmed live, `upgrade <empty-dir> --auto-yes` wrote a
-    `qdrant` server block containing only `{"env": {"HF_HUB_OFFLINE": ""}}`
-    -- no `command`/`type` at all -- plus a default `memory-bank` block,
-    for a directory that had never been `init`'d.
+    `qdrant` server block with an `env` but no `command`/`type` at all --
+    plus a default `memory-bank` block, for a directory that had never been
+    `init`'d.
     """
     mcp_json_path = Path(target_repo) / ".mcp.json"
     if not mcp_json_path.exists():

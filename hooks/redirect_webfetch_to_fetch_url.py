@@ -57,8 +57,9 @@ denied again normally. The cache reuses the shared libs/cache_db.py store
 fails open -- WebFetch proceeds as if the cache were empty.
 
 Setup:
-    Dependencies (openai, via libs/local_compress_lib.py) come from
-    requirements.txt; run this script with that environment's Python.
+    Dependencies come from requirements.txt (this hook imports
+    libs/local_compress_lib.py, which needs only the standard library, so it
+    does not need `openai`); run this script with that environment's Python.
 
 Register in .claude/settings.json (see templates/settings.json.template; the
 `claude-runway-setup` tool writes this for you) -- point the args path at this

@@ -63,8 +63,8 @@ def check_embedding_model_mismatch(
     Covers three Qdrant vector-config cases:
     - None -- sparse-only collection with no dense-vector config at all; definitive
       incompatibility (not inconclusive), same as empty dict.
-    - Dict[str, VectorParams] -- named vectors (mcp-server-qdrant's own format,
-      using a "fast-<model-slug>" key produced by FastEmbedProvider.get_vector_name()).
+    - Dict[str, VectorParams] -- named vectors (the format libs/qdrant_connector.py writes, unchanged from what the third-party
+      qdrant server wrote, using a "fast-<model-slug>" key produced by FastEmbedProvider.get_vector_name()).
       Errors on missing name (including empty dict -- sparse-only) or wrong dimension.
     - VectorParams -- unnamed/default single vector (older or third-party ingestion).
       QdrantConnector.search always passes using=get_vector_name(), which Qdrant
@@ -134,7 +134,7 @@ def check_embedding_model_mismatch(
             # instead -- the only thing that still actually works.
             return (
                 f"Error: collection '{collection}' uses an unnamed/default vector "
-                f"format (not compatible with mcp-server-qdrant's named-vector search). "
+                f"format (not compatible with the named-vector search the Qdrant tools use). "
                 + (
                     recovery_hint
                     or f"Drop this collection directly in Qdrant and re-index it from scratch "

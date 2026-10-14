@@ -9,8 +9,8 @@ argparse Namespace):
     .venv/bin/python -m unittest discover -s tests
 
 Why _hook_env_reminders is tested (PR #113 review): --track-savings/--lmstudio-model/
---lmstudio-url/--savings-db only reach the local-compress MCP server's env
-block in the generated .mcp.json -- they do NOT reach the hook scripts
+--lmstudio-url/--savings-db only reach the MCP servers' env blocks
+in the generated .mcp.json (local-compress, and the qdrant block for the two LM Studio values) -- they do NOT reach the hook scripts
 written into .claude/settings.json, since Claude Code hook entries have no
 env field of their own and instead inherit the shell's environment
 unfiltered. The CLI previously reported these options as fully applied with
@@ -45,37 +45,6 @@ REPO_ROOT = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, str(REPO_ROOT / "libs"))
 sys.path.insert(0, str(REPO_ROOT / "tools"))
 
-import setup_project_lib  # noqa: E402
-
-_fastembed_warmup_patcher = None
-
-
-def setUpModule():
-    # Issue #221: cmd_init now passes attempt_fastembed_warmup=not
-    # args.dry_run into run_setup, which (when True) calls
-    # setup_project_lib.warm_fastembed_cache -- a REAL fastembed
-    # construction attempt, not something this file's own "no network"
-    # promise (see module docstring) can tolerate. Several tests below
-    # exercise cmd_init with dry_run=False; without this patch they'd
-    # depend on THIS machine's own dogfooded ~/.claude/claude-runway/
-    # fastembed-cache happening to already be warm, and would hang/fail on
-    # a genuinely cold cache with no network (e.g. a fresh CI runner).
-    # Patched once at module scope (not per-TestCase) since
-    # `setup_project_lib` is a real, singleton, sys.modules-cached module --
-    # every `_load_setup_project()` call below re-execs a FRESH copy of
-    # tools/setup_project.py, but its own `from setup_project_lib import
-    # run_setup` reuses that same cached module, so `run_setup`'s internal
-    # free-variable lookup of `warm_fastembed_cache` always resolves through
-    # this one patched attribute regardless of which copy is under test.
-    global _fastembed_warmup_patcher
-    _fastembed_warmup_patcher = mock.patch.object(setup_project_lib, "warm_fastembed_cache", return_value=False)
-    _fastembed_warmup_patcher.start()
-
-
-def tearDownModule():
-    _fastembed_warmup_patcher.stop()
-
-
 def _load_setup_project():
     """Loads a fresh copy of tools/setup_project.py by file path, the same
     pattern tests/test_compress_mcp_server.py uses -- this module isn't
@@ -90,6 +59,7 @@ def _args(**overrides) -> argparse.Namespace:
     defaults = dict(
         track_savings=False,
         savings_db="",
+        metrics_db="",
         lmstudio_model="",
         lmstudio_url="http://localhost:1234/v1",
     )
@@ -126,6 +96,17 @@ class HookEnvReminders(unittest.TestCase):
     def test_savings_db_flags_the_shell_export(self):
         reminders = self.mod._hook_env_reminders(_args(savings_db="/custom/savings.db"))
         self.assertIn("CLAUDE_RUNWAY_SAVINGS_DB=/custom/savings.db", reminders)
+
+    def test_metrics_db_is_not_a_hook_reminder(self):
+        # No hook reads the metrics database; it has its own note (below).
+        reminders = self.mod._hook_env_reminders(_args(metrics_db="/custom/metrics.db"))
+        self.assertEqual(reminders, [])
+
+    def test_metrics_db_note_names_the_export_and_is_empty_without_the_flag(self):
+        self.assertEqual(self.mod._metrics_db_reminder(_args()), "")
+        note = self.mod._metrics_db_reminder(_args(metrics_db="/custom/metrics.db"))
+        self.assertIn("CLAUDE_RUNWAY_METRICS_DB=/custom/metrics.db", note)
+        self.assertIn("memory-bank", note)
 
 
 class WriteJsonAtomic(unittest.TestCase):
@@ -175,6 +156,7 @@ def _init_args(target_repo, **overrides) -> argparse.Namespace:
         lmstudio_model="",
         track_savings=False,
         savings_db="",
+        metrics_db="",
         compact_collection="",
         memory_bank_collection="",
         memory_bank_id="",
@@ -443,6 +425,26 @@ class HookEnvReminderShownForSkipHooks(unittest.TestCase):
             self.mod.cmd_init(args)
         self.assertNotIn("CLAUDE_RUNWAY_TRACK_SAVINGS", buf.getvalue())
 
+    def test_qdrant_only_with_metrics_db_still_shows_the_export_note(self):
+        # --qdrant-only still writes the override into the memory-bank block,
+        # and a shell-run reporting CLI reads it from the shell, so the note
+        # must not be swallowed by the hook-side suppression.
+        args = _init_args(self.target_repo, qdrant_only=True, metrics_db="/custom/metrics.db", dry_run=False)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.mod.cmd_init(args)
+        self.assertIn("CLAUDE_RUNWAY_METRICS_DB=/custom/metrics.db", buf.getvalue())
+        written = json.loads((self.target_repo / ".mcp.json").read_text(encoding="utf-8"))
+        self.assertEqual(written["mcpServers"]["memory-bank"]["env"]["CLAUDE_RUNWAY_METRICS_DB"], "/custom/metrics.db")
+        self.assertNotIn("analytics", written["mcpServers"])
+
+    def test_normal_init_with_metrics_db_shows_the_note_once(self):
+        args = _init_args(self.target_repo, track_savings=True, metrics_db="/custom/metrics.db")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.mod.cmd_init(args)
+        self.assertEqual(buf.getvalue().count("CLAUDE_RUNWAY_METRICS_DB=/custom/metrics.db"), 1)
+
 
 class CompactCollectionFlag(unittest.TestCase):
     """--compact-collection: defaults to the shared historical
@@ -465,14 +467,14 @@ class CompactCollectionFlag(unittest.TestCase):
         self.mod.cmd_init(args)
         written = json.loads((self.target_repo / ".mcp.json").read_text(encoding="utf-8"))
         self.assertEqual(
-            written["mcpServers"]["local-compress"]["env"]["COMPACT_COLLECTION"], "conversation-compacts"
+            written["mcpServers"]["qdrant"]["env"]["COMPACT_COLLECTION"], "conversation-compacts"
         )
 
     def test_rerun_with_no_flag_does_not_drift_between_runs(self):
         # Regression for the finding from PR #130 review: a plain re-run
         # with no new flags must produce the SAME COMPACT_COLLECTION both
         # times on an already-configured project, or its conversation-compact
-        # history becomes unreachable (see compress_mcp_server.py's
+        # history becomes unreachable (see qdrant_mcp_server.py's
         # _collections_for_project, which scans for siblings by this exact
         # prefix).
         first_args = _init_args(self.target_repo, dry_run=False)
@@ -484,8 +486,8 @@ class CompactCollectionFlag(unittest.TestCase):
         second_written = json.loads((self.target_repo / ".mcp.json").read_text(encoding="utf-8"))
 
         self.assertEqual(
-            first_written["mcpServers"]["local-compress"]["env"]["COMPACT_COLLECTION"],
-            second_written["mcpServers"]["local-compress"]["env"]["COMPACT_COLLECTION"],
+            first_written["mcpServers"]["qdrant"]["env"]["COMPACT_COLLECTION"],
+            second_written["mcpServers"]["qdrant"]["env"]["COMPACT_COLLECTION"],
         )
 
     def test_explicit_value_is_used_verbatim(self):
@@ -493,7 +495,7 @@ class CompactCollectionFlag(unittest.TestCase):
         self.mod.cmd_init(args)
         written = json.loads((self.target_repo / ".mcp.json").read_text(encoding="utf-8"))
         self.assertEqual(
-            written["mcpServers"]["local-compress"]["env"]["COMPACT_COLLECTION"], "my-custom-compacts"
+            written["mcpServers"]["qdrant"]["env"]["COMPACT_COLLECTION"], "my-custom-compacts"
         )
 
 
@@ -698,18 +700,16 @@ class PipInstalledLayoutReminder(unittest.TestCase):
             self.mod.cmd_init(_init_args(self.target_repo))
         self.assertEqual(captured["venv_python"], fake_python)
         # ...and that override actually lands on the generated qdrant
-        # server's command, sibling to mcp-server-qdrant -- not just passed
-        # through and ignored.
+        # server's command (every server runs under that one interpreter) --
+        # not just passed through and ignored.
         mcp_json_path = self.target_repo / ".mcp.json"
         # dry_run=True by default in _init_args, so nothing was written --
         # re-run for real to inspect the actual generated file.
         with mock.patch.object(self.mod, "_pip_installed_venv_python", return_value=fake_python):
             self.mod.cmd_init(_init_args(self.target_repo, dry_run=False))
         mcp_json = json.loads(mcp_json_path.read_text(encoding="utf-8"))
-        self.assertEqual(
-            mcp_json["mcpServers"]["qdrant"]["command"],
-            "/opt/pipx/venvs/claude-runway/bin/mcp-server-qdrant",
-        )
+        self.assertEqual(mcp_json["mcpServers"]["qdrant"]["command"], "/opt/pipx/venvs/claude-runway/bin/python")
+        self.assertTrue(mcp_json["mcpServers"]["qdrant"]["args"][0].endswith("qdrant_mcp_server.py"))
 
     def test_clone_based_layout_keeps_the_original_reminder(self):
         # Mocked to None, the value _pip_installed_venv_python returns when
@@ -723,46 +723,6 @@ class PipInstalledLayoutReminder(unittest.TestCase):
             output = buf.getvalue()
         self.assertIn("venv activated", output)
         self.assertIn("ingest_to_qdrant.py", output)
-
-
-class FastembedWarmupWiring(unittest.TestCase):
-    """cmd_init passes attempt_fastembed_warmup=not args.dry_run into
-    run_setup (issue #221) -- a preview shouldn't attempt a real
-    network/disk-touching cache warm-up just to show what WOULD happen.
-    Spies on run_setup (the same _capture_run_setup pattern
-    PipInstalledLayoutReminder uses above) rather than mocking it away
-    entirely, so this still exercises the real generated HF_HUB_OFFLINE
-    value -- with setUpModule's module-wide warm_fastembed_cache patch
-    (return_value=False) still in effect, so this stays network-free."""
-
-    def setUp(self):
-        self.mod = _load_setup_project()
-        self._tmpdir = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmpdir.cleanup)
-        self.target_repo = Path(self._tmpdir.name) / "my-project"
-        self.target_repo.mkdir()
-
-    def _capture_kwargs(self):
-        original_run_setup = self.mod.run_setup
-        captured = {}
-
-        def _capture(*args, **kwargs):
-            captured.update(kwargs)
-            return original_run_setup(*args, **kwargs)
-
-        return captured, mock.patch.object(self.mod, "run_setup", side_effect=_capture)
-
-    def test_dry_run_does_not_attempt_warmup(self):
-        captured, patcher = self._capture_kwargs()
-        with patcher:
-            self.mod.cmd_init(_init_args(self.target_repo, dry_run=True))
-        self.assertFalse(captured["attempt_fastembed_warmup"])
-
-    def test_real_run_attempts_warmup(self):
-        captured, patcher = self._capture_kwargs()
-        with patcher:
-            self.mod.cmd_init(_init_args(self.target_repo, dry_run=False))
-        self.assertTrue(captured["attempt_fastembed_warmup"])
 
 
 class MainIsTheConsoleScriptEntryPoint(unittest.TestCase):

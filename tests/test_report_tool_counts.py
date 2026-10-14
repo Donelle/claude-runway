@@ -3,8 +3,7 @@
 that EVALUATION.md's Track A/B prose and the CI lint step both point at
 instead of a hardcoded tool count/token estimate. Verifies it reports a
 live, nonzero count AND schema size (in characters, issue #439) for each
-real server (this repo's own, plus the standalone third-party
-`mcp-server-qdrant` package) and
+real server (all four are this repo's own) and
 correctly signals failure (nonzero exit) if a server can't be
 constructed/enumerated, rather than silently reporting zero -- a silent
 zero would be indistinguishable from "this server genuinely has no
@@ -12,9 +11,9 @@ tools," which would defeat the entire point of this being a smoke check.
 
 Stdlib-only (unittest, no pytest) and no network -- report_tool_counts.py
 only imports/constructs each server (none of which connect to a live
-Qdrant/LM Studio just to enumerate their already-registered tools -- see
-the module's own docstring for how the standalone qdrant server avoids
-that too).
+Qdrant/LM Studio just to enumerate their already-registered tools; the
+qdrant server builds its embedding model on first use, so importing it loads
+none).
 
     .venv/bin/python -m unittest discover -s tests
 """
@@ -55,53 +54,66 @@ class ReportRepoServerReturnsLiveCountsAndSchemaSizes(unittest.TestCase):
             _rtc._report_repo_server("this_module_does_not_exist_anywhere")
 
 
-class ReportStandaloneQdrantServerCoversTheThirdPartyHalf(unittest.TestCase):
-    """PR #120 review finding: mcp-server-qdrant is unpinned in
-    requirements.txt, so its own tool count isn't a repo-controlled
-    invariant the way a hardcoded "2" in EVALUATION.md's prose implied.
-    This introspects the actual installed package's server directly,
-    rather than assuming it never changes.
-    """
+class ReportQdrantServerCoversTheServerThatReplacedTheThirdPartyOne(unittest.TestCase):
+    """The `qdrant` server used to be the unpinned third-party package's, whose
+    tool count this repo could not control, so the report had to construct it
+    specially. It is this repo's own `qdrant_mcp_server.py` now and goes through
+    the same live enumeration as the others."""
 
-    def test_reports_the_two_known_qdrant_tools_without_a_live_connection(self):
-        count, chars = _rtc._report_standalone_qdrant_server()
-        self.assertEqual(count, 2)
+    def test_reports_five_tools_without_a_live_connection(self):
+        count, chars = _rtc._report_repo_server("qdrant_mcp_server")
+        self.assertEqual(count, 5)
         self.assertGreater(chars, 0)
 
     def test_pinned_to_the_actual_tool_names_not_just_the_count(self):
-        # PR #120 review finding: a count-only assertion would still pass
-        # if mcp-server-qdrant renamed a tool while keeping the count at 2
-        # (e.g. "qdrant-find" -> "qdrant-search") -- that's exactly the
-        # kind of silent drift this whole issue exists to catch, so this
-        # constructs the same server directly and checks the actual
-        # registered names, not just how many there are.
-        import asyncio
-        from unittest.mock import patch
+        # A count-only assertion would still pass if a tool were renamed while
+        # the count stayed at 5 -- the silent drift this report exists to catch.
+        import qdrant_mcp_server
+        from mcp_tool_introspect import list_registered_tools
 
-        from mcp_server_qdrant.mcp_server import QdrantMCPServer
-        from mcp_server_qdrant.settings import EmbeddingProviderSettings, QdrantSettings, ToolSettings
+        names = {fn.__name__ for fn in list_registered_tools(qdrant_mcp_server.mcp)}
+        self.assertEqual(
+            names, {"qdrant_find", "qdrant_store", "compact_store", "compact_find", "compact_prune"}
+        )
 
-        # Patch out the embedding-provider factory so construction stays
-        # network-free -- the provider is never invoked here (no real tool
-        # calls are made), and FastEmbedProvider.__init__ would otherwise
-        # trigger a model download on a cold runner.
-        with patch("mcp_server_qdrant.mcp_server.create_embedding_provider", return_value=object()):
-            srv = QdrantMCPServer(
-                tool_settings=ToolSettings(),
-                qdrant_settings=QdrantSettings(),
-                embedding_provider_settings=EmbeddingProviderSettings(),
-            )
-        # QdrantMCPServer is a subclass of the standalone fastmcp.FastMCP
-        # (not our MCPServer), so _tool_manager is not available. Use the
-        # async list_tools() coroutine, which is the public API across all
-        # fastmcp versions and returns objects with a .name attribute.
-        tools = asyncio.run(srv.list_tools())
-        names = {t.name for t in tools}
-        self.assertEqual(names, {"qdrant-find", "qdrant-store"})
+    def test_local_compress_no_longer_registers_the_compact_tools(self):
+        import compress_mcp_server
+        from mcp_tool_introspect import list_registered_tools
+
+        names = {fn.__name__ for fn in list_registered_tools(compress_mcp_server.mcp)}
+        self.assertFalse(names & {"compact_store", "compact_find", "compact_prune"})
 
 
-class MainReportsAllThreeServersAndExitsCleanly(unittest.TestCase):
-    def test_main_prints_all_three_server_labels_and_returns_zero(self):
+class AnalyticsServerIsReported(unittest.TestCase):
+    """The savings and metrics tools moved off `local-compress` onto the opt-in
+    `analytics` server; both must show their own live count."""
+
+    def test_analytics_reports_the_five_moved_tools(self):
+        count, chars = _rtc._report_repo_server("analytics_mcp_server")
+        self.assertEqual(count, 5)
+        self.assertGreater(chars, 0)
+
+    def test_local_compress_reports_five_tools_and_none_of_the_moved_ones(self):
+        import compress_mcp_server
+        from mcp_tool_introspect import list_registered_tools
+
+        names = {fn.__name__ for fn in list_registered_tools(compress_mcp_server.mcp)}
+        self.assertEqual(
+            names,
+            {"list_local_models", "compress_file", "compress_command_output", "fetch_url", "compress_text"},
+        )
+
+    def test_main_prints_both_counts(self):
+        captured = io.StringIO()
+        with redirect_stdout(captured):
+            _rtc.main()
+        output = captured.getvalue()
+        self.assertIn("local-compress (compress_mcp_server.py): 5 tools", output)
+        self.assertIn("analytics (analytics_mcp_server.py): 5 tools", output)
+
+
+class MainReportsAllServersAndExitsCleanly(unittest.TestCase):
+    def test_main_prints_all_server_labels_and_returns_zero(self):
         captured = io.StringIO()
         with redirect_stdout(captured):
             exit_code = _rtc.main()
@@ -109,8 +121,11 @@ class MainReportsAllThreeServersAndExitsCleanly(unittest.TestCase):
         output = captured.getvalue()
         self.assertEqual(exit_code, 0)
         self.assertIn("local-compress", output)
+        self.assertIn("analytics", output)
         self.assertIn("codebase-indexer", output)
-        self.assertIn("qdrant", output)
+        self.assertIn("memory-bank", output)
+        self.assertIn("qdrant (qdrant_mcp_server.py): 5 tools", output)
+        self.assertNotIn("standalone", output)
         self.assertIn("tools", output)
         self.assertIn("tool-description characters (schema proxy)", output)
         # Issue #439: no token estimate is printed any more.

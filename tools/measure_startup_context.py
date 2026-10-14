@@ -142,8 +142,14 @@ def _run_survey(root: str) -> int:
     for server in T.TOOLKIT_SERVERS:
         count = sum(1 for s in listed if server in s["toolkit_servers_deferred"])
         print(f"  {server}: {count}")
-    all_four = sum(1 for s in listed if set(T.TOOLKIT_SERVERS) <= set(s["toolkit_servers_deferred"]))
-    print(f"  all {len(T.TOOLKIT_SERVERS)} servers: {all_four}")
+    # "All" means every always-on (core) server. Optional servers are left out of it:
+    # one that exists only in projects that opted in would otherwise drag this toward 0.
+    all_core = sum(1 for s in listed if set(T.TOOLKIT_SERVERS) <= set(s["toolkit_servers_deferred"]))
+    print(f"  all {len(T.TOOLKIT_SERVERS)} servers: {all_core}")
+    # Optional servers get their own line and count, outside the all-servers figure.
+    for server in T.OPTIONAL_TOOLKIT_SERVERS:
+        count = sum(1 for s in listed if server in s["toolkit_servers_deferred"])
+        print(f"  {server} (optional, not in the all-servers count): {count}")
 
     late_or_upfront = [s for s in listed + unclassified if s["toolkit_used_not_deferred"]]
     if late_or_upfront:

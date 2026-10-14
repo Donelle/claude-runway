@@ -180,3 +180,17 @@ jobs:
           "$VENV_BIN/claude-runway-ingest" --help
           mkdir -p pkgtest-target
           "$VENV_BIN/claude-runway-setup" init "$(pwd)/pkgtest-target" --dry-run
+
+          # The `qdrant` block is this repo's own server now. A generated
+          # config must never launch the third-party package's console
+          # script, and every script the qdrant and analytics blocks launch
+          # must exist in this fresh env (the paths come from <env>/src/).
+          "$VENV_BIN/claude-runway-setup" init "$(pwd)/pkgtest-target" --dry-run --track-savings > init-dry-run.txt
+          "$VENV_PY" -c "import json, os
+          text = open('init-dry-run.txt', encoding='utf-8').read()
+          assert 'mcp-server-qdrant' not in text and 'fastmcp' not in text, 'stale third-party reference in generated config'
+          servers, _ = json.JSONDecoder().raw_decode(text[text.index('\n{\n') + 1:])
+          for name in ('qdrant', 'analytics'):
+              script = servers[name]['args'][0]
+              assert os.path.isfile(script), name + ' server script missing: ' + script
+          print('OK: qdrant and analytics blocks launch scripts that exist; no third-party qdrant server reference')"

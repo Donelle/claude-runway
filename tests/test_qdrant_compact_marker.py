@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Tests for issue #397: conversation-compact collections are marked internal
 (libs/qdrant_compact_marker.py), written by compact_store and honored by
-find_in_collection/list_collections; and local-compress reads EMBEDDING_MODEL
-and checks for a model mismatch.
+find_in_collection/list_collections; and the qdrant server reads
+COMPACT_EMBEDDING_MODEL and checks for a model mismatch.
 
 Stdlib-only (unittest), no network: QdrantClient and the embedding provider
 are faked.
@@ -30,9 +30,9 @@ os.environ.setdefault("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2
 import ingest_mcp_server as _ims  # noqa: E402
 import qdrant_compact_marker as marker  # noqa: E402
 from qdrant_client.http.models import models as _m  # noqa: E402
-from test_compress_mcp_server import (  # noqa: E402
+from test_qdrant_mcp_server import (  # noqa: E402
     _FakeEmbeddingProvider,
-    _load_compress_mcp_server,
+    _load_qdrant_mcp_server,
     _make_fake_qdrant_client_class,
     _run,
 )
@@ -115,7 +115,7 @@ def _metadata_fake_client_class(vectors_config=None):
 
 class CompactStoreMarksCollection(unittest.TestCase):
     def _module(self, **client_kwargs):
-        mod = _load_compress_mcp_server()
+        mod = _load_qdrant_mcp_server()
         client_cls = _metadata_fake_client_class(**client_kwargs)
         mod.QdrantClient = client_cls
         mod.FastEmbedProvider = _FakeEmbeddingProvider
@@ -161,7 +161,7 @@ class CompactModelMismatch(unittest.TestCase):
     """compact_store/compact_find now call check_embedding_model_mismatch."""
 
     def _module(self):
-        mod = _load_compress_mcp_server()
+        mod = _load_qdrant_mcp_server()
         # The collection holds the OLD model's vector; the fake provider asks
         # for a different name, as a changed EMBEDDING_MODEL would.
         client_cls = _metadata_fake_client_class(
@@ -191,7 +191,7 @@ class CompactModelMismatch(unittest.TestCase):
         self.assertIn("embedding model mismatch", result)
 
     def test_matching_model_still_stores(self):
-        mod = _load_compress_mcp_server()
+        mod = _load_qdrant_mcp_server()
         client_cls = _metadata_fake_client_class(
             vectors_config={
                 _FakeEmbeddingProvider.VECTOR_NAME: _m.VectorParams(
@@ -209,10 +209,10 @@ class CompactModelMismatch(unittest.TestCase):
 class CompactEmbeddingModelEnv(unittest.TestCase):
     def _load(self, value=None):
         with mock.patch.dict(os.environ):
-            os.environ.pop("EMBEDDING_MODEL", None)
+            os.environ.pop("COMPACT_EMBEDDING_MODEL", None)
             if value is not None:
-                os.environ["EMBEDDING_MODEL"] = value
-            return _load_compress_mcp_server().COMPACT_EMBEDDING_MODEL
+                os.environ["COMPACT_EMBEDDING_MODEL"] = value
+            return _load_qdrant_mcp_server().COMPACT_EMBEDDING_MODEL
 
     def test_unset_falls_back_to_the_legacy_model(self):
         self.assertEqual(self._load(), "BAAI/bge-small-en")
@@ -220,7 +220,7 @@ class CompactEmbeddingModelEnv(unittest.TestCase):
     def test_blank_falls_back_to_the_legacy_model(self):
         self.assertEqual(self._load(""), "BAAI/bge-small-en")
 
-    def test_reads_embedding_model(self):
+    def test_reads_compact_embedding_model(self):
         self.assertEqual(self._load("sentence-transformers/all-MiniLM-L6-v2"),
                          "sentence-transformers/all-MiniLM-L6-v2")
 

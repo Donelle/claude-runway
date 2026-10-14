@@ -116,7 +116,8 @@ compressed log, since it can corrupt an edit rather than just lose detail
 in a summary. Don't add Read to the matcher without addressing that.
 
 Setup:
-    Dependencies (openai, via libs/local_compress_lib.py) come from
+    Dependencies (openai, via libs/lmstudio_client.py, which builds the model
+    client this hook passes to libs/local_compress_lib.py) come from
     requirements.txt; run this script with that environment's Python.
 
 Register in .claude/settings.json (see templates/settings.json.template; the
@@ -131,7 +132,7 @@ comments below):
   "hooks": {
     "PostToolUse": [
       {
-        "matcher": "Bash|Grep|WebFetch|Glob|WebSearch|mcp__local-compress__.*",
+        "matcher": "Bash|Grep|WebFetch|Glob|WebSearch|mcp__local-compress__.*|mcp__qdrant__(?:compact_store|compact_find|compact_prune)$",
         "hooks": [
           {
             "type": "command",
@@ -212,6 +213,7 @@ for _dir in _candidates:
         sys.path.insert(0, _dir)
 
 try:
+    from lmstudio_client import build_client
     from local_compress_lib import compress, stale_env_warning
 except ImportError as e:
     # Fail open, but say why via stderr (stdout is reserved for the
@@ -219,7 +221,7 @@ except ImportError as e:
     # Claude Code's hook debug output instead of behaving identically to
     # "nothing needed compressing."
     print(
-        f"compress_output.py: could not import local_compress_lib ({e}). "
+        f"compress_output.py: could not import local_compress_lib or lmstudio_client ({e}). "
         f"Checked: {[d for d in _candidates if d]}. Set TOOLS_REPO_DIR if the "
         "tools repo isn't where this script's parent directory implies.",
         file=sys.stderr,
@@ -337,14 +339,24 @@ MCP_SAVINGS_TOOL_PREFIX = "mcp__local-compress__"
 # first pass was told to preserve (PR #88 review: this is /my-compact's own
 # real usage, which sets preserve_identifiers=preserve_sections=True).
 _SELF_COMPRESSING_MCP_TOOLS = {"compress_file", "compress_command_output", "fetch_url", "compress_text"}
-# Tool names (without the prefix) whose output is an exact numeric/structured
-# report meant to be read verbatim -- a savings breakdown table, a metrics
-# trend, a list of pruned compact ids (issue #302). Same failure class as the
-# Bash `grep -c` exemption: running them through the lossy local-model path
-# once the response passes THRESHOLD could silently drop or alter a specific
-# number. Distinct from _SELF_COMPRESSING_MCP_TOOLS: these never compress
-# anything themselves, they're just exempt from the generic fallback.
-_EXACT_OUTPUT_MCP_TOOLS = {"savings_summary", "savings_detail", "savings_trend", "get_metrics", "compact_prune"}
+# The qdrant server's tools. Only the three compact tools are ever compressed
+# here: `qdrant-find` and `qdrant-store` are deliberately left alone (their
+# results are code locations and stored notes Claude acts on directly, and the
+# matcher does not list them), so any other tool under this prefix exits
+# untouched.
+MCP_QDRANT_TOOL_PREFIX = "mcp__qdrant__"
+_QDRANT_COMPACT_MCP_TOOLS = {"compact_store", "compact_find", "compact_prune"}
+# The opt-in `analytics` server (savings_summary/savings_detail/savings_trend,
+# get_metrics, record_metric). Every tool there returns an exact numeric/
+# structured report meant to be read verbatim -- a savings breakdown table, a
+# metrics trend (issue #302). Same failure class as the Bash `grep -c`
+# exemption: running them through the lossy local-model path once the response
+# passes THRESHOLD could silently drop or alter a specific number. So nothing
+# under this prefix is ever compressed, and the matcher does not list it; the
+# check in main() keeps that true even if a hand-edited matcher were widened
+# to `mcp__analytics__.*`. (The qdrant server's `compact_prune`, a list of
+# pruned compact ids, is the same class and is handled by its own branch.)
+MCP_ANALYTICS_TOOL_PREFIX = "mcp__analytics__"
 SAVINGS_FOOTER_RE = re.compile(r"\n?<!--CLAUDE_RUNWAY_SAVINGS:(\{.*?\})-->\s*\Z", re.DOTALL)
 # Below this length, a string is assumed to be metadata (a URL, a file
 # count, a status word) rather than content worth compressing or blanking --
@@ -749,6 +761,14 @@ def _emit_updated(updated):
     }))
 
 
+def _compress_text(text):
+    """compress() with the model client this hook owns: the library never
+    builds one (it does not import `openai`), so the hook builds the bounded
+    client for the default LM Studio URL and passes it in. Built per call,
+    which is cheap (no network until the first request)."""
+    return asyncio.run(compress(text, skip_if_under_chars=THRESHOLD, client=build_client(None)))
+
+
 def _handle_bash(tool_response):
     """Known shape: {stdout, stderr, ...}. Proven by testing.
     Returns ("updated", updated, raw_text, compressed_text) on success so the
@@ -760,7 +780,7 @@ def _handle_bash(tool_response):
     if len(combined) < THRESHOLD:
         return None  # small enough to leave alone
 
-    result = asyncio.run(compress(combined, skip_if_under_chars=THRESHOLD))
+    result = _compress_text(combined)
     if result.startswith("Error:"):
         return ("error", combined, result)
 
@@ -831,7 +851,7 @@ def _compress_group(fields):
     exactly these two values. Mirrors the single-blob logic _handle_generic
     used to apply globally -- now scoped to just this group's own fields."""
     combined = "\n\n".join(s for _, s in fields)
-    result = asyncio.run(compress(combined, skip_if_under_chars=THRESHOLD))
+    result = _compress_text(combined)
     return combined, result
 
 
@@ -1016,7 +1036,7 @@ def _finish_compression_outcome(outcome, tool_name, source, session_id, project,
     sys.exit(0)
 
 
-# Matches compact_find's own header verbatim (compress_mcp_server.py):
+# Matches compact_find's own header verbatim (qdrant_mcp_server.py):
 # f"Found {len(entries)} compact(s) for project '{project}':\n". Anchored to
 # the START of the leaf (^, no re.MULTILINE, so this only matches the
 # absolute beginning of the string) -- not just anchored to that exact
@@ -1101,20 +1121,41 @@ def _dispatch(payload):
         # alone regardless of size -- re-compressing it generically here
         # would discard exactly what that first pass was told to preserve.
         # Otherwise, this is one of the local-compress tools that never
-        # compresses anything itself (e.g. compact_find, compact_store,
-        # list_local_models) -- fall back to the
-        # same size-based compression every other matched tool gets,
+        # compresses anything itself (e.g. list_local_models) -- fall back to
+        # the same size-based compression every other matched tool gets,
         # otherwise every one of THOSE calls is a complete no-op regardless
         # of size, the opposite of what this hook exists to do (issue #25).
-        # compact_find in particular can return up to 10 full stored
-        # conversation compacts.
         bare_tool_name = tool_name[len(MCP_SAVINGS_TOOL_PREFIX):]
         if bare_tool_name in _SELF_COMPRESSING_MCP_TOOLS:
             sys.exit(0)
-        # Exact-output reports: pass through untouched regardless of size (#302).
-        if bare_tool_name in _EXACT_OUTPUT_MCP_TOOLS:
+        outcome = _handle_generic(tool_response)
+        _finish_compression_outcome(outcome, tool_name, tool_name, session_id, project, agent_id, agent_type, tool_use_id)
+
+    # The analytics server's reports are exact numbers read verbatim (see
+    # MCP_ANALYTICS_TOOL_PREFIX): never compressed, at any size.
+    if tool_name and tool_name.startswith(MCP_ANALYTICS_TOOL_PREFIX):
+        sys.exit(0)
+
+    # The compact tools live on the qdrant server (they used to be on
+    # local-compress). They never compress anything themselves and carry no
+    # savings footer, so they take the same size-based path as any other
+    # matched tool, with the two exemptions below. Every OTHER tool on this
+    # server (`qdrant-find`, `qdrant-store`) is never compressed, and the
+    # matcher does not list them; this check keeps that true even if a
+    # hand-edited matcher were widened to `mcp__qdrant__.*`.
+    # (compact_prune, an exact list of ids, is the same verbatim-report class
+    # as the analytics tools above.)
+    if tool_name and tool_name.startswith(MCP_QDRANT_TOOL_PREFIX):
+        bare_tool_name = tool_name[len(MCP_QDRANT_TOOL_PREFIX):]
+        if bare_tool_name not in _QDRANT_COMPACT_MCP_TOOLS or tool_response is None:
             sys.exit(0)
-        # compact_find's output is structured data /my-resume parses for
+        # A list of pruned compact ids is an exact report, the same class as
+        # the analytics server's reports (#302).
+        if bare_tool_name == "compact_prune":
+            sys.exit(0)
+        # compact_find can return up to 10 full stored conversation compacts,
+        # which is why it is matched at all (issue #25). Its output is
+        # structured data /my-resume parses for
         # control flow (issue #193), not prose to skim: a "Found {N}
         # compact(s)" header followed by N discrete dated/labeled entries.
         # /my-resume branches on that count (0 -> tell the user to run

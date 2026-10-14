@@ -29,9 +29,22 @@ import json
 from pathlib import Path
 from typing import Iterable, Optional
 
-# The MCP server names this toolkit's templates register (templates/mcp.json.template).
-# A tool name in a transcript is `mcp__<server>__<tool>`.
+# The core MCP servers this toolkit's templates always register
+# (templates/mcp.json.template). A tool name in a transcript is
+# `mcp__<server>__<tool>`. "Every always-on server" statistics (the survey's
+# per-server counts and its "all N servers" line) use this tuple alone.
 TOOLKIT_SERVERS = ("qdrant", "codebase-indexer", "memory-bank", "local-compress")
+
+# Servers that exist only when the user opted in, so most projects and every older
+# transcript lack them. `analytics` is written by `init --track-savings` (and offered
+# by `upgrade` to a project that already tracks savings). Its tools still belong to
+# the toolkit when present, so tool-name matching counts them, but they stay out of
+# the always-on statistics: otherwise those would fall toward zero for a reason
+# unrelated to what they measure.
+OPTIONAL_TOOLKIT_SERVERS = ("analytics",)
+
+# What tool-name matching uses by default: the core servers plus the optional ones.
+ALL_TOOLKIT_SERVERS = TOOLKIT_SERVERS + OPTIONAL_TOOLKIT_SERVERS
 
 
 def _entries(path):
@@ -143,13 +156,13 @@ def _apply_delta(names: set, attachment: dict) -> None:
         names.difference_update(n for n in removed if isinstance(n, str))
 
 
-def toolkit_tool_names(names: Iterable[str], servers: Iterable[str] = TOOLKIT_SERVERS) -> set:
+def toolkit_tool_names(names: Iterable[str], servers: Iterable[str] = ALL_TOOLKIT_SERVERS) -> set:
     """The subset of `names` that belong to one of the toolkit's MCP servers."""
     wanted = set(servers)
     return {n for n in names if server_of(n) in wanted}
 
 
-def loaded_schema_chars(path, servers: Iterable[str] = TOOLKIT_SERVERS) -> dict:
+def loaded_schema_chars(path, servers: Iterable[str] = ALL_TOOLKIT_SERVERS) -> dict:
     """
     Size, in characters, of the toolkit tools' schemas that were recorded as
     loaded into this session on demand: `deferred_tools_record` entries carry
@@ -179,7 +192,7 @@ def loaded_schema_chars(path, servers: Iterable[str] = TOOLKIT_SERVERS) -> dict:
     return sizes
 
 
-def toolkit_tools_used(path, servers: Iterable[str] = TOOLKIT_SERVERS) -> set:
+def toolkit_tools_used(path, servers: Iterable[str] = ALL_TOOLKIT_SERVERS) -> set:
     """Names of toolkit tools the session actually CALLED (assistant `tool_use`
     blocks). A tool that was called but not listed as deferred at the first turn is
     AMBIGUOUS: either its schema was sent up front, or its server connected after
@@ -202,7 +215,7 @@ def toolkit_tools_used(path, servers: Iterable[str] = TOOLKIT_SERVERS) -> set:
     return used
 
 
-def summarize(path, servers: Iterable[str] = TOOLKIT_SERVERS) -> Optional[dict]:
+def summarize(path, servers: Iterable[str] = ALL_TOOLKIT_SERVERS) -> Optional[dict]:
     """One session's start-of-session facts plus how many of its tools are the
     toolkit's, and how many of those start deferred. None when there is no data."""
     start = start_of_session(path)
@@ -228,7 +241,7 @@ def _mean(values: list) -> Optional[float]:
     return sum(values) / len(values) if values else None
 
 
-def compare(with_paths, without_paths, servers: Iterable[str] = TOOLKIT_SERVERS) -> dict:
+def compare(with_paths, without_paths, servers: Iterable[str] = ALL_TOOLKIT_SERVERS) -> dict:
     """
     Per model, the mean starting context of the `with_paths` sessions (toolkit
     servers connected) against the `without_paths` sessions (removed), and the

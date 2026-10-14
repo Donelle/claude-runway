@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 Bulk-index a repo's code and docs into the same Qdrant collection your
-mcp-server-qdrant MCP server reads from, using the *same* embedding
+`qdrant` MCP server reads from, using the *same* embedding
 provider the server uses (so vectors are compatible with qdrant-find).
 
 Usage:
-    pip install mcp-server-qdrant
+    pip install qdrant-client fastembed pydantic_settings
 
     python tools/ingest_to_qdrant.py \
         --repo-path /path/to/your/repo \
@@ -36,7 +36,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 from version_lib import version_string  # noqa: E402
 
 # Issue #348 (Copilot review): answer --version BEFORE the dependency imports
-# below. Those exit(1) on a missing/broken mcp_server_qdrant/qdrant_client --
+# below. Those exit(1) on a missing/broken fastembed/qdrant_client --
 # exactly the half-broken environment where someone most needs to report which
 # version they have. parse_args() still declares the flag (so --help lists it).
 if len(sys.argv) == 2 and sys.argv[1] == "--version":
@@ -44,13 +44,13 @@ if len(sys.argv) == 2 and sys.argv[1] == "--version":
     sys.exit(0)
 
 try:
-    from mcp_server_qdrant.qdrant import QdrantConnector, Entry
-    from mcp_server_qdrant.embeddings.fastembed import FastEmbedProvider
+    from qdrant_connector import QdrantConnector, Entry
+    from qdrant_embeddings import FastEmbedProvider
     from qdrant_client import QdrantClient
 except ImportError:
     print(
         "Missing dependency. Install with:\n"
-        "    pip install mcp-server-qdrant qdrant-client --break-system-packages\n",
+        "    pip install qdrant-client fastembed pydantic_settings --break-system-packages\n",
         file=sys.stderr,
     )
     sys.exit(1)
