@@ -26,7 +26,7 @@ Because the collection is shared, `EMBEDDING_MODEL` is locked in by whichever pr
 The script warns (rather than silently allowing) two collisions:
 
 - **`--memory-bank-id` resolving to `"general"`** — `"general"` is memory-bank's reserved sentinel for cross-project knowledge (see "Using it" below); a project's own ID colliding with it would tag that project's memories as if they applied everywhere. Pass an explicit `--memory-bank-id` to fix.
-- **This project's `--collection-name` equal to `--memory-bank-collection`** — `index_repo`/`sync_repo` refuse outright to run against the shared memory-bank collection (issue #175), so this collision would leave the project's own codebase index unable to run at all. Pass a different `--collection-name` or `--memory-bank-collection` to fix.
+- **This project's `--collection-name` equal to `--memory-bank-collection`** — `index_repo`/`sync_repo` refuse outright to run against the shared memory-bank collection, so this collision would leave the project's own codebase index unable to run at all. Pass a different `--collection-name` or `--memory-bank-collection` to fix.
 
 **Manual fallback**: copy `templates/mcp.json.template`'s `memory-bank` block into your TARGET PROJECT's own `.mcp.json` (per [Installation](installation.md)'s step 4) and edit these fields there — never edit the shared `templates/mcp.json.template` file itself, which doesn't configure any project and risks committing project-specific paths or credentials into this tools repo:
 
@@ -34,17 +34,17 @@ The script warns (rather than silently allowing) two collisions:
 - Replace `/absolute/path/to/tools/memory_bank_mcp_server.py` with the real path.
 - Replace `MEMORY_BANK_ID`'s placeholder with a plain identifier for this project (or leave it equal to this project's `COLLECTION_NAME` if unsure).
 - Leave `MEMORY_BANK_COLLECTION` at its default (`memory-bank`) unless you have a specific reason to run a separate shared collection. **If you DO override it, set the exact same value in the `codebase-indexer` block's own `MEMORY_BANK_COLLECTION` entry too** — `index_repo`/`sync_repo`'s guard against ever touching the shared memory-bank collection checks against that block's copy, not this one, so a mismatch here leaves the indexer only protecting the default name while your memories actually live under the custom one. `setup_project.py`'s `--memory-bank-collection` flag (recommended, above) writes both automatically; this is specifically a manual-editing gotcha.
-- `QDRANT_URL`/`QDRANT_API_KEY` follow the same values as the `qdrant`/`codebase-indexer` blocks in the same file. `EMBEDDING_MODEL` does **not**: it is memory-bank's own value, independent of the code-index model, and must match whatever model created the shared collection. `setup_project.py init` leaves it alone on a re-run and never changes it for `--embedding-model`; pass `--memory-bank-embedding-model <model>` to change it deliberately (it warns, because `remember`/`recall` then fail for every project sharing the collection until it is rebuilt). A project with no `memory-bank` block gets the template default. `init` also warms the fastembed cache for this model (upstream #428).
+- `QDRANT_URL`/`QDRANT_API_KEY` follow the same values as the `qdrant`/`codebase-indexer` blocks in the same file. `EMBEDDING_MODEL` does **not**: it is memory-bank's own value, independent of the code-index model, and must match whatever model created the shared collection. `setup_project.py init` leaves it alone on a re-run and never changes it for `--embedding-model`; pass `--memory-bank-embedding-model <model>` to change it deliberately (it warns, because `remember`/`recall` then fail for every project sharing the collection until it is rebuilt). A project with no `memory-bank` block gets the template default. `init` also warms the fastembed cache for this model.
 
 ## Using it
 
-- `recall(query, ...)` — defaults to this project's own memories plus anything tagged `general`. Pass `repo=<other-project-id>` or `all_repos=True` only when genuinely needed, not as a default broadening. Results are ranked by `effective_score` (`max(0, raw cosine similarity) * weight`; ties on `effective_score` — e.g. all non-positive-similarity hits, which score 0 — are broken by `weight > 0` first (so `weight=0` is always last), then raw `score`), not raw similarity alone (issue #177) — each hit reports both `score` (raw similarity, unchanged meaning) and `effective_score` (what ranking/truncation actually used) so the re-ranking is inspectable, not hidden. Raw cosine similarity is floored at 0 BEFORE the multiply (not multiplied directly) because it can be negative, which would otherwise invert the weight semantics below (a `weight=0` memory could rank above a normal one); there is deliberately no `+0.5` offset/rescale, which (issue #272) made `weight>=2.0` an unconditional takeover — see `libs/memory_bank_lib.py`'s `_normalize_similarity` docstring.
-- `remember(summary, description, kind, general=False, weight=1.0, ...)` — `summary` is the only field actually searched, so write it the way a future query would be phrased; put the full verbatim detail in `description`. Set `general=True` only when the user explicitly signals the memory applies across every project. `weight` (issue #177) is a static, FINITE, NONNEGATIVE quality multiplier stored as `metadata.weight` (a negative, infinite, or NaN value is rejected with an error): `1.0` (default) is a true no-op against plain-similarity ranking, `>1.0` boosts a known-good memory above equally-similar competitors, `0.0` de-emphasizes a stale/superseded one without deleting it. `weight` is a proportional relevance multiplier (`effective_score = max(0, similarity) * weight`): a hit with weight `w` beats a default-weight hit only if `w * its_similarity` exceeds the other's similarity, so `2.0` lets a hit with half the similarity tie a default one, and a zero-similarity memory scores 0 at any weight — it is a boost among comparably-relevant hits, never a takeover. A point written before this field existed is treated as `weight=1.0` at read time. There's no separate "update weight" tool — `forget` the point and `remember` it again to change it.
+- `recall(query, ...)` — defaults to this project's own memories plus anything tagged `general`. Pass `repo=<other-project-id>` or `all_repos=True` only when genuinely needed, not as a default broadening. Results are ranked by `effective_score` (`max(0, raw cosine similarity) * weight`; ties on `effective_score` — e.g. all non-positive-similarity hits, which score 0 — are broken by `weight > 0` first (so `weight=0` is always last), then raw `score`), not raw similarity alone — each hit reports both `score` (raw similarity, unchanged meaning) and `effective_score` (what ranking/truncation actually used) so the re-ranking is inspectable, not hidden. Raw cosine similarity is floored at 0 BEFORE the multiply (not multiplied directly) because it can be negative, which would otherwise invert the weight semantics below (a `weight=0` memory could rank above a normal one); there is deliberately no `+0.5` offset/rescale, which would make `weight>=2.0` an unconditional takeover — see `libs/memory_bank_lib.py`'s `_normalize_similarity` docstring.
+- `remember(summary, description, kind, general=False, weight=1.0, ...)` — `summary` is the only field actually searched, so write it the way a future query would be phrased; put the full verbatim detail in `description`. Set `general=True` only when the user explicitly signals the memory applies across every project. `weight` is a static, FINITE, NONNEGATIVE quality multiplier stored as `metadata.weight` (a negative, infinite, or NaN value is rejected with an error): `1.0` (default) is a true no-op against plain-similarity ranking, `>1.0` boosts a known-good memory above equally-similar competitors, `0.0` de-emphasizes a stale/superseded one without deleting it. `weight` is a proportional relevance multiplier (`effective_score = max(0, similarity) * weight`): a hit with weight `w` beats a default-weight hit only if `w * its_similarity` exceeds the other's similarity, so `2.0` lets a hit with half the similarity tie a default one, and a zero-similarity memory scores 0 at any weight — it is a boost among comparably-relevant hits, never a takeover. A point written before this field existed is treated as `weight=1.0` at read time. There's no separate "update weight" tool — `forget` the point and `remember` it again to change it.
 - `forget(...)` — requires explicit user confirmation before calling with `confirm=True`; show what would be deleted first.
 
 ## Migrating a legacy collection
 
-`transfer_memories(source_collection, dry_run=True, qdrant_url=None, qdrant_api_key=None)` (issue #336) copies memories from an older Qdrant collection into the shared memory-bank collection. The source has to look like a memory-bank export: a `document` payload field plus a `metadata` object with `repo`, `kind`, `description` and (optionally) `weight`.
+`transfer_memories(source_collection, dry_run=True, qdrant_url=None, qdrant_api_key=None)` copies memories from an older Qdrant collection into the shared memory-bank collection. The source has to look like a memory-bank export: a `document` payload field plus a `metadata` object with `repo`, `kind`, `description` and (optionally) `weight`.
 
 - **Name the source exactly.** There is no auto-discovery; use codebase-indexer's `list_collections` if unsure. The memory-bank collection itself is refused as a source, including through a Qdrant alias.
 - **Dry run by default.** With `dry_run=True` nothing is written or embedded; the report shows `would_migrate`. Pass `dry_run=False` to write.
@@ -60,7 +60,7 @@ For the exact usage guidance Claude should follow when deciding whether to call 
 ## Usage event logging
 
 `recall`/`remember` calls are passively logged, one row per event, to a dedicated
-`~/.claude/claude-runway/memory-events.db` (issue #179) — a diagnostic signal for
+`~/.claude/claude-runway/memory-events.db` — a diagnostic signal for
 validating the reuse thesis behind this feature (are stored memories actually
 getting recalled later, by which projects, how soon after creation) without
 relying entirely on manually-run scenarios. `forget` is deliberately NOT logged
@@ -91,7 +91,7 @@ Each row records `event_type` (`recall`/`remember`), `point_id`, `repo`,
 log time), `event_timestamp`, `turn` (a per-session call-sequence counter —
 "3rd memory-bank call this session," not a real Claude Code conversation
 turn), `session_id`, and `project`. `session_id` comes from
-`libs/session_id_lib.py`'s `SessionIdStrategy.PROXY` (issue #198/#214) — a
+`libs/session_id_lib.py`'s `SessionIdStrategy.PROXY` — a
 process-lifetime UUID cached once when the MCP server starts, not Claude
 Code's own internal session id. See that module's docstring for the full
 four-strategy classification (`HOOK_PAYLOAD`/`SHADOW_FILE`/
@@ -104,7 +104,7 @@ spawned fresh per Claude Code session, that proxy is a documented, practical
 stand-in for "this session," not the real thing. A read-only report over this
 table now exists — see [Baseline staleness report](#baseline-staleness-report)
 below. A simpler, separate signal also exists:
-issue #211 added `record_memory_metric()` alongside the above, writing a
+`record_memory_metric()` runs alongside the above, writing a
 plain per-call tally (no `point_id`/`repo`/`kind` detail, just a count) for
 every `recall`/`remember`/`forget` call into [the shared metrics
 store](metrics.md)'s `metrics.db`, under `metric_id="memory-bank"` — gated by
@@ -123,7 +123,7 @@ table's own `forget` exclusion reasoning depends on.
 
 ### Baseline staleness report
 
-`python tools/memory_bank_report.py` (issue #338, Batch A of #328) reads
+`python tools/memory_bank_report.py` reads
 `memory-events.db` read-only (it never creates or writes the file) and prints:
 
 - **Dead-memory ratio** — of distinct remembered `point_id`s, the share with no
@@ -142,7 +142,7 @@ table's own `forget` exclusion reasoning depends on.
 `--json` prints the same report as JSON. Rows logged by project
 `test-collection` are excluded by default (`--no-default-excludes` to keep
 them, `--exclude-project P` to drop more): that is the id the test suite uses,
-and before #338 `tests/test_memory_bank_mcp_server.py` wrote those rows into
+and before that report existed `tests/test_memory_bank_mcp_server.py` wrote those rows into
 the real file. The report also matches a memory's remember and recall rows
 whether the id was logged with dashes or without (remember logs
 `uuid4().hex`, recall logs the dashed form Qdrant returns), which a plain id
@@ -150,4 +150,4 @@ comparison would miss.
 
 ## Where the data lives
 
-The same Qdrant instance as `codebase-indexer`'s per-project collections, but in one collection shared across every project, and never touched by `index_repo`/`sync_repo`'s reset/delete paths — those always preserve `metadata.source == "memory-bank"` points, even during a full reset (issue #175; see the README's [Known limitations](../README.md#known-limitations) for the mechanics of that filtered-delete behavior).
+The same Qdrant instance as `codebase-indexer`'s per-project collections, but in one collection shared across every project, and never touched by `index_repo`/`sync_repo`'s reset/delete paths — those always preserve `metadata.source == "memory-bank"` points, even during a full reset (see the README's [Known limitations](../README.md#known-limitations) for the mechanics of that filtered-delete behavior).

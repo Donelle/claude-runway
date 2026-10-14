@@ -57,10 +57,12 @@ denied again normally. The cache reuses the shared libs/cache_db.py store
 fails open -- WebFetch proceeds as if the cache were empty.
 
 Setup:
-    pip install openai --break-system-packages
+    Dependencies (openai, via libs/local_compress_lib.py) come from
+    requirements.txt; run this script with that environment's Python.
 
-Register in .claude/settings.json (see settings.json.template) -- point
-the args path at this script's location in the cloned tools repo:
+Register in .claude/settings.json (see templates/settings.json.template; the
+`claude-runway-setup` tool writes this for you) -- point the args path at this
+script's location in the cloned tools repo:
 {
   "hooks": {
     "PreToolUse": [
@@ -69,7 +71,7 @@ the args path at this script's location in the cloned tools repo:
         "hooks": [
           {
             "type": "command",
-            "command": "python3",
+            "command": "REPLACE-WITH-VENV-PYTHON",
             "args": ["/absolute/path/to/tools-repo/hooks/redirect_webfetch_to_fetch_url.py"]
           }
         ]

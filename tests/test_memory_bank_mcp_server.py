@@ -41,22 +41,18 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-# Issue #211 (Copilot review): most tests in this module call remember()/
-# recall()/forget() with tracking left at its real default (True) and don't
-# mock mev.record_memory_metric -- only MemoryMetricCounterTest below does.
-# Without this module-wide redirect, every one of those calls falls through
-# to the REAL metrics_lib.MetricsStore(), which resolves CLAUDE_RUNWAY_METRICS_DB
-# via os.environ and, if unset, writes into the DEVELOPER'S OWN real
-# ~/.claude/claude-runway/metrics.db -- confirmed live: running this suite
-# once appended 45 real "memory-bank" rows to that file. setUpModule/
-# tearDownModule redirect the env var to a throwaway temp path for the
-# entire module's test run (not just one test class), so every remember/
-# recall/forget call in this file -- mocked or not -- writes (if it writes
-# at all) into a file nothing else reads, then discards it wholesale on
-# teardown. Same tempfile-per-test-run approach test_memory_events_lib.py
-# already uses for CLAUDE_RUNWAY_MEMORY_EVENTS_DB, just scoped to the whole
-# module here rather than per-test-class, since the risk here is "any test
-# that doesn't explicitly mock record_memory_metric," not one specific class.
+# Issue #211: most tests in this module call remember()/recall()/forget()
+# with tracking left at its real default (True) and don't mock
+# mev.record_memory_metric -- only MemoryMetricCounterTest below does.
+# Without a module-wide redirect, those calls fall through to the REAL
+# metrics_lib.MetricsStore(), which resolves CLAUDE_RUNWAY_METRICS_DB via
+# os.environ and, if unset, writes into the developer's own real
+# ~/.claude/claude-runway/metrics.db (a run once appended 45 real
+# "memory-bank" rows there). setUpModule/tearDownModule point the env var at
+# a throwaway temp path for the whole module, so every call in this file --
+# mocked or not -- writes into a file nothing else reads, discarded on
+# teardown. Scoped to the whole module (not per test class) because the risk
+# is any test that doesn't explicitly mock record_memory_metric.
 _metrics_db_tmpdir: tempfile.TemporaryDirectory
 _metrics_db_env_patch: "mock._patch_dict"
 
@@ -65,11 +61,9 @@ def setUpModule():
     # Issue #338: CLAUDE_RUNWAY_MEMORY_EVENTS_DB is redirected here too, for
     # the same reason as metrics.db above. Tests that patch tracking_enabled
     # to True without also mocking mev.record_memory_event (e.g.
-    # MemoryMetricCounterTest) fall through to the REAL rich-event writer --
-    # confirmed live: ~790 fake "test-collection"/"proj-a" rows had piled up
-    # in a dogfood machine's real memory-events.db, about 70% of it,
-    # skewing the very baseline report (tools/memory_bank_report.py) that
-    # reads that file.
+    # MemoryMetricCounterTest) fall through to the REAL rich-event writer,
+    # which polluted a real memory-events.db with fake rows and skewed the
+    # baseline report (tools/memory_bank_report.py) that reads that file.
     global _metrics_db_tmpdir, _metrics_db_env_patch
     _metrics_db_tmpdir = tempfile.TemporaryDirectory()
     db_path = Path(_metrics_db_tmpdir.name) / "metrics.db"

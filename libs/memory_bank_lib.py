@@ -256,8 +256,9 @@ def _scope_filter(
     kind: Optional[str] = None,
 ) -> models.Filter:
     """
-    Builds the `metadata.source == "memory-bank"` (+ repo/kind) filter shared
-    by recall/count. Precedence: an explicit `repo` override narrows to
+    Builds the `metadata.source == "memory-bank"` (+ repo/kind) filter
+    `recall_points` searches with (`count_memory_bank_points` builds its own,
+    simpler filter). Precedence: an explicit `repo` override narrows to
     exactly that repo; `all_repos=True` (with no explicit `repo`) applies no
     repo constraint at all; otherwise (the default) scope is this project's
     own repo OR the general-knowledge sentinel -- `should` conditions in a

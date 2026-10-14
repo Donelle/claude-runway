@@ -11,9 +11,9 @@ Project-scoped to this repo on purpose: it hardcodes claude-runway's actual conv
 
 ## Usage
 ```
-/my-gh-code-it 12345
-/my-gh-code-it #12345
-/my-gh-code-it https://github.com/Donelle/claude-runway/issues/12345
+/my-gh-code-it <issue-number>
+/my-gh-code-it #<issue-number>
+/my-gh-code-it <full GitHub issue URL>
 ```
 
 ## Steps
@@ -85,8 +85,8 @@ Project-scoped to this repo on purpose: it hardcodes claude-runway's actual conv
 13. **Run the test suite, then lint and type-check.** First resolve the venv's
     Python interpreter path once — Windows `uv venv` creates `.venv/Scripts/`,
     Linux/macOS creates `.venv/bin/`, so a hardcoded `.venv/bin/python` fails
-    with command-not-found on a Windows checkout (issue #286 — the same defect
-    class issue #230 fixed for `/my-gh-autowork`). ruff and Pyright are invoked
+    with command-not-found on a Windows checkout (the same defect
+    class `/my-gh-autowork` had to fix too). ruff and Pyright are invoked
     as `$PYTHON -m ruff`/`$PYTHON -m pyright` rather than as their own
     `.venv/bin/ruff`/`.venv/bin/pyright` binaries, so only the one interpreter
     path has to be resolved per platform:

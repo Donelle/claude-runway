@@ -23,7 +23,7 @@ from typing import Optional, Tuple
 from openai import APITimeoutError, OpenAI
 
 DEFAULT_BASE_URL = os.environ.get("CLAUDE_RUNWAY_LMSTUDIO_URL", "http://localhost:1234/v1")
-DEFAULT_MODEL = os.environ.get("CLAUDE_RUNWAY_LMSTUDIO_MODEL")  # intentionally no fallback -- see compress_mcp_server.py NOTE 2
+DEFAULT_MODEL = os.environ.get("CLAUDE_RUNWAY_LMSTUDIO_MODEL")  # intentionally no fallback -- resolve_model() auto-detects when unset
 DEFAULT_CHUNK_CHARS = 12_000  # conservative per-call size -- local models vary widely in context window
 
 # Timeout (seconds) for the /api/v0/models probe in fetch_loaded_models below.
@@ -344,7 +344,7 @@ _AUTO_POSITIONAL_CHARS = 4000
 # Applied to each individual chunk (the "map" step), AFTER the dedicated
 # relevance classifier below has already confirmed the chunk is worth
 # extracting from. Kept as a second line of defense (belt-and-suspenders,
-# not the primary mechanism) -- see _classify_relevant's docstring for why
+# not the primary mechanism) -- see classify_relevant's docstring for why
 # the classifier, not this marker, is what's actually relied on now.
 _MAP_ANTI_CHAT_INSTRUCTION = (
     "Respond ONLY with the compressed content itself -- no greetings, no "
@@ -566,7 +566,7 @@ def split_sections(text: str):
     """
     Split `text` into (preamble, [(heading_line, body), ...]) on '## ' headings.
 
-    Returns ("", []) worth of nothing -- specifically (text, []) -- when there
+    Returns (text, []) -- the whole text as the preamble and no sections -- when there
     are no headings, so callers can fall back to whole-text compression instead
     of special-casing unstructured input.
     """
@@ -692,7 +692,7 @@ def derive_compact_label(information: str) -> str:
     # with a single space first, then find the sentence terminator. Operating
     # on just `body.splitlines()[0]` truncates at the first physical newline,
     # which cuts off a sentence that the author wrapped for readability (the
-    # COMPACT_TEMPLATE itself does exactly this: "Aligning the OA publisher
+    # the COMPACT_TEMPLATE fixture in tests/test_local_compress_lib.py does exactly this: "Aligning the OA publisher
     # with the provisioned\nOrderNotification Service Bus topology.").
     # The joined form is only used for sentence-boundary detection; the
     # first physical line is kept as the no-terminator fallback so callers
@@ -725,7 +725,7 @@ def derive_compact_label(information: str) -> str:
 # Design: an in-memory dict keyed on a SHA-256 digest of the inputs that
 # determine the output (text, focus, resolved model id, max_chars,
 # auto_truncated, chunk_chars, preserve_identifiers, preserve_sections,
-# effective base_url). Sized-capped so pathological
+# effective base_url, was_truncated). Size-capped so pathological
 # caller patterns don't accumulate unbounded memory; the cap is enforced by
 # evicting the oldest entry (insertion-order dicts in Python 3.7+, so the
 # oldest is always `next(iter(_compression_cache))`).
@@ -1327,7 +1327,8 @@ def append_trailing_summary_if_missing(original: str, summary: str) -> str:
     A no-op, not a truncation risk: most compressions never touch this at
     all, since the model usually keeps this line on its own (confirmed by
     testing -- it isn't dropped every time, just often enough to matter).
-    This only fires on the specific gap the docstring above measured.
+    This only fires on the specific gap measured in the comment above
+    _TRAILING_SUMMARY_PATTERNS.
     """
     line = find_trailing_summary_line(original)
     if not line or line in summary:
@@ -1436,7 +1437,10 @@ def classify_relevant(
     truncated: bool = False,
 ) -> Optional[bool]:
     """
-    Dedicated relevance classifier, run BEFORE extraction on every chunk.
+    Dedicated relevance classifier, run BEFORE extraction on each chunk (except
+    when compress() bypasses it for a non-selective or max_chars-scoped focus,
+    or when preserve_sections=True and the text has headings: that path returns
+    from _compress_each_section() before any chunking or classification).
 
     Earlier design relied on a single combined call per chunk: "extract what
     matches this focus, or respond with a NOT_RELEVANT marker if nothing
@@ -1455,7 +1459,7 @@ def classify_relevant(
     number of local model calls per chunk (one to classify, one to extract),
     but that's free against the actual budget this project cares about
     (Claude tokens) -- same reasoning as chunking instead of truncating
-    (see compress_mcp_server.py's RESOLVED note #3).
+    (the same reasoning applies to chunking instead of truncating).
 
     Returns True/False, or None if the request itself failed -- callers
     should treat None as a hard error (same as any other local model
@@ -1735,8 +1739,9 @@ async def _compress_each_section(text, focus, oai_client, model, base_url, prese
     The returned string is always success-shaped ("[compressed N -> M
     chars...]") EXCEPT when every section actually SENT a request that FAILED
     outright (complete() itself returned None) and none succeeded -- that
-    case gets an "[LM Studio appears unreachable ...]" line prepended instead,
-    so a total outage during this run is distinguishable from a normal one
+    case gets an "[LM Studio appears unreachable ...]" line prepended instead
+    (or "[LM Studio timed out on every request ...]" when every failure was a
+    timeout), so a total outage during this run is distinguishable from a normal one
     (issue #43) without regressing the content-preserving fallback itself:
     each section's original body is still preserved either way, never
     dropped -- though "preserved" means kept out of the model's summarizing
@@ -2016,13 +2021,15 @@ async def compress(
     empty-but-live response don't count toward it -- and for why the wording
     says "preserved" rather than "unchanged": redact_and_disclose() still
     runs regardless, so a credential-shaped value is still replaced even in
-    a fallback section, PR #134 review round 3). This is NOT an
+    a fallback section, PR #134 review round 3). When every failed request was
+    a timeout, the prefix is "[LM Studio timed out on every request ..." instead
+    (issue #368). This is NOT an
     "Error:"-prefixed string -- the content is fully present and usable
     either way -- so a caller parsing only for "Error:" vs. everything-else
     still works unchanged; a caller that specifically wants to detect this
-    distinct total-outage signal should check for that "[LM Studio appears
-    unreachable" prefix instead
-    (PR #134 review).
+    distinct total-outage signal should check for either the "[LM Studio
+    appears unreachable" or the "[LM Studio timed out on every request"
+    prefix instead (PR #134 review).
 
     max_chars, if given, truncates to the first N chars of `text` before
     anything else happens. If not given but `focus` looks positional (see
@@ -2030,8 +2037,7 @@ async def compress(
     _AUTO_POSITIONAL_CHARS -- this makes positional asks ("summarize the
     lead section") correct automatically, without requiring the caller to
     separately recognize "this needs max_chars" and pass it explicitly
-    (that requirement was tried first and got flagged as impractical -- see
-    compress_mcp_server.py's fetch_url docstring history). This is a
+    (that requirement was tried first and got flagged as impractical). This is a
     deterministic shortcut, not a judgment call left to the model: real
     testing showed a position-aware classifier (still used below for
     phrasings this keyword list doesn't catch) isn't reliably followed by
@@ -2082,7 +2088,7 @@ async def compress(
     triple-quote. At that size the text is ONE chunk, so the entire result is
     a single call to a 2-4B local model with no reduce step to catch anything.
     A summarizer cannot be prompted into being lossless; this measures the
-    output instead of trusting it, the same way _EXACT_CMDS measures the
+    output instead of trusting it, the same way hooks/compress_output.py's _EXACT_CMDS measures the
     command instead of trusting a size threshold.
 
     preserve_sections compresses a '## '-headed document one section at a time
@@ -2273,12 +2279,13 @@ async def compress(
             # Only cache fully successful section runs. Two cases skip caching:
             #
             # 1. Total outage: a result prepended with "[LM Studio appears
-            #    unreachable ...]" means every model request that was SENT failed
-            #    outright. Caching this would make repeated calls keep returning
-            #    the degraded preserved-content output instead of retrying once
-            #    LM Studio recovers. The "[LM Studio appears unreachable" prefix
-            #    is the one and only marker _compress_each_section emits for this
-            #    case, so checking for it here is both necessary and sufficient.
+            #    unreachable ...]" (or the all-timeouts variant, _ALL_TIMED_OUT_PREFIX)
+            #    means every model request that was SENT failed outright.
+            #    Caching this would make repeated calls keep returning the
+            #    degraded preserved-content output instead of retrying once
+            #    LM Studio recovers. Those two prefixes are the only markers
+            #    _compress_each_section emits for this case, so checking for
+            #    both here is both necessary and sufficient.
             #
             # 2. Partial failure: a result containing "kept verbatim after a
             #    failed call" means at least one prose section had a transient

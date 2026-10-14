@@ -171,7 +171,7 @@ class CheckEmbeddingModelMismatchTest(unittest.TestCase):
         result = _qmc.check_embedding_model_mismatch(client, "col", provider)
         self.assertIsNone(result)
 
-    # --- fail_closed=True: the two callers (index_repo's and sync_repo's pre-delete checks) that must NOT fail open ---
+    # --- fail_closed=True: the destructive-delete callers (index_repo/CLI reset and sync_repo pre-delete checks) that must NOT fail open ---
 
     def test_fail_closed_returns_error_on_exception_instead_of_none(self):
         # Regression for PR #178 review (fourth pass): a destructive-delete

@@ -21,8 +21,9 @@ memory_events_lib.py's `memory-events.db` -- both are genuinely tailored
 schemas that already work well for their one specific domain each,
 migrating them onto this generic store is an explicit follow-up, not part
 of this ticket (see issue #208's "Explicitly out of scope" section).
-As of issue #210, my-gh-autowork's per-ticket outcome logging is the first
-real domain writing into this store (`metric_id="autowork"`).
+As of issue #210, my-gh-autowork's per-ticket outcome logging writes into
+this store (`metric_id="autowork"`), as does memory_events_lib's
+`record_memory_metric` (`metric_id="memory-bank"`, issue #311).
 
 Storage shape: single append-only `metrics` table --
 `(id, metric_id, event_type, value, metadata, event_timestamp, session_id)`.
@@ -615,9 +616,8 @@ class MetricsStore:
 # Formatting -- shared by the get_metrics MCP tool (tools/compress_mcp_server.py)
 # and skills/my-metrics/SKILL.md, so both surfaces render identically. Kept
 # deliberately simpler than savings_ledger.py's formatting (no bars/sparklines) --
-# this store has no established human-facing view of its own yet (that's the
-# "future /my-metrics reporting skill" the issue itself describes as a
-# downstream consumer, not something this ticket needs to design in full).
+# this generic store has no domain-specific rendering (skills/my-metrics is
+# the thin consumer that prints these views verbatim).
 # ---------------------------------------------------------------------------
 
 def _fmt_value(v: float) -> str:

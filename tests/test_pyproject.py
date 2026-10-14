@@ -62,8 +62,8 @@ class PyprojectTomlIsWellFormed(unittest.TestCase):
         # Issue #206: these no longer point straight at tools.*:main --
         # tools/ isn't an importable site-packages package anymore (it
         # ships as wheel data under <env>/src/tools instead), so each
-        # entry point routes through the claude_runway shim, which puts
-        # <env>/src on sys.path before calling the real tools/*.py main().
+        # entry point routes through the claude_runway shim, which loads the
+        # real <env>/src/tools/*.py by file path (issue #290) and calls its main().
         scripts = self.data["project"]["scripts"]
         self.assertEqual(scripts.get("claude-runway-ingest"), "claude_runway:ingest_main")
         self.assertEqual(scripts.get("claude-runway-setup"), "claude_runway:setup_main")

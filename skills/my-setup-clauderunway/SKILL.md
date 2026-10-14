@@ -145,8 +145,8 @@ in step 8 proceeds), stop immediately** and tell the user:
   when present. A THIRD different collection concept from the two above: the ONE shared
   Qdrant collection every project's `memory-bank` server stores memories in (default
   `"memory-bank"`), common across every project on this machine -- unlike `COLLECTION_NAME`
-  (per-project) and `COMPACT_COLLECTION` (per-project by default). Found in Copilot review
-  on PR #178: without extracting this, re-running this skill on a project that had ever
+  (per-project) and `COMPACT_COLLECTION` (per-project by default). Found in a Copilot
+  review: without extracting this, re-running this skill on a project that had ever
   customized it away from the default would silently reset it back to `"memory-bank"` on
   the next run, splitting that project's future memories into a different collection than
   its past ones -- existing memories wouldn't be deleted, but `recall` would no longer find
@@ -157,7 +157,7 @@ in step 8 proceeds), stop immediately** and tell the user:
   `COLLECTION_NAME` (this run's resolved project name), `MEMORY_BANK_ID` is this project's
   OWN identity tag for memory-bank specifically, and it is NOT re-derived from `COLLECTION_NAME`
   on a re-run — `setup_project.py` only defaults it from `--collection-name` when
-  `--memory-bank-id` is omitted entirely. Found in Copilot review on PR #178: without this
+  `--memory-bank-id` is omitted entirely. Found in a Copilot review: without this
   extraction, changing `--collection-name` on a re-run (e.g. via Q2's "Specify") would
   silently retag all FUTURE memories under the new identifier while every EXISTING memory
   stayed tagged under the old one, becoming invisible to default recall/wipe scope — nothing
@@ -174,8 +174,7 @@ path) — including any `COMPACT_COLLECTION` it held — so this state is indist
 a genuinely brand-new project by `COMPACT_COLLECTION`'s absence alone. This matters for Q5 in
 step 4 below: without this signal, re-enabling full setup on a project that was full →
 qdrant-only at some point silently computes a fresh `<collection-name>-conversation` default
-as if no prior compact history could possibly exist, when it might (found in Copilot review
-on PR #130). Only relevant if Q1 (step 3) ends up "Full setup" — a project going TO
+as if no prior compact history could possibly exist, when it might (found in a Copilot review). Only relevant if Q1 (step 3) ends up "Full setup" — a project going TO
 qdrant-only, or staying qdrant-only, never reaches Q5 at all (step 4 is skipped entirely).
 
 Check whether `CLAUDE.md` exists in the current directory and, if so, read it.
@@ -187,7 +186,7 @@ Use `AskUserQuestion` with three questions:
 **Q1 — Setup scope**
 Header: "Setup scope"
 - "Full setup (Recommended)" — Qdrant memory + LM Studio compression + PostToolUse/PreToolUse/SessionEnd hooks
-- "Qdrant-only" — no LM Studio server, no LM Studio-dependent hooks (good for projects where LM Studio isn't in use or you want to add it later). The CORE `record_session_id.py` hook (registered under `SessionStart`/`SessionEnd`) is still installed either way — since #198/#231, it's a base-install hook independent of qdrant-only vs. full setup.
+- "Qdrant-only" — no LM Studio server, no LM Studio-dependent hooks (good for projects where LM Studio isn't in use or you want to add it later). The CORE `record_session_id.py` hook (registered under `SessionStart`/`SessionEnd`) is still installed either way — it's a base-install hook independent of qdrant-only vs. full setup.
 
 **Q2 — Collection name**
 Header: "Collection"
@@ -202,7 +201,7 @@ next message). Use whatever they provide for the remainder of the skill.
 **Q6 — Memory bank collection name**
 Header: "Memory bank"
 Asked here, in step 3 (NOT step 4 alongside Q3-Q5), because `memory-bank` is always
-configured regardless of Q1's answer (issue #175) — unlike Q5 (local-compress's
+configured regardless of Q1's answer — unlike Q5 (local-compress's
 compact-collection), which only applies to a full setup and is skipped entirely for
 qdrant-only.
 - If `MEMORY_BANK_COLLECTION` already has a value: show `"Keep current"` as the first option (description: the existing value)
@@ -297,7 +296,7 @@ default"'s `"memory-bank"`, or "Specify"'s typed name) — unlike `--compact-col
 this is passed explicitly for **every** run, `--qdrant-only` included, since `memory-bank`
 is never gated behind full-vs-qdrant-only the way `local-compress` is. Omitting this flag
 on a re-run of a project that had ever customized it would silently reset it back to the
-`"memory-bank"` default (found in Copilot review on PR #178) — `setup_project.py`'s
+`"memory-bank"` default (found in a Copilot review) — `setup_project.py`'s
 `--memory-bank-collection` isn't "sticky" across runs any more than `--collection-name`/
 `--compact-collection` are, so it must be re-passed explicitly every time, the same way
 this skill already does for those two.
@@ -496,7 +495,7 @@ the key into context, and do NOT stop for it — just proceed.
    it applied and the skills it refreshed, from its output. Tell the user that the
    refreshed skill text only takes effect in a new Claude Code session (step 5).
 4. **Verify.** Tell the user to confirm with `doctor` (it flags a stale compress-hook
-   path left by the #395 rename, among other things), and offer to run it:
+   path left by the hook's rename, among other things), and offer to run it:
    ```
    <venv-python> <CLAUDE_RUNWAY_DIR>/tools/doctor.py <cwd>
    ```

@@ -124,8 +124,9 @@ class CodeItResolverRequirements(unittest.TestCase):
 
     def test_documents_the_windows_failure_mode(self):
         # The "why" comment must survive so a future reader understands the resolver
-        # isn't gratuitous -- it's the issue #286 / #230 Windows command-not-found fix.
-        self.assertIn("#286", self.content)
+        # isn't gratuitous -- it's the Windows command-not-found fix (issues #286 / #230;
+        # the docs themselves carry no ticket numbers, so key on the failure mode).
+        self.assertIn("command-not-found", self.content)
         self.assertIn(".venv/Scripts/", self.content)
 
 
@@ -145,7 +146,7 @@ class PrValidateWordingRequirements(unittest.TestCase):
         # The wording must acknowledge both venv layouts rather than privileging one.
         self.assertIn(".venv/Scripts/python", self.content)
         self.assertIn(".venv/bin/python", self.content)
-        self.assertIn("#286", self.content)
+        self.assertIn("one or the other, never both", self.content)
 
 
 class DevWorkflowResolverRequirements(unittest.TestCase):
@@ -168,7 +169,7 @@ class DevWorkflowResolverRequirements(unittest.TestCase):
     def test_checks_run_through_resolved_python(self):
         self.assertIn("$PYTHON -m ruff check libs tools hooks tests", self.content)
         self.assertIn('$PYTHON -m pyright --pythonpath "$PYTHON"', self.content)
-        self.assertIn("#286", self.content)
+        self.assertIn("command-not-found", self.content)
 
 
 class ResolverLogic(unittest.TestCase):

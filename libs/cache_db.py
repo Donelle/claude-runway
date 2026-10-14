@@ -16,9 +16,11 @@ directory.
 Callers own their own tables (their own CREATE TABLE IF NOT EXISTS against
 the connection this module hands back) -- this module itself defines no
 tables, just where the shared file lives and how to open it. See
-libs/qdrant_collection_hints.py for the first table living here; future
-caches (this toolkit will likely grow more) should reuse connect() below
-rather than resolving their own separate DB file.
+libs/qdrant_collection_hints.py (collection_hints) and
+hooks/redirect_webfetch_to_fetch_url.py (webfetch_denied_urls) for the tables
+living here (qdrant_collection_hints also creates a small schema_versions
+table in this file to track its own migrations); future caches should reuse connect() below rather than
+resolving their own separate DB file.
 
 DB location resolution: CLAUDE_RUNWAY_CACHE_DB env var (absolute path) if
 set, else ~/.claude/claude-runway/cache.db. Same convention as

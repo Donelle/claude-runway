@@ -27,7 +27,7 @@ Optional argument: a keyword or phrase to narrow which compact to find (e.g., `/
    Note: each entry's header from `compact_find` includes a short `(id: ...)`
    suffix — this exists so that two entries which otherwise render
    identically (same date and label; possible for compacts stored before
-   issue #36's idempotency fix) can still be told apart. If two or more
+   the idempotency fix) can still be told apart. If two or more
    options in the selection UI would otherwise have an identical `label`,
    append that suffix to each one's `label` (e.g. `<date> — <label> (id:
    <suffix>)`) so the user can distinguish them; omit it when every
@@ -95,7 +95,7 @@ Optional argument: a keyword or phrase to narrow which compact to find (e.g., `/
 If `compact_find` returns no results for this project (a "No compacts
 collection found" or "No compacts found" message), check whether that
 message also includes a "Did you mean one of these other projects..."
-section (issue #37) — `compact_find` looks for sibling projects with saved
+section — `compact_find` looks for sibling projects with saved
 compacts whenever the current project comes up empty, since an empty
 result usually means either "never compacted" or the project name has
 drifted from whatever it was when /my-compact ran in a way that ISN'T just

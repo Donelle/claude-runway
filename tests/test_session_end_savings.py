@@ -8,7 +8,7 @@ mock.patch.object pattern as test_redirect_webfetch_to_fetch_url.py.
 Issue #162: the hook wrapped systemMessage inside hookSpecificOutput, which is
 not a valid key for SessionEnd — Claude Code rejects the entire payload with a
 schema validation error. The fix emits {"systemMessage": summary} at the JSON
-root. These tests pin that output shape and verify the three silent-exit paths
+root. These tests pin that output shape and verify the silent-exit paths
 produce no stdout.
 
     .venv/bin/python -m unittest discover -s tests
@@ -115,7 +115,7 @@ class SilentExitPaths(unittest.TestCase):
 
     def test_uncredited_only_session_no_output_but_still_finalized(self):
         # #307: events exist (e.g. fetch_url, never credited) but none credited
-        # -> finalize_session reports event_count 0. The session must still be
+        # -> finalize_owned_session reports event_count 0. The session must still be
         # rolled up into the perpetual store, yet nothing may be printed.
         with (
             mock.patch.object(hook.savings_ledger, "tracking_enabled", return_value=True),
@@ -222,11 +222,11 @@ _PAYLOAD_WITH_TRANSCRIPT = json.dumps({
 
 
 class TranscriptParsing(unittest.TestCase):
-    """Hook calls parse_transcript_token_counts and passes result to
-    finalize_session when CLAUDE_RUNWAY_PARSE_TRANSCRIPT_TOKENS is enabled."""
+    """Hook calls parse_session_token_counts and passes result to
+    finalize_owned_session when CLAUDE_RUNWAY_PARSE_TRANSCRIPT_TOKENS is enabled."""
 
     def _run_with_patched_ledger(self, env, finalize_kwargs_capture, transcript_result):
-        """Run main() with all ledger calls stubbed; capture finalize_session kwargs."""
+        """Run main() with all ledger calls stubbed; capture finalize_owned_session kwargs."""
         captured = {}
 
         def _fake_finalize(session_id, project=None, actual_tokens=None, stale_before=None, attribution=None):
@@ -291,8 +291,8 @@ class TranscriptParsing(unittest.TestCase):
         self.assertIsNone(captured["actual_tokens"])
 
     def test_actual_tokens_none_when_transcript_parse_returns_none(self):
-        # parse_transcript_token_counts returned None (e.g. file unreadable) --
-        # finalize_session must still receive None, not an exception.
+        # parse_session_token_counts returned None (e.g. file unreadable) --
+        # finalize_owned_session must still receive None, not an exception.
         captured = {}
         self._run_with_patched_ledger(
             {"CLAUDE_RUNWAY_PARSE_TRANSCRIPT_TOKENS": "1"},

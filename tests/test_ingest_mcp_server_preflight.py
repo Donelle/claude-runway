@@ -2,14 +2,14 @@
 """Tests for index_repo's pre-flight duplicate-point warning (issue #58).
 
 Stdlib-only (unittest, no pytest) and no network -- all QdrantClient,
-FastEmbedProvider, store_batch, and build_entries calls are mocked so these
+FastEmbedProvider, store_batch, and iter_entries calls are mocked so these
 run without a live Qdrant instance or model download.
 
     .venv/bin/python -m unittest discover -s tests
 
 Why this file exists: the warning fires early (before the expensive embedding
-loop) and must NOT fire when reset=True, force=True, collection is empty, or
-collection doesn't exist -- all four "don't warn" cases are pinned here because
+loop) and must NOT fire when reset=True, force=True, collection is empty, collection
+doesn't exist, or points_count is None -- all five "don't warn" cases are pinned here because
 a regression in any direction is silent: a false positive stops legitimate
 re-indexing; a false negative lets duplicate chunks accumulate unnoticed.
 """
@@ -68,7 +68,7 @@ class IndexRepoPreflightWarningTest(unittest.TestCase):
 
         # iter_entries is the CPU-bound scan -- also must not run on early return.
         # Returns an empty generator (no chunks, no skipped files) to keep tests
-        # fast and network-free. index_repo now calls iter_entries(), not build_entries().
+        # fast and network-free. index_repo scans via iter_entries().
         self._iter_entries_patcher = patch.object(_ims, "iter_entries", return_value=iter([]))
         self.mock_iter_entries = self._iter_entries_patcher.start()
 

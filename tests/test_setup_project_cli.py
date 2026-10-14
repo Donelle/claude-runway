@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Tests for tools/setup_project.py's `_hook_env_reminders`.
+"""Tests for tools/setup_project.py's CLI layer (`cmd_init`, `cmd_upgrade`,
+`parse_args`, `_hook_env_reminders`, `_write_json`, skill install/refresh).
 
-Stdlib-only (unittest, no pytest) and no network -- pure function over an
-argparse Namespace, so this needs neither a real target repo nor a real
-venv:
+Stdlib-only (unittest, no pytest) and no network -- tests run against tmp
+target directories (`_hook_env_reminders` itself is a pure function over an
+argparse Namespace):
 
     .venv/bin/python -m unittest discover -s tests
 
-Why this file exists (PR #113 review): --track-savings/--lmstudio-model/
+Why _hook_env_reminders is tested (PR #113 review): --track-savings/--lmstudio-model/
 --lmstudio-url/--savings-db only reach the local-compress MCP server's env
 block in the generated .mcp.json -- they do NOT reach the hook scripts
 written into .claude/settings.json, since Claude Code hook entries have no
@@ -621,9 +622,11 @@ class QdrantOnlyWriteOrderSafety(unittest.TestCase):
         # the stale hooks...
         settings = json.loads((self.target_repo / ".claude" / "settings.json").read_text(encoding="utf-8"))
         self.assertEqual(settings["hooks"]["PreToolUse"], [])
-        # ...but .mcp.json's write never got a chance to run, so
-        # local-compress is still fully configured -- the safer partial
-        # state, not "hooks gone but local-compress still active".
+        # ...but .mcp.json's write is the one that failed, so it is
+        # unchanged and local-compress is still fully configured. So the
+        # partial state IS "hooks gone but local-compress still active"; the
+        # settings-first write order picks it over the reverse (hooks still
+        # registered after their server entry was removed).
         self.assertEqual((self.target_repo / ".mcp.json").read_text(encoding="utf-8"), self.original_mcp_json)
 
 
@@ -709,9 +712,10 @@ class PipInstalledLayoutReminder(unittest.TestCase):
         )
 
     def test_clone_based_layout_keeps_the_original_reminder(self):
-        # None (this repo's real TOOLS_REPO_DIR/.venv exists in this test
-        # environment -- see Step 15 bootstrap) documents the
-        # zero-behavior-change case for the existing documented workflow.
+        # Mocked to None, the value _pip_installed_venv_python returns when
+        # TOOLS_REPO_DIR/.venv exists (the documented clone workflow, see
+        # scripts/bootstrap.sh), whether or not this environment has one --
+        # CI doesn't. Covers the zero-behavior-change case for that workflow.
         with mock.patch.object(self.mod, "_pip_installed_venv_python", return_value=None):
             buf = io.StringIO()
             with redirect_stdout(buf):
@@ -1007,8 +1011,8 @@ class UpgradeSubcommand(unittest.TestCase):
         # PipInstalledLayoutReminder tests already follow this same pattern)
         # has no such directory at all, since its own workflow installs
         # dependencies with a plain `pip install` into the runner's system
-        # Python rather than this repo's Step-15-documented `uv venv`
-        # bootstrap -- asserting on the real, ambient value broke this test
+        # Python rather than the `.venv` scripts/bootstrap.sh creates --
+        # asserting on the real, ambient value broke this test
         # in CI while passing locally.
         captured = {}
 

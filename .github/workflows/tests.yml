@@ -15,7 +15,7 @@ name: Tests
 # longer hardcodes a tool count to compare against (issue #52 replaced
 # that prose with instructions to run this exact script), so there's
 # nothing left to drift out of sync -- this step instead just fails loudly
-# if either server's tool registry stops importing/enumerating cleanly.
+# if any server's tool registry stops importing/enumerating cleanly.
 # The broader template/placeholder-consistency half of the original
 # proposal is still a separate, unfiled follow-up.
 

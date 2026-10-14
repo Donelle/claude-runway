@@ -2,7 +2,7 @@
 Storage + formatting for ClaudeRunway's opt-in savings tracker. Used by:
   - hooks/compress_output.py   (sole ledger WRITER -- see below for why)
   - hooks/session_end_savings.py    (rolls a session's ledger into SQLite, emits a summary)
-  - compress_mcp_server.py          (the savings_summary/savings_detail/savings_trend tools read it;
+  - tools/compress_mcp_server.py     (the savings_summary/savings_detail/savings_trend tools read it;
                                       the 3 credited tools themselves do NOT import this module --
                                       their footer helper only measures character counts)
   - skills/my-savings/SKILL.md      (reads, via the savings_summary/savings_detail MCP tools)
@@ -809,9 +809,12 @@ def _ensure_schema(conn) -> None:
     # Checked BEFORE the CREATE TABLE calls below, specifically so
     # _run_migrations can tell a genuinely fresh DB (nothing to migrate --
     # see its docstring) apart from a pre-existing one that needs its
-    # history replayed. `sessions` specifically, not the other four tables
-    # (`session_tools`/`session_agents`/`session_models`/`meta`), since it's the one this
-    # migration scaffold actually versions.
+    # history replayed. `sessions` is only the fresh-database marker: the
+    # migrations version the other tables too (v2/v3/v6/v7 alter or rebuild
+    # `session_tools`, v5 creates `session_agents` and v6/v7 alter or rebuild it, v9
+    # creates `session_models`, v8 deletes a `meta` row), but a pre-existing
+    # DB older than v5 or v9 has no `session_agents` or `session_models`, so
+    # those tables' absence can't mean "fresh".
     sessions_existed = _table_exists(conn, "sessions")
     # Always the LATEST schema -- a brand-new DB gets every current column
     # in one step and never needs a migration to add anything for it.
@@ -1180,8 +1183,9 @@ def finalize_session(session_id: str, project: str, delete_jsonl: bool = True, a
                      ended_at: Optional[str] = None, events: Optional[list] = None,
                      attribution: Optional[dict] = None) -> dict:
     """
-    Aggregate a session's transient JSONL into one SQLite row (+ per-tool
-    rows), then delete the JSONL (its job is done once rolled up). Returns
+    Aggregate a session's transient JSONL into one SQLite row (+ per-tool,
+    per-agent rows, plus per-model rows when `attribution` is given), then
+    delete the JSONL unless delete_jsonl=False (its job is done once rolled up). Returns
     the aggregate dict, used both for the DB write and to format the
     SessionEnd summary directly without a second read.
 
@@ -1189,9 +1193,9 @@ def finalize_session(session_id: str, project: str, delete_jsonl: bool = True, a
     instead (issue #306), which adds the cross-process ownership this simple
     read-write-delete doesn't have; this stays the plain primitive.
 
-    actual_tokens: optional dict from parse_transcript_token_counts() with
-    keys input/output/cache_read/cache_write -- the real per-turn token counts
-    Anthropic processed this session. When None (opt-in feature disabled or
+    actual_tokens: optional dict from parse_session_token_counts() (or
+    parse_transcript_token_counts()) with keys input/output/cache_read/cache_write
+    -- the real per-turn token counts Anthropic processed this session. When None (opt-in feature disabled or
     transcript parse failed), the four actual_* columns stay 0.
 
     ended_at: optional "%Y-%m-%dT%H:%M:%SZ" timestamp to record instead of
@@ -1518,7 +1522,9 @@ def recover_orphaned_sessions(exclude_session_id: Optional[str] = None, now: Opt
 
 def get_live_session_aggregate(session_id: str) -> dict:
     """
-    Same shape as finalize_session's return, but read-only -- for /my-savings
+    Same shape as finalize_session's return (minus `project` and the
+    `by_model`/`attribution` fields finalize_session adds when given a
+    transcript index), but read-only -- for /my-savings
     mid-session checks where the session hasn't ended yet, so nothing should
     be written to SQLite or have its JSONL deleted.
     """
@@ -1663,8 +1669,8 @@ def query_trend(project: str, bucket: str = "week", n: int = 12) -> list:
         )
 
     conn = _connect()
-    # Fetch all sessions for this project ordered descending so we can stop
-    # early once we have `n` distinct buckets without reading the full table.
+    # Fetch this project's sessions newest-first; the loop below stops reading
+    # them once it has `n` distinct buckets.
     raw = conn.execute(
         "SELECT ended_at, raw_chars_sum, out_chars_sum, event_count FROM sessions "
         "WHERE project = ? ORDER BY ended_at DESC",
@@ -1673,8 +1679,8 @@ def query_trend(project: str, bucket: str = "week", n: int = 12) -> list:
     conn.close()
 
     # Aggregate into buckets from most-recent to oldest, stopping once we have
-    # `n` distinct buckets -- equivalent to the SQL LIMIT but applied after the
-    # Python-side bucketing so partial calendar-year weeks are counted correctly.
+    # `n` distinct buckets -- a limit applied after the Python-side bucketing,
+    # so partial calendar-year weeks are counted correctly.
     agg: dict[str, dict] = {}
     for ended_at, raw_chars, out_chars, event_count in raw:
         key = _key(ended_at)
@@ -1711,7 +1717,7 @@ def query_all_projects() -> list:
     for a given project, derived from session_tools: its summed before minus its
     summed after (clamped at 0, like every other saving here), NOT a sum of the
     per-session saved_chars, which are each clamped and so overstate a tool that
-    grows content in some sessions. Rows with no recorded size are left out. Returns None when no
+    grows content in some sessions. Rows with no recorded size are left out. best_tool is None when no
     session_tools rows exist for that project (e.g. all its sessions predate the
     per-tool breakdown schema), so callers can suppress the field rather than
     fabricating a value.
@@ -2066,8 +2072,8 @@ def _format_actual_token_block(session_agg: dict, project: str = "") -> list:
     ]
 
     # Deliberately no "local compression avoided ... % of total processed" line
-    # here (issue #436): it divided an ESTIMATE (chars/3.5 credited savings) by
-    # a MEASUREMENT (real usage from the transcript) without saying so. The
+    # here (issue #436): it divided an ESTIMATE (a token saving derived as
+    # chars/3.5, since dropped) by a MEASUREMENT (real usage from the transcript) without saying so. The
     # compression figure already appears in the savings summary itself.
 
     # Cache efficiency ratio: how many times more cache-read tokens than fresh
@@ -2325,13 +2331,15 @@ def format_trend_view(trend_rows: list, project: str, bucket: str = "week") -> s
     Renders a day/week-bucketed trend view for one project.
 
     trend_rows is the list returned by query_trend (ascending, oldest first).
-    Each row: {bucket, sessions, total_raw_chars, total_out_chars, total_saved_chars}.
+    Each row: {bucket, sessions, total_raw_chars, total_out_chars, total_saved_chars,
+    unsized_sessions}.
 
     Shows:
       - a sparkline across all buckets (reuses _sparkline) of characters saved
       - a table of recent buckets with session count, characters before/after
         and percent reduction
-      - a grand-total line at the bottom
+      - a grand-total line at the bottom, followed by a note when some sessions
+        have no recorded size and are left out
 
     When trend_rows is empty, returns a short "no history yet" message rather
     than an empty table so callers can relay it directly.
@@ -2380,8 +2388,11 @@ def format_trend_view(trend_rows: list, project: str, bucket: str = "week") -> s
 def format_json(session_agg: dict, project_summary: dict, tool_breakdown: list, last_n: list, all_projects: list,
                 model_breakdown: Optional[dict] = None) -> str:
     """
-    Machine-readable JSON export of all savings data.  Mirrors the same five
-    data blocks that format_detail_view renders as text, serialised as a
+    Machine-readable JSON export of the savings data.  Mirrors most of the data
+    blocks that format_detail_view renders as text (session, project summary,
+    per-tool, last-N sessions, across projects, and the per-model split when
+    there is one), but NOT its "Main session vs subagents" block (the
+    session's `by_agent` rows are text-only), serialised as a
     single JSON object so the caller can pipe it into jq, a spreadsheet
     importer, or a dashboard without hand-parsing the terminal output.
 

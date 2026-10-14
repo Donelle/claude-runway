@@ -339,14 +339,10 @@ def _log_registered_tool_count():
     so nothing here may ever call print() without file=sys.stderr) of how
     many tools this server currently registers.
 
-    EVALUATION.md's Track A section used to have no live self-reporting
-    mechanism at all for this server's tool count, so its "as of this
-    writing" number drifted stale twice in a row (issue #23 corrected 6->8
-    total across both servers; by the time of issue #52's investigation
-    this server alone had already moved on to 7, since
-    set_collection_description shipped after #23 and was never added to the
-    doc). Uses libs/mcp_tool_introspect.py (issue #52/GROW-05), the same
-    enumeration `tools/report_tool_counts.py` uses, so the two can't drift.
+    Gives EVALUATION.md's tool count a live source instead of a hand-typed
+    number that drifted stale (issues #23/#52). Uses
+    libs/mcp_tool_introspect.py (issue #52/GROW-05), the same enumeration
+    `tools/report_tool_counts.py` uses, so the two can't drift.
 
     This is purely an operator-visible log line plus the live count
     `tools/report_tool_counts.py` and EVALUATION.md's Track A prose point at
@@ -581,12 +577,10 @@ async def index_repo(
     #     producer thread, calling ctx.report_progress() per chunk in real
     #     time rather than in bulk at the end.
     #
-    # Progress uses a single monotonically increasing counter across BOTH the
-    # chunking and embed/store phases, with the combined total only known once
-    # chunking is done (total_chunks * 2 -- chunking counted as N steps, then
-    # embed/store counts another N steps against the same total). This avoids
-    # the progress-goes-backward problem that occurs when the embed/store phase
-    # reports from 0 while the prior chunking phase already reported up to N.
+    # Progress is reported as two interleaved streams: chunking reports a
+    # running chunk count with no known total, and each flushed batch reports
+    # stored/chunk_count-so-far (batches are embedded and stored while
+    # chunking is still going, so that total keeps growing until chunking ends).
     #
     # A sentinel value (_DONE) signals that the producer has finished.
     # Errors from iter_entries() arrive as (None, (rel, err)) tuples (the
@@ -680,12 +674,12 @@ async def index_repo(
         """Report embed/store progress as chunks flow through, not after all are done.
 
         `stored_in_batch` counts stored entries within the CURRENT store_batch()
-        call (resets to 1 on each new call). We accumulate across calls into the
+        call (starts over on each new call). We accumulate across calls into the
         nonlocal stored_count so the progress value is monotonically increasing.
-        chunk_count is at its final value by the time embed/store begins (we only
-        flush once a full UPSERT_BATCH_SIZE batch has been collected, after the
-        corresponding chunks were already counted in the drain loop above). Using
-        chunk_count as the total makes the embed/store progress determinate.
+        chunk_count is only the number of chunks seen so far, not a final total:
+        batches are flushed while chunking is still running (a flush happens
+        once a full UPSERT_BATCH_SIZE batch has been collected), so it can still
+        grow after this is reported.
         """
         nonlocal stored_count
         # stored_in_batch is within-batch progress (1..batch_size); to make
@@ -816,7 +810,7 @@ async def sync_repo(
     collection/qdrant_url/embedding_model default to this project's
     COLLECTION_NAME/QDRANT_URL/EMBEDDING_MODEL env vars if not given.
 
-    Reports progress via MCP progress notifications per changed file.
+    Reports progress via MCP progress notifications as chunks are embedded and stored.
     """
     # See index_repo's identical check above -- issue #26.
     chunk_err = validate_chunk_params(chunk_lines, overlap)
@@ -1065,7 +1059,7 @@ async def sync_repo(
         # the batch's file_paths match, deleting every changed/removed
         # file's points in each chunked call.
         for batch in batched(to_delete, DELETE_BATCH_SIZE):
-            # Retry once on a transient dropped connection -- see issue #75 /
+            # Retry on a transient dropped connection -- see issue #75 /
             # libs/qdrant_retry.py.
             call_with_retry(
                 client.delete,
@@ -1209,7 +1203,7 @@ def get_collection_info(
     qdrant_api_key = qdrant_api_key or DEFAULT_QDRANT_API_KEY
 
     client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
-    # Retry once on a transient dropped connection -- see issue #75/#76 /
+    # Retry on a transient dropped connection -- see issue #75/#76 /
     # libs/qdrant_retry.py.
     if not call_with_retry(client.collection_exists, collection):
         return f"Collection '{collection}' does not exist yet."
@@ -1264,7 +1258,7 @@ async def find_in_collection(
     embedding_model = embedding_model or DEFAULT_EMBEDDING_MODEL
 
     client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
-    # Retry once on a transient dropped connection -- see issue #75/#76 /
+    # Retry on a transient dropped connection -- see issue #75/#76 /
     # libs/qdrant_retry.py.
     if not call_with_retry(client.collection_exists, collection):
         return (
@@ -1352,7 +1346,7 @@ def set_collection_description(
     qdrant_api_key = qdrant_api_key or DEFAULT_QDRANT_API_KEY
 
     client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
-    # Retry once on a transient dropped connection -- see issue #75/#76 /
+    # Retry on a transient dropped connection -- see issue #75/#76 /
     # libs/qdrant_retry.py.
     if not call_with_retry(client.collection_exists, collection):
         return (
@@ -1406,7 +1400,7 @@ def list_collections(
     qdrant_url = qdrant_url or DEFAULT_QDRANT_URL
     qdrant_api_key = qdrant_api_key or DEFAULT_QDRANT_API_KEY
     client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
-    # Retry once on a transient dropped connection -- see issue #75/#76 /
+    # Retry on a transient dropped connection -- see issue #75/#76 /
     # libs/qdrant_retry.py.
     names = sorted(c.name for c in call_with_retry(client.get_collections).collections)
     if not names:

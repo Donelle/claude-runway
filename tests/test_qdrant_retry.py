@@ -5,8 +5,7 @@ Stdlib-only (unittest, no pytest), no network and no real Qdrant/Docker --
 uses fake sync/async functions that raise on their first N calls to stand in
 for a dropped pooled connection, since the actual Docker Desktop vpnkit
 idle-reap behavior this guards against isn't something a unit test can
-reliably simulate (see the module docstring and 75-plan.md's "Known
-limitation" section).
+reliably simulate (see the module docstring).
 
 time.sleep/asyncio.sleep are patched out everywhere here so the backoff
 between attempts (real behavior, added after real-world testing showed a

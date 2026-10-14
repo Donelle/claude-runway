@@ -107,15 +107,15 @@ class MemoryBankServerMissing(unittest.TestCase):
         self.assertFalse(migration.detect(after_mcp, {}))
 
     def test_apply_preserves_a_customized_embedding_model(self):
-        # Regression for the finding from Copilot review on PR #227:
-        # build_mcp_servers has no embedding_model parameter at all -- every
-        # server it generates just inherits mcp.json.template's own
-        # hardcoded default. A project whose qdrant/codebase-indexer blocks
-        # were hand-customized to a different model (the documented, if
-        # manual, way to change this) must get a memory-bank block that
-        # matches THAT model, not silently reset to the template default,
-        # or it can mismatch whatever model actually created the shared
-        # memory-bank collection on this machine.
+        # Pins the CURRENT, legacy behavior (issue #458), not a desired
+        # contract: the migration copies the code-index block's
+        # EMBEDDING_MODEL into the new memory-bank block. That copy came from
+        # the Copilot review on PR #227 (build_mcp_servers' embedding_model
+        # parameter defaults to blank and the migration doesn't pass it, so
+        # without the copy a hand-customized project got the template
+        # default). Since #428 memory-bank's model is independent of the
+        # code-index model, so this assertion should change when #458 is
+        # fixed.
         migration = _migration("memory-bank-server-missing")
         before = {
             "mcpServers": {
@@ -349,7 +349,8 @@ class RecordSessionIdHooksMissing(unittest.TestCase):
     def test_detect_true_when_old_posttooluse_wildcard_present_but_sessionstart_absent(self):
         # A project configured by issue #198 (old PostToolUse '.*' design)
         # before issue #231 shipped: has PostToolUse+SessionEnd but not
-        # SessionStart -- both _RECORD_SESSION_ID_EVENTS are still missing.
+        # SessionStart -- the PostToolUse entry doesn't count for that event,
+        # so _RECORD_SESSION_ID_EVENTS still has SessionStart missing.
         migration = _migration("record-session-id-hooks-missing")
         settings_json = {
             "hooks": {
@@ -636,7 +637,7 @@ class LocalCompressEmbeddingModelMissing(unittest.TestCase):
 class PendingMigrations(unittest.TestCase):
     def test_all_pending_on_a_fully_stale_project(self):
         # A project with the old PostToolUse '.*' block (issue #198 config)
-        # plus no memory-bank / HF_HUB_OFFLINE: all four migrations pending.
+        # plus no memory-bank / HF_HUB_OFFLINE: every migration pending.
         mcp_json = {
             "mcpServers": {
                 "qdrant": {"env": {}},
@@ -724,7 +725,7 @@ class RunUpgradeEndToEnd(unittest.TestCase):
         # has memory-bank and HF_HUB_OFFLINE absent (pre-#175/#221), plus
         # the OLD PostToolUse '.*' registration for record_session_id.py
         # (issue #198's original design, superseded by SessionStart in #231).
-        # This exercises all four migrations in one end-to-end run.
+        # This exercises every migration in one end-to-end run.
         (self.target_repo / ".mcp.json").write_text(
             json.dumps(
                 {

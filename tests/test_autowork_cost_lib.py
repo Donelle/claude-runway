@@ -291,6 +291,75 @@ class Report(Base):
         self.assertIn("No autowork", C.format_report(C.build_report([])))
 
 
+class CacheRebuild(Base):
+    """Longest gap and cold-cache rebuild count, on fixtures with and without a rebuild."""
+
+    def attempt(self, agent_id, entries):
+        write_agent(self.root, "s1", agent_id, "toolu_" + agent_id, "d", 7, entries)
+        return C.parse_attempt(self.root / "proj" / "s1" / "subagents" / f"agent-{agent_id}.jsonl")
+
+    def rebuilt(self):
+        return self.attempt("reb", [
+            asst("m1", "model-a", usage(1, 56000, 0, 10), iso("01:00:00")),   # first request: always writes, never a rebuild
+            asst("m2", "model-a", usage(1, 500, 56000, 10), iso("01:00:30")),
+            asst("m3", "model-a", usage(1, 224000, 0, 10), iso("01:09:00")),  # 510 s later, read nothing, wrote the context again
+            asst("m4", "model-a", usage(1, 300, 224000, 10), iso("01:09:20")),
+        ])
+
+    def warm(self):
+        return self.attempt("warm", [
+            asst("m1", "model-a", usage(1, 56000, 0, 10), iso("01:00:00")),
+            asst("m2", "model-a", usage(1, 500, 56000, 10), iso("01:04:40")),  # 280 s gap, cache still read
+            asst("m3", "model-a", usage(1, 300, 56500, 10), iso("01:04:50")),
+        ])
+
+    def test_rebuild_is_counted_with_its_gap(self):
+        a = self.rebuilt()
+        self.assertEqual(a["cold_rebuilds"], 1)
+        self.assertEqual(a["longest_gap_s"], 510)
+
+    def test_no_rebuild_when_the_cache_was_still_read(self):
+        a = self.warm()
+        self.assertEqual(a["cold_rebuilds"], 0)
+        self.assertEqual(a["longest_gap_s"], 280)
+
+    def test_definition_edges(self):
+        big = C.REBUILD_MIN_CREATION
+        gap = C.REBUILD_GAP_S
+        # exactly at the gap threshold is not "over"; a small write is not "large"; a read means the cache was alive
+        self.assertEqual(C.cache_stats([(0, big, 0), (gap, big, 0)])["cold_rebuilds"], 0)
+        self.assertEqual(C.cache_stats([(0, big, 0), (gap + 1, big - 1, 0)])["cold_rebuilds"], 0)
+        self.assertEqual(C.cache_stats([(0, big, 0), (gap + 1, big, 1)])["cold_rebuilds"], 0)
+        self.assertEqual(C.cache_stats([(0, big, 0), (gap + 1, big, 0)])["cold_rebuilds"], 1)
+        self.assertEqual(C.cache_stats([(None, big, 0)]), {"longest_gap_s": None, "cold_rebuilds": 0})
+
+    def test_streamed_lines_of_one_request_use_its_earliest_timestamp(self):
+        a = self.attempt("str", [
+            asst("m1", "model-a", usage(1, 56000, 0, 10), iso("01:00:00")),
+            asst("m2", "model-a", usage(1, 400, 56000, 1), iso("01:00:10")),
+            asst("m2", "model-a", usage(1, 400, 56000, 30), iso("01:08:00")),  # a late line of m2 must not look like a new request
+        ])
+        self.assertEqual(a["longest_gap_s"], 10)
+        self.assertEqual(a["cold_rebuilds"], 0)
+
+    def test_report_shows_cache_creation_gap_and_rebuilds_per_ticket(self):
+        reb = ticket_row("issue-7-1", iso("02:00:00"), C.ticket_metadata(self.rebuilt(), {"issue": 7}))
+        warm = ticket_row("issue-8-1", iso("03:00:00"), C.ticket_metadata(self.warm(), {"issue": 8}))
+        old = ticket_row("issue-9-1", iso("04:00:00"), {"issue": 9, "cost": {
+            "available": True, "by_model": {"model-a": {"requests": 1, "input_tokens": 1, "cache_creation_tokens": 5,
+                                                         "cache_read_tokens": 0, "output_tokens": 1}}}})
+        rep = C.build_report([reb, warm, old])
+        by_issue = {t["issue"]: t for t in rep["tickets"]}
+        self.assertEqual(by_issue[7]["cache_creation_tokens"], 56000 + 500 + 224000 + 300)
+        self.assertEqual((by_issue[7]["longest_gap_s"], by_issue[7]["cold_rebuilds"]), (510, 1))
+        self.assertEqual((by_issue[8]["longest_gap_s"], by_issue[8]["cold_rebuilds"]), (280, 0))
+        self.assertIsNone(by_issue[9]["cold_rebuilds"])  # recorded before these fields existed
+        text = C.format_report(rep)
+        self.assertIn("longest gap 510s, cold-cache rebuilds 1", text)
+        self.assertIn("longest gap 280s, cold-cache rebuilds 0", text)
+        self.assertIn("cold-cache rebuilds n/a", text)
+
+
 class Cli(Base):
     def run_cli(self, *argv):
         out, err = io.StringIO(), io.StringIO()

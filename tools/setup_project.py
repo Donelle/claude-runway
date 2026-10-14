@@ -81,7 +81,8 @@ def _pip_installed_venv_python() -> Optional[Path]:
     `claude-runway-setup` console script from a `pipx`/`uv tool install`
     install (the two methods `docs/installation.md`'s "Alternative" callout actually
     documents): there IS no `.venv` sibling directory next to the installed
-    `tools`/`libs` packages under site-packages -- pipx/uv tool manage their
+    `tools`/`libs` directories (wheel data files under `<env>/src`, issue
+    #206) -- pipx/uv tool manage their
     own venv elsewhere, and `sys.executable` (whichever interpreter is
     actually running this console script right now) is the only
     generally-correct answer in that case, since that's exactly the
@@ -869,8 +870,9 @@ def main() -> None:
     Entry point for both `python tools/setup_project.py` (the
     `if __name__` guard below) and the `claude-runway-setup` console
     script pip/pipx/uvx installs (issue #50) -- pulled out into its own
-    function purely so `[project.scripts]` in pyproject.toml has something
-    to point `module:function` at; behavior is unchanged either way.
+    function so the `claude_runway:setup_main` shim that
+    `[project.scripts]` in pyproject.toml points at (issue #206) has
+    something to call; behavior is unchanged either way.
     """
     parsed_args = parse_args()
     parsed_args.func(parsed_args)
