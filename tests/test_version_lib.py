@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Tests for libs/version_lib.py and the `--version` flag on the three CLIs
-(issue #348).
+"""Tests for libs/version_lib.py and the `--version` flag on the three CLIs.
+
 
     .venv/bin/python -m unittest discover -s tests
 """
@@ -29,7 +29,7 @@ class GetVersion(unittest.TestCase):
             self.assertEqual(version_lib.get_version(), "1.2.3.dev4+gabc1234")
 
     def test_checkout_wins_over_an_also_installed_distribution(self):
-        # Copilot review (PR #372): running a clone with an interpreter that
+        # Copilot review: running a clone with an interpreter that
         # ALSO has claude-runway installed must report the clone's version.
         with (
             mock.patch.object(version_lib, "_checkout_root", return_value=version_lib.Path(REPO_ROOT)),
@@ -112,7 +112,7 @@ class VersionFlagOnEachCli(unittest.TestCase):
 
 class IngestVersionWorksWithBrokenDependencies(unittest.TestCase):
     def test_version_exits_zero_even_when_qdrant_imports_fail(self):
-        # Copilot review (PR #372): the dependency import guard in
+        # Copilot review: the dependency import guard in
         # ingest_to_qdrant.py exit(1)s before parse_args() ever runs, so
         # --version must be answered ahead of it. Shadow the third-party
         # modules with ones that raise ImportError (PYTHONPATH wins over

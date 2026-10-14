@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for issue #397: conversation-compact collections are marked internal
+"""Conversation-compact collections are marked internal
 (libs/qdrant_compact_marker.py), written by compact_store and honored by
 find_in_collection/list_collections; and the qdrant server reads
 COMPACT_EMBEDDING_MODEL and checks for a model mismatch.
@@ -137,7 +137,7 @@ class CompactStoreMarksCollection(unittest.TestCase):
 
     def test_legacy_unmarked_collection_gets_marked_on_next_store_keeping_its_description(self):
         mod, client_cls = self._module()
-        # A pre-#397 collection: exists, has a description hint, no marker.
+        # A pre-marker collection: exists, has a description hint, no marker.
         col = f"{mod.COMPACT_COLLECTION}-my-project"
         client_cls().collections[col] = {}
         client_cls.metadata[col] = {"description": "legacy"}

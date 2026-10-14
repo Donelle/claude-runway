@@ -220,7 +220,7 @@ class StoreBatch(unittest.TestCase):
 
 
 class EnsureFilePathIndex(unittest.TestCase):
-    """Tests for ensure_file_path_index() (issue #54)."""
+    """Tests for ensure_file_path_index()."""
 
     def test_creates_index_when_missing(self):
         client = _FakeSyncClient(existing_payload_schema={})

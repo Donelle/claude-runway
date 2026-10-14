@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Tests for tools/ingest_to_qdrant.py's ingest() -- specifically its
---dry-run contract (PR #121 review, Copilot, issue #54 follow-up).
+--dry-run contract.
 
 Stdlib-only (unittest, no pytest), no network and no real Qdrant/FastEmbed
 -- QdrantClient, FastEmbedProvider, and QdrantConnector are all mocked out,
@@ -55,11 +55,11 @@ class DryRunNeverTouchesQdrant(unittest.TestCase):
     """--dry-run is documented (--help, and the "not storing" print in
     ingest() itself) as a pure preview -- these pin that contract after a
     real regression: an earlier version of the file_path payload-index
-    backfill (issue #54) unconditionally constructed a QdrantClient and
+    backfill unconditionally constructed a QdrantClient and
     called collection_exists/ensure_file_path_index even when dry_run was
     set, which broke an offline dry run outright and, for an online one,
     silently created a real payload index despite the "preview only"
-    contract. Confirmed by reproduction before fixing (see PR #121)."""
+    contract. Confirmed by reproduction before fixing."""
 
     def test_plain_dry_run_constructs_no_qdrant_client_at_all(self):
         fake_client_cls = mock.MagicMock()
@@ -129,7 +129,7 @@ class NonDryRunStillPerformsCollectionMaintenance(unittest.TestCase):
         return fake_check
 
     def test_non_dry_run_reset_uses_filtered_delete_never_delete_collection(self):
-        """Issue #265: pins the index_repo-style filtered delete (this used
+        """Pins the index_repo-style filtered delete (this used
         to pin a raw delete_collection)."""
         fake_client = mock.MagicMock()
         fake_client.collection_exists.return_value = True
@@ -169,7 +169,7 @@ def _transient_drop():
 
 
 class SharedPreparationWithIndexRepo(unittest.TestCase):
-    """Issue #304: the CLI now runs index_repo's shared preparation
+    """The CLI now runs index_repo's shared preparation
     (libs/qdrant_index_prep.py). These failed on main before the fix: a
     --dry-run loaded the embedding model, and the non-reset path's
     collection_exists/ensure_file_path_index weren't retry-wrapped, so one
@@ -235,7 +235,7 @@ class SharedPreparationWithIndexRepo(unittest.TestCase):
 
 
 class ResetRefusesMemoryBankCollection(unittest.TestCase):
-    """Issue #265: --reset against the configured memory-bank collection is
+    """--Reset against the configured memory-bank collection is
     refused outright, before any Qdrant client is even constructed."""
 
     def _assert_refused(self, **overrides):
@@ -258,7 +258,7 @@ class ResetRefusesMemoryBankCollection(unittest.TestCase):
         self._assert_refused(dry_run=True)
 
     def test_non_reset_ingest_into_memory_bank_name_is_not_this_guards_concern(self):
-        """Scope pin: only --reset is guarded here (issue #265)."""
+        """Scope pin: only --reset is guarded here."""
         fake_client = mock.MagicMock()
         fake_client.collection_exists.return_value = False
         with mock.patch.object(mod, "QdrantClient", return_value=fake_client), \
@@ -293,7 +293,7 @@ def _dry_run_indexed_paths(args) -> set:
 
 
 class CliParityWithMcpServer(unittest.TestCase):
-    """Issue #276: three ways the CLI had drifted from ingest_mcp_server.py.
+    """Three ways the CLI had drifted from ingest_mcp_server.py.
     The csv, manifest and env-fallback tests failed on main before the fix;
     the flags-win, no-env-defaults and --help tests are guards on the new
     defaults (precedence, unchanged built-ins, no secret echoed in help)."""
@@ -321,7 +321,7 @@ class CliParityWithMcpServer(unittest.TestCase):
             )
         self.assertEqual(captured["paths"], {os.path.join("keep", "m.py")})
 
-    # --- 2. manifest self-indexing (#91) ---------------------------------
+    # --- 2. manifest self-indexing ---------------------------------
 
     def test_cli_never_indexes_the_sync_manifest(self):
         """Mirrors test_qdrant_ingest_lib.ManifestSelfIndex for the CLI path:
@@ -398,7 +398,7 @@ class CliParityWithMcpServer(unittest.TestCase):
 
 
 class MainIsTheConsoleScriptEntryPoint(unittest.TestCase):
-    """`main()` (issue #50) is what pyproject.toml's `claude-runway-ingest`
+    """`main()` is what pyproject.toml's `claude-runway-ingest`
     console script points `module:function` at -- pinning that it does
     exactly what the `if __name__ == "__main__":` guard always did
     (`asyncio.run(ingest(parse_args()))`), just pulled into a callable so

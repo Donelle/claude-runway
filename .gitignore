@@ -3,7 +3,7 @@ __pycache__/
 .venv/
 .DS_Store
 
-# pyproject.toml packaging build artifacts (issue #50) -- generated locally
+# pyproject.toml packaging build artifacts -- generated locally
 # by `pip install -e .` / `python -m build` / `uv build`, never committed.
 *.egg-info/
 build/

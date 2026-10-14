@@ -1,11 +1,11 @@
 # Core -- required for the Qdrant codebase-memory piece (qdrant_mcp_server.py,
-# ingest_to_qdrant.py, ingest_mcp_server.py) and the memory-bank piece (tools/memory_bank_mcp_server.py,
-# issue #175) -- memory-bank reuses this same Qdrant client machinery (mcp,
+# ingest_to_qdrant.py, ingest_mcp_server.py) and the memory-bank piece (tools/memory_bank_mcp_server.py)
+# -- memory-bank reuses this same Qdrant client machinery (mcp,
 # this repo's own libs/qdrant_embeddings.py FastEmbedProvider, qdrant-client), so no separate
 # dependency section is needed for it. Install these even if you're not using
 # local-compress.
 #
-# Issues #98/#175: the servers use `mcp.server.mcpserver.MCPServer`, the officially
+# The servers use `mcp.server.mcpserver.MCPServer`, the officially
 # supported path in mcp>=2.0.0 (the older module path was removed there).
 mcp[cli]>=2.0.0
 qdrant-client

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Shared, dependency-free join of the savings tracker's compression events to the
-session transcript (issue #440): which MODEL and which TURN each compression
+session transcript: which MODEL and which TURN each compression
 happened under, plus a per-model chars-per-token ratio measured from the same
 transcript.
 
@@ -12,7 +12,7 @@ the current turn may not be in it yet. By SessionEnd the transcript is complete.
 What the transcript gives (all of it recorded by Claude Code, none estimated):
   - each assistant entry: `message.id` (the turn), `message.model`, `timestamp`,
     `message.usage`, and one `tool_use` block per call, whose `id` is the same
-    `tool_use_id` the PostToolUse payload carries (stored on the event by #437);
+    `tool_use_id` the PostToolUse payload carries (stored on the event by the compress hook);
   - each tool result (a user entry's `tool_result` block): which call it answers
     and its text. A compressed result's text starts with `[compressed A -> B
     chars`, which is how the join is cross-checked.

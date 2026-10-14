@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Tests for libs/memory_bank_report_lib.py and tools/memory_bank_report.py
-(issue #338) -- the read-only baseline report over memory-events.db.
+-- the read-only baseline report over memory-events.db.
 
 Stdlib-only, no network, real on-disk SQLite in a temp dir. Rows are seeded
 through memory_events_lib's own _connect() (so the schema under test is the
@@ -98,7 +98,7 @@ class DeadMemoryRatioTest(_DbTestCase):
         self.assertEqual(result["overall"]["remembered"], 1)
 
     def test_non_finite_or_negative_min_age_is_rejected(self):
-        # PR #424 review: nan silently disabled the filter; inf overflowed gmtime().
+        # Nan silently disabled the filter; inf overflowed gmtime().
         for bad in (float("nan"), float("inf"), -1.0):
             with self.assertRaises(ValueError):
                 rl.dead_memory_ratio(self.ro(), min_age_days=bad)
@@ -122,7 +122,7 @@ class DeadMemoryRatioTest(_DbTestCase):
         self.assertEqual(rl.dead_memory_ratio(self.ro())["overall"]["dead"], 1)
 
     def test_generator_exclusions_apply_to_recall_rows_too(self):
-        # PR #424 review: a generator was consumed by the first clause, so
+        # a generator was consumed by the first clause, so
         # the excluded project's recall still revived the memory.
         self.add("remember", "a", "2026-09-01T00:00:00Z")
         self.add("recall", "a", "2026-09-02T00:00:00Z", project="x")
@@ -182,7 +182,7 @@ class BuildReportTest(_DbTestCase):
             conn.execute("DELETE FROM memory_events")
 
     def test_all_sections_read_inside_one_transaction(self):
-        # PR #424 review: every section must see one snapshot, so each
+        # Every section must see one snapshot, so each
         # query has to run inside the same open read transaction.
         self.add("remember", "a", "2026-09-01T00:00:00Z")
         seen = []

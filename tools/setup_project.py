@@ -4,9 +4,9 @@ One-time setup for a target project repo: writes that repo's `.mcp.json`
 and `.claude/settings.json` with every `REPLACE-WITH-*` /
 `/absolute/path/to/...` placeholder from `templates/mcp.json.template` and
 `templates/settings.json.template` filled in automatically, instead of the
-manual copy-and-hand-edit flow in `docs/installation.md`'s steps 4/4b/5
-(issue #48). Also structurally prevents stale hand-typed example paths
-(issue #34/BUG-14) recurring, since every path here is computed, not typed.
+manual copy-and-hand-edit flow in `docs/installation.md`'s steps 4/4b/5.
+Also structurally prevents stale hand-typed example paths
+(BUG-14) recurring, since every path here is computed, not typed.
 
 Usage:
     python tools/setup_project.py init /path/to/target-repo
@@ -15,19 +15,19 @@ Usage:
     python tools/setup_project.py init /path/to/target-repo \
         --collection-name my-project --lmstudio-model google/gemma-3-4b --track-savings
     python tools/setup_project.py init /path/to/target-repo --install-skills
-    python tools/setup_project.py init --install-skills   # skills only, no target_repo (issue #205)
+    python tools/setup_project.py init --install-skills   # skills only, no target_repo
 
     python tools/setup_project.py upgrade /path/to/target-repo             # apply pending config migrations + refresh installed skills
     python tools/setup_project.py upgrade /path/to/target-repo --dry-run
     python tools/setup_project.py upgrade /path/to/target-repo --auto-yes
 
-`upgrade` (issue #225) is for an ALREADY-configured project: unlike `init`,
+`upgrade` is for an ALREADY-configured project: unlike `init`,
 which resets every toolkit-owned setting to whatever this run's flags/
 defaults are, `upgrade` compares the target's current `.mcp.json`/
 `.claude/settings.json` against a fixed set of named, individually
 detectable config gaps (see `libs/upgrade_lib.py`) and applies only the ones
-the user approves, leaving every other config setting untouched. Since issue
-#449 it ALSO refreshes product skills that are already installed under
+the user approves, leaving every other config setting untouched. It
+ALSO refreshes product skills that are already installed under
 `~/.claude/skills/` (`--skills-dir` to override) and differ from the shipped
 ones -- a second, separate step after the config migrations (same
 `--dry-run`/`--auto-yes` semantics), which rewrites only the body of an
@@ -74,15 +74,15 @@ TOOLS_REPO_DIR = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))
 
 def _pip_installed_venv_python() -> Optional[Path]:
     """
-    Issue #50: `setup_project_lib.venv_python_path`'s DEFAULT assumes the
+    `setup_project_lib.venv_python_path`'s DEFAULT assumes the
     "clone this repo, `uv venv` right next to it" layout
     `docs/installation.md`'s step 3 documents -- `TOOLS_REPO_DIR / ".venv" / "bin" /
     "python"`. That assumption breaks when this script runs as the
     `claude-runway-setup` console script from a `pipx`/`uv tool install`
     install (the two methods `docs/installation.md`'s "Alternative" callout actually
     documents): there IS no `.venv` sibling directory next to the installed
-    `tools`/`libs` directories (wheel data files under `<env>/src`, issue
-    #206) -- pipx/uv tool manage their
+    `tools`/`libs` directories (wheel data files under `<env>/src`)
+    -- pipx/uv tool manage their
     own venv elsewhere, and `sys.executable` (whichever interpreter is
     actually running this console script right now) is the only
     generally-correct answer in that case, since that's exactly the
@@ -108,7 +108,7 @@ def _atomic_write(path: Path, content: str) -> None:
     """
     Writes text atomically: serialize to a temp file in the SAME directory
     as the destination, flush + fsync it, then os.replace() over the real
-    path. Found in PR #113 review: the previous open(path, "w") truncated
+    path. Found in review: the previous open(path, "w") truncated
     the destination immediately, so an interruption or disk-full error
     mid-write could destroy the target repo's existing .mcp.json/.claude/
     settings.json -- exactly the content this script's merge logic exists
@@ -116,13 +116,13 @@ def _atomic_write(path: Path, content: str) -> None:
     Windows as long as source and destination share a filesystem, which a
     temp file created in the destination's own directory guarantees.
 
-    Factored out of _write_json (issue #205) so --install-skills's SKILL.md
+    Factored out of _write_json so --install-skills's SKILL.md
     writes share the exact same atomicity guarantee instead of a second,
     possibly-drifted copy of this logic -- a skill file is no less worth
     protecting from a truncate-then-crash than .mcp.json/settings.json is.
 
     Writes via a BINARY-mode file handle (`content.encode("utf-8")`), not
-    a text-mode one (Copilot review on PR #224): opening in text mode
+    a text-mode one: opening in text mode
     without an explicit `newline=""` translates every "\n" in `content` to
     the PLATFORM's own line ending on write (CRLF on Windows) -- combined
     with `libs/setup_project_lib.py`'s `plan_skill_installs` reading a
@@ -167,7 +167,7 @@ def _redact_secrets(mcp_servers: dict) -> dict:
     write always uses the unredacted `result.mcp_json`/`generated_mcp_
     servers`, so the API key still ends up correctly configured on disk).
 
-    Found in PR #113 review: `generated_mcp_servers` is already scoped to
+    Found in review: `generated_mcp_servers` is already scoped to
     just this run's own toolkit-owned content, not the full merged document
     (see SetupResult's docstring for why that matters for OTHER servers'
     secrets) -- but it still includes the REAL `--qdrant-api-key` value the
@@ -204,7 +204,7 @@ def _hook_env_reminders(args: argparse.Namespace) -> list:
     hook scripts written into .claude/settings.json, since Claude Code hook
     entries have no env field of their own and instead inherit the shell's
     environment unfiltered (see README's "Environment variables" section).
-    Found in PR #113 review: this script previously reported these options
+    Found in review: this script previously reported these options
     as fully applied with no indication that the hook-side half of the same
     setting still needs a matching shell export, so e.g. --track-savings
     silently dropped every hook-side event while looking fully configured.
@@ -254,7 +254,7 @@ def _quote_command(argv: list, *, windows: bool) -> str:
     `Path()` instantiation entirely when tested on a real POSIX machine).
 
     shlex.quote produces POSIX single-quoted output, which cmd.exe treats
-    as LITERAL characters rather than quoting -- found in PR #113 review
+    as LITERAL characters rather than quoting -- found in review
     that README documents Windows cmd.exe usage too, so a path containing a
     space would print an uncopyable command there. subprocess.list2cmdline
     renders the same argv using cmd.exe/CreateProcess's own quoting rules
@@ -285,7 +285,7 @@ def _resolve_skills_dir(args: argparse.Namespace) -> Path:
 
 def _report_and_apply_skill_plan(plans: list, *, dry_run: bool) -> None:
     """
-    Prints per-skill install/update/up-to-date status (issue #205's item 3)
+    Prints per-skill install/update/up-to-date status
     and, unless --dry-run, actually writes each non-up-to-date SKILL.md via
     _atomic_write. Kept as one function (not split into "plan" + "print" +
     "apply" separately) since every existing caller in this file always
@@ -312,7 +312,7 @@ def _report_and_apply_skill_plan(plans: list, *, dry_run: bool) -> None:
 
 
 def cmd_init(args: argparse.Namespace) -> None:
-    # Issue #205: `target_repo` is now optional (nargs="?") specifically so
+    # `target_repo` is now optional (nargs="?") specifically so
     # `--install-skills` can run alone, with no project to configure at all
     # -- parse_args() already refuses this combination (target_repo absent
     # AND --install-skills absent) before cmd_init is ever called, so
@@ -331,7 +331,7 @@ def cmd_init(args: argparse.Namespace) -> None:
         print(f"error: target repo path does not exist or is not a directory: {target_repo}", file=sys.stderr)
         sys.exit(1)
 
-    # Issue #198: --qdrant-only no longer suppresses settings.json entirely --
+    # --qdrant-only no longer suppresses settings.json entirely --
     # record_session_id.py is CORE/base install and must be written (and, on
     # a rerun after a prior full setup, keep the compress-gated blocks
     # stripped) regardless of --qdrant-only. Only --skip-hooks (the explicit
@@ -339,7 +339,7 @@ def cmd_init(args: argparse.Namespace) -> None:
     include_hooks = not args.skip_hooks
     # None when TOOLS_REPO_DIR/.venv exists (the documented clone workflow --
     # see _pip_installed_venv_python's docstring): run_setup then falls back
-    # to its own pure venv_python_path default exactly as before this issue,
+    # to its own pure venv_python_path default exactly as before,
     # so this is a no-op for every existing user/test of that flow.
     venv_python_override = _pip_installed_venv_python()
     result = run_setup(
@@ -367,7 +367,7 @@ def cmd_init(args: argparse.Namespace) -> None:
         include_hooks=include_hooks,
         # clean_hooks_if_unused's own special-case path is only relevant
         # when include_hooks=False (--skip-hooks now, exclusively) -- since
-        # --qdrant-only keeps include_hooks=True (issue #198: core hooks are
+        # --qdrant-only keeps include_hooks=True (core hooks are
         # always written), build_settings_hooks(include_compress=False)
         # already drops the compress-gated blocks, and merge_settings_hooks
         # strips any STALE compress-gated block a prior full setup left in
@@ -387,12 +387,12 @@ def cmd_init(args: argparse.Namespace) -> None:
     # guaranteed to leave no COMPRESS-DEPENDENT hooks active (removal
     # happens through build_settings_hooks(include_compress=False) plus the
     # normal merge path above -- NOT clean_hooks_if_unused, which is
-    # hardcoded False here; see its own comment above for why) -- issue
-    # #198 means it no longer removes ALL toolkit hooks (the CORE
+    # hardcoded False here; see its own comment above for why) -- it
+    # no longer removes ALL toolkit hooks (the CORE
     # record_session_id.py hook is written/kept either way), but that core
     # hook doesn't read any of the env vars this reminder is about, so
     # suppressing it under --qdrant-only is still correct -- just not
-    # because every toolkit hook is gone. Found in PR #113 review: gating
+    # because every toolkit hook is gone. Found in review: gating
     # on include_hooks silenced the reminder for --skip-hooks +
     # --track-savings/--lmstudio-model/etc, even though any existing hooks
     # would keep running with stale/default values.
@@ -413,8 +413,8 @@ def cmd_init(args: argparse.Namespace) -> None:
         print(metrics_reminder)
 
     # Use the ACTUAL resolved collection name/Qdrant URL/include-exclude
-    # filters from this run, not a generic placeholder -- found in PR #113
-    # review across two rounds: a hardcoded "<name>" with no --qdrant-url
+    # filters from this run, not a generic placeholder -- found in review across two
+    # rounds: a hardcoded "<name>" with no --qdrant-url
     # either fails to copy-paste as-is or silently indexes the wrong Qdrant
     # instance, and separately, omitting --include-ext/--exclude-dirs when
     # they were actually set means the copied command indexes a different
@@ -426,7 +426,7 @@ def cmd_init(args: argparse.Namespace) -> None:
     # A pip/pipx/uvx install (venv_python_override set, see above) puts
     # claude-runway-ingest on PATH -- no "python /path/to/script.py" needed,
     # and no local clone whose path this reminder could even print. The
-    # clone-based workflow's reminder is unchanged (issue #50): still the
+    # clone-based workflow's reminder is unchanged: still the
     # exact `python tools/ingest_to_qdrant.py` invocation it always was.
     if venv_python_override is not None:
         index_argv = ["claude-runway-ingest"]
@@ -440,7 +440,7 @@ def cmd_init(args: argparse.Namespace) -> None:
         "--qdrant-url",
         args.qdrant_url,
         # ingest_to_qdrant.py's own --embedding-model default is the template
-        # default, so a custom/preserved model (issue #279) MUST be passed
+        # default, so a custom/preserved model MUST be passed
         # explicitly or the suggested command would index under the wrong
         # model and mismatch the servers this run just configured. Always
         # passed (the resolved value from what was generated), not only when
@@ -454,7 +454,7 @@ def cmd_init(args: argparse.Namespace) -> None:
         index_argv += ["--exclude-dirs", args.exclude_dirs]
     if args.qdrant_api_key:
         # ingest_to_qdrant.py supports --qdrant-api-key and needs it to
-        # reach an authenticated instance (found in PR #113 review: the
+        # reach an authenticated instance (found in review: the
         # reminder previously omitted it entirely, so the suggested command
         # failed against a configured remote Qdrant) -- but the FLAG is
         # included with a placeholder, never the real value, so this
@@ -473,7 +473,7 @@ def cmd_init(args: argparse.Namespace) -> None:
     if args.dry_run:
         # Preview ONLY this run's own generated content, never
         # result.mcp_json/settings_json (the FULL merged document) --
-        # found in PR #113 review that printing the full merged document
+        # found in review that printing the full merged document
         # here leaked any unrelated existing MCP server's secret (an API
         # token sitting in that server's own env block, merged in
         # unchanged from the target's existing .mcp.json) straight to the
@@ -507,8 +507,8 @@ def cmd_init(args: argparse.Namespace) -> None:
     # Write order matters specifically for --qdrant-only: it REMOVES
     # local-compress from .mcp.json and REMOVES this toolkit's
     # local-compress-dependent hooks from settings.json in the same run
-    # (issue #198: the CORE record_session_id.py hook is written/kept
-    # either way, not removed). Found in PR #113 review: writing
+    # (the CORE record_session_id.py hook is written/kept
+    # either way, not removed). Found in review: writing
     # .mcp.json first meant that if the settings.json write then failed
     # (e.g. an unwritable .claude/ directory), local-compress was already
     # gone but the stale PreToolUse hook was still active -- denying
@@ -530,7 +530,7 @@ def cmd_init(args: argparse.Namespace) -> None:
     print("\nDone. Remember to:")
     print(next_step_note)
     if args.qdrant_api_key:
-        # Found in PR #113 review: unconditionally telling the user to
+        # Found in review: unconditionally telling the user to
         # commit .mcp.json is actively harmful once a real credential has
         # just been written into it in plaintext -- swap the instruction
         # for a warning instead of adding the warning alongside it.
@@ -568,7 +568,7 @@ def refresh_installed_skills(
     tools_repo_dir: "Path | None" = None,
 ) -> "list[str]":
     """
-    `upgrade`'s skill refresh (issue #449): brings INSTALLED product skills
+    `upgrade`'s skill refresh: brings INSTALLED product skills
     that differ from the shipped ones up to date, reusing
     `plan_skill_installs` (one comparison, shared with `init
     --install-skills`, so the two can never disagree about what counts as
@@ -637,8 +637,8 @@ def cmd_upgrade(args: argparse.Namespace) -> None:
     Also checks `upgrade_lib.is_project_configured` up front, exiting with a
     clear error/exit code 1 if `target_repo` has no existing toolkit
     `.mcp.json` at all -- `upgrade` is only for an ALREADY-configured
-    project (a brand-new one needs `init` first). Found in Copilot review
-    on PR #227 and confirmed live: without this check, `run_upgrade` treated
+    project (a brand-new one needs `init` first). Found in Copilot review and confirmed
+    live: without this check, `run_upgrade` treated
     a missing/empty `.mcp.json` the same as `{}`, so every migration's
     `detect` fired unconditionally and wrote a BROKEN partial config (a
     `qdrant` server block with no `command`/`type` at all) for a directory
@@ -671,7 +671,7 @@ def cmd_upgrade(args: argparse.Namespace) -> None:
         dry_run=args.dry_run,
     )
 
-    # Issue #449: config migrations never touched installed skills, so a user
+    # Config migrations never touched installed skills, so a user
     # who only ran `upgrade` kept stale skill text indefinitely. Runs after
     # the config migrations, whether or not any were pending.
     refresh_installed_skills(_resolve_skills_dir(args), auto_yes=args.auto_yes, dry_run=args.dry_run)
@@ -683,7 +683,7 @@ def parse_args() -> argparse.Namespace:
     sub = p.add_subparsers(dest="command", required=True)
 
     init = sub.add_parser("init", help="Write .mcp.json/.claude/settings.json into a target repo")
-    # Issue #205: optional (nargs="?") so `--install-skills` can run alone,
+    # Optional (nargs="?") so `--install-skills` can run alone,
     # skills-only, with no project to configure at all. Still required for
     # every OTHER use of `init` -- enforced below, after parsing, rather
     # than left to argparse itself (argparse has no built-in way to say "X
@@ -772,7 +772,7 @@ def parse_args() -> argparse.Namespace:
         "but it's independent of --collection-name, not derived from it every run: pass the "
         "existing value explicitly on a re-run of a project that has already accumulated real "
         "memories, or changing --collection-name later would silently retag future memories "
-        "while stranding existing ones under the old identifier (issue #175, PR #178 review).",
+        "while stranding existing ones under the old identifier.",
     )
     init.add_argument(
         "--compact-collection",
@@ -795,9 +795,9 @@ def parse_args() -> argparse.Namespace:
     # Mutually exclusive: their settings.json semantics genuinely conflict.
     # --qdrant-only actively REMOVES this toolkit's local-compress-dependent
     # hooks if present (the CORE record_session_id.py hook is written/kept
-    # either way, per issue #198 -- it isn't removed);
+    # either way -- it isn't removed);
     # --skip-hooks promises to leave settings.json untouched either way.
-    # Found in PR #113 review: passing both together silently let
+    # Found in review: passing both together silently let
     # --qdrant-only's cleanup win, deleting existing hooks despite
     # --skip-hooks's own promise not to write/merge settings.json at all --
     # rejecting the combination up front (before any config is read or
@@ -808,7 +808,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Only configure the Qdrant codebase-memory piece: omit local-compress from .mcp.json, "
         "and remove this toolkit's local-compress-dependent hook blocks from .claude/settings.json if "
-        "a prior run had added them. The CORE record_session_id.py hook (issue #198) is still written "
+        "a prior run had added them. The CORE record_session_id.py hook is still written "
         "(or kept) either way, since it's base install now, not local-compress-gated -- so the file is "
         "no longer left untouched even on a project that never had any hooks before; use --skip-hooks "
         "instead if you want settings.json fully untouched",
@@ -825,7 +825,7 @@ def parse_args() -> argparse.Namespace:
         help="Install/update this toolkit's product skills (skills/*/SKILL.md) into --skills-dir (default "
         "~/.claude/skills) -- missing skills are installed, changed ones are updated, identical ones are left "
         "alone. Combine with target_repo to do both in one run, or pass alone (omitting target_repo) for "
-        "skills-only mode that touches no project config at all (issue #205).",
+        "skills-only mode that touches no project config at all.",
     )
     init.add_argument(
         "--skills-dir",
@@ -836,7 +836,7 @@ def parse_args() -> argparse.Namespace:
     init.add_argument("--dry-run", action="store_true", help="Print what would be written without writing")
     init.set_defaults(func=cmd_init)
 
-    # Issue #225: a config-migration tool for an ALREADY-configured project --
+    # a config-migration tool for an ALREADY-configured project --
     # unlike `init`, which resets every toolkit-owned setting to this run's
     # flags/defaults, `upgrade` compares the target's current .mcp.json/
     # .claude/settings.json against a fixed set of named, individually
@@ -844,7 +844,7 @@ def parse_args() -> argparse.Namespace:
     # ones the user approves. No feature-selection flags (--qdrant-only,
     # --lmstudio-model, etc.) -- migrations are self-contained and derive
     # everything they need from the existing config or the template.
-    # Issue #449: after the migrations it also refreshes already-installed
+    # After the migrations it also refreshes already-installed
     # skills (see refresh_installed_skills), so the flags below cover both.
     upgrade = sub.add_parser(
         "upgrade",
@@ -863,7 +863,7 @@ def parse_args() -> argparse.Namespace:
         "--skills-dir",
         default="",
         help="Where installed product skills live (default: ~/.claude/skills) -- upgrade also refreshes "
-        "any skill already installed there that differs from the shipped version (issue #449); skills "
+        "any skill already installed there that differs from the shipped version; skills "
         "that are not installed are never installed by upgrade",
     )
     upgrade.set_defaults(func=cmd_upgrade)
@@ -885,9 +885,9 @@ def main() -> None:
     """
     Entry point for both `python tools/setup_project.py` (the
     `if __name__` guard below) and the `claude-runway-setup` console
-    script pip/pipx/uvx installs (issue #50) -- pulled out into its own
-    function so the `claude_runway:setup_main` shim that
-    `[project.scripts]` in pyproject.toml points at (issue #206) has
+    script pip/pipx/uvx installs -- pulled out into its own
+    function so the `claude_runway:setup_main` shim, which is what
+    `[project.scripts]` in pyproject.toml points at, has
     something to call; behavior is unchanged either way.
     """
     parsed_args = parse_args()

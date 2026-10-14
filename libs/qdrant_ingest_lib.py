@@ -32,7 +32,7 @@ MARKDOWN_EXTENSIONS = {".md", ".mdx"}
 
 # Curly-brace-block languages (from CODE_EXTENSIONS) that get boundary-aware
 # chunking via brace_boundary_indexes() instead of a pure fixed-line window
-# (issue #55) -- every CODE_EXTENSIONS member whose blocks are delimited by
+# -- every CODE_EXTENSIONS member whose blocks are delimited by
 # '{'/'}' rather than indentation or a non-brace keyword (.rb's 'end', for
 # example, isn't covered here -- out of the issue's named scope of "at least
 # C#, Python, TypeScript", and there's no brace signal to hook a heuristic on).
@@ -42,7 +42,7 @@ BRACE_BLOCK_EXTENSIONS = {
 }
 
 # Indentation-delimited-block languages that get boundary-aware chunking via
-# python_boundary_indexes() instead of brace_boundary_indexes() (issue #55) --
+# python_boundary_indexes() instead of brace_boundary_indexes() --
 # Python has no braces, so "depth returns to zero" has to mean something else
 # (see python_boundary_indexes' own docstring).
 INDENT_BLOCK_EXTENSIONS = {".py"}
@@ -54,10 +54,10 @@ EXCLUDE_DIRS = {
 
 
 # sync_repo's bookkeeping file at the repo root. Lives here rather than in
-# ingest_mcp_server.py (issue #276) so the CLI can exclude it too: .json is in
+# ingest_mcp_server.py so the CLI can exclude it too: .json is in
 # CODE_EXTENSIONS, so every build_entries/compute_file_hashes caller has to
 # pass extra_exclude_files={MANIFEST_FILENAME} or it embeds the manifest
-# itself (issue #91) -- the CLI was the one caller that didn't.
+# itself -- the CLI was the one caller that didn't.
 MANIFEST_FILENAME = ".qdrant_index_manifest.json"
 
 # Built-in fallbacks for ingest_env_defaults() below -- what both the MCP
@@ -75,7 +75,7 @@ def parse_csv_set(value: Optional[str]) -> Optional[set]:
     a None/empty value or one with no non-blank entries, so callers can
     write `parse_csv_set(x) or default`.
 
-    Shared by ingest_mcp_server.py and ingest_to_qdrant.py (issue #276):
+    Shared by ingest_mcp_server.py and ingest_to_qdrant.py:
     the CLI used to do a bare split(","), so ".py, .md" became
     {".py", " .md"} -> normalize_extensions -> {".py", ". .md"} and every
     .md file was silently skipped.
@@ -89,7 +89,7 @@ def ingest_env_defaults(environ=None) -> dict:
     """
     The env-var-backed defaults every ingestion entry point shares, resolved
     in one place so the MCP server and the CLI can't disagree about them
-    again (issue #276 -- the CLI used to hardcode every one of these and
+    again (the CLI used to hardcode every one of these and
     ignore the env entirely). Keys: qdrant_url, qdrant_api_key,
     embedding_model, include_extensions, exclude_dirs,
     memory_bank_collection.
@@ -107,7 +107,7 @@ def ingest_env_defaults(environ=None) -> dict:
     Only reads the process environment. For the MCP server that is its
     .mcp.json env block plus whatever it inherited; for the CLI it is the
     shell it was run from, which normally does NOT carry .mcp.json's values
-    (see issue #352 for the memory-bank-collection case of that gap).
+    (the memory-bank collection name is one case of that gap).
     """
     env = os.environ if environ is None else environ
     return {
@@ -188,7 +188,7 @@ def validate_chunk_params(chunk_size: int, overlap: int) -> Optional[str]:
     overlap) to 1 -- silently turning "chunk every N lines with M overlap"
     into "chunk every line," multiplying the number of chunks (and
     embedding/storage cost) by roughly chunk_size -- confirmed real, not
-    theoretical (issue #26). chunk_size < 1 is the same class of defect from
+    theoretical. chunk_size < 1 is the same class of defect from
     the other direction: chunk_lines()'s `end <= start` window then yields
     nothing at all (0) or a nonsensical chunk (negative) instead of raising
     cleanly. overlap < 0 has no valid meaning either.
@@ -263,11 +263,11 @@ def _strip_c_style_line(
     principle misjudge a literal '\\' immediately followed by a backtick as
     an escaped delimiter rather than the string's actual close. Accepted
     tradeoff: that's a much rarer pattern than an ordinary '${...}'/brace-
-    containing template literal (issue #55, PR #137 review) -- correctly
+    containing template literal -- correctly
     treating THAT common case matters far more than the rare Go edge case.
 
     C# verbatim strings (`@"..."`) are the one common multi-line plain-
-    quote form worth handling explicitly (PR #137 review): unlike an
+    quote form worth handling explicitly: unlike an
     ordinary `"..."`, a bare newline inside one is legal, and `""` (a
     doubled quote) is an escaped literal `"` rather than the closing
     delimiter -- so it needs its own state, tracked separately from the
@@ -289,7 +289,7 @@ def _strip_c_style_line(
     introduces a preprocessor directive (`#if`, `#include`, `#region`, ...);
     in Rust, `#` introduces an attribute (`#[derive(...)]`). A blanket rule
     would corrupt scanning for those languages, which is why the issue
-    explicitly ruled it out (#138). All other `ext` values leave `#` alone.
+    explicitly ruled it out. All other `ext` values leave `#` alone.
 
     Not a real tokenizer: unusual per-language escape rules, nested block
     comments (most C-family languages don't allow those anyway), and other
@@ -460,7 +460,7 @@ _CONTAINER_MODIFIER_RE = re.compile(
 # behavior), never a wrong split.
 #
 # Requires actual WHITESPACE right after the keyword, not just a '\b' word
-# boundary (PR #137 review): '\b' is satisfied between a word char and ANY
+# boundary: '\b' is satisfied between a word char and ANY
 # non-word char, including '.' -- so '\bmodule\b' matched the start of
 # 'module.exports = function () {' (a completely ordinary CommonJS
 # expression, not a TypeScript module declaration), tagging that
@@ -469,7 +469,7 @@ _CONTAINER_MODIFIER_RE = re.compile(
 #
 # The optional identifier group plus lookahead disambiguates a genuine
 # declaration from the SAME keyword used as a plain TYPE NAME in a variable
-# declaration (PR #137 review, second finding): 'object value = new Foo {'
+# declaration: 'object value = new Foo {'
 # or 'struct Point p = {' both have whitespace right after the keyword too
 # (so the earlier '\s'-only fix doesn't catch them), but neither is a
 # container declaration -- 'object'/'struct' there just names the
@@ -497,7 +497,7 @@ def _line_declares_container(stripped_line: str) -> bool:
     the container keyword must be the line's own first real token (after
     any leading modifiers), not merely present anywhere on the line.
 
-    PR #137 review: matching the keyword anywhere via `.search()` treated
+    Matching the keyword anywhere via `.search()` treated
     a type ANNOTATION/parameter/generic-bound mentioning one of these words
     as if it opened a container -- e.g. `function process(value: object) {`
     (TypeScript, "object" as a type) or `void foo(struct Point p) {` (C,
@@ -535,8 +535,7 @@ def brace_boundary_indexes(lines, ext: str = "") -> set:
     (class/struct/interface/... -- see _line_declares_container) -- i.e.
     between two sibling members (two methods, a field and a method, ...) of
     that container, never inside a method body or a control-flow block
-    (if/for/while/switch/lambda/...). PR #137 review (issue #55 follow-up):
-    the original version only recognized depth-0 (file-level) as safe,
+    (if/for/while/switch/lambda/...). The original version only recognized depth-0 (file-level) as safe,
     which meant a whole class/namespace longer than chunk_size never had
     ANY boundary candidate inside it at all -- the exact "reduce mid-class
     splits" case the issue asks for. Each currently-open brace is tagged
@@ -551,7 +550,7 @@ def brace_boundary_indexes(lines, ext: str = "") -> set:
     closes back out to the enclosing container.
 
     A line is only a candidate while PAREN depth (from '(' and ')') is also
-    0 (PR #137 review: a multi-line method/constructor SIGNATURE -- e.g.
+    0 (a multi-line method/constructor SIGNATURE -- e.g.
     Allman-style `void Bar(\n    int a,\n    int b\n)` -- doesn't open any
     NEW brace of its own while its parameter list spans several lines, so
     without this check every one of those lines still looked like a safe
@@ -570,8 +569,8 @@ def brace_boundary_indexes(lines, ext: str = "") -> set:
     own opening brace is Allman-style on the following line.
 
     `ext` is the lowercase file extension (e.g. `".php"`) passed through to
-    `_strip_c_style_line` for PHP-specific `#` line-comment handling (issue
-    #138). All other extensions leave `#` untouched (see _strip_c_style_line).
+    `_strip_c_style_line` for PHP-specific `#` line-comment handling.
+    All other extensions leave `#` untouched (see _strip_c_style_line).
 
     Strings and comments (including backtick template/raw-string literals
     -- see _strip_c_style_line) are stripped first so a brace inside one is
@@ -650,13 +649,13 @@ def python_boundary_indexes(lines) -> set:
        OR the member indentation level of the nearest still-open class body
        (between two sibling methods/fields of the same class) -- tracked via
        a small indentation stack keyed on `class` declarations
-       (_PY_CLASS_RE). PR #137 review (issue #55 follow-up): the original
+       (_PY_CLASS_RE). The original
        version only recognized column 0, so a whole class body longer than
        chunk_size never had ANY boundary candidate between its own methods
        -- the exact "reduce mid-class splits" case the issue asks for.
 
     A line is EXCLUDED from being a candidate if it's still inside an
-    unterminated triple-quoted string when it ends (PR #137 review finding:
+    unterminated triple-quoted string when it ends (review finding:
     a line like `return \"\"\"` -- unterminated on this line -- must never be
     treated as safe just because the *string's own content* on a later line
     happens to look unindented; that content isn't real code at all). For
@@ -668,7 +667,7 @@ def python_boundary_indexes(lines) -> set:
 
     A line is also EXCLUDED if it's part of a decorator statement (`@foo`,
     possibly spanning multiple lines via unclosed parens, e.g.
-    `@app.route(\n    "/x",\n)`) -- PR #137 review: a decorator sits at the
+    `@app.route(\n    "/x",\n)`) -- a decorator sits at the
     same indentation as the def/class it decorates, so without this check
     it satisfied the indentation-level rule above and could get split from
     its own target (confirmed by direct reproduction: `['@route', 'def
@@ -676,8 +675,8 @@ def python_boundary_indexes(lines) -> set:
 
     A comment-only line is treated the same as a blank line everywhere
     above -- both when scanning for "the next real line of code" and when
-    updating the class-indentation stack -- never as real code (PR #137
-    review: Python comments carry no indentation meaning at all, so a
+    updating the class-indentation stack -- never as real code
+    (Python comments carry no indentation meaning at all, so a
     comment sitting at a class's member-indentation level in between two
     statements that are STILL part of the same method's body was
     previously read as if it were a real dedent back to member level,
@@ -687,7 +686,7 @@ def python_boundary_indexes(lines) -> set:
     whitespace -- is detected uniformly the same way a truly blank line
     already is.
 
-    IMPORTANT distinction (PR #137 review): a line that strips down to
+    IMPORTANT distinction: a line that strips down to
     whitespace because it's a REAL bare string-literal statement (the
     entire body of a function whose only content is a multi-line
     docstring) is NOT "ignorable" the same way a blank/comment line is --
@@ -785,7 +784,7 @@ def python_boundary_indexes(lines) -> set:
 
 def chunk_code_by_boundaries(text: str, chunk_size: int, overlap: int, boundary_indexes_fn):
     """
-    Boundary-aware variant of chunk_lines() (issue #55): keeps the same
+    Boundary-aware variant of chunk_lines(): keeps the same
     chunk_size/overlap *budget*, but nudges each chunk's actual end line
     back to the nearest safe boundary (per boundary_indexes_fn -- see
     brace_boundary_indexes/python_boundary_indexes above) instead of an
@@ -950,7 +949,7 @@ def chunk_file(path: Path, rel_path: str, chunk_size: int, overlap: int):
     elif suffix in BRACE_BLOCK_EXTENSIONS:
         # Pass the extension to brace_boundary_indexes so PHP's '#' line
         # comments are recognized correctly without affecting other languages
-        # (issue #138 -- see _strip_c_style_line's `ext` parameter).
+        # (see _strip_c_style_line's `ext` parameter).
         generator = chunk_code_by_boundaries(
             text, chunk_size, overlap,
             functools.partial(brace_boundary_indexes, ext=suffix),
@@ -982,7 +981,7 @@ def build_entries(
     tuples for every matching file across the whole repo that could actually
     be read; skipped is a list of (rel_path, error message) for any file
     that raised while being read/chunked (broken symlink, permission error,
-    etc.) -- one bad file no longer aborts the whole run (issue #27).
+    etc.) -- one bad file no longer aborts the whole run.
     scope is one of "code", "docs", "both" -- ignored if include_extensions
     is given. extra_exclude_dirs adds project-specific folders to skip on
     top of the built-in EXCLUDE_DIRS. extra_exclude_files skips individual
@@ -1031,7 +1030,7 @@ def iter_entries(
                 # content and metadata are both valid
 
     Unlike build_entries(), this never holds more than one file's chunks in
-    memory at a time, which matters for very large repos (issue #57). It also
+    memory at a time, which matters for very large repos. It also
     enables progress reporting DURING the chunking phase -- the caller can
     count yielded items and report progress without waiting for the entire
     repo to be scanned first.
@@ -1065,7 +1064,7 @@ def compute_file_hashes(
     sync without re-embedding anything. skipped is a list of (rel_path,
     error message) for any file that raised while being hashed (broken
     symlink, permission error, etc.) -- one bad file no longer aborts the
-    whole sync (issue #27); callers must NOT treat a skipped file as
+    whole sync; callers must NOT treat a skipped file as
     "removed" just because it's absent from hashes -- see
     files_removed_since_last_sync below. Filtering params match
     build_entries -- keep them consistent between calls or the diff will
@@ -1096,7 +1095,7 @@ def files_removed_since_last_sync(manifest_files, current_hashes: dict, skipped_
     "removed" nor "changed": its current state is unknown, so its existing
     embeddings are left alone rather than deleted -- treating an unreadable
     file as removed would silently delete good, previously-indexed content
-    over what may just be a transient read error (issue #27).
+    over what may just be a transient read error.
     """
     skipped_set = set(skipped_paths)
     return [f for f in manifest_files if f not in current_hashes and f not in skipped_set]
@@ -1108,8 +1107,8 @@ def ensure_persistent_fastembed_cache() -> None:
     defaults an unset FASTEMBED_CACHE_PATH to the OS temp directory
     (tempfile.gettempdir()/"fastembed_cache"), which gets wiped on reboot or
     periodic temp cleanup -- silently reintroducing a network dependency on
-    huggingface.co the next time a FastEmbedProvider is constructed (issue
-    #77). Point it at a persistent, toolkit-owned directory instead, unless
+    huggingface.co the next time a FastEmbedProvider is constructed.
+    Point it at a persistent, toolkit-owned directory instead, unless
     the caller already set their own value -- .mcp.json's codebase-indexer
     env block or a shell export both take priority via setdefault().
 
@@ -1139,7 +1138,7 @@ def batched(items: list, size: int):
     """
     Yields successive `size`-length slices of `items` (the final slice may be
     shorter). Used by sync_repo to group per-file Qdrant delete filters into
-    chunks instead of one client.delete() call per file -- issue #75/#76
+    chunks instead of one client.delete() call per file
     found that thousands of individual round-trips in a tight loop (not an
     idle gap) can exhaust local ephemeral ports / Docker Desktop's
     connection-tracking table, breaking the very next connection attempt.

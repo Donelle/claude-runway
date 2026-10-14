@@ -1,7 +1,7 @@
 """
-Read-only baseline report over memory-bank's EXISTING usage log (issue #338,
-Batch A of the #328 staleness audit) -- turns `libs/memory_events_lib.py`'s
-`memory-events.db` into the three numbers the #328 decision gate needs,
+Read-only baseline report over memory-bank's EXISTING usage log (Batch A of the
+staleness audit) -- turns `libs/memory_events_lib.py`'s
+`memory-events.db` into the three numbers the audit's decision gate needs,
 without any schema change and without touching memory-bank's behavior:
 
 - **Dead-memory ratio**: of all distinct remembered `point_id`s, the fraction
@@ -17,7 +17,7 @@ without any schema change and without touching memory-bank's behavior:
 
 What the existing data can and can't say -- stated here, and repeated in the
 report's own output, so nobody reads more into the numbers than they hold
-(the counting-semantics trap a past EVALUATION.md fix fell into, PR #323):
+(the counting-semantics trap a past EVALUATION.md fix fell into):
 
 - `memory_events` logs one row per returned recall HIT, not per call; every
   hit from one `recall()` call shares that call's `(session_id, turn)`, so a
@@ -30,7 +30,7 @@ report's own output, so nobody reads more into the numbers than they hold
 - No column records a hit's `score`/`effective_score`, or the size of the
   response a call returned. Payload is therefore reported as a HIT COUNT,
   not bytes/tokens, and the score trend can't be computed at all without a
-  schema change, which this ticket explicitly rules out.
+  schema change, which this report deliberately avoids.
 - A "dead" memory may also have been `forget`-ed (not logged in this table)
   or be too new to have had a chance to be recalled -- `min_age_days` exists
   for the second case; nothing in the existing data distinguishes the first.
@@ -52,7 +52,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 # Project ids excluded by default. "test-collection" is the MEMORY_BANK_ID
-# tests/test_memory_bank_mcp_server.py sets; until issue #338 that module did
+# tests/test_memory_bank_mcp_server.py sets; that module once did
 # not redirect CLAUDE_RUNWAY_MEMORY_EVENTS_DB, so every local test run appended
 # fake "proj-a"/"new-id" rows into the developer's REAL memory-events.db
 # (confirmed live: ~70% of one dogfood machine's rows). The test fix stops new
@@ -63,7 +63,7 @@ DEFAULT_EXCLUDED_PROJECTS = ("test-collection",)
 
 SCORE_TREND_UNAVAILABLE = (
     "Not available from existing data: memory_events records no score/effective_score "
-    "for recall hits, so a score trend needs a schema change (out of scope for #338's "
+    "for recall hits, so a score trend needs a schema change (out of scope for this "
     "baseline, which is existing-data only)."
 )
 
@@ -131,16 +131,16 @@ def dead_memory_ratio(
     min_age_days > 0 only counts memories remembered at least that long ago
     (relative to `now`, default the current time), since a memory written
     an hour ago being "dead" says nothing yet. Memories recalled but never
-    remembered while logging was on (created before issue #179) aren't in
+    remembered while logging was on (created before the usage log existed) aren't in
     either count -- there's no remember row to anchor them to.
     """
-    # Materialized once (PR #424 review): both clauses below consume it, and
+    # Materialized once: both clauses below consume it, and
     # a generator would be empty by the second, letting excluded projects'
     # recall rows count as reuse.
     excluded = tuple(excluded_projects)
     where_rem, rem_params = _exclusion_clause(excluded, "project")
     where_rec, rec_params = _exclusion_clause(excluded, "r.project")
-    # Non-finite input is rejected rather than interpreted (PR #424 review):
+    # Non-finite input is rejected rather than interpreted:
     # nan fails every comparison, so it silently disabled the age filter,
     # and inf reached time.gmtime() and raised OverflowError.
     if not math.isfinite(min_age_days) or min_age_days < 0:
@@ -288,7 +288,7 @@ def build_report(
     if conn is None:
         return {**base, "available": False, "reason": "no memory-events.db found (nothing logged yet)"}
     try:
-        # One read transaction for the whole report (PR #424 review), so
+        # One read transaction for the whole report, so
         # every query sees the same snapshot. Without it each SELECT runs in
         # its own implicit transaction, and an event the memory-bank server
         # logs mid-report can show up in some sections but not others
@@ -329,7 +329,7 @@ def _payload_lines(rows: list, indent: str) -> list:
 
 
 def format_report(report: dict) -> str:
-    lines = ["memory-bank baseline report (issue #338)", f"Source: {report['db_path']}"]
+    lines = ["memory-bank baseline report", f"Source: {report['db_path']}"]
     excluded = report["excluded_projects"]
     lines.append(f"Excluded projects: {', '.join(excluded) if excluded else '(none)'}")
     if not report["available"]:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for libs/qdrant_retry.py (issue #75).
+"""Tests for libs/qdrant_retry.py.
 
 Stdlib-only (unittest, no pytest), no network and no real Qdrant/Docker --
 uses fake sync/async functions that raise on their first N calls to stand in

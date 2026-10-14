@@ -27,13 +27,13 @@ SETTINGS_TEMPLATE_PATH = os.path.join(REPO_ROOT, "templates", "settings.json.tem
 
 # Mirrors the regex embedded in SKILL.md's Step 0 preflight check:
 #   jq -e '(.permissions.allow // []) | any(test("^Bash\\((git|gh|uv)[ :)]|^Bash\\(\\.venv/(bin|Scripts)/"))'
-# The `[ :)]` delimiter right after git/gh/uv is required (Copilot review round 2 on
-# PR #196): an earlier version with no delimiter (`^Bash\((git|gh|uv|\.venv/bin/)`)
+# The `[ :)]` delimiter right after git/gh/uv is required:
+# an earlier version with no delimiter (`^Bash\((git|gh|uv|\.venv/bin/)`)
 # false-positived on unrelated tool names sharing the same leading letters, e.g.
 # `Bash(github-cli:*)`, `Bash(ghastly:*)`, `Bash(uvicorn:*)` -- confirmed live by
 # running this exact regex against those three strings before fixing it.
-# The venv branch matches both `bin/` (Linux/macOS) and `Scripts/` (Windows), per
-# issue #230 -- a Windows-only setup using `.venv/Scripts/python` would otherwise
+# The venv branch matches both `bin/` (Linux/macOS) and `Scripts/` (Windows) --
+# a Windows-only setup using `.venv/Scripts/python` would otherwise
 # have incorrectly reported "no" and stopped the preflight unnecessarily.
 _BASELINE_PERMISSION_RE = re.compile(r"^Bash\((git|gh|uv)[ :)]|^Bash\(\.venv/(bin|Scripts)/")
 
@@ -94,7 +94,7 @@ class SkillContentRequirements(unittest.TestCase):
 
     def test_preflight_stops_on_missing_permissions(self):
         # Must instruct a hard stop, matching the existing dogfood-preflight pattern.
-        # The 2500-char window leaves room for the issue #230 note in the
+        # The 2500-char window leaves room for the Windows-venv note in the
         # preflight's explanatory paragraph without pushing STOP out of sight.
         section = self.content[self.content.find("Baseline Bash permission preflight"):]
         self.assertIn("STOP", section[:2500])
@@ -106,7 +106,7 @@ class SkillContentRequirements(unittest.TestCase):
         self.assertIn("not confirm", self.content.lower())
 
     def test_does_not_recommend_wildcard_permissions(self):
-        # Copilot review on PR #196 (round 1): an earlier draft of this fix
+        # Copilot review (round 1): an earlier draft of this fix
         # recommended broadening the confirmed narrow rules into a blanket
         # 'Bash(git:*)'/'Bash(gh:*)'/'Bash(uv:*)' wildcard. Verified live that this
         # is a real arbitrary-command-execution bypass (git alias mechanism,
@@ -146,7 +146,7 @@ class AutoPickExclusionContentRequirements(unittest.TestCase):
     def test_explicit_issue_number_overrides_exclusion(self):
         # An explicitly-named ticket must still be worked regardless of its labels --
         # the label exclusion is for auto-pick only, not a blanket ban on ever touching a
-        # blocked/theme-design issue. Issue #240 added a second exclusion (assignee/branch/
+        # blocked/theme-design issue. A later change added a second exclusion (assignee/branch/
         # PR) that is explicitly NOT overridden the same way, so the pinned phrase narrowed
         # from "this exclusion" to "the label-based exclusions above" to stay accurate.
         idx = self.content.find("apply to auto-pick only")
@@ -154,14 +154,14 @@ class AutoPickExclusionContentRequirements(unittest.TestCase):
         self.assertIn("{ISSUE_NUMBER}", self.content[idx : idx + 300])
 
     def test_assignee_branch_pr_check_not_overridden_by_explicit_issue(self):
-        # Issue #240: unlike the label-based exclusions, the already-in-progress check
+        # Unlike the label-based exclusions, the already-in-progress check
         # (assignee/branch/PR) still applies even to an explicit {ISSUE_NUMBER} invocation --
         # Step 8 is what enforces it in that case, since Step 0's own filtering is bypassed.
         self.assertIn("NOT overridden by an", self.content)
         self.assertIn("no:assignee", self.content)
 
     def test_search_command_has_no_positive_label_restriction(self):
-        # Copilot review on PR #258: the other tests in this class only assert the
+        # Copilot review: the other tests in this class only assert the
         # negative exclusions (-label:blocked, -label:theme-design) are present --
         # none of them would fail if a future edit silently restored the old
         # `label:bug,enhancement` positive restriction alongside them, since that's
@@ -179,7 +179,7 @@ class AutoPickExclusionContentRequirements(unittest.TestCase):
                 )
 
     def test_priority_sort_includes_p0_first(self):
-        # Issue #285: the sort rule once read "priority-p1 > p2 > p3", so a literal
+        # The sort rule once read "priority-p1 > p2 > p3", so a literal
         # reading filed priority-p0 (the "fix first" label) under "unlabeled sorts last".
         idx = self.content.find("Sort by priority label")
         self.assertNotEqual(idx, -1, "auto-pick sort rule must exist")
@@ -253,7 +253,7 @@ class BaselinePermissionRegexLogic(unittest.TestCase):
 
     def test_matches_venv_scripts_rule(self):
         # Windows venv uses Scripts/ not bin/ -- the preflight must accept either
-        # form so a Windows-only setup doesn't incorrectly report "no". Issue #230.
+        # form so a Windows-only setup doesn't incorrectly report "no".
         self.assertTrue(has_baseline_permission(["Bash(.venv/Scripts/python:*)"]))
 
     def test_no_match_on_unrelated_rules(self):
@@ -272,7 +272,7 @@ class BaselinePermissionRegexLogic(unittest.TestCase):
         self.assertTrue(has_baseline_permission(["Bash(git)"]))
 
     def test_no_false_positive_on_github_cli(self):
-        # Copilot review round 2 on PR #196: 'github-cli' starts with the same three
+        # Copilot review round 2: 'github-cli' starts with the same three
         # letters as 'git' ('g','i','t'), so a delimiter-less prefix check wrongly
         # matched it. Confirmed live before fixing.
         self.assertFalse(has_baseline_permission(["Bash(github-cli:*)"]))
@@ -294,7 +294,7 @@ class BaselinePermissionRegexLogic(unittest.TestCase):
 
 
 class MetricsLoggingContentRequirements(unittest.TestCase):
-    """Pin the logging-call shape added by issue #210 — the cut-over from
+    """Pin the logging-call shape — the cut-over from
     compact_store to record_metric. The skill is prose, not code, so a future
     edit that silently reverts the logging call or changes its domain string
     would otherwise produce no test failure."""
@@ -332,7 +332,7 @@ class MetricsLoggingContentRequirements(unittest.TestCase):
         self.assertIn('"Error:"', self.content)
 
     def test_cost_figures_come_from_the_transcript_cli_not_hand_copying(self):
-        # Issue #455: the orchestrator passes an agent id and the tool computes
+        # The orchestrator passes an agent id and the tool computes
         # wall clock/tokens/tool calls, so rows can't go missing or be mistyped.
         self.assertIn("tools/autowork_cost.py record", self.content)
         self.assertIn("--agent-id", self.content)
@@ -347,7 +347,7 @@ class MetricsLoggingContentRequirements(unittest.TestCase):
 
 
 class WorktreeVenvInstallContentRequirements(unittest.TestCase):
-    """Pin Step 15's worktree-venv invariant (PR #387). Run from a git worktree,
+    """Pin Step 15's worktree-venv invariant. Run from a git worktree,
     `uv pip install` without `--python` resolved to the PRIMARY checkout's
     `.venv`, so the install was a no-op there and ruff/Pyright were then missing
     from the worktree's own venv. The fix lives entirely in the skill's prose,
@@ -355,7 +355,7 @@ class WorktreeVenvInstallContentRequirements(unittest.TestCase):
     from either install line and reintroduced the wrong-venv behavior."""
 
     # Allows flags (e.g. --python "$PYTHON") between `install` and `-r`, so the
-    # pattern matches both the fixed lines and the pre-#387 form.
+    # pattern matches both the fixed lines and the older form.
     INSTALL_LINE = re.compile(r"^\s*uv pip install\b.* -r .*$", re.MULTILINE)
 
     def setUp(self):
@@ -382,7 +382,7 @@ class WorktreeVenvInstallContentRequirements(unittest.TestCase):
 
     def test_python_is_resolved_before_the_first_install(self):
         # The flag is only meaningful if $PYTHON already exists when the
-        # install runs -- resolving it after (the pre-#387 order) would pass
+        # install runs -- resolving it after (the older order) would pass
         # an empty string to --python.
         assignment = self.content.find("PYTHON=$(")
         self.assertNotEqual(assignment, -1, "PYTHON= assignment not found")
@@ -404,7 +404,7 @@ def dedupe_preserve_order(numbers):
 
 class ExplicitTicketListContentRequirements(unittest.TestCase):
     """Pin the list-mode contract added for /my-gh-autowork's third invocation
-    form (`/my-gh-autowork 45 52 61`). Copilot review on PR #316 flagged both
+    form (`/my-gh-autowork 45 52 61`). Copilot review flagged both
     the missing test coverage for this contract (this class) and a real
     duplicate-ticket bug in the original queue-building prose, fixed alongside
     these tests -- test_queue_deduplicates_while_preserving_order below is the
@@ -445,7 +445,7 @@ class ExplicitTicketListContentRequirements(unittest.TestCase):
         self.assertIn("List mode never uses `{ATTEMPTED_LIST}`", section)
 
     def test_all_mode_always_substitutes_attempted_list_with_no_exception(self):
-        # Regression guard for a Copilot-flagged contradiction (PR #316, round 2):
+        # Regression guard for a Copilot-flagged contradiction:
         # an earlier version of this paragraph said {ISSUE_NUMBER} covered "the
         # current ticket of an `all` run once Step 0's auto-pick has chosen one" --
         # but the orchestrator never knows an all-mode ticket in advance, only the
@@ -501,7 +501,7 @@ def _template_step(content, n):
 
 
 class RunLessonsContentRequirements(unittest.TestCase):
-    """Pin the rules issue #447 carried over from the 2026-10-12/13 autowork run,
+    """Pin the rules carried over from the 2026-10-12/13 autowork run,
     where the orchestrator had to patch each one into the subagent prompt by hand.
     Each lives in the template (or, for the follow-up pattern, the orchestrator
     half) next to the step it qualifies; a future edit that drops one would
@@ -517,7 +517,7 @@ class RunLessonsContentRequirements(unittest.TestCase):
         self.assertNotEqual(idx, -1)
         paragraph = self.template[idx : self.template.find("## Step 0", idx)]
         self.assertIn("compression hook", paragraph)
-        # Copilot review round 2 on PR #452: plain grep treats `|` literally and
+        # Copilot review round 2: plain grep treats `|` literally and
         # matches none of these lines, so the command must carry -E.
         self.assertIn("grep -E '^Ran|^OK|FAILED'", paragraph)
         self.assertIn("Redirect test output to a file", paragraph)
@@ -526,7 +526,7 @@ class RunLessonsContentRequirements(unittest.TestCase):
         step3 = self.template[self.template.find("## Step 3") : self.template.find("## Step 4")]
         self.assertIn("Pre-push sweep for old wording", step3)
         self.assertIn("before the FIRST push", step3)
-        # Copilot review round 2 on PR #452: without -e, a flag-shaped pattern
+        # Copilot review round 2: without -e, a flag-shaped pattern
         # ("--old-option") is parsed as a git grep option and the sweep errors out.
         self.assertIn('git grep -n -i -e "<old wording>"', step3)
         # The sweep must sit before the commit/push item, or it can't run "before
@@ -582,7 +582,7 @@ class RunLessonsContentRequirements(unittest.TestCase):
         self.assertIn("Model choice is the orchestrator's call", section)
 
     def test_continuation_overrides_the_new_pr_assumptions_of_the_review_loop(self):
-        # Copilot review round 1 on PR #452: Step 4 starts seen_ids empty, Step 22
+        # Copilot review round 1: Step 4 starts seen_ids empty, Step 22
         # hard-codes the 5-round cap, and Step 19 polls before anything -- all
         # correct for a brand-new PR, all wrong for a follow-up on an existing one
         # (every earlier round's comment would read as new, the cap would be 5,
@@ -599,7 +599,7 @@ class RunLessonsContentRequirements(unittest.TestCase):
         self.assertNotIn("run Steps 19–25 and Step 5 exactly as written", section)
 
     def test_continuation_resume_does_not_remove_from_the_queue_twice(self):
-        # Copilot review round 1 on PR #452: resuming "at Step 2c" after a
+        # Copilot review round 1: resuming "at Step 2c" after a
         # follow-up merge re-ran 2c's "remove the just-worked ticket", though
         # Step 1 had already removed it when its own call returned.
         start = self.content.find("## Continuing after a BLOCKED at the round cap")

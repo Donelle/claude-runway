@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Developer bootstrap for macOS and Linux (issue #31). POSIX counterpart of
+# Developer bootstrap for macOS and Linux. POSIX counterpart of
 # scripts/bootstrap.ps1: creates .venv, installs runtime + dev requirements
 # and this checkout's console scripts, opts the clone into .githooks, then
 # runs claude-runway-doctor. Safe to re-run -- every step checks first and
@@ -67,7 +67,7 @@ pip_install() {
 
 # A .venv created by a previous run WITH uv has no pip, so re-running on a
 # machine/shell where uv is no longer on PATH would fail at the first
-# `python -m pip` (PR #41 review). Seed pip into it once instead.
+# `python -m pip`. Seed pip into it once instead.
 if [ "$HAVE_UV" -eq 0 ] && ! "$VENV_PYTHON" -m pip --version >/dev/null 2>&1; then
     step "Seed pip into the existing .venv (it was created by uv, which is not on PATH now)"
     "$VENV_PYTHON" -m ensurepip --upgrade || die "the existing .venv has no pip and ensurepip failed. Install uv, or remove '$VENV_DIR' and rerun this script."

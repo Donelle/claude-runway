@@ -1,5 +1,5 @@
 """
-Shared "prepare a collection for a full index" step (issue #304), used by
+Shared "prepare a collection for a full index" step, used by
 both tools/ingest_mcp_server.py's index_repo and tools/ingest_to_qdrant.py's
 ingest().
 
@@ -46,7 +46,7 @@ class IndexPreparation:
         instead of loading the model a second time.
     reset_deleted: True if the filtered reset delete ran.
     backfilled: True if the metadata.file_path payload index was newly
-        created on an existing collection (issue #54).
+        created on an existing collection.
     """
 
     error: Optional[str] = None
@@ -79,16 +79,16 @@ def prepare_collection_for_index(
     (only here -- the non-reset path never needs it before indexing, so an
     early return from existing_points_guard doesn't pay for a model load),
     validate the model BEFORE deleting anything (fail_closed=True: an
-    inconclusive result must block a destructive delete, issue #175/#265),
+    inconclusive result must block a destructive delete),
     then ALWAYS a filtered delete that preserves memory-bank and marked
     conversation-compact points -- never delete_collection, and no
-    count-then-act, to avoid the race documented in index_repo (PR #178).
+    count-then-act, to avoid the race documented in index_repo.
 
     reset=False and the collection exists: if existing_points_guard is
     given, call it with the collection's current point count; a non-None
-    return aborts (index_repo's issue #58 duplicate-risk warning). Then
+    return aborts (index_repo's duplicate-risk warning). Then
     backfill the metadata.file_path payload index, since FIELD_INDEXES only
-    applies when QdrantConnector creates a brand-new collection (issue #54).
+    applies when QdrantConnector creates a brand-new collection.
 
     The collection not existing is a no-op either way: QdrantConnector
     creates it (with FIELD_INDEXES) on the first store.

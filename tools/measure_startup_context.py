@@ -2,7 +2,7 @@
 """
 Measures, from real Claude Code session transcripts, what this toolkit's MCP
 servers add to a session's STARTING context -- instead of estimating it
-(issue #439; replaces the old chars / 3.5 "tool overhead per turn" figure).
+(replaces the old chars / 3.5 "tool overhead per turn" figure).
 
 Two modes:
 
@@ -163,7 +163,7 @@ def _run_survey(root: str) -> int:
     # largest observed wins in case a server's docstrings changed between runs).
     # Scanned over EVERY session that parsed, not just the `listed` cohort: a
     # deferred_tools_record is direct evidence of a load whatever the first-turn
-    # classification was (PR #448 review). The cohorts only matter for the
+    # classification was. The cohorts only matter for the
     # observational comparison below.
     sizes: dict = {}
     sessions_that_loaded = 0

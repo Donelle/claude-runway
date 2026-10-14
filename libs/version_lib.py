@@ -1,6 +1,6 @@
 """
-Resolve "which claude-runway is this?" for the three CLIs' `--version` flag
-(issue #348). stdlib-only, like the other libs/ modules the console scripts
+Resolve "which claude-runway is this?" for the three CLIs' `--version` flag.
+stdlib-only, like the other libs/ modules the console scripts
 load, so `--version` works even in a half-broken environment -- exactly when
 someone filing a bug needs it most.
 
@@ -40,7 +40,7 @@ def _checkout_root() -> Optional[Path]:
 
     An installed wheel ships this file to <env>/src/libs/ (see setup.py), whose
     parent has no `.git`; a clone has `.git` (a directory, or a file in a
-    worktree) right above libs/. Copilot review (PR #372): a checkout run with
+    worktree) right above libs/. Copilot review: a checkout run with
     an interpreter that ALSO has claude-runway installed must report the
     checkout's version, not the unrelated installed distribution's.
     """

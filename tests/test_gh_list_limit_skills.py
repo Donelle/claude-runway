@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression test for issue #355: `gh issue list` / `gh pr list` return at most 30
+"""Regression test: `gh issue list` / `gh pr list` return at most 30
 results unless given `--limit`, so a skill that tells the model to run one without it
 silently drops everything older than the 30 newest items (it once produced a work order
 covering 30 of 73 open issues, and a duplicate ticket because the duplicate-check search

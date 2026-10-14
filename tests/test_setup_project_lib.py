@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for libs/setup_project_lib.py (issue #48's setup/init script).
+"""Tests for libs/setup_project_lib.py (the setup/init script).
 
 Stdlib-only (unittest, no pytest) and no network -- everything here is pure
 dict/path logic over real template files already in this repo (`templates/
@@ -205,7 +205,7 @@ class BuildMcpServers(unittest.TestCase):
         self.assertEqual(before, after)
 
     def test_qdrant_api_key_applied_to_all_three_servers(self):
-        # Regression for the finding from PR #113 review: an authenticated
+        # Regression for a review finding: an authenticated
         # remote-Qdrant setup needs QDRANT_API_KEY on every server that
         # talks to Qdrant -- qdrant, codebase-indexer and memory-bank (the
         # local-compress server no longer talks to Qdrant at all).
@@ -220,13 +220,13 @@ class BuildMcpServers(unittest.TestCase):
         self.assertEqual(servers["codebase-indexer"]["env"]["QDRANT_API_KEY"], "")
 
     def test_compact_collection_defaults_to_the_shared_historical_name(self):
-        # Regression guard for the finding from PR #130 review: deriving
+        # Regression guard for the finding review: deriving
         # this default from collection_name (a per-project value) would
         # silently change COMPACT_COLLECTION on every ALREADY-configured
         # project the moment its .mcp.json gets regenerated, since every
         # project's COMPACT_COLLECTION has only ever
         # held this one constant so far (this function never touched the
-        # key at all before PR #130) -- orphaning that project's entire
+        # key at all originally) -- orphaning that project's entire
         # conversation-compact history, since qdrant_mcp_server.py's
         # sibling-scan/canonical-name computation both key off this exact
         # string. A per-project default is still worth having for NEW
@@ -255,7 +255,7 @@ class BuildMcpServers(unittest.TestCase):
         self.assertEqual(servers["memory-bank"]["env"]["MEMORY_BANK_ID"], "my-project")
 
     def test_memory_bank_id_explicit_value_overrides_collection_name(self):
-        # Regression for PR #178 review (fifth pass): an earlier version
+        # Regression for a review finding (fifth pass): an earlier version
         # hardcoded MEMORY_BANK_ID to always equal collection_name with no
         # independent parameter at all, so a project that later changed
         # --collection-name would silently retag all future memories while
@@ -270,7 +270,7 @@ class BuildMcpServers(unittest.TestCase):
     def test_memory_bank_collection_defaults_to_shared_name(self):
         # Deliberately NOT derived from collection_name -- every project on
         # a machine must agree on this exact value for memories to actually
-        # be shared/found across projects (issue #175).
+        # be shared/found across projects.
         servers = self._build()
         self.assertEqual(servers["memory-bank"]["env"]["MEMORY_BANK_COLLECTION"], "memory-bank")
         self.assertEqual(servers["codebase-indexer"]["env"]["MEMORY_BANK_COLLECTION"], "memory-bank")
@@ -295,7 +295,7 @@ def _find_block_args(hooks: dict, event: str, script_name: str) -> list:
     """Test helper: finds the args list of whichever block under `event`
     references `script_name` by basename -- position-independent, matching
     build_settings_hooks' own basename-matching approach rather than
-    assuming a fixed array index (issue #198 added a second block per
+    assuming a fixed array index (there is now a second block per
     event, so a fixed index would be fragile against future reordering)."""
     for block in hooks.get(event, []):
         for inner in block.get("hooks", []):
@@ -333,10 +333,10 @@ class BuildSettingsHooks(unittest.TestCase):
         )
 
     def test_core_hook_present_under_both_events_regardless_of_compress(self):
-        # Issues #198, #231: record_session_id.py is CORE/base install --
+        # record_session_id.py is CORE/base install --
         # present (and correctly patched) under SessionStart and SessionEnd
         # whether or not local-compress is included.  It is NOT in PostToolUse
-        # (moved from PostToolUse '.*' to SessionStart in issue #231).
+        # (moved from PostToolUse '.*' to SessionStart).
         for include_compress in (True, False):
             hooks = self._build(include_compress=include_compress)
             self.assertEqual(
@@ -384,7 +384,7 @@ class MergeMcpJson(unittest.TestCase):
         self.assertEqual(merged, {"mcpServers": {"qdrant": {"command": "x"}}})
 
     def test_omitting_an_owned_server_this_run_removes_it_from_existing(self):
-        # Regression for the finding from PR #113 review: re-running with
+        # Regression for a review finding: re-running with
         # --qdrant-only after a prior run had configured local-compress
         # previously left the stale local-compress entry in place, since a
         # plain dict .update() only ever adds/overwrites keys it's given
@@ -422,7 +422,7 @@ class MergeSettingsHooks(unittest.TestCase):
         self.assertEqual(len(twice["hooks"]["PostToolUse"]), 1)
 
     def test_rerun_after_tools_repo_moved_replaces_the_stale_block_not_duplicates(self):
-        # Regression for the finding from PR #113 review: matching by exact
+        # Regression for a review finding: matching by exact
         # command/args (rather than by script basename) meant a moved
         # tools-repo checkout / recreated venv left the OLD, now-broken
         # block in place alongside a fresh duplicate.
@@ -451,7 +451,7 @@ class MergeSettingsHooks(unittest.TestCase):
         self.assertEqual(blocks[0]["hooks"][0]["command"], "/new/.venv/bin/python")
 
     def test_a_users_custom_inner_hook_sharing_a_block_survives(self):
-        # Regression for the finding from PR #113 review: a block's "hooks"
+        # Regression for a review finding: a block's "hooks"
         # list can hold more than one entry under the same matcher. The
         # earlier whole-block check discarded the ENTIRE block -- including
         # a user's own unrelated custom hook -- the moment any ONE inner
@@ -557,7 +557,7 @@ class RunSetupEndToEnd(unittest.TestCase):
         )
 
     def test_compact_collection_defaults_to_the_shared_historical_name(self):
-        # See BuildMcpServers' equivalent test (PR #130 review regression
+        # See BuildMcpServers' equivalent test (a review regression
         # guard) for why this deliberately does NOT vary with the resolved
         # collection name here -- a re-run of run_setup() with no
         # --compact-collection must be a no-op for this field on an
@@ -569,7 +569,7 @@ class RunSetupEndToEnd(unittest.TestCase):
         )
 
     def test_collection_name_colliding_with_general_sentinel_warns(self):
-        # Issue #175: a project resolved/named "general" would be
+        # a project resolved/named "general" would be
         # indistinguishable from memory-bank's reserved cross-project tag.
         result = run_setup(
             self.target_repo, REPO_ROOT, home_dir=Path("/home/user"), collection_name="general"
@@ -581,7 +581,7 @@ class RunSetupEndToEnd(unittest.TestCase):
         self.assertFalse(any("WARNING" in c for c in result.changes))
 
     def test_general_collision_check_keys_off_memory_bank_id_not_collection_name(self):
-        # Regression for PR #178 review (fifth pass): since memory_bank_id
+        # Regression for a review finding (fifth pass): since memory_bank_id
         # is now independently settable, the "general" collision check must
         # track the value that actually ends up as the repo tag -- not
         # collection_name, which is now only its fallback default.
@@ -598,7 +598,7 @@ class RunSetupEndToEnd(unittest.TestCase):
         self.assertTrue(any("general" in c and "WARNING" in c for c in result2.changes))
 
     def test_collection_name_colliding_with_memory_bank_collection_warns(self):
-        # Regression for PR #178 review: a target repo directory named
+        # Regression for a review finding: a target repo directory named
         # e.g. "memory-bank" with both COLLECTION_NAME and
         # MEMORY_BANK_COLLECTION left at their defaults resolves them to the
         # SAME string, which makes ingest_mcp_server.py's reserved-name guard
@@ -618,7 +618,7 @@ class RunSetupEndToEnd(unittest.TestCase):
         self.assertFalse(any("WARNING" in c for c in result.changes))
 
     def test_rerun_with_no_compact_collection_flag_does_not_drift_between_runs(self):
-        # Regression for the finding from PR #130 review: a plain re-run
+        # Regression for a review finding: a plain re-run
         # (no new flags -- the exact "safe to re-run" workflow
         # tools/setup_project.py's own docstring advertises) of an already-configured
         # project that has only ever used the shared default must produce
@@ -644,7 +644,7 @@ class RunSetupEndToEnd(unittest.TestCase):
         self.assertIsNone(result.settings_json)
 
     def test_cli_style_qdrant_only_still_writes_core_hooks(self):
-        # Issues #198, #231: the CLI's --qdrant-only keeps include_hooks=True
+        # The CLI's --qdrant-only keeps include_hooks=True
         # (only --skip-hooks sets it False) and passes include_compress=False
         # -- record_session_id.py (CORE/base install) must still be written
         # under SessionStart and SessionEnd, while compress-gated hooks must not.
@@ -674,7 +674,7 @@ class RunSetupEndToEnd(unittest.TestCase):
         # -style rerun (include_hooks=True, include_compress=False) must
         # strip those stale blocks while keeping the core one, all through
         # the normal merge path -- no separate clean_hooks_if_unused branch
-        # needed anymore for this case (issue #198).
+        # needed anymore for this case.
         first = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
         (self.target_repo / ".claude").mkdir()
         (self.target_repo / ".claude" / "settings.json").write_text(
@@ -684,7 +684,7 @@ class RunSetupEndToEnd(unittest.TestCase):
         second = run_setup(
             self.target_repo, REPO_ROOT, home_dir=Path("/home/user"), include_compress=False, include_hooks=True
         )
-        # record_session_id.py lives under SessionStart (issue #231), so
+        # record_session_id.py lives under SessionStart, so
         # PostToolUse held only the compress block, now stripped → empty
         # list. SessionStart has the core record_session_id.py
         # block. SessionEnd has record_session_id.py only (no savings hook).
@@ -712,9 +712,9 @@ class RunSetupEndToEnd(unittest.TestCase):
             json.dumps(first.settings_json), encoding="utf-8"
         )
         second = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
-        # SessionStart: 1 core block (record_session_id.py, issue #231).
+        # SessionStart: 1 core block (record_session_id.py).
         # PostToolUse: 1 compress block (compress_output.py only; core
-        #   record_session_id.py moved from PostToolUse to SessionStart in #231).
+        #   record_session_id.py moved from PostToolUse to SessionStart).
         # PreToolUse: 1 block (redirect_webfetch_to_fetch_url.py).
         # SessionEnd: 2 blocks (record_session_id.py + session_end_savings.py).
         self.assertEqual(len(second.settings_json["hooks"]["SessionStart"]), 1)
@@ -723,7 +723,7 @@ class RunSetupEndToEnd(unittest.TestCase):
         self.assertEqual(len(second.settings_json["hooks"]["SessionEnd"]), 2)
 
     def test_generated_mcp_servers_never_includes_an_unrelated_existing_secret(self):
-        # Regression for the finding from PR #113 review: the full merged
+        # Regression for a review finding: the full merged
         # mcp_json legitimately preserves an unrelated pre-existing server
         # (that's the whole point of merge_mcp_json), but a caller
         # PREVIEWING changes must be able to show only what THIS run
@@ -755,7 +755,7 @@ class RunSetupEndToEnd(unittest.TestCase):
         self.assertIn("qdrant", second.mcp_json["mcpServers"])
 
     def test_rerun_with_qdrant_only_also_removes_stale_hooks_from_a_prior_full_setup(self):
-        # Regression for the finding from PR #113 review: --qdrant-only
+        # Regression for a review finding: --qdrant-only
         # correctly stopped ADDING local-compress-dependent hooks, but a
         # prior full setup's PostToolUse/PreToolUse/SessionEnd hooks were
         # left completely untouched -- still firing (and PreToolUse still
@@ -814,7 +814,7 @@ class RunSetupEndToEnd(unittest.TestCase):
         )
 
         # PostToolUse: 1 block (compress_output.py); record_session_id.py
-        # moved to SessionStart in issue #231 -- no longer in PostToolUse.
+        # moved to SessionStart -- no longer in PostToolUse.
         # SessionStart: 1 block (record_session_id.py).
         # Both must reference the moved tools repo path, not the old one.
         post_hooks = second.settings_json["hooks"]["PostToolUse"]
@@ -829,7 +829,7 @@ class RunSetupEndToEnd(unittest.TestCase):
             actual = block["hooks"][0]["args"][0].replace("\\", "/")
             self.assertIn(moved_tools_repo.as_posix(), actual)
 
-    # --- Issue #279: init re-run must not reset a customized EMBEDDING_MODEL ---
+    # --- Init re-run must not reset a customized EMBEDDING_MODEL ---
 
     _EMBED_SERVERS = ("qdrant", "codebase-indexer", "memory-bank")
     _CUSTOM_MODEL = "BAAI/bge-small-en"
@@ -862,7 +862,7 @@ class RunSetupEndToEnd(unittest.TestCase):
         result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"), embedding_model=new_model)
         models = self._models(result)
         # Per-project code collections move to the new model; memory-bank's model is
-        # its own value (issue #428) and is untouched.
+        # its own value and is untouched.
         self.assertEqual(models["qdrant"], new_model)
         self.assertEqual(models["codebase-indexer"], new_model)
         self.assertEqual(models["memory-bank"], self._CUSTOM_MODEL)
@@ -882,7 +882,7 @@ class RunSetupEndToEnd(unittest.TestCase):
     _OTHER_MODEL = "sentence-transformers/all-mpnet-base-v2"
 
     def test_explicit_model_change_without_memory_bank_block_uses_template_default(self):
-        # Issue #428: no memory-bank block means memory-bank's model comes from the
+        # No memory-bank block means memory-bank's model comes from the
         # template default, never from the code-side model.
         self._write_customized_existing_config(self._CUSTOM_MODEL)
         self._drop_memory_bank_block()
@@ -901,7 +901,7 @@ class RunSetupEndToEnd(unittest.TestCase):
         self.assertEqual(models["memory-bank"], MCP_TEMPLATE["mcpServers"]["memory-bank"]["env"]["EMBEDDING_MODEL"])
 
     def test_code_side_model_is_never_read_from_memory_bank_block(self):
-        # Issue #428: only the memory-bank block has a custom model; the code side
+        # Only the memory-bank block has a custom model; the code side
         # must fall back to the template default rather than read it.
         first = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
         cfg = first.mcp_json
@@ -1003,7 +1003,7 @@ class DefaultSkillsDir(unittest.TestCase):
 
 
 class PlanSkillInstalls(unittest.TestCase):
-    """`plan_skill_installs` (issue #205) -- pure, read-only planning over a
+    """`plan_skill_installs` -- pure, read-only planning over a
     fake tools-repo `skills/` layout (never this real repo's own skills/,
     so these tests don't need updating whenever a skill is added/renamed
     here)."""
@@ -1058,7 +1058,7 @@ class PlanSkillInstalls(unittest.TestCase):
         self.assertFalse(self.skills_dir.exists())
 
     def test_crlf_source_content_is_preserved_verbatim(self):
-        # Regression for Copilot review finding on PR #224: source.read_text()
+        # Regression for Copilot review finding: source.read_text()
         # opens in universal-newlines text mode, silently translating a
         # CRLF source's line endings to bare "\n" -- lossy regardless of
         # platform, and (combined with a text-mode write) the root cause of
@@ -1072,7 +1072,7 @@ class PlanSkillInstalls(unittest.TestCase):
         self.assertEqual(plan_a.content, "line one\r\nline two\r\n")
 
     def test_non_utf8_dest_is_reported_as_update_not_a_crash(self):
-        # Regression for Copilot review finding on PR #224: a pre-existing
+        # Regression for Copilot review finding: a pre-existing
         # dest SKILL.md saved in a non-UTF-8 encoding (e.g. a user's editor
         # defaulting to latin-1, or plain corruption) previously raised
         # UnicodeDecodeError from a decoding comparison, aborting the ENTIRE
@@ -1087,7 +1087,7 @@ class PlanSkillInstalls(unittest.TestCase):
 
 
 class SkillFrontmatterHandling(unittest.TestCase):
-    """Issue #449: shipped skills have no frontmatter, installed ones do. The
+    """Shipped skills have no frontmatter, installed ones do. The
     installed copy's frontmatter is preserved and only the body is compared,
     so there is no perpetual false "update" and no frontmatter is deleted."""
 
@@ -1116,7 +1116,7 @@ class SkillFrontmatterHandling(unittest.TestCase):
         self.assertEqual(split_skill_frontmatter(b""), (b"", b""))
 
     def test_bom_before_the_opening_fence_is_still_frontmatter(self):
-        # Copilot review on PR #451: a Windows editor's UTF-8 BOM must not
+        # Copilot review: a Windows editor's UTF-8 BOM must not
         # make the block look absent (which would delete it on refresh).
         bom = b"\xef\xbb\xbf"
         data = bom + self.FM + b"# Skill: a\n"
@@ -1179,7 +1179,7 @@ class SkillFrontmatterHandling(unittest.TestCase):
         self.assertEqual(plan.content.encode("utf-8", errors="surrogateescape"), fm + b"# Skill: a\nbody v2\n")
 
     def test_source_gaining_frontmatter_never_overwrites_the_installed_block(self):
-        # Copilot review on PR #451: a shipped skill that later gains its own
+        # Copilot review: a shipped skill that later gains its own
         # frontmatter must not replace the installed copy's frontmatter.
         self.src.write_bytes(self.FM + b"body\n")
         installed_fm = b"---\nname: other\ndescription: mine\n---\n\n"

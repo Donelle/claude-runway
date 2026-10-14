@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for libs/session_id_lib.py (issue #198) -- all four
+"""Tests for libs/session_id_lib.py -- all four
 SessionIdStrategy variants (HOOK_PAYLOAD, SHADOW_FILE, TRANSCRIPT_SCAN,
 PROXY) behind the unified session_id() entry point.
 
@@ -223,8 +223,7 @@ class ShadowFileSweep(SessionIdLibTestCase):
         old_path = L._shadow_marker_path("sess-old")
         # Derived from the real constant (not hand-typed) so this doesn't
         # silently go stale the next time the default TTL changes -- same
-        # class of drift EVALUATION.md already flags for hardcoded numbers
-        # (issues #22/#23).
+        # class of drift EVALUATION.md already flags for hardcoded numbers.
         very_old = time.time() - ((L._DEFAULT_SESSION_MARKER_TTL_HOURS + 1) * 3600)
         os.utime(old_path, (very_old, very_old))
         L.record_shadow_marker("sess-fresh", project="/repos/proj-a")
@@ -284,7 +283,7 @@ class ShadowFileSweep(SessionIdLibTestCase):
         self.assertEqual(deleted, 0)
 
     def test_default_ttl_is_168_hours(self):
-        # Pins issue #233's fix directly: SessionStart-based refresh (#231)
+        # Pins the fix directly: SessionStart-based refresh
         # only resets a marker's mtime on resume/clear/compact, not on
         # every tool call, so the default TTL was raised from 48h to 168h
         # (1 week) to shrink the window where a long-running session's
@@ -387,14 +386,14 @@ class TranscriptScanStrategy(SessionIdLibTestCase):
         self.assertIsNone(result)
 
     def test_windows_slug_replaces_backslashes_and_drive_colon(self):
-        # Issue #264: a Windows absolute path must collapse every backslash AND
+        # a Windows absolute path must collapse every backslash AND
         # the drive-letter colon to `-`, matching the real layout verified live
         # under ~/.claude/projects/ on this machine
         # (C:\Repos\CVNA-Github\SandboxOrg\claude-runway ->
         #  C--Repos-CVNA-Github-SandboxOrg-claude-runway). The drive root `C:\`
         # produces `C--` (colon + backslash, each -> one `-`).
         #
-        # Stub _resolve_project (Copilot review PR #388): _project_slug routes
+        # Stub _resolve_project: _project_slug routes
         # through it, and its native os.path.isabs rejects a Windows-style string
         # on a POSIX host -- so without the stub this slug-string assertion would
         # fail on the Linux/macOS CI runner. Stubbing it to return the path
@@ -408,17 +407,17 @@ class TranscriptScanStrategy(SessionIdLibTestCase):
             self.assertEqual(L._project_slug(r"D:\dev\app"), "D--dev-app")
 
     def test_posix_slug_unaffected_by_windows_separator_handling(self):
-        # Issue #264 regression guard: adding `\`/`:` to the replacement set
+        # Regression guard: adding `\`/`:` to the replacement set
         # must not change the POSIX slug (no backslash or colon present there).
         self.assertEqual(L._project_slug("/Users/dev/repos/my-project"), "-Users-dev-repos-my-project")
 
     def test_windows_transcript_scan_finds_the_right_slug_dir(self):
-        # Issue #264 end-to-end: before the fix, a Windows path slug was left as
+        # End-to-end: before the fix, a Windows path slug was left as
         # an absolute path, so `projects_dir / slug` discarded projects_dir and
         # scanned the project root itself. With the fix the slug is a plain
         # directory name that correctly nests under the (mocked) projects dir.
         #
-        # Stub _resolve_project (Copilot review PR #388) for the whole test: its
+        # Stub _resolve_project for the whole test: its
         # native os.path.isabs would reject this Windows-style path on a POSIX
         # host, yielding a None slug -- which fails `projects_dir / slug` during
         # fixture setup AND the scan. Keep the stub active through both the slug
@@ -435,7 +434,7 @@ class TranscriptScanStrategy(SessionIdLibTestCase):
         self.assertEqual(result, "win-session-id")
 
     def test_containment_guard_rejects_slug_escaping_projects_dir(self):
-        # Issue #264 defense-in-depth: even if a future slug-convention miss
+        # Defense-in-depth: even if a future slug-convention miss
         # yielded an absolute or `..`-escaping segment, the scan must fail safe
         # to None rather than globbing outside the transcripts dir. Simulate the
         # miss by patching _project_slug to return an absolute path (the exact
@@ -449,9 +448,9 @@ class TranscriptScanStrategy(SessionIdLibTestCase):
         self.assertIsNone(result)
 
     def test_containment_guard_symlink_loop_runtimeerror_returns_none(self):
-        # Issue #264 / Copilot review PR #388: on Python 3.10-3.12 Path.resolve()
+        # Copilot review: on Python 3.10-3.12 Path.resolve()
         # raises RuntimeError (NOT OSError) on a symlink loop. The containment
-        # guard added for this issue must catch that too, or it would newly
+        # guard must catch that too, or it would newly
         # violate session_id()'s never-raises contract (before the guard,
         # is_dir() just returned False for this case). Verified live that a real
         # symlink loop raises RuntimeError; here we force it deterministically.
@@ -462,7 +461,7 @@ class TranscriptScanStrategy(SessionIdLibTestCase):
         self.assertIsNone(result)
 
     def test_containment_guard_embedded_nul_valueerror_returns_none(self):
-        # Issue #264 / Copilot review PR #388: Path.resolve() raises ValueError
+        # Copilot review: Path.resolve() raises ValueError
         # (not OSError/RuntimeError) for an embedded NUL in the path, e.g. a
         # malformed marker whose stored absolute `project` passed earlier
         # validation. The containment guard must catch that too to preserve
@@ -520,7 +519,7 @@ class ProxyStrategy(SessionIdLibTestCase):
 
 
 class ShadowFileStaleMarkerFallback(SessionIdLibTestCase):
-    """Issue #236: when the best-matching SHADOW_FILE marker is stale (older
+    """When the best-matching SHADOW_FILE marker is stale (older
     than CLAUDE_RUNWAY_SESSION_MARKER_TTL_HOURS), fall back to TRANSCRIPT_SCAN
     before returning None -- a live session that has outlived the TTL without
     triggering a hook lifecycle event should still be recoverable."""
@@ -541,7 +540,7 @@ class ShadowFileStaleMarkerFallback(SessionIdLibTestCase):
 
     def test_stale_marker_falls_back_to_transcript_scan_result(self):
         # The matching marker is past the TTL; TRANSCRIPT_SCAN finds a live one.
-        # Copilot review on PR #252: TRANSCRIPT_SCAN must receive the marker's
+        # Copilot review: TRANSCRIPT_SCAN must receive the marker's
         # own recorded absolute path, not None/os.getcwd(), so it scans the
         # RIGHT project's transcript directory even when the caller's cwd
         # differs from the marker's project.
@@ -560,11 +559,11 @@ class ShadowFileStaleMarkerFallback(SessionIdLibTestCase):
         mock_scan.assert_called_once_with("/repos/myapp")
 
     def test_no_matching_marker_at_all_falls_back_to_transcript_scan(self):
-        # Issue #253: when the sessions dir has markers but none match the
+        # When the sessions dir has markers but none match the
         # requested project (all swept by sweep_stale_shadow_markers()), fall
         # back to TRANSCRIPT_SCAN with the MCP server's cwd (not None) when the
         # cwd's basename matches the requested project.
-        # Contrast with the stale-marker case (issue #236), where the marker's
+        # Contrast with the stale-marker case, where the marker's
         # own recorded absolute path is used so TRANSCRIPT_SCAN always scans the
         # right project root regardless of cwd.
         L.record_shadow_marker("sess-other", project="/repos/other-project")
@@ -575,7 +574,7 @@ class ShadowFileStaleMarkerFallback(SessionIdLibTestCase):
         mock_scan.assert_called_once_with("/repos/myapp")
 
     def test_no_matching_marker_transcript_scan_returns_none(self):
-        # Issue #253: TRANSCRIPT_SCAN is called but also finds nothing -- None returned.
+        # TRANSCRIPT_SCAN is called but also finds nothing -- None returned.
         L.record_shadow_marker("sess-other", project="/repos/other-project")
         with mock.patch.object(os, "getcwd", return_value="/repos/myapp"):
             with mock.patch.object(L, "_session_id_from_transcript_scan", return_value=None) as mock_scan:
@@ -584,7 +583,7 @@ class ShadowFileStaleMarkerFallback(SessionIdLibTestCase):
         mock_scan.assert_called_once_with("/repos/myapp")
 
     def test_cwd_mismatch_skips_swept_marker_fallback(self):
-        # Cross-project guard (issue #35): if the MCP server's cwd basename
+        # Cross-project guard: if the MCP server's cwd basename
         # does NOT match the requested project, skip the fallback -- returning
         # the wrong project's session_id would be worse than returning None.
         L.record_shadow_marker("sess-other", project="/repos/other-project")
@@ -595,7 +594,7 @@ class ShadowFileStaleMarkerFallback(SessionIdLibTestCase):
         mock_scan.assert_not_called()
 
     def test_empty_sessions_dir_falls_back_to_transcript_scan_on_cwd_match(self):
-        # Issue #253 (Copilot review fix): when the project's last marker was
+        # When the project's last marker was
         # swept AND it was the only marker (dated is empty), the fallback must
         # still fire -- the early `if not dated: return None` was removed to
         # cover this case.

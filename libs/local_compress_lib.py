@@ -159,7 +159,7 @@ NOT_RELEVANT_MARKER = "[NOT RELEVANT]"
 # leading-verb/article strip below), never substring: a positional word is
 # routinely part of a topical query ("how the abstract base class is used",
 # "what the introduction of retries changed") and substring matching silently
-# truncated those to the first ~4000 chars, discarding the answer (issue #299).
+# truncated those to the first ~4000 chars, discarding the answer.
 # Same failure direction as _looks_non_selective's own docs describe: a
 # selective focus misread as a special one fails quietly and looks correct.
 # The cost of this strictness is that an unusual positional phrasing falls
@@ -257,7 +257,7 @@ def _normalize_focus(focus: str) -> str:
     behind ("please summarize this"), which then failed to match
     DEFAULT_FOCUS/_GENERIC_FOCUS_PHRASES in _looks_non_selective and wrongly
     ran the per-chunk classifier against the leftover fragment as if it
-    were a real selection target (issue #42)."""
+    were a real selection target."""
     normalized = re.sub(r"\s+", " ", focus.strip().lower()).strip(" .!?")
     return re.sub(r"^(?:(?:please|just|can you|could you)\s+)+", "", normalized).strip()
 
@@ -274,7 +274,7 @@ def _looks_non_selective(focus: str) -> bool:
     when they pass no focus at all and is by construction non-selective --
     so those paths stay covered regardless of how conservative the phrase set
     is. Any new default focus constant MUST be added to _DEFAULT_FOCUSES
-    (issue #299: DEFAULT_WEB_FOCUS was missed, so every no-focus fetch_url
+    (DEFAULT_WEB_FOCUS was once missed, so every no-focus fetch_url
     ran the NO-biased classifier)."""
     if not focus or not focus.strip():
         return True
@@ -293,7 +293,7 @@ def _nearest_nonblank_stripped(lines: list, start: int, step: int) -> Optional[s
     Needed because a heading is normally separated from surrounding prose by
     a blank line (standard Markdown, including this repo's own README) --
     checking only the line immediately adjacent to a candidate heading missed
-    that far more often than intended (issue #28).
+    that far more often than intended.
     """
     j = start
     while 0 <= j < len(lines) and not lines[j].strip():
@@ -326,7 +326,7 @@ def _find_first_heading_boundary(text: str, min_offset: int = 300, max_offset: i
     The prose lines don't have to be immediately adjacent -- a blank line
     (or several) in between is the normal case, not the exception, so the
     nearest NON-BLANK line on each side is what actually gets checked
-    (issue #28; see _nearest_nonblank_stripped).
+    (see _nearest_nonblank_stripped).
 
     Returns None if no confident heading-like line is found within
     max_offset chars (callers should fall back to a fixed default in that
@@ -516,7 +516,7 @@ def section_has_mixed_runs(body: str) -> bool:
 # i.e. a reachable-but-hung LM Studio (model loaded but stuck) could block one
 # call for ~30 minutes. That matters most for the PostToolUse hook, which runs
 # synchronously in Claude Code's own tool-result path, so a hang there stalls
-# the whole session, not just one tool call (issue #301).
+# the whole session, not just one tool call.
 #
 # The invariant, stated once: every client built for this module (by
 # libs/lmstudio_client.py, which reads the constants below) is BOUNDED -- a
@@ -553,7 +553,7 @@ def is_bounded_timeout(value: float) -> bool:
     """
     The single definition of a usable timeout, applied to BOTH the env var
     and an explicit `build_client(timeout=...)` argument
-    (libs/lmstudio_client.py) so neither path can smuggle in an unbounded client (PR #361 review): finite and > 0. The
+    (libs/lmstudio_client.py) so neither path can smuggle in an unbounded client: finite and > 0. The
     SDK would treat inf as no bound, and 0/negative/nan as broken or
     immediate-fail.
     """
@@ -769,7 +769,7 @@ def strip_total_outage_notice(result: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# In-session compression cache (issue #60)
+# In-session compression cache
 # ---------------------------------------------------------------------------
 #
 # Skips a redundant LM Studio round-trip when the exact same content is
@@ -798,7 +798,7 @@ def strip_total_outage_notice(result: str) -> Optional[str]:
 #     in-process cache already covers the same-process case (e.g. the MCP server
 #     compresses the same file twice in one session).
 #   - In practice, each process's own in-memory cache is sufficient for the
-#     within-session deduplication this issue targets. A future cross-process
+#     within-session deduplication this cache targets. A future cross-process
 #     cache can be layered on top if measured to matter.
 #
 # model is included in the key: the same content compressed with a different
@@ -865,7 +865,7 @@ def _compression_cache_key(
       auto-detected call adds a "[note: focus looked positional...]" suffix
       while an explicit call adds a "[note: max_chars=N truncated...]" suffix
       (or none at all if the limit wasn't reached).
-    - was_truncated (issue #300, Copilot review): the positional truncation
+    - was_truncated: the positional truncation
       note is gated on it, and by the time the key is built `text` is already
       the sliced window. An N-char positional input (nothing dropped) and a
       longer input whose first N chars are identical hash the same
@@ -1350,7 +1350,7 @@ _TRAILING_SUMMARY_RE = re.compile("|".join(f"(?:{p})" for p in _TRAILING_SUMMARY
 #
 # 500 was too narrow: a CI log with a trailing coverage table or
 # artifact-upload confirmation (typically 800-1200 chars) could push the real
-# pass/fail line past the window, causing a silent miss (#47). 1500 covers
+# pass/fail line past the window, causing a silent miss. 1500 covers
 # those realistic noise patterns while staying well short of where a stale
 # retry result would appear.
 _TRAILING_SUMMARY_WINDOW = 1500
@@ -1393,8 +1393,8 @@ def append_trailing_summary_if_missing(original: str, summary: str) -> str:
 # Why the most recent complete() call on THIS thread failed ("timeout" or
 # "other"), or None. complete() deliberately keeps its Optional[str] contract
 # (many callers and tests rely on None meaning "the request failed"), so the
-# reason travels on this side channel instead of widening the return type
-# (issue #368). Thread-local because the relevance classifier runs complete()
+# reason travels on this side channel instead of widening the return type.
+# Thread-local because the relevance classifier runs complete()
 # in executor threads concurrently; read it with take_failure_kind() on the
 # same thread that made the call.
 _failure_state = threading.local()
@@ -1425,8 +1425,8 @@ def complete(oai_client, model: str, system: str, content: str) -> Optional[str]
     explicit model= or CLAUDE_RUNWAY_LMSTUDIO_MODEL skips that check entirely, so
     a dead LM Studio server is only caught here, at the actual request.
 
-    On failure the reason is also recorded for take_failure_kind() (issue
-    #368): the client signals a timeout by raising CompletionTimeout (a
+    On failure the reason is also recorded for take_failure_kind():
+    the client signals a timeout by raising CompletionTimeout (a
     timeout may subclass a connection error in the client's own SDK, so the
     client translates it explicitly rather than this function inferring it
     from "not a connection error"). `oai_client` is any object with an
@@ -1454,7 +1454,7 @@ _ALL_TIMED_OUT_PREFIX = "[LM Studio timed out on every request"
 
 
 def _request_failed_message(where: str, kind: Optional[str], base_url: Optional[str]) -> str:
-    """Wording for a failed LM Studio request (issue #368).
+    """Wording for a failed LM Studio request.
 
     A timeout means the request did not finish in time -- typically because
     LM Studio is busy (it runs a limited number of requests in parallel, 4 by
@@ -1482,7 +1482,7 @@ def _classify_relevant_with_reason(*args) -> Tuple[Optional[bool], Optional[str]
 
     complete()'s failure reason is thread-local, and the relevance requests run
     in executor threads, so the event-loop thread cannot read it afterwards --
-    it has to be taken here, immediately after the call (issue #368).
+    it has to be taken here, immediately after the call.
     """
     result = classify_relevant(*args)
     return result, (take_failure_kind() if result is None else None)
@@ -1609,8 +1609,8 @@ def classify_relevant(
 def _http_get_json(url: str, timeout: float):
     """
     Minimal stdlib-only GET-and-parse-JSON helper for fetch_loaded_models'
-    /api/v0/models probe below -- deliberately NOT `requests` (PR #318
-    review, high severity): this module is deliberately standard-library-only
+    /api/v0/models probe below -- deliberately NOT `requests`:
+    this module is deliberately standard-library-only
     (it imports no client SDK; libs/lmstudio_client.py is the only module that
     imports `openai`), and both hooks/compress_output.py and
     hooks/redirect_webfetch_to_fetch_url.py import it directly (not through
@@ -1637,8 +1637,8 @@ def _http_get_json(url: str, timeout: float):
 def fetch_loaded_models(base_url: Optional[str], timeout: float = LM_STUDIO_V0_TIMEOUT_SECONDS) -> Tuple[list, str]:
     """
     Returns (ids, source) -- the actual guarantee on `ids` is
-    SOURCE-DEPENDENT, not a single uniform "loaded and chat-capable" promise
-    (PR #318 review), so callers needing to know which guarantee applies
+    SOURCE-DEPENDENT, not a single uniform "loaded and chat-capable" promise,
+    so callers needing to know which guarantee applies
     must check `source`, not just assume the stronger one:
       - source == "v0": ids are LM Studio's native /api/v0/models endpoint's
         own report of what's currently LOADED, filtered to exclude entries
@@ -1646,7 +1646,7 @@ def fetch_loaded_models(base_url: Optional[str], timeout: float = LM_STUDIO_V0_T
         paragraph below for why even this isn't a 100% guarantee).
       - source == "v1": /api/v0 wasn't available, so this fell back to the
         OpenAI-compatible /v1/models endpoint, which lists every DOWNLOADED
-        model regardless of whether it's actually loaded (issue #296) --
+        model regardless of whether it's actually loaded --
         `ids` here may include models that aren't loaded at all.
     Callers use `source` to avoid claiming "loaded" in a message when the
     fallback path can't actually confirm that.
@@ -1665,7 +1665,7 @@ def fetch_loaded_models(base_url: Optional[str], timeout: float = LM_STUDIO_V0_T
     not-loaded, mistyped model is correctly excluded here for being
     not-loaded, not by accident of its type.
 
-    KNOWN RESIDUAL LIMITATION (PR #318 review): `type != "embeddings"` is
+    KNOWN RESIDUAL LIMITATION: `type != "embeddings"` is
     still the only signal available to exclude a LOADED embedding model
     (which can't serve a chat completion) once `state == "loaded"` -- and
     `/api/v0/models` exposes no OTHER field that reliably distinguishes
@@ -1686,7 +1686,7 @@ def fetch_loaded_models(base_url: Optional[str], timeout: float = LM_STUDIO_V0_T
 
     try:
         payload = _http_get_json(v0_url, timeout)
-        # PR #318 review: a 200 response that ISN'T actually the /api/v0
+        # a 200 response that ISN'T actually the /api/v0
         # schema (e.g. a reverse proxy returning its own JSON error body, or
         # a non-LM-Studio server that happens to answer this exact path with
         # something unrelated) used to silently fall through to `entries =
@@ -1710,8 +1710,8 @@ def fetch_loaded_models(base_url: Optional[str], timeout: float = LM_STUDIO_V0_T
         # to /v1/models unchanged so behavior there doesn't regress. If LM
         # Studio is genuinely unreachable, this raises too -- callers already
         # catch that.
-        # Plain GET of {base}/models with the same short `timeout` (PR #318
-        # review: a caller like the WebFetch redirect hook relies on a short
+        # Plain GET of {base}/models with the same short `timeout`
+        # (a caller like the WebFetch redirect hook relies on a short
         # timeout to fail open promptly). Done with urllib rather than an
         # `openai` client's models.list() so this module needs no client SDK;
         # the response shape is the OpenAI-compatible {"data": [{"id": ...}]}.
@@ -1735,7 +1735,7 @@ def resolve_model(explicit_model: Optional[str], base_url: Optional[str]):
     # CLAUDE_RUNWAY_LMSTUDIO_MODEL var -- if we returned early on the model
     # before ever checking this, that other partial migration would stay
     # silent and this whole call would go on to use the wrong base URL with
-    # no diagnosis of why (issue #41). stale_env_warning() itself only fires
+    # no diagnosis of why. stale_env_warning() itself only fires
     # per-pair (old set + that SAME pair's new name missing), so a
     # successfully migrated model var never masks or gets masked by a
     # still-stale URL var, and vice versa.
@@ -1758,7 +1758,7 @@ def resolve_model(explicit_model: Optional[str], base_url: Optional[str]):
     if not ids:
         return None, "LM Studio is reachable but no model is loaded. Load one in LM Studio, or pass model= explicitly."
     # source == "v0" means these really are confirmed LOADED chat models
-    # (issue #296) -- say so precisely. source == "v1" means /api/v0 wasn't
+    # -- say so precisely. source == "v1" means /api/v0 wasn't
     # reachable, so this can no longer distinguish loaded from
     # merely-downloaded -- the wording must not claim "loaded" for something
     # it can't actually confirm.
@@ -1802,21 +1802,21 @@ async def _compress_each_section(text, focus, oai_client, model, base_url, prese
     case gets an "[LM Studio appears unreachable ...]" line prepended instead
     (or "[LM Studio timed out on every request ...]" when every failure was a
     timeout), so a total outage during this run is distinguishable from a normal one
-    (issue #43) without regressing the content-preserving fallback itself:
+    without regressing the content-preserving fallback itself:
     each section's original body is still preserved either way, never
     dropped -- though "preserved" means kept out of the model's summarizing
     pass, not a promise of byte-for-byte identity: redact_and_disclose()
     still runs over the whole result afterward regardless of which path got
     it there, so a credential-shaped value in a fallback section is still
-    replaced and disclosed exactly as it would be anywhere else (PR #134
-    review, round 3) -- the warning text below is worded to reflect that.
+    replaced and disclosed exactly as it would be anywhere else
+    -- the warning text below is worded to reflect that.
 
     A "NOT RELEVANT" verdict is deliberately NOT counted toward that signal,
     even though it also falls back to the original body: it's a valid,
     successful response from a reachable model, just one that doesn't apply
     to this section, so a document whose every attempted section happens to
-    be judged not relevant must not be reported as an outage (PR #134
-    review) -- LM Studio answered every request just fine. Same reasoning
+    be judged not relevant must not be reported as an outage
+    -- LM Studio answered every request just fine. Same reasoning
     applies to a genuinely empty/whitespace-only response: per complete()'s
     own contract, it returns None specifically for a request failure
     (connection error, model not found, etc.) and the completion's actual
@@ -1825,7 +1825,7 @@ async def _compress_each_section(text, focus, oai_client, model, base_url, prese
     "   " together via `(summary or "").strip()`) is what makes that
     distinction possible; collapsing them, as an earlier version of this
     function did, made an empty-but-successful response indistinguishable
-    from an actual outage (also PR #134 review).
+    from an actual outage.
     """
     preamble, sections = split_sections(text)
     if not sections:
@@ -1835,7 +1835,7 @@ async def _compress_each_section(text, focus, oai_client, model, base_url, prese
     parts = [preamble] if preamble else []
     compressed_count = verbatim_count = 0
     request_failed_count = not_relevant_count = empty_response_count = 0
-    # Why each failed request failed (issue #368), so an outage made up ENTIRELY
+    # Why each failed request failed, so an outage made up ENTIRELY
     # of timeouts (usually a busy LM Studio, though a timeout can also mean it
     # was unreachable) gets the neutral "timed out" wording, not the
     # connection-refused "appears unreachable" one.
@@ -1861,7 +1861,7 @@ async def _compress_each_section(text, focus, oai_client, model, base_url, prese
         # Mixed section (prose + bullet runs): compress only the prose runs and
         # keep each bullet run verbatim -- recovering compression ratio on the
         # prose portions without weakening the 'a list of facts is never
-        # compressed' guarantee (issue #61).
+        # compressed' guarantee.
         if section_has_mixed_runs(body):
             runs = split_prose_bullet_runs(body)
             run_parts = []
@@ -1987,14 +1987,14 @@ async def _compress_each_section(text, focus, oai_client, model, base_url, prese
     # failure, and nothing succeeded (not compressed, not a valid
     # NOT-RELEVANT verdict, not even an empty-but-live response) --
     # distinguish this from a normal, healthy run rather than returning the
-    # same success-shaped string either way (issue #43). This is NOT
+    # same success-shaped string either way. This is NOT
     # "request_failed_count == len(sections)": a section that's verbatim by
     # heading/structure is never sent to the model at all, so a document
     # with, say, four verbatim sections and two prose ones that both failed
     # would otherwise never trip a literal all-sections check, even though
     # every model call that WAS made failed outright. And it is deliberately
-    # NOT triggered by not_relevant_count or empty_response_count alone (PR
-    # #134 review, both rounds): either one means the request reached a live
+    # NOT triggered by not_relevant_count or empty_response_count alone:
+    # either one means the request reached a live
     # model and got an actual response back, so a document whose attempted
     # sections are all judged not relevant, or all come back empty, is a
     # normal (if unproductive) run, not an outage -- conflating either with a
@@ -2017,7 +2017,7 @@ async def _compress_each_section(text, focus, oai_client, model, base_url, prese
     # regardless of why a section fell back to its original body, so a
     # credential-shaped value in a fallback section IS still replaced and
     # disclosed here exactly as it would be anywhere else -- "unchanged"
-    # would be a false claim in that case (PR #134 review, round 3).
+    # would be a false claim in that case.
     if (
         compressed_count == 0
         and not_relevant_count == 0
@@ -2068,7 +2068,7 @@ async def compress(
     value starting with "Error:" as a signal to fall back to the original
     text rather than lose it.
 
-    EXCEPTION to "unchanged" above (PR #135 review, round 2): with
+    EXCEPTION to "unchanged" above: with
     preserve_identifiers=True or preserve_sections=True, redact_and_disclose()
     still runs on this under-threshold path too, so a credential-shaped value
     is replaced and a "[N credential-shaped value(s) redacted...]" note
@@ -2082,20 +2082,20 @@ async def compress(
     success string: if every section whose request was actually attempted
     failed outright and nothing succeeded, the result is prepended with
     "[LM Studio appears unreachable -- no section was compressed; original
-    content preserved]" (issue #43; see _compress_each_section's own
+    content preserved]" (see _compress_each_section's own
     docstring for the precise condition and why a NOT-RELEVANT verdict or an
     empty-but-live response don't count toward it -- and for why the wording
     says "preserved" rather than "unchanged": redact_and_disclose() still
     runs regardless, so a credential-shaped value is still replaced even in
-    a fallback section, PR #134 review round 3). When every failed request was
-    a timeout, the prefix is "[LM Studio timed out on every request ..." instead
-    (issue #368). This is NOT an
+    a fallback section). When every failed request was
+    a timeout, the prefix is "[LM Studio timed out on every request ..." instead.
+    This is NOT an
     "Error:"-prefixed string -- the content is fully present and usable
     either way -- so a caller parsing only for "Error:" vs. everything-else
     still works unchanged; a caller that specifically wants to detect this
     distinct total-outage signal should check for either the "[LM Studio
     appears unreachable" or the "[LM Studio timed out on every request"
-    prefix instead (PR #134 review).
+    prefix instead.
 
     max_chars, if given, truncates to the first N chars of `text` before
     anything else happens. If not given but `focus` looks positional (see
@@ -2214,7 +2214,7 @@ async def compress(
     # chars_limited/auto_truncated but text[:max_chars] is a no-op. Computed
     # before the slice so the comparison is against the real original length.
     # Written as "max_chars is not None and ..." rather than "chars_limited
-    # and ..." so the type checker (mypy originally, Pyright since issue #297
+    # and ..." so the type checker (mypy originally, Pyright
     # -- both share this same limitation) can narrow max_chars from
     # Optional[int] to int within this same expression -- neither can do
     # that narrowing through a separate bool variable, even though
@@ -2238,15 +2238,15 @@ async def compress(
         # short." Disclose truncation the same way the full pipeline does
         # further down (see auto_truncated's truncate_note below), whether
         # it was auto-detected from a positional focus or came from an
-        # explicit max_chars the caller passed themselves -- issue #24
+        # explicit max_chars the caller passed themselves
         # reproduced both as silently truncated with no note. Gated on
         # was_truncated, not chars_limited: a limit that was merely selected
         # but never reached (e.g. a short positional input, or an explicit
         # max_chars >= len(text)) truncated nothing, so a disclosure note
-        # here would itself be a false claim (caught in PR #85 review).
+        # here would itself be a false claim.
         #
-        # Redacts here in EITHER artifact-producing mode (PR #135 review,
-        # Copilot, both rounds): this early return happens BEFORE the main
+        # Redacts here in EITHER artifact-producing mode:
+        # this early return happens BEFORE the main
         # preserve_identifiers block AND before _compress_each_section
         # further down ever run, so a caller relying on either flag to get
         # credential redaction was leaving every input shorter than
@@ -2261,7 +2261,7 @@ async def compress(
         # summarized," not "byte-for-byte identical regardless of what it
         # contains" -- same distinction already drawn for the total-outage
         # fallback path elsewhere in this file, and now documented in this
-        # function's own docstring too (PR #135 review, round 2).
+        # function's own docstring too.
         #
         # Captured BEFORE redact_and_disclose below can change text's length
         # (replacing a credential with a shorter/longer placeholder, or
@@ -2300,7 +2300,7 @@ async def compress(
         return f"Error: {error}"
     # resolve_model()'s own docstring: "exactly one will be None" -- error is
     # falsy here, so model is guaranteed non-None. Pyright can't infer that
-    # correlation between two tuple-unpacked values on its own (issue #297).
+    # correlation between two tuple-unpacked values on its own.
     assert model is not None
 
     # The resolved model id is now known -- compute the cache key and check
@@ -2385,7 +2385,7 @@ async def compress(
     # (uses the caller's blocking client), so we dispatch each call on the
     # default thread-pool executor and gather the results -- same semantics
     # as running them in parallel threads, but compatible with the surrounding
-    # async function. See issue #59.
+    # async function.
     #
     # Note: actual parallelism is bounded by the executor's thread pool size
     # and by LM Studio's own request concurrency limit, so the speedup is
@@ -2509,7 +2509,7 @@ async def compress(
         # re-appending it would assert coverage the summary never claimed.
         compressed = append_missing_identifiers(text, compressed)
     # Redaction is gated on EITHER preservation flag, not preserve_identifiers
-    # alone (PR #135 review, round 4): preserve_sections=True falls through
+    # alone: preserve_sections=True falls through
     # to this same ordinary whole-text path whenever _compress_each_section
     # finds no headings to split on (see the `if preserve_sections:` block
     # above) -- so with preserve_sections=True and preserve_identifiers left

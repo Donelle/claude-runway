@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Computes the wheel's `data_files` list at BUILD time (issue #206) --
+Computes the wheel's `data_files` list at BUILD time --
 supplements pyproject.toml's static `[project]`/`[tool.setuptools]` tables
 with the one thing PEP 621 has no declarative equivalent for: shipping
 libs/, tools/, hooks/, templates/, and skills/ as wheel DATA files under
 <env>/src/{libs,tools,hooks,templates,skills} instead of as
 `[tool.setuptools] packages` (which previously put them directly in
-site-packages -- the generic top-level-namespace layout this issue moves
+site-packages -- the generic top-level-namespace layout this project moved
 away from; see pyproject.toml's own `[tool.setuptools]` comment block).
 
 A GLOB, not a hand-typed file list, for exactly the reason the issue asks
@@ -23,7 +23,7 @@ shared "src/skills" target covering all of them -- setuptools' `data_files`
 copies every matched source file into the SAME target directory by BASENAME
 ALONE, so a single shared target would collapse every skill's identically
 named SKILL.md into just one, silently dropping every skill but the last
-(confirmed live during this issue's own development: a shared
+(confirmed live during development: a shared
 `"src/skills": ["skills/*/SKILL.md"]` entry kept only the alphabetically
 last skill's SKILL.md in the built wheel). One tuple per subdirectory
 preserves each skill's own name as part of the install path instead.

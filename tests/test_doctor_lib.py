@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tests for libs/doctor_lib.py -- the validator behind tools/doctor.py
 that diffs .mcp.json's local-compress env block against the shell for the
-four dual-config CLAUDE_RUNWAY_* vars (issue #49).
+four dual-config CLAUDE_RUNWAY_* vars.
 
 Stdlib-only (unittest), no network, no real .mcp.json fixture beyond
 temp-dir JSON this test writes itself:
@@ -32,7 +32,7 @@ class LoadLocalCompressEnv(unittest.TestCase):
         self.assertIsNone(doctor_lib.load_local_compress_env(self.mcp_json_path))
 
     def test_invalid_json_raises_malformed_error_not_none(self):
-        # Regression for the finding from PR #119 review: invalid/unreadable
+        # Regression for a review finding: invalid/unreadable
         # JSON previously returned None, indistinguishable from a genuine
         # --qdrant-only setup with nothing to check -- so the CLI's
         # advertised "exit 1 on a problem" gate silently exited 0 on a
@@ -47,7 +47,7 @@ class LoadLocalCompressEnv(unittest.TestCase):
             doctor_lib.load_local_compress_env(self.mcp_json_path)
 
     def test_mcp_servers_null_raises_malformed_error_not_attribute_error(self):
-        # Regression for the finding from PR #119 review: "mcpServers":
+        # Regression for a review finding: "mcpServers":
         # null (present but None) previously crashed with an uncaught
         # AttributeError from the blind data.get("mcpServers", {}).get(...)
         # chain -- .get()'s default only applies when the KEY is missing,
@@ -76,7 +76,7 @@ class LoadLocalCompressEnv(unittest.TestCase):
             doctor_lib.load_local_compress_env(self.mcp_json_path)
 
     def test_local_compress_explicit_null_value_raises_malformed_error_not_none(self):
-        # Regression for the finding from PR #119 review (round 2):
+        # Regression for a review finding (round 2):
         # {"local-compress": null} previously came back from
         # mcp_servers.get("local-compress") as None -- INDISTINGUISHABLE
         # from the key being genuinely absent (a real --qdrant-only setup)
@@ -87,7 +87,7 @@ class LoadLocalCompressEnv(unittest.TestCase):
             doctor_lib.load_local_compress_env(self.mcp_json_path)
 
     def test_env_value_that_is_not_a_string_raises_malformed_error(self):
-        # Regression for the finding from PR #119 review (round 2):
+        # Regression for a review finding (round 2):
         # a non-string env value (here, an int) previously either crashed
         # downstream inside _is_truthy_track_savings()'s .strip() call, or
         # (for a JSON null) was silently misread by _normalize() as "key
@@ -252,7 +252,7 @@ class CheckDualEnvVars(unittest.TestCase):
         self.assertEqual(self._check(mcp_env, shell_env), [])
 
     def test_savings_db_tilde_path_matches_its_expanded_absolute_equivalent(self):
-        # Regression for the finding from PR #119 review: this previously
+        # Regression for a review finding: this previously
         # compared the raw override strings as-is, so "~/savings.db" and
         # "/home/testuser/savings.db" -- the SAME real database, per
         # savings_ledger.resolve_db_path()'s own expanduser() call -- were
@@ -315,7 +315,7 @@ class RunDoctor(unittest.TestCase):
         self.assertIsNone(result.config_error)
 
     def test_malformed_mcp_json_is_reported_as_a_config_error_not_swallowed(self):
-        # Regression for the finding from PR #119 review: a malformed
+        # Regression for a review finding: a malformed
         # .mcp.json (here, "mcpServers": null) previously either returned
         # the same "nothing to check" result as a genuine --qdrant-only
         # setup, or crashed outright -- run_doctor must instead surface it
@@ -420,7 +420,7 @@ class QdrantBlockIsCheckedToo(unittest.TestCase):
 
 
 class LegacyCompressHook(unittest.TestCase):
-    """Issue #395: doctor flags a settings.json still on compress_bash_output.py."""
+    """Doctor flags a settings.json still on compress_bash_output.py."""
 
     def setUp(self):
         self._tmpdir = tempfile.TemporaryDirectory()

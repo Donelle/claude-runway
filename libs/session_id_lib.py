@@ -4,14 +4,14 @@ get or approximate a session_id -- including all the path/directory/slug
 logic behind each strategy -- behind a single entry point, so a future
 caller picks the right strategy deliberately instead of reinventing one,
 copying the wrong one, or reaching into another module's private directory
-layout (issue #198).
+layout.
 
 Four strategies exist:
 
 | Type | Strategy        | Mechanism                                                                                                  | Needs a hook? | Real ID? | Risk |
 |------|-----------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------|----------|------|
 | 1    | HOOK_PAYLOAD    | Claude Code hands every hook `session_id`/`transcript_path` directly on stdin -- trivial extraction.        | Yes (hook only) | Yes -- authoritative | None |
-| 2    | SHADOW_FILE     | `hooks/record_session_id.py` writes a small presence marker (`session_<id>.jsonl`) into the sessions directory `savings_ledger.py` also uses (own filename prefix, no shared format); an MCP tool call scans for the most-recently-modified marker, optionally filtered by project. | Conditionally No — swept-marker fallback (PR #254) reaches TRANSCRIPT_SCAN only if the sessions directory exists; stale-marker fallback (PR #252) additionally requires a prior hook run to have written the marker | Yes — hook marker on primary path; TRANSCRIPT_SCAN result on fallback paths | Primary path: hook required. Stale-marker fallback: TRANSCRIPT_SCAN layout risk only (cwd-independent; uses marker's recorded path). Swept-marker fallback: cwd-sensitive + TRANSCRIPT_SCAN layout risk. |
+| 2    | SHADOW_FILE     | `hooks/record_session_id.py` writes a small presence marker (`session_<id>.jsonl`) into the sessions directory `savings_ledger.py` also uses (own filename prefix, no shared format); an MCP tool call scans for the most-recently-modified marker, optionally filtered by project. | Conditionally No — swept-marker fallback reaches TRANSCRIPT_SCAN only if the sessions directory exists; stale-marker fallback additionally requires a prior hook run to have written the marker | Yes — hook marker on primary path; TRANSCRIPT_SCAN result on fallback paths | Primary path: hook required. Stale-marker fallback: TRANSCRIPT_SCAN layout risk only (cwd-independent; uses marker's recorded path). Swept-marker fallback: cwd-sensitive + TRANSCRIPT_SCAN layout risk. |
 | 3    | TRANSCRIPT_SCAN | Claude Code itself continuously writes `~/.claude/projects/<slug>/<session-id>.jsonl` for every session, hook or no hook. `<slug>` is the project's absolute path with every path separator (and, on Windows, the drive colon) replaced by `-`. Picks the most-recently-modified file's stem. | No | Yes -- zero hook dependency | Depends on an undocumented, empirically-observed internal convention (verified on macOS and Windows) |
 | 4    | PROXY           | One `uuid.uuid4().hex` generated once per process and cached, reused for every event that process logs.     | No | No -- proxy, spans the whole process | None -- pure in-memory |
 
@@ -58,7 +58,7 @@ Cleanup (two layers, both driven by `hooks/record_session_id.py`):
     deletes its own session's marker on normal exit (see
     `delete_shadow_marker`).
   - Layer 2 (crash-safety net, write side): the `SessionStart` registration
-    (issue #231; replaced the original `PostToolUse '.*'` registration to
+    (replaced the original `PostToolUse '.*'` registration to
     cut per-tool-call subprocess overhead) opportunistically sweeps markers
     older than `CLAUDE_RUNWAY_SESSION_MARKER_TTL_HOURS` (default 168h / 1
     week) -- see `sweep_stale_shadow_markers`/`should_sweep`/`mark_swept`.
@@ -74,13 +74,12 @@ Cleanup (two layers, both driven by `hooks/record_session_id.py`):
     `hooks/record_session_id.py`'s own docstring, not a refresh of the
     parent session's existing one) -- a single session that runs longer
     than the TTL without hitting one of those events can have its
-    still-live marker swept by another session's sweep. Issue #233 raised
-    the default from 48h to 168h to shrink this window, but didn't
+    still-live marker swept by another session's sweep. Raising
+    the default from 48h to 168h shrank this window, but didn't
     eliminate it -- a session outliving 168h with no such event is still
     exposed; the more complete fix
     (falling back to TRANSCRIPT_SCAN when SHADOW_FILE is stale or its
-    markers are fully swept) shipped in PR #252 (stale-marker fallback)
-    and PR #254 (swept-marker fallback).
+    markers are fully swept) has since shipped.
 """
 
 from __future__ import annotations
@@ -193,7 +192,7 @@ def _session_id_from_hook_payload(hook_payload: Optional[dict]) -> Optional[str]
 # savings_ledger's own CLAUDE_RUNWAY_SAVINGS_DB override or db-path logic.
 # See module docstring: same directory CONVENTION, not a code dependency.
 #
-# Public (issue #273) because the directory is shared: savings_ledger.py's
+# Public because the directory is shared: savings_ledger.py's
 # own per-session ledgers are bare `<session_id>.jsonl` files in the same
 # place by default, so its readers must skip markers by this exact prefix.
 # Exporting it from the writer's module keeps writer and readers from
@@ -339,12 +338,12 @@ def _session_id_from_shadow_file(
     (the marker-scan loop simply has nothing to iterate), so "empty
     directory" is NOT a return-None condition on its own.
 
-    **Stale-marker fallback (issue #236):** if the most-recently-modified
+    **Stale-marker fallback:** if the most-recently-modified
     matching marker is older than `CLAUDE_RUNWAY_SESSION_MARKER_TTL_HOURS`,
     falls back to `_session_id_from_transcript_scan(marker_project)` before
     returning None -- TRANSCRIPT_SCAN has zero hook dependency and works for
     sessions that have outlived the TTL without triggering a lifecycle event
-    (the residual gap issue #233 narrowed but didn't eliminate). Passes the
+    (the residual gap the longer TTL narrowed but didn't eliminate). Passes the
     matched marker's own recorded absolute path (`marker_project`) rather
     than None so TRANSCRIPT_SCAN scans the RIGHT project's transcript
     directory (not the MCP process's own cwd, which may differ). If
@@ -352,7 +351,7 @@ def _session_id_from_shadow_file(
     fabricates a session_id. `now` is injectable for testing (defaults to
     `time.time()`).
 
-    **Swept-marker fallback (issue #253):** if NO matching marker is found
+    **Swept-marker fallback:** if NO matching marker is found
     at all (whether because all markers were swept by
     `sweep_stale_shadow_markers()` or because none was ever written),
     calls `os.getcwd()` and -- if its
@@ -364,7 +363,7 @@ def _session_id_from_shadow_file(
     on this path; the cwd guard means TRANSCRIPT_SCAN always receives a
     real, already-validated absolute path, never None.
 
-    To preserve `current_session_id`'s cross-project guarantee (issue #35),
+    To preserve `current_session_id`'s cross-project guarantee,
     the fallback only fires when `Path(os.getcwd()).name == project` --
     i.e. when the MCP server's own cwd belongs to the requested project. If
     the cwd belongs to a DIFFERENT project (e.g. the server was started from
@@ -398,7 +397,7 @@ def _session_id_from_shadow_file(
         if marker_project is not None and Path(marker_project).name == project:
             _now = time.time() if now is None else now
             if (_now - mtime) > _ttl_hours() * 3600:
-                # The best matching marker is stale (issue #236): the session
+                # The best matching marker is stale: the session
                 # may still be live but its marker was swept or never refreshed
                 # across a lifecycle event that exceeded the TTL. Fall back to
                 # TRANSCRIPT_SCAN rather than returning None -- it reads Claude
@@ -415,7 +414,7 @@ def _session_id_from_shadow_file(
             return _strip_marker_prefix(p.stem)
     # No matching marker found at all -- either the sessions dir is empty (all
     # markers swept) or no marker in the dir belongs to the requested project.
-    # Fall back to TRANSCRIPT_SCAN as a last resort (issue #253): it reads
+    # Fall back to TRANSCRIPT_SCAN as a last resort: it reads
     # Claude Code's own undocumented project-transcript directory and has zero
     # hook dependency, so it can still find a live session even when every
     # shadow marker for the project is gone.
@@ -423,7 +422,7 @@ def _session_id_from_shadow_file(
     # Guard: only use cwd when its basename matches the requested project --
     # if the MCP server is running from a DIFFERENT project's directory,
     # returning that project's session_id labeled as `project`'s would violate
-    # current_session_id()'s cross-project guarantee (issue #35). A non-matching
+    # current_session_id()'s cross-project guarantee. A non-matching
     # cwd is no better than None here.
     if project is not None:
         try:
@@ -437,7 +436,7 @@ def _session_id_from_shadow_file(
 
 # --- Layer 2: crash-safety sweep, rate-limited via a sentinel file ----------
 
-_DEFAULT_SESSION_MARKER_TTL_HOURS = 168.0  # 1 week (issue #233, up from 48h)
+_DEFAULT_SESSION_MARKER_TTL_HOURS = 168.0  # 1 week (up from 48h)
 _SWEEP_INTERVAL_SECONDS = 3600  # bound sweep cost to roughly once per hour per project
 _SENTINEL_FILENAME = ".last_sweep"
 
@@ -503,7 +502,7 @@ def sweep_stale_shadow_markers(now: Optional[float] = None) -> int:
     tracking-enabled sessions) and are cleaned up separately by that
     module's own `finalize_owned_session()` at SessionEnd, or -- for a
     session that never reached SessionEnd -- by its
-    `recover_orphaned_sessions()` (issue #306), which goes through the same
+    `recover_orphaned_sessions()`, which goes through the same
     function and reuses this module's `_ttl_hours()`.
 
     Safe by construction ONLY if the caller refreshes its own marker first
@@ -513,7 +512,7 @@ def sweep_stale_shadow_markers(now: Optional[float] = None) -> int:
     USUALLY a dead session's leftover marker -- but not always: a session
     that never hits another such event before running longer than the TTL
     (no restart/resume/clear/compact in between) is indistinguishable from
-    a dead one and can be swept out from under it (issue #233).
+    a dead one and can be swept out from under it.
 
     Known limitation (cross-PROCESS TOCTOU, narrowed but not eliminated):
     the staleness check and the unlink below are two separate syscalls, so
@@ -528,7 +527,7 @@ def sweep_stale_shadow_markers(now: Optional[float] = None) -> int:
     exceedingly unlikely in practice, but not a hard guarantee the way a
     real interprocess lock (e.g. `flock`/`fcntl`) would be. Deliberately not
     adding one: this module's whole design intentionally avoids
-    cross-process coordination for this marker mechanism (see issue #198's
+    cross-process coordination for this marker mechanism (see the
     "no schema/migration concerns... trivial to reason about" rationale for
     staying file-based over e.g. SQLite) -- the residual race here is the
     same category of trade-off, and the worst case is usually self-healing
@@ -538,7 +537,7 @@ def sweep_stale_shadow_markers(now: Optional[float] = None) -> int:
     parent's, per `hooks/record_session_id.py`'s own docstring). Unlike the
     old `PostToolUse` registration, this no longer self-heals on the very
     next tool call -- a session with no such lifecycle event before it ends
-    simply never gets the chance (same underlying gap as issue #233).
+    simply never gets the chance (the same underlying TTL gap).
 
     Returns the number of markers deleted (mainly useful for tests).
     """
@@ -581,7 +580,7 @@ def _project_slug(project: Optional[str]) -> Optional[str]:
     (`C:\\Repos\\...\\claude-runway` -> `C--Repos-...-claude-runway`: the
     drive colon AND each backslash each map to a single `-`, so `C:\\` -> `C--`).
 
-    Windows was previously unsupported here (issue #264): `str(Path(...))` on
+    Windows was previously unsupported here: `str(Path(...))` on
     Windows produces backslashes and a drive colon, and a `/`-only replacement
     left both unchanged -- so the "slug" was still an absolute Windows path.
     That did NOT fail safe the way this docstring once claimed: joining an
@@ -623,7 +622,7 @@ def _session_id_from_transcript_scan(project: Optional[str]) -> Optional[str]:
         return None
     projects_dir = _transcript_projects_dir()
     d = projects_dir / slug
-    # Defensive containment guard (issue #264): if a slug-convention miss ever
+    # Defensive containment guard: if a slug-convention miss ever
     # produces an absolute or `..`-escaping segment, `projects_dir / slug` can
     # resolve OUTSIDE the transcripts dir (on Windows an absolute slug made
     # pathlib discard `projects_dir` entirely, landing on the project root).
@@ -636,8 +635,8 @@ def _session_id_from_transcript_scan(project: Optional[str]) -> Optional[str]:
     # missing/permission cases, RuntimeError for a symlink loop, ValueError for
     # an embedded NUL in the path, e.g. a malformed marker's stored project
     # that passed earlier validation). Letting any escape would violate
-    # session_id()'s documented never-raises/fail-open contract (Copilot review,
-    # PR #388) -- before this guard existed, is_dir() simply returned False for
+    # session_id()'s documented never-raises/fail-open contract
+    # -- before this guard existed, is_dir() simply returned False for
     # all of these, so the guard must not newly introduce a raising path.
     try:
         resolved = d.resolve()

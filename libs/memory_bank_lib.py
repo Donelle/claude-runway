@@ -1,6 +1,6 @@
 """
-Shared, dependency-light logic behind `tools/memory_bank_mcp_server.py`
-(issue #175): `remember`/`recall`/`forget` persist durable, cross-session
+Shared, dependency-light logic behind `tools/memory_bank_mcp_server.py`:
+`remember`/`recall`/`forget` persist durable, cross-session
 lessons into ONE shared Qdrant collection across every project (not each
 project's own code-index collection), tagged by writing project so lookups
 stay precise by default while still allowing a deliberate cross-project
@@ -55,7 +55,7 @@ from qdrant_retry import call_with_retry
 from qdrant_model_check import check_embedding_model_mismatch
 
 # Passed as check_embedding_model_mismatch's recovery_hint by every memory-bank
-# call site (PR #178 review) -- the shared check's DEFAULT text tells a caller
+# call site -- the shared check's DEFAULT text tells a caller
 # to "use index_repo(reset=true)"/mentions "find_in_collection", both wrong
 # here: index_repo refuses to ever touch the shared memory-bank collection
 # (see is_memory_bank_collection_name's callers in tools/ingest_mcp_server.py),
@@ -80,30 +80,30 @@ WEIGHT_FIELD = "metadata.weight"
 MEMORY_BANK_SOURCE = "memory-bank"
 
 # metadata.source value qdrant_mcp_server.compact_store stamps on every
-# conversation-compact point (issue #282). Lives here beside
+# conversation-compact point. Lives here beside
 # MEMORY_BANK_SOURCE so the writer and the indexer's delete guard
 # (memory_bank_exclusion_filter) share one constant and can't drift apart.
 COMPACT_SOURCE = "conversation-compact"
 
-# Default weight for a point with no metadata.weight at all (issue #177) --
+# Default weight for a point with no metadata.weight at all --
 # either a point written before this field existed, or one explicitly
 # remembered with weight=1.0 (the default). Multiplicative against
 # FLOORED similarity (see _normalize_similarity below -- effective_score =
-# max(0, raw) * weight, issue #272), so this value is specifically chosen to
+# max(0, raw) * weight), so this value is specifically chosen to
 # be a true no-op: 1.0 preserves plain-similarity ORDERING exactly (a
 # constant scale factor across every hit, with negative-similarity ties
 # broken by raw score in recall_points).
 DEFAULT_WEIGHT = 1.0
 
 # recall_points over-fetches this many times `limit` from query_points BEFORE
-# applying the weight multiplier and truncating (issue #177) -- re-ranking by
+# applying the weight multiplier and truncating -- re-ranking by
 # effective_score = max(0, raw_score) * weight (see _normalize_similarity's
 # docstring for the full semantics and why) has to happen against a wider raw-similarity pool than
 # the final `limit`, or a genuinely high-weight but lower-raw-similarity
 # match could get cut by Qdrant's own similarity-only ordering before
-# re-ranking ever sees it. 3x is a fixed implementation choice (the ticket
-# calls out the two-stage SHAPE -- fetch pool, re-rank, truncate -- as the
-# spec decision, not this exact multiplier).
+# re-ranking ever sees it. 3x is a fixed implementation choice (the
+# two-stage SHAPE -- fetch pool, re-rank, truncate -- is the
+# design decision, not this exact multiplier).
 _RECALL_OVERFETCH_MULTIPLIER = 3
 
 
@@ -111,7 +111,7 @@ def _normalize_similarity(raw_score: float) -> float:
     """
     Floors a raw cosine similarity at 0 (`max(0.0, raw_score)`, no offset, no
     rescale) BEFORE it's multiplied by `weight`. FINAL WEIGHT SEMANTICS
-    (issue #272; the contract a future `reweight_point`, #341, builds on):
+    (the contract a future `reweight_point`, builds on):
 
         effective_score = max(0, raw_similarity) * weight
 
@@ -134,12 +134,12 @@ def _normalize_similarity(raw_score: float) -> float:
     plain-similarity ordering even in the negative range, and weight=0 hits
     always sit at the very bottom.
 
-    History: issue #177 first multiplied the RAW score, which inverted for
+    History: the first version multiplied the RAW score, which inverted for
     NEGATIVE similarities (weight=0 on score=-0.8 gave 0, ranking ABOVE a
-    weight=1 hit at -0.1; weight>1 demoted). PR #199 fixed the sign with a
+    weight=1 hit at -0.1; weight>1 demoted). A follow-up fixed the sign with a
     `(raw+1)/2` rescale into [0, 1], but that put every realistic hit
     (raw>=0) in [0.5, 1.0]: weight=2.0 on raw=0.0 scored 1.0 and beat a
-    default-weight raw=0.99 (0.995) -- an unconditional takeover, issue #272.
+    default-weight raw=0.99 (0.995) -- an unconditional takeover.
     Flooring at 0 with no offset keeps both sign fixes and removes the 0.5
     floor.
 
@@ -235,10 +235,10 @@ def memory_bank_exclusion_filter() -> models.Filter:
     delete filters, so a collection that ever ends up holding both code
     chunks and protected points (it shouldn't, given
     is_memory_bank_collection_name's guard, but this stays as
-    defense-in-depth per issue #175) never has them caught by an unrelated
+    defense-in-depth) never has them caught by an unrelated
     delete. Protects memory-bank points (metadata.source == "memory-bank")
-    and, since issue #282, conversation compacts (metadata.source ==
-    "conversation-compact"). Compacts stored before #282 carry no
+    and conversation compacts (metadata.source ==
+    "conversation-compact"). Compacts stored before that marker existed carry no
     metadata.source and stay unprotected until backfilled.
     """
     return models.Filter(
@@ -266,7 +266,7 @@ def _scope_filter(
     to 1) alongside `must`, giving `source == memory-bank AND (repo ==
     caller_repo OR repo == "general")`.
 
-    Also excludes `pending == True` points (PR #178 review, seventh pass):
+    Also excludes `pending == True` points:
     `remember_point`'s point is visible to a search the instant its initial
     upsert returns, before its follow-up call clears `pending`/stamps
     `created_at` -- without this, `recall` could surface a record whose
@@ -278,7 +278,7 @@ def _scope_filter(
     not the other.
     """
     # Bare `list` (not `list[FieldCondition]`) so the type checker (mypy
-    # originally, Pyright since issue #297 -- both treat this the same way)
+    # originally, Pyright -- both treat this the same way)
     # sees these as list[Any] -- Filter's must/should accept a broader
     # Condition union, and list's invariance would otherwise reject a
     # narrower list[FieldCondition].
@@ -313,7 +313,7 @@ def ensure_collection(client: "QdrantClient", collection: str, embedding_provide
     Conflict) -- re-checking existence before re-raising treats that as
     "the collection now exists" rather than a real failure.
 
-    Found in PR #178 review: the previous version stopped there, silently
+    Found in review: the previous version stopped there, silently
     treating "it exists now" as full success -- but the WINNING creator could
     be a different project configured with a DIFFERENT EMBEDDING_MODEL, in
     which case this process's next upsert would fail with an opaque Qdrant
@@ -362,7 +362,7 @@ def ensure_memory_bank_indexes(client: "QdrantClient", collection: str) -> None:
     is-empty `created_before` clause) have no payload index, so Qdrant
     evaluates them per point. Those filters are therefore only partly
     index-assisted, not fully so; adding indexes for them is a separate,
-    unmade decision (issue #310).
+    unmade decision.
     """
     info = call_with_retry(client.get_collection, collection)
     existing = info.payload_schema or {}
@@ -393,7 +393,7 @@ async def remember_point(
     alongside `description` (verbatim, payload-only, never embedded) and the
     tool-set `source`/`repo`/`embedding_model` metadata.
 
-    `weight` (issue #177) is a static, caller-supplied quality multiplier --
+    `weight` is a static, caller-supplied quality multiplier --
     `recall_points` re-ranks by `effective_score = max(0, raw_similarity) *
     weight` (see `_normalize_similarity`'s docstring for the exact semantics
     and why) instead of raw similarity alone, so a stale or superseded memory
@@ -405,12 +405,12 @@ async def remember_point(
     (written before this change) is treated as `weight=1.0` at read time by
     `recall_points` -- a true no-op, not a behavior change for existing data.
 
-    `point_id` (issue #334, part of #327) is optional. When omitted (the
+    `point_id` is optional. When omitted (the
     default, and what `remember()`'s MCP tool always does) a fresh random
     `uuid.uuid4().hex` is minted exactly as before -- behavior is unchanged
     for every existing caller. When provided, that exact ID is used for the
     upsert instead, so a caller that needs deterministic per-source IDs (the
-    legacy-collection transfer tool's idempotency, see #327) can get them.
+    legacy-collection transfer tool's idempotency) can get them.
     This function itself does NO check-before-write: upserting an existing ID
     overwrites it and re-stamps `created_at`/re-cycles `pending`, so a caller
     that wants a re-run to leave unchanged points alone must check first.
@@ -422,7 +422,7 @@ async def remember_point(
     collection already existed) -- same `(value, error)` two-outcome
     convention `resolve_repo` uses, just with an extra success-only field.
 
-    `created_at` (issue #179, PR #197 review) is the EXACT `time.time()`
+    `created_at` is the EXACT `time.time()`
     value this function itself stamped into `metadata.created_at` below --
     returned so a caller logging a memory-events row for this write (see
     `tools/memory_bank_mcp_server.py`'s `remember()`) can record the real
@@ -433,8 +433,8 @@ async def remember_point(
     exists specifically to support a time-to-first-reuse metric that a
     drifted value would corrupt.
 
-    Known residual gap, accepted as-is rather than built out further (PR #178
-    review, seventh pass): if the initial upsert below succeeds but the
+    Known residual gap, accepted as-is rather than built out further:
+    if the initial upsert below succeeds but the
     follow-up `set_payload` call that clears `pending` fails even after
     `call_with_retry`'s retries are exhausted, that exception propagates out
     of this function uncaught -- the caller never receives `point_id`, so it
@@ -466,7 +466,7 @@ async def remember_point(
     # unconditionally excludes any point with pending=True regardless of its
     # created_at state, so a point can never be swept up while it's between
     # "exists" and "fully stamped," no matter how that window's timing lines
-    # up against a concurrent wipe's cutoff/scroll. Found in PR #178 review
+    # up against a concurrent wipe's cutoff/scroll. Found in review
     # (sixth pass): a two-step write (create, THEN stamp created_at
     # separately) closes the "timestamp read before upsert completes" race
     # from the previous round, but during the gap between those two calls
@@ -508,8 +508,8 @@ async def remember_point(
     # why this is a second call rather than one -- see the pending comment
     # above for why the gap between these two calls is still safe regardless.
     #
-    # This does NOT fully close the created_at race, only shrink it further
-    # (PR #178 review, ninth pass): time.time() here is STILL a client-side
+    # This does NOT fully close the created_at race, only shrink it further:
+    # time.time() here is STILL a client-side
     # read taken before THIS call's own RPC is sent, same pattern as the
     # original upsert-embedded version, just one level narrower -- if this
     # specific set_payload round-trip is delayed and a concurrent wipe's
@@ -555,20 +555,20 @@ async def recall_points(
     error) when the collection doesn't exist yet -- an empty memory bank is a
     normal, expected state, not a failure.
 
-    `created_at` (issue #179) is the point's own `metadata.created_at`
+    `created_at` is the point's own `metadata.created_at`
     (a float `time.time()` value stamped by `remember_point`, or None for a
     legacy point written before that field existed) -- included so a caller
     logging a memory-events row for this hit can denormalize the memory's
     real creation time without a second Qdrant round trip.
 
-    `weight`/`effective_score` (issue #177): `score` stays the RAW cosine
+    `weight`/`effective_score`: `score` stays the RAW cosine
     similarity Qdrant returned (unchanged meaning, for backward compat with
     any existing caller reading it) -- `effective_score` is what re-ranking
     and truncation actually use, so raw similarity alone can't tell "most
     trustworthy" from "most similar wording." A point with no `metadata.weight`
     (written before this field existed) is treated as `weight=1.0`, a true
     no-op for ORDERING purposes among other default-weight hits:
-    `effective_score = max(0, score) * weight` (issue #272; see
+    `effective_score = max(0, score) * weight` (see
     `_normalize_similarity` for the full semantics), so at weight=1.0 it
     equals max(0, score) -- same ordering as raw similarity, though a
     negative `score` reports effective_score 0. `query_points` itself is
@@ -625,12 +625,12 @@ async def recall_points(
     # to plain-similarity ordering among all-negative hits (which all floor to
     # effective 0). The `weight > 0` middle term keeps weight=0 a true bottom:
     # without it a weight=0 hit with raw 0.95 would out-tie a default-weight
-    # hit at raw -0.1 (both effective 0) on raw score alone (PR #359 review).
+    # hit at raw -0.1 (both effective 0) on raw score alone.
     results.sort(key=lambda r: (r["effective_score"], r["weight"] > 0, r["score"]), reverse=True)
     return results[:limit]
 
 
-# Page size for scroll_collection (issue #335). Qdrant's own scroll default is
+# Page size for scroll_collection. Qdrant's own scroll default is
 # 10; 1000 matches wipe_memory_bank's page size, keeping round trips low on a
 # large legacy collection without one enormous response.
 _SCROLL_BATCH_SIZE = 1000
@@ -639,7 +639,7 @@ _SCROLL_BATCH_SIZE = 1000
 def scroll_collection(client: "QdrantClient", source: str, batch_size: int = _SCROLL_BATCH_SIZE) -> tuple:
     """
     Read-only, COMPLETE-for-an-unchanged-collection enumeration of every point
-    in `source` (issue #335, part of #327) -- for reading a foreign/legacy
+    in `source` -- for reading a foreign/legacy
     collection (e.g. one that predates the shared memory-bank collection) so
     its points can be audited or migrated. Loops `client.scroll` following
     `next_offset` until Qdrant returns None, so unlike `recall_points` it is
@@ -647,7 +647,7 @@ def scroll_collection(client: "QdrantClient", source: str, batch_size: int = _SC
     a top-k: no query text and no embedding provider are involved at all.
     Vectors are never fetched.
 
-    Completeness caveat (PR #382 review): `scroll()` has no cross-page
+    Completeness caveat: `scroll()` has no cross-page
     consistency guarantee (see wipe_memory_bank's docstring), so if points
     are inserted or deleted WHILE this runs, the result is not a snapshot --
     a concurrent insert can be missed or a concurrent delete still seen. The
@@ -714,7 +714,7 @@ def scroll_collection(client: "QdrantClient", source: str, batch_size: int = _SC
     return points, errors
 
 
-# Fixed namespace for transfer_point_id (issue #336). Never change it: every
+# Fixed namespace for transfer_point_id. Never change it: every
 # id a past transfer_points run wrote was derived from this exact value, so a
 # new namespace would make a re-run see none of them as already present and
 # write every point a second time under a fresh id.
@@ -723,7 +723,7 @@ TRANSFER_ID_NAMESPACE = uuid.UUID("6f1c2b7e-4d3a-5e8f-9a0b-1c2d3e4f5a6b")
 
 def transfer_point_id(source: str, source_point_id) -> str:
     """
-    Deterministic target id for one source point (issue #336, see #327):
+    Deterministic target id for one source point:
     `uuid5(TRANSFER_ID_NAMESPACE, "<source>:<source_point_id>")`. The same
     source point always maps to the same target id, so a re-run of
     `transfer_points` can tell "already migrated" apart from "new" with a
@@ -770,8 +770,8 @@ async def transfer_points(
 ) -> dict:
     """
     Migrates the in-scope points of a legacy/foreign collection `source` into
-    the shared memory-bank collection `target` (issue #336, part 3 of #327's
-    design). Returns a report dict; never raises for a per-point problem.
+    the shared memory-bank collection `target` (part 3 of the
+    memory-transfer design). Returns a report dict; never raises for a per-point problem.
 
     Repo-tag mapping, per point -- the same boundary `resolve_repo` enforces
     for a single `remember()` call, applied point by point, with no bypass:
@@ -821,7 +821,7 @@ async def transfer_points(
         "already_present": 0,
         "errors": [],
     }
-    # Compared by BACKING collection, not by name (PR #422 review): Qdrant
+    # Compared by BACKING collection, not by name: Qdrant
     # accepts an alias anywhere a collection name goes (collection_exists and
     # scroll both resolve it -- confirmed live), so an alias of the memory-bank
     # collection would pass a plain name check, scroll memory-bank itself, and
@@ -830,7 +830,7 @@ async def transfer_points(
     # can't be read, nothing is scrolled or written.
     #
     # Every Qdrant call below then uses these RESOLVED backing names, never
-    # the requested ones (PR #422 review, second pass): an alias can be
+    # the requested ones: an alias can be
     # repointed atomically at any moment, so checking resolved names but then
     # scrolling/writing through the alias would leave a window where the
     # check passes and the alias is switched to memory-bank (copying it into
@@ -887,7 +887,7 @@ async def transfer_points(
     # One retrieve per batch instead of one per point. A target that doesn't
     # exist yet holds nothing, so there is nothing to look up.
     #
-    # Only a FINISHED write counts as present (PR #422 review, second pass):
+    # Only a FINISHED write counts as present:
     # remember_point upserts with pending=True and clears it in a second
     # call, so a run whose second call failed leaves the id in the target
     # with pending=True -- hidden from recall and wipe (see _scope_filter /
@@ -944,13 +944,13 @@ def count_memory_bank_points(client: "QdrantClient", collection: str, repo: Opti
     Counts memory-bank points in `collection`, optionally scoped to `repo`.
     Returns 0 if the collection doesn't exist. Used by `wipe_memory_bank`'s
     pre-confirm count (repo=caller's own) -- NOT by `index_repo(reset=true)`
-    anymore (PR #178 review): that guard used to call this with repo=None
+    anymore: that guard used to call this with repo=None
     first to decide between a full `delete_collection` and a filtered one,
     but the count-then-act sequence was racy against a concurrent write, so
     `index_repo(reset=true)` now always does the filtered delete unconditionally
     instead of counting at all.
 
-    Excludes `pending == True` points (PR #178 review, seventh pass): without
+    Excludes `pending == True` points: without
     this, a dry-run (`confirm=False`) call could report a count that includes
     a still-pending point, while the immediately following `confirm=True`
     call excludes that same point via `_own_repo_filter` -- the dry-run number
@@ -1020,7 +1020,7 @@ def forget_point(client: "QdrantClient", collection: str, point_id: str, caller_
 
 def _own_repo_filter(caller_repo: str, created_before: Optional[float] = None) -> models.Filter:
     """
-    Always excludes `pending == True` points (PR #178 review, sixth pass):
+    Always excludes `pending == True` points:
     that marker covers the brief window between remember_point's initial
     upsert (which creates the point, including pending=True, atomically)
     and its follow-up call that clears pending while stamping `created_at`
@@ -1069,8 +1069,8 @@ def wipe_memory_bank(client: "QdrantClient", collection: str, caller_repo: str, 
 
     `confirm=True` snapshots the matching point ids first (via `scroll`),
     then deletes precisely those ids, and `count` is `len(ids)` -- not a
-    separate `count()` call taken before the delete. Found in PR #178
-    review: the previous version called `count_memory_bank_points` (one
+    separate `count()` call taken before the delete. Found in review: the previous
+    version called `count_memory_bank_points` (one
     Qdrant request) and then deleted by the same live FILTER (a second,
     separate request) -- if a new same-repo point arrived in between, the
     filter-based delete would remove it too, but the EARLIER count wouldn't
@@ -1080,7 +1080,7 @@ def wipe_memory_bank(client: "QdrantClient", collection: str, caller_repo: str, 
     evaluated separately at delete time.
 
     `count` is this snapshot's size, not a guaranteed-exact count of points
-    physically removed (PR #178 review, sixth-and-a-half pass): Qdrant's
+    physically removed: Qdrant's
     delete-by-id tolerates an already-missing id without error, so if some
     OTHER concurrent actor (a `forget_point` call, another `wipe_memory_bank`
     call) removes one of these exact snapshotted ids in the narrow gap
@@ -1097,13 +1097,13 @@ def wipe_memory_bank(client: "QdrantClient", collection: str, caller_repo: str, 
     calls with no state carried between them. That gap is inherent to any
     two-step confirm UX spanning separate calls (visible in real time via
     each call's own honestly-reported count, never silently hidden) rather
-    than something this function alone can close -- see PR #178's review
+    than something this function alone can close -- see the review
     thread for the full reasoning on why a heavier cross-call snapshot
     mechanism wasn't added on top of this.
 
     WITHIN this one call, though, the snapshot ids are additionally bounded
-    by a `created_at` cutoff captured before scrolling starts (PR #178
-    review, second wipe-related pass): `scroll()` has no cross-page
+    by a `created_at` cutoff captured before scrolling starts:
+    `scroll()` has no cross-page
     consistency guarantee, and point ids are random UUIDs (not
     insertion-ordered), so once a repo has enough memories to need more
     than one page (>1000), a `remember()` landing mid-scroll could sort
@@ -1112,8 +1112,8 @@ def wipe_memory_bank(client: "QdrantClient", collection: str, caller_repo: str, 
 
     A `remember()` call whose point exists but is still `pending` (between
     its initial upsert and the follow-up call that stamps `created_at`) is
-    excluded unconditionally, regardless of the cutoff comparison (PR #178
-    review, sixth pass) -- see `remember_point`'s and `_own_repo_filter`'s
+    excluded unconditionally, regardless of the cutoff comparison
+    -- see `remember_point`'s and `_own_repo_filter`'s
     own docstrings for why a missing `created_at` alone isn't enough to
     tell "legacy point, definitely safe" apart from "brand new point,
     mid-write, definitely NOT safe."

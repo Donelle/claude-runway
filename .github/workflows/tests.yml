@@ -1,19 +1,18 @@
 name: Tests
 
 # Runs the existing unit test suite (tests/test_*.py), ruff, and Pyright on
-# every PR and on pushes to main. See issue #51 (test suite gate) and issue
-# #297 (ruff + Pyright, replacing an earlier mypy-only type-check step --
-# Pyright is also what VS Code's Pylance extension runs under the hood, so
-# the editor and this gate now agree).
+# every PR and on pushes to main. Ruff + Pyright replaced an earlier
+# mypy-only type-check step -- Pyright is also what VS Code's Pylance
+# extension runs under the hood, so the editor and this gate now agree.
 #
-# The issue's proposal also included a lint step for template/placeholder
+# The original proposal also included a lint step for template/placeholder
 # consistency and EVALUATION.md tool-count drift, gated on "once GROW-01's
-# setup script and GROW-05's self-updating tool-count utility exist" --
-# those were issues #48 and #52. Both have since landed, so the tool-count
+# setup script and GROW-05's self-updating tool-count utility exist".
+# Both have since landed, so the tool-count
 # half of that lint step is now included below ("Check MCP tool counts").
 # It's a smoke check, not a doc-vs-code comparison: EVALUATION.md no
-# longer hardcodes a tool count to compare against (issue #52 replaced
-# that prose with instructions to run this exact script), so there's
+# longer hardcodes a tool count to compare against (that prose was
+# replaced with instructions to run this exact script), so there's
 # nothing left to drift out of sync -- this step instead just fails loudly
 # if any server's tool registry stops importing/enumerating cleanly.
 # The broader template/placeholder-consistency half of the original
@@ -42,7 +41,7 @@ jobs:
       # unreviewed code after this file was last reviewed. v4.4.0.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          # Issue #348: the package version is derived from the commit
+          # The package version is derived from the commit
           # history (setuptools-scm), and the unit tests build a real wheel.
           # A default shallow clone (depth 1) would make every CI build
           # report a depth-1 version, not the real one.
@@ -70,7 +69,7 @@ jobs:
         run: ruff check libs tools hooks tests
 
       - name: Type check (Pyright)
-        # --pythonpath explicitly (Copilot review, PR #319): this job
+        # --pythonpath explicitly: this job
         # installs dependencies directly into actions/setup-python's own
         # interpreter, never creating a `.venv/` -- pyproject.toml's
         # [tool.pyright] deliberately has no venvPath/venv (see its own
@@ -84,10 +83,10 @@ jobs:
       - name: Run unit tests
         run: python -m unittest discover -s tests -v
 
-      - name: Check MCP tool counts (issue #52/GROW-05)
+      - name: Check MCP tool counts
         run: python tools/report_tool_counts.py
 
-  # Issue #206 acceptance criterion: on each of Windows/macOS/Linux, a
+  # On each of Windows/macOS/Linux, a
   # `uv tool install`/pipx-style install (built wheel installed into a
   # FRESH environment, not this checkout's own venv) must put
   # libs/tools/hooks/templates/skills under <env>/src/, all 3 console
@@ -97,7 +96,7 @@ jobs:
   # `test` stays ubuntu-only since ruff/pyright/unittest have no OS-specific
   # behavior to catch. Replaces the single ubuntu-only
   # "Build & smoke-test pip packaging" step this job used to be inline in
-  # `test` (issue #50) -- same checks, now run on all 3 platforms instead
+  # `test` -- same checks, now run on all 3 platforms instead
   # of just one; tests/test_pyproject.py's BuiltWheelHasExpectedDataLayout
   # covers the wheel-CONTENTS half of this same acceptance criterion
   # without needing 3 OS runners, since a wheel's own DATA-category
@@ -106,7 +105,7 @@ jobs:
   # OS-specific: real path separators, real venv layout (`bin` vs
   # `Scripts`), and real console-script shims.
   packaging-smoke:
-    name: Packaging smoke test (issue #206)
+    name: Packaging smoke test
     strategy:
       fail-fast: false
       matrix:
@@ -117,13 +116,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          fetch-depth: 0 # full history for setuptools-scm, issue #348
+          fetch-depth: 0 # full history for setuptools-scm
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version: "3.12"
 
-      - name: Build wheel, install into a FRESH env, and smoke-test (issue #206)
+      - name: Build wheel, install into a FRESH env, and smoke-test
         # `shell: bash` -- GitHub-hosted Windows runners ship Git Bash, so
         # this one script works unmodified across all three OSes instead of
         # needing a separate PowerShell/cmd variant. The two things that
@@ -141,8 +140,8 @@ jobs:
           python -m pip install --upgrade pip
           # `python -m build` (unlike `pip install`) has no `--index-url`
           # flag of its own -- passing one is a straight CLI parse error
-          # ("unrecognized arguments: --index-url"), confirmed live
-          # (Copilot review, PR #228). `--no-isolation` sidesteps the whole
+          # ("unrecognized arguments: --index-url"), confirmed live.
+          # `--no-isolation` sidesteps the whole
           # question: it reuses THIS pip install (already pointed at public
           # PyPI via --index-url below) instead of `build` spinning up its
           # own nested, isolated pip environment that would need a SEPARATE
@@ -173,7 +172,7 @@ jobs:
           print('OK: libs/tools/hooks/templates/skills all present under <env>/src/')"
 
           "$VENV_BIN/claude-runway-doctor" --help
-          # Issue #348: each CLI reports the installed, git-derived version.
+          # Each CLI reports the installed, git-derived version.
           "$VENV_BIN/claude-runway-doctor" --version
           "$VENV_BIN/claude-runway-ingest" --version
           "$VENV_BIN/claude-runway-setup" --version

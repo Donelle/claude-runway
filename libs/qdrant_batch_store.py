@@ -115,7 +115,7 @@ async def store_batch(
 def ensure_file_path_index(client, collection_name: str) -> bool:
     """
     Idempotently backfills the KEYWORD payload index on
-    FILE_PATH_INDEX_FIELD for an ALREADY-EXISTING collection (issue #54).
+    FILE_PATH_INDEX_FIELD for an ALREADY-EXISTING collection.
 
     Without this, sync_repo's per-file delete-by-filter -- and any other
     metadata.file_path-scoped query -- full-scans every point in the
@@ -133,7 +133,7 @@ def ensure_file_path_index(client, collection_name: str) -> bool:
     unconditionally calling create_payload_index every time: Qdrant builds
     a payload index by scanning every existing point once, so blindly
     reissuing this call on every sync_repo run would just move the exact
-    full-scan cost this issue exists to eliminate from the delete path to
+    full-scan cost the index exists to eliminate from the delete path to
     here instead.
 
     Callers must confirm collection_name already exists before calling this
