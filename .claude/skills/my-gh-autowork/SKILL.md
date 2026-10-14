@@ -95,7 +95,10 @@ Project-scoped to this repo (hardcodes `Donelle/claude-runway`, `.venv`-based te
         <reason>` → append `<n>` to `attempted` anyway (so re-running this same invocation
         doesn't immediately re-pick the same stuck ticket), log this ticket to the metrics
         store too (a blocked/failed outcome is itself real signal, not noise to skip),
-        **stop the whole run immediately**, surface the reason verbatim.
+        **stop the whole run immediately**, surface the reason verbatim. A `BLOCKED` at
+        the 5-round review cap can later be finished by a follow-up subagent, but only
+        with the user's authorization — see "Continuing after a BLOCKED at the round cap"
+        below; never start one on your own initiative.
 
       **Logging a ticket to the metrics store** (orchestrator-only bookkeeping — the
       subagent's prompt and report format are NOT changed for this, so every subagent
@@ -104,10 +107,31 @@ Project-scoped to this repo (hardcodes `Donelle/claude-runway`, `.venv`-based te
       reproduced/fixed vs. declined, per finding) yourself from the report's own existing
       prose summary — every subagent report already includes this per the Final report
       section below, this just means reading it rather than asking for a new format.
-      Combine that with the model and timestamp noted in 2a and this Agent call's own
-      `usage` block (`duration_ms` / 1000 → `wall_clock_s`, `subagent_tokens`, `tool_uses`
-      → `tool_calls`), then call the `record_metric` tool (from the `local-compress` MCP
-      server — the same server that hosts `get_metrics`/`savings_summary`):
+      **Do not copy `duration_ms`, token or tool-use figures out of the Agent call's
+      `usage` block by hand** (issue #455: nothing enforced that, 22 of 91 rows had none,
+      and the single total it gave had no cache split). Take the subagent's `agentId`
+      from that Agent result (or the Agent call's tool-use id) and run, from the repo
+      root (stdlib only, no venv needed):
+      ```
+      python3 tools/autowork_cost.py record --issue <n> --outcome <merged|blocked|failed> \
+        --agent-id <agentId> [--pr <pr>] --rounds <N> --manual-interventions <N> \
+        --findings '[{"category": "...", "reproduced": true, "fixed": true}]'
+      ```
+      It reads that subagent's own transcript (`<session>/subagents/agent-<agentId>.jsonl`)
+      and writes the same `autowork` row `record_metric` used to, with `wall_clock_s`,
+      `subagent_tokens` (input + cache creation + output, the scale the older rows used),
+      `tool_calls` and `model` computed, plus a `cost` object splitting every counter per
+      model (cache reads included). If the transcript can't be found it still records the
+      row, marked `cost.available=false`, and says so on stderr. **One attempt, one row:**
+      a re-attempt or a follow-up subagent has its own agent id and gets its own row; never
+      merge them. Its output is `OK` or an `Error: ...` string, treated exactly like
+      `record_metric`'s below. `python3 tools/autowork_cost.py report` shows per-ticket and
+      per-model totals and the cache-read share; `backfill`/`compare` are one-off tools for
+      the older rows (see `docs/metrics.md`). The cost is the subagent's only, not this
+      orchestrator's own session.
+
+      `record_metric` still works for anything this CLI can't cover (e.g. no agent id at
+      all), with the same metadata shape minus the computed figures:
       ```
       record_metric(
         metric_id="autowork",
@@ -115,7 +139,6 @@ Project-scoped to this repo (hardcodes `Donelle/claude-runway`, `.venv`-based te
         value=1.0,
         metadata=<JSON string: {"issue": n, "pr": pr_or_null, "outcome": "...",
                     "model": "...", "rounds": N, "manual_interventions": N,
-                    "wall_clock_s": N, "subagent_tokens": N, "tool_calls": N,
                     "findings": [{"category": "...", "reproduced": bool, "fixed": bool}]}>,
         session_id=f"issue-{n}-{HHMMSS}"
       )
@@ -163,6 +186,26 @@ Project-scoped to this repo (hardcodes `Donelle/claude-runway`, `.venv`-based te
         that one ticket.
 
 3. **After the run ends**, give the user a summary table: ticket #, outcome, PR # if any, and the one-line reason for any non-merge outcome. Don't start a new run without being asked again, even if this invocation was `all`.
+
+## Continuing after a BLOCKED at the round cap
+
+Step 2b's rule — a `BLOCKED` stops the whole run — still holds. This section only covers what happens *after* that stop, when the human has looked at the round history and wants the PR finished. It applies to exactly one kind of `BLOCKED`: the subagent's Step 22 cap (`hit the 5-round review-feedback cap on PR #<PR>`) where the unresolved round-6 findings are small, concrete and checkable (a stale docstring, a missed rename, a narrow edge case). It does **not** apply to a `BLOCKED` for a design question, an ambiguous requirement, a ticket already in progress, a closed ticket, or Step 25's "same concern resurfaced after a reply" stop — those need a human decision, and a follow-up subagent would just be guessing on their behalf.
+
+**Never automatic, never past the cap without authorization.** Start a follow-up only when the user has authorized continuing — either for this PR ("fix them", "finish #446"), or in advance for the run, by explicitly telling the orchestrator to use its own judgment and keep going; in that second case the orchestrator may start the follow-up itself, without asking again. Without one of those, report the `BLOCKED` and stop, exactly as Step 2b says. A follow-up that hits its own cap is another `BLOCKED` that needs a fresh authorization; it does not chain into a third subagent on its own.
+
+**The pattern that worked** (the 2026-10-12/13 run: PR #446 merged after one extra round, and a second capped PR also merged this way): a fresh, single-purpose `Agent` call, `subagent_type: "general-purpose"`, `isolation: "worktree"` — same two settings, for the same reasons, as Step 2a — whose prompt says:
+- It is finishing an existing PR, not starting a ticket: skip Step 0's pick, Step 8's already-in-progress gate (that gate would report this very PR as in progress), Steps 9–10's assignee/type/branch creation, Step 17's `gh pr create` and Step 18's artifact comments. Give it the issue number, the PR number, the PR's branch name and the round history from the `BLOCKED` report.
+- Check out the PR's own branch under a throwaway local name, since the real branch name may still be held by the original subagent's worktree: `git fetch origin <branch> && git checkout -B <throwaway> origin/<branch>`, and push every fix with `git push origin HEAD:<branch>` so it lands on the PR (and triggers `review_on_push`) rather than on a new remote branch.
+- Bootstrap the venv as in Step 15. The review loop's own setup assumes a brand-new PR, so the prompt has to override three parts of it explicitly rather than say "run Steps 19–25 as written":
+  - **Seed `seen_ids` first.** Step 4 starts `seen_ids` empty because a normal run never has a pre-existing PR. On this PR, an empty set would make Step 20 report every comment and review from all five earlier rounds as new. Before anything else, run Step 20's three-endpoint fetch once and put every id it returns into `seen_ids`.
+  - **The inherited round-6 findings are follow-up round 1.** Set `ROUND=1` and handle them with Step 22's reproduce-or-decline rules and Steps 23–24, straight from the round history and their existing threads, without polling first: their review has already arrived. Then apply Step 25 as written: loop back to Step 19 only if that round pushed a fix, and go straight to Step 5 if every finding was declined.
+  - **The cap is 3, not 5.** In Step 22's check, replace "greater than 5" with "greater than 3", and report `OUTCOME: BLOCKED (issue #<N>) — hit the 3-round follow-up review cap on PR #<PR>, see round history above`. These are leftovers from a PR that already used five rounds; if three more don't close it, the ticket needs a human, not more rounds.
+- Everything else about the review loop stays as written: the same verify-before-fix rules (reproduce or decline with evidence, never `@copilot`, reply to and resolve every thread), the same full 40-character `HEAD_SHA` poll, the same three-check gate before every push, and Step 5's merge.
+- The same Final report section and `OUTCOME:` line shapes, so Step 2b can read the result and log it to the metrics store as its own attempt, as usual.
+
+If the follow-up reports `MERGED` and the user's authorization covered keeping the run going, pick the run back up where it stopped, without removing or re-adding anything. In `all` mode, go back to 2a; the original ticket is already in `attempted`. In list mode, go back to 2a with whatever ticket is now at the front of the remaining queue: the original ticket already left the queue when its own call returned (Step 1), so it must not be "removed" a second time. Otherwise the run ends there, and Step 3's summary table shows both the original `BLOCKED` and the follow-up's outcome.
+
+**Model choice is the orchestrator's call** — nothing here requires a particular one. For what it's worth, in that run an Opus follow-up merged two capped PRs in fewer rounds than the original Sonnet subagents had used, but that is one run's observation, not a rule.
 
 ## Subagent Prompt Template
 
@@ -218,7 +261,15 @@ unconfirmed merge); a small diff doesn't make either reason go away. If the sand
 a compound Bash command (git/gh combined with a loop, `$(...)`, or a heredoc — confirmed to
 happen in worktree-isolated subagents), split it into separate simple commands, or put the
 logic in a script file under your scratchpad directory and run it with `bash <script>`;
-that is a workaround for the refusal, never a reason to skip the step.
+that is a workaround for the refusal, never a reason to skip the step. **This repo's own
+`PostToolUse` compression hook can also summarize large `unittest`/`grep` output in your
+shell** (reported live by a subagent in the 2026-10-12 run): output over the hook's
+threshold comes back as a local model's summary, not the raw text, and a summary can drop
+or misstate the one line that matters (a failure count, a missing hit). Redirect test
+output to a file (e.g. `$PYTHON -m unittest discover -s tests > <scratchpad>/test.log 2>&1`)
+and read it with Read, or run `grep -E '^Ran|^OK|FAILED' <that file>`, rather than
+trusting a compressed summary of it. (`-E` is required: plain `grep` treats `|` as a
+literal character, matches nothing, and a failed run then looks the same as no output.)
 
 ## Step 0 — determine the target ticket
 {ISSUE_NUMBER}                                   <-- orchestrator fills in ONE of these two
@@ -373,7 +424,11 @@ under `~/.claude/skills/`, not guaranteed to exist on whichever machine is runni
     tickets that reach this point have none of those, so there is nothing to resume. A
     ticket a prior attempt stalled on now requires a human to clear its assignee/branch/PR
     before it can be auto-picked or explicitly retried again, rather than this skill trying
-    to detect and continue from wherever a prior attempt left off.
+    to detect and continue from wherever a prior attempt left off. (The orchestrator's
+    human-authorized follow-up for a round-cap `BLOCKED` is not a retry through this
+    prompt: it finishes the existing PR from a separate, purpose-written prompt that never
+    runs Steps 0 or 8–11 — see the "Continuing after a BLOCKED at the round cap" section
+    of `.claude/skills/my-gh-autowork/SKILL.md`.)
 
 ## Step 3 — plan and implement
 12. Read whatever specific file(s) the issue's Location field names (README was already
@@ -429,6 +484,21 @@ under `~/.claude/skills/`, not guaranteed to exist on whichever machine is runni
     ```
     If you cannot get all three clean after reasonable effort, report FAILED with what's
     failing and why, rather than committing broken code.
+
+    **Pre-push sweep for old wording — before the FIRST push, on any ticket that removes,
+    replaces, relabels or widens the scope of something** (a command, a figure, a concept,
+    a flag, a file name). Run `git grep -n -i -e "<old wording>"` over the whole tracked tree
+    — library and test docstrings, comments, CLI help text, `README.md`, `docs/`,
+    `skills/`, `templates/`, `.claude/skills/`, `.github/` — for the old wording AND for
+    phrases that merely imply it (e.g. "config-only", "only applies", "every turn",
+    "exact"), and make every hit consistent with the change in this same commit. Keep the
+    `-e`: without it, `git grep` parses a flag-shaped pattern such as `"--old-option"` as
+    one of its own options (quoting doesn't help) and fails with `unknown option`.
+    Confirmed live: in the 2026-10-12/13 run, issues #439, #440 and #449 each lost review
+    rounds to Copilot finding one stale docstring, README cell or help string after
+    another, one per round, all of which a single sweep before the first push would have
+    caught. Each such round still counts toward Step 4's 5-round cap, so a missed sweep
+    can by itself push an otherwise-finished ticket to BLOCKED.
 16. Commit (no `Fixes #N` in the commit message — that goes in the PR body only, or
     GitHub's squash-merge won't attribute it right) and push:
     `git add <files> && git commit -m "..." && git push -u origin <branch>`
@@ -525,6 +595,14 @@ actionable) does NOT increment it, since no fix cycle happens there.
     a temp file, not `comm -23 - <(...)` — process substitution `<(...)` is unreliable in
     Git Bash on Windows; `grep -vxFf tmpfile` achieves the same set-difference without it.
     `mktemp` IS available in Git Bash.)
+    **`HEAD_SHA` must be the full 40-character SHA from `git rev-parse HEAD`, never an
+    abbreviated one** (`git rev-parse --short HEAD`, `git log --oneline`'s 7 characters,
+    or a SHA copied out of a push or commit message). The API's `commit_id` is always the
+    full 40-character form and the `jq` test above is an exact string comparison, so a short
+    SHA never matches anything: confirmed live in the 2026-10-12/13 run, a follow-up subagent
+    polled with a short SHA, could never match, and burned the whole ~9-minute window. A
+    timeout from this loop that you can't otherwise explain is worth one check that
+    `HEAD_SHA` is 40 characters before reporting it.
     **36 iterations, not 40 — the loop's own sleep budget must leave real headroom under the
     wrapping Bash tool call's hard 600000ms timeout, not just equal it.** 40×15s of pure
     `sleep` alone already totals exactly 600000ms with zero margin left for the `gh api`
@@ -599,8 +677,16 @@ actionable) does NOT increment it, since no fix cycle happens there.
     contains), so a genuinely clean re-review still lands here as "something new," not as
     Step 19's timeout case. Read the actual content: if this round's new id(s) contain no
     concrete finding at all (no inline comments, no "Suppressed comments" section, just a
-    summary like "reviewed N files, generated no comments") → that's clean too. Go to Step
-    5 (merge) directly — do NOT loop back to Step 19 for another poll-wait just because an
+    summary like "reviewed N files, generated no comments") → that's clean too. **The
+    headline count is not the test — the body is.** A review that headlines "0 open
+    findings" (or "generated no new comments") can still list concrete "previously
+    missed" or suppressed items in its body. Treat any concrete, checkable claim anywhere
+    in the review as a finding regardless of the headline count: go to Step 22 for it, and
+    it counts toward the round cap like any other finding. Confirmed live on PR #446: a
+    review headlined "0 open findings" listed three "previously missed" items in its body
+    (`best_session_chars`, `best_tool` and a docstring), all three valid, and the subagent
+    had to decide on its own whether they counted. Only a review with no concrete claim
+    anywhere in it is clean; for that one, go to Step 5 (merge) directly — do NOT loop back to Step 19 for another poll-wait just because an
     id was technically new; doing so burns a round of the 5-round cap for nothing, which
     matters on a ticket that genuinely needs several real rounds. Only proceed to Step 22
     below when there's an actual finding to verify.
@@ -621,7 +707,11 @@ actionable) does NOT increment it, since no fix cycle happens there.
     recognize the outcome. A finding surviving to round 6 is itself a signal this ticket
     needs human judgment — either the fix is generating new surface area as fast as it
     closes it, or the review is holding it to a standard beyond the ticket's actual scope;
-    both are reasons to stop and hand it back, not to keep going. If `ROUND` is still ≤ 5,
+    both are reasons to stop and hand it back, not to keep going. (If the human then wants
+    the PR finished, the orchestrator can start a separate follow-up subagent for it with
+    their authorization — that is the orchestrator's decision, never yours; your job ends
+    at the `BLOCKED` line, and the round history is what that follow-up starts from.) If
+    `ROUND` is still ≤ 5,
     proceed below — once each finding this round is actually handled (reproduced/fixed or
     declined, per the rest of this step), append a one-line summary of it to
     `ROUND_HISTORY` (for use in either this report or the final one):
@@ -646,7 +736,16 @@ actionable) does NOT increment it, since no fix cycle happens there.
       go to merge.
     - **Doesn't reproduce** → don't change the code. Reply with the specific reasoning or
       test evidence for why — never silently ignore a finding, never defer to a reviewer
-      by default just because it's a reviewer (bot or human).
+      by default just because it's a reviewer (bot or human). **For a "this value gets
+      misclassified" or "this edge case is mishandled" finding, check whether any real
+      recording or call path can actually produce that value before accepting it** —
+      trace every caller/writer of the field, not just the function the reviewer quoted.
+      A value no real path can produce is not a bug, and a deliberate, documented contract
+      (e.g. "0 means unknown") is not a bug either; reply with the call paths you checked.
+      Confirmed live on PR #446's follow-up: a review claimed a valid 500 → 0 session would
+      be mistaken for an unsized row, but every recorder measures output that includes a
+      non-empty `[compressed N -> M chars` header, so 0 can't occur for a real
+      compression, and "0 means unknown" was the documented contract.
     Style/best-practice suggestions with no checkable failure mode don't need a repro —
     judgment call directly.
 23. **Reply to every NEW finding, confirmed or declined — but NEVER mention `@copilot` in

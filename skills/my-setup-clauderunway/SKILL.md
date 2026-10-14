@@ -6,7 +6,8 @@ already configured. Two paths, chosen in step 2:
 - **init** — generates `.mcp.json`, updates `.claude/settings.json` hooks, and adds the
   correct usage guidance to `CLAUDE.md`, all in one pass (steps 3-7).
 - **upgrade** — applies only the specific, named config migrations a newer claude-runway
-  release added (e.g. a renamed hook script), leaving every other setting alone (step 8).
+  release added (e.g. a renamed hook script) and refreshes any already-installed product
+  skill that went stale, leaving every other setting alone (step 8).
   This is the supported route for users who cannot install the `claude-runway-*` console
   scripts: it runs the checkout's own `tools/setup_project.py upgrade`, so it always sees
   the migrations that match the checkout rather than a possibly stale installed copy.
@@ -93,7 +94,8 @@ at the end.
   only `codebase-indexer`, `memory-bank`, or `local-compress`) → **init path** (steps 3-7,
   unchanged). Do not offer upgrade: it refuses a project without a `qdrant` server.
 - `qdrant` server present → use `AskUserQuestion` (header
-  "Path"): "Upgrade (Recommended)" — apply only pending config migrations, nothing else
+  "Path"): "Upgrade (Recommended)" — apply only pending config migrations (and refresh
+  already-installed skills that went stale), nothing else
   reset; "Re-run init" — reconfigure from scratch via the question flow below, which
   resets every toolkit-owned setting to the answers you give. If the user asked for
   one explicitly in their message, skip the question.
@@ -470,11 +472,19 @@ the key into context, and do NOT stop for it — just proceed.
    ```
    <venv-python> <CLAUDE_RUNWAY_DIR>/tools/setup_project.py upgrade <cwd> --dry-run
    ```
-   If it reports no pending migrations, say so ("already up to date"), skip to the
-   `doctor` check (item 4 below), and stop. If it exits non-zero, show the output and stop.
+   The same command also previews the **installed-skill refresh**: after the migrations it
+   lists any skill already installed under `~/.claude/skills/` whose content differs from
+   the shipped version ("Would refresh <skill>"), writing nothing. It only ever refreshes
+   skills the user already has (it never installs new ones), and keeps an installed copy's
+   own `name`/`description` frontmatter. If it reports no pending migrations AND no stale
+   skills, say so ("already up to date"), skip to the `doctor` check (item 4 below), and
+   stop. If it exits non-zero, show the output and stop.
 2. **Approve.** Use `AskUserQuestion` (header "Apply"): "Apply all pending migrations"
-   / "Cancel". Be explicit that approval is **all-or-nothing**: a skill cannot answer the
-   CLI's interactive per-migration prompts, so every pending migration is applied. A user
+   / "Cancel" (name the stale skills in the question text if the preview listed any, e.g.
+   "Apply all pending migrations and refresh N installed skill(s)"). Be explicit that approval
+   is **all-or-nothing**: a skill cannot answer the CLI's interactive per-migration or
+   per-skill prompts, so every pending migration is applied and every stale installed skill
+   is refreshed (`--auto-yes` covers both). A user
    who wants to pick migrations individually should decline and run the CLI directly
    (`<venv-python> <CLAUDE_RUNWAY_DIR>/tools/setup_project.py upgrade <cwd>`) in their own
    terminal. On "Cancel", stop and change nothing.
@@ -483,7 +493,8 @@ the key into context, and do NOT stop for it — just proceed.
    <venv-python> <CLAUDE_RUNWAY_DIR>/tools/setup_project.py upgrade <cwd> --auto-yes
    ```
    If it exits non-zero, show the full output and stop. Otherwise report the migrations
-   it applied, from its output.
+   it applied and the skills it refreshed, from its output. Tell the user that the
+   refreshed skill text only takes effect in a new Claude Code session (step 5).
 4. **Verify.** Tell the user to confirm with `doctor` (it flags a stale compress-hook
    path left by the #395 rename, among other things), and offer to run it:
    ```
@@ -494,4 +505,7 @@ the key into context, and do NOT stop for it — just proceed.
 
 `upgrade` does not touch `CLAUDE.md`; it has no CLAUDE.md step (that is `init`-only,
 step 6). The migration list lives in `libs/upgrade_lib.py` (`MIGRATIONS`) and is the
-single source of truth for what an upgrade can change; this skill adds nothing to it.
+single source of truth for which CONFIG changes an upgrade can make; this skill adds nothing
+to it. The skill refresh is separate from `MIGRATIONS`: it compares each already-installed
+skill with the shipped `skills/*/SKILL.md` (`plan_skill_installs` in
+`libs/setup_project_lib.py`), so there is no list to keep in sync.

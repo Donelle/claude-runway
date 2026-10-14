@@ -178,6 +178,7 @@ def _init_args(target_repo, **overrides) -> argparse.Namespace:
         memory_bank_collection="",
         memory_bank_id="",
         embedding_model="",
+        memory_bank_embedding_model="",
         qdrant_only=False,
         skip_hooks=False,
         install_skills=False,
@@ -515,12 +516,35 @@ class EmbeddingModelFlag(unittest.TestCase):
             for s in ("qdrant", "codebase-indexer", "memory-bank")
         }
 
-    def test_flag_is_written_into_all_three_blocks_and_survives_a_plain_rerun(self):
+    def test_flag_is_written_into_code_blocks_only_and_survives_a_plain_rerun(self):
         self.mod.cmd_init(_init_args(self.target_repo, embedding_model=self.CUSTOM, dry_run=False))
-        self.assertEqual(set(self._written_models().values()), {self.CUSTOM})
+        models = self._written_models()
+        self.assertEqual({models["qdrant"], models["codebase-indexer"]}, {self.CUSTOM})
+        # Issue #428: memory-bank's model is its own value, never taken from --embedding-model.
+        self.assertNotEqual(models["memory-bank"], self.CUSTOM)
         # A plain re-run (no flag) must not reset it to the template default.
         self.mod.cmd_init(_init_args(self.target_repo, dry_run=False))
-        self.assertEqual(set(self._written_models().values()), {self.CUSTOM})
+        again = self._written_models()
+        self.assertEqual({again["qdrant"], again["codebase-indexer"]}, {self.CUSTOM})
+        self.assertEqual(again["memory-bank"], models["memory-bank"])
+
+    def test_memory_bank_flag_is_written_into_memory_bank_block_only(self):
+        self.mod.cmd_init(_init_args(self.target_repo, memory_bank_embedding_model=self.CUSTOM, dry_run=False))
+        models = self._written_models()
+        self.assertEqual(models["memory-bank"], self.CUSTOM)
+        self.assertNotEqual(models["qdrant"], self.CUSTOM)
+        # Sticky across a plain re-run.
+        self.mod.cmd_init(_init_args(self.target_repo, dry_run=False))
+        self.assertEqual(self._written_models()["memory-bank"], self.CUSTOM)
+
+    def test_parser_accepts_memory_bank_embedding_model_and_defaults_blank(self):
+        with mock.patch.object(
+            self.mod.sys, "argv",
+            ["setup_project.py", "init", str(self.target_repo), "--memory-bank-embedding-model", self.CUSTOM],
+        ):
+            self.assertEqual(self.mod.parse_args().memory_bank_embedding_model, self.CUSTOM)
+        with mock.patch.object(self.mod.sys, "argv", ["setup_project.py", "init", str(self.target_repo)]):
+            self.assertEqual(self.mod.parse_args().memory_bank_embedding_model, "")
 
     def test_parser_accepts_embedding_model_and_defaults_blank(self):
         with mock.patch.object(
@@ -912,6 +936,15 @@ class UpgradeSubcommand(unittest.TestCase):
         self.addCleanup(self._tmpdir.cleanup)
         self.target_repo = Path(self._tmpdir.name) / "my-project"
         self.target_repo.mkdir()
+        # SAFETY (issue #449): cmd_upgrade now also refreshes installed
+        # skills under the home directory's ~/.claude/skills. Point both the
+        # skills dir and Path.home() at a throwaway directory so no test here
+        # can ever read or write the real home.
+        self.skills_dir = Path(self._tmpdir.name) / "skills-dest"
+        fake_home = Path(self._tmpdir.name) / "fake-home"
+        home_patch = mock.patch.object(Path, "home", return_value=fake_home)
+        home_patch.start()
+        self.addCleanup(home_patch.stop)
         # is_project_configured (Copilot review, PR #227) now gates
         # cmd_upgrade before it ever calls run_upgrade -- give this fixture
         # a minimal, already-configured .mcp.json (a 'qdrant' server block
@@ -947,7 +980,7 @@ class UpgradeSubcommand(unittest.TestCase):
 
     def test_nonexistent_target_repo_errors_out(self):
         args = argparse.Namespace(
-            target_repo=str(self.target_repo / "does-not-exist"), dry_run=False, auto_yes=True
+            target_repo=str(self.target_repo / "does-not-exist"), dry_run=False, auto_yes=True, skills_dir=""
         )
         with self.assertRaises(SystemExit) as ctx:
             self.mod.cmd_upgrade(args)
@@ -960,7 +993,7 @@ class UpgradeSubcommand(unittest.TestCase):
         # and exit code, not silently write a broken partial config.
         unconfigured = Path(self._tmpdir.name) / "never-init-run"
         unconfigured.mkdir()
-        args = argparse.Namespace(target_repo=str(unconfigured), dry_run=False, auto_yes=True)
+        args = argparse.Namespace(target_repo=str(unconfigured), dry_run=False, auto_yes=True, skills_dir="")
         with self.assertRaises(SystemExit) as ctx:
             self.mod.cmd_upgrade(args)
         self.assertEqual(ctx.exception.code, 1)
@@ -986,7 +1019,7 @@ class UpgradeSubcommand(unittest.TestCase):
             )
             return []
 
-        args = argparse.Namespace(target_repo=str(self.target_repo), dry_run=True, auto_yes=False)
+        args = argparse.Namespace(target_repo=str(self.target_repo), dry_run=True, auto_yes=False, skills_dir=str(self.skills_dir))
         with mock.patch.object(self.mod, "_pip_installed_venv_python", return_value=None), \
              mock.patch.object(self.mod, "run_upgrade", side_effect=_fake_run_upgrade):
             self.mod.cmd_upgrade(args)
@@ -1009,12 +1042,154 @@ class UpgradeSubcommand(unittest.TestCase):
             captured["venv_python"] = venv_python
             return []
 
-        args = argparse.Namespace(target_repo=str(self.target_repo), dry_run=False, auto_yes=True)
+        args = argparse.Namespace(target_repo=str(self.target_repo), dry_run=False, auto_yes=True, skills_dir=str(self.skills_dir))
         with mock.patch.object(self.mod, "_pip_installed_venv_python", return_value=fake_python), \
              mock.patch.object(self.mod, "run_upgrade", side_effect=_fake_run_upgrade):
             self.mod.cmd_upgrade(args)
 
         self.assertEqual(captured["venv_python"], fake_python)
+
+
+class UpgradeSkillRefresh(unittest.TestCase):
+    """Issue #449: `upgrade` refreshes INSTALLED skills that differ from the
+    shipped ones. Everything runs against temp dirs; Path.home() is patched
+    so the real ~/.claude is never read or written."""
+
+    FM = '---\nname: my-savings\ndescription: "x"\n---\n\n'
+
+    def setUp(self):
+        self.mod = _load_setup_project()
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        root = Path(self._tmpdir.name)
+        home_patch = mock.patch.object(Path, "home", return_value=root / "fake-home")
+        home_patch.start()
+        self.addCleanup(home_patch.stop)
+        self.tools = root / "tools"
+        for name, body in (("my-savings", "# Skill: my-savings\nnew wording\n"), ("my-other", "# Skill: my-other\n")):
+            (self.tools / "skills" / name).mkdir(parents=True)
+            (self.tools / "skills" / name / "SKILL.md").write_text(body, encoding="utf-8")
+        self.skills = root / "skills-dest"
+
+    def _install(self, name, text):
+        (self.skills / name).mkdir(parents=True, exist_ok=True)
+        (self.skills / name / "SKILL.md").write_bytes(text.encode("utf-8"))
+
+    def _read(self, name):
+        return (self.skills / name / "SKILL.md").read_bytes().decode("utf-8")
+
+    def _refresh(self, **kw):
+        kw.setdefault("auto_yes", True)
+        kw.setdefault("dry_run", False)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            done = self.mod.refresh_installed_skills(self.skills, tools_repo_dir=self.tools, **kw)
+        return done, buf.getvalue()
+
+    def test_stale_my_savings_is_refreshed_keeping_frontmatter_and_dropping_the_pointer(self):
+        self._install("my-savings", self.FM + "# Skill: my-savings\nold wording, see EVALUATION.md\n")
+        done, out = self._refresh()
+        self.assertEqual(done, ["my-savings"])
+        text = self._read("my-savings")
+        self.assertEqual(text, self.FM + "# Skill: my-savings\nnew wording\n")
+        self.assertNotIn("EVALUATION.md", text)
+        self.assertIn("keeping its existing frontmatter", out)
+
+    def test_up_to_date_copy_with_frontmatter_is_nothing_to_do(self):
+        self._install("my-savings", self.FM + "# Skill: my-savings\nnew wording\n")
+        self._install("my-other", "# Skill: my-other\n")
+        before = (self.skills / "my-savings" / "SKILL.md").stat().st_mtime_ns
+        done, out = self._refresh()
+        self.assertEqual(done, [])
+        self.assertIn("up to date", out)
+        self.assertEqual((self.skills / "my-savings" / "SKILL.md").stat().st_mtime_ns, before)
+        self.assertEqual(self._refresh()[0], [])
+
+    def test_dry_run_writes_nothing_and_never_prompts(self):
+        stale = self.FM + "stale\n"
+        self._install("my-savings", stale)
+        done, out = self._refresh(dry_run=True, auto_yes=False, prompt_fn=lambda p: self.fail("prompted"))
+        self.assertEqual(done, ["my-savings"])
+        self.assertEqual(self._read("my-savings"), stale)
+        self.assertIn("Would refresh my-savings", out)
+
+    def test_no_installed_skills_installs_nothing(self):
+        done, out = self._refresh()
+        self.assertEqual(done, [])
+        self.assertFalse(self.skills.exists())
+        self.assertIn("No installed skills to refresh", out)
+        self.assertIn("2 shipped skill(s) are not installed", out)
+
+    def test_partial_install_refreshes_only_what_is_installed(self):
+        self._install("my-savings", "stale\n")
+        done, _ = self._refresh()
+        self.assertEqual(done, ["my-savings"])
+        self.assertFalse((self.skills / "my-other").exists())
+
+    def test_declining_leaves_the_copy_alone(self):
+        self._install("my-savings", "stale\n")
+        done, out = self._refresh(auto_yes=False, prompt_fn=lambda p: False)
+        self.assertEqual(done, [])
+        self.assertEqual(self._read("my-savings"), "stale\n")
+        self.assertIn("Skipped", out)
+
+    def test_accepting_prompt_writes(self):
+        self._install("my-savings", "stale\n")
+        done, _ = self._refresh(auto_yes=False, prompt_fn=lambda p: True)
+        self.assertEqual(done, ["my-savings"])
+
+    def test_closed_stdin_counts_as_decline(self):
+        self._install("my-savings", "stale\n")
+        with mock.patch("builtins.input", side_effect=EOFError):
+            done, _ = self._refresh(auto_yes=False)
+        self.assertEqual(done, [])
+        self.assertEqual(self._read("my-savings"), "stale\n")
+
+    def test_missing_skills_dir_is_fine(self):
+        done, _ = self._refresh(dry_run=True)
+        self.assertEqual(done, [])
+
+    def test_hand_edited_copy_is_reported_and_refreshed(self):
+        self._install("my-savings", self.FM + "# Skill: my-savings\nnew wording\nmy own edit\n")
+        self.assertEqual(self._refresh(dry_run=True)[0], ["my-savings"])
+
+    def test_crlf_installed_copy_stays_up_to_date(self):
+        (self.tools / "skills" / "my-savings" / "SKILL.md").write_bytes(b"# Skill: my-savings\r\nx\r\n")
+        self._install("my-savings", "# Skill: my-savings\r\nx\r\n")
+        self.assertEqual(self._refresh()[0], [])
+
+    def _cmd_upgrade(self, **kw):
+        target = Path(self._tmpdir.name) / "proj"
+        target.mkdir(exist_ok=True)
+        (target / ".mcp.json").write_text(json.dumps({"mcpServers": {"qdrant": {}}}), encoding="utf-8")
+        args = argparse.Namespace(target_repo=str(target), skills_dir=str(self.skills), **kw)
+        buf = io.StringIO()
+        with mock.patch.object(self.mod, "TOOLS_REPO_DIR", self.tools), \
+             mock.patch.object(self.mod, "_pip_installed_venv_python", return_value=None), \
+             mock.patch.object(self.mod, "run_upgrade", return_value=[]), \
+             redirect_stdout(buf):
+            self.mod.cmd_upgrade(args)
+        return buf.getvalue()
+
+    def test_cmd_upgrade_refreshes_with_auto_yes(self):
+        self._install("my-savings", "stale\n")
+        self._cmd_upgrade(dry_run=False, auto_yes=True)
+        self.assertEqual(self._read("my-savings"), "# Skill: my-savings\nnew wording\n")
+
+    def test_cmd_upgrade_dry_run_writes_nothing(self):
+        self._install("my-savings", "stale\n")
+        self._cmd_upgrade(dry_run=True, auto_yes=False)
+        self.assertEqual(self._read("my-savings"), "stale\n")
+
+    def test_parse_args_accepts_skills_dir(self):
+        with mock.patch.object(sys, "argv", ["setup_project.py", "upgrade", "x", "--skills-dir", "/tmp/s"]):
+            parsed = self.mod.parse_args()
+        self.assertEqual(parsed.skills_dir, "/tmp/s")
+
+    def test_real_shipped_skills_have_no_evaluation_pointer(self):
+        for name in ("my-savings", "my-setup-clauderunway"):
+            shipped = (REPO_ROOT / "skills" / name / "SKILL.md").read_text(encoding="utf-8")
+            self.assertNotIn("EVALUATION.md", shipped, name)
 
 
 if __name__ == "__main__":

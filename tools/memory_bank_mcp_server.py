@@ -17,8 +17,10 @@ Setup:
 
 Register in .mcp.json (see templates/mcp.json.template's "memory-bank"
 block). Reuses the same QDRANT_URL/QDRANT_API_KEY/EMBEDDING_MODEL env var
-names the qdrant/codebase-indexer servers already read, so one project
-config keeps every Qdrant-talking server aligned -- but MEMORY_BANK_COLLECTION
+names the qdrant/codebase-indexer servers read, but EMBEDDING_MODEL here is
+its OWN value, set independently of theirs (issue #428) because it must match
+the shared collection's model, not the project's code index -- and
+MEMORY_BANK_COLLECTION
 is its own, separate collection name: every project shares ONE memory-bank
 collection (not each project's own code-index collection), tagged by writing
 project (see libs/memory_bank_lib.py's module docstring for why, and

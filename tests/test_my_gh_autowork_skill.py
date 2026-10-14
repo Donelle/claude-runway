@@ -331,6 +331,13 @@ class MetricsLoggingContentRequirements(unittest.TestCase):
         # old compact_store prose did for that tool's own two failure shapes.
         self.assertIn('"Error:"', self.content)
 
+    def test_cost_figures_come_from_the_transcript_cli_not_hand_copying(self):
+        # Issue #455: the orchestrator passes an agent id and the tool computes
+        # wall clock/tokens/tool calls, so rows can't go missing or be mistyped.
+        self.assertIn("tools/autowork_cost.py record", self.content)
+        self.assertIn("--agent-id", self.content)
+        self.assertIn("Do not copy", self.content)
+
     def test_session_id_carries_per_attempt_timestamp(self):
         # The per-attempt HHMMSS timestamp is now stored as session_id (not
         # a label field, since the append-only store doesn't upsert) --
@@ -466,6 +473,156 @@ class ExplicitTicketListContentRequirements(unittest.TestCase):
         section = " ".join(self.content[idx : idx + 1200].split())
         self.assertIn("not a failure", section)
         self.assertIn("no subagent call ever produces a `DONE` outcome in this mode", section)
+
+
+def _normalized(text):
+    """Collapse all whitespace runs to single spaces, so a phrase that the
+    source line-wraps (with newline + indentation) still matches a plain
+    substring check."""
+    return " ".join(text.split())
+
+
+def _template(content):
+    """The subagent prompt template: everything from its heading to the end.
+    Rules aimed at the subagent must live here, since only this block is
+    passed as the Agent prompt -- text elsewhere in the file never reaches it."""
+    idx = content.find("## Subagent Prompt Template")
+    assert idx != -1, "Subagent Prompt Template heading not found"
+    return content[idx:]
+
+
+def _template_step(content, n):
+    """The text of one numbered template item, from `n. ` at line start up to
+    the next numbered item or `## ` heading."""
+    template = _template(content)
+    match = re.search(rf"^ *{n}\. .*?(?=^ *{n + 1}\. |^## )", template, re.MULTILINE | re.DOTALL)
+    assert match is not None, f"template item {n} not found"
+    return _normalized(match.group(0))
+
+
+class RunLessonsContentRequirements(unittest.TestCase):
+    """Pin the rules issue #447 carried over from the 2026-10-12/13 autowork run,
+    where the orchestrator had to patch each one into the subagent prompt by hand.
+    Each lives in the template (or, for the follow-up pattern, the orchestrator
+    half) next to the step it qualifies; a future edit that drops one would
+    otherwise pass silently, since the skill is prose, not code."""
+
+    def setUp(self):
+        with open(SKILL_PATH, encoding="utf-8") as f:
+            self.content = f.read()
+        self.template = _normalized(_template(self.content))
+
+    def test_opening_paragraph_warns_about_compressed_test_output(self):
+        idx = self.template.find("Do NOT skip any numbered step")
+        self.assertNotEqual(idx, -1)
+        paragraph = self.template[idx : self.template.find("## Step 0", idx)]
+        self.assertIn("compression hook", paragraph)
+        # Copilot review round 2 on PR #452: plain grep treats `|` literally and
+        # matches none of these lines, so the command must carry -E.
+        self.assertIn("grep -E '^Ran|^OK|FAILED'", paragraph)
+        self.assertIn("Redirect test output to a file", paragraph)
+
+    def test_step_3_has_pre_push_sweep(self):
+        step3 = self.template[self.template.find("## Step 3") : self.template.find("## Step 4")]
+        self.assertIn("Pre-push sweep for old wording", step3)
+        self.assertIn("before the FIRST push", step3)
+        # Copilot review round 2 on PR #452: without -e, a flag-shaped pattern
+        # ("--old-option") is parsed as a git grep option and the sweep errors out.
+        self.assertIn('git grep -n -i -e "<old wording>"', step3)
+        # The sweep must sit before the commit/push item, or it can't run "before
+        # the first push".
+        self.assertLess(step3.find("Pre-push sweep"), step3.find("16. Commit"))
+
+    def test_step_19_requires_full_40_character_sha(self):
+        step19 = _template_step(self.content, 19)
+        self.assertIn("full 40-character SHA", step19)
+        self.assertIn("git rev-parse HEAD", step19)
+        self.assertIn("never an abbreviated one", step19)
+
+    def test_step_19_poll_does_not_use_a_short_sha(self):
+        # The rule above is only true if the poll itself doesn't use --short.
+        step19 = _template_step(self.content, 19)
+        self.assertIn("HEAD_SHA=$(git rev-parse HEAD)", step19)
+        self.assertNotIn("HEAD_SHA=$(git rev-parse --short", step19)
+
+    def test_step_21_headline_count_is_not_the_test(self):
+        step21 = _template_step(self.content, 21)
+        self.assertIn('"0 open findings"', step21)
+        self.assertIn("previously missed", step21)
+        self.assertIn("regardless of the headline count", step21)
+        self.assertIn("counts toward the round cap", step21)
+
+    def test_step_22_checks_whether_a_real_path_produces_the_value(self):
+        step22 = _template_step(self.content, 22)
+        doesnt = step22[step22.find("**Doesn't reproduce**") :]
+        self.assertIn("misclassified", doesnt)
+        self.assertIn("any real recording or call path", doesnt)
+        self.assertIn("deliberate, documented contract", doesnt)
+
+    def test_continuation_section_exists_outside_the_template(self):
+        # It tells the ORCHESTRATOR what to do after a BLOCKED, so it belongs in
+        # the orchestrator half, not in the subagent's own prompt.
+        heading = "## Continuing after a BLOCKED at the round cap"
+        idx = self.content.find(heading)
+        self.assertNotEqual(idx, -1)
+        self.assertLess(idx, self.content.find("## Subagent Prompt Template"))
+
+    def test_continuation_is_authorized_only_and_capped_lower(self):
+        start = self.content.find("## Continuing after a BLOCKED at the round cap")
+        section = _normalized(self.content[start : self.content.find("## Subagent Prompt Template")])
+        self.assertIn("Never automatic, never past the cap without authorization", section)
+        self.assertIn("use its own judgment and keep going", section)
+        self.assertIn("The cap is 3, not 5", section)
+        self.assertIn('replace "greater than 5" with "greater than 3"', section)
+        self.assertIn("git checkout -B <throwaway> origin/<branch>", section)
+        self.assertIn("git push origin HEAD:<branch>", section)
+        # Design/ambiguity BLOCKEDs are excluded -- only the round cap qualifies.
+        self.assertIn("does **not** apply to a `BLOCKED` for a design question", section)
+        # Model is the orchestrator's call, not hard-coded.
+        self.assertIn("Model choice is the orchestrator's call", section)
+
+    def test_continuation_overrides_the_new_pr_assumptions_of_the_review_loop(self):
+        # Copilot review round 1 on PR #452: Step 4 starts seen_ids empty, Step 22
+        # hard-codes the 5-round cap, and Step 19 polls before anything -- all
+        # correct for a brand-new PR, all wrong for a follow-up on an existing one
+        # (every earlier round's comment would read as new, the cap would be 5,
+        # and a declined-only first round would poll for a review no push triggers).
+        start = self.content.find("## Continuing after a BLOCKED at the round cap")
+        section = _normalized(self.content[start : self.content.find("## Subagent Prompt Template")])
+        self.assertIn("Seed `seen_ids` first", section)
+        self.assertIn("put every id it returns into `seen_ids`", section)
+        self.assertIn("are follow-up round 1", section)
+        self.assertIn("`ROUND=1`", section)
+        self.assertIn("without polling first", section)
+        self.assertIn("loop back to Step 19 only if that round pushed a fix", section)
+        # The old blanket "run Steps 19-25 exactly as written" must not come back.
+        self.assertNotIn("run Steps 19–25 and Step 5 exactly as written", section)
+
+    def test_continuation_resume_does_not_remove_from_the_queue_twice(self):
+        # Copilot review round 1 on PR #452: resuming "at Step 2c" after a
+        # follow-up merge re-ran 2c's "remove the just-worked ticket", though
+        # Step 1 had already removed it when its own call returned.
+        start = self.content.find("## Continuing after a BLOCKED at the round cap")
+        section = _normalized(self.content[start : self.content.find("## Subagent Prompt Template")])
+        self.assertIn("without removing or re-adding anything", section)
+        self.assertIn('must not be "removed" a second time', section)
+        self.assertNotIn("continue at Step 2c", section)
+
+    def test_step_2b_points_at_the_continuation_section(self):
+        idx = self.content.find("**stop the whole run immediately**, surface the reason verbatim")
+        self.assertNotEqual(idx, -1)
+        following = _normalized(self.content[idx : idx + 600])
+        self.assertIn("Continuing after a BLOCKED at the round cap", following)
+        self.assertIn("never start one on your own initiative", following)
+
+    def test_every_step_cross_reference_in_the_template_exists(self):
+        # The template numbers its items 1-29 (plus "Step 0"..."Step 5" section
+        # headings, all <= 29), so any "Step N" outside 0..29 is a stale
+        # reference left by an edit that renumbered or removed an item.
+        numbered = {int(m) for m in re.findall(r"^ *(\d+)\. ", _template(self.content), re.MULTILINE)}
+        self.assertEqual(numbered, set(range(1, 30)), "template items must stay numbered 1-29")
+        for ref in re.findall(r"\bSteps? (\d+)", self.template):
+            self.assertIn(int(ref), numbered | {0}, f"dangling cross-reference: Step {ref}")
 
 
 if __name__ == "__main__":
