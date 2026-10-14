@@ -886,8 +886,8 @@ def main() -> None:
     Entry point for both `python tools/setup_project.py` (the
     `if __name__` guard below) and the `claude-runway-setup` console
     script pip/pipx/uvx installs -- pulled out into its own
-    function so the `claude_runway:setup_main` shim that
-    `[project.scripts]` in pyproject.toml points at has
+    function so the `claude_runway:setup_main` shim, which is what
+    `[project.scripts]` in pyproject.toml points at, has
     something to call; behavior is unchanged either way.
     """
     parsed_args = parse_args()
