@@ -5,7 +5,7 @@ Stdlib-only (unittest, no pytest) and no disk/DB/network — all savings_ledger
 calls are stubbed at the hook's module-level reference, following the same
 mock.patch.object pattern as test_redirect_webfetch_to_fetch_url.py.
 
-Issue #162: the hook wrapped systemMessage inside hookSpecificOutput, which is
+The hook wrapped systemMessage inside hookSpecificOutput, which is
 not a valid key for SessionEnd — Claude Code rejects the entire payload with a
 schema validation error. The fix emits {"systemMessage": summary} at the JSON
 root. These tests pin that output shape and verify the silent-exit paths
@@ -31,7 +31,7 @@ _RECOVER_PATCH = None
 
 
 def setUpModule():
-    # Issue #306: main() now calls savings_ledger.recover_orphaned_sessions(),
+    # main() now calls savings_ledger.recover_orphaned_sessions(),
     # which is NOT stubbed by the per-test patches below and would otherwise
     # scan (and roll up/delete from) the REAL ~/.claude/claude-runway/sessions
     # directory whenever a test patches tracking_enabled to True. Stub it for
@@ -83,7 +83,7 @@ class OutputShape(unittest.TestCase):
         self.assertEqual(data["systemMessage"], _SUMMARY)
 
     def test_no_hookspecificoutput(self):
-        # Regression for #162: hookSpecificOutput is not valid for SessionEnd;
+        # Regression: hookSpecificOutput is not valid for SessionEnd;
         # Claude Code rejects any payload that contains it.
         data = json.loads(_run_main())
         self.assertNotIn("hookSpecificOutput", data)
@@ -114,7 +114,7 @@ class SilentExitPaths(unittest.TestCase):
             self.assertEqual(_run_main(), "")
 
     def test_uncredited_only_session_no_output_but_still_finalized(self):
-        # #307: events exist (e.g. fetch_url, never credited) but none credited
+        # Events exist (e.g. fetch_url, never credited) but none credited
         # -> finalize_owned_session reports event_count 0. The session must still be
         # rolled up into the perpetual store, yet nothing may be printed.
         with (
@@ -137,7 +137,7 @@ class SilentExitPaths(unittest.TestCase):
 
 
 class RecoveryWiring(unittest.TestCase):
-    """Issue #306: every SessionEnd (tracking on) rolls up OTHER sessions'
+    """Every SessionEnd (tracking on) rolls up OTHER sessions'
     orphaned ledgers, excluding the session that is ending, regardless of
     whether the ending session logged anything, and never at the cost of
     the ending session's own roll-up/summary."""
@@ -174,7 +174,7 @@ class RecoveryWiring(unittest.TestCase):
         self.assertEqual(data["systemMessage"], _SUMMARY)
 
     def test_own_roll_up_goes_through_the_owned_protocol(self):
-        # PR #412 review: the hook must use the same ownership protocol as
+        # The hook must use the same ownership protocol as
         # recovery (finalize_owned_session -- serialized, and combining this
         # session's ledger with any leftover claim of it), not the plain
         # finalize_session, or the two can overwrite each other's rows.
@@ -190,7 +190,7 @@ class RecoveryWiring(unittest.TestCase):
         fin.assert_called_once_with("abc123", "my-project", actual_tokens=None, attribution=None)
 
     def test_artifact_check_error_fails_open(self):
-        # PR #412 review (round 6): has_session_artifacts() ran outside the
+        # has_session_artifacts() ran outside the
         # hook's guard, so an error there escaped as a traceback at session
         # shutdown instead of failing open like every other step.
         with (
@@ -250,13 +250,13 @@ class TranscriptParsing(unittest.TestCase):
             mock.patch.object(hook.savings_ledger, "finalize_owned_session", side_effect=_fake_finalize),
             mock.patch.object(hook.savings_ledger, "query_project_summary", return_value={}),
             mock.patch.object(hook.savings_ledger, "format_simple_view", return_value=_SUMMARY),
-            # #364: the hook calls the session-level parser (main + subagent
+            # The hook calls the session-level parser (main + subagent
             # transcripts), not the single-file one.
             mock.patch.object(
                 hook.savings_ledger, "parse_session_token_counts",
                 return_value=transcript_result
             ),
-            # #440: the same opt-in also reads the transcript for the per-model join.
+            # The same opt-in also reads the transcript for the per-model join.
             mock.patch.object(
                 hook.savings_ledger, "read_transcript_attribution",
                 return_value={"calls": {}, "marker_ids": set(), "samples": {}}
@@ -323,7 +323,7 @@ class TranscriptParsing(unittest.TestCase):
         read.assert_called_once_with("/fake/transcript.jsonl")
 
     def test_hook_passes_transcript_path_to_session_level_parser(self):
-        # #364: the payload's transcript_path is only the MAIN transcript; the
+        # The payload's transcript_path is only the MAIN transcript; the
         # session-level parser derives the subagent transcripts from it, so the
         # hook must hand it that exact path.
         with (

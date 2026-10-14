@@ -115,7 +115,7 @@ async def store_batch(
 def ensure_file_path_index(client, collection_name: str) -> bool:
     """
     Idempotently backfills the KEYWORD payload index on
-    FILE_PATH_INDEX_FIELD for an ALREADY-EXISTING collection (issue #54).
+    FILE_PATH_INDEX_FIELD for an ALREADY-EXISTING collection.
 
     Without this, sync_repo's per-file delete-by-filter -- and any other
     metadata.file_path-scoped query -- full-scans every point in the

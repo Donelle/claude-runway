@@ -1,7 +1,7 @@
 """
 Embedding-model mismatch check shared by `tools/ingest_mcp_server.py`
-(`find_in_collection`, `index_repo`, `sync_repo`) and `libs/memory_bank_lib.py`
-(issue #175). Relocated here from `ingest_mcp_server.py` (where it was a private,
+(`find_in_collection`, `index_repo`, `sync_repo`) and `libs/memory_bank_lib.py`.
+Relocated here from `ingest_mcp_server.py` (where it was a private,
 single-file function used only by `find_in_collection`) rather than
 duplicated, so callers can't drift apart on this logic. The default
 behavior is unchanged from that original home (fails open on an
@@ -45,9 +45,9 @@ def check_embedding_model_mismatch(
     of this function (`find_in_collection`, `memory_bank_lib.py`'s remember/
     recall/ensure_collection) is fine proceeding on an inconclusive result.
 
-    `fail_closed=True` (PR #178 review, fourth and eighth passes) inverts that
+    `fail_closed=True` inverts that
     for the three callers where it's wrong: `index_repo(reset=True)`'s,
-    `sync_repo`'s, and `tools/ingest_to_qdrant.py --reset`'s (issue #265)
+    `sync_repo`'s, and `tools/ingest_to_qdrant.py --reset`'s
     pre-delete checks. Each exists specifically to stop a
     destructive delete before it runs -- fail-open there meant an
     inconclusive check (a transient network error,
@@ -73,7 +73,7 @@ def check_embedding_model_mismatch(
     `recovery_hint`, if given, REPLACES the default `find_in_collection`/
     `index_repo`-oriented remediation text in the two error messages that carry
     one (the name-mismatch and unnamed-vector-format cases). Added for issue
-    #175 (PR #178 review): `memory_bank_lib.py` also calls this shared check,
+    `memory_bank_lib.py` also calls this shared check,
     where "use index_repo(reset=true)" is actively wrong advice -- `index_repo`
     refuses to ever touch the shared memory-bank collection -- and "check the
     other repo's .mcp.json"/"that find_in_collection expects" don't apply
@@ -126,8 +126,8 @@ def check_embedding_model_mismatch(
             # letting it fail downstream with an opaque Qdrant error.
             # Recovery (find_in_collection's default text): previously
             # recommended index_repo(reset=true) to wipe and recreate with a
-            # named-vector schema -- no longer effective advice (PR #178
-            # review, third pass): reset=true was changed to always preserve
+            # named-vector schema -- no longer effective advice:
+            # reset=true was changed to always preserve
             # the collection's existing schema (never delete_collection), so
             # it can no longer fix an unnamed-vector collection's format at
             # all. Recommend dropping/recreating the collection directly
@@ -144,7 +144,7 @@ def check_embedding_model_mismatch(
                 )
             )
         else:
-            # Found in PR #178 review (seventh pass): any vectors_config shape
+            # Found in review (seventh pass): any vectors_config shape
             # OTHER than None, dict, or VectorParams (a future qdrant-client
             # type this function doesn't know about yet) fell through every
             # branch above with no return, silently reaching the shared

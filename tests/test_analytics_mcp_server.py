@@ -157,7 +157,7 @@ class RecordMetricAcceptsDictOrJsonStringMetadata(unittest.TestCase):
 
 
 class GetMetricsSessionIdFilter(unittest.TestCase):
-    """Issue #248: get_metrics gained an optional session_id passthrough for
+    """get_metrics gained an optional session_id passthrough for
     view="summary"/"by_event_type" -- covers the MCP tool surface on top of
     tests/test_metrics_lib.py's own MetricsStore-level coverage of the
     underlying filter."""
@@ -208,7 +208,7 @@ class GetMetricsSessionIdFilter(unittest.TestCase):
         self.assertEqual(data["event_count"], 2)
 
     def test_trend_view_ignores_session_id_without_erroring(self):
-        # session_id has no effect on trend() (out of scope per issue #248) --
+        # session_id has no effect on trend() --
         # passing it must not raise or otherwise break the trend view.
         mod = _load_analytics_mcp_server()
         store = mod.metrics_lib.MetricsStore()
@@ -223,7 +223,7 @@ class GetMetricsSessionIdFilter(unittest.TestCase):
         self.assertEqual(sum(r["event_count"] for r in data), 2)
 
     def test_summary_view_empty_filter_names_the_session_not_the_whole_metric(self):
-        """Copilot review on PR #250 (round 4): a session_id filter that
+        """Copilot review (round 4): a session_id filter that
         matches nothing must not claim the metric_id as a whole has no
         events -- it has plenty, just not under this session_id."""
         mod = _load_analytics_mcp_server()
@@ -245,7 +245,7 @@ class GetMetricsSessionIdFilter(unittest.TestCase):
 
 
 class GetMetricsDetailView(unittest.TestCase):
-    """Issue #249: get_metrics gained a "detail" view -- raw per-event rows
+    """get_metrics gained a "detail" view -- raw per-event rows
     with deserialized metadata, most recent first. Covers the MCP tool
     surface on top of tests/test_metrics_lib.py's own MetricsStore-level
     coverage of the underlying detail()/format_detail_view()."""
@@ -322,7 +322,7 @@ class GetMetricsDetailView(unittest.TestCase):
 
 
 class GetMetricsBucketAndNScopedToRelevantViews(unittest.TestCase):
-    """Copilot review on PR #255: bucket/n are documented as "ignored" for
+    """Copilot review: bucket/n are documented as "ignored" for
     views that don't consume them, but were validated unconditionally --
     an irrelevant bucket="month" or n=0 alongside view="summary" rejected
     an otherwise-valid call. Scoped so only the views that actually use

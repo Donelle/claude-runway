@@ -1,5 +1,5 @@
 """
-Collection-metadata marker for conversation-compact collections (issue #397).
+Collection-metadata marker for conversation-compact collections.
 
 `compact_store` (tools/qdrant_mcp_server.py) writes saved conversation
 summaries for /my-compact and /my-resume into their own collections, which
@@ -64,7 +64,7 @@ def mark_compact_collection(client, collection: str) -> bool:
     Idempotently marks `collection` as an internal compact collection.
     Called by `compact_store` on EVERY write, so a legacy collection created
     before this marker existed gets marked on its next /my-compact (no
-    backfill, by decision -- issue #397). Skips the network write when the
+    backfill, by decision). Skips the network write when the
     marker is already present. Sends ONLY the marker key, relying on Qdrant's
     metadata merge so a stored description/search_limit survives. Returns
     True when the collection is marked on return, False when it could not be

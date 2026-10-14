@@ -8,7 +8,7 @@ marks "both" (`CLAUDE_RUNWAY_LMSTUDIO_URL`/`_MODEL`/`_TRACK_SAVINGS`/
 `_SAVINGS_DB`), flagging any mismatch instead of relying on a human to
 notice that the MCP-server side (`compress_file`/`fetch_url`) and the
 hook side (`compress_output.py`/`session_end_savings.py`) have quietly
-drifted apart (issue #49, GROW-02 in `.plans/code-review-2026-08-18.md`).
+drifted apart (GROW-02 in `.plans/code-review-2026-08-18.md`).
 
 Usage:
     python tools/doctor.py /path/to/target-repo
@@ -18,7 +18,7 @@ that launches `claude` for that project -- it reads `os.environ` from
 whatever process runs it, matching the README's own "set both" advice.
 
 Also flags a .claude/settings.json still running the renamed-away
-`compress_bash_output.py` hook (issue #395; `upgrade` fixes it).
+`compress_bash_output.py` hook (`upgrade` fixes it).
 
 Exit code is 1 if any mismatch (or stale hook) is found, 0 otherwise (including when
 there is nothing to check -- e.g. a `--qdrant-only` setup whose `qdrant` block
@@ -38,14 +38,14 @@ from version_lib import version_string  # noqa: E402
 
 
 def _legacy_hook_note(result: DoctorResult) -> str:
-    """Extra section for a settings.json still running the pre-#395
+    """Extra section for a settings.json still running the pre-rename
     compress_bash_output.py -- empty string when there's nothing to flag."""
     if not result.legacy_compress_hook_events:
         return ""
     events = ", ".join(result.legacy_compress_hook_events)
     return (
         "\n\nStale hook: .claude/settings.json still runs hooks/compress_bash_output.py "
-        f"(under {events}), which was renamed to hooks/compress_output.py (issue #395) -- the old path "
+        f"(under {events}), which was renamed to hooks/compress_output.py -- the old path "
         "no longer exists, so output compression is silently not running. Fix: "
         "`claude-runway-setup upgrade <target_repo>` (migration compress-hook-renamed)."
     )
@@ -59,7 +59,7 @@ def _format_env_report(result: DoctorResult) -> str:
     if result.config_error:
         # Distinct from "no local-compress configured" below -- this means
         # .mcp.json itself is malformed/unreadable, not a valid config that
-        # simply omits local-compress. Found in PR #119 review: the two
+        # simply omits local-compress. Found in review: the two
         # were previously conflated, so a broken .mcp.json silently
         # reported "nothing to check" and exited 0 instead of surfacing
         # the real problem.
@@ -98,9 +98,9 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 def main(argv=None) -> int:
     """
-    Also what the `claude-runway-doctor` console script (issue #50) ends up
+    Also what the `claude-runway-doctor` console script ends up
     calling: `[project.scripts]` in pyproject.toml points at
-    `claude_runway:doctor_main`, a small shim (issue #206) that loads this
+    `claude_runway:doctor_main`, a small shim that loads this
     file by path and calls this function, which already took this shape for
     `python tools/doctor.py` (the `if __name__` guard below).
     """

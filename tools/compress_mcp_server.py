@@ -92,7 +92,7 @@ from local_compress_lib import (
 # savings_ledger is optional at import time (e.g. an older checkout of just
 # this file without libs/savings_ledger.py) -- fails open to "tracking off"
 # rather than crashing server startup over an opt-in feature. The explicit
-# `savings_ledger = None` in the except branch (issue #297, adopting Pyright)
+# `savings_ledger = None` in the except branch (adopting Pyright)
 # keeps the name always bound -- every function below that touches
 # savings_ledger checks _SAVINGS_LEDGER_AVAILABLE/TRACK_SAVINGS first and
 # then asserts it's not None, which is always true at runtime (that's exactly
@@ -111,7 +111,7 @@ if _SAVINGS_LEDGER_AVAILABLE:
 else:
     TRACK_SAVINGS = False
 
-# Issue #39: cap on how much of a fetch_url response body is ever read into
+# Cap on how much of a fetch_url response body is ever read into
 # memory. max_total_chars is a post-extraction cap and timeout_seconds is a
 # per-read/connect timeout, not a total-duration cap, so neither stops a URL
 # that resolves to a multi-GB file (a redirect to a video/zip/dataset, a
@@ -145,8 +145,8 @@ def _append_savings_footer(outer_text: str, inner_result: str, tool: str, raw_te
     pure no-op, so tool output stays byte-identical to before this feature
     existed.
 
-    `source` is redacted (not just truncated) before being embedded here
-    (PR #135 review, round 3): it's the raw caller-supplied value --
+    `source` is redacted (not just truncated) before being embedded here:
+    it's the raw caller-supplied value --
     compress_command_output passes the actual shell command, which can
     itself carry a credential (e.g. `curl -H 'Authorization: Bearer ghp_...'`)
     even when the compressed BODY the command produced is properly
@@ -164,7 +164,7 @@ def _append_savings_footer(outer_text: str, inner_result: str, tool: str, raw_te
     redacted_source, _ = redact_credentials(source) if source else ("", 0)
     footer = json.dumps({
         "tool": tool,
-        # Exact character counts (issues #437, #438). The chars / 3.5 token
+        # Exact character counts. The chars / 3.5 token
         # estimates this footer used to carry are gone: a token count depends on
         # the model's vocabulary, which is not public.
         "raw_chars": len(raw_text),
@@ -183,7 +183,7 @@ def list_local_models(base_url: Optional[str] = None) -> str:
     compress_text's model param, or to check LM Studio is actually reachable
     before relying on it.
 
-    Issue #296: this used to report every model /v1/models returned, which
+    This used to report every model /v1/models returned, which
     is every DOWNLOADED model (LM Studio's default is JIT loading, so a
     downloaded model isn't necessarily loaded) -- misleading when the output
     is used directly as a model= value that must name something actually
@@ -243,7 +243,7 @@ async def _compress(
 
 
 def _decode_file_bytes(data: bytes) -> str:
-    """Decode a file's raw bytes without silently corrupting them (issue #267).
+    """Decode a file's raw bytes without silently corrupting them.
 
     The old read, `read_text(encoding="utf-8", errors="ignore")`, pinned the
     encoding but still dropped every byte it couldn't decode, so the model
@@ -278,7 +278,7 @@ async def compress_file(
     # parameter name. `ctx: Context = None` keeps the framework-visible type
     # annotation while suppressing a "None isn't a valid Context default"
     # complaint per-line, avoiding the need to widen to Optional[Context].
-    # Confirmed still needed under Pyright (issue #297 -- replaced mypy):
+    # Confirmed still needed under Pyright (which replaced mypy):
     # removing the ignore surfaces Pyright's own equivalent
     # reportArgumentType error here, just phrased differently than mypy's.
     # Same reasoning at every other `ctx` parameter below and in
@@ -359,7 +359,7 @@ async def compress_command_output(
     alone often tells you whether you even need to read further.
 
     preserve_identifiers defaults to True HERE (unlike compress_file/
-    compress_text, which default it off) -- issue #46: shell command output
+    compress_text, which default it off) -- Shell command output
     (curl responses, printenv, config dumps, an API token embedded in JSON)
     is the single surface most likely to contain a raw secret, and
     local_compress_lib.compress()'s credential redaction runs whenever
@@ -448,14 +448,14 @@ async def fetch_url(
     response that declares a larger Content-Length is refused before any
     body is read, and one with no (or an understated) Content-Length is
     aborted mid-stream the moment the running byte count crosses the cap.
-    Issue #39: without this, a URL that happens to resolve to a very large
+    Without this, a URL that happens to resolve to a very large
     resource (a redirect to a video/zip/dataset, a poorly-bounded API
     response) would fully download into memory before anything checked its
     size, since timeout_seconds is a per-read/connect timeout, not a
     total-duration cap.
     """
     try:
-        # PR #124 review (Copilot): a bare `resp = requests.get(...)` left
+        # a bare `resp = requests.get(...)` left
         # the connection unclosed on any exception raised by
         # raise_for_status()/iter_content() below (a normal read timeout or
         # a broken chunked response, not something exotic) -- those
@@ -519,7 +519,7 @@ async def fetch_url(
             raw_bytes = b"".join(chunks)
 
             encoding = resp.encoding
-            # Issue #266: requests derives resp.encoding from the header
+            # Requests derives resp.encoding from the header
             # alone, and for any text/* Content-Type WITHOUT a charset
             # parameter it reports the RFC 2616 legacy default "ISO-8859-1"
             # (confirmed live) rather than None. That is truthy, so the
@@ -537,7 +537,7 @@ async def fetch_url(
                 and "charset" not in content_type.lower()
             )
             if not encoding or implicit_latin1:
-                # PR #124 review (Copilot): a response with no Content-Type
+                # a response with no Content-Type
                 # charset at all (resp.encoding is None) used to fall back,
                 # via resp.text, to apparent_encoding -- chardet/
                 # charset_normalizer detection over the full body -- not a
@@ -556,7 +556,7 @@ async def fetch_url(
     except Exception as e:
         return f"Error fetching {url}: {e}"
 
-    # PR #124 review (Copilot): resp.text's OWN implementation catches
+    # resp.text's OWN implementation catches
     # (LookupError, TypeError) around this exact decode and falls back to
     # UTF-8 -- a server is free to send a Content-Type charset that isn't a
     # real Python codec name (confirmed live: `Content-Type: ...;

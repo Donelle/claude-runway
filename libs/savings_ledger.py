@@ -11,9 +11,9 @@ Storage + formatting for ClaudeRunway's opt-in savings tracker. Used by:
 This tracker observes a COUNTERFACTUAL online (the exact characters before and
 after compression, and the percent reduction between them), which is categorically
 different from EVALUATION.md's measured A/B delta -- the two numbers must never be
-conflated. It reports characters, not tokens (issue #438): a token count depends on
+conflated. It reports characters, not tokens: a token count depends on
 the model's vocabulary, which is not public. The one token figure it shows is the
-per-model DERIVED one (issue #440, labelled as derived wherever it appears): the
+per-model DERIVED one (labelled as derived wherever it appears): the
 characters removed, divided by the chars-per-token that session's own transcript
 shows for that model. It is not a measurement. See EVALUATION.md's "Track D" section.
 
@@ -54,10 +54,10 @@ from typing import Optional
 # libs/memory_bank_lib.py already uses for libs/qdrant_model_check.py --
 # both files live in libs/, which is already on sys.path by the time either
 # is imported (every caller inserts libs/ before importing anything from
-# it). Used by current_session_id() below (issue #213) -- see that
+# it). Used by current_session_id() below -- see that
 # function's docstring for exactly what is and isn't delegated.
 import session_id_lib
-# Same convention: joins events to the transcript's model and turn (issue #440).
+# Same convention: joins events to the transcript's model and turn.
 import transcript_attribution_lib
 
 
@@ -86,8 +86,8 @@ def resolve_db_path() -> Path:
 
 
 def _sessions_dir() -> Path:
-    # Deliberately NOT delegated to session_id_lib._sessions_dir() (issue
-    # #213) even though the two resolve to the identical default path
+    # Deliberately NOT delegated to session_id_lib._sessions_dir()
+    # even though the two resolve to the identical default path
     # (Path.home()/".claude"/"claude-runway"/"sessions") -- session_id_lib's
     # own module docstring frames that overlap as "a directory-CONVENTION
     # match, not a code dependency" precisely so each module can keep
@@ -122,7 +122,7 @@ def _is_shadow_marker_name(name: str) -> bool:
     """True if a sessions-dir filename (or a ledger stem) is one of
     session_id_lib's shadow markers (`session_<id>.jsonl`) rather than one of
     this module's own `<session_id>.jsonl` ledgers. Both file families share
-    the default sessions dir, and a marker is never a ledger (issue #273), so
+    the default sessions dir, and a marker is never a ledger, so
     every reader here that enumerates or opens ledgers by name checks this.
     The prefix comes from session_id_lib, the marker's writer, so the two
     can't drift apart."""
@@ -139,7 +139,7 @@ def current_session_id(project: Optional[str] = None) -> Optional[str]:
     calls made mid-session. Unlike a hook, an MCP tool call has no direct access
     to Claude Code's session_id.
 
-    Issue #213: when `project` is given, this delegates entirely to
+    When `project` is given, this delegates entirely to
     `session_id_lib.session_id(SessionIdStrategy.SHADOW_FILE, project=project)`
     -- scanning the CORE `hooks/record_session_id.py` hook's own
     always-populated marker files, rather than this module's own transient
@@ -148,7 +148,7 @@ def current_session_id(project: Optional[str] = None) -> Optional[str]:
     a strict improvement over the old project-filtered mechanism (finds a
     live session even when nothing has been compressed yet, or when the
     savings tracker is off entirely) while preserving the exact behavior
-    issue #35 fixed: a live session in a DIFFERENT project is never
+    a live session in a DIFFERENT project is never
     substituted just because its marker happens to be the most recently
     touched file -- no match still means None, not someone else's session.
 
@@ -159,8 +159,8 @@ def current_session_id(project: Optional[str] = None) -> Optional[str]:
     means "no marker can match" (a marker's basename is never `None`), NOT
     "most recent regardless of project," and that a caller wanting that
     different, unfiltered meaning "must implement that itself." Implementing
-    it here is exactly that -- with one change since the original (issue
-    #273): session_id_lib's `session_<id>.jsonl` shadow markers share this
+    it here is exactly that -- with one change since the original:
+    #session_id_lib's `session_<id>.jsonl` shadow markers share this
     directory by default and are refreshed on every lifecycle event, far
     more often than a ledger is written, so the newest `*.jsonl` was often a
     marker and its stem (`"session_<id>"`) came back as a session id. Markers
@@ -179,7 +179,7 @@ def current_session_id(project: Optional[str] = None) -> Optional[str]:
     Still only a best-effort guess when multiple live sessions share the SAME
     project (e.g. two windows open on the same repo) -- picks whichever of
     those was modified most recently. That ambiguity is out of scope here;
-    only the cross-project mislabeling is what issue #35's filter fixes.
+    only the cross-project mislabeling is what the filter fixes.
     """
     if project is not None:
         return session_id_lib.session_id(
@@ -199,7 +199,7 @@ def current_session_id(project: Optional[str] = None) -> Optional[str]:
     dated = []
     for p in d.glob("*.jsonl"):
         if _is_shadow_marker_name(p.name):
-            continue  # a session_id_lib marker, never a ledger (issue #273)
+            continue  # a session_id_lib marker, never a ledger
         try:
             dated.append((p.stat().st_mtime, p))
         except OSError:
@@ -223,17 +223,17 @@ def record_event(session_id: str, tool: str, raw_chars: int, out_chars: int, cre
     honest counterfactual -- WebFetch's own server-side summary -- we don't
     observe) so an uncredited event can never contribute to the headline sum.
 
-    `raw_chars`/`out_chars` (issues #437, #438) are the EXACT character counts
+    `raw_chars`/`out_chars` are the EXACT character counts
     of the content before and after compression. They are the only size fields
     this ledger records: a token count depends on the model's vocabulary, which
     is not public, so the old chars / 3.5 estimate was a uniform guess (about
-    29% low, #437) and is no longer written. `saved_chars` is clamped at 0 (a
+    29% low) and is no longer written. `saved_chars` is clamped at 0 (a
     summary can end up longer than a small raw chunk) exactly like the saved
-    figure always was. Events logged before #438 still carry their estimated
+    figure always was. Events logged before the switch to characters still carry their estimated
     token fields; nothing reads them any more.
 
     `project` was originally what current_session_id()'s optional project
-    filter matched against (issue #35); as of issue #213, that filtered
+    filter matched against; that filtered
     lookup delegates to session_id_lib's shadow markers instead and no
     longer reads this per-event field at all -- it's retained here purely
     as informational/debugging metadata on each transient event, not
@@ -242,7 +242,7 @@ def record_event(session_id: str, tool: str, raw_chars: int, out_chars: int, cre
     `cwd` field (the same source session_end_savings.py already uses via
     project_name_from_cwd).
 
-    `agent_id`/`agent_type` (issue #365) identify WHICH agent earned this
+    `agent_id`/`agent_type` identify WHICH agent earned this
     saving. A tool call made inside a subagent reports the PARENT's
     session_id, so without these an event is indistinguishable from a
     main-session one. They're written only when non-empty, so every
@@ -255,7 +255,7 @@ def record_event(session_id: str, tool: str, raw_chars: int, out_chars: int, cre
 
     `tool_use_id` is the PostToolUse payload's id for the tool call; written only
     when non-empty. At SessionEnd it is the key that joins the event to its
-    transcript turn and model (issue #440, libs/transcript_attribution_lib.py).
+    transcript turn and model (libs/transcript_attribution_lib.py).
     """
     entry = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -292,7 +292,7 @@ def read_session_events(session_id: str) -> list:
     path = _session_jsonl_path(session_id)
     # A marker's stem (e.g. from an older current_session_id(), or any caller
     # passing one through) maps onto the marker file itself. Never parse a
-    # marker as an event log (issue #273) -- its `{"project": ...}` line would
+    # marker as an event log -- its `{"project": ...}` line would
     # otherwise be counted as one event under tool "unknown".
     if _is_shadow_marker_name(path.name):
         return []
@@ -305,8 +305,8 @@ def read_session_events(session_id: str) -> list:
 
 
 def _parse_event_lines(lines) -> list:
-    """Shared by read_session_events() and recover_orphaned_sessions() (issue
-    #306), which parses a claimed ledger under a different filename."""
+    """Shared by read_session_events() and recover_orphaned_sessions(),
+    #which parses a claimed ledger under a different filename."""
     events = []
     for line in lines:
         line = line.strip()
@@ -324,22 +324,22 @@ def _parse_event_lines(lines) -> list:
 # ---------------------------------------------------------------------------
 
 # Bumped whenever the shape of ANY persistent table changes: `sessions`,
-# `session_tools`, `session_agents` (added in v5, #365), `session_models` (added in v9, #440) or `meta`. That includes
+# `session_tools`, `session_agents` (added in v5), `session_models` (added in v9) or `meta`. That includes
 # adding a new table, even though _connect creates it for fresh DBs via CREATE
 # TABLE IF NOT EXISTS -- the bump plus a registered migration is what keeps
 # existing databases on the same versioned path as new ones.
 # _MIGRATIONS below must gain a matching entry for every bump -- see
-# _run_migrations' docstring for how the two stay in sync (issue #30/#69).
+# _run_migrations' docstring for how the two stay in sync.
 SCHEMA_VERSION = 9
 
-# Issue #365: per-session savings split by which agent earned them. One DDL
+# per-session savings split by which agent earned them. One DDL
 # string shared by _connect (fresh DBs) and _migrate_to_v5 (existing DBs) so the
 # two can't drift. `is_subagent` is part of the key so a `claude --agent X` main
 # session and a subagent of type X can never collide into one row; '' in
 # agent_type means "no agent_type reported". The raw agent_id is deliberately NOT
 # stored here -- one row per spawned subagent would grow without bound for little
 # analytical value; type + flag answers "main or subagent, and which kind".
-# Issue #438: no estimated-token columns. `{name}` is the table name, so
+# No estimated-token columns. `{name}` is the table name, so
 # _migrate_to_v7 can build a side table with the same shape.
 _SESSION_AGENTS_DDL = """
     CREATE TABLE IF NOT EXISTS {name} (
@@ -397,7 +397,7 @@ _SESSION_TOOLS_DDL = """
 """
 
 
-# Issue #440: the session's compression split by the model that was running. One
+# The session's compression split by the model that was running. One
 # row per (session, model); model '' is the unattributed bucket (events with no
 # matching transcript turn), so the rows always add up to the session's own
 # characters. `derived_tokens`/`chars_per_token` are NULL when the session had too
@@ -421,7 +421,7 @@ _SESSION_MODELS_DDL = """
 def _migrate_to_v1(conn) -> None:
     """
     Backfills raw_tokens_sum/out_tokens_sum/overhead_tokens onto a `sessions`
-    table that predates them (issue #30) -- these three shipped with
+    table that predates them -- these three shipped with
     DEFAULT 0 (unlike this table's other NOT NULL columns, which have none)
     specifically so ALTER TABLE ADD COLUMN can backfill existing rows with a
     real, honest value (0 -- "unknown," not a fabricated historical number)
@@ -446,7 +446,7 @@ def _migrate_to_v1(conn) -> None:
 def _migrate_to_v2(conn) -> None:
     """
     Adds raw_tokens_sum to `session_tools` so per-tool average reduction %
-    can be computed (issue #65). DEFAULT 0 lets existing rows get backfilled
+    can be computed. DEFAULT 0 lets existing rows get backfilled
     with an honest "unknown" rather than requiring a destructive rebuild --
     the same pattern as _migrate_to_v1's columns on `sessions`.
 
@@ -461,8 +461,7 @@ def _migrate_to_v2(conn) -> None:
 
 def _migrate_to_v3(conn) -> None:
     """
-    Adds out_tokens_sum and credited_event_count to `session_tools` (issue #65
-    follow-up after Copilot review).
+    Adds out_tokens_sum and credited_event_count to `session_tools`.
 
     out_tokens_sum: actual compressed-output token total for credited events --
       necessary because record_event clamps saved_tokens to max(0, raw-out),
@@ -488,11 +487,11 @@ def _migrate_to_v3(conn) -> None:
 def _migrate_to_v4(conn) -> None:
     """
     Adds actual per-turn token counts from the transcript_path stopgap
-    (issue #165) to `sessions`: the real tokens Anthropic processed this
+    to `sessions`: the real tokens Anthropic processed this
     session, broken out by type. Distinct from the compression heuristic
     estimates in raw_tokens_sum/out_tokens_sum. DEFAULT 0 so existing rows
     backfill safely and the prior rows never report fabricated non-zero counts.
-    # STOPGAP: remove when #164 is resolved (Stop hook will expose these directly).
+    # STOPGAP: remove once the Stop hook payload exposes these token counts directly.
     """
     existing = {row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()}
     for column in (
@@ -507,7 +506,7 @@ def _migrate_to_v4(conn) -> None:
 
 def _migrate_to_v5(conn) -> None:
     """
-    Adds the `session_agents` table (issue #365): savings split by main session
+    Adds the `session_agents` table: savings split by main session
     vs. subagent, and by agent_type. Purely additive and idempotent
     (CREATE TABLE IF NOT EXISTS) -- _connect already creates it before migrations
     run, so this mostly exists so SCHEMA_VERSION and _MIGRATIONS stay in lockstep
@@ -518,7 +517,7 @@ def _migrate_to_v5(conn) -> None:
     conn.execute(_SESSION_AGENTS_DDL.format(name="session_agents"))
 
 
-# Issue #437: exact character counts stored next to the estimated token fields.
+# Exact character counts stored next to the estimated token fields.
 # (table, char column, token column the backfill derives it from). `sessions`
 # names its saved figure credited_saved_tokens; the other two tables saved_tokens.
 _CHAR_COLUMNS = (
@@ -536,7 +535,7 @@ _CHAR_COLUMNS = (
 
 def _migrate_to_v6(conn) -> None:
     """
-    Adds exact character counts (issue #437) to `sessions`, `session_tools` and
+    Adds exact character counts to `sessions`, `session_tools` and
     `session_agents`, alongside -- never replacing -- the estimated token fields.
 
     Existing rows are backfilled as tokens x 3.5, because that is exactly how
@@ -562,12 +561,12 @@ def _migrate_to_v6(conn) -> None:
         conn.execute(f"UPDATE {table} SET {char_col} = CAST(ROUND({token_col} * 3.5) AS INTEGER)")
 
 
-# Issue #438: (table, DDL, columns kept, the saved column, the credited-event count). The estimated-token
+# (Table, DDL, columns kept, the saved column, the credited-event count). The estimated-token
 # columns are not in the kept lists, so they are simply not copied across -- but
 # see _v7_select, which reads them first so no history is lost with them.
 _V7_REBUILDS = (
     ("sessions", _SESSIONS_DDL,
-     # No overhead_tokens: v7 builds the CURRENT `sessions` shape (issue #439 dropped
+     # No overhead_tokens: v7 builds the CURRENT `sessions` shape (a later change dropped
      # that column), so a v6 database going straight to v8 loses it here, and
      # _migrate_to_v8 only has work for a database that already reached v7.
      ("session_id", "project", "ended_at", "event_count", "fetch_url_count",
@@ -587,10 +586,10 @@ _V7_REBUILDS = (
 
 def _v7_select(columns: tuple, saved_col: str, has_tokens: bool, count_col: str) -> str:
     """The SELECT list that copies a table's kept columns into its v7 rebuild.
-    Two columns are not copied as-is (both PR #446 review):
+    Two columns are not copied as-is:
 
     - before/after: a v6 row can hold token data the character columns don't
-      cover. After #437 an MCP server that hadn't been restarted still sent
+      cover. After character counts were added, an MCP server that hadn't been restarted still sent
       token-only savings footers, and the hook recorded them, so a v6 row may be
       token-only (character sums 0) or mixed (character sums partial). Dropping
       the token columns would lose that, so when the tokens x 3.5 estimate
@@ -611,7 +610,7 @@ def _v7_select(columns: tuple, saved_col: str, has_tokens: bool, count_col: str)
     it must count the same events the token sums do, which are CREDITED events only
     -- `sessions.event_count` already is, but `session_tools`/`session_agents`
     `event_count` also counts uncredited calls (fetch_url), so they use
-    `credited_event_count` (PR #446 review)."""
+    `credited_event_count`."""
     if has_tokens:
         def recon(chars: str, tokens: str) -> str:
             est = f"CAST(ROUND({tokens} * 3.5) AS INTEGER)"
@@ -630,12 +629,12 @@ def _v7_select(columns: tuple, saved_col: str, has_tokens: bool, count_col: str)
 
 def _migrate_to_v7(conn) -> None:
     """
-    Drops the estimated-token columns (issue #438): `sessions.credited_saved_tokens`,
+    Drops the estimated-token columns: `sessions.credited_saved_tokens`,
     `raw_tokens_sum`, `out_tokens_sum`, and `saved_tokens`/`raw_tokens_sum`/
     `out_tokens_sum` on `session_tools` and `session_agents`. The exact character
     columns v6 added replace them, and every reader now uses those. The
     `actual_*_tokens` columns hold real transcript usage and stay. (`overhead_tokens`
-    stayed in the original v7 but is dropped by v8, issue #439; this rebuild already
+    stayed in the original v7 but is dropped by v8; this rebuild already
     omits it, since it builds the current `sessions` shape.)
 
     Rebuilds each table (create side table, copy the kept columns, drop, rename)
@@ -662,8 +661,8 @@ def _migrate_to_v7(conn) -> None:
 
 def _migrate_to_v8(conn) -> None:
     """
-    Drops `sessions.overhead_tokens` and the `schema_overhead_tokens` meta row
-    (issue #439). Both held a chars / 3.5 estimate of the toolkit's tool-schema
+    Drops `sessions.overhead_tokens` and the `schema_overhead_tokens` meta row.
+    Both held a chars / 3.5 estimate of the toolkit's tool-schema
     size, shown as "Tool overhead .../turn". That premise is not what the real
     transcripts show: Claude Code lists these tools as deferred, loaded on demand
     rather than sent every turn (tools/measure_startup_context.py measures it from
@@ -688,7 +687,7 @@ def _migrate_to_v8(conn) -> None:
 
 def _migrate_to_v9(conn) -> None:
     """
-    Adds the `session_models` table (issue #440): compression split by model, with
+    Adds the `session_models` table: compression split by model, with
     the derived token figure. Purely additive and idempotent (CREATE TABLE IF NOT
     EXISTS) -- _connect already creates it before migrations run, in its final
     shape, so no earlier migration ever needs to know about it. Sessions finalized
@@ -701,7 +700,7 @@ def _migrate_to_v9(conn) -> None:
 # Maps target schema version -> the function that migrates INTO it from the
 # version immediately before. The next schema change adds one more entry here
 # and bumps SCHEMA_VERSION -- _run_migrations doesn't need to change at all,
-# which is the actual "scaffold" issue #69 asked for: a repeatable shape for
+# which is the actual "scaffold" a repeatable shape for
 # schema changes, not a one-off patch for this specific set of columns.
 _MIGRATIONS = {1: _migrate_to_v1, 2: _migrate_to_v2, 3: _migrate_to_v3, 4: _migrate_to_v4, 5: _migrate_to_v5, 6: _migrate_to_v6, 7: _migrate_to_v7, 8: _migrate_to_v8, 9: _migrate_to_v9}
 
@@ -715,7 +714,7 @@ def _table_exists(conn, name: str) -> bool:
 def _run_migrations(conn, is_new_db: bool) -> None:
     """
     Brings the DB's PRAGMA user_version up to SCHEMA_VERSION. Two real bugs
-    found in PR #94 review (Copilot), both fixed here rather than left as
+    found in review (Copilot), both fixed here rather than left as
     "works today, breaks on the next migration":
 
     1. A brand-new DB's CREATE TABLE (run by _connect just before this)
@@ -850,7 +849,7 @@ def get_meta(key: str, default: Optional[str] = None) -> Optional[str]:
     return row[0] if row else default
 
 
-# Aggregate keys for the exact-character sums (issue #437). `saved_chars` is NOT
+# Aggregate keys for the exact-character sums. `saved_chars` is NOT
 # summed from the events: see _derive_saved.
 _CHAR_SUM_KEYS = ("raw_chars_sum", "out_chars_sum", "saved_chars")
 
@@ -868,9 +867,9 @@ def _is_count(v) -> bool:
 def _counted(e: dict) -> bool:
     """True if an event contributes to the character figures: credited AND
     carrying a valid before and after count. An event without them (logged before
-    #437, or corrupt) has an unknown size, so it must be left out of every figure
+    character counts were recorded, or corrupt) has an unknown size, so it must be left out of every figure
     that is shown beside a reduction percentage -- the percentage and the "N
-    events" next to it have to describe the same set of events (PR #446 review)."""
+    events" next to it have to describe the same set of events."""
     return bool(e.get("credited")) and _is_count(e.get("raw_chars")) and _is_count(e.get("out_chars"))
 
 
@@ -889,8 +888,8 @@ def _derive_saved(agg: dict) -> None:
     """Set `saved_chars` from the aggregate's own before/after totals instead of
     summing the per-event savings. Each event's saving is clamped at 0 on its own,
     so the sum can exceed `raw - out` (events 100->150 and 100->10 sum to 90, but
-    200->160 is only 40) and then contradict the totals shown beside it (PR #446
-    review). Deriving it keeps every displayed saving consistent with them."""
+    200->160 is only 40) and then contradict the totals shown beside it.
+    Deriving it keeps every displayed saving consistent with them."""
     agg["saved_chars"] = _saved(agg["raw_chars_sum"], agg["out_chars_sum"])
 
 
@@ -917,7 +916,7 @@ def _aggregate_by_tool(events: list) -> dict:
 
 def _aggregate_by_agent(events: list) -> list:
     """
-    Group a session's events by which agent earned them (issue #365). Returns a
+    Group a session's events by which agent earned them. Returns a
     list of dicts, one per (is_subagent, agent_type), sorted by saved_chars
     descending then deterministically, with the same counters as by_tool and
     the same rules (character sums and credited_event_count only count events
@@ -927,7 +926,7 @@ def _aggregate_by_agent(events: list) -> list:
     the hooks docs say it's also present on the MAIN thread when the session
     was started with `claude --agent <name>`, so keying "subagent" off
     agent_type would misfile that whole session's savings as subagent work. An
-    event with neither field (every event recorded before #365, and every
+    event with neither field (every event recorded before agent attribution existed, and every
     plain main-session event) lands in the (0, '') row.
     """
     groups: dict[tuple[int, str], dict[str, int]] = {}
@@ -958,7 +957,7 @@ def _write_session_rows(conn, session_id: str, project: str, events: list,
     `session_tools`/`session_agents` delete-then-insert -- the row is exactly
     these events.
 
-    accumulate=True (finalize_owned_session, issue #306 / PR #412 round 5):
+    accumulate=True (finalize_owned_session):
     these events are ADDED to whatever the session already has. A session's
     events can reach savings.db in more than one roll-up -- recovered as an
     orphan, then resumed and ended cleanly; or ended, resumed, ended again --
@@ -971,7 +970,7 @@ def _write_session_rows(conn, session_id: str, project: str, events: list,
     only correct if no event is ever rolled up twice -- finalize_owned_session
     guarantees that, see its docstring.
 
-    attribution (issue #440): the transcript index from
+    attribution: the transcript index from
     transcript_attribution_lib.read_transcript, or None (no transcript, or the
     opt-in is off). Given, each counted event is joined to its model and the
     session is also written per model to `session_models`. The model rows follow
@@ -1012,7 +1011,7 @@ def _write_session_rows(conn, session_id: str, project: str, events: list,
     # row has credited events but no recorded size (a pre-v6 row) must stay
     # unsized: adding the resumed events' exact counts to its zeros would turn it
     # into a row that looks fully sized while covering only part of the session,
-    # and would drop its backfilled saving (PR #446 review). Such a row only
+    # and would drop its backfilled saving. Such a row only
     # accumulates its event counts; its character figures stay "unknown".
     resumed_unsized = False
     had_events_before = False  # a resume: the stored row already holds credited events
@@ -1074,7 +1073,7 @@ def _write_session_rows(conn, session_id: str, project: str, events: list,
     else:
         conn.execute("INSERT OR REPLACE INTO sessions " + session_columns, session_values)
         conn.execute("DELETE FROM session_tools WHERE session_id = ?", (session_id,))
-        # Same replace-then-insert shape as session_tools (issue #365), so
+        # Same replace-then-insert shape as session_tools, so
         # re-finalizing a session can never leave stale per-agent rows behind.
         conn.execute("DELETE FROM session_agents WHERE session_id = ?", (session_id,))
         tools_conflict = agents_conflict = ""
@@ -1157,7 +1156,7 @@ def _write_model_rows(conn, session_id: str, rows: list, accumulate: bool, had_e
             # Mutated in place so the roll-up's own return value (the SessionEnd
             # summary) agrees with what is stored, and every row already stored
             # for the session is invalidated too, including a model with no new
-            # event this time (PR #450 review, round 2).
+            # event this time.
             for r in rows:
                 r["derived_tokens"] = None
             conn.execute("UPDATE session_models SET derived_tokens = NULL WHERE session_id = ?", (session_id,))
@@ -1191,7 +1190,7 @@ def finalize_session(session_id: str, project: str, delete_jsonl: bool = True, a
     SessionEnd summary directly without a second read.
 
     The SessionEnd hook and orphan recovery use finalize_owned_session()
-    instead (issue #306), which adds the cross-process ownership this simple
+    instead, which adds the cross-process ownership this simple
     read-write-delete doesn't have; this stays the plain primitive.
 
     actual_tokens: optional dict from parse_session_token_counts() (or
@@ -1225,17 +1224,17 @@ def finalize_session(session_id: str, project: str, delete_jsonl: bool = True, a
 
 def _orphan_project(events: list) -> str:
     """
-    The project to file a recovered orphan under (issue #306). An orphan has
+    The project to file a recovered orphan under. An orphan has
     no SessionEnd payload, so there's no `cwd` to derive it from the way
     hooks/session_end_savings.py does -- but every event the sole writer
     (hooks/compress_output.py) records carries `project`, derived from that
     same `cwd` via project_name_from_cwd(), so it's the same value a graceful
     SessionEnd would have used. The most recent non-empty one wins; "unknown"
     (project_name_from_cwd's own fallback for a missing cwd) when none has it,
-    e.g. a ledger written before the field existed (issue #35).
+    e.g. a ledger written before the field existed.
 
-    "Most recent" is by each event's own `ts`, not list position (PR #412
-    review): `events` can combine several artifacts of one session (a
+    "Most recent" is by each event's own `ts`, not list position:
+    `events` can combine several artifacts of one session (a
     leftover claim plus the ledger written after it), and a resumed session
     can have moved to another project in between. `ts` is a fixed-width
     UTC "%Y-%m-%dT%H:%M:%SZ" string, so it sorts chronologically as text; an
@@ -1254,7 +1253,7 @@ def _orphan_project(events: list) -> str:
     return best[1] if best else "unknown"
 
 
-# Issue #306: while a session's events are being rolled up, its ledger is
+# While a session's events are being rolled up, its ledger is
 # renamed to "<session_id>.jsonl.claimed-<hex>". That name never matches the
 # "*.jsonl" glob current_session_id() scans, and a record_event() call after
 # the rename starts a fresh ledger instead of writing into the file about to
@@ -1302,7 +1301,7 @@ def _consumed_claim_key(claim: Path) -> str:
 
 def has_session_artifacts(session_id: str) -> bool:
     """True if `session_id` has anything left to roll up: its ledger, or a
-    claim of it left by a roll-up that failed or died (issue #306). The
+    claim of it left by a roll-up that failed or died. The
     SessionEnd hook's cheap "anything logged?" check -- checking the ledger
     alone would skip a session whose only artifact is such a claim."""
     return bool(_session_artifacts(session_id))
@@ -1316,13 +1315,13 @@ def finalize_owned_session(session_id: str, project: Optional[str] = None,
     Roll ALL of a session's event artifacts (its ledger plus any leftover
     claims) into savings.db as ONE snapshot, then delete them -- the single
     ownership protocol both the SessionEnd hook and orphan recovery go
-    through (issue #306). Returns the aggregate dict, {} if the artifacts held
+    through. Returns the aggregate dict, {} if the artifacts held
     no readable events (they're still deleted; no row is written, matching
     the hook's "nothing logged -> nothing finalized" rule), or None if there
     was nothing to take or `stale_before` said the session is live after all.
 
     Why one protocol, and why this shape (each piece fixes a race found and
-    reproduced in PR #412's review):
+    reproduced in the review):
       - Ownership is SQLite's own write lock: everything below runs inside
         BEGIN IMMEDIATE on savings.db, so any two finalizers -- two
         recoveries, or a recovery and a session's own SessionEnd -- run one
@@ -1461,8 +1460,8 @@ def finalize_owned_session(session_id: str, project: Optional[str] = None,
 def recover_orphaned_sessions(exclude_session_id: Optional[str] = None, now: Optional[float] = None) -> int:
     """
     Roll up, then delete, the event artifacts of every session that never
-    reached a graceful SessionEnd -- a crash, a force-kill, a closed terminal
-    (issue #306). The SessionEnd hook is otherwise the ONLY path from a ledger
+    reached a graceful SessionEnd -- a crash, a force-kill, a closed terminal.
+    The SessionEnd hook is otherwise the ONLY path from a ledger
     into savings.db, so without this an orphan's credited savings never reach
     /my-savings and its JSONL is never cleaned up. Returns how many sessions
     were consumed.
@@ -1475,14 +1474,14 @@ def recover_orphaned_sessions(exclude_session_id: Optional[str] = None, now: Opt
     appended on every credited compression, so its mtime is "last activity":
     a week with none is this toolkit's existing convention for "treat as
     dead". Still a heuristic -- a live session idle longer than the TTL looks
-    the same as a dead one, exactly as for shadow markers (#233); its
+    the same as a dead one, exactly as for shadow markers; its
     recovered events are in savings.db either way, and a later finalize of
     the same id adds to that row (see finalize_owned_session()).
 
     This lives here as a SIBLING of session_id_lib's marker sweep rather than
     as part of it: session_id_lib deliberately never imports this module, and
     this module's sessions dir follows a CLAUDE_RUNWAY_SAVINGS_DB override
-    while session_id_lib's does not (issue #408), so only this module knows
+    while session_id_lib's does not, so only this module knows
     where its own ledgers actually are.
 
     `exclude_session_id` is the caller's own session (the SessionEnd hook
@@ -1569,8 +1568,8 @@ def query_project_summary(project: str) -> dict:
     """All-time totals for one project. Before/after and the saving cover only
     sessions with a recorded size; `unsized_sessions` counts the rest (rows from
     before schema v6 that have credited events but no before/after), so a caller
-    can say they were left out instead of presenting a partial total as complete
-    (PR #446 review). `total_saved_chars` is derived from the two totals; the best
+    can say they were left out instead of presenting a partial total as complete.
+    `total_saved_chars` is derived from the two totals; the best
     session's saving is derived per session from its own before/after."""
     conn = _connect()
     row = conn.execute(
@@ -1698,7 +1697,7 @@ def query_trend(project: str, bucket: str = "week", n: int = 12) -> list:
         elif event_count > 0:
             # Credited events but no recorded size (a pre-v6 row): left out of the
             # totals and counted here instead, so the bucket doesn't pass a
-            # partial total off as complete (PR #446 review).
+            # partial total off as complete.
             agg[key]["unsized_sessions"] += 1
 
     for v in agg.values():
@@ -1712,7 +1711,7 @@ def query_all_projects() -> list:
     """
     Aggregates cross-project stats for the detail view's 'Across projects'
     block: total characters before/after/saved per project, plus best_tool via
-    the existing sessions/session_tools data -- no new storage needed (issue #68).
+    the existing sessions/session_tools data -- no new storage needed.
 
     best_tool is the tool with the highest aggregate saving across all sessions
     for a given project, derived from session_tools: its summed before minus its
@@ -1784,7 +1783,7 @@ def query_session_tool_breakdown(session_id: str) -> list:
 
 
 def query_session_agent_breakdown(session_id: str) -> list:
-    """Per-agent rows for one finalized session (issue #365), same shape as
+    """Per-agent rows for one finalized session, same shape as
     finalize_session's `by_agent`. Empty for a session finalized before schema v5
     (nothing was recorded to backfill from)."""
     conn = _connect()
@@ -1824,7 +1823,7 @@ def _model_rows(conn, session_id: str) -> list:
 
 
 def query_session_model_breakdown(session_id: str) -> list:
-    """Per-model rows for one finalized session (issue #440), same shape as
+    """Per-model rows for one finalized session, same shape as
     finalize_session's `by_model`. Empty for a session finalized before schema v9,
     or without a transcript (nothing was recorded to backfill from)."""
     conn = _connect()
@@ -1854,7 +1853,7 @@ def query_recent_model_breakdown(project: str) -> Optional[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Transcript token parsing (opt-in stopgap -- see issue #165)
+# Transcript token parsing (opt-in stopgap)
 # ---------------------------------------------------------------------------
 
 def parse_transcript_token_counts(transcript_path) -> Optional[dict]:
@@ -1870,7 +1869,7 @@ def parse_transcript_token_counts(transcript_path) -> Optional[dict]:
     change with any Claude Code release. Callers must treat a None return as
     "no data available" rather than an error.
 
-    # STOPGAP: remove when #164 is resolved (Stop hook will expose these directly).
+    # STOPGAP: remove once the Stop hook payload exposes these token counts directly.
     """
     if not transcript_path:
         return None
@@ -1880,7 +1879,7 @@ def parse_transcript_token_counts(transcript_path) -> Optional[dict]:
     # of an assistant turn. Every line of the same turn shares one message.id
     # and repeats the SAME whole-turn usage object (not a per-block delta), so
     # summing per line multiplies each turn's usage by its block count (~1.9x
-    # on real transcripts, #298). Invariant: each distinct message.id is
+    # on real transcripts). Invariant: each distinct message.id is
     # counted exactly once (first occurrence wins). Lines with no id cannot be
     # deduplicated, so they are always counted -- never silently dropped.
     seen_message_ids: set = set()
@@ -1918,7 +1917,7 @@ def parse_transcript_token_counts(transcript_path) -> Optional[dict]:
 def parse_session_token_counts(transcript_path) -> Optional[dict]:
     """
     Like parse_transcript_token_counts, but for a whole SESSION: the main
-    transcript plus every subagent transcript that belongs to it (#364).
+    transcript plus every subagent transcript that belongs to it.
 
     Why a separate function: the payload's `transcript_path` is only the MAIN
     session's transcript. Claude Code writes each subagent's turns to its own
@@ -1927,7 +1926,7 @@ def parse_session_token_counts(transcript_path) -> Optional[dict]:
     had zero `isSidechain` lines, so its totals never included subagent usage
     and "tokens processed" was understated for any session that delegates work
     (autowork most of all). parse_transcript_token_counts is left untouched so
-    its contract, and the #298 dedup it implements, stay scoped to one file.
+    its contract, and the per-message dedup it implements, stay scoped to one file.
 
     The subagents directory is derived from the transcript path itself (strip
     the `.jsonl` suffix, append `/subagents`) rather than from the hook
@@ -1946,7 +1945,7 @@ def parse_session_token_counts(transcript_path) -> Optional[dict]:
     Known gap, by design: a subagent still running when the session ends, or a
     resumed session, may be only partially counted.
 
-    # STOPGAP: remove when #164 is resolved (Stop hook will expose these directly).
+    # STOPGAP: remove once the Stop hook payload exposes these token counts directly.
     """
     if not transcript_path:
         return None
@@ -1970,7 +1969,7 @@ def parse_session_token_counts(transcript_path) -> Optional[dict]:
 def read_transcript_attribution(transcript_path) -> Optional[dict]:
     """The transcript index finalize_owned_session's `attribution` takes: each
     tool call's model, turn and timestamp, plus per-model chars-per-token samples
-    (issue #440; see libs/transcript_attribution_lib.py). None when the path is
+    (see libs/transcript_attribution_lib.py). None when the path is
     absent or unreadable. Always fails open -- never raises. Like
     parse_session_token_counts it reads Claude Code's internal transcript format,
     so the hook only calls it under the same opt-in."""
@@ -1996,7 +1995,7 @@ def _fmt_tokens(n: int) -> str:
 
 def _fmt_chars(n: int) -> str:
     """An exact character count with thousands separators -- never abbreviated
-    or prefixed with "~", since (unlike the token estimate it replaces, #438) it
+    or prefixed with "~", since (unlike the token estimate it replaces) it
     is a real count."""
     return f"{n:,}"
 
@@ -2023,7 +2022,7 @@ def _json_pct(raw, out):
 def _unsized_note(unsized: int, sessions: int, noun: str = "sessions") -> str:
     """The line that says some of the history has no recorded size and is NOT in
     the totals above it (rows from before schema v6), so a partial total is never
-    presented as a complete one (PR #446 review). Empty when nothing is left out."""
+    presented as a complete one. Empty when nothing is left out."""
     if not unsized:
         return ""
     return f"  Note: {unsized} of {sessions} {noun} have no recorded size and are left out of the figures above"
@@ -2073,7 +2072,7 @@ def _format_actual_token_block(session_agg: dict, project: str = "") -> list:
     ]
 
     # Deliberately no "local compression avoided ... % of total processed" line
-    # here (issue #436): it divided an ESTIMATE (a token saving derived as
+    # here: it divided an ESTIMATE (a token saving derived as
     # chars/3.5, since dropped) by a MEASUREMENT (real usage from the transcript) without saying so. The
     # compression figure already appears in the savings summary itself.
 
@@ -2108,7 +2107,7 @@ def _sparkline(values: list) -> str:
 
 
 def _format_model_block(rows: list, heading: str, attribution: Optional[dict] = None) -> list:
-    """Lines for the per-model split (issue #440), or [] when there are none. The
+    """Lines for the per-model split, or [] when there are none. The
     characters before and after are exact counts; the token line under a model is
     DERIVED and says so, with the ratio and sample size it came from. It is absent
     for a model with too few samples to derive a ratio -- not shown as 0."""
@@ -2195,7 +2194,7 @@ def format_detail_view(session_agg: dict, project_summary: dict, tool_breakdown:
 
     # This session's own split when it has one (a finalized aggregate); otherwise
     # the most recent finished session's, since a session in progress has no
-    # transcript to join yet (issue #440).
+    # transcript to join yet.
     if session_agg.get("by_model"):
         lines += _format_model_block(session_agg["by_model"], "By model · this session", session_agg.get("attribution"))
     elif model_breakdown and model_breakdown.get("models"):
@@ -2236,12 +2235,12 @@ def format_detail_view(session_agg: dict, project_summary: dict, tool_breakdown:
             else:
                 lines.append(f"  {t['tool']:<16} {t['event_count']:>3} calls  {'—':>8}  (not credited)")
 
-    # Issue #365: shown only when at least one subagent earned a POSITIVE saving
+    # Shown only when at least one subagent earned a POSITIVE saving
     # this session, so a session with no delegation renders exactly as before.
     # Gated on saved_chars > 0, not merely "a subagent row exists": a subagent
     # whose only activity was uncredited (fetch_url) or whose credited events
     # saved nothing still gets a row in by_agent, and listing it would print a
-    # misleading "0 events / 0 chars" line (Copilot review on PR #367). The same
+    # misleading "0 events / 0 chars" line. The same
     # filter applies to the per-type lines below. Counts are credited events,
     # matching the "N events" headline above (not total calls, which include
     # uncredited fetch_url activity).
@@ -2312,7 +2311,7 @@ def format_detail_view(session_agg: dict, project_summary: dict, tool_breakdown:
                 f"  {p['project']:<{col_w}} {p['sessions']:>3} sessions  "
                 f"{_fmt_chars(raw)} → {_fmt_chars(out)} chars  {_fmt_reduction(raw, out)} reduction{suffix}"
             )
-        # Grand total (#95) -- answers "how much has this toolkit saved me
+        # Grand total -- answers "how much has this toolkit saved me
         # overall" directly instead of making the reader add up every row by
         # hand. Deliberately inside the `if all_projects:` guard so an empty
         # list still means no total row, same as the per-project loop above.
@@ -2474,7 +2473,7 @@ def format_json(session_agg: dict, project_summary: dict, tool_breakdown: list, 
         ],
     }
     # Only when there is a split to report, so the document keeps its old shape
-    # for everyone else (issue #440). `derived_tokens`/`chars_per_token` are null
+    # for everyone else. `derived_tokens`/`chars_per_token` are null
     # when not derived; the characters are exact, the tokens are derived.
     models = session_raw.get("by_model") or (model_breakdown or {}).get("models") or []
     if models:

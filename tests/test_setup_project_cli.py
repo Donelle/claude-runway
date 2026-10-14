@@ -8,7 +8,7 @@ argparse Namespace):
 
     .venv/bin/python -m unittest discover -s tests
 
-Why _hook_env_reminders is tested (PR #113 review): --track-savings/--lmstudio-model/
+Why _hook_env_reminders is tested: --track-savings/--lmstudio-model/
 --lmstudio-url/--savings-db only reach the MCP servers' env blocks
 in the generated .mcp.json (local-compress, and the qdrant block for the two LM Studio values) -- they do NOT reach the hook scripts
 written into .claude/settings.json, since Claude Code hook entries have no
@@ -19,7 +19,7 @@ matching shell export -- _hook_env_reminders is what now surfaces that gap
 to the user instead of leaving it silent.
 
 Also covers _write_json's atomic-write behavior and cmd_init's initial-index
-reminder (both also found in PR #113 review): _write_json previously opened
+reminder: _write_json previously opened
 the destination directly with "w", truncating it immediately, so an
 interruption or disk-full error mid-write could destroy the very
 .mcp.json/.claude/settings.json content this script's merge logic exists to
@@ -125,7 +125,7 @@ class WriteJsonAtomic(unittest.TestCase):
         self.assertEqual(list(self.path.parent.glob(".*.tmp")), [])
 
     def test_failure_mid_write_leaves_original_file_untouched(self):
-        # Regression for the finding from PR #113 review: writing directly
+        # Regression for a review finding: writing directly
         # to the destination truncated it immediately, so a failure partway
         # through (disk full, interruption, or here, a non-serializable
         # value) could destroy the caller's existing content instead of
@@ -173,7 +173,7 @@ def _init_args(target_repo, **overrides) -> argparse.Namespace:
 
 
 class DryRunNeverLeaksUnrelatedSecrets(unittest.TestCase):
-    """Regression for the finding from PR #113 review: --dry-run previously
+    """Regression for a review finding: --dry-run previously
     printed the FULL merged .mcp.json/.claude/settings.json, so an unrelated
     existing MCP server's secret (an API token in its own env block) was
     printed to the terminal/CI log right along with this toolkit's own
@@ -217,7 +217,7 @@ class DryRunNeverLeaksUnrelatedSecrets(unittest.TestCase):
 
 
 class QdrantApiKeyNeverLeaksInOwnOutput(unittest.TestCase):
-    """Regression for the finding from PR #113 review: even after
+    """Regression for a review finding: even after
     generated_mcp_servers stopped including UNRELATED existing secrets, it
     still included the REAL --qdrant-api-key value the user just typed on
     this exact command line, so --dry-run (and the printed follow-up
@@ -278,8 +278,8 @@ class QdrantApiKeyNeverLeaksInOwnOutput(unittest.TestCase):
 
 
 class InitialIndexReminder(unittest.TestCase):
-    """cmd_init's printed 'run the initial index' reminder (PR #113 review:
-    it previously showed a literal '<name>' placeholder and no --qdrant-url,
+    """cmd_init's printed 'run the initial index' reminder
+    (it previously showed a literal '<name>' placeholder and no --qdrant-url,
     which either fails to copy-paste as-is or silently indexes the wrong
     Qdrant instance when a custom --qdrant-url was actually configured)."""
 
@@ -303,7 +303,7 @@ class InitialIndexReminder(unittest.TestCase):
         self.assertNotIn("<name>", output)
 
     def test_reminder_carries_the_resolved_embedding_model(self):
-        # Issue #279 review: ingest_to_qdrant.py defaults --embedding-model to
+        # ingest_to_qdrant.py defaults --embedding-model to
         # the template default, so a custom model must be passed explicitly
         # (both via the flag and when preserved from an existing .mcp.json).
         buf = io.StringIO()
@@ -323,7 +323,7 @@ class InitialIndexReminder(unittest.TestCase):
         self.assertIn("--collection my-project", buf.getvalue())
 
     def test_includes_include_extensions_and_exclude_dirs_when_set(self):
-        # Regression for the finding from PR #113 review: the reminder
+        # Regression for a review finding: the reminder
         # previously omitted these entirely, so copying it indexed a
         # different corpus than the codebase-indexer config this run
         # actually generated.
@@ -345,7 +345,7 @@ class InitialIndexReminder(unittest.TestCase):
         self.assertNotIn("--exclude-dirs", output)
 
     def test_target_repo_path_with_a_space_is_shell_quoted(self):
-        # Regression for the finding from PR #113 review: raw interpolation
+        # Regression for a review finding: raw interpolation
         # of target_repo would silently split into multiple shell
         # arguments if the path contained a space.
         spacey_repo = self.target_repo.parent / "my project"
@@ -367,7 +367,7 @@ class InitialIndexReminder(unittest.TestCase):
         self.assertIn(expected, output)
 
     def test_windows_uses_cmd_exe_style_quoting_not_posix_single_quotes(self):
-        # Regression for the finding from PR #113 review: shlex.quote
+        # Regression for a review finding: shlex.quote
         # produces POSIX single-quoted output, which cmd.exe treats as
         # LITERAL characters rather than quoting -- README documents
         # Windows cmd.exe usage too, so a path with a space needs
@@ -393,7 +393,7 @@ class InitialIndexReminder(unittest.TestCase):
 
 
 class HookEnvReminderShownForSkipHooks(unittest.TestCase):
-    """Regression for the finding from PR #113 review: --skip-hooks leaves
+    """Regression for a review finding: --skip-hooks leaves
     settings.json (and any hooks a PRIOR full setup already wrote there)
     completely untouched -- unlike --qdrant-only, it does NOT remove them --
     so the reminder is still just as relevant there. Gating it on
@@ -416,7 +416,7 @@ class HookEnvReminderShownForSkipHooks(unittest.TestCase):
 
     def test_qdrant_only_with_track_savings_does_not_show_the_reminder(self):
         # qdrant-only omits local-compress (and its compress-gated hooks)
-        # entirely -- issue #198's CORE record_session_id.py hook is still
+        # entirely -- the CORE record_session_id.py hook is still
         # written, but it reads none of --track-savings/--lmstudio-*, so
         # there's genuinely nothing left for THIS reminder to be about.
         args = _init_args(self.target_repo, qdrant_only=True, track_savings=True)
@@ -449,7 +449,7 @@ class HookEnvReminderShownForSkipHooks(unittest.TestCase):
 class CompactCollectionFlag(unittest.TestCase):
     """--compact-collection: defaults to the shared historical
     'conversation-compacts' when unset (NOT a value derived from the
-    resolved collection name -- see the PR #130 review regression guard in
+    resolved collection name -- see the review regression guard in
     test_setup_project_lib.py's BuildMcpServers for why deriving it would
     silently orphan every already-configured project's conversation-compact
     history the moment its .mcp.json gets regenerated), and is written
@@ -471,7 +471,7 @@ class CompactCollectionFlag(unittest.TestCase):
         )
 
     def test_rerun_with_no_flag_does_not_drift_between_runs(self):
-        # Regression for the finding from PR #130 review: a plain re-run
+        # Regression for a review finding: a plain re-run
         # with no new flags must produce the SAME COMPACT_COLLECTION both
         # times on an already-configured project, or its conversation-compact
         # history becomes unreachable (see qdrant_mcp_server.py's
@@ -500,7 +500,7 @@ class CompactCollectionFlag(unittest.TestCase):
 
 
 class EmbeddingModelFlag(unittest.TestCase):
-    """Issue #279: `init` preserves an existing customized EMBEDDING_MODEL on
+    """`init` preserves an existing customized EMBEDDING_MODEL on
     a plain re-run, and --embedding-model overrides it explicitly."""
 
     CUSTOM = "BAAI/bge-small-en"
@@ -523,7 +523,7 @@ class EmbeddingModelFlag(unittest.TestCase):
         self.mod.cmd_init(_init_args(self.target_repo, embedding_model=self.CUSTOM, dry_run=False))
         models = self._written_models()
         self.assertEqual({models["qdrant"], models["codebase-indexer"]}, {self.CUSTOM})
-        # Issue #428: memory-bank's model is its own value, never taken from --embedding-model.
+        # memory-bank's model is its own value, never taken from --embedding-model.
         self.assertNotEqual(models["memory-bank"], self.CUSTOM)
         # A plain re-run (no flag) must not reset it to the template default.
         self.mod.cmd_init(_init_args(self.target_repo, dry_run=False))
@@ -559,7 +559,7 @@ class EmbeddingModelFlag(unittest.TestCase):
 
 
 class QdrantOnlyAndSkipHooksAreMutuallyExclusive(unittest.TestCase):
-    """Regression for the finding from PR #113 review: --qdrant-only
+    """Regression for a review finding: --qdrant-only
     ACTIVELY REMOVES existing toolkit hooks while --skip-hooks promises to
     leave settings.json completely untouched -- genuinely conflicting
     semantics that were previously accepted together with --qdrant-only
@@ -574,7 +574,7 @@ class QdrantOnlyAndSkipHooksAreMutuallyExclusive(unittest.TestCase):
 
 
 class QdrantOnlyWriteOrderSafety(unittest.TestCase):
-    """Regression for the finding from PR #113 review: --qdrant-only wrote
+    """Regression for a review finding: --qdrant-only wrote
     .mcp.json (removing local-compress) BEFORE settings.json (removing the
     stale hooks). If the second write then failed, local-compress was
     already gone but the stale PreToolUse hook was still active -- denying
@@ -633,7 +633,7 @@ class QdrantOnlyWriteOrderSafety(unittest.TestCase):
 
 
 class PipInstalledVenvPython(unittest.TestCase):
-    """`_pip_installed_venv_python` (issue #50): `run_setup`'s own
+    """`_pip_installed_venv_python`: `run_setup`'s own
     `venv_python_path` default assumes the documented clone workflow's
     `<tools-repo>/.venv` sibling directory -- this is what falls back to
     `sys.executable` instead when that assumption doesn't hold, which is
@@ -660,8 +660,8 @@ class PipInstalledVenvPython(unittest.TestCase):
 
 
 class PipInstalledLayoutReminder(unittest.TestCase):
-    """cmd_init's printed reminders adapt for a pip/pipx/uvx install (issue
-    #50): there's no local clone to say "venv activated" about, and
+    """cmd_init's printed reminders adapt for a pip/pipx/uvx install:
+    #there's no local clone to say "venv activated" about, and
     claude-runway-ingest is on PATH instead of a `python tools/....py` path
     that wouldn't even exist in that layout. Mocks `_pip_installed_venv_python`
     directly (rather than manipulating a real `.venv` next to this repo's own
@@ -726,7 +726,7 @@ class PipInstalledLayoutReminder(unittest.TestCase):
 
 
 class MainIsTheConsoleScriptEntryPoint(unittest.TestCase):
-    """`main()` (issue #50) is what pyproject.toml's `claude-runway-setup`
+    """`main()` is what pyproject.toml's `claude-runway-setup`
     console script points `module:function` at -- pinning that it does
     exactly what the `if __name__ == "__main__":` guard always did
     (`parse_args()` then `args.func(args)`), just pulled into a callable so
@@ -743,7 +743,7 @@ class MainIsTheConsoleScriptEntryPoint(unittest.TestCase):
 
 
 class InstallSkillsFlag(unittest.TestCase):
-    """`--install-skills` (issue #205): fresh install, no-op on identical,
+    """`--install-skills`: fresh install, no-op on identical,
     update on modified, --dry-run writes nothing, --skills-dir override,
     skills-only mode (no target_repo) touching no project config, and the
     now-optional target_repo still being required when --install-skills
@@ -826,7 +826,7 @@ class InstallSkillsFlag(unittest.TestCase):
         self.assertFalse((self.target_repo / ".claude").exists())
 
     def test_crlf_source_round_trips_byte_for_byte_and_stays_up_to_date(self):
-        # Regression for Copilot review finding on PR #224: read_text()'s
+        # Regression for Copilot review finding: read_text()'s
         # universal-newline translation on read, combined with a text-mode
         # write on the way back out, silently converted a CRLF source's
         # line endings -- lossy on every platform, and on Windows
@@ -853,7 +853,7 @@ class InstallSkillsFlag(unittest.TestCase):
         self.assertIn("CLAUDE_RUNWAY_DIR", output)
 
     def test_my_setup_clauderunway_caveat_is_state_neutral(self):
-        # Regression for Copilot review finding on PR #224: the caveat
+        # Regression for Copilot review finding: the caveat
         # previously asserted "was installed/updated too" unconditionally,
         # which is false during --dry-run (nothing written) and when the
         # skill is already up to date (nothing changed) -- contradicting
@@ -889,7 +889,7 @@ class InstallSkillsFlag(unittest.TestCase):
 
 
 class UpgradeSubcommand(unittest.TestCase):
-    """`upgrade` (issue #225): argument parsing, and cmd_upgrade delegating
+    """`upgrade`: argument parsing, and cmd_upgrade delegating
     to upgrade_lib.run_upgrade with the same venv-python resolution cmd_init
     already uses (_pip_installed_venv_python(), falling back to
     setup_project_lib.venv_python_path for the documented clone workflow)."""
@@ -900,7 +900,7 @@ class UpgradeSubcommand(unittest.TestCase):
         self.addCleanup(self._tmpdir.cleanup)
         self.target_repo = Path(self._tmpdir.name) / "my-project"
         self.target_repo.mkdir()
-        # SAFETY (issue #449): cmd_upgrade now also refreshes installed
+        # SAFETY: cmd_upgrade now also refreshes installed
         # skills under the home directory's ~/.claude/skills. Point both the
         # skills dir and Path.home() at a throwaway directory so no test here
         # can ever read or write the real home.
@@ -909,7 +909,7 @@ class UpgradeSubcommand(unittest.TestCase):
         home_patch = mock.patch.object(Path, "home", return_value=fake_home)
         home_patch.start()
         self.addCleanup(home_patch.stop)
-        # is_project_configured (Copilot review, PR #227) now gates
+        # is_project_configured now gates
         # cmd_upgrade before it ever calls run_upgrade -- give this fixture
         # a minimal, already-configured .mcp.json (a 'qdrant' server block
         # is the only thing that check looks for) so tests that mock
@@ -951,7 +951,7 @@ class UpgradeSubcommand(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 1)
 
     def test_unconfigured_target_repo_errors_out(self):
-        # Regression for the finding from Copilot review on PR #227: a real,
+        # Regression for the finding from Copilot review: a real,
         # existing directory that was simply never `init`'d (no .mcp.json,
         # or one with no 'qdrant' server) must be refused with a clear error
         # and exit code, not silently write a broken partial config.
@@ -1015,7 +1015,7 @@ class UpgradeSubcommand(unittest.TestCase):
 
 
 class UpgradeSkillRefresh(unittest.TestCase):
-    """Issue #449: `upgrade` refreshes INSTALLED skills that differ from the
+    """`upgrade` refreshes INSTALLED skills that differ from the
     shipped ones. Everything runs against temp dirs; Path.home() is patched
     so the real ~/.claude is never read or written."""
 

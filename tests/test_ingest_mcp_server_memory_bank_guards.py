@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Tests for the memory-bank guards added to tools/ingest_mcp_server.py
-(issue #175):
+"""Tests for the memory-bank guards added to tools/ingest_mcp_server.py:
+
 
 - index_repo/sync_repo refuse outright when their target collection matches
   the configured shared memory-bank collection name.
 - index_repo(reset=True) ALWAYS preserves memory-bank points via a filtered
   delete, and never calls delete_collection or counts anything first (PR
-  #178 review: an earlier version branched on a memory-bank point count, but
+  An earlier version branched on a memory-bank point count, but
   that count and the delete were separate Qdrant requests with no
   transaction between them -- a concurrent remember() landing in the gap
   could still be destroyed by a "zero-count" full delete. Always using the
@@ -98,7 +98,7 @@ class IndexRepoResetGuardTest(unittest.TestCase):
         return client
 
     def test_reset_always_takes_the_filtered_delete_path(self):
-        # PR #178 review: an earlier version counted memory-bank points first
+        # An earlier version counted memory-bank points first
         # and only used the filtered (preserving) delete when that count was
         # nonzero -- but count-then-act is racy against a concurrent
         # remember() call landing in between. Fixed by ALWAYS using the
@@ -107,7 +107,7 @@ class IndexRepoResetGuardTest(unittest.TestCase):
         # check happens at all, and delete_collection is never called.
         client = self._make_client()
         # get_collection must return a vectors_config the mismatch check
-        # actually recognizes as compatible (PR #178 review, seventh pass):
+        # actually recognizes as compatible:
         # an unconfigured MagicMock is neither None, dict, nor VectorParams,
         # which now correctly fails closed rather than silently passing.
         info = MagicMock()
@@ -126,7 +126,7 @@ class IndexRepoResetGuardTest(unittest.TestCase):
         _, kwargs = client.delete.call_args
         self.assertEqual(kwargs["collection_name"], "test-collection")
         must_not = kwargs["points_selector"].must_not
-        # Memory-bank points AND (issue #282) conversation compacts.
+        # Memory-bank points AND conversation compacts.
         self.assertEqual({c.match.value for c in must_not}, {mb.MEMORY_BANK_SOURCE, mb.COMPACT_SOURCE})
 
     def test_collection_not_existing_skips_both_delete_paths(self):
@@ -137,7 +137,7 @@ class IndexRepoResetGuardTest(unittest.TestCase):
         client.delete.assert_not_called()
 
     def test_schema_mismatch_blocks_the_destructive_delete(self):
-        # Regression for PR #178 review (third pass): without a schema check,
+        # Regression for a review finding (third pass): without a schema check,
         # reset=True would run the filtered delete FIRST and only discover an
         # incompatible embedding model later, once the embed/store loop's
         # upsert failed -- destroying the existing non-memory-bank index with
@@ -162,7 +162,7 @@ class IndexRepoResetGuardTest(unittest.TestCase):
         client.delete_collection.assert_not_called()
 
     def test_inconclusive_schema_check_blocks_the_destructive_delete(self):
-        # Regression for PR #178 review (fourth pass): the pre-delete check
+        # Regression for a review finding (fourth pass): the pre-delete check
         # must fail CLOSED, not open -- a transient error verifying schema
         # compatibility (e.g. get_collection failing) must block the delete
         # the same way a confirmed mismatch does, not be silently treated as
@@ -221,7 +221,7 @@ class SyncRepoDeleteFilterTest(unittest.TestCase):
         client = MagicMock()
         client.collection_exists.return_value = True
         # get_collection must return a vectors_config the mismatch check
-        # actually recognizes as compatible (PR #178 review, seventh pass):
+        # actually recognizes as compatible:
         # an unconfigured MagicMock is neither None, dict, nor VectorParams,
         # which now correctly fails closed rather than silently passing.
         info = MagicMock()
@@ -243,7 +243,7 @@ class SyncRepoDeleteFilterTest(unittest.TestCase):
         self.assertEqual({c.match.value for c in should}, {"changed_file.py"})
 
     def test_schema_mismatch_blocks_the_delete_loop(self):
-        # Regression for PR #178 review (fifth pass): without this check,
+        # Regression for a review finding (fifth pass): without this check,
         # sync_repo would delete each changed/removed file's old chunks
         # FIRST and only discover an incompatible EMBEDDING_MODEL later,
         # once the embed/store loop's upsert failed -- leaving those files
@@ -277,7 +277,7 @@ class SyncRepoDeleteFilterTest(unittest.TestCase):
 
 
 class SyncRepoMissingCollectionTest(unittest.TestCase):
-    """Issue #303 (bug 2): sync_repo's manifest-diff "no changes" early return
+    """sync_repo's manifest-diff "no changes" early return
     used to run before any collection_exists check, so a manifest claiming
     every file was indexed masked a dropped/empty collection -- which is
     exactly the state the documented EMBEDDING_MODEL-change remediation
@@ -340,7 +340,7 @@ class SyncRepoMissingCollectionTest(unittest.TestCase):
         _ims.store_batch.assert_not_called()
 
     def test_count_ignores_points_without_a_file_path(self):
-        # PR #350 review: preserved memory-bank / qdrant-store points must not
+        # Preserved memory-bank / qdrant-store points must not
         # make an otherwise chunk-less collection look populated. The fake
         # count honors the filter the way Qdrant would.
         client = MagicMock()
@@ -355,21 +355,21 @@ class SyncRepoMissingCollectionTest(unittest.TestCase):
         self.assertIn("no indexed file chunks", result)
 
     def test_manifest_of_only_zero_chunk_files_is_not_an_error(self):
-        # PR #350 review: a file that hashes but chunks to nothing (empty /
+        # a file that hashes but chunks to nothing (empty /
         # whitespace-only) is in the manifest yet never creates a point.
         with patch.object(_ims, "chunk_file", side_effect=lambda *a, **kw: iter([])):
             result = self._sync(self._client(exists=False), {"a.py": "h1", "b.py": "h2"})
         self.assertIn("No changes since last sync", result)
 
     def test_full_rebuild_where_every_tracked_file_changed_is_not_rejected(self):
-        # PR #350 review: every manifest entry is changed, so this sync will
+        # Every manifest entry is changed, so this sync will
         # index all of them itself -- nothing unchanged is missing.
         result = self._sync(self._client(exists=False), {"a.py": "old1", "b.py": "old2"})
         self.assertNotIn("Error", result)
         _ims.store_batch.assert_called_once()
 
     def test_collection_dropped_between_early_and_later_check_is_reported(self):
-        # PR #350 review: exists at the early check, dropped before the
+        # Exists at the early check, dropped before the
         # later one -- store_batch must not recreate a partial index.
         client = self._client(exists=True, points=5)
         client.collection_exists.side_effect = [True, False]
@@ -378,7 +378,7 @@ class SyncRepoMissingCollectionTest(unittest.TestCase):
         _ims.store_batch.assert_not_called()
 
     def test_chunk_failed_changed_file_is_not_exempt_from_the_guard(self):
-        # PR #350 review: every tracked file changed and the collection is
+        # Every tracked file changed and the collection is
         # missing, but chunking one of them just failed -- store_batch must
         # not build a partial collection while the manifest keeps its old hash.
         def flaky_chunk_file(path, rel, *a, **kw):
@@ -422,7 +422,7 @@ class SyncRepoMissingCollectionTest(unittest.TestCase):
             self._sync(client, {"a.py": "h1", "b.py": "h2"})
 
     def test_unreadable_manifest_files_fail_closed(self):
-        # PR #350 review: a hash-skipped or re-chunk-unreadable entry is
+        # a hash-skipped or re-chunk-unreadable entry is
         # unknown, not a proven zero-chunk file, so it must not permit the
         # zero-chunk exception.
         with patch.object(_ims, "compute_file_hashes", return_value=({"a.py": "h1"}, [("b.py", "boom")])), \

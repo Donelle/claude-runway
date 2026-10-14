@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Shared, dependency-free derivation of /my-gh-autowork's per-ticket cost from the
-SUBAGENT TRANSCRIPTS (issue #455), instead of the orchestrator copying figures out
+SUBAGENT TRANSCRIPTS, instead of the orchestrator copying figures out
 of the Agent call's `usage` block by hand (which nothing enforced: 22 of 91 logged
 runs had no figures at all, and the one total it did record had no cache split).
 
@@ -176,8 +176,7 @@ def parse_attempt(jsonl_path) -> Optional[dict]:
     for obj in transcript_context_lib.iter_entries(jsonl_path):
         # Wall clock spans the WHOLE file, prompt to final entry, taken before any
         # entry is filtered by kind: measuring only assistant messages made a
-        # one-response agent 0s and dropped the first request's latency (Copilot
-        # review on PR #456).
+        # one-response agent 0s and dropped the first request's latency.
         ts = _parse_ts(obj.get("timestamp"))
         if ts is not None:
             first_ts = ts if first_ts is None else min(first_ts, ts)
@@ -194,8 +193,7 @@ def parse_attempt(jsonl_path) -> Optional[dict]:
         usage = message.get("usage")
         # A usage slot exists only for a message that carries a non-empty usage
         # object. A readable transcript with none (the format is internal and can
-        # change) must degrade to "no figures", not to an available zero-cost run
-        # (Copilot review, PR #456).
+        # change) must degrade to "no figures", not to an available zero-cost run.
         if isinstance(usage, dict) and usage:
             mid = message.get("id")
             if not isinstance(mid, str) or not mid:
@@ -229,7 +227,7 @@ def parse_attempt(jsonl_path) -> Optional[dict]:
         "agent_id": agent_id, "tool_use_id": tool_use_id, "description": description,
         # Issue numbers are not unique across repositories, and discovery scans every
         # Claude project, so an attempt only carries an issue (and so can only match
-        # a row) when its own prompt names this repository (Copilot review, PR #456).
+        # a row) when its own prompt names this repository.
         "issue": issue_of(prompt, description) if REPO_MARKER in prompt else None,
         "kind": "followup" if re.search(r"follow-?up", description, re.IGNORECASE) else "attempt",
         "first_ts": first_ts, "last_ts": last_ts, "wall_clock_s": wall,
@@ -309,7 +307,7 @@ def cost_metadata(attempt: dict, source: str = "transcript") -> dict:
 def figures(attempt: dict) -> dict:
     """The three flat figures the orchestrator used to type in by hand, now
     computed. `subagent_tokens` is input + cache creation + output, i.e. everything
-    EXCEPT cache reads: `compare` showed (issue #455) the hand-copied figures on the
+    EXCEPT cache reads: `compare` showed the hand-copied figures on the
     existing rows match that definition (median 101% of it) and are about 3.6% of
     the all-counter total, so this keeps old and new rows on one scale. The cache
     reads, which are most of the volume, are in `cost.by_model` and the report."""
@@ -374,15 +372,14 @@ def match_rows(rows: list, attempts: list) -> dict:
                     continue
                 # Bounded in BOTH directions: an old unclaimed transcript for the same
                 # issue must not be assigned to a row whose own transcript is gone
-                # (that row is unavailable, not someone else's cost; Copilot review,
-                # PR #456).
+                # (that row is unavailable, not someone else's cost; Copilot review).
                 if a["last_ts"] > row_ts + MATCH_SLACK_S or a["last_ts"] < row_ts - MATCH_LOOKBACK_S:
                     continue
                 # Any attempt that finished before the row beats one that finished
                 # after it (a later re-attempt or follow-up inside the slack window
                 # must not take the row from its real attempt); among pre-row
                 # candidates the latest wins, and future ones are only a clock-skew
-                # fallback, the earliest of them winning (Copilot review, PR #456).
+                # fallback, the earliest of them winning.
                 if best is None:
                     best = a
                     continue
@@ -408,7 +405,7 @@ def plan_backfill(rows: list, attempts: list) -> list:
     A session whose `ticket_cost` event is unavailable is retried: when a transcript
     matches it now, a new available event is appended (the report prefers it). While
     nothing matches, it is skipped, so re-running never piles up unavailable
-    duplicates (Copilot review, PR #456)."""
+    duplicates."""
     done = {r.get("session_id") for r in rows if r.get("event_type") == COST_EVENT and _cost_available(r)}
     done_unavailable = {r.get("session_id") for r in rows if r.get("event_type") == COST_EVENT and not _cost_available(r)}
     ticket_rows = [r for r in rows if str(r.get("event_type", "")).startswith("ticket_") and r.get("event_type") != COST_EVENT]
@@ -482,7 +479,7 @@ def build_report(rows: list) -> dict:
     table and the cache share rather than guessed into it."""
     # A `ticket_cost` event for the row's session always wins over the row's own
     # `cost` (a row first recorded with available=false can be recovered later by
-    # backfill; Copilot review, PR #456). Should one session have several, an
+    # backfill; Copilot review). Should one session have several, an
     # available one wins over an unavailable one.
     cost_rows: dict = {}
     for r in rows:
@@ -542,7 +539,7 @@ def _pct(v) -> str:
 
 
 def format_report(rep: dict) -> str:
-    lines = ["Autowork cost, derived from subagent transcripts (issue #455)", ""]
+    lines = ["Autowork cost, derived from subagent transcripts", ""]
     if not rep["tickets"]:
         return "No autowork ticket rows recorded yet."
     lines.append("Per ticket:")

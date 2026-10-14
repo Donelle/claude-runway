@@ -2,7 +2,7 @@
 """
 PostToolUse hook that compresses ANY large tool output via a local LM Studio
 model, replacing what Claude actually sees with the compressed version.
-(Formerly compress_bash_output.py -- renamed in issue #395 because it started
+(Formerly compress_bash_output.py -- renamed because it started
 Bash-only but now also covers Grep, WebFetch, Glob, and WebSearch; existing
 installs are migrated by `upgrade`'s compress-hook-renamed migration.)
 It is written to extend to further tools without code changes per-tool where possible. Unlike a PreToolUse hook,
@@ -70,7 +70,7 @@ This preserves the original JSON shape/keys exactly -- only string VALUES
 change -- which is the safest bet against an undocumented schema silently
 rejecting the rewrite. Per-record grouping exists because concatenating
 across independent records and writing the result into just one of them
-silently destroyed every other record's content (issue #38, reproduced
+silently destroyed every other record's content (reproduced
 live against a 10-result WebSearch payload: 9 of 10 snippets got blanked
 to "" with no error or indication). If you add a new tool to the matcher
 and this generic path picks the wrong field or discards something you need
@@ -100,7 +100,7 @@ short-but-numerous fields elsewhere that shouldn't be touched.
 Fails OPEN, not closed: if compression fails for any reason (LM Studio
 unreachable, ambiguous/missing model, request error, OR any other unexpected
 exception anywhere in main()'s dispatch after payload parsing -- see the
-top-level try/except wrapping _dispatch() below, issue #44), the ORIGINAL
+top-level try/except wrapping _dispatch() below), the ORIGINAL
 output is left unchanged and a short note is attached via additionalContext.
 PostToolUse can't block anyway (the tool already ran), so silently losing the
 actual output on a compression failure would be strictly worse than just
@@ -152,7 +152,7 @@ Env vars (same names local_compress_lib.py / compress_mcp_server.py use):
     separated regex patterns a project can add ON TOP OF the built-in
     exactness-critical list below, e.g. for an internal CLI whose output must
     stay byte-exact; see the _EXTRA_EXACT_PATTERNS block for matching
-    semantics and issue #192),
+    semantics),
     CLAUDE_RUNWAY_TRACK_SAVINGS (opt-in savings tracker, off by default -- see
     libs/savings_ledger.py), CLAUDE_RUNWAY_SAVINGS_DB (optional override of
     the savings DB's location; must match the value set in compress_mcp_server.py's
@@ -162,7 +162,7 @@ Env vars (same names local_compress_lib.py / compress_mcp_server.py use):
     a hook entry in .claude/settings.json has no `env` field, so it inherits the
     parent environment and cannot see .mcp.json's env block. The MCP server
     actually inherits the same full shell environment too (not a small
-    allowlist -- see docs/environment-variables.md's "Why two places" section and issue #117), but
+    allowlist -- see docs/environment-variables.md's "Why two places" section), but
     only for a key genuinely absent from its own env block; this toolkit's
     shipped .mcp.json always declares CLAUDE_RUNWAY_LMSTUDIO_URL/
     CLAUDE_RUNWAY_LMSTUDIO_MODEL/CLAUDE_RUNWAY_TRACK_SAVINGS/
@@ -230,7 +230,7 @@ except ImportError as e:
 
 # savings_ledger is optional -- an older checkout without libs/savings_ledger.py
 # should keep working exactly as before, just without ledger logging. The
-# explicit `savings_ledger = None` in the except branch (issue #297, adopting
+# explicit `savings_ledger = None` in the except branch (adopting
 # Pyright) keeps the name always bound -- every use below checks
 # _SAVINGS_LEDGER_AVAILABLE first and then asserts it's not None, which is
 # always true at runtime (that's exactly what _SAVINGS_LEDGER_AVAILABLE
@@ -248,27 +248,27 @@ def _record_savings_event(session_id, tool, raw_chars, out_chars, credited, sour
                           agent_id=None, agent_type=None, tool_use_id=None):
     """Best-effort -- a ledger-logging bug must never break the hook's real job
     (making sure Claude sees the right output). `project` is threaded through to
-    record_event's own `project` field -- originally (issue #35) what let
+    record_event's own `project` field -- originally what let
     current_session_id()'s project-filtered lookup avoid picking an unrelated
-    live session from a different project; as of issue #213 that lookup
+    live session from a different project; that lookup
     delegates to session_id_lib's shadow markers instead (populated by the
     separate hooks/record_session_id.py hook, not this one), so this field is
     now informational only -- see savings_ledger.record_event's own docstring.
 
-    `agent_id`/`agent_type` (issue #365) come from the hook payload and are only
+    `agent_id`/`agent_type` come from the hook payload and are only
     present for a tool call made inside a subagent (`agent_type` also when the
     session itself was started with `claude --agent`). They're forwarded as-is
     and default to None, so a main-session event is recorded exactly as before.
 
-    `raw_chars`/`out_chars` (issues #437, #438) are the EXACT character counts
+    `raw_chars`/`out_chars` are the EXACT character counts
     of the content before and after compression -- the only size the ledger
-    records now; the chars / 3.5 token estimate was dropped (#438). Either one
-    being None (a savings footer from an MCP server that predates #437 carries
+    records now; the chars / 3.5 token estimate was dropped. Either one
+    being None (a savings footer from an MCP server that predates character counts carries
     only token estimates) means there is nothing honest to record, so the event
     is skipped. `tool_use_id` is the PostToolUse payload's id for this tool
     call, kept so SessionEnd can join the event to its transcript turn and model
-    (issue #440, libs/transcript_attribution_lib.py)."""
-    # Split out of one combined `and` expression (issue #297) so Pyright can
+    (libs/transcript_attribution_lib.py)."""
+    # Split out of one combined `and` expression so Pyright can
     # narrow savings_ledger's type via the assert below -- same short-circuit
     # order and return behavior as the original `if not (A and B and C):`.
     if not _SAVINGS_LEDGER_AVAILABLE or not session_id:
@@ -291,7 +291,7 @@ _DEFAULT_THRESHOLD = 2000
 
 
 def _parse_threshold() -> int:
-    """Issue #270: this runs at import time, before main()'s fail-open guards
+    """This runs at import time, before main()'s fail-open guards
     exist, so a malformed env value ("4,000", "2k", ...) used to raise
     ValueError on every matched tool call and kill compression with a bare
     traceback. Fall back to the default and warn on stderr instead -- the same
@@ -336,7 +336,7 @@ MCP_SAVINGS_TOOL_PREFIX = "mcp__local-compress__"
 # CLAUDE_RUNWAY_TRACK_SAVINGS is off server-side even though real
 # compression still happened. The no-footer fallback below must never
 # re-compress these generically -- doing so would discard exactly what the
-# first pass was told to preserve (PR #88 review: this is /my-compact's own
+# first pass was told to preserve (this is /my-compact's own
 # real usage, which sets preserve_identifiers=preserve_sections=True).
 _SELF_COMPRESSING_MCP_TOOLS = {"compress_file", "compress_command_output", "fetch_url", "compress_text"}
 # The qdrant server's tools. Only the three compact tools are ever compressed
@@ -349,7 +349,7 @@ _QDRANT_COMPACT_MCP_TOOLS = {"compact_store", "compact_find", "compact_prune"}
 # The opt-in `analytics` server (savings_summary/savings_detail/savings_trend,
 # get_metrics, record_metric). Every tool there returns an exact numeric/
 # structured report meant to be read verbatim -- a savings breakdown table, a
-# metrics trend (issue #302). Same failure class as the Bash `grep -c`
+# metrics trend. Same failure class as the Bash `grep -c`
 # exemption: running them through the lossy local-model path once the response
 # passes THRESHOLD could silently drop or alter a specific number. So nothing
 # under this prefix is ever compressed, and the matcher does not list it; the
@@ -394,12 +394,12 @@ _EXACT_CMDS = (
     r"pwd|realpath|readlink|basename|dirname|which|hostname|whoami|id",
     # Bare `env` is NOT here: `env VAR=x npm test` is the standard idiom for
     # RUNNING a command, so a start-anchored `env` exempted the whole launched
-    # command (issue #269). It's handled by _ENV_RE below instead.
+    # command. It's handled by _ENV_RE below instead.
     r"printenv",
     # Requested in a machine-readable form precisely because it gets parsed.
     r"jq|yq",
     # Version pins, where the digits are the entire payload.
-    r"pip\s+freeze|npm\s+(?:ls|list)",  # `list` is npm ls's documented alias (#268)
+    r"pip\s+freeze|npm\s+(?:ls|list)",  # `list` is npm ls's documented alias
     # Encoded/parsed payloads: a summary is not decodable.
     r"base64|openssl|xxd|od",
 )
@@ -431,9 +431,9 @@ _EXACT_CMD_RE = re.compile(
 _EXACT_FLAG_RE = re.compile(
     r"--porcelain\b|--json\b|--version\b|--query\b|--format[= ]"
     # `-o json`, `-o=json` and `-ojson` are all accepted spellings (kubectl,
-    # az, ...) -- issue #268. The lookbehind keeps `--foo-ojson` from matching.
+    # az, ...). The lookbehind keeps `--foo-ojson` from matching.
     # The trailing `(?![\w.-])` (not `\b`) keeps `-o json.txt` -- an output
-    # FILENAME -- from reading as a format value (issue #269).
+    # FILENAME -- from reading as a format value.
     r"|(?<![\w-])-o[= ]?\s*(?i:json|tsv|yaml)(?![\w.-])|--output[= ](?i:json|tsv|yaml)(?![\w.-])|\|\s*jq\b"
     # `grep -c` / `grep -rc` etc. -- counting, where the number is the answer.
     r"|\bgrep\b[^|;&]*\s-\w*c(?:\s|$)"
@@ -454,7 +454,7 @@ _EXACT_FLAG_RE = re.compile(
     # or a comment/review body read verbatim to decide what to reply to or
     # fix -- never prose to skim. Same rationale as the `jq|yq` command
     # exemption above, just reached through `gh` instead of a literal pipe to
-    # the `jq` binary (issue #190).
+    # the `jq` binary.
     #
     # Matched ANYWHERE rather than as a start-of-segment command (like
     # `jq|yq`) on purpose: the real call sites in this repo's own skills wrap
@@ -467,7 +467,7 @@ _EXACT_FLAG_RE = re.compile(
     # bare form but returned False on this exact wrapped form.
     #
     # Also deliberately broader than gating on `--jq`/`graphql` specifically:
-    # issue #190's own suggested fix (those two flags only) was verified
+    # the narrower fix first suggested (those two flags only) was verified
     # incomplete before implementing -- this repo's `my-gh-pr-feedback` skill
     # calls `gh api .../comments --paginate` with neither flag at all, so a
     # narrower fix would have left that skill's primary feedback-fetch step
@@ -476,7 +476,7 @@ _EXACT_FLAG_RE = re.compile(
 )
 
 # `gh api` lives in its own pattern, NOT in _EXACT_FLAG_RE above: that one runs
-# on quote-stripped text (issue #269), but `bash -c 'gh api ...'` executes its
+# on quote-stripped text, but `bash -c 'gh api ...'` executes its
 # quoted payload and returns structured JSON, so this one must see the raw
 # segment. See the `gh api` rationale in the comment block above.
 _EXACT_ANYWHERE_RE = re.compile(r"\bgh\s+api\b")
@@ -493,7 +493,7 @@ _EXACT_ANYWHERE_RE = re.compile(r"\bgh\s+api\b")
 # also matches how it's documented and how a real shell comment behaves.
 _FORCE_COMPRESS_RE = re.compile(r"#\s*compress-ok\s*\Z")
 
-# --- Project-level extra exactness-critical patterns (issue #192) ----------
+# --- Project-level extra exactness-critical patterns ----------
 #
 # hooks/compress_output.py is shared across every project that installs
 # this toolkit -- each project's .claude/settings.json points at the SAME
@@ -514,7 +514,7 @@ _FORCE_COMPRESS_RE = re.compile(r"#\s*compress-ok\s*\Z")
 #
 # Matched ANYWHERE in a segment -- like _EXACT_FLAG_RE, not the start-anchored
 # _EXACT_CMD_RE -- because the anywhere-matched form has no blind spot for a
-# `VAR=$(...)` wrapper (see the `gh api` addition's comment above, issue #190),
+# `VAR=$(...)` wrapper (see the `gh api` addition's comment above),
 # and a project adding its own pattern is far more likely to want "this
 # command anywhere in the pipeline" than the narrower start-of-segment
 # semantics the builtin command list uses.
@@ -550,7 +550,7 @@ _EXTRA_EXACT_PATTERNS = _compile_extra_exact_patterns()
 
 
 # Segment boundaries. Beyond the shell's own separators this also splits at
-# `$(` and a backtick (issue #268): `HASH=$(git rev-parse HEAD)` otherwise
+# `$(` and a backtick: `HASH=$(git rev-parse HEAD)` otherwise
 # reads as ONE segment whose leading-assignment sub-pattern swallows
 # `HASH=$(git` as a single token, stranding `rev-parse` at segment start and
 # silently losing the exemption for the most common way a hash gets captured.
@@ -561,7 +561,7 @@ _EXTRA_EXACT_PATTERNS = _compile_extra_exact_patterns()
 _SEGMENT_SPLIT_RE = re.compile(r"\|\||&&|\$\(|`|[;|\n]")
 
 
-# Heredoc bodies are data, not commands (issue #269). Splitting on `\n` would
+# Heredoc bodies are data, not commands. Splitting on `\n` would
 # otherwise put each body line at segment start, so a commit message or
 # generated script with a line beginning `git`/`wc`/`env` exempted the whole
 # command. The body is dropped but the `<<WORD ...` line itself (which can
@@ -638,11 +638,11 @@ _QUOTED_RE = re.compile(r"\"(?:\\.|[^\"\\])*\"|'[^']*'")
 
 # `env` is exempt only as a bare listing, or when the command it launches is
 # itself exempt (`env FOO=1 git status`) -- mirrors the VAR=val/sudo prefix
-# stripping in _EXACT_CMD_RE, in reverse (issue #269).
+# stripping in _EXACT_CMD_RE, in reverse.
 #
 # Parsed with shlex (real shell word rules: escapes, adjacent quoted/unquoted
-# pieces, quoted executables) rather than regexes -- three review rounds on
-# PR #390 each found another quoting form a regex parser got wrong, and shlex
+# pieces, quoted executables) rather than regexes -- three review rounds each found
+# another quoting form a regex parser got wrong, and shlex
 # has no backtracking to attack. Anything shlex can't parse is UNCERTAIN, and
 # uncertain keeps the exemption (the benign direction for a lone `env` word).
 _ASSIGNMENT_TOKEN_RE = re.compile(r"\w+=.*", re.DOTALL)
@@ -826,7 +826,7 @@ def _record_group_key(path):
     key ('sections', 0) regardless of its own 'results' index -- merging
     sections[0].results[3] and sections[0].results[4] back into one group,
     reintroducing the exact cross-record blending this grouping exists to
-    prevent, just one level deeper (PR #107 review). Using the last index
+    prevent, just one level deeper. Using the last index
     instead isolates the innermost repeating record, which is always the
     one actually holding these sibling fields.
 
@@ -863,8 +863,8 @@ def _handle_generic(tool_response):
     _record_group_key) rather than concatenated across the whole response,
     so multiple independent records (e.g. WebSearch's `results` list) never
     get blended into one combined summary that then gets written back into
-    only ONE record while every sibling's own field is blanked to "" (issue
-    #38 -- reproduced live: a 10-result WebSearch-shaped payload lost 9 of
+    only ONE record while every sibling's own field is blanked to ""
+    (reproduced live: a 10-result WebSearch-shaped payload lost 9 of
     10 snippets this way, with no error or indication it happened).
 
     - Exactly one group (no sibling record structure, e.g. Grep's flat
@@ -877,7 +877,7 @@ def _handle_generic(tool_response):
       single-group case below but scoped to one record instead of the
       whole response -- NOT a per-field check, so two fields that are each
       individually under THRESHOLD can still get compressed together if
-      their combined length crosses it (PR #107 review: the previous
+      their combined length crosses it (the previous
       wording here read as a per-field guarantee, which it never was). A
       record whose combined content stays under THRESHOLD is left
       completely untouched rather than forcibly summarized just because ITS
@@ -996,7 +996,8 @@ def _handle_mcp_savings_footer(tool_response):
 
 def _footer_chars(value):
     """A savings footer's char count, or None if absent/malformed (a footer
-    written before #437 has none, and the event is then not recorded) -- bool is excluded since it's an int subclass."""
+    written before character counts were recorded has none, and the event is then not
+    recorded) -- bool is excluded since it's an int subclass."""
     if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
         return value
     return None
@@ -1007,7 +1008,7 @@ def _finish_compression_outcome(outcome, tool_name, source, session_id, project,
     """
     Shared tail for turning an _handle_bash/_handle_generic `outcome` into
     the right hook response -- used by both the ordinary Bash/Grep/etc. path
-    and the MCP-tool no-footer fallback below (issue #25). Always calls
+    and the MCP-tool no-footer fallback below. Always calls
     sys.exit(0) itself, matching every other terminal branch in main().
     """
     if outcome is None:
@@ -1045,13 +1046,13 @@ def _finish_compression_outcome(outcome, tool_name, source, session_id, project,
 # mid-string (e.g. a past /my-compact session about debugging this very
 # hook). The genuine header is always the first thing compact_find's own
 # "\n".join(lines) call emits, so requiring position 0 costs nothing for
-# the real case while closing that false-match window (PR #194 review).
+# the real case while closing that false-match window.
 _COMPACT_FIND_HEADER_RE = re.compile(r"^Found (\d+) compact\(s\) for project '")
 
 
 def _compact_find_entry_count(tool_response):
     """Extract N from compact_find's "Found {N} compact(s) for project..."
-    header (issue #193), searching every string leaf of the (possibly
+    header, searching every string leaf of the (possibly
     nested) tool response via the same _walk_strings used elsewhere in this
     file. Returns None if no such header is found anywhere -- e.g. an error
     string ("No compacts found for project..."), some other response shape
@@ -1067,22 +1068,22 @@ def _compact_find_entry_count(tool_response):
 
 def _dispatch(payload):
     """Everything main() does after the payload has been parsed off stdin --
-    split out so main() can wrap this whole body in one try/except (issue
-    #44) without also swallowing the json.load try/except above it, which
+    split out so main() can wrap this whole body in one try/except
+    #without also swallowing the json.load try/except above it, which
     has to stay narrowly scoped to the parse step itself."""
     _debug_log(payload)
 
     tool_name = payload.get("tool_name")
     session_id = payload.get("session_id")
     tool_response = payload.get("tool_response")
-    # Issue #365: a tool call made inside a subagent carries the PARENT's
+    # a tool call made inside a subagent carries the PARENT's
     # session_id plus `agent_id` (present only inside a subagent) and
     # `agent_type` (a subagent's type, or the main thread's `claude --agent`
     # name). Read once here and threaded to every recording call below, so a
     # credited saving can later be attributed to the subagent that earned it.
     agent_id = payload.get("agent_id")
     agent_type = payload.get("agent_type")
-    # Issue #437: the id of THIS tool call (documented PostToolUse payload
+    # The id of THIS tool call (documented PostToolUse payload
     # field). Recorded on the event so it can later be joined to its turn/model.
     # Empty when absent; a non-string value is dropped rather than trusted.
     tool_use_id = payload.get("tool_use_id")
@@ -1090,9 +1091,9 @@ def _dispatch(payload):
         tool_use_id = None
     # Same source session_end_savings.py already uses for the identical
     # purpose -- derived once here so both _record_savings_event call sites
-    # below tag their JSONL entries with it. Originally (issue #35) this is
+    # below tag their JSONL entries with it. Originally this is
     # what let current_session_id()'s project-filtered lookup tell this
-    # session's events apart from an unrelated project's; as of issue #213
+    # session's events apart from an unrelated project's;
     # that lookup delegates to session_id_lib's shadow markers instead, so
     # this tag is now informational only -- see savings_ledger.record_event's
     # own docstring.
@@ -1124,7 +1125,7 @@ def _dispatch(payload):
         # compresses anything itself (e.g. list_local_models) -- fall back to
         # the same size-based compression every other matched tool gets,
         # otherwise every one of THOSE calls is a complete no-op regardless
-        # of size, the opposite of what this hook exists to do (issue #25).
+        # of size, the opposite of what this hook exists to do.
         bare_tool_name = tool_name[len(MCP_SAVINGS_TOOL_PREFIX):]
         if bare_tool_name in _SELF_COMPRESSING_MCP_TOOLS:
             sys.exit(0)
@@ -1150,13 +1151,13 @@ def _dispatch(payload):
         if bare_tool_name not in _QDRANT_COMPACT_MCP_TOOLS or tool_response is None:
             sys.exit(0)
         # A list of pruned compact ids is an exact report, the same class as
-        # the analytics server's reports (#302).
+        # the analytics server's reports.
         if bare_tool_name == "compact_prune":
             sys.exit(0)
         # compact_find can return up to 10 full stored conversation compacts,
-        # which is why it is matched at all (issue #25). Its output is
+        # which is why it is matched at all. Its output is
         # structured data /my-resume parses for
-        # control flow (issue #193), not prose to skim: a "Found {N}
+        # control flow, not prose to skim: a "Found {N}
         # compact(s)" header followed by N discrete dated/labeled entries.
         # /my-resume branches on that count (0 -> tell the user to run
         # /my-compact, 1 -> restore silently, 2+ -> AskUserQuestion picker
@@ -1168,7 +1169,7 @@ def _dispatch(payload):
         # header itself reports more than one entry. A single-entry (or
         # header-less, e.g. "No compacts found...") response has no
         # multi-entry structure to lose, so it still gets the ordinary
-        # size-based path below -- preserving issue #25's original intent
+        # size-based path below -- preserving the original intent
         # that compact_find isn't UNCONDITIONALLY exempt, just exempt when
         # exemption actually matters.
         if bare_tool_name == "compact_find":
@@ -1225,7 +1226,7 @@ def _dispatch(payload):
 def main():
     # Claude Code writes the hook payload to stdin as UTF-8, but on Windows
     # Python opens stdin with the locale codepage (cp1252 on a US/Western
-    # install), not UTF-8 (issue #263). Left unfixed that has two silent,
+    # install), not UTF-8. Left unfixed that has two silent,
     # wrong-result failure modes here: (1) multi-byte UTF-8 in tool_response
     # (routine in build logs/fetched pages) decodes as mojibake, which this
     # hook would then compress and splice back in via updatedToolOutput --
@@ -1247,7 +1248,7 @@ def main():
     except (json.JSONDecodeError, ValueError):
         sys.exit(0)  # can't parse input -- fail open, don't touch anything
 
-    # Top-level guard for everything AFTER the parse step above (issue #44):
+    # Top-level guard for everything AFTER the parse step above:
     # _dispatch() calls into _handle_bash/_handle_generic, which call
     # compress() via asyncio.run -- compress()'s own docstring promises
     # "never raises," but that's upheld only incidentally (the one

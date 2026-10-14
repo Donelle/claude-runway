@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Baseline memory-bank staleness report (issue #338) -- dead-memory ratio and
+Baseline memory-bank staleness report -- dead-memory ratio and
 recall payload trend, per repo/project, computed read-only from the existing
 `memory-events.db` usage log. See `libs/memory_bank_report_lib.py` for what
 each number means and, as importantly, what the existing data can't answer
@@ -30,7 +30,7 @@ import memory_events_lib  # noqa: E402
 
 
 def parse_args(argv=None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Baseline memory-bank staleness report (issue #338).")
+    parser = argparse.ArgumentParser(description="Baseline memory-bank staleness report.")
     parser.add_argument("--db", type=Path, default=None,
                         help="memory-events.db path (default: the memory-bank server's own resolution).")
     parser.add_argument("--bucket", choices=("week", "month"), default="week",
@@ -44,7 +44,7 @@ def parse_args(argv=None) -> argparse.Namespace:
                              "(the test-suite's project id) by default.")
     parser.add_argument("--json", action="store_true", help="Print the report as JSON instead of text.")
     args = parser.parse_args(argv)
-    # math.isfinite too, not just >= 0 (PR #424 review): argparse's float()
+    # math.isfinite too, not just >= 0: argparse's float()
     # accepts "inf"/"nan", and neither is a usable age.
     if not math.isfinite(args.min_age_days) or args.min_age_days < 0:
         parser.error("--min-age-days must be a finite number, 0 or greater")

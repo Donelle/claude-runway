@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Tests for libs/qdrant_index_prep.py's prepare_collection_for_index (issue
-#304) -- the pre-index collection maintenance shared by index_repo and
+"""Tests for libs/qdrant_index_prep.py's prepare_collection_for_index
+#-- the pre-index collection maintenance shared by index_repo and
 tools/ingest_to_qdrant.py.
 
 Stdlib-only, no network: the Qdrant client is a MagicMock and every other

@@ -1,5 +1,5 @@
 [build-system]
-# setuptools-scm (issue #348): the package version is derived from the VCS
+# setuptools-scm: the package version is derived from the VCS
 # history instead of a hand-edited number, so every commit gets a distinct,
 # monotonically increasing version with no version-bump commit -- which this
 # repo's PR-only, linear-history ruleset on `main` would not let CI push anyway.
@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-runway"
-# Not hand-edited -- see [tool.setuptools_scm] below (issue #348).
+# Not hand-edited -- see [tool.setuptools_scm] below.
 dynamic = ["version"]
 description = "Local-compute token savings for Claude Code: Qdrant codebase memory + LM Studio local compression."
 readme = "README.md"
@@ -43,7 +43,7 @@ requires-python = ">=3.10"
 # them optional the way requirements.txt's own two-file split achieves for a
 # manual venv.
 #
-# pathspec is ALSO base here, not an extra (PR #136 review, Copilot) -- for
+# pathspec is ALSO base here, not an extra -- for
 # a security-relevant reason, not just convenience: libs/qdrant_ingest_lib.py
 # defaults respect_gitignore=True but silently falls back to "don't filter
 # at all" if pathspec isn't importable (no error, no warning -- see
@@ -70,10 +70,10 @@ dependencies = [
 ]
 
 [tool.setuptools_scm]
-# Issue #348: the repo carries a `v0.1.0` baseline tag (the last hand-set
+# The repo carries a `v0.1.0` baseline tag (the last hand-set
 # version), so builds are `0.1.1.dev<commits-since-tag>+g<sha>` -- distinct on
 # every commit, increasing along `main`'s linear history, and above the old
-# static 0.1.0 so upgrade checks see them as newer (Copilot review, PR #372).
+# static 0.1.0 so upgrade checks see them as newer.
 # Do NOT delete that tag: without any tag setuptools-scm falls back to
 # `0.0.1.devN`, which PEP 440 sorts BELOW 0.1.0. Later `vX.Y.Z` tags simply
 # move the baseline forward. `fallback_version` only applies to builds with NO VCS metadata at all (e.g.
@@ -82,19 +82,19 @@ dependencies = [
 fallback_version = "0.0.0+unknown"
 
 [tool.ruff.lint]
-# Starting narrow (issue #297) -- pyflakes (F) + flake8-bugbear (B). More
+# Starting narrow -- pyflakes (F) + flake8-bugbear (B). More
 # rule groups get added later, one at a time, each its own reviewed PR per
 # that issue's hard constraint: adopting/expanding the linter must never
 # change runtime behavior on its own.
 select = ["F", "B"]
 
 [tool.pyright]
-# Replaces mypy (issue #297) -- Pyright is also what VS Code's Pylance
+# Replaces mypy -- Pyright is also what VS Code's Pylance
 # extension runs under the hood, so the editor and this repo's CI/pre-push
 # gate now report the same findings instead of two type checkers disagreeing.
 typeCheckingMode = "standard"
 pythonVersion = "3.12"
-# Deliberately NOT venvPath/venv here (Copilot review, PR #319): CI
+# Deliberately NOT venvPath/venv here: CI
 # (.github/workflows/tests.yml) installs dependencies directly into the
 # actions/setup-python interpreter, never creating a `.venv/` -- a hardcoded
 # venvPath="."/venv=".venv" would make Pyright emit "venv .venv subdirectory
@@ -112,7 +112,7 @@ extraPaths = ["libs", "tools", "hooks"]
 include = ["libs", "tools", "hooks"]
 
 [project.scripts]
-# Issue #206: libs/tools/hooks/templates/skills are no longer
+# libs/tools/hooks/templates/skills are no longer
 # `[tool.setuptools] packages` (see that section below) -- they ship as
 # wheel DATA files instead, landing at <env>/src/{libs,tools,hooks,
 # templates,skills} rather than directly in site-packages, so they no
@@ -126,7 +126,7 @@ include = ["libs", "tools", "hooks"]
 # bridge this gap: each entry point below calls into it, it locates <env>/src
 # via sys.prefix (the one thing that sits at the same relative place on
 # Windows/macOS/Linux), loads the real tools/*.py by explicit file path
-# (issue #290; nothing is added to sys.path) and calls its `main()` exactly
+# (nothing is added to sys.path) and calls its `main()` exactly
 # as before -- behavior is unchanged, only how entry_points resolves it. See
 # claude_runway/__init__.py for the shim.
 claude-runway-ingest = "claude_runway:ingest_main"
@@ -135,7 +135,7 @@ claude-runway-doctor = "claude_runway:doctor_main"
 
 [tool.setuptools]
 # `claude_runway` is the ONE real, importable site-packages package this
-# project declares (issue #206) -- see its own module docstring for why it
+# project declares -- see its own module docstring for why it
 # exists (bridging [project.scripts] entry points to the data-files layout
 # below) and [project.scripts]'s comment above for the full chain. It has
 # an __init__.py deliberately (unlike libs/tools/hooks/templates/skills
@@ -145,7 +145,7 @@ claude-runway-doctor = "claude_runway:doctor_main"
 packages = ["claude_runway"]
 
 # libs/, tools/, templates/, hooks/, and skills/ are NOT declared as
-# setuptools packages anymore (issue #206 -- previously
+# setuptools packages anymore (previously
 # `packages = ["libs", "tools", "templates", "hooks", "skills"]` put all
 # five directly in site-packages, the generic top-level-namespace layout
 # this issue moves away from). setup.py's `data_files()` instead globs each
@@ -169,14 +169,13 @@ packages = ["claude_runway"]
 # resolves libs/'s content via __file__ + sys.path and a bare (non-dotted)
 # import (e.g. `from qdrant_ingest_lib import ...`), tools/ and hooks/ are
 # only ever run as standalone scripts (claude_runway's shim loads tools/*.py
-# by explicit file path, issue #290), and templates/skills aren't Python at
+# by explicit file path), and templates/skills aren't Python at
 # all. mypy (`mypy.ini`'s old `mypy_path = libs`) used to be specifically
 # why libs/ had to stay import-nameless -- adding an __init__.py to libs/
 # specifically made mypy see libs/qdrant_retry.py under two module identities at once
-# (confirmed live in this issue's own testing predecessor, issue #50/PR
-# #136's own history; see that repo history for the "Source file found
+# (confirmed live; see the repo history for the "Source file found
 # twice under different module names" mypy error an __init__.py there
-# previously caused). Issue #297 replaced mypy with Pyright (this file's own
+# previously caused). Pyright has since replaced mypy (this file's own
 # [tool.pyright] section, above), which doesn't share that specific
 # duplicate-module-identity failure mode -- but the reasoning right above
 # this paragraph (libs/'s content is resolved via __file__ + sys.path and a

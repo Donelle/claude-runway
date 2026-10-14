@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Tests for find_in_collection's limit resolution (issue #332, part of
-#326). Stdlib-only, no network: QdrantClient, the cache, the embedding
+"""Tests for find_in_collection's limit resolution.
+#Stdlib-only, no network: QdrantClient, the cache, the embedding
 provider and the connector are all mocked.
 
     .venv/bin/python -m unittest discover -s tests
@@ -43,7 +43,7 @@ class FindInCollectionLimitTest(unittest.TestCase):
             "provider": patch.object(_ims, "FastEmbedProvider"),
             "connector": patch.object(_ims, "QdrantConnector"),
             "mismatch": patch.object(_ims, "check_embedding_model_mismatch", return_value=None),
-            # Issue #397's compact-marker read legitimately calls get_collection;
+            # The compact-marker read legitimately calls get_collection;
             # stubbed out so these tests keep asserting only about the LIMIT lookup.
             "compact_marker": patch.object(_ims, "collection_is_marked_compact", return_value=False),
         }

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tests for .claude/skills/my-gh-code-it/SKILL.md and .claude/skills/my-gh-pr/SKILL.md
-and docs/development-workflow.md -- issue #286's port of the bin-vs-Scripts venv-path
-resolver (issue #230's defect class, originally fixed only for /my-gh-autowork).
+and docs/development-workflow.md -- the port of the bin-vs-Scripts venv-path
+resolver (the defect class, originally fixed only for /my-gh-autowork).
 
 Those three documents are prose instructions, not Python modules, so this mirrors
 tests/test_my_gh_autowork_skill.py's content-pinning strategy: assert the resolver's
@@ -27,7 +27,7 @@ PR_PATH = os.path.join(REPO_ROOT, ".claude", "skills", "my-gh-pr", "SKILL.md")
 DEV_WORKFLOW_PATH = os.path.join(REPO_ROOT, "docs", "development-workflow.md")
 
 # The exact resolver line shared by the two documents that actually embed it --
-# my-gh-code-it's SKILL.md (step 13) and docs/development-workflow.md (issue #286).
+# my-gh-code-it's SKILL.md (step 13) and docs/development-workflow.md.
 # my-gh-pr's SKILL.md deliberately carries only platform-neutral wording (it names both
 # venv layouts rather than embedding the resolver), so it is pinned by
 # PrValidateWordingRequirements below, NOT by RESOLVER_LINE. Matches the form already
@@ -70,7 +70,7 @@ class SkillFilesExist(unittest.TestCase):
 
 
 class CodeItResolverRequirements(unittest.TestCase):
-    """Pin issue #286's resolver in /my-gh-code-it's step 13."""
+    """Pin the resolver in /my-gh-code-it's step 13."""
 
     def setUp(self):
         with open(CODE_IT_PATH, encoding="utf-8") as f:
@@ -124,14 +124,14 @@ class CodeItResolverRequirements(unittest.TestCase):
 
     def test_documents_the_windows_failure_mode(self):
         # The "why" comment must survive so a future reader understands the resolver
-        # isn't gratuitous -- it's the Windows command-not-found fix (issues #286 / #230;
-        # the docs themselves carry no ticket numbers, so key on the failure mode).
+        # isn't gratuitous -- it's the Windows command-not-found fix (the docs
+        # themselves carry no ticket numbers, so key on the failure mode).
         self.assertIn("command-not-found", self.content)
         self.assertIn(".venv/Scripts/", self.content)
 
 
 class PrValidateWordingRequirements(unittest.TestCase):
-    """Pin /my-gh-pr's validate-artifact wording as platform-neutral (issue #286)."""
+    """Pin /my-gh-pr's validate-artifact wording as platform-neutral."""
 
     def setUp(self):
         with open(PR_PATH, encoding="utf-8") as f:
@@ -150,7 +150,7 @@ class PrValidateWordingRequirements(unittest.TestCase):
 
 
 class DevWorkflowResolverRequirements(unittest.TestCase):
-    """Pin docs/development-workflow.md's linting/type-checking resolver (issue #286)."""
+    """Pin docs/development-workflow.md's linting/type-checking resolver."""
 
     def setUp(self):
         with open(DEV_WORKFLOW_PATH, encoding="utf-8") as f:

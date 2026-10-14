@@ -2,7 +2,7 @@
 # 'claude-runway-doctor' work as installed commands in the pipx/uv install path.
 """
 Tiny importable shim package backing claude-runway's 3 console-script entry
-points (issue #206). Exists purely to bridge a gap `[project.scripts]`
+points. Exists purely to bridge a gap `[project.scripts]`
 otherwise can't close: pyproject.toml ships libs/tools/hooks/templates/
 skills as wheel DATA files under <env>/src/{libs,tools,hooks,templates,
 skills} (see setup.py), not as `[tool.setuptools] packages` -- so, unlike
@@ -18,7 +18,7 @@ Locate <env>/src via `sys.prefix`, NEVER a hardcoded `Lib`/`Scripts`
 install` both create a dedicated venv per tool, and `sys.prefix` while
 running as that venv's own console script is already that venv's root,
 identically across all three platforms (verified live for `uv tool install`
-specifically during issue #206's own research; the wheel `data` category's
+specifically; the wheel `data` category's
 "goes to sys.prefix" rule is a wheel-spec guarantee, not OS-specific, so
 pipx behaves the same way).
 """
@@ -80,7 +80,7 @@ def doctor_main() -> int:
     (rather than just calls) `tools.doctor.main()`'s int exit code --
     setuptools' generated console-script wrapper does `sys.exit(doctor_main())`,
     so the return value here IS the process exit code CI/pre-flight callers
-    rely on (issue #49); swallowing it here would silently turn every
+    rely on; swallowing it here would silently turn every
     doctor-detected mismatch into a false "exit 0".
     """
     _add_src_to_sys_path()

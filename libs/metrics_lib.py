@@ -1,5 +1,5 @@
 """
-Shared, cross-tool metrics store (issue #208) -- ONE generic SQLite table
+Shared, cross-tool metrics store -- ONE generic SQLite table
 any domain in this toolkit can write into (memory-bank's recall/remember
 events, my-gh-autowork's per-ticket run metrics, whatever comes next),
 behind ONE small `MetricsStore` class and ONE new MCP tool
@@ -8,7 +8,7 @@ behind ONE small `MetricsStore` class and ONE new MCP tool
 Why this exists instead of "add a new MCP tool per domain": the toolkit's
 connected MCP servers already expose many tools (`python
 tools/report_tool_counts.py` gives the live count; a number written here
-would go stale). Issue #208 assumed each one rides along in context on every
+would go stale). The original design assumed each one rides along in context on every
 turn; session transcripts later showed Claude Code listing them as deferred
 (loaded on demand) -- see EVALUATION.md's Step A4 and docs/metrics.md. A
 metrics-reporting design that adds one new tool per future metric domain
@@ -20,10 +20,10 @@ Deliberately NOT the home for savings_ledger.py's `savings.db` or
 memory_events_lib.py's `memory-events.db` -- both are genuinely tailored
 schemas that already work well for their one specific domain each,
 migrating them onto this generic store is an explicit follow-up, not part
-of this ticket (see issue #208's "Explicitly out of scope" section).
-As of issue #210, my-gh-autowork's per-ticket outcome logging writes into
+of this ticket (see the "Explicitly out of scope" section).
+my-gh-autowork's per-ticket outcome logging writes into
 this store (`metric_id="autowork"`), as does memory_events_lib's
-`record_memory_metric` (`metric_id="memory-bank"`, issue #311).
+`record_memory_metric` (`metric_id="memory-bank"`).
 
 Storage shape: single append-only `metrics` table --
 `(id, metric_id, event_type, value, metadata, event_timestamp, session_id)`.
@@ -125,7 +125,7 @@ def _connect(db_path: Path) -> sqlite3.Connection:
         # disruptive than creating them alongside the table from day one.
         conn.execute("CREATE INDEX IF NOT EXISTS idx_metrics_metric_id ON metrics (metric_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_metrics_event_type ON metrics (metric_id, event_type)")
-        # PR #222 review: trend()'s `ORDER BY event_timestamp DESC WHERE
+        # trend()'s `ORDER BY event_timestamp DESC WHERE
         # metric_id = ?` had no index covering that access pattern, forcing
         # SQLite to scan the whole table for one metric_id and then sort the
         # result. DESC in the index definition itself (supported since
@@ -210,7 +210,7 @@ class MetricsStore:
         this table is meant to serve domains not yet known, so validating
         against a hardcoded set would defeat the point). `metadata`, if
         given, must be JSON-serializable; it's stored as TEXT and decoded
-        back to a dict by detail() (issue #249) -- the domain-specific
+        back to a dict by detail() -- the domain-specific
         reporting view this was originally carried through for.
         summary()/by_event_type()/trend() still never need it; they only
         ever aggregate `value`.
@@ -223,7 +223,7 @@ class MetricsStore:
         ISO 8601 UTC (`"YYYY-MM-DDTHH:MM:SSZ"`, matching this column's own
         documented format) -- validated via `datetime.strptime` (REAL
         calendar/time validation, e.g. rejects `"2026-99-99T99:99:99Z"`;
-        PR #246 review caught an earlier version that only checked
+        Review caught an earlier version that only checked
         character-class SHAPE via regex, which would have accepted that
         exact string and persisted it, only for `trend()`'s own
         `datetime.fromisoformat` parsing to raise `ValueError` on it later
@@ -244,8 +244,8 @@ class MetricsStore:
         for the caller. Same fail-open philosophy as
         `memory_events_lib.record_memory_event`.
 
-        `value` must be finite (not `inf`/`-inf`/`nan`) -- PR #222 review:
-        a `float` in Python/SQLite can be non-finite, and persisting one
+        `value` must be finite (not `inf`/`-inf`/`nan`) -- a `float` in Python/SQLite
+        can be non-finite, and persisting one
         poisons EVERY future aggregate for this metric_id: `SUM(value)`
         propagates the non-finite value into `summary()`'s `total_value`
         forever (confirmed live: one `inf` row makes `total_value` `inf`
@@ -264,7 +264,7 @@ class MetricsStore:
             return False
         if event_timestamp is not None:
             try:
-                # PR #246 review (Copilot, round 1): a regex only checks
+                # a regex only checks
                 # character SHAPE, not that the value is a real calendar
                 # date/time -- it would accept "2026-99-99T99:99:99Z" and
                 # persist it, which trend()'s datetime.fromisoformat parsing
@@ -274,7 +274,7 @@ class MetricsStore:
                 # calendar/time validation, not just character-class
                 # matching.
                 #
-                # PR #246 review (Copilot, round 2): strptime alone still
+                # Strptime alone still
                 # isn't sufficient -- it's lenient about zero-padding, so it
                 # happily parses "2026-8-5T01:02:03Z" (non-zero-padded month/
                 # day) and would have persisted that non-canonical string
@@ -370,10 +370,10 @@ class MetricsStore:
         "last_event_at"}`. `first_event_at`/`last_event_at` are `None` when
         the metric_id has no rows yet (never a fabricated timestamp).
 
-        `session_id` (issue #248), when given, narrows the aggregate to rows
+        `session_id`, when given, narrows the aggregate to rows
         matching BOTH `metric_id` AND this exact `session_id` -- e.g. one
         specific `my-gh-autowork` attempt's `f"issue-{n}-{HHMMSS}"` marker
-        (see issue #210) rather than that metric_id's entire history.
+        rather than that metric_id's entire history.
         Omitting it (the default) keeps today's metric_id-only aggregate
         unchanged -- existing callers see no behavior change.
         """
@@ -403,7 +403,7 @@ class MetricsStore:
         `savings_ledger.query_session_tool_breakdown`'s ordering convention.
         Each row: `{"event_type", "event_count", "total_value"}`.
 
-        `session_id` (issue #248): same optional narrowing as `summary()`
+        `session_id`: same optional narrowing as `summary()`
         above -- when given, only rows matching BOTH `metric_id` and this
         exact `session_id` are aggregated. Omitting it keeps today's
         metric_id-only breakdown unchanged.
@@ -436,7 +436,7 @@ class MetricsStore:
         if the stored text somehow isn't valid JSON, or decodes to
         something JSON-valid but not an object, e.g. a list or scalar).
 
-        Added for issue #249: `summary()`/`by_event_type()` only ever
+        `summary()`/`by_event_type()` only ever
         aggregate `value`, never surfacing `metadata` -- this is the "future
         domain-specific reporting view" record()'s own docstring says
         `metadata` is carried through for. Deliberately generic (no
@@ -444,7 +444,7 @@ class MetricsStore:
         that stores structured metadata gets this view for free, matching
         this module's "one generic store, no per-domain tool" design.
 
-        `session_id` (issue #249), when given, narrows to rows matching
+        `session_id`, when given, narrows to rows matching
         BOTH `metric_id` AND this exact `session_id` -- same semantics as
         summary()/by_event_type(). Unlike trend(), detail() DOES support
         session_id filtering: "show me this one run's metadata" is exactly
@@ -552,7 +552,7 @@ class MetricsStore:
         Raises ValueError for an unrecognised `bucket` value, same as
         `savings_ledger.query_trend`.
 
-        PR #222 review: this iterates the cursor directly and breaks out of
+        This iterates the cursor directly and breaks out of
         the aggregation loop as soon as `n` distinct buckets are filled,
         rather than calling `.fetchall()` up front -- `savings_ledger.
         query_trend` can get away with `fetchall()` because its `sessions`
@@ -630,7 +630,7 @@ def _fmt_value(v: float) -> str:
 
 
 def _no_events_message(session_id: Optional[str] = None) -> str:
-    # Issue #248 (Copilot review, round 4): a session_id-filtered query that
+    # a session_id-filtered query that
     # comes back empty must NOT say "No events recorded yet for this
     # metric_id" -- that's true of the empty FILTERED result, but false (and
     # misleading for per-attempt forensics) about the metric_id as a whole,

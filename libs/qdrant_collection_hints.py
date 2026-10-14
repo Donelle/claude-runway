@@ -1,6 +1,6 @@
 """
-Persistent, cross-session cache for per-collection description hints (issue
-#81). tools/ingest_mcp_server.py's list_collections tool surfaces these
+Persistent, cross-session cache for per-collection description hints.
+#tools/ingest_mcp_server.py's list_collections tool surfaces these
 hints so a model can pick the right collection for find_in_collection on its
 own, instead of the user always having to name it explicitly.
 
@@ -24,7 +24,7 @@ different Qdrant instances could coincidentally share a collection name
 with unrelated content, and a name-only cache would silently serve the
 wrong hint across instances with no way to detect it.
 
-No TTL by design (per issue #81's explicit ask) -- a cached entry is only
+No TTL by design -- a cached entry is only
 ever refreshed by an explicit write. Only REAL hints get cached, though:
 set_collection_description always writes through (an explicit, intentional
 call -- even an empty string is a deliberate "clear this hint"), but
@@ -43,7 +43,7 @@ raised, since by the time either write call runs the authoritative Qdrant
 operation has already succeeded. Letting a corrupt/locked/unwritable cache
 file turn that into a reported tool failure would be strictly worse than
 just not caching this one time -- confirmed as a real gap via Copilot
-review on PR #82 (issue #81's PR): an unwritable cache before this fix
+review: an unwritable cache before this fix
 could make list_collections/set_collection_description fail outright even
 though Qdrant itself was completely healthy.
 """
@@ -58,7 +58,7 @@ from cache_db import connect as _connect_shared_cache
 
 
 # Bumped whenever collection_hints' shape changes; _MIGRATIONS must gain a
-# matching entry for every bump (issue #329, same scaffold shape as
+# matching entry for every bump (same scaffold shape as
 # libs/savings_ledger.py's SCHEMA_VERSION/_MIGRATIONS/_run_migrations).
 #
 # One deliberate difference from savings_ledger: the version is NOT kept in
@@ -74,7 +74,7 @@ _SCHEMA_NAME = _TABLE_NAME
 
 # Always the LATEST shape -- a brand-new DB gets this directly and never
 # replays a migration. `description` is nullable (NULL = never fetched, ''
-# = explicitly cleared); `search_limit` is NULL until first computed (#326).
+# = explicitly cleared); `search_limit` is NULL until first computed.
 _CREATE_HINTS_DDL = """
     CREATE TABLE IF NOT EXISTS collection_hints (
         qdrant_url TEXT NOT NULL,
@@ -89,7 +89,7 @@ _CREATE_HINTS_DDL = """
 
 def _migrate_to_v1(conn) -> None:
     """
-    Makes `description` nullable and adds `search_limit` (issue #329) by
+    Makes `description` nullable and adds `search_limit` by
     dropping and recreating the table. A straight drop is safe because this
     table is a disposable cache (Qdrant's own collection metadata is the
     source of truth), so no rows are copied forward -- they repopulate on
@@ -166,7 +166,7 @@ def _run_migrations(conn) -> None:
                 "SELECT version FROM schema_versions WHERE name = ?", (_SCHEMA_NAME,)
             ).fetchone()
             # An existing table with no recorded version predates this
-            # scaffold (the pre-#329 shape) -- treat it as version 0.
+            # scaffold (the pre-migration shape) -- treat it as version 0.
             current_version = row[0] if row else 0
             for version in range(current_version + 1, SCHEMA_VERSION + 1):
                 if version not in _MIGRATIONS:
@@ -242,7 +242,7 @@ def set_cached_description(qdrant_url: str, collection: str, description: str) -
     a SCHEMA_VERSION/_MIGRATIONS mismatch -- a code bug, not a cache failure.
     Qdrant collection metadata is arbitrary JSON, so a
     description read back from it (list_collections's cache-miss path) may
-    legally be None, a dict, or a list rather than a string. Since #329 the
+    legally be None, a dict, or a list rather than a string. The
     `description` column is nullable, so None would no longer raise -- but
     NULL there is the "never fetched" sentinel (get_cached_descriptions
     treats it as a miss), and this function's write is an explicit "this
@@ -309,8 +309,8 @@ def get_cached_descriptions(qdrant_url: str, collections: list) -> dict:
 
 def set_cached_search_limit(qdrant_url: str, collection: str, search_limit: int) -> None:
     """
-    Upserts the cached default search limit for one collection (issue #329,
-    part of #326). Only touches search_limit/updated_at -- never clobbers a
+    Upserts the cached default search limit for one collection.
+    Only touches search_limit/updated_at -- never clobbers a
     cached description, just as set_cached_description never clobbers this.
     Never raises, for the same fail-open reasons as set_cached_description;
     a non-int (or bool) value is skipped with a warning instead of being
@@ -362,7 +362,7 @@ def get_cached_search_limit(qdrant_url: str, collection: str) -> Optional[int]:
     return get_cached_search_limits(qdrant_url, [collection]).get(collection)
 
 
-# Tier boundaries for compute_search_limit (issue #330, part of #326). Kept as
+# Tier boundaries for compute_search_limit. Kept as
 # a module-level table rather than inline if-chains so retuning is a data edit.
 # Each entry is (exclusive upper bound on point_count, limit); anything at or
 # above the last bound gets _SEARCH_LIMIT_MAX. A starting point calibrated

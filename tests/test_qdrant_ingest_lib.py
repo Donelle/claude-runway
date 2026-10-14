@@ -22,8 +22,8 @@ The first three were found by indexing this repo with its own indexer:
      file with YAML frontmatter was indexed starting at line 5.
   4. overlap >= chunk_size collapsed chunk_lines()'s step to 1, silently
      turning "chunk every N lines" into "chunk every line" -- multiplying
-     embedding/storage cost by roughly chunk_size with no error anywhere
-     (issue #26). Caught by code review, not by indexing this repo, since
+     embedding/storage cost by roughly chunk_size with no error anywhere.
+     Caught by code review, not by indexing this repo, since
      this repo's own defaults never hit the bad case.
 """
 
@@ -214,8 +214,8 @@ class MarkdownChunking(unittest.TestCase):
 
 class BraceBoundaryDetection(unittest.TestCase):
     """brace_boundary_indexes must find real curly-brace depth-zero points
-    and never miscount a brace hiding inside a string literal or a comment
-    (issue #55)."""
+    and never miscount a brace hiding inside a string literal or a comment.
+    """
 
     def test_braces_inside_strings_and_line_comments_are_not_counted(self):
         lines = [
@@ -253,7 +253,7 @@ class BraceBoundaryDetection(unittest.TestCase):
         self.assertEqual(brace_boundary_indexes(lines), {2, 3, 6})
 
     def test_brace_inside_backtick_template_literal_is_not_counted(self):
-        # PR #137 review: a template/raw-string literal (JS/TS/Go) can
+        # a template/raw-string literal (JS/TS/Go) can
         # contain a brace character that must not decrement tracked depth
         # and fabricate a boundary inside the surrounding function.
         lines = [
@@ -284,7 +284,7 @@ class BraceBoundaryDetection(unittest.TestCase):
         )
 
     def test_methods_inside_a_class_get_boundaries_between_them(self):
-        # PR #137 review: depth only ever returning to 0 meant a whole
+        # Depth only ever returning to 0 meant a whole
         # class/namespace longer than chunk_size had NO boundary candidate
         # between its own methods -- the core "reduce mid-class splits"
         # case the issue is about. A closing '}' that returns to directly
@@ -313,7 +313,7 @@ class BraceBoundaryDetection(unittest.TestCase):
         self.assertNotIn(9, boundaries, "must not treat a statement inside method B as safe")
 
     def test_container_keyword_in_a_type_annotation_is_not_a_declaration(self):
-        # PR #137 review: matching the container keyword anywhere on the
+        # Matching the container keyword anywhere on the
         # line (rather than requiring it be the line's OWN declaration
         # keyword) tagged a function whose signature merely MENTIONS one of
         # these words -- e.g. a TypeScript "object" type annotation -- as a
@@ -363,7 +363,7 @@ class BraceBoundaryDetection(unittest.TestCase):
         self.assertIn(3, boundaries, "must still find the boundary between method A and method B")
 
     def test_brace_inside_csharp_verbatim_string_is_not_counted(self):
-        # PR #137 review: a C# verbatim string (@"...") can legally span
+        # a C# verbatim string (@"...") can legally span
         # multiple lines -- unlike an ordinary "...", which cannot -- and a
         # brace inside one must not be counted (confirmed by direct
         # reproduction before this fix: a false boundary appeared right at
@@ -393,7 +393,7 @@ class BraceBoundaryDetection(unittest.TestCase):
         self.assertEqual(brace_boundary_indexes(lines), {3})
 
     def test_module_dot_exports_is_not_a_container_declaration(self):
-        # PR #137 review: '\b' is satisfied between a word char and ANY
+        # '\b' is satisfied between a word char and ANY
         # non-word char, including '.', so '\bmodule\b' matched the start
         # of an ordinary CommonJS 'module.exports = function () {'
         # expression -- confirmed by direct reproduction: every line of the
@@ -419,7 +419,7 @@ class BraceBoundaryDetection(unittest.TestCase):
         self.assertIn(3, boundaries, "must still recognize a real anonymous-object declaration")
 
     def test_container_keyword_as_a_variable_type_is_not_a_declaration(self):
-        # PR #137 review (round 4): the keyword can have real whitespace
+        # The keyword can have real whitespace
         # after it and STILL not be a declaration -- 'object value = ...'
         # uses "object" as a plain TYPE NAME for a variable, not to open a
         # container. Confirmed by direct reproduction: every line of the
@@ -445,7 +445,7 @@ class BraceBoundaryDetection(unittest.TestCase):
         self.assertEqual(boundaries, {3})
 
     def test_allman_style_multiline_method_signature_is_never_split_from_its_body(self):
-        # PR #137 review (round 4): a multi-line method signature doesn't
+        # a multi-line method signature doesn't
         # open any NEW brace of its own while its parameter list spans
         # several lines, so every one of those lines (including the line
         # that closes the signature's own ')') still looked boundary-safe,
@@ -493,7 +493,7 @@ class BraceBoundaryDetection(unittest.TestCase):
 
 class PythonBoundaryDetection(unittest.TestCase):
     """python_boundary_indexes must not treat a line inside a multi-line
-    call/list/dict expression as a boundary (issue #55), and must find the
+    call/list/dict expression as a boundary, and must find the
     real top-level gap between two function definitions."""
 
     def test_multiline_call_args_are_not_false_boundaries(self):
@@ -524,7 +524,7 @@ class PythonBoundaryDetection(unittest.TestCase):
         self.assertIn(2, boundaries, "the final line is always a safe boundary")
 
     def test_methods_inside_a_class_get_boundaries_between_them(self):
-        # PR #137 review: requiring column-0 indentation meant a whole
+        # Requiring column-0 indentation meant a whole
         # class body longer than chunk_size had NO boundary candidate
         # between its own sibling methods -- the exact "reduce mid-class
         # splits" case the issue is about.
@@ -543,7 +543,7 @@ class PythonBoundaryDetection(unittest.TestCase):
         self.assertNotIn(4, boundaries)
 
     def test_triple_quoted_string_content_is_never_a_boundary(self):
-        # PR #137 review: a line like `return """` (unterminated on that
+        # a line like `return """` (unterminated on that
         # line) must never be treated as safe just because the STRING'S OWN
         # unindented payload on a later line happens to look like column-0
         # top-level code -- that's string content, not real code.
@@ -578,7 +578,7 @@ class PythonBoundaryDetection(unittest.TestCase):
         self.assertNotIn(6, boundaries, "method b's own header, whose next line is its own body, is not a boundary")
 
     def test_decorator_is_never_split_from_its_definition(self):
-        # PR #137 review: a decorator sits at the same indentation as the
+        # a decorator sits at the same indentation as the
         # def/class it decorates, so it satisfied the column-0 rule and was
         # flagged as a boundary itself -- confirmed by direct reproduction
         # before this fix (index 0, the '@route' line, was in the result).
@@ -598,7 +598,7 @@ class PythonBoundaryDetection(unittest.TestCase):
         self.assertNotIn(1, boundaries)
 
     def test_comment_only_line_is_not_treated_as_a_real_dedent(self):
-        # PR #137 review: Python comments carry no indentation meaning --
+        # Python comments carry no indentation meaning --
         # a comment sitting at a class's member-indentation level, in
         # between two lines that are BOTH still part of the same method's
         # body, must not be read as a real dedent back to member level
@@ -637,7 +637,7 @@ class PythonBoundaryDetection(unittest.TestCase):
         self.assertIn(4, boundaries, "the real boundary between method a and method b must still be found")
 
     def test_docstring_only_function_body_is_never_split_from_its_header(self):
-        # PR #137 review (round 4): a function whose ENTIRE body is a
+        # a function whose ENTIRE body is a
         # multi-line docstring strips down to whitespace on every one of
         # those lines -- previously indistinguishable from blank/comment
         # filler, so the scan for "the next real line" after 'def foo():'
@@ -676,7 +676,7 @@ class ChunkCodeByBoundaries(unittest.TestCase):
     """chunk_code_by_boundaries must nudge chunk ends to a real boundary
     instead of an arbitrary fixed line count, and must always fall back
     safely (never hang, never grow unboundedly) when no boundary exists in
-    the lookback window (issue #55)."""
+    the lookback window."""
 
     def test_does_not_split_either_function_across_chunks(self):
         text = "\n".join([
@@ -780,7 +780,7 @@ class FileRouting(unittest.TestCase):
             return list(chunk_file(p, name, chunk_size, overlap))
 
     def test_cs_uses_boundary_aware_chunking_not_a_mid_function_split(self):
-        # Issue #55: a brace-block language must not split a function body
+        # a brace-block language must not split a function body
         # across two chunks the way a pure fixed-line window would.
         text = "\n".join([
             "public class Foo {",
@@ -869,7 +869,7 @@ class FileRouting(unittest.TestCase):
 
 class IterFilesExcludeDirs(unittest.TestCase):
     """iter_files must exclude on the path RELATIVE TO repo_path, not the
-    absolute path (issue #21) -- otherwise an ancestor directory that happens
+    absolute path -- otherwise an ancestor directory that happens
     to share a name with EXCLUDE_DIRS (e.g. a repo checked out under
     ~/build/myrepo) silently excludes every file in the repo, with no error.
     """
@@ -910,7 +910,7 @@ class IterFilesExcludeDirs(unittest.TestCase):
 
 class Batched(unittest.TestCase):
     """batched() groups sync_repo's per-file deletes into fixed-size chunks
-    (issue #75/#76) -- confirmed empirically that neither extreme works:
+    -- confirmed empirically that neither extreme works:
     one client.delete() call per file exhausts connections on a large repo,
     and one call covering every file can time out server-side.
     """
@@ -936,7 +936,7 @@ class Batched(unittest.TestCase):
 
 
 class BuildEntriesSkipsUnreadableFiles(unittest.TestCase):
-    """Issue #27: a single unreadable file (broken symlink, permission
+    """a single unreadable file (broken symlink, permission
     error, ...) must not abort the whole indexing run -- build_entries logs
     it and skips it, with the rest of the repo still indexed.
 
@@ -981,7 +981,7 @@ class BuildEntriesSkipsUnreadableFiles(unittest.TestCase):
 
 class ComputeFileHashesSkipsUnreadableFiles(unittest.TestCase):
     """Same guarantee as BuildEntriesSkipsUnreadableFiles, for the hashing
-    path sync_repo relies on to detect changed files (issue #27)."""
+    path sync_repo relies on to detect changed files."""
 
     def _patched_read_bytes(self, bad_name):
         real_read_bytes = Path.read_bytes
@@ -1015,7 +1015,7 @@ class ComputeFileHashesSkipsUnreadableFiles(unittest.TestCase):
 
 
 class FilesRemovedSinceLastSync(unittest.TestCase):
-    """Issue #27: a file that failed to hash must not be reported as
+    """a file that failed to hash must not be reported as
     'removed' -- sync_repo would otherwise delete its still-good existing
     embeddings over what may just be a transient read error. Only a file
     genuinely absent from BOTH current_hashes and skipped_paths (i.e.
@@ -1045,7 +1045,7 @@ class FilesRemovedSinceLastSync(unittest.TestCase):
 
 class EnsurePersistentFastembedCache(unittest.TestCase):
     """ensure_persistent_fastembed_cache() must default FASTEMBED_CACHE_PATH
-    to a persistent, toolkit-owned directory when unset (issue #77 -- the
+    to a persistent, toolkit-owned directory when unset (the
     fastembed default is the OS temp dir, wiped on reboot/cleanup), but never
     override a value the caller already set via .mcp.json or the shell.
     """
@@ -1064,7 +1064,7 @@ class EnsurePersistentFastembedCache(unittest.TestCase):
 
 
 class ValidateChunkParams(unittest.TestCase):
-    """Issue #26: overlap >= chunk_size collapses chunk_lines()'s step to 1,
+    """Overlap >= chunk_size collapses chunk_lines()'s step to 1,
     silently multiplying chunk count. validate_chunk_params is the shared
     check every CLI/tool boundary calls before chunking anything."""
 
@@ -1097,7 +1097,7 @@ class ValidateChunkParams(unittest.TestCase):
 
 
 class ChunkLinesOverlapExplosion(unittest.TestCase):
-    """Demonstrates the actual defect mechanism directly (issue #26), not
+    """Demonstrates the actual defect mechanism directly, not
     just that validate_chunk_params rejects the bad input -- pins the ROOT
     CAUSE so a future refactor of chunk_lines() can't silently reintroduce
     this while validate_chunk_params stays correct in isolation."""
@@ -1123,7 +1123,7 @@ class ChunkLinesOverlapExplosion(unittest.TestCase):
 
 
 class McpToolsValidateChunkParamsBeforeAnyWork(unittest.TestCase):
-    """Issue #26: a shared validator only closes the bug if every boundary
+    """a shared validator only closes the bug if every boundary
     actually calls it. Imports ingest_mcp_server.py directly and calls each
     tool with an invalid chunk_lines/overlap pair -- no live Qdrant/FastEmbed
     needed, since the validation check is the very first thing each function
@@ -1170,7 +1170,7 @@ class McpToolsValidateChunkParamsBeforeAnyWork(unittest.TestCase):
 
 
 class IndexRepoDocumentsTheOrphanedChunkLimitation(unittest.TestCase):
-    """Issue #31: index_repo(reset=False) never detects/removes chunks for
+    """index_repo(reset=False) never detects/removes chunks for
     files deleted from the repo, unlike sync_repo. Decided to document this
     loudly rather than change the behavior --
     sync_repo already exists specifically for ongoing/incremental
@@ -1199,7 +1199,7 @@ class IndexRepoDocumentsTheOrphanedChunkLimitation(unittest.TestCase):
 
 
 class SyncRepoPreservesEmbeddingsOnChunkAndHashFailures(unittest.TestCase):
-    """PR #90 review (Copilot), issue #27 follow-up. Two real bugs the
+    """Review (Copilot) follow-up. Two real bugs the
     original try/except-and-skip fix introduced, both now fixed:
 
     1. sync_repo deleted a changed file's OLD embeddings BEFORE attempting to
@@ -1269,7 +1269,7 @@ class SyncRepoPreservesEmbeddingsOnChunkAndHashFailures(unittest.TestCase):
 
             fake_client = MagicMock()
             fake_client.collection_exists.return_value = True
-            # sync_repo's index-consistency check (issue #303) counts file
+            # sync_repo's index-consistency check counts file
             # chunks; this fixture models a populated collection.
             fake_client.count.return_value = mock.MagicMock(count=10)
 
@@ -1286,7 +1286,7 @@ class SyncRepoPreservesEmbeddingsOnChunkAndHashFailures(unittest.TestCase):
                 # test_ingest_mcp_server_memory_bank_guards.py). fake_client's
                 # unconfigured get_collection() returns a vectors_config the
                 # real check can't recognize, which now correctly fails
-                # closed (PR #178 review, seventh pass) instead of silently
+                # closed instead of silently
                 # passing, which would otherwise block sync_repo's delete
                 # loop for reasons unrelated to what's being tested here.
                 result = asyncio.run(self.ims.sync_repo(
@@ -1299,7 +1299,7 @@ class SyncRepoPreservesEmbeddingsOnChunkAndHashFailures(unittest.TestCase):
                     # CODE_EXTENSIONS, and this repo has no .gitignore to
                     # exclude it) doesn't get self-indexed as a "changed"
                     # file, which would throw off this test's exact counts.
-                    # Pre-existing, unrelated to issue #27/this PR.
+                    # Pre-existing, unrelated to this test.
                     include_extensions=".py",
                 ))
 
@@ -1335,7 +1335,7 @@ class SyncRepoPreservesEmbeddingsOnChunkAndHashFailures(unittest.TestCase):
 
 
 class ManifestSelfIndex(unittest.TestCase):
-    """Issue #91: .qdrant_index_manifest.json has a .json extension that
+    """.qdrant_index_manifest.json has a .json extension that
     matches CODE_EXTENSIONS, so iter_files yields it when the repo's
     .gitignore doesn't list it. The manifest content (a flat map of
     file->sha256) gets embedded as source and perpetually looks "changed"
@@ -1367,7 +1367,7 @@ class ManifestSelfIndex(unittest.TestCase):
             self.assertIn("main.py", names)
             self.assertIn(self.MANIFEST, names, (
                 "Without extra_exclude_files the manifest is yielded -- "
-                "this confirms the bug scenario from issue #91 is real"
+                "this confirms the bug scenario is real"
             ))
 
     # --- Verify the fix -----------------------------------------------------
@@ -1429,7 +1429,7 @@ class ManifestSelfIndex(unittest.TestCase):
 
     def test_ingest_mcp_server_constant_matches_expected_filename(self):
         """Guards the filename constant -- if MANIFEST_FILENAME ever changes,
-        this fails loudly rather than silently re-exposing the bug (issue #91)."""
+        this fails loudly rather than silently re-exposing the bug."""
         tools_dir = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"
         )
@@ -1448,7 +1448,7 @@ class ManifestSelfIndex(unittest.TestCase):
 
 
 class IterEntries(unittest.TestCase):
-    """iter_entries() is a generator variant of build_entries() (issue #57) --
+    """iter_entries() is a generator variant of build_entries() --
     same content, but yields chunks one at a time rather than accumulating the
     whole repo into memory upfront. Errors are yielded as (None, (rel, err))
     sentinels instead of accumulated into a separate list."""
@@ -1523,7 +1523,7 @@ class IterEntries(unittest.TestCase):
 
     def test_is_a_generator_not_a_list(self):
         # Confirms iter_entries() returns a generator object rather than a
-        # pre-built list -- the whole point of issue #57 is that chunks flow
+        # pre-built list -- the whole point is that chunks flow
         # out incrementally, not after all files are processed.
         import types
         with tempfile.TemporaryDirectory() as d:
@@ -1536,7 +1536,7 @@ class IterEntries(unittest.TestCase):
 class PhpHashCommentScanning(unittest.TestCase):
     """PHP's '#' line comment must be treated as a comment when ext='.php'
     and must NOT be treated as one for other brace-block languages where '#'
-    has a different meaning (issue #138).
+    has a different meaning.
 
     The bug: _strip_c_style_line had no language-specific handling for '#',
     so a PHP comment like '# }' was parsed as a real closing brace by
@@ -1664,7 +1664,7 @@ class PhpHashCommentScanning(unittest.TestCase):
 
 
 class SharedIngestDefaults(unittest.TestCase):
-    """Issue #276: parse_csv_set/ingest_env_defaults/MANIFEST_FILENAME moved
+    """parse_csv_set/ingest_env_defaults/MANIFEST_FILENAME moved
     into the lib so ingest_mcp_server.py and ingest_to_qdrant.py resolve them
     identically. Imported lazily via the module so a missing helper fails
     the test rather than the whole file's import."""

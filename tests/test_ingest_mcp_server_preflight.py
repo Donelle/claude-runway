@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for index_repo's pre-flight duplicate-point warning (issue #58).
+"""Tests for index_repo's pre-flight duplicate-point warning.
 
 Stdlib-only (unittest, no pytest) and no network -- all QdrantClient,
 FastEmbedProvider, store_batch, and iter_entries calls are mocked so these
@@ -229,8 +229,8 @@ class IndexRepoPreflightWarningTest(unittest.TestCase):
         # concern (test_ingest_mcp_server_memory_bank_guards.py /
         # test_qdrant_model_check.py) -- not what this test is pinning.
         # _make_collection_info only sets points_count, so the real check's
-        # unconfigured vectors_config now correctly fails closed (PR #178
-        # review, seventh pass) rather than silently passing; patch it out here.
+        # unconfigured vectors_config now correctly fails closed
+        # rather than silently passing; patch it out here.
         with self._patch_client(client), \
              patch.object(_ims, "check_embedding_model_mismatch", return_value=None):
             result = _run(_ims.index_repo(

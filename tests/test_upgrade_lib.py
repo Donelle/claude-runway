@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for libs/upgrade_lib.py (issue #225's `upgrade` subcommand).
+"""Tests for libs/upgrade_lib.py (the `upgrade` subcommand).
 
 Stdlib-only (unittest, no pytest) and no network -- exercises the REAL
 templates in this repo (`templates/mcp.json.template`/`settings.json.
@@ -18,7 +18,7 @@ declined migration reappearing on the next run.
 
 Also pins the specific real-world regression `_apply_record_session_id_
 hooks_missing`'s own docstring describes: a project that adopted
-local-compress BEFORE #198 shipped has a REAL `compress_output.py`
+local-compress BEFORE the session-id hook shipped has a REAL `compress_output.py`
 PostToolUse block and no core block at all -- applying this migration must
 ADD the core block without touching that existing one.
 """
@@ -113,15 +113,15 @@ class MemoryBankServerMissing(unittest.TestCase):
         self.assertFalse(migration.detect(after_mcp, {}))
 
     def test_apply_preserves_a_customized_embedding_model(self):
-        # Pins the CURRENT, legacy behavior (issue #458), not a desired
+        # Pins the CURRENT, legacy behavior, not a desired
         # contract: the migration copies the code-index block's
         # EMBEDDING_MODEL into the new memory-bank block. That copy came from
-        # the Copilot review on PR #227 (build_mcp_servers' embedding_model
+        # the Copilot review (build_mcp_servers' embedding_model
         # parameter defaults to blank and the migration doesn't pass it, so
         # without the copy a hand-customized project got the template
-        # default). Since #428 memory-bank's model is independent of the
-        # code-index model, so this assertion should change when #458 is
-        # fixed.
+        # default). Memory-bank's model is independent of the
+        # code-index model, so this assertion should change when that copy is
+        # removed.
         migration = _migration("memory-bank-server-missing")
         before = {
             "mcpServers": {
@@ -148,7 +148,7 @@ class MemoryBankServerMissing(unittest.TestCase):
 
 
 class CodebaseIndexerMemoryBankCollectionMissing(unittest.TestCase):
-    """Issue #346: `upgrade` never added MEMORY_BANK_COLLECTION to an existing
+    """`upgrade` never added MEMORY_BANK_COLLECTION to an existing
     codebase-indexer block, leaving index_repo/sync_repo's memory-bank guard
     protecting only the default name for a project with a custom one."""
 
@@ -253,7 +253,7 @@ class RecordSessionIdHooksMissing(unittest.TestCase):
 
     def test_apply_adds_core_blocks_without_touching_existing_compress_hook(self):
         # Regression guard for the exact scenario _apply_record_session_id_
-        # hooks_missing's own docstring describes: a pre-#198 project with a
+        # hooks_missing's own docstring describes: a project from before the session-id hook, with a
         # REAL compress_output.py PostToolUse block and NO core block.
         # A naive merge_settings_hooks-based apply would delete this block --
         # this must not happen.
@@ -325,7 +325,7 @@ class RecordSessionIdHooksMissing(unittest.TestCase):
         self.assertIn("record_session_id.py", scripts)
 
     def test_detect_true_when_only_session_end_is_registered(self):
-        # Regression for the finding from Copilot review on PR #227: a
+        # Regression for the finding from Copilot review: a
         # single boolean "does record_session_id.py appear ANYWHERE"
         # treated this partially-configured state as already up to date,
         # even though SessionStart -- the event that actually creates/
@@ -353,8 +353,8 @@ class RecordSessionIdHooksMissing(unittest.TestCase):
         self.assertTrue(migration.detect({}, settings_json))
 
     def test_detect_true_when_old_posttooluse_wildcard_present_but_sessionstart_absent(self):
-        # A project configured by issue #198 (old PostToolUse '.*' design)
-        # before issue #231 shipped: has PostToolUse+SessionEnd but not
+        # A project configured with the old PostToolUse '.*' design,
+        # before SessionStart replaced it: has PostToolUse+SessionEnd but not
         # SessionStart -- the PostToolUse entry doesn't count for that event,
         # so _RECORD_SESSION_ID_EVENTS still has SessionStart missing.
         migration = _migration("record-session-id-hooks-missing")
@@ -415,7 +415,7 @@ class ObsoleteMigrationsAreGone(unittest.TestCase):
 
 
 class RecordSessionIdSessionstart(unittest.TestCase):
-    """Tests for the record-session-id-sessionstart migration (issue #231):
+    """Tests for the record-session-id-sessionstart migration:
     removes the stale PostToolUse '.*' block for record_session_id.py."""
 
     def test_detect_true_when_posttooluse_wildcard_present_for_record_session_id(self):
@@ -461,7 +461,7 @@ class RecordSessionIdSessionstart(unittest.TestCase):
 
     # Helper: a minimal SessionStart block to satisfy the safety guard -- the apply
     # function requires SessionStart to be present before it removes the PostToolUse
-    # fallback (PR #232 Copilot review finding).
+    # fallback.
     _SESSION_START_BLOCK = {"hooks": [{"args": ["/x/hooks/record_session_id.py"]}]}
 
     def test_apply_removes_only_the_wildcard_record_session_id_block(self):
@@ -519,7 +519,7 @@ class RecordSessionIdSessionstart(unittest.TestCase):
         self.assertIn(user_block, after_settings["hooks"]["PostToolUse"])
 
     def test_apply_is_noop_when_sessionstart_absent(self):
-        # Regression guard for the finding from Copilot review on PR #232:
+        # Regression guard for the finding from Copilot review:
         # if the user declines record-session-id-hooks-missing (the migration that
         # adds SessionStart) but accepts this removal, the apply must be a safe
         # no-op -- leaving the PostToolUse '.*' block in place rather than
@@ -543,7 +543,7 @@ class RecordSessionIdSessionstart(unittest.TestCase):
         self.assertTrue(migration.detect({}, after_settings))
 
     def test_apply_preserves_unrelated_inner_hook_in_the_same_wildcard_block(self):
-        # Regression guard for the finding from Copilot review on PR #232: a
+        # Regression guard for the finding from Copilot review: a
         # user who manually added a second inner hook to the same '.*' block
         # (sharing it with the toolkit's record_session_id.py entry) must not
         # have their custom hook silently deleted by this migration.  Only the
@@ -824,7 +824,7 @@ class QdrantServerReplaced(unittest.TestCase):
 
 class PendingMigrations(unittest.TestCase):
     def test_all_pending_on_a_fully_stale_project(self):
-        # A project with the old PostToolUse '.*' block (issue #198 config)
+        # A project with the old PostToolUse '.*' block (the original config)
         # plus no memory-bank and the third-party qdrant server: every
         # migration pending.
         mcp_json = {
@@ -864,7 +864,7 @@ class PendingMigrations(unittest.TestCase):
 
 
 class IsProjectConfigured(unittest.TestCase):
-    """`is_project_configured` (Copilot review, PR #227): the CLI-level and
+    """`is_project_configured`: the CLI-level and
     run_upgrade-internal guard against `upgrade` writing broken partial
     config into a directory that was never `init`'d."""
 
@@ -911,10 +911,10 @@ class RunUpgradeEndToEnd(unittest.TestCase):
         self._write_stale_config()
 
     def _write_stale_config(self):
-        # A project configured by issues #175/#198/#221 but BEFORE #231:
-        # has memory-bank absent (pre-#175) and the third-party qdrant server, plus
+        # A project configured before SessionStart replaced PostToolUse:
+        # has memory-bank absent and the third-party qdrant server, plus
         # the OLD PostToolUse '.*' registration for record_session_id.py
-        # (issue #198's original design, superseded by SessionStart in #231).
+        # (the original design, superseded by SessionStart).
         # This exercises every migration in one end-to-end run.
         (self.target_repo / ".mcp.json").write_text(
             json.dumps(
@@ -946,7 +946,7 @@ class RunUpgradeEndToEnd(unittest.TestCase):
                     "hooks": {
                         "PostToolUse": [
                             {
-                                "matcher": ".*",  # stale record_session_id.py registration (issue #198)
+                                "matcher": ".*",  # stale record_session_id.py registration
                                 "hooks": [
                                     {
                                         "type": "command",
@@ -1112,7 +1112,7 @@ class RunUpgradeEndToEnd(unittest.TestCase):
         self.assertEqual([i for i, _ in seen], list(range(1, len(MIGRATIONS) + 1)))
 
     def test_refuses_a_brand_new_never_configured_project(self):
-        # Regression for the finding from Copilot review on PR #227: an
+        # Regression for the finding from Copilot review: an
         # earlier version treated a missing/empty .mcp.json the same as
         # "{}", so every migration's detect() fired unconditionally and
         # wrote a BROKEN partial config (a qdrant server block with no
@@ -1153,7 +1153,7 @@ class RunUpgradeEndToEnd(unittest.TestCase):
 
 
 class RunUpgradeWritesOnlyChangedFiles(unittest.TestCase):
-    """Issue #278: run_upgrade must write only the documents an applied
+    """run_upgrade must write only the documents an applied
     migration actually changed, and must not report a no-op apply as applied."""
 
     _MCP_COMPACT = '{"mcpServers":{"qdrant":{"command":"/x/bin/mcp-server-qdrant","env":{"COLLECTION_NAME":"p"}}}}'
@@ -1401,7 +1401,7 @@ class AnalyticsServerMissing(unittest.TestCase):
 
 
 class CompressHookRenamed(unittest.TestCase):
-    """Issue #395: compress_bash_output.py -> compress_output.py."""
+    """compress_bash_output.py -> compress_output.py."""
 
     OLD = "/old/tools-repo/hooks/compress_bash_output.py"
     NEW = "/old/tools-repo/hooks/compress_output.py"
@@ -1468,7 +1468,7 @@ class CompressHookRenamed(unittest.TestCase):
         self.assertEqual(out["hooks"]["PostToolUse"], [{"matcher": "Bash", "hooks": [{"args": [self.NEW]}]}])
 
     def test_legacy_hook_with_a_different_matcher_is_renamed_not_dropped(self):
-        # Copilot review (PR #402): a legacy Bash block next to a new-named
+        # Copilot review: a legacy Bash block next to a new-named
         # Grep block is not a duplicate; dropping it disabled Bash compression.
         m = _migration("compress-hook-renamed")
         settings = self._settings(

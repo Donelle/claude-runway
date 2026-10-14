@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Computes the wheel's `data_files` list at BUILD time (issue #206) --
+Computes the wheel's `data_files` list at BUILD time --
 supplements pyproject.toml's static `[project]`/`[tool.setuptools]` tables
 with the one thing PEP 621 has no declarative equivalent for: shipping
 libs/, tools/, hooks/, templates/, and skills/ as wheel DATA files under

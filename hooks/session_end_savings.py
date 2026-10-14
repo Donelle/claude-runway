@@ -10,16 +10,16 @@ Verified against Claude Code v2.1.218: SessionEnd supports `systemMessage`
 (not `additionalContext`, which SessionEnd does NOT support) as the way to
 show text to the user, and receives session_id/transcript_path/cwd/reason on
 stdin. The summary shows exact characters before and after compression and the
-percent reduction (issue #438), and -- when the transcript opt-in below is on --
-the same split per model, with a token figure labelled as derived (issue #440); see libs/savings_ledger.py's module docstring
+percent reduction, and -- when the transcript opt-in below is on --
+the same split per model, with a token figure labelled as derived; see libs/savings_ledger.py's module docstring
 for why the counterfactual behind it is observed online, not a measured A/B
 delta (EVALUATION.md Track D covers that distinction).
 
 No-op (silent, zero output) when CLAUDE_RUNWAY_TRACK_SAVINGS is off, or when
 this session logged no credited compression events -- an empty summary isn't
 worth printing every time a session ends. Either way (tracking on), it first
-silently rolls up any OTHER session's ledger orphaned by a crash (issue #306,
-see savings_ledger.recover_orphaned_sessions) -- that never prints anything.
+silently rolls up any OTHER session's ledger orphaned by a crash (see
+savings_ledger.recover_orphaned_sessions) -- that never prints anything.
 
 Setup: register in .claude/settings.json (see settings.json.template):
 {
@@ -67,8 +67,8 @@ def main():
     # Force UTF-8 on stdin before the read: Claude Code sends the payload as
     # UTF-8, but Windows Python defaults stdin to the locale codepage
     # (cp1252), under which a cp1252-unmappable byte raises UnicodeDecodeError
-    # -- a ValueError the guard below swallows into a silent fail-open (issue
-    # #263). Guarded because a non-reconfigurable stream (e.g. io.StringIO in
+    # -- a ValueError the guard below swallows into a silent fail-open.
+    # Guarded because a non-reconfigurable stream (e.g. io.StringIO in
     # the unit tests) has no reconfigure(); fail open rather than crash.
     _reconfigure = getattr(sys.stdin, "reconfigure", None)
     if _reconfigure is not None:
@@ -90,7 +90,7 @@ def main():
     if not session_id:
         sys.exit(0)
 
-    # Issue #306: roll up any OTHER session's ledger that was orphaned by a
+    # Roll up any OTHER session's ledger that was orphaned by a
     # crash/force-kill (it never got a SessionEnd of its own, so this hook is
     # the only chance it has of reaching savings.db). Runs before the
     # "nothing logged this session" exit below on purpose -- recovery mustn't
@@ -103,7 +103,7 @@ def main():
     except Exception:
         pass
 
-    # Any artifact, not just the ledger (#306): a roll-up of this session that
+    # Any artifact, not just the ledger: a roll-up of this session that
     # failed or died can have left only a claim of it, which recovery skips
     # for the session that is ending -- so this hook must still take it.
     # Guarded like the rest of this hook: any error here fails open (exit 0,
@@ -118,14 +118,14 @@ def main():
 
     # Parse actual token counts from the transcript if the opt-in env var is set.
     # parse_session_token_counts also folds in this session's subagent
-    # transcripts (#364) -- transcript_path alone is only the MAIN session's file.
+    # transcripts -- transcript_path alone is only the MAIN session's file.
     # Fails open -- any parse failure leaves actual_tokens as None. None means
     # "no new counts": finalize_owned_session writes 0s for a session with no
     # row yet, and keeps the counts an existing row already has (a resumed
     # session's earlier roll-up) rather than zeroing them.
-    # STOPGAP: remove when #164 is resolved (Stop hook will expose these directly).
+    # STOPGAP: remove once the Stop hook payload exposes these token counts directly.
     actual_tokens = None
-    # Issue #440: the same opt-in also lets the hook join each compression event to
+    # The same opt-in also lets the hook join each compression event to
     # the model and turn it happened under (from the same transcript), read here,
     # before the roll-up takes savings.db's write lock. None means no per-model
     # rows: no transcript, or the opt-in is off.
@@ -140,7 +140,7 @@ def main():
     # crashed hook or a missing systemMessage at normal session shutdown.
     try:
         project = savings_ledger.project_name_from_cwd(cwd)
-        # finalize_owned_session, not finalize_session (#306): the same
+        # finalize_owned_session, not finalize_session: the same
         # ownership protocol orphan recovery uses -- serialized on savings.db's
         # write lock, and rolling up this session's ledger TOGETHER with any
         # claim of it a failed/dead recovery left behind, since rolling them
@@ -152,7 +152,7 @@ def main():
         if not session_agg:
             sys.exit(0)
         session_agg["project"] = project
-        # #307: events existing isn't enough to print -- `event_count` counts
+        # Events existing isn't enough to print -- `event_count` counts
         # CREDITED events only (see _write_session_rows), so a fetch_url-only
         # session (logged but never credited) rolls up into the perpetual
         # store above but stays silent here instead of printing an all-zero

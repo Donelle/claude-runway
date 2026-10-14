@@ -36,7 +36,7 @@ class ClientOptionalTimeout(unittest.TestCase):
 
 
 class ClientIsAlwaysBounded(unittest.TestCase):
-    """Issue #301: build_client() used to pass neither timeout nor max_retries, so
+    """build_client() used to pass neither timeout nor max_retries, so
     the OpenAI SDK's own defaults (600s read timeout, 2 retries) let a
     reachable-but-hung LM Studio stall the PostToolUse hook for ~30 minutes.
     Invariant under test: every client is built with a finite timeout and
@@ -66,7 +66,7 @@ class ClientIsAlwaysBounded(unittest.TestCase):
         self.assertEqual(c.max_retries, 0)
 
     def test_invalid_explicit_timeout_falls_back_to_bounded_default(self):
-        """PR #361 review: the explicit-arg path must apply the same
+        """The explicit-arg path must apply the same
         finite-and-positive rule as the env var, not bypass it."""
         import local_compress_lib as L
         for bad in (float("inf"), float("nan"), 0, -1):

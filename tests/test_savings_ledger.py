@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Tests for libs/savings_ledger.py -- current_session_id()'s optional
-project filter and record_event()'s project field (issue #35), and the
-PRAGMA user_version schema migration scaffold in _connect() (issue #30/#69).
+project filter and record_event()'s project field, and the
+PRAGMA user_version schema migration scaffold in _connect().
 
-This module had ZERO test coverage before this file (also separately
-tracked as issue #40) -- these tests are scoped to the bugs the PRs that
+This module had ZERO test coverage before this file (tracked
+separately) -- these tests are scoped to the bugs the PRs that
 added them actually fixed, not a full audit of the module.
 
 Stdlib-only (unittest, no pytest) and no network:
@@ -17,7 +17,7 @@ sibling module) so nothing here ever touches the real
 ~/.claude/claude-runway/ store, and _sessions_dir() -- derived from
 resolve_db_path().parent -- lands under that temp dir too.
 
-Issue #213: current_session_id(project=...) now delegates to
+current_session_id(project=...) now delegates to
 session_id_lib.session_id(SessionIdStrategy.SHADOW_FILE, ...), which scans
 its OWN, separately-resolved (session_id_lib._sessions_dir(), hardcoded to
 ~/.claude/claude-runway/sessions -- see that module's docstring) marker
@@ -57,7 +57,7 @@ class SavingsLedgerTestCase(unittest.TestCase):
         self._env_patch = mock.patch.dict(os.environ, {"CLAUDE_RUNWAY_SAVINGS_DB": str(db_path)})
         self._env_patch.start()
 
-        # Issue #213: session_id_lib's own sessions dir is independent of
+        # session_id_lib's own sessions dir is independent of
         # CLAUDE_RUNWAY_SAVINGS_DB (see module docstring above) -- redirect it
         # to the SAME temp dir savings_ledger's own _sessions_dir() resolves
         # to above, so current_session_id(project=...)'s delegation is both
@@ -91,7 +91,7 @@ class RecordEventProjectField(SavingsLedgerTestCase):
 
     def test_project_defaults_to_none(self):
         # Matches the pre-fix JSONL shape (no project key at all, in effect).
-        # Issue #213: this field no longer drives current_session_id()'s
+        # This field no longer drives current_session_id()'s
         # project-filtered lookup at all (that now reads session_id_lib's
         # shadow markers instead) -- kept as a data-integrity guard so an
         # omitted project is stored honestly as None, not fabricated.
@@ -101,11 +101,11 @@ class RecordEventProjectField(SavingsLedgerTestCase):
 
 
 class CurrentSessionIdProjectFilter(SavingsLedgerTestCase):
-    """The core of issue #35's fix: current_session_id(project=...) must not
+    """The core of the fix: current_session_id(project=...) must not
     hand back a real, unrelated session just because its marker happens to be
     the most recently modified file in the shared sessions dir.
 
-    Issue #213: the project-FILTERED cases below now set up their fixtures
+    The project-FILTERED cases below now set up their fixtures
     via session_id_lib.record_shadow_marker() (what the CORE
     hooks/record_session_id.py hook actually writes) rather than
     L.record_event() (this module's own transient compression-event log),
@@ -135,7 +135,7 @@ class CurrentSessionIdProjectFilter(SavingsLedgerTestCase):
         # a DIFFERENT project's session is the most recently modified marker,
         # but the caller asked for a specific project -- it must not be
         # substituted in.
-        # Use recent relative timestamps so issue #236's stale-marker fallback
+        # Use recent relative timestamps so the stale-marker fallback
         # does not fire (markers within TTL are returned directly, not
         # passed to TRANSCRIPT_SCAN): sess-other is 30s more recent than
         # sess-mine, but sess-mine is still well within the 168h TTL.
@@ -170,12 +170,12 @@ class CurrentSessionIdProjectFilter(SavingsLedgerTestCase):
 
 
 class SessionIdDelegatesToSessionIdLibTest(SavingsLedgerTestCase):
-    """Issue #213: current_session_id(project=...) must come from
+    """current_session_id(project=...) must come from
     libs/session_id_lib.py's SessionIdStrategy.SHADOW_FILE rather than this
     module re-implementing its own marker scan -- asserting on the exact
     returned session_id (not just "some session_id came back") is what
-    actually proves delegation happened, matching PR #218's precedent for the
-    sibling PROXY-strategy migration (issue #214)."""
+    actually proves delegation happened, matching the precedent for the
+    sibling PROXY-strategy migration."""
 
     def test_matches_session_id_lib_directly_for_the_same_project(self):
         session_id_lib.record_shadow_marker("sess-abc", project="claude-runway")
@@ -187,7 +187,7 @@ class SessionIdDelegatesToSessionIdLibTest(SavingsLedgerTestCase):
 
 
 class ShadowMarkersAreNeverLedgers(SavingsLedgerTestCase):
-    """Issue #273: session_id_lib's `session_<id>.jsonl` shadow markers share
+    """session_id_lib's `session_<id>.jsonl` shadow markers share
     the default sessions dir with this module's `<id>.jsonl` ledgers (the
     base class points both modules at the same temp dir, as in a default
     install). The unfiltered current_session_id() used to return the newest
@@ -237,7 +237,7 @@ class ShadowMarkersAreNeverLedgers(SavingsLedgerTestCase):
 def _old_schema_db_path(db_path: Path) -> None:
     """Builds a `sessions` table matching the schema from before
     raw_tokens_sum/out_tokens_sum/overhead_tokens existed, plus one
-    pre-existing row -- the exact shape issue #30 is about. `session_tools`/
+    pre-existing row -- the exact shape the migration is about. `session_tools`/
     `meta` are deliberately NOT created here either, to also exercise
     _connect()'s CREATE TABLE IF NOT EXISTS for those two."""
     conn = sqlite3.connect(str(db_path))
@@ -261,7 +261,7 @@ def _old_schema_db_path(db_path: Path) -> None:
 
 
 class SchemaMigration(SavingsLedgerTestCase):
-    """Issue #30/#69: a pre-existing savings.db from before
+    """a pre-existing savings.db from before
     raw_chars_sum/out_chars_sum existed must not make
     finalize_session raise sqlite3.OperationalError -- and the migration
     scaffold itself must be safe to run against a DB that already has the
@@ -281,7 +281,7 @@ class SchemaMigration(SavingsLedgerTestCase):
         conn = sqlite3.connect(str(self._db_path()))
         columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()}
         self.assertTrue({"raw_chars_sum", "out_chars_sum"} <= columns)
-        # Issue #439: the schema-overhead estimate column is gone.
+        # The schema-overhead estimate column is gone.
         self.assertNotIn("overhead_tokens", columns)
         self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], L.SCHEMA_VERSION)
         conn.close()
@@ -300,7 +300,7 @@ class SchemaMigration(SavingsLedgerTestCase):
         ).fetchone()
         conn.close()
         # 42 saved tokens -> 147 chars via v6's tokens x 3.5 backfill; the token
-        # columns themselves are gone after v7 (issue #438).
+        # columns themselves are gone after v7.
         self.assertEqual(row, ("old-project", 147, 0, 0))
 
     def test_brand_new_db_gets_latest_schema_and_version_immediately(self):
@@ -363,7 +363,7 @@ class SchemaMigration(SavingsLedgerTestCase):
 
 
 class MigrationTransactionSafety(SavingsLedgerTestCase):
-    """PR #94 review (Copilot): the version check, migration execution, and
+    """The version check, migration execution, and
     PRAGMA user_version write must be one atomic transaction (BEGIN
     IMMEDIATE ... COMMIT/ROLLBACK) -- a failure partway through must undo
     everything, including any ALTER TABLE a migration already ran, rather
@@ -470,8 +470,8 @@ class MigrationTransactionSafety(SavingsLedgerTestCase):
 
 
 class FormatDetailViewAcrossProjectsTotal(unittest.TestCase):
-    """format_detail_view's "Across projects · all time" grand-total row
-    (#95). Pure-function tests -- format_detail_view takes plain dicts/lists
+    """format_detail_view's "Across projects · all time" grand-total row.
+    Pure-function tests -- format_detail_view takes plain dicts/lists
     and returns a string, so no CLAUDE_RUNWAY_SAVINGS_DB fixture is needed
     (unlike the sqlite-backed query functions above).
     """
@@ -521,7 +521,7 @@ class FormatDetailViewAcrossProjectsTotal(unittest.TestCase):
 
 
 class PerToolRawTokensAccumulation(SavingsLedgerTestCase):
-    """Issue #65: raw_chars_sum, out_chars_sum, and credited_event_count
+    """raw_chars_sum, out_chars_sum, and credited_event_count
     accumulated per tool so avg % reduction can be computed and displayed.
     Tests the accumulation logic in both finalize_session (DB path) and
     get_live_session_aggregate (JSONL path).
@@ -602,7 +602,7 @@ class PerToolRawTokensAccumulation(SavingsLedgerTestCase):
 
 
 class PerToolAvgPctFormat(unittest.TestCase):
-    """Issue #65: format_detail_view must show avg % reduction per credited
+    """format_detail_view must show avg % reduction per credited
     tool. Pure-function tests -- no DB, no temp dir needed.
     """
 
@@ -701,7 +701,7 @@ class PerToolAvgPctFormat(unittest.TestCase):
 
 class SchemaMigrationV2V3(SavingsLedgerTestCase):
     """Schema migrations: v2 adds the raw-size column and v3 the out-size column
-    plus credited_event_count to session_tools (issue #65 and follow-up); v6/v7
+    plus credited_event_count to session_tools; v6/v7
     later turn the size columns into raw_chars_sum/out_chars_sum, which these
     tests assert on.
     Mirrors the shape of existing SchemaMigration tests for v1.
@@ -787,7 +787,7 @@ class SchemaMigrationV2V3(SavingsLedgerTestCase):
 
 
 class QueryAllProjectsRicherStats(SavingsLedgerTestCase):
-    """Issue #68/#438: query_all_projects() returns, per project, the characters
+    """query_all_projects() returns, per project, the characters
     before/after/saved and best_tool -- pure DB-layer tests that exercise the SQL
     directly."""
 
@@ -884,7 +884,7 @@ class QueryAllProjectsRicherStats(SavingsLedgerTestCase):
 
 
 class FormatDetailViewCrossProjectRicherStats(unittest.TestCase):
-    """Issue #68/#438: format_detail_view shows characters before/after, percent
+    """format_detail_view shows characters before/after, percent
     reduction and best_tool in the 'Across projects' block when present.
     Pure-function tests -- no DB or temp dir needed."""
 
@@ -1000,7 +1000,7 @@ class FormatJson(unittest.TestCase):
         self.assertEqual(sess["raw_chars_sum"], 5000)
         self.assertEqual(sess["event_count"], 7)
         self.assertEqual(sess["fetch_url_count"], 2)
-        self.assertNotIn("overhead_tokens", sess)  # issue #439
+        self.assertNotIn("overhead_tokens", sess)  # column dropped in v8
 
     def test_project_summary_values_are_correct(self):
         parsed = json.loads(self._render())
@@ -1243,7 +1243,7 @@ class FormatCsv(unittest.TestCase):
 
 
 class QueryTrend(SavingsLedgerTestCase):
-    """Issue #67: query_trend groups sessions by day or week bucket."""
+    """query_trend groups sessions by day or week bucket."""
 
     def test_weekly_buckets_group_same_week_together(self):
         # Two sessions on 2026-09-07 (Mon) and 2026-09-09 (Wed) are in the
@@ -1272,7 +1272,7 @@ class QueryTrend(SavingsLedgerTestCase):
         self.assertEqual(rows[0]["total_saved_chars"], 300)
 
     def test_weekly_buckets_iso_year_boundary_not_split(self):
-        # Regression guard for the %Y-W%W bug Copilot identified in PR #157:
+        # Regression guard for the %Y-W%W bug Copilot identified:
         # 2024-12-30 (Mon) and 2025-01-01 (Wed) are BOTH in ISO week 2025-W01
         # (the week containing the first Thursday of 2025). The broken %Y/%W
         # format would produce 2024-W53 and 2025-W00, splitting them into two
@@ -1386,7 +1386,7 @@ class QueryTrend(SavingsLedgerTestCase):
 
 
 class FormatTrendView(unittest.TestCase):
-    """Issue #67/#438: format_trend_view must render a sparkline + table of
+    """format_trend_view must render a sparkline + table of
     characters before/after and percent reduction for the bucketed trend data
     returned by query_trend.
     Pure-function tests — no DB or temp dir needed.
@@ -1515,7 +1515,7 @@ class ParseTranscriptTokenCounts(unittest.TestCase):
             import os as _os; _os.unlink(path)
 
     def test_dedups_lines_sharing_a_message_id(self):
-        """#298: one line per content block, all repeating the turn's usage."""
+        """One line per content block, all repeating the turn's usage."""
         path = self._make_transcript([
             # Turn A: text block + two tool_use blocks = 3 lines, same usage.
             self._assistant(inp=10, out=5, cr=100, cw=20, msg_id="msg_A"),
@@ -1600,7 +1600,7 @@ class ParseTranscriptTokenCounts(unittest.TestCase):
 
 
 class ParseSessionTokenCounts(unittest.TestCase):
-    """parse_session_token_counts (#364): main transcript + subagent transcripts.
+    """parse_session_token_counts: main transcript + subagent transcripts.
 
     Builds the real on-disk layout Claude Code uses --
     <tmp>/<session_id>.jsonl  and  <tmp>/<session_id>/subagents/agent-<id>.jsonl
@@ -1692,7 +1692,7 @@ class ParseSessionTokenCounts(unittest.TestCase):
         self.assertIsNone(L.parse_session_token_counts(self.main))
 
     def test_dedup_is_scoped_per_file_not_across_files(self):
-        # #298 collapses one turn's per-content-block lines WITHIN a file. The same
+        # The dedup collapses one turn's per-content-block lines WITHIN a file. The same
         # message.id in two different files is two separate transcripts' turns.
         self._write(self.main, [
             self._assistant(inp=10, msg_id="same"),
@@ -1709,7 +1709,7 @@ class ParseSessionTokenCounts(unittest.TestCase):
 
 
 class RecordEventAgentFields(SavingsLedgerTestCase):
-    """Issue #365: record_event writes agent_id/agent_type only when present."""
+    """record_event writes agent_id/agent_type only when present."""
 
     def test_omitted_when_absent_so_old_shape_is_unchanged(self):
         L.record_event("s", "hook:Bash", 1000, 100, True, "cmd")
@@ -1810,7 +1810,7 @@ class AggregateByAgent(unittest.TestCase):
 
 
 class SessionAgentsRollup(SavingsLedgerTestCase):
-    """Issue #365: finalize_session persists the per-agent split; schema v5."""
+    """finalize_session persists the per-agent split; schema v5."""
 
     def _mixed_session(self, sid="s1"):
         L.record_event(sid, "hook:Bash", 1000, 100, True, "main cmd")
@@ -1889,7 +1889,7 @@ class SessionAgentsRollup(SavingsLedgerTestCase):
 
 
 class FormatDetailViewByAgent(unittest.TestCase):
-    """Issue #365: the "Main session vs subagents" block in /my-savings detail."""
+    """The "Main session vs subagents" block in /my-savings detail."""
 
     _PROJECT_SUMMARY = {"project": "proj"}
 
@@ -1921,7 +1921,7 @@ class FormatDetailViewByAgent(unittest.TestCase):
         self.assertNotIn("Main session vs subagents", self._render([self._row(0, "", 1000, 2)]))
 
     def test_block_absent_when_by_agent_missing_or_empty(self):
-        # Old-shape aggregates (and every pre-#365 caller) don't carry by_agent.
+        # Old-shape aggregates (and every older caller) don't carry by_agent.
         self.assertNotIn("Main session vs subagents", self._render(None))
         self.assertNotIn("Main session vs subagents", self._render([]))
 
@@ -1930,7 +1930,7 @@ class FormatDetailViewByAgent(unittest.TestCase):
         self.assertNotIn("subagent · my-agent", out)
 
     def test_block_absent_when_the_only_subagent_activity_saved_nothing(self):
-        # Regression for the Copilot review on PR #367: a subagent whose only
+        # Regression for the Copilot review: a subagent whose only
         # activity was uncredited (e.g. fetch_url) has a by_agent row with 0
         # saved / 0 credited events -- that must NOT render a block of
         # zeros, even though the main session did earn savings.
@@ -1953,7 +1953,7 @@ class FormatDetailViewByAgent(unittest.TestCase):
 
 
 class SchemaMigrationV4(SavingsLedgerTestCase):
-    """Schema migration v4: actual_* token columns added to sessions (issue #165)."""
+    """Schema migration v4: actual_* token columns added to sessions."""
 
     def _db_path(self) -> Path:
         return L.resolve_db_path()
@@ -2048,7 +2048,7 @@ class SchemaMigrationV4(SavingsLedgerTestCase):
         self.assertEqual(result["actual_cache_write_tokens"],  30)
 
     def test_schema_version_includes_v4(self):
-        # Was `== 4`; every later bump (v5 for #365) would otherwise have to edit
+        # Was `== 4`; every later bump (v5 onwards) would otherwise have to edit
         # this test just to keep asserting that v4's migration is still present.
         self.assertGreaterEqual(L.SCHEMA_VERSION, 4)
         self.assertIn(4, L._MIGRATIONS)
@@ -2095,7 +2095,7 @@ class FormatActualTokenBlock(unittest.TestCase):
         self.assertIn("5.00×", joined)
 
     def test_no_compression_rate_line_even_when_saved_nonzero(self):
-        # Issue #436: the line divided an estimate by a measurement; it must
+        # The line divided an estimate by a measurement; it must
         # not come back, whether or not savings were credited.
         for saved in (300, 0):
             lines = L._format_actual_token_block(self._agg(inp=100, out=50, cr=1000, cw=200, saved=saved))
@@ -2131,7 +2131,7 @@ class FormatActualTokenBlock(unittest.TestCase):
 
 
 class ActualTokensReadPath(SavingsLedgerTestCase):
-    """Issue #167: actual_* token counts written by finalize_session must be
+    """actual_* token counts written by finalize_session must be
     readable via query_last_n_sessions and visible in format_detail_view /
     format_json in a subsequent session.
 
@@ -2275,7 +2275,7 @@ class ActualTokensReadPath(SavingsLedgerTestCase):
 
 
 class OrphanedLedgerRecovery(SavingsLedgerTestCase):
-    """Issue #306: a session that never reached a graceful SessionEnd (crash,
+    """a session that never reached a graceful SessionEnd (crash,
     force-kill) left its <session_id>.jsonl ledger behind forever -- its
     credited savings never reached savings.db and nothing deleted the file.
     recover_orphaned_sessions() rolls up and deletes any ledger older than the
@@ -2391,7 +2391,7 @@ class OrphanedLedgerRecovery(SavingsLedgerTestCase):
         return claim
 
     def test_append_after_claim_survives_in_a_fresh_ledger(self):
-        # PR #412 review (round 1): an append racing the recovery used to be
+        # An append racing the recovery used to be
         # deleted with the file. The ledger is renamed to a claim before it's
         # read, so the append lands in a NEW ledger at the old path.
         L.record_event("busy", "compress_file", 1000, 100, True, project="proj")
@@ -2418,7 +2418,7 @@ class OrphanedLedgerRecovery(SavingsLedgerTestCase):
         self.assertEqual(self._session_row("snap")["credited_saved_chars"], 900)
 
     def test_second_owner_finds_nothing_and_leaves_the_row_alone(self):
-        # PR #412 review (round 1): a second finalizer re-reading a ledger the
+        # a second finalizer re-reading a ledger the
         # first had already consumed wrote an all-zero row over it.
         L.record_event("x", "compress_file", 1000, 100, True, project="proj")
         self._age("x", self.ttl_seconds + 60)
@@ -2429,7 +2429,7 @@ class OrphanedLedgerRecovery(SavingsLedgerTestCase):
         self.assertEqual((row["credited_saved_chars"], row["event_count"]), (900, 1))
 
     def test_finalizers_are_serialized_on_the_db_write_lock(self):
-        # PR #412 review (round 3): per-file claims let two workers each own
+        # per-file claims let two workers each own
         # part of one session. Ownership is now savings.db's write lock: while
         # another finalizer holds it, nobody can take this session's files.
         L.record_event("x", "compress_file", 1000, 100, True, project="proj")
@@ -2450,7 +2450,7 @@ class OrphanedLedgerRecovery(SavingsLedgerTestCase):
         self.assertEqual(L.recover_orphaned_sessions(now=self.now), 1)  # once the lock is free
 
     def test_leftover_claim_and_later_ledger_roll_up_together(self):
-        # PR #412 review (round 2): a roll-up dies after claiming, the session
+        # a roll-up dies after claiming, the session
         # then writes a fresh ledger, and later both are stale. Rolled up one
         # file at a time, INSERT OR REPLACE kept only the last file's events.
         L.record_event("s", "compress_file", 1000, 100, True, project="proj")  # saves 900
@@ -2465,7 +2465,7 @@ class OrphanedLedgerRecovery(SavingsLedgerTestCase):
         self.assertFalse(path.exists())
 
     def test_graceful_end_includes_its_own_leftover_claim(self):
-        # PR #412 review (round 3): the SessionEnd hook excludes its own
+        # The SessionEnd hook excludes its own
         # session from recovery, so it must roll up that session's leftover
         # claim itself -- otherwise a later sweep finalized the old claim on
         # its own and replaced the newer row with the older subset.
@@ -2511,7 +2511,7 @@ class OrphanedLedgerRecovery(SavingsLedgerTestCase):
                 row["actual_cache_read_tokens"], row["actual_cache_write_tokens"])
 
     def test_recovered_then_resumed_session_accumulates(self):
-        # PR #412 review (round 5): a crashed session is recovered (900), later
+        # a crashed session is recovered (900), later
         # resumed, and its next clean end used to REPLACE the row with only
         # the resumed events (200) -- the recovered savings were lost again.
         L.record_event("s", "compress_file", 1000, 100, True, project="proj")
@@ -2590,7 +2590,7 @@ class OrphanedLedgerRecovery(SavingsLedgerTestCase):
         self.assertEqual(leftover, 0)  # bookkeeping cleaned up once the files are gone
 
     def test_recovered_project_is_the_newest_events_not_the_last_file_read(self):
-        # PR #412 review (round 6): artifacts are listed by filename, so the
+        # Artifacts are listed by filename, so the
         # ledger "s.jsonl" is read before the older "s.jsonl.claimed-*", and
         # taking the last event in list order filed the row under the OLD
         # claim's project after the resumed session moved projects.
@@ -2617,7 +2617,7 @@ class OrphanedLedgerRecovery(SavingsLedgerTestCase):
                                             {"ts": "2026-01-03T00:00:00Z", "project": ""}]), "a")
 
     def test_claim_only_session_counts_as_having_artifacts(self):
-        # PR #412 review (round 4): the SessionEnd hook checked only the
+        # The SessionEnd hook checked only the
         # ledger, so a session whose only artifact was a leftover claim exited
         # before its own finalize (and recovery skips the ending session).
         L.record_event("c", "compress_file", 1000, 100, True, project="proj")
@@ -2662,7 +2662,7 @@ class OrphanedLedgerRecovery(SavingsLedgerTestCase):
 
 
 class ExactCharCountsAndToolUseId(SavingsLedgerTestCase):
-    """Issues #437/#438: exact character counts and the tool-call id are the only
+    """Exact character counts and the tool-call id are the only
     size fields recorded, rolled up at SessionEnd and in orphan recovery. A
     pre-v6 database migrates with a tokens x 3.5 backfill, then v7 drops the
     estimated-token columns."""
@@ -2691,8 +2691,8 @@ class ExactCharCountsAndToolUseId(SavingsLedgerTestCase):
         self.assertNotIn("tool_use_id", none)
 
     def _append_legacy_event(self, session_id):
-        """A line as a pre-#438 build wrote it: estimated tokens (and, from #437,
-        sometimes chars) but none of the fields this version reads."""
+        """A line as an older build wrote it: estimated tokens (and,
+        sometimes, chars) but none of the fields this version reads."""
         path = L._session_jsonl_path(session_id)
         legacy = {"ts": "2026-10-01T00:00:00Z", "tool": "hook:Bash", "raw_tokens": 10, "out_tokens": 10,
                   "saved_tokens": 0, "credited": True, "source": "", "project": None}
@@ -2836,7 +2836,7 @@ class ExactCharCountsAndToolUseId(SavingsLedgerTestCase):
             cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
             self.assertFalse(cols & dropped, (table, cols & dropped))
         # Real transcript usage is NOT an estimate and stays. (The schema-overhead
-        # estimate column went in v8, issue #439 -- see SchemaOverheadRemovedV8.)
+        # estimate column went in v8 -- see SchemaOverheadRemovedV8.)
         row = conn.execute(
             "SELECT actual_input_tokens, event_count FROM sessions WHERE session_id = 'known'"
         ).fetchone()
@@ -2923,7 +2923,7 @@ class ExactCharCountsAndToolUseId(SavingsLedgerTestCase):
 
 
 class ConsistentCharacterFigures(SavingsLedgerTestCase):
-    """PR #446 review: the figures shown together must describe the same events
+    """The figures shown together must describe the same events
     (counted events only), the saving must agree with the before/after beside it,
     and history with no recorded size must be reported as left out rather than
     folded into a total that looks complete."""
@@ -3142,7 +3142,8 @@ class ConsistentCharacterFigures(SavingsLedgerTestCase):
         self.assertEqual(L.query_project_summary("p")["best_session_chars"], 40)
 
     def test_v7_migration_reconstructs_v6_rows_whose_tokens_exceed_their_characters(self):
-        # After #437 a not-yet-restarted MCP server still sent token-only footers and the
+        # After character counts were added, a not-yet-restarted MCP server still sent
+        # token-only footers and the
         # hook recorded them, so a v6 row can be token-only (characters 0) or mixed
         # (characters partial). Dropping the token columns must not lose that.
         self._make_v6_db()
@@ -3272,7 +3273,7 @@ class ConsistentCharacterFigures(SavingsLedgerTestCase):
 
 
 class FormatSimpleViewCharacters(unittest.TestCase):
-    """Issue #438: the simple view (and so the SessionEnd summary) reports exact
+    """The simple view (and so the SessionEnd summary) reports exact
     characters before and after compression and the percent reduction -- never an
     estimated token count."""
 
@@ -3312,7 +3313,7 @@ class FormatSimpleViewCharacters(unittest.TestCase):
         self.assertRegex("\n".join(self._lines(session=session)), r"Reduction\s+0%\s+\(3 events\)")
 
     def test_no_tool_overhead_line_even_when_the_aggregate_carries_one(self):
-        # Issue #439: the "Tool overhead .../turn" line is gone. A stray
+        # The "Tool overhead .../turn" line is gone. A stray
         # overhead_tokens key (e.g. from an older caller) must not bring it back.
         session = dict(self._SESSION, overhead_tokens=2500)
         text = "\n".join(self._lines(session=session))
@@ -3321,7 +3322,7 @@ class FormatSimpleViewCharacters(unittest.TestCase):
 
 
 class SchemaOverheadRemovedV8(SavingsLedgerTestCase):
-    """Issue #439: `sessions.overhead_tokens` and the `schema_overhead_tokens` meta
+    """`sessions.overhead_tokens` and the `schema_overhead_tokens` meta
     row held a chars / 3.5 estimate of a per-turn cost real transcripts show is not
     paid (the tools are deferred). v8 drops them; the rest of each row survives."""
 

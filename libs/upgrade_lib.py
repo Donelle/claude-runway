@@ -1,5 +1,5 @@
 """
-Shared logic behind `tools/setup_project.py upgrade` (issue #225) -- a config
+Shared logic behind `tools/setup_project.py upgrade` -- a config
 MIGRATION tool for an already-configured project, distinct from `init`
 (`libs/setup_project_lib.py`'s `run_setup`). `init` is safe to re-run in the
 sense that it never clobbers UNRELATED config, but it still resets every
@@ -96,7 +96,7 @@ class Migration:
 
 
 # ---------------------------------------------------------------------------
-# memory-bank-server-missing (feature: #175)
+# memory-bank-server-missing
 # ---------------------------------------------------------------------------
 
 
@@ -132,23 +132,23 @@ def _apply_memory_bank_server_missing(
     matching what a fresh `init` run does when `--memory-bank-id` isn't
     passed.
 
-    KNOWN LEGACY BEHAVIOR (issue #458): `EMBEDDING_MODEL` is copied from the
+    KNOWN LEGACY BEHAVIOR: `EMBEDDING_MODEL` is copied from the
     existing `qdrant`/`codebase-indexer` block instead of being left at what
     `build_mcp_servers` bakes in from the CURRENT `mcp.json.template`
-    (`build_mcp_servers`'s `embedding_model` parameter, added for issue #279,
+    (`build_mcp_servers`'s `embedding_model` parameter
     defaults to blank, so every server it generates inherits the template's
     own default -- and this migration doesn't pass it). That copy was added
-    after a Copilot review on PR #227: a project whose `qdrant`/
+    after a Copilot review: a project whose `qdrant`/
     `codebase-indexer` blocks were hand-customized to a non-default model
     (see README's Known limitations) got a freshly-added `memory-bank` block
     pinned to the template's default, which can mismatch the model that
     created the shared `memory-bank` collection (`docs/memory-bank.md`: the
     collection locks in whichever `EMBEDDING_MODEL` created it first).
-    Since issue #428, though, memory-bank's model is its own value,
+    Memory-bank's model is now its own value,
     independent of the code-index model, so the copy is not a correct source
     either and can produce the same mismatch the other way round;
     `memory_bank_mcp_server.py` reports such a mismatch loudly rather than
-    returning wrong results. Issue #458 tracks the fix.
+    returning wrong results.
     """
     mcp_json = copy.deepcopy(mcp_json)
     servers = mcp_json.setdefault("mcpServers", {})
@@ -182,7 +182,7 @@ def _apply_memory_bank_server_missing(
 
 
 # ---------------------------------------------------------------------------
-# codebase-indexer-memory-bank-collection-missing (fix: #346)
+# codebase-indexer-memory-bank-collection-missing
 # ---------------------------------------------------------------------------
 
 
@@ -226,17 +226,17 @@ def _apply_indexer_memory_bank_collection_missing(
 
 
 # ---------------------------------------------------------------------------
-# record-session-id-hooks-missing (feature: #198)
+# record-session-id-hooks-missing
 # ---------------------------------------------------------------------------
 
 
-# The two events record_session_id.py must be registered under (issues
-# #198, #231): SessionStart creates/refreshes libs/session_id_lib.py's
+# The two events record_session_id.py must be registered under:
+# SessionStart creates/refreshes libs/session_id_lib.py's
 # SHADOW_FILE marker once per session lifecycle event (startup/resume/
 # clear/compact/fork), SessionEnd deletes it on graceful exit.  Both
 # matter independently -- see _missing_record_session_id_events below.
-# PostToolUse was the original event (#198) but was replaced by SessionStart
-# (#231) to eliminate the ~400ms-per-tool-call Python startup overhead on
+# PostToolUse was the original event but was replaced by SessionStart
+# to eliminate the ~400ms-per-tool-call Python startup overhead on
 # Windows.  Projects still carrying the old PostToolUse '.*' registration
 # are handled by the separate record-session-id-sessionstart migration below.
 _RECORD_SESSION_ID_EVENTS = ("SessionStart", "SessionEnd")
@@ -255,13 +255,13 @@ def _missing_record_session_id_events(settings_json: dict) -> "list[str]":
     Which of `_RECORD_SESSION_ID_EVENTS` still lack a record_session_id.py
     registration -- checked PER EVENT, not "does record_session_id.py
     appear ANYWHERE in settings_json's hooks at all". Found in Copilot
-    review on PR #227 and confirmed by reproducing it directly: an earlier,
+    review and confirmed by reproducing it directly: an earlier,
     single boolean `_has_record_session_id_hook` treated the migration as
     already-applied the moment EITHER event had the registration, so a
     partially-configured project with only a SessionEnd entry (no
     SessionStart) permanently skipped the repair -- SessionStart is the one
-    that actually creates/refreshes the marker (issue #231; PostToolUse was
-    the original event from issue #198), so that project's SHADOW_FILE
+    that actually creates/refreshes the marker (PostToolUse was
+    the original event), so that project's SHADOW_FILE
     strategy would silently never populate at all, forever, since `detect`
     would keep reporting "nothing to do" on every future `upgrade` run too.
     """
@@ -284,7 +284,7 @@ def _apply_record_session_id_hooks_missing(
     `SessionStart`'s must get only `SessionStart` added -- appending BOTH
     unconditionally would duplicate the one that's already there (see
     `_missing_record_session_id_events`'s own docstring for the real-world
-    scenario this fixes, found in Copilot review on PR #227).
+    scenario this fixes, found in Copilot review).
 
     Deliberately does NOT go through `setup_project_lib.merge_settings_hooks`
     (unlike what an earlier draft of this migration, following the issue's
@@ -293,12 +293,12 @@ def _apply_record_session_id_hooks_missing(
     generated dict, then re-add only what was just generated" semantics is
     exactly right for `init`, which regenerates every toolkit-owned block on
     every run, but wrong here: this migration's own `detect` fires precisely
-    for a project that adopted local-compress BEFORE #198 shipped, i.e. one
+    for a project that adopted local-compress BEFORE the session-id hook shipped, i.e. one
     whose PostToolUse already has a REAL `compress_output.py` block and
     no separate CORE block at all (the template's own SessionStart entry for
     record_session_id.py didn't exist yet when that project was set up --
-    it was originally a PostToolUse entry, replaced by SessionStart in
-    issue #231).  Calling `build_settings_hooks(..., include_compress=False)`
+    it was originally a PostToolUse entry, replaced by SessionStart).
+    Calling `build_settings_hooks(..., include_compress=False)`
     and merging the result would treat PostToolUse as "generated -> only the
     core block" and, via `merge_settings_hooks`'s strip-then-replace logic,
     silently DELETE that project's real, working `compress_output.py`
@@ -465,15 +465,15 @@ def _apply_qdrant_server_replaced(
 
 
 # ---------------------------------------------------------------------------
-# record-session-id-sessionstart (fix: #231)
+# record-session-id-sessionstart
 # ---------------------------------------------------------------------------
 
 
 def _detect_record_session_id_posttooluse_wildcard(mcp_json: dict, settings_json: dict) -> bool:
     """
     True when .claude/settings.json still has the OLD PostToolUse '.*' block
-    for record_session_id.py (issue #198's original registration, superseded
-    by SessionStart in issue #231).  Detects by matcher value AND script name
+    for record_session_id.py (the original registration, superseded
+    by SessionStart).  Detects by matcher value AND script name
     so a user's own unrelated '.*' PostToolUse block isn't falsely flagged.
     """
     for block in settings_json.get("hooks", {}).get("PostToolUse", []):
@@ -491,12 +491,12 @@ def _apply_record_session_id_posttooluse_wildcard(
     """
     Removes only the record_session_id.py INNER HOOK entry from any PostToolUse
     block whose matcher is '.*' -- the stale registration that fired a Python
-    subprocess (~400ms on Windows) on every single tool call (issue #231).
+    subprocess (~400ms on Windows) on every single tool call.
     Operates at INNER-HOOK granularity (same as _strip_toolkit_owned_inner_hooks
     in setup_project_lib.py), not whole-block: if a user manually added another
     inner hook to the same '.*' block, only the record_session_id.py entry is
     removed and the block survives with the remaining content intact (confirmed
-    as the data-loss-safe behaviour by Copilot review on PR #232).  A block
+    as the data-loss-safe behaviour by Copilot review).  A block
     that contained ONLY the record_session_id.py entry is dropped entirely,
     leaving 'PostToolUse: []' rather than removing the key -- consistent with
     _strip_toolkit_owned_inner_hooks.  An empty PostToolUse array is harmless.
@@ -506,7 +506,7 @@ def _apply_record_session_id_posttooluse_wildcard(
     its replacement is in place (see inline comment below).  Re-run after
     record-session-id-hooks-missing has added the SessionStart block.
     """
-    # Safety guard (PR #232 Copilot review): only remove the stale PostToolUse
+    # Safety guard: only remove the stale PostToolUse
     # '.*' block if a SessionStart registration for record_session_id.py is
     # ALREADY PRESENT in the current (in-memory) settings_json.  Without this
     # guard, a user who declines record-session-id-hooks-missing (the migration
@@ -531,7 +531,7 @@ def _apply_record_session_id_posttooluse_wildcard(
             # in setup_project_lib.py) so a user who manually added their own hook
             # to the same '.*' block doesn't lose it.  A whole-block drop would only
             # be correct if the block contained ONLY the record_session_id.py entry --
-            # confirmed as the real failure mode by Copilot review on PR #232.
+            # confirmed as the real failure mode by Copilot review.
             remaining_inner = [
                 hook for hook in block.get("hooks", [])
                 if not any(Path(a).name == "record_session_id.py" for a in hook.get("args", []))
@@ -548,7 +548,7 @@ def _apply_record_session_id_posttooluse_wildcard(
 
 
 # ---------------------------------------------------------------------------
-# compress-hook-renamed (refactor: #395)
+# compress-hook-renamed
 # ---------------------------------------------------------------------------
 
 
@@ -557,7 +557,7 @@ def _is_script_hook(hook: dict, script_name: str) -> bool:
 
 
 def _detect_compress_hook_renamed(mcp_json: dict, settings_json: dict) -> bool:
-    """True when ANY hook, under any event, still invokes the pre-#395
+    """True when ANY hook, under any event, still invokes the pre-rename
     `compress_bash_output.py` -- a path that no longer exists in the toolkit
     repo, so that hook now fails on every tool call."""
     for blocks in settings_json.get("hooks", {}).values():
@@ -584,7 +584,7 @@ def _apply_compress_hook_renamed(mcp_json: dict, settings_json: dict, ctx: Migra
     block itself survives if it still holds anything else). Scoped to the
     matcher, not the whole event: a legacy `Bash` block beside a new-named
     `Grep` block is NOT a duplicate -- dropping it would silently disable
-    Bash compression (Copilot review, PR #402).
+    Bash compression.
     """
     settings_json = copy.deepcopy(settings_json)
     for blocks in settings_json.get("hooks", {}).values():
@@ -754,7 +754,7 @@ MIGRATIONS: "list[Migration]" = [
         kind="add",
         description=(
             "This project's .mcp.json has no 'memory-bank' server configured -- durable, cross-session "
-            "remember/recall/forget storage (issue #175) isn't available here yet. Adds the memory-bank "
+            "remember/recall/forget storage isn't available here yet. Adds the memory-bank "
             "server block, reusing this project's existing qdrant server's QDRANT_URL/QDRANT_API_KEY."
         ),
         note=(
@@ -775,8 +775,8 @@ MIGRATIONS: "list[Migration]" = [
         description=(
             "This project's codebase-indexer server has no MEMORY_BANK_COLLECTION in its env, so "
             "index_repo/sync_repo's guard against touching the shared memory-bank collection only "
-            "protects the default name -- unprotected if your memory-bank server uses a custom one "
-            "(issue #346). Adds the key, copied from the memory-bank server's own value if present, "
+            "protects the default name -- unprotected if your memory-bank server uses a custom one. "
+            "Adds the key, copied from the memory-bank server's own value if present, "
             'else "memory-bank".'
         ),
         note="",
@@ -789,7 +789,7 @@ MIGRATIONS: "list[Migration]" = [
         kind="add",
         description=(
             "No hook entry in this project's .claude/settings.json references record_session_id.py for "
-            "SessionStart or SessionEnd -- the CORE/base-install hook (issues #198, #231) that keeps "
+            "SessionStart or SessionEnd -- the CORE/base-install hook that keeps "
             "libs/session_id_lib.py's SHADOW_FILE session-id strategy populated isn't running here yet. "
             "Adds the SessionStart + SessionEnd blocks; any other existing hooks (including local-compress's "
             "own) are left completely untouched."
@@ -830,8 +830,8 @@ MIGRATIONS: "list[Migration]" = [
         kind="remove",
         description=(
             "This project's .claude/settings.json has the old PostToolUse '.*' registration for "
-            "record_session_id.py (issue #198), which fires a Python subprocess (~400ms on Windows) on "
-            "EVERY tool call. Issue #231 replaced it with a SessionStart hook that fires exactly once per "
+            "record_session_id.py, which fires a Python subprocess (~400ms on Windows) on "
+            "EVERY tool call. It was replaced by a SessionStart hook that fires exactly once per "
             "session lifecycle event (startup/resume/clear/compact/fork). Removes the stale '.*' block; "
             "any other PostToolUse hooks are left completely untouched. Run 'claude-runway-setup upgrade' "
             "first to add the SessionStart block if it isn't present yet."
@@ -851,7 +851,7 @@ MIGRATIONS: "list[Migration]" = [
         kind="update",
         description=(
             "This project's .claude/settings.json still runs hooks/compress_bash_output.py, which was "
-            "renamed to hooks/compress_output.py (issue #395) -- the old path no longer exists, so "
+            "renamed to hooks/compress_output.py -- the old path no longer exists, so "
             "output compression silently stops working. Rewrites just the script filename in each such "
             "hook; the venv path, tools-repo directory, matcher, and every other hook are left untouched."
         ),
@@ -928,8 +928,8 @@ def is_project_configured(target_repo: "Path | str") -> bool:
     (`init` is what a brand-new project needs first) -- without this check,
     every migration's own `detect` fires on an effectively-empty `{}` (a
     missing `.mcp.json` is treated the same as one with no keys at all) and
-    happily writes a BROKEN partial config: found in Copilot review on PR
-    #227 and confirmed live, `upgrade <empty-dir> --auto-yes` wrote a
+    happily writes a BROKEN partial config: found in Copilot review and confirmed live,
+    `upgrade <empty-dir> --auto-yes` wrote a
     `qdrant` server block with an `env` but no `command`/`type` at all --
     plus a default `memory-bank` block, for a directory that had never been
     `init`'d.
@@ -1073,7 +1073,7 @@ def run_upgrade(
             continue
         new_mcp, new_settings = migration.apply(mcp_json, settings_json, ctx)
         # Diff each document against its pre-apply value so we know what this
-        # migration ACTUALLY touched (issue #278). Migrations deep-copy before
+        # migration ACTUALLY touched. Migrations deep-copy before
         # mutating, so comparing by value is reliable.
         mcp_changed = new_mcp != mcp_json
         settings_changed = new_settings != settings_json
@@ -1103,7 +1103,7 @@ def run_upgrade(
         print(f"\nDry run: no changes written. {len(pending)} pending upgrade(s) would be applied.")
         return applied
 
-    # Write only documents some applied migration actually changed (issue #278):
+    # Write only documents some applied migration actually changed:
     # an unconditional both-file write would materialize a settings.json a
     # --skip-hooks project opted out of, and re-indent an untouched .mcp.json.
     if mcp_dirty:

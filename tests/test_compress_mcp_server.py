@@ -6,9 +6,9 @@ nor a real database:
 
     .venv/bin/python -m unittest discover -s tests
 
-Originally written for issue #22 (the startup schema-overhead estimate
-enumerated a hardcoded tool tuple that silently went stale); that estimate is
-gone (issue #439) and RegisteredToolSet keeps the live-enumeration guard.
+Originally written because the startup schema-overhead estimate
+enumerated a hardcoded tool tuple that silently went stale; that estimate is
+gone and RegisteredToolSet keeps the live-enumeration guard.
 """
 
 import codecs
@@ -51,8 +51,8 @@ def _run(coro):
 class RegisteredToolSet(unittest.TestCase):
     """Pins the server's registered tool set and checks the shared live count
     sees a tool added later. This used to be tested through
-    _log_fixed_overhead() (issue #22: a hardcoded 5-tool tuple silently went
-    stale); that startup estimate was removed in issue #439, but the failure
+    _log_fixed_overhead() (a hardcoded 5-tool tuple silently went
+    stale); that startup estimate has since been removed, but the failure
     mode it guarded -- a tool list that drifts from what is really registered --
     is still real for tools/report_tool_counts.py, which uses the same
     libs/mcp_tool_introspect.py enumeration."""
@@ -92,20 +92,20 @@ class RegisteredToolSet(unittest.TestCase):
         self.assertIn("_newly_added_probe_tool", mcp_tool_introspect.describe_tools(mod.mcp))
 
     def test_no_schema_overhead_estimate_is_computed_or_stored(self):
-        # Issue #439: the chars / 3.5 estimate and its meta row are gone.
+        # The chars / 3.5 estimate and its meta row are gone.
         mod = _load_compress_mcp_server()
         self.assertFalse(hasattr(mod, "_log_fixed_overhead"))
         self.assertFalse(hasattr(mod.savings_ledger, "get_schema_overhead_tokens"))
 
 
 class CompressCommandOutputDefaultsToRedaction(unittest.TestCase):
-    """Regression coverage for issue #46: compress_command_output never
+    """Regression coverage: compress_command_output never
     exposed preserve_identifiers or preserve_sections, so its call into the
     shared compress() pipeline always used both flags' defaults
     (preserve_identifiers=False, preserve_sections=False) -- and
     redact_and_disclose() (libs/local_compress_lib.py) only runs credential
-    redaction when at least one of those two is True (PR #135 review, round
-    4 -- initially gated on preserve_identifiers alone, widened to either
+    redaction when at least one of those two is True
+    (initially gated on preserve_identifiers alone, widened to either
     flag once round 4 caught preserve_sections=True falling through to the
     same ungated whole-text path on unstructured input). That left the tool
     most likely to see a raw secret (curl output, printenv, config dumps)
@@ -158,7 +158,7 @@ class CompressCommandOutputDefaultsToRedaction(unittest.TestCase):
         self.assertFalse(captured["preserve_identifiers"])
 
     def test_preserve_sections_still_defaults_off_and_is_passed_through(self):
-        # preserve_sections isn't part of issue #46's finding, but since this
+        # preserve_sections isn't part of the finding, but since this
         # tool now exposes both flags (matching compress_text's pattern),
         # confirm the second flag's own default/pass-through isn't broken by
         # the same change.
@@ -185,7 +185,7 @@ class CompressCommandOutputDefaultsToRedaction(unittest.TestCase):
         # BODY's redaction specifically -- the savings footer's "source"
         # field (a separate leak vector: the raw command line itself, which
         # is also now redacted -- see SavingsFooterRedactsSourceCredentials
-        # below, PR #135 review round 3) is exercised by its own dedicated
+        # below) is exercised by its own dedicated
         # test instead. Passing it via an env var keeps the command line
         # itself secret-free while still producing the secret in stdout.
         os.environ["CLAUDE_RUNWAY_TEST_SECRET"] = secret
@@ -222,7 +222,7 @@ class CompressCommandOutputDefaultsToRedaction(unittest.TestCase):
         self.assertIn("credential-shaped value(s) redacted", result)
 
     def test_redaction_still_runs_under_the_real_default_threshold(self):
-        # PR #135 review (Copilot): the end-to-end test above used
+        # The end-to-end test above used
         # skip_if_under_chars=0 specifically to route through the main
         # compression pipeline, which masked a real gap -- command output
         # shorter than the DEFAULT 2000-char threshold hit compress()'s
@@ -253,7 +253,7 @@ class CompressCommandOutputDefaultsToRedaction(unittest.TestCase):
 
 
 class SavingsFooterRedactsSourceCredentials(unittest.TestCase):
-    """Regression coverage for PR #135 review, round 3 (Copilot):
+    """Regression coverage for a review finding, round 3 (Copilot):
     _append_savings_footer's "source" field echoed the raw caller-supplied
     value (compress_command_output passes the actual shell command)
     verbatim and unredacted into the savings footer -- so a command like
@@ -312,7 +312,7 @@ class SavingsFooterRedactsSourceCredentials(unittest.TestCase):
 
 
 class SavingsFooterCarriesExactChars(unittest.TestCase):
-    """Issues #437/#438: the footer carries exact character counts of raw_text and
+    """The footer carries exact character counts of raw_text and
     the returned outer_text, and no longer the chars / 3.5 token estimates."""
 
     def test_footer_has_exact_char_counts_and_no_token_estimates(self):
@@ -336,7 +336,7 @@ class _FakeStreamedResponse:
     the surface fetch_url actually touches (.headers, .raise_for_status(),
     .iter_content(), .close(), .encoding, .apparent_encoding, ._content, and
     the context-manager protocol fetch_url now uses via
-    `with requests.get(...) as resp:` -- PR #124 review) so no real network
+    `with requests.get(...) as resp:`) so no real network
     call happens. `body_chunks` is a list of byte strings handed back one at
     a time from .iter_content(), simulating a streamed download regardless
     of what Content-Length (if any) claimed up front. `raise_in_iter`, if
@@ -392,7 +392,7 @@ class _FakeStreamedResponse:
 
 
 class CompressFileDecodesWithoutSilentCorruption(unittest.TestCase):
-    """Regression coverage for issue #267: compress_file read files with
+    """Regression coverage: compress_file read files with
     errors="ignore", silently dropping non-UTF-8 bytes (cp1252 accents) and
     letting UTF-16 arrive NUL-interleaved."""
 
@@ -442,7 +442,7 @@ class CompressFileDecodesWithoutSilentCorruption(unittest.TestCase):
 
 
 class FetchUrlEnforcesSizeCap(unittest.TestCase):
-    """Regression coverage for issue #39: fetch_url used to call
+    """Regression coverage: fetch_url used to call
     requests.get() with no stream=True, no Content-Length check, and no
     size cap of any kind -- resp.text/resp.content fully materialized the
     body into memory unconditionally before max_total_chars (a
@@ -489,7 +489,7 @@ class FetchUrlEnforcesSizeCap(unittest.TestCase):
 
         self.assertNotIn("Error fetching", result)
         self.assertIn("Small page", result)
-        # PR #124 review fix: fetch_url now uses `with requests.get(...) as
+        # fetch_url now uses `with requests.get(...) as
         # resp:`, so the connection is released on every exit path,
         # including a normal successful fetch -- not just the early-return
         # error paths that used to call resp.close() explicitly.
@@ -508,7 +508,7 @@ class FetchUrlEnforcesSizeCap(unittest.TestCase):
         self.assertIn("Content-Length", result)
 
     def test_connection_is_closed_when_iteration_raises_mid_stream(self):
-        """PR #124 review (Copilot): a bare `resp = requests.get(...)` left
+        """a bare `resp = requests.get(...)` left
         the connection open on any exception from iter_content() (a normal
         read timeout or broken chunked response) -- those exceptions used to
         propagate straight past every resp.close() call in the function.
@@ -529,7 +529,7 @@ class FetchUrlEnforcesSizeCap(unittest.TestCase):
         self.assertTrue(fake_resp.closed)
 
     def test_invalid_server_declared_charset_falls_back_to_utf8_instead_of_crashing(self):
-        """PR #124 review (Copilot): resp.encoding is derived from a
+        """resp.encoding is derived from a
         server-controlled Content-Type header -- a value like
         `charset=invalid-bogus-charset` makes requests set resp.encoding to
         that literal (unvalidated) string. Decoding with an unknown codec
@@ -551,7 +551,7 @@ class FetchUrlEnforcesSizeCap(unittest.TestCase):
         self.assertIn("Still readable", result)
 
     def test_headerless_response_uses_detected_encoding_not_a_blind_utf8_default(self):
-        """PR #124 review round 2 (Copilot): when resp.encoding is None (no
+        """When resp.encoding is None (no
         Content-Type charset declared at all), the old resp.text path fell
         back to apparent_encoding (chardet/charset_normalizer detection over
         the full body), not a blind UTF-8 assumption. Reproduced directly:
@@ -582,7 +582,7 @@ class FetchUrlEnforcesSizeCap(unittest.TestCase):
         self.assertEqual(fake_resp._content, body)
 
     def test_charsetless_text_html_is_not_decoded_as_latin1(self):
-        """Issue #266: for a bare `Content-Type: text/html` (no charset
+        """For a bare `Content-Type: text/html` (no charset
         parameter) requests sets resp.encoding to the RFC 2616 legacy default
         "ISO-8859-1" -- truthy, so the apparent_encoding detection (which
         only ran for a falsy encoding) was skipped and a UTF-8 page decoded
@@ -605,7 +605,7 @@ class FetchUrlEnforcesSizeCap(unittest.TestCase):
         self.assertNotIn("Ã©", result)
 
     def test_explicit_iso_8859_1_charset_is_still_honored(self):
-        """Issue #266: an EXPLICIT `charset=iso-8859-1` is the server's real
+        """An EXPLICIT `charset=iso-8859-1` is the server's real
         declaration and must not be overridden by detection."""
         mod = _load_compress_mcp_server()
         body = "<html><body><p>Café au lait.</p></body></html>".encode("iso-8859-1")
@@ -624,7 +624,7 @@ class FetchUrlEnforcesSizeCap(unittest.TestCase):
 
 
 class ListLocalModelsReportsLoadedNotDownloaded(unittest.TestCase):
-    """Issue #296: list_local_models used to report every model
+    """list_local_models used to report every model
     /v1/models returned -- every DOWNLOADED model, not just loaded ones
     (LM Studio's default is JIT loading) -- which is misleading when the
     output is used directly as a model= value that must name something

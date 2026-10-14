@@ -1,4 +1,4 @@
-"""Tests for libs/autowork_cost_lib.py and tools/autowork_cost.py (issue #455).
+"""Tests for libs/autowork_cost_lib.py and tools/autowork_cost.py.
 Fixture transcripts in a temp dir only -- never the real ~/.claude/projects."""
 
 import contextlib

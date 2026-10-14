@@ -127,11 +127,11 @@ CREDENTIALS = [
     (_fake("AKIA", "IOSFODNN7EXAMPLE"), "AWS access key id"),
     (_fake("AIza", "SyD-abcdefghijklmnopqrstuvwxyz12"), "Google API key"),
     (_fake("eyJ", "hbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.dozjgNryP4J3jVmNHl0w5N"), "JWT"),
-    # Azure Databricks PAT (issue #62): "dapi" + exactly 32 hex chars.
+    # Azure Databricks PAT: "dapi" + exactly 32 hex chars.
     # Uses a dedicated pattern rather than _CREDENTIAL_PREFIXES to avoid
     # false-positives on ordinary identifiers that start with "dapi".
     (_fake("dapi", "abcdef1234567890abcdef1234567890"), "Azure Databricks PAT"),
-    # GCP OAuth2 refresh token (issue #62)
+    # GCP OAuth2 refresh token
     (_fake("1//", "0fAbCdEfGhIjKlMnOpQrStUvWxYz-AbCd"), "GCP OAuth2 refresh token"),
 ]
 
@@ -144,11 +144,11 @@ NOT_CREDENTIALS = [
     ("src/Validators/Order.cs", "a path"),
     ("_EXACT_CMDS", "a module constant"),
     ("skip_if_under_chars", "a parameter that merely starts with 'sk'"),
-    # issue #62: "dapi" is now matched only as dapi+32hex, NOT as a generic
+    # "dapi" is now matched only as dapi+32hex, NOT as a generic
     # prefix -- API handler names starting with "dapi" must not be redacted.
     ("dapi_request", "API handler name starting with 'dapi'"),
     ("dapi_handler", "another ordinary dapi-prefixed name"),
-    # issue #62: a 40-char git-style hex hash that begins with "dapi" must NOT
+    # a 40-char git-style hex hash that begins with "dapi" must NOT
     # match -- the right-boundary (?![A-Za-z0-9_]) prevents the {32} quantifier
     # from consuming the first 32 chars of a longer hex string.
     ("dapi" + "a" * 40, "a 40-char hex identifier that happens to start with dapi"),
@@ -164,9 +164,9 @@ NON_SELECTIVE = [
     ("  summarize this  ", "surrounding whitespace"),
     ("give me the gist", ""),
     ("Please summarize this.", "leading filler and trailing punctuation stripped"),
-    ("Just please summarize this.", "doubled filler: just + please (issue #42)"),
-    ("Please just summarize this.", "doubled filler: please + just (issue #42)"),
-    ("Can you please just summarize this.", "tripled filler: can you + please + just (issue #42)"),
+    ("Just please summarize this.", "doubled filler: just + please"),
+    ("Please just summarize this.", "doubled filler: please + just"),
+    ("Can you please just summarize this.", "tripled filler: can you + please + just"),
     ("what happened", ""),
     ("did it fail?", ""),
     ("pass or fail", ""),
@@ -219,7 +219,7 @@ class NonSelectiveFocus(unittest.TestCase):
 
 
 class NormalizeFocusDoubledFiller(unittest.TestCase):
-    """Issue #42: _normalize_focus's filler-stripping regex used to be
+    """_normalize_focus's filler-stripping regex used to be
     anchored at ^ but applied only ONCE (a single re.sub, not a loop or a
     repeating group), so a doubled politeness/imperative prefix only lost
     its first layer -- 'Just please summarize this.' normalized to
@@ -270,7 +270,7 @@ class PositionalFocus(unittest.TestCase):
                 self.assertTrue(_looks_positional(focus))
 
     def test_topical_focus_containing_positional_word_is_not_positional(self):
-        """Issue #299: substring matching treated these as positional and
+        """Substring matching treated these as positional and
         truncated the document to its first ~4000 chars."""
         for focus in ["how the abstract base class is used",
                       "what the introduction of retries changed",
@@ -281,7 +281,7 @@ class PositionalFocus(unittest.TestCase):
                 self.assertFalse(_looks_positional(focus))
 
     def test_default_web_focus_is_non_selective(self):
-        """Issue #299: fetch_url's own default must skip the classifier too."""
+        """fetch_url's own default must skip the classifier too."""
         self.assertTrue(_looks_non_selective(DEFAULT_WEB_FOCUS))
         self.assertFalse(_looks_positional(DEFAULT_WEB_FOCUS))
 
@@ -294,7 +294,7 @@ class PositionalFocus(unittest.TestCase):
 
 
 class FindFirstHeadingBoundary(unittest.TestCase):
-    """Issue #28: _find_first_heading_boundary only checked the line
+    """_find_first_heading_boundary only checked the line
     IMMEDIATELY adjacent to a candidate heading for "is this prose" --
     missing the standard Markdown convention of a blank line on either side
     of a heading (including this repo's own README), which silently fell
@@ -388,7 +388,7 @@ MUST_DETECT = [
     ("fixed OrderStatusNotificationRequestDtoValidator today",
      "OrderStatusNotificationRequestDtoValidator"),
     # 2-segment CamelCase, common in .NET-style names -- regression case for
-    # the {2,}->{1,} fix (issue #32): the old 3-hump minimum missed these.
+    # the {2,}->{1,} fix: the old 3-hump minimum missed these.
     ("restart UserService now", "UserService"),
     ("call GetUser first", "GetUser"),
     ("call compute_file_hashes on the repo", "compute_file_hashes"),
@@ -765,7 +765,7 @@ class SectionSplitting(unittest.TestCase):
 
 
 class DeriveCompactLabel(unittest.TestCase):
-    """Issue #72: derive_compact_label extracts a short, deterministic label
+    """derive_compact_label extracts a short, deterministic label
     from a structured compact summary without involving a model call."""
 
     def test_extracts_first_sentence_from_working_on_section(self):
@@ -780,7 +780,7 @@ class DeriveCompactLabel(unittest.TestCase):
 
     def test_wrapped_sentence_is_not_truncated_at_first_line_break(self):
         """Regression: a sentence that word-wraps to a second line must not be
-        cut at the first physical newline (Copilot review finding on PR #159).
+        cut at the first physical newline.
 
         The sentence terminator is on the second physical line, so the result
         must contain content from that line (not just the first line's text).
@@ -862,7 +862,7 @@ class DeriveCompactLabel(unittest.TestCase):
 
 
 class SplitProseBulletRuns(unittest.TestCase):
-    """Issue #61: split_prose_bullet_runs and section_has_mixed_runs.
+    """split_prose_bullet_runs and section_has_mixed_runs.
 
     The feature compresses only the prose portions of a mixed section, keeping
     bullet runs verbatim -- recovering compression ratio without weakening the
@@ -1025,7 +1025,7 @@ class SectionsAreNeverSilentlyDropped(unittest.TestCase):
 
 
 class CompressEarlyReturnDisclosure(unittest.TestCase):
-    """Issue #24: compress()'s early-return (text under skip_if_under_chars)
+    """compress()'s early-return (text under skip_if_under_chars)
     must disclose truncation rather than silently handing back a truncated
     slice indistinguishable from "the whole document was already this
     short." None of these reach LM Studio -- the early-return path returns
@@ -1078,7 +1078,7 @@ class CompressEarlyReturnDisclosure(unittest.TestCase):
         self.assertIn("pass max_chars explicitly", result)
 
     def test_no_false_truncation_note_when_limit_is_selected_but_not_reached(self):
-        # PR #85 review (Copilot): chars_limited/auto_truncated only mean a
+        # chars_limited/auto_truncated only mean a
         # limit was SELECTED, not that text[:max_chars] actually dropped
         # anything. A short positional input, or an explicit max_chars >=
         # len(text), must return completely unchanged -- no false claim of
@@ -1110,7 +1110,7 @@ class CompressEarlyReturnDisclosure(unittest.TestCase):
         ))
 
     def test_credential_under_threshold_is_still_redacted_when_preserving_identifiers(self):
-        # PR #135 review (Copilot): this early return happens BEFORE the
+        # This early return happens BEFORE the
         # main preserve_identifiers block further down in compress() ever
         # runs, so a caller that turns preserve_identifiers on specifically
         # to get credential redaction (compress_command_output's new
@@ -1134,7 +1134,7 @@ class CompressEarlyReturnDisclosure(unittest.TestCase):
     def test_credential_under_threshold_is_not_redacted_when_not_preserving_identifiers(self):
         # Confirms the fix is still gated on preserve_identifiers, matching
         # this function's documented "only in artifact-producing modes"
-        # tradeoff -- unrelated to issue #46/PR #135, just guarding against
+        # tradeoff -- unrelated to the redaction fix, just guarding against
         # accidentally making this unconditional.
         secret = "ghp_" + "a" * 36
         text = f"TOKEN={secret}"
@@ -1153,7 +1153,7 @@ class CompressEarlyReturnDisclosure(unittest.TestCase):
         self.assertNotIn(secret, result)
 
     def test_credential_under_threshold_is_still_redacted_when_preserving_sections_only(self):
-        # PR #135 review (Copilot), round 2: preserve_sections is also an
+        # Review (Copilot), round 2: preserve_sections is also an
         # artifact-producing mode -- the NORMAL (over-threshold)
         # _compress_each_section path always redacts unconditionally,
         # regardless of preserve_identifiers -- so gating this early-return
@@ -1244,7 +1244,7 @@ class SectionCompressionEndToEnd(unittest.TestCase):
         self.assertIn("Aligning the OA", out)
 
     def test_all_not_relevant_is_not_mistaken_for_an_outage(self):
-        # PR #134 review (Copilot): a NOT RELEVANT verdict is a valid,
+        # a NOT RELEVANT verdict is a valid,
         # successful response from a reachable model, not a request failure.
         # Every attempted section here gets that verdict -- compressed_count
         # is 0, same as a real outage -- but LM Studio answered every request
@@ -1258,7 +1258,7 @@ class SectionCompressionEndToEnd(unittest.TestCase):
         self.assertIn("Aligning the OA", out, "content is still fully preserved")
 
     def test_all_empty_responses_are_not_mistaken_for_an_outage(self):
-        # PR #134 review (Copilot): complete() returns None ONLY on a genuine
+        # complete() returns None ONLY on a genuine
         # request failure -- "" or whitespace-only text is a real, successful
         # response the model just happened to send nothing useful in. Every
         # attempted section here gets an empty response, so compressed_count
@@ -1279,7 +1279,7 @@ class SectionCompressionEndToEnd(unittest.TestCase):
                 self.assertIn("Aligning the OA", out, "content is still fully preserved")
 
     def test_total_outage_prepends_an_unambiguous_warning(self):
-        # issue #43: both prose sections in COMPACT_TEMPLATE fail (the model
+        # Both prose sections in COMPACT_TEMPLATE fail (the model
         # call itself failed, not a NOT RELEVANT verdict) and nothing else was
         # ever sent to the model (the other four sections are verbatim) --
         # this is a real total outage and must be distinguishable from a
@@ -1294,7 +1294,7 @@ class SectionCompressionEndToEnd(unittest.TestCase):
         self.assertNotIn("Error:", out, "the content-preserving fallback is not a hard error")
 
     def test_total_outage_warning_does_not_falsely_claim_content_is_unchanged(self):
-        # PR #134 review (Copilot), round 3: redact_and_disclose() runs over
+        # Review (Copilot), round 3: redact_and_disclose() runs over
         # the WHOLE result regardless of why a section fell back to its
         # original body, so a credential-shaped value inside a fallback
         # section during a total outage is still replaced -- the warning
@@ -1419,12 +1419,12 @@ class SectionCompressionEndToEnd(unittest.TestCase):
 
 
 class MainPathTruncationNoteGatesOnWasTruncated(unittest.TestCase):
-    """Issue #300: the main (over-threshold) whole-text path's two truncation
+    """The main (over-threshold) whole-text path's two truncation
     notes (the success footer and the no-relevant-chunks error) gated on
     auto_truncated, which only means a positional limit was SELECTED. A
     positional-focus input shorter than that limit is sliced as a no-op, so
-    the "only the first N chars were considered" claim was false. PR #85
-    fixed the same class of bug on the under-threshold early return only."""
+    the "only the first N chars were considered" claim was false. An
+    earlier fix covered the same class of bug on the under-threshold early return only."""
 
     def setUp(self):
         clear_compression_cache()
@@ -1461,7 +1461,7 @@ class MainPathTruncationNoteGatesOnWasTruncated(unittest.TestCase):
         self.assertIn("focus looked positional", out)
 
     def test_cache_does_not_leak_note_between_truncated_and_untruncated_inputs(self):
-        # Copilot review on PR #393: the cache key is built from the already-
+        # Copilot review: the cache key is built from the already-
         # sliced text, so a longer input and a window-sized input with the
         # same first N chars used to share a key. Run the truncated one first
         # (no cache clear in between) and the untruncated one must still get
@@ -1477,7 +1477,7 @@ class MainPathTruncationNoteGatesOnWasTruncated(unittest.TestCase):
 
 
 class WholeTextFallbackRedactsWithEitherPreservationFlag(unittest.TestCase):
-    """Regression coverage for PR #135 review, round 4 (Copilot):
+    """Regression coverage for a review finding, round 4 (Copilot):
     preserve_sections=True falls through to the ORDINARY whole-text
     compression path (chunk_text -> classify/compress -> the
     `if preserve_identifiers:`-gated block) whenever
@@ -1608,12 +1608,12 @@ class TrailingSummaryRepair(unittest.TestCase):
         # A totals-shaped line from an early retry, buried well before the
         # end -- not the actual final result, and must not be mistaken for it.
         # "padding\n" is 8 chars; 200 repetitions = 1600 chars of noise, which
-        # exceeds the 1500-char window so this still returns None after #47.
+        # exceeds the 1500-char window so this still returns None.
         text = "3 failed, 39 passed in 8.72s\n" + ("padding\n" * 200) + "retrying..."
         self.assertIsNone(find_trailing_summary_line(text))
 
     def test_result_line_now_found_within_widened_window(self):
-        # Issue #47: the old 500-char window missed a result line pushed back
+        # The old 500-char window missed a result line pushed back
         # by trailing CI noise (coverage tables, upload confirmations). With
         # the new 1500-char window the line is found even when ~910 chars of
         # trailing content follow it -- 900 chars of noise plus "retrying..."
@@ -1641,7 +1641,7 @@ class TrailingSummaryRepair(unittest.TestCase):
 
 
 class TrailingSummaryPatternCoverage(unittest.TestCase):
-    """Issue #62: extend _TRAILING_SUMMARY_PATTERNS with Playwright, Cypress,
+    """Extend _TRAILING_SUMMARY_PATTERNS with Playwright, Cypress,
     and JUnit 5 console-launcher output shapes (same structural-evidence
     requirement as all the existing patterns -- keyword + digits, not prose).
 
@@ -1677,7 +1677,7 @@ class TrailingSummaryPatternCoverage(unittest.TestCase):
 
     def test_detects_playwright_failed_bare_no_duration(self):
         # An all-failing run emits a bare "N failed" line with no duration.
-        # Confirmed in Playwright's own CLI output (see issue #62).
+        # Confirmed in Playwright's own CLI output.
         text = "Running 2 tests\n\n  2 failed"
         self.assertEqual(find_trailing_summary_line(text), "2 failed")
 
@@ -1760,7 +1760,7 @@ class TrailingSummaryPatternCoverage(unittest.TestCase):
 
 
 class ResolveModelStaleEnvCheck(unittest.TestCase):
-    """Issue #41: resolve_model() used to check stale_env_warning() only on
+    """resolve_model() used to check stale_env_warning() only on
     the auto-detect branch -- reached only when neither explicit_model nor
     DEFAULT_MODEL short-circuited first. That meant a partial env-var
     migration (e.g. LMSTUDIO_BASE_URL never renamed to
@@ -1821,7 +1821,7 @@ class ResolveModelStaleEnvCheck(unittest.TestCase):
 
 
 class FetchLoadedModelsTests(unittest.TestCase):
-    """Issue #296: LM Studio's OpenAI-compatible /v1/models lists every
+    """LM Studio's OpenAI-compatible /v1/models lists every
     DOWNLOADED model (JIT loading is LM Studio's default), not just loaded
     ones -- so a bare .models.list() count couldn't distinguish "one loaded,
     two merely downloaded" from "three actually loaded", and auto-detect
@@ -1835,7 +1835,7 @@ class FetchLoadedModelsTests(unittest.TestCase):
     Monkeypatches local_compress_lib's own `_http_get_json` module global
     directly (same style as SectionCompressionEndToEnd above) rather than
     unittest.mock, to match this file's established pattern.
-    `_http_get_json` (not `requests`, PR #318 review) is a stdlib-only
+    `_http_get_json` (not `requests`) is a stdlib-only
     (urllib) GET-and-parse-JSON helper -- see its own docstring for why a
     third-party HTTP library was deliberately avoided here (this module is
     standard-library only, and both hook files import it directly).
@@ -1911,7 +1911,7 @@ class FetchLoadedModelsTests(unittest.TestCase):
         self.assertEqual(source, "v0")
 
     def test_known_limitation_loaded_embedding_mistyped_as_llm_still_slips_through(self):
-        # PR #318 review: a LOADED embedding model whose OWN `type` field is
+        # a LOADED embedding model whose OWN `type` field is
         # (like the issue's confirmed not-loaded jina-embeddings-v5 repro)
         # misreported as "llm" cannot be excluded here -- `/api/v0/models`
         # exposes no field beyond `state`/`type` to catch this, and `type`
@@ -1936,7 +1936,7 @@ class FetchLoadedModelsTests(unittest.TestCase):
         self.assertEqual(source, "v1")
 
     def test_v1_fallback_receives_the_caller_supplied_timeout(self):
-        # PR #318 review: the /v1 fallback used to drop whatever `timeout`
+        # The /v1 fallback used to drop whatever `timeout`
         # the caller passed to fetch_loaded_models -- so a short-timeout
         # caller (the WebFetch redirect hook, 2s) would fall through to a
         # much longer default timeout whenever /api/v0 was unavailable,
@@ -1996,7 +1996,7 @@ class FetchLoadedModelsTests(unittest.TestCase):
             self.L.fetch_loaded_models(None)
 
     def test_v0_200_with_unexpected_shape_falls_back_to_v1(self):
-        # PR #318 review round 2: a 200 response that ISN'T the real
+        # a 200 response that ISN'T the real
         # /api/v0 schema (e.g. a reverse proxy's own JSON error body, or a
         # non-LM-Studio server that happens to answer this path with
         # something unrelated) used to silently produce `entries = []` --
@@ -2018,7 +2018,7 @@ class FetchLoadedModelsTests(unittest.TestCase):
         self.assertEqual(source, "v1")
 
     def test_http_get_json_is_real_stdlib_over_a_real_socket(self):
-        # PR #318 review: confirms _http_get_json (the requests replacement)
+        # Confirms _http_get_json (the requests replacement)
         # actually works end-to-end against a REAL HTTP server -- not just
         # mocked out everywhere else in this class -- using only the
         # standard library on both ends, proving no third-party HTTP
@@ -2056,7 +2056,7 @@ class FetchLoadedModelsTests(unittest.TestCase):
 
 
 class ResolveModelMultipleModelsMessaging(unittest.TestCase):
-    """Issue #296 item 3: resolve_model's "multiple models" error must not
+    """resolve_model's "multiple models" error must not
     claim models are LOADED when fetch_loaded_models had to fall back to
     /v1/models (which can't tell loaded from merely-downloaded), and should
     point at tools/doctor.py, since a misspelled/mismatched env var pin is a
@@ -2122,7 +2122,7 @@ class ResolveModelMultipleModelsMessaging(unittest.TestCase):
 
 
 class ConcurrentClassification(unittest.TestCase):
-    """Issue #59: classify_relevant calls must run concurrently for multi-chunk
+    """classify_relevant calls must run concurrently for multi-chunk
     input with a selective focus, not sequentially.
 
     All tests use stub injection (same pattern as SectionCompressionEndToEnd)
@@ -2296,7 +2296,7 @@ class ConcurrentClassification(unittest.TestCase):
 
 
 class CompressionCache(unittest.TestCase):
-    """Issue #60: in-session compression cache that skips redundant LM Studio
+    """in-session compression cache that skips redundant LM Studio
     round-trips for the same content compressed more than once.
 
     All tests use stub injection (same pattern as SectionCompressionEndToEnd)
@@ -2770,8 +2770,8 @@ class CompressionCache(unittest.TestCase):
 
 
 class WholeTxtMapReducePath(unittest.TestCase):
-    """Regression pins for the ordinary whole-text map-reduce compress() path
-    (issue #40): chunking, classify_relevant integration, the chars_limited /
+    """Regression pins for the ordinary whole-text map-reduce compress() path:
+    chunking, classify_relevant integration, the chars_limited /
     non_selective bypass, and append_trailing_summary_if_missing.
 
     These complement the ConcurrentClassification tests (which pin ordering
@@ -2925,7 +2925,7 @@ class WholeTxtMapReducePath(unittest.TestCase):
 
 
 class TimeoutVersusConnectionFailureReporting(unittest.TestCase):
-    """Issue #368: a request that TIMED OUT (LM Studio reachable but busy -- it
+    """a request that TIMED OUT (LM Studio reachable but busy -- it
     runs a limited number of requests in parallel and queues the rest) must not
     be reported as "check it's still running", and an outage made up entirely of
     timeouts must not read as "appears unreachable". Drives the REAL

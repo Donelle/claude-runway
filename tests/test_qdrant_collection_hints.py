@@ -6,7 +6,7 @@ cache layer, so testing it needs neither Qdrant nor an embedding model:
 
     .venv/bin/python -m unittest discover -s tests
 
-Why this file exists (issue #81): list_collections surfaces a per-collection
+Why this file exists: list_collections surfaces a per-collection
 description hint so a model can pick the right collection on its own. The
 cache exists specifically to make that cheap across sessions/restarts --
 these tests pin down the two properties that actually matter for that: a
@@ -104,7 +104,7 @@ class CollectionHintsCache(unittest.TestCase):
 
 
 class CacheFailsOpen(unittest.TestCase):
-    """Copilot review on PR #82 caught this: a disposable cache must never
+    """Copilot review caught this: a disposable cache must never
     turn into a reported failure for list_collections/set_collection_
     description, since by the time either cache write runs, Qdrant itself
     -- the authoritative source -- has already been read or written
@@ -261,7 +261,7 @@ class SchemaMigration(_TempCacheDb):
         self.assertEqual(get_cached_search_limit(URL, "old"), 4)
 
     def test_older_process_does_not_lower_a_newer_stored_version(self):
-        # PR #379 review: an older build opening a cache already migrated to
+        # An older build opening a cache already migrated to
         # a newer version used to reset the stored version to its own.
         set_cached_description(URL, "repo", "d")
         conn = sqlite3.connect(self.db_path)
@@ -274,7 +274,7 @@ class SchemaMigration(_TempCacheDb):
         self.assertEqual(get_cached_descriptions(URL, ["repo"]), {"repo": "d2"})
 
     def test_stale_higher_version_is_reset_when_table_is_recreated(self):
-        # PR #379 review: schema_versions holds a higher version but the
+        # schema_versions holds a higher version but the
         # collection_hints table is missing. The table we create is this
         # build's schema, so the stored version must be reset to match it --
         # keeping the higher one would let a later newer build skip migrations.
@@ -379,7 +379,7 @@ class ConnectionHygiene(_TempCacheDb):
 
 
 class ComputeSearchLimitTests(unittest.TestCase):
-    """compute_search_limit (issue #330): pure tier lookup, boundaries exclusive."""
+    """compute_search_limit: pure tier lookup, boundaries exclusive."""
 
     def test_each_tier_and_boundary(self):
         cases = [

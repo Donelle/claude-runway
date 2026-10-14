@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Shared, dependency-free reading of what a Claude Code session transcript
-records about its STARTING context -- the measured replacement (issue #439) for
+records about its STARTING context -- the measured replacement for
 the old chars / 3.5 "tool schema overhead" estimate.
 
 Two things in a transcript are real, not estimated:
@@ -72,8 +72,8 @@ def _entries(path):
 
 def iter_entries(path):
     """Public name for the shared line reader, for sibling libs that read the same
-    transcript (libs/transcript_attribution_lib.py, issue #440, and
-    libs/autowork_cost_lib.py, issue #455): same fail-open
+    transcript (libs/transcript_attribution_lib.py, and
+    libs/autowork_cost_lib.py): same fail-open
     behavior, one reader so the two can't drift on what counts as a readable line."""
     return _entries(path)
 

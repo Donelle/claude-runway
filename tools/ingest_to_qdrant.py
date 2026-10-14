@@ -20,7 +20,7 @@ server reads, read from this shell's environment (not from .mcp.json).
 
 Run this once to seed the collection, then re-run periodically (or on a
 schedule) to pick up changes. Re-running without --reset will add duplicate
-chunks; pass --reset to wipe the collection's unprotected points (everything except memory-bank points and compacts carrying the issue #282 source marker) before indexing.
+chunks; pass --reset to wipe the collection's unprotected points (everything except memory-bank points and compacts carrying the source marker) before indexing.
 
 Project minimum: Python 3.12 (policy floor; the dependency chain supports >=3.10).
 """
@@ -35,7 +35,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 
 from version_lib import version_string  # noqa: E402
 
-# Issue #348 (Copilot review): answer --version BEFORE the dependency imports
+# Answer --version BEFORE the dependency imports
 # below. Those exit(1) on a missing/broken fastembed/qdrant_client --
 # exactly the half-broken environment where someone most needs to report which
 # version they have. parse_args() still declares the flag (so --help lists it).
@@ -70,7 +70,7 @@ from qdrant_retry import call_with_retry
 import memory_bank_lib as mb
 
 # Must run before FastEmbedProvider(...) is constructed in ingest() below --
-# see issue #77 and the function's own docstring for why this can't just be
+# see the function's own docstring for why this can't just be
 # a .mcp.json/shell env value.
 ensure_persistent_fastembed_cache()
 
@@ -80,13 +80,13 @@ ensure_persistent_fastembed_cache()
 # shared memory bank. Read at import time like the server does; an
 # interactive shell that doesn't export MEMORY_BANK_COLLECTION falls back to
 # the "memory-bank" default, which is the name a stock install uses anyway
-# (a custom name that lives only in .mcp.json is issue #352).
+# (a custom name that lives only in .mcp.json is not picked up here).
 DEFAULT_MEMORY_BANK_COLLECTION = ingest_env_defaults()["memory_bank_collection"]
 
 
 async def ingest(args):
-    # Issue #265: --reset used to be a raw delete_collection with none of
-    # the protections index_repo(reset=True) got in issue #175 / PR #178.
+    # --Reset used to be a raw delete_collection with none of
+    # the protections index_repo(reset=True) has.
     # Layer 1 (name refusal), ported from index_repo: pointing --reset at
     # the shared memory-bank collection would irreversibly destroy every
     # project's durable memories. Checked BEFORE the dry-run guard and
@@ -104,8 +104,7 @@ async def ingest(args):
     # --dry-run is documented (both in --help and this preview print below)
     # as writing NOTHING to Qdrant -- so all collection maintenance
     # (reset-delete, file_path index backfill) must stay entirely behind
-    # this guard, not just the actual store_batch() call further down. PR
-    # #121 review (Copilot): an earlier version of this constructed
+    # this guard, not just the actual store_batch() call further down. An earlier version of this constructed
     # QdrantClient and called collection_exists/ensure_file_path_index
     # unconditionally, which broke an offline dry run outright and, for an
     # online one, silently created a real payload index despite the
@@ -113,10 +112,10 @@ async def ingest(args):
     embedding_provider = None
     if not args.dry_run:
         client = QdrantClient(url=args.qdrant_url, api_key=args.qdrant_api_key)
-        # Issue #304: the same preparation index_repo runs (libs/
+        # The same preparation index_repo runs (libs/
         # qdrant_index_prep.py) -- --reset's pre-delete model check (Layer 3,
-        # issue #265, fail_closed) and always-filtered delete (Layer 2), or
-        # the issue #54 file_path index backfill -- with EVERY Qdrant call
+        # fail_closed) and always-filtered delete (Layer 2), or
+        # the file_path index backfill -- with EVERY Qdrant call
         # retry-wrapped. This copy used to skip call_with_retry on the
         # non-reset collection_exists/ensure_file_path_index, so one vpnkit
         # dropped connection (README's Known limitations) aborted the
@@ -141,13 +140,13 @@ async def ingest(args):
             print(
                 f"Reset: deleted existing points from '{args.collection}' except protected ones "
                 f"(the collection itself, memory-bank points and marked conversation compacts are kept; "
-                f"compacts stored before issue #282 carry no marker and were deleted)."
+                f"compacts stored before the marker existed carry none and were deleted)."
             )
         if prep.backfilled:
             print(f"Backfilled the metadata.file_path payload index on '{args.collection}'.")
 
     repo_path = Path(args.repo_path).resolve()
-    # parse_csv_set strips each entry and drops blanks (issue #276) -- a bare
+    # parse_csv_set strips each entry and drops blanks -- a bare
     # split(",") turned "--include-ext '.py, .md'" into {".py", " .md"}, which
     # normalizes to ". .md" and silently indexed no markdown at all.
     include_extensions = parse_csv_set(args.include_ext)
@@ -157,9 +156,9 @@ async def ingest(args):
         include_extensions=include_extensions,
         extra_exclude_dirs=extra_exclude_dirs,
         respect_gitignore=not args.no_gitignore,
-        # Issue #276: sync_repo's manifest is a .json file at the repo root,
+        # sync_repo's manifest is a .json file at the repo root,
         # so without this the CLI embeds it whenever a repo previously
-        # maintained by sync_repo doesn't gitignore it -- the exact bug #91
+        # maintained by sync_repo doesn't gitignore it -- the exact bug
         # fixed for the server's three build_entries/compute_file_hashes
         # call sites.
         extra_exclude_files={MANIFEST_FILENAME},
@@ -179,7 +178,7 @@ async def ingest(args):
         print(f"... dry run, not storing. ({len(entries)} total)")
         return
 
-    # Issue #304: built only AFTER the --dry-run return above. Constructing
+    # Built only AFTER the --dry-run return above. Constructing
     # FastEmbedProvider loads (and on a cold cache downloads) the embedding
     # model, which a preview never uses -- the MCP preview_index tool never
     # loads it either. Reuses the provider --reset's model check already
@@ -202,7 +201,7 @@ async def ingest(args):
     # diagnosis: real-world testing on a large repo found thousands of
     # individual round-trips in this loop hit a hard connection/request
     # ceiling at a deterministic failure point that a bigger retry count
-    # (issue #75/#76) didn't move, confirming retrying more doesn't help
+    # didn't move, confirming retrying more doesn't help
     # once you're actually at the ceiling -- only batching does.
     await store_batch(connector, entries, collection_name=args.collection, progress_callback=_print_progress)
 
@@ -210,7 +209,7 @@ async def ingest(args):
 
 
 def parse_args():
-    # Issue #276: every default below used to be hardcoded, so the CLI
+    # Every default below used to be hardcoded, so the CLI
     # ignored the QDRANT_URL/QDRANT_API_KEY/EMBEDDING_MODEL/
     # INDEX_INCLUDE_EXTENSIONS/INDEX_EXCLUDE_DIRS the MCP server honors. Both
     # now resolve them through the same ingest_env_defaults(). Precedence: an
@@ -249,13 +248,13 @@ def parse_args():
     p.add_argument("--overlap", type=int, default=10)
     p.add_argument("--dry-run", action="store_true", help="Preview chunks without writing to Qdrant")
     p.add_argument("--reset", action="store_true", help="Delete the collection's existing points before indexing (avoids duplicate chunks on re-runs). "
-                         "Like index_repo(reset=True) (issue #175), this is a filtered delete that keeps the "
-                         "collection itself, any memory-bank points and marked (issue #282) conversation compacts, refuses the configured "
+                         "Like index_repo(reset=True), this is a filtered delete that keeps the "
+                         "collection itself, any memory-bank points and marked conversation compacts, refuses the configured "
                          "MEMORY_BANK_COLLECTION outright, and aborts before deleting on an embedding-model "
                          "mismatch -- so it can no longer rebuild a collection's vector schema after an "
                          "EMBEDDING_MODEL change (drop the collection manually for that)")
     args = p.parse_args()
-    # See validate_chunk_params's docstring (issue #26) -- overlap >=
+    # See validate_chunk_params's docstring -- overlap >=
     # chunk_lines silently multiplies chunk count by roughly chunk_lines,
     # with no error anywhere otherwise. p.error() is argparse's own idiom:
     # prints usage + this message to stderr and exits 2, same as any other
@@ -270,9 +269,9 @@ def main() -> None:
     """
     Entry point for both `python tools/ingest_to_qdrant.py` (the
     `if __name__` guard below) and the `claude-runway-ingest` console
-    script pip/pipx/uvx installs (issue #50) -- pulled out into its own
+    script pip/pipx/uvx installs -- pulled out into its own
     function so the `claude_runway:ingest_main` shim that
-    `[project.scripts]` in pyproject.toml points at (issue #206) has
+    `[project.scripts]` in pyproject.toml points at has
     something to call; behavior is unchanged either way.
     """
     asyncio.run(ingest(parse_args()))
