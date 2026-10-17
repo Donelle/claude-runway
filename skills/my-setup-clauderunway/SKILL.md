@@ -139,7 +139,7 @@ in step 8 proceeds), stop immediately** and tell the user:
   Both servers carry these two values (`qdrant`'s `compact_store` compresses with them);
   a `--qdrant-only` config has them only in `qdrant.env`
 - `CLAUDE_RUNWAY_TRACK_SAVINGS` from `local-compress.env` (default: off)
-- `CLAUDE_RUNWAY_SAVINGS_DB` from `local-compress.env` (default: empty)
+- `CLAUDE_RUNWAY_SAVINGS_DB` from `analytics.env`, else from `local-compress.env` for a config written before `init` stopped writing it there (the `local-compress` server never reads it) — first non-empty one (default: empty). The `analytics` block exists only when savings tracking was enabled, so never treat its absence as "no override".
 - `CLAUDE_RUNWAY_METRICS_DB` from `analytics.env`, else from `memory-bank.env` (where `init --metrics-db` also writes it, and the only place it lives when savings tracking is off or the setup is `--qdrant-only`), else from `local-compress.env` for a config written before the move — first non-empty one (default: empty). The `analytics` block exists only when savings tracking was enabled, so never treat its absence as "no override".
 - `COMPACT_COLLECTION` from `qdrant.env` (the `qdrant` server serves the compact tools),
   falling back to `local-compress.env` for a config written before they moved — use as the

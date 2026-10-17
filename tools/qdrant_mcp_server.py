@@ -59,6 +59,7 @@ from local_compress_lib import (
 from memory_bank_lib import COMPACT_SOURCE
 from qdrant_compact_marker import mark_compact_collection
 from qdrant_connector import Entry, QdrantConnector
+from qdrant_credentials import resolve_qdrant_credentials
 from qdrant_embeddings import FastEmbedProvider
 from qdrant_ingest_lib import ensure_persistent_fastembed_cache
 from qdrant_model_check import check_embedding_model_mismatch
@@ -75,7 +76,11 @@ QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY") or None
 COLLECTION_NAME = os.environ.get("COLLECTION_NAME") or None
 DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL") or DEFAULT_EMBEDDING_MODEL
-# How many hits qdrant-find returns. The package this replaces defaulted to 10.
+# How many hits qdrant-find returns when the caller passes no limit. The
+# package this replaces defaulted to 10 and took no limit at all; the tool now
+# takes an optional one, because repetitive content (generated
+# clients, JSON fixtures, lock files) can fill a fixed top 10 with near-
+# duplicates and push the chunk that was asked for past it.
 SEARCH_LIMIT = 10
 
 # The names the compact tools and their helpers below are written against; the
@@ -83,6 +88,29 @@ SEARCH_LIMIT = 10
 COMPACT_QDRANT_URL = QDRANT_URL
 COMPACT_QDRANT_API_KEY = QDRANT_API_KEY
 COMPACT_COLLECTION = os.environ.get("COMPACT_COLLECTION", "conversation-compacts")
+
+
+def _resolve_compact_credentials(
+    qdrant_url: Optional[str], qdrant_api_key: Optional[str]
+) -> tuple[str, Optional[str]]:
+    """
+    Resolves a compact tool call's qdrant_url/qdrant_api_key against this
+    project's QDRANT_URL/QDRANT_API_KEY. Every tool that takes those two inputs
+    goes through here, never an inline `x or COMPACT_QDRANT_...` pair:
+    qdrant_url is tool input (text the model picks, so a prompt-injected URL is
+    a real path), and falling back to the configured key for ANY url would send
+    that credential to whatever host a call names. The configured key is only
+    used with the configured URL; see libs/qdrant_credentials.py.
+
+    The defaults are read from the module globals at call time, not bound at
+    import, so a test (or a future reload) that changes them is honoured.
+    """
+    return resolve_qdrant_credentials(
+        qdrant_url,
+        qdrant_api_key,
+        default_url=COMPACT_QDRANT_URL,
+        default_api_key=COMPACT_QDRANT_API_KEY,
+    )
 
 # Fallback when COMPACT_EMBEDDING_MODEL is unset: the historical default from
 # qdrant-client's QdrantFastembedMixin (the QdrantClient.add()/.query()
@@ -147,20 +175,27 @@ _NO_COLLECTION_ERROR = (
 
 
 @mcp.tool(name="qdrant-find")
-async def qdrant_find(query: str) -> list[str]:
+async def qdrant_find(query: str, limit: int = SEARCH_LIMIT) -> list[str]:
     """
-    Semantically search previously stored project knowledge (code locations,
-    design decisions, past investigation findings) for THIS project. Use this
+    Semantic search over everything in THIS project's collection (indexed code
+    and docs, plus any text stored with qdrant-store). Use this
     BEFORE grepping or reading files for conceptual questions like 'where is X
-    handled' or 'why was Y built this way'. Do NOT use for exact string, symbol,
-    or error-message matches -- use Grep for those. Returns stored entries as
-    text, including any metadata (e.g. file_path, line_range) attached when
-    stored -- use that metadata to read only the relevant lines instead of the
-    whole file. Input: query (a natural-language question, not a code snippet).
+    handled' or 'how does Y work'. Do NOT use for exact string, symbol, or
+    error-message matches -- use Grep for those. Returns matching entries as
+    text, including any metadata (e.g. file_path, line_number, char_range)
+    attached to them -- use line_number to read only the relevant lines
+    instead of the whole file (points indexed before token-window chunking
+    carry line_range, "start-end", instead). Input: query (a natural-language
+    question, not a code snippet), limit (how many hits to return, default 10;
+    raise it when the thing you want is not in the first 10, which repetitive
+    content can cause). Hits with line_range come from an index that predates
+    token-window chunking, where a miss is not proof the code is absent.
     """
     if not COLLECTION_NAME:
         return [_NO_COLLECTION_ERROR]
-    entries = await _get_connector().search(query, collection_name=COLLECTION_NAME, limit=SEARCH_LIMIT)
+    if limit < 1:
+        return [f"Error: limit must be 1 or greater (got {limit})."]
+    entries = await _get_connector().search(query, collection_name=COLLECTION_NAME, limit=limit)
     if not entries:
         return [f"No information found for the query '{query}'"]
     return [f"Results for the query '{query}'"] + [_format_entry(e) for e in entries]
@@ -169,13 +204,12 @@ async def qdrant_find(query: str) -> list[str]:
 @mcp.tool(name="qdrant-store")
 async def qdrant_store(information: str, metadata: Optional[dict[str, Any]] = None) -> str:
     """
-    Persist a distilled finding for this project's future sessions -- e.g. a
-    bug's root cause, a design decision and its rationale, or the answer to a
-    search that took real exploration to find. Store a short summary, not raw
-    file dumps. ALWAYS include file_path and line_range (or source/url for
-    non-code) in metadata. Do not store speculative or in-progress reasoning.
-    Input: information (concise summary), metadata (JSON, must include
-    file_path/line_range or source when applicable).
+    Store a piece of text, with optional metadata, in this project's
+    collection so qdrant-find can return it by meaning. Keep it short; do not
+    store raw file dumps or speculative, in-progress reasoning. Metadata is optional: add file_path and line_number
+    when the text is about a file, source or url when it comes from somewhere
+    else, or nothing. Input: information (the text to store), metadata
+    (optional JSON).
     """
     if not COLLECTION_NAME:
         return _NO_COLLECTION_ERROR
@@ -564,6 +598,9 @@ async def compact_store(
     requirements.txt's Core section). QDRANT_URL / QDRANT_API_KEY /
     COMPACT_COLLECTION / COMPACT_EMBEDDING_MODEL and the CLAUDE_RUNWAY_LMSTUDIO_*
     values are read from this server's .mcp.json env block.
+
+    The configured QDRANT_API_KEY is only sent to the configured QDRANT_URL; a
+    different qdrant_url needs its own qdrant_api_key if it requires one.
     """
     import re as _re
     if not _re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
@@ -580,10 +617,8 @@ async def compact_store(
     # rewrite of it. Never raises: a failure here stores the summary as given.
     information, compression_note = await _compress_for_storage(information)
 
-    client = QdrantClient(
-        url=qdrant_url or COMPACT_QDRANT_URL,
-        api_key=(qdrant_api_key or COMPACT_QDRANT_API_KEY) or None,
-    )
+    qdrant_url, qdrant_api_key = _resolve_compact_credentials(qdrant_url, qdrant_api_key)
+    client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
     canonical_col = f"{COMPACT_COLLECTION}-{_sanitize_project(project)}"
     if collection:
         # Caller-controlled override -- use exactly as given, no
@@ -909,11 +944,12 @@ async def compact_find(
     name at that point (a renamed working directory, a different worktree
     checkout), since any same-project casing variant would already have
     been picked up by the aggregation above.
+
+    The configured QDRANT_API_KEY is only sent to the configured QDRANT_URL; a
+    different qdrant_url needs its own qdrant_api_key if it requires one.
     """
-    client = QdrantClient(
-        url=qdrant_url or COMPACT_QDRANT_URL,
-        api_key=(qdrant_api_key or COMPACT_QDRANT_API_KEY) or None,
-    )
+    qdrant_url, qdrant_api_key = _resolve_compact_credentials(qdrant_url, qdrant_api_key)
+    client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
     canonical_col = f"{COMPACT_COLLECTION}-{_sanitize_project(project)}"
 
     if collection:
@@ -1149,6 +1185,9 @@ async def compact_prune(
     compact_find.
 
     Only individual POINTS are deleted, never the collection itself.
+
+    The configured QDRANT_API_KEY is only sent to the configured QDRANT_URL; a
+    different qdrant_url needs its own qdrant_api_key if it requires one.
     """
     import datetime as _dt
 
@@ -1163,10 +1202,8 @@ async def compact_prune(
     if older_than_days is not None and older_than_days < 0:
         return f"Error: older_than_days must be a non-negative integer (got {older_than_days!r})."
 
-    client = QdrantClient(
-        url=qdrant_url or COMPACT_QDRANT_URL,
-        api_key=(qdrant_api_key or COMPACT_QDRANT_API_KEY) or None,
-    )
+    qdrant_url, qdrant_api_key = _resolve_compact_credentials(qdrant_url, qdrant_api_key)
+    client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
     canonical_col = f"{COMPACT_COLLECTION}-{_sanitize_project(project)}"
 
     if collection:

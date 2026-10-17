@@ -37,7 +37,9 @@ from unittest import mock
 from unittest.mock import AsyncMock, MagicMock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "libs"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # fake_token_budget
 
+from fake_token_budget import word_budget  # noqa: E402
 from qdrant_ingest_lib import (  # noqa: E402
     _strip_c_style_line,
     batched,
@@ -1013,6 +1015,63 @@ class ComputeFileHashesSkipsUnreadableFiles(unittest.TestCase):
             self.assertEqual(list(hashes.keys()), ["good.py"])
             self.assertEqual(skipped, [])
 
+    # -- on_progress --------------------------------------------
+
+    def _repo_with(self, d, count):
+        repo = Path(d)
+        for i in range(count):
+            (repo / f"f{i}.py").write_text(f"x = {i}")
+        return repo
+
+    def test_on_progress_is_called_with_the_running_count_every_n_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = self._repo_with(d, 7)
+            calls = []
+            hashes, _ = compute_file_hashes(repo, "code", on_progress=calls.append, progress_every=3)
+            self.assertEqual(len(hashes), 7)
+            self.assertEqual(calls, [3, 6])
+
+    def test_skipped_files_count_toward_the_running_total(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = self._repo_with(d, 4)
+            calls = []
+            with mock.patch.object(Path, "read_bytes", self._patched_read_bytes("f1.py")):
+                hashes, skipped = compute_file_hashes(repo, "code", on_progress=calls.append, progress_every=2)
+            self.assertEqual((len(hashes), len(skipped)), (3, 1))
+            self.assertEqual(calls, [2, 4])
+
+    def test_no_callback_means_no_reporting_and_the_same_result(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = self._repo_with(d, 3)
+            with_cb, _ = compute_file_hashes(repo, "code", on_progress=lambda n: None, progress_every=1)
+            without, _ = compute_file_hashes(repo, "code")
+            self.assertEqual(with_cb, without)
+
+    def test_a_non_positive_interval_disables_reporting(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = self._repo_with(d, 3)
+            calls = []
+            compute_file_hashes(repo, "code", on_progress=calls.append, progress_every=0)
+            self.assertEqual(calls, [])
+
+    def test_an_exception_from_the_callback_stops_the_scan(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = self._repo_with(d, 5)
+            calls = []
+
+            def boom(n):
+                calls.append(n)
+                raise RuntimeError("cancelled")
+
+            with self.assertRaises(RuntimeError):
+                compute_file_hashes(repo, "code", on_progress=boom, progress_every=1)
+            self.assertEqual(calls, [1])
+
+    def test_the_default_interval_is_far_above_a_per_file_report(self):
+        from qdrant_ingest_lib import HASH_PROGRESS_EVERY
+
+        self.assertGreater(HASH_PROGRESS_EVERY, 1)
+
 
 class FilesRemovedSinceLastSync(unittest.TestCase):
     """a file that failed to hash must not be reported as
@@ -1125,9 +1184,14 @@ class ChunkLinesOverlapExplosion(unittest.TestCase):
 class McpToolsValidateChunkParamsBeforeAnyWork(unittest.TestCase):
     """a shared validator only closes the bug if every boundary
     actually calls it. Imports ingest_mcp_server.py directly and calls each
-    tool with an invalid chunk_lines/overlap pair -- no live Qdrant/FastEmbed
-    needed, since the validation check is the very first thing each function
-    does, before any network call or even a filesystem check."""
+    tool with an invalid overlap -- no live Qdrant/FastEmbed needed, since the
+    validation check is the very first thing each function does, before any
+    network call or even a filesystem check.
+
+    Overlap is a number of tokens now, so "overlap >= chunk_lines"
+    is no longer wrong (chunk_lines sets no size); a negative overlap is, and
+    one that is too big for the embedding window is rejected when the budget is
+    built (see test_qdrant_embeddings.py)."""
 
     @classmethod
     def setUpClass(cls):
@@ -1145,18 +1209,18 @@ class McpToolsValidateChunkParamsBeforeAnyWork(unittest.TestCase):
 
     def test_index_repo_rejects_bad_overlap_before_touching_qdrant(self):
         import asyncio
-        result = asyncio.run(self.ims.index_repo(repo_path=".", chunk_lines=10, overlap=10))
+        result = asyncio.run(self.ims.index_repo(repo_path=".", chunk_lines=10, overlap=-1))
         self.assertTrue(result.startswith("Error:"))
         self.assertIn("overlap", result)
 
     def test_sync_repo_rejects_bad_overlap_before_touching_qdrant(self):
         import asyncio
-        result = asyncio.run(self.ims.sync_repo(repo_path=".", chunk_lines=10, overlap=15))
+        result = asyncio.run(self.ims.sync_repo(repo_path=".", chunk_lines=10, overlap=-3))
         self.assertTrue(result.startswith("Error:"))
         self.assertIn("overlap", result)
 
     def test_preview_index_rejects_bad_overlap_before_touching_qdrant(self):
-        result = self.ims.preview_index(repo_path=".", chunk_lines=10, overlap=10)
+        result = self.ims.preview_index(repo_path=".", chunk_lines=10, overlap=-1)
         self.assertTrue(result.startswith("Error:"))
         self.assertIn("overlap", result)
 
@@ -1272,11 +1336,15 @@ class SyncRepoPreservesEmbeddingsOnChunkAndHashFailures(unittest.TestCase):
             # sync_repo's index-consistency check counts file
             # chunks; this fixture models a populated collection.
             fake_client.count.return_value = mock.MagicMock(count=10)
+            # Chunking needs a token budget; a word-count one
+            # keeps this model-free.
+            fake_provider = MagicMock()
+            fake_provider.build_token_budget.return_value = word_budget()
 
             with mock.patch.object(Path, "read_bytes", flaky_read_bytes), \
                  mock.patch.object(Path, "read_text", flaky_read_text), \
                  mock.patch.object(self.ims, "QdrantClient", return_value=fake_client), \
-                 mock.patch.object(self.ims, "FastEmbedProvider", return_value=MagicMock()), \
+                 mock.patch.object(self.ims, "FastEmbedProvider", return_value=fake_provider), \
                  mock.patch.object(self.ims, "QdrantConnector", return_value=MagicMock()), \
                  mock.patch.object(self.ims, "store_batch", new=AsyncMock(return_value=None)), \
                  mock.patch.object(self.ims, "check_embedding_model_mismatch", return_value=None):
@@ -1661,6 +1729,110 @@ class PhpHashCommentScanning(unittest.TestCase):
             if "function foo" in content:
                 self.assertIn("$x = 1", content, "foo's body must stay with its header")
                 self.assertIn("$y = 2", content)
+
+
+class RustLifetimeTickScanning(unittest.TestCase):
+    """In Rust, `'` is both a char-literal delimiter and the tick of every
+    lifetime/loop label. Treating each `'` as a string opener blanked the
+    `{` of `fn foo<'a>(x: &'a str) -> &'a str {`, so brace depth stayed 0 and
+    every line of the body was reported as a safe boundary."""
+
+    LIFETIME_FN = [
+        "fn foo<'a>(x: &'a str) -> &'a str {",  # 0 -- opens the body
+        "    let y = x;",                        # 1 -- inside body
+        "    y",                                 # 2 -- inside body
+        "}",                                     # 3 -- real close
+        "",                                      # 4
+        "fn bar() {",                            # 5
+        "    1;",                                # 6 -- inside body
+        "}",                                     # 7
+    ]
+
+    def test_lifetime_signature_keeps_its_opening_brace(self):
+        # The exact line from the issue: three ticks, odd count.
+        line = "fn foo<'a>(x: &'a str) -> &'a str {"
+        result, bc, ts, vs = _strip_c_style_line(line, False, ext=".rs")
+        self.assertEqual(result, line, "lifetime ticks must not blank anything")
+
+    def test_lifetime_fn_does_not_fabricate_mid_body_boundaries(self):
+        boundaries = brace_boundary_indexes(self.LIFETIME_FN, ext=".rs")
+        self.assertEqual(boundaries, {3, 4, 7})
+
+    def test_static_lifetime_and_loop_label_are_ticks(self):
+        for line in (
+            "const NAME: &'static str = \"x\"; {",
+            "'outer: loop {",
+            "impl<'a, 'b: 'a> Foo<'a, 'b> {",
+            "struct S<'a> { r: &'a u8 }",
+        ):
+            with self.subTest(line=line):
+                result, bc, ts, vs = _strip_c_style_line(line, False, ext=".rs")
+                self.assertIn("{", result)
+
+    def test_char_literal_braces_are_blanked(self):
+        for line, blanked in (
+            ("let c = '{';", "'{'"),
+            ("let c = '}';", "'}'"),
+            ("let c = '\\'';", "'\\''"),
+            ("let c = '\\\\';", "'\\\\'"),
+            ("let c = '\\n';", "'\\n'"),
+            ("let c = '\\x41';", "'\\x41'"),
+            ("let c = '\\u{1F600}';", "'\\u{1F600}'"),
+        ):
+            with self.subTest(line=line):
+                result, bc, ts, vs = _strip_c_style_line(line, False, ext=".rs")
+                self.assertEqual(len(result), len(line))
+                self.assertEqual(result, line.replace(blanked, " " * len(blanked)))
+                self.assertNotIn("{", result)
+                self.assertNotIn("}", result)
+
+    def test_char_literal_and_lifetime_on_one_line(self):
+        line = "fn f<'a>(c: char, s: &'a str) -> bool { c == '}' }"
+        result, bc, ts, vs = _strip_c_style_line(line, False, ext=".rs")
+        self.assertEqual(result.count("{"), 1)
+        self.assertEqual(result.count("}"), 1, "only the real closing brace survives")
+
+    def test_char_literal_brace_does_not_fabricate_boundary(self):
+        lines = [
+            "fn f() {",            # 0
+            "    let c = '}';",    # 1 -- the '}' is a char, not a close
+            "    let d = 1;",      # 2 -- inside body
+            "}",                    # 3
+        ]
+        self.assertEqual(brace_boundary_indexes(lines, ext=".rs"), {3})
+
+    def test_double_quoted_string_with_apostrophe_still_blanked(self):
+        result, bc, ts, vs = _strip_c_style_line('let s = "it\'s {";', False, ext=".rs")
+        self.assertNotIn("{", result)
+
+    def test_other_languages_still_treat_single_quote_as_string(self):
+        # Unchanged for every non-Rust extension: 'a' and '{' are strings.
+        for ext in (".cs", ".php", ".c", ".ts", ""):
+            with self.subTest(ext=ext):
+                result, bc, ts, vs = _strip_c_style_line("x = '{';", False, ext=ext)
+                self.assertNotIn("{", result)
+
+    def test_chunk_file_rust_lifetime_fn_is_not_split_mid_body(self):
+        text = "\n".join([
+            "fn foo<'a>(x: &'a str) -> &'a str {",
+            "    let a = 1;",
+            "    let b = 2;",
+            "    let c = 3;",
+            "    x",
+            "}",
+            "",
+            "fn bar() {",
+            "    1;",
+            "}",
+        ])
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "example.rs"
+            p.write_text(text, encoding="utf-8")
+            chunks = list(chunk_file(p, "example.rs", chunk_size=5, overlap=1))
+        for content, _ in chunks:
+            if "fn foo" in content:
+                self.assertIn("let a = 1", content, "foo's body must stay with its header")
+                self.assertIn("let b = 2", content)
 
 
 class SharedIngestDefaults(unittest.TestCase):

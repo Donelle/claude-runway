@@ -29,7 +29,7 @@ def _passthrough(fn, *a, **kw):
 
 
 class PrepareCollectionForIndex(unittest.TestCase):
-    def _prep(self, client, *, reset, mismatch=None, guard=None, backfilled=False, retry=_passthrough):
+    def _prep(self, client, *, reset, mismatch=None, guard=None, backfilled=False, retry=_passthrough, before=None):
         self.provider_factory = mock.MagicMock(name="provider_factory")
         self.model_check = mock.MagicMock(return_value=mismatch)
         self.backfill = mock.MagicMock(return_value=backfilled)
@@ -43,6 +43,7 @@ class PrepareCollectionForIndex(unittest.TestCase):
             retry=retry,
             model_check=self.model_check,
             backfill=self.backfill,
+            before_reset_delete=before,
         )
 
     def test_reset_checks_model_then_does_the_filtered_delete(self):
@@ -67,6 +68,44 @@ class PrepareCollectionForIndex(unittest.TestCase):
         self.assertEqual(result.error, "Error: mismatch")
         self.assertFalse(result.reset_deleted)
         client.delete.assert_not_called()
+
+    def test_before_reset_delete_runs_after_the_model_check_and_before_the_delete(self):
+        events = []
+        client = mock.MagicMock()
+        client.collection_exists.return_value = True
+        self.model_check = mock.MagicMock(side_effect=lambda *a, **kw: events.append("check"))
+        client.delete.side_effect = lambda **kw: events.append("delete")
+
+        def before():
+            events.append("before")
+
+        result = prep_mod.prepare_collection_for_index(
+            client, "coll", "model-x", reset=True, provider_factory=mock.MagicMock(),
+            model_check=self.model_check, before_reset_delete=before,
+        )
+        self.assertIsNone(result.error)
+        self.assertEqual(events, ["check", "before", "delete"])
+
+    def test_before_reset_delete_error_aborts_with_nothing_deleted(self):
+        client = mock.MagicMock()
+        client.collection_exists.return_value = True
+        result = self._prep(client, reset=True, before=lambda: "Error: could not invalidate")
+        self.assertEqual(result.error, "Error: could not invalidate")
+        self.assertFalse(result.reset_deleted)
+        client.delete.assert_not_called()
+
+    def test_before_reset_delete_is_not_called_after_a_mismatch_or_without_a_collection_or_reset(self):
+        before = mock.MagicMock(return_value=None)
+        client = mock.MagicMock()
+        client.collection_exists.return_value = True
+        self._prep(client, reset=True, mismatch="Error: mismatch", before=before)
+        client = mock.MagicMock()
+        client.collection_exists.return_value = False
+        self._prep(client, reset=True, before=before)
+        client = mock.MagicMock()
+        client.collection_exists.return_value = True
+        self._prep(client, reset=False, before=before)
+        before.assert_not_called()
 
     def test_missing_collection_is_a_no_op_and_loads_no_model(self):
         for reset in (True, False):

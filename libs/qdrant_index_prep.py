@@ -66,6 +66,7 @@ def prepare_collection_for_index(
     retry: Callable[..., Any] = call_with_retry,
     model_check: Callable[..., Optional[str]] = check_embedding_model_mismatch,
     backfill: Callable[..., bool] = ensure_file_path_index,
+    before_reset_delete: Optional[Callable[[], Optional[str]]] = None,
 ) -> IndexPreparation:
     """
     Run the pre-index collection maintenance for a full index of `collection`.
@@ -83,6 +84,11 @@ def prepare_collection_for_index(
     then ALWAYS a filtered delete that preserves memory-bank and marked
     conversation-compact points -- never delete_collection, and no
     count-then-act, to avoid the race documented in index_repo.
+    `before_reset_delete`, if given, runs after the model check and immediately
+    before that delete; a non-None return aborts with that message, with nothing
+    deleted (index_repo uses it to invalidate its sync manifest first, so no
+    failure after the wipe can leave a manifest describing an index that is
+    gone). Not called when the collection does not exist: nothing is deleted.
 
     reset=False and the collection exists: if existing_points_guard is
     given, call it with the collection's current point count; a non-None
@@ -105,6 +111,11 @@ def prepare_collection_for_index(
             if mismatch:
                 result.error = mismatch
                 return result
+            if before_reset_delete is not None:
+                hook_error = before_reset_delete()
+                if hook_error:
+                    result.error = hook_error
+                    return result
             retry(client.delete, collection_name=collection, points_selector=mb.memory_bank_exclusion_filter())
             result.reset_deleted = True
     elif retry(client.collection_exists, collection):

@@ -151,6 +151,15 @@ class BuildMcpServers(unittest.TestCase):
         self.assertEqual(env["CLAUDE_RUNWAY_SAVINGS_DB"], "/x/s.db")
         self.assertEqual(env["CLAUDE_RUNWAY_METRICS_DB"], "/x/m.db")
 
+    def test_savings_db_is_never_written_into_the_local_compress_block(self):
+        # That server never opens the savings database, so the
+        # key there would be inert. Neither the template nor any flag adds it.
+        for kwargs in ({}, {"savings_db": "/x/s.db"}, {"track_savings": True, "savings_db": "/x/s.db"}):
+            with self.subTest(**kwargs):
+                env = self._build(**kwargs)["local-compress"]["env"]
+                self.assertNotIn("CLAUDE_RUNWAY_SAVINGS_DB", env)
+        self.assertNotIn("CLAUDE_RUNWAY_SAVINGS_DB", MCP_TEMPLATE["mcpServers"]["local-compress"]["env"])
+
     def test_metrics_db_override_reaches_memory_bank_too(self):
         # memory-bank writes metric_id="memory-bank" into the same store the
         # analytics server reads; both must see the same override.
