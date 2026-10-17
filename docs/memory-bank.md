@@ -2,7 +2,7 @@
 
 A durable, cross-session knowledge store — `remember`, `recall`, `forget` — provided by the `memory-bank` MCP server (`tools/memory_bank_mcp_server.py`, backed by `libs/memory_bank_lib.py`).
 
-This is separate from the Qdrant codebase memory piece described in the main README: `qdrant-store`/`qdrant-find` are for THIS project's own conceptual notes about its code; memory-bank is for lessons, decisions, and corrections meant to survive a fresh session, and can span every project on the machine.
+This is separate from the Qdrant codebase memory piece described in the main README: `qdrant-store`/`qdrant-find` work on THIS project's own collection, whatever you and Claude choose to put in it; memory-bank is for lessons, decisions, and corrections meant to survive a fresh session, and can span every project on the machine.
 
 ## Why a separate collection, not per-project
 

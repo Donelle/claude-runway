@@ -155,8 +155,9 @@ Env vars (same names local_compress_lib.py / compress_mcp_server.py use):
     semantics),
     CLAUDE_RUNWAY_TRACK_SAVINGS (opt-in savings tracker, off by default -- see
     libs/savings_ledger.py), CLAUDE_RUNWAY_SAVINGS_DB (optional override of
-    the savings DB's location; must match the value set in compress_mcp_server.py's
-    env if you set it at all -- default needs no coordination)
+    the savings DB's location; must match the value set in the analytics
+    server's env, whose savings tools read the database this script writes,
+    if you set it at all -- default needs no coordination)
 
     ALL of these must be exported at the OS/shell level to reach this script --
     a hook entry in .claude/settings.json has no `env` field, so it inherits the
@@ -165,9 +166,9 @@ Env vars (same names local_compress_lib.py / compress_mcp_server.py use):
     allowlist -- see docs/environment-variables.md's "Why two places" section), but
     only for a key genuinely absent from its own env block; this toolkit's
     shipped .mcp.json always declares CLAUDE_RUNWAY_LMSTUDIO_URL/
-    CLAUDE_RUNWAY_LMSTUDIO_MODEL/CLAUDE_RUNWAY_TRACK_SAVINGS/
-    CLAUDE_RUNWAY_SAVINGS_DB explicitly, so those four need setting in BOTH
-    places with matching values. CLAUDE_RUNWAY_COMPRESS_THRESHOLD_CHARS is
+    CLAUDE_RUNWAY_LMSTUDIO_MODEL/CLAUDE_RUNWAY_TRACK_SAVINGS explicitly (and
+    CLAUDE_RUNWAY_SAVINGS_DB in the analytics block when overridden), so
+    those need setting in BOTH places with matching values. CLAUDE_RUNWAY_COMPRESS_THRESHOLD_CHARS is
     the exception -- this script is its only reader, so it's shell-only; an
     .mcp.json copy would just be inert. Formerly
     LMSTUDIO_BASE_URL / LMSTUDIO_MODEL / HOOK_COMPRESS_THRESHOLD_CHARS; those

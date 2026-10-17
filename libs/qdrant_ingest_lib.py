@@ -8,12 +8,25 @@ it's easy to unit test and reuse. No print() calls in this file on purpose --
 ingest_mcp_server.py runs over stdio, where stray prints corrupt the protocol.
 """
 
+import bisect
 import functools
 import hashlib
+import json
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Generator, Optional
+from typing import Callable, Generator, Optional, Sequence
+
+# A complete Rust char literal, tried at a `'` in .rs files only:
+# `'x'` (one non-quote, non-backslash character) or a backslash escape --
+# `'\n'`, `'\''`, `'\\'`, `'\x41'`, `'\u{1F600}'`. Rust char literals are short
+# and always close; a lifetime or loop label (`'a`, `'static`, `'outer:`) is
+# followed by an identifier and never has a second `'` right after one
+# character, so it fails this match and is treated as a plain tick.
+_RUST_CHAR_LITERAL = re.compile(
+    r"'(?:\\(?:u\{[0-9a-fA-F_]+\}|x[0-9a-fA-F]{2}|.)|[^'\\])'"
+)
 
 CODE_EXTENSIONS = {
     ".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".java", ".rb", ".rs",
@@ -59,6 +72,37 @@ EXCLUDE_DIRS = {
 # pass extra_exclude_files={MANIFEST_FILENAME} or it embeds the manifest
 # itself -- the CLI was the one caller that didn't.
 MANIFEST_FILENAME = ".qdrant_index_manifest.json"
+
+# How many files compute_file_hashes visits between two on_progress calls.
+# Reading and hashing one file is quick, so a per-file report
+# would cost more MCP round-trips than the hashing itself on a large repo;
+# every few hundred files is frequent enough that the call never looks frozen
+# and rare enough to be noise-free.
+HASH_PROGRESS_EVERY = 200
+
+# The manifest is versioned. It is a wrapper, not the flat
+# {file: hash} map it used to be, and it keeps the SAME filename on purpose:
+# users already gitignore ".qdrant_index_manifest.json", and a new name would
+# put a new untracked file into every repo. The manifest only tracks file
+# CONTENT, so it cannot tell that the chunker changed; bumping the version is
+# what makes the first sync after a chunker change rebuild the index instead
+# of reporting "No changes" and serving stale chunks forever. A manifest in any
+# other shape (the old flat map, or a newer version this code does not know) is
+# ignored, which makes every file count as changed. Keys inside "files" stay
+# file paths only: files_removed_since_last_sync treats every key as a file.
+MANIFEST_FORMAT_VERSION = 2
+MANIFEST_FORMAT_KEY = "manifest_format"
+MANIFEST_FILES_KEY = "files"
+# Additive key beside "files": paths a rebuild found indexed and still on disk
+# but outside its scan, so it neither re-embedded nor hashed them. They are kept
+# apart from the hash map on purpose, because files_removed_since_last_sync
+# treats every key of that map as a file the scan should yield, and a narrower
+# scope would then delete a still-present file's chunks. The key is absent when
+# the set is empty, and a reader that predates it never looks at it, so adding
+# it needed NO MANIFEST_FORMAT_VERSION bump: the version is what forces a full
+# rebuild on every project that has the toolkit installed, and a manifest that
+# is merely richer must not do that.
+MANIFEST_PRESERVED_KEY = "preserved_untracked"
 
 # Built-in fallbacks for ingest_env_defaults() below -- what both the MCP
 # server and the CLI use when the matching env var is unset or blank.
@@ -193,9 +237,11 @@ def validate_chunk_params(chunk_size: int, overlap: int) -> Optional[str]:
     nothing at all (0) or a nonsensical chunk (negative) instead of raising
     cleanly. overlap < 0 has no valid meaning either.
 
-    Called once at every CLI/tool boundary that accepts these two params
-    (ingest_to_qdrant.py's argparse setup; ingest_mcp_server.py's
-    index_repo/sync_repo/preview_index) rather than enforced inside
+    Only for callers of the line-window chunkers. No indexing entry point
+    calls it any more: they chunk by the embedding model's token
+    window, where `overlap` is a number of tokens and `chunk_lines` sets
+    nothing, so they check validate_token_overlap instead. It was called once
+    at every CLI/tool boundary rather than enforced inside
     chunk_lines()/chunk_markdown() themselves -- that way the error names the
     actual bad input immediately, at the point the caller can still act on
     it, instead of surfacing however deep the chunking call stack happens to
@@ -291,6 +337,18 @@ def _strip_c_style_line(
     would corrupt scanning for those languages, which is why the issue
     explicitly ruled it out. All other `ext` values leave `#` alone.
 
+    Rust's `'` is ambiguous: it opens a char literal (`'x'`,
+    `'{'`) but is also the tick of every lifetime (`<'a>`, `&'a str`,
+    `'static`) and loop label (`'outer:`). When `ext == ".rs"`, a `'` is
+    only treated as a string opener if a complete char literal starts there
+    (`_RUST_CHAR_LITERAL`); otherwise it is kept as an ordinary character and
+    scanning continues. Treating every `'` as an opener, as the other
+    languages here do, made a signature like `fn f<'a>(x: &'a str) -> &'a str {`
+    swallow its own `{` from the third tick onward, so every line of the body
+    looked like a depth-zero boundary -- a fabricated boundary, not a missed
+    one. A char literal this regex misses (none in valid Rust) would at worst
+    leave a stray brace visible, never hide one.
+
     Not a real tokenizer: unusual per-language escape rules, nested block
     comments (most C-family languages don't allow those anyway), and other
     multiline literal forms this scanner doesn't special-case (Java text
@@ -368,6 +426,15 @@ def _strip_c_style_line(
             in_verbatim_string = True
             result.append("  ")
             i += 2
+        elif ch == "'" and ext == ".rs":
+            # Rust: a char literal, or a lifetime/label tick.
+            m = _RUST_CHAR_LITERAL.match(line, i)
+            if m:
+                result.append(" " * (m.end() - i))
+                i = m.end()
+            else:
+                result.append(ch)
+                i += 1
         elif ch in ("'", '"'):
             quote = ch
             j = i + 1
@@ -912,6 +979,323 @@ def chunk_markdown(text: str, fallback_chunk_size: int, fallback_overlap: int):
             yield chunk, start + 1, end
 
 
+class TokenBudgetError(ValueError):
+    """The token budget for chunking cannot be established.
+
+    Raised before anything is chunked, deleted or written, and never worked
+    around: falling back to line-based chunking, or to an invented window size,
+    would silently reproduce the bug token-budget chunking exists to fix (most
+    of every chunk never reaching its vector).
+    """
+
+
+def validate_token_overlap(overlap: int, max_tokens: Optional[int] = None) -> Optional[str]:
+    """
+    Error message for an unusable token overlap, or None.
+
+    `overlap` is measured in TOKENS now (it used to be lines), so the upper
+    bound is the embedding window, which is only known once the model is loaded:
+    callers check `overlap >= 0` at the tool boundary (max_tokens=None), where
+    the failure is cheapest, and the window bound when the budget is built. An
+    overlap of max_tokens or more would make every chunk start inside the
+    previous one's first token and never advance.
+    """
+    if overlap < 0:
+        return f"overlap must be 0 or greater (got {overlap})."
+    if max_tokens is not None and overlap >= max_tokens:
+        return (
+            f"overlap ({overlap} tokens) must be smaller than the embedding window's usable size "
+            f"({max_tokens} tokens) -- otherwise a chunk could never advance past the previous one."
+        )
+    return None
+
+
+@dataclass(frozen=True)
+class TokenBudget:
+    """How big a chunk may be, in the embedding model's own tokens.
+
+    The library stays dependency-free, so it never imports a tokenizer: the
+    indexer builds one of these from the loaded embedding model
+    (libs/qdrant_embeddings.py's FastEmbedProvider.build_token_budget) and
+    passes it in.
+
+    max_tokens: the usable window, i.e. the model's truncation limit minus the
+        special tokens the tokenizer adds around every text. A chunk of at most
+        this many tokens is embedded in full.
+    overlap_tokens: how many tokens the next chunk repeats from the end of the
+        previous one, at any cut.
+    token_spans: text -> [(start, end), ...], the character offsets of every
+        real token in `text` (no special tokens), in order. The count of a text
+        is len(token_spans(text)). Offsets, not just a count, because the cut
+        has to land on a character position: a minified file is one line, so
+        "cut after line N" has nothing to cut at.
+    """
+
+    max_tokens: int
+    overlap_tokens: int
+    token_spans: Callable[[str], list]
+
+    def __post_init__(self):
+        if self.max_tokens < 1:
+            raise TokenBudgetError(f"The usable embedding window must be at least 1 token (got {self.max_tokens}).")
+        err = validate_token_overlap(self.overlap_tokens, self.max_tokens)
+        if err:
+            raise TokenBudgetError(err)
+
+
+def _choose_cut(text: str, pos: int, cut_min: int, cut_max: int, preferred: Sequence[int]) -> int:
+    """
+    Where a chunk that starts at `pos` should end, given that the token budget
+    allows it to end anywhere up to `cut_max` and a cut earlier than `cut_min`
+    would waste too much of the window.
+
+    Prefers, in order, within [cut_min, cut_max]: (1) the last offset in
+    `preferred` (a markdown heading, or the end of a safe code boundary from
+    brace_boundary_indexes/python_boundary_indexes), (2) just after the last
+    newline, (3) a whitespace boundary, (4) `cut_max` exactly. Never requires a
+    preferred point to exist: a minified file or one long unbroken token has
+    none, and cutting at the budget is then the only correct answer.
+    """
+    if cut_min >= cut_max:
+        return cut_max
+    i = bisect.bisect_right(preferred, cut_max) - 1
+    if i >= 0 and preferred[i] >= cut_min and preferred[i] > pos:
+        return preferred[i]
+    newline = text.rfind("\n", max(cut_min - 1, pos), cut_max)
+    if newline != -1:
+        return newline + 1
+    n = len(text)
+    for p in range(cut_max, cut_min - 1, -1):
+        if p >= n or text[p].isspace() or text[p - 1].isspace():
+            return p
+    return cut_max
+
+
+def chunk_stream(text: str, budget: TokenBudget, preferred_cuts: Sequence[int] = ()):
+    """
+    Token-budgeted chunking over a stream of characters. Yields
+    (chunk_text, start, end): `text[start:end] == chunk_text`, offsets into
+    `text` as given (end exclusive).
+
+    Replaces the line-window chunkers for every indexing entry point. Lines are
+    the wrong unit: the embedder reads tokens and silently drops everything past
+    its window, so a 50-line chunk of a JSON file had ~10% of its text
+    searchable, and a minified file (one line) was one chunk with only its first
+    window searchable. Here a chunk is whatever fits the model's window, wherever
+    the line breaks fall.
+
+    The chunk is not stripped, so offsets and stored text always agree (the old
+    chunkers stripped, which shifted the start past leading blank lines). A
+    chunk that is only whitespace is dropped.
+
+    Each chunk is re-tokenized on its own after the cut and shortened until it
+    fits: cutting in the middle of a word can make the shorter text tokenize into
+    MORE tokens than the same characters did inside the longer one, so counting
+    inside the window alone does not guarantee the stored text fits.
+
+    Overlap (budget.overlap_tokens) is measured in tokens and applied at every
+    cut, including cuts at a preferred point.
+
+    A run of non-whitespace longer than the tokenizer's per-word limit comes
+    back as ONE (unknown) token covering all of it, so a chunk can be far longer
+    in characters than the window suggests, but never longer in tokens.
+    """
+    n = len(text)
+    # Offset past which nothing but whitespace remains: a chunk that would be
+    # only the overlap repeated over trailing whitespace is a duplicate.
+    content_end = len(text.rstrip())
+    if content_end == 0:
+        return
+    max_tokens = budget.max_tokens
+    pos = 0
+    while pos < n:
+        # Ask the tokenizer about a bounded slice, not the whole rest of the
+        # file (a minified bundle is millions of characters). Start from a
+        # generous guess and double until the slice holds more than one chunk's
+        # worth of tokens or reaches the end of the text.
+        window_chars = max_tokens * 4
+        while True:
+            window_end = min(pos + window_chars, n)
+            spans = budget.token_spans(text[pos:window_end])
+            if len(spans) > max_tokens or window_end >= n:
+                break
+            window_chars *= 2
+        if len(spans) <= max_tokens:
+            end = n  # the rest of the text fits in one chunk
+        else:
+            cut_max = pos + spans[max_tokens - 1][1]
+            cut_min = pos + spans[max(max_tokens // 2, 1) - 1][1]
+            end = _choose_cut(text, pos, cut_min, cut_max, preferred_cuts)
+        # Never a zero-length chunk, whatever the offsets say.
+        end = max(end, pos + 1)
+        chunk = text[pos:end]
+        chunk_spans = budget.token_spans(chunk)
+        while len(chunk_spans) > max_tokens:
+            # Strictly shorter on every pass. The end of the max_tokens-th
+            # token is NOT enough on its own: a byte-level or byte-fallback
+            # tokenizer can give several tokens the same character span, so
+            # that offset can be the end of the chunk already being counted
+            # and the loop would recount the same slice forever.
+            shorter = min(pos + chunk_spans[max_tokens - 1][1], end - 1)
+            if shorter <= pos:
+                raise TokenBudgetError(
+                    f"A single character {text[pos]!r} (offset {pos}) needs more than the embedding window's "
+                    f"{max_tokens} usable tokens, so no chunk can hold it. Indexing is stopped rather than "
+                    f"storing text the model cannot read."
+                )
+            end = shorter
+            chunk = text[pos:end]
+            chunk_spans = budget.token_spans(chunk)
+        if chunk.strip():
+            yield chunk, pos, end
+        if end >= content_end:
+            return
+        overlap = budget.overlap_tokens
+        next_pos = pos + chunk_spans[len(chunk_spans) - overlap][0] if 0 < overlap < len(chunk_spans) else end
+        pos = next_pos if next_pos > pos else end
+
+
+def _line_end_offsets(text: str) -> list:
+    """Offset just past each line of text.splitlines(), newline included --
+    the same line split brace_boundary_indexes/python_boundary_indexes see."""
+    ends = []
+    total = 0
+    for line in text.splitlines(keepends=True):
+        total += len(line)
+        ends.append(total)
+    return ends
+
+
+def _preferred_cuts(text: str, suffix: str) -> list:
+    """
+    Character offsets where a chunk may preferably end, for chunk_stream:
+    the start of every markdown heading, or the end of every line
+    after which the code boundary heuristics say a cut is safe. Empty for any
+    other file type, which then cuts at a newline, whitespace or the budget.
+    """
+    if suffix in MARKDOWN_EXTENSIONS:
+        starts = [0] + _line_end_offsets(text)[:-1]
+        return sorted(starts[i] for i in heading_line_indexes(text.splitlines()))
+    if suffix in BRACE_BLOCK_EXTENSIONS:
+        indexes = brace_boundary_indexes(text.splitlines(), ext=suffix)
+    elif suffix in INDENT_BLOCK_EXTENSIONS:
+        indexes = python_boundary_indexes(text.splitlines())
+    else:
+        return []
+    ends = _line_end_offsets(text)
+    return sorted(ends[i] for i in indexes)
+
+
+def chunk_position(metadata) -> str:
+    """
+    Human-readable position of a chunk from its metadata, tolerant of both
+    shapes: `line_number` + `char_range` on chunks indexed after
+    token-budget chunking, `line_range` on points that predate it and keep it
+    until their collection is re-indexed. A collection can also be another
+    repo's, found with find_in_collection, which may not be re-indexed yet.
+    Returns "" for a point carrying neither (a note stored with no position).
+    """
+    if not isinstance(metadata, dict):
+        return ""
+    line_number = metadata.get("line_number")
+    char_range = metadata.get("char_range")
+    if line_number is not None:
+        position = f"line {line_number}"
+        if char_range:
+            position += f", chars {char_range}"
+        return position
+    line_range = metadata.get("line_range")
+    if line_range:
+        return f"lines {line_range}"
+    return ""
+
+
+def format_largest_files(chunk_counts: dict, top: int = 5) -> str:
+    """
+    One sentence naming the files that produced the most chunks, or "" when
+    there are none. Token-budget chunking has no per-file cap by
+    owner decision -- a minified bundle or a data dump simply becomes thousands
+    of chunks -- so the indexing entry points name the biggest files in their
+    result, which is how a run that expanded unexpectedly gets noticed.
+    """
+    ranked = sorted(chunk_counts.items(), key=lambda item: (-item[1], item[0]))[:top]
+    if not ranked:
+        return ""
+    listing = ", ".join(f"{rel} ({count})" for rel, count in ranked)
+    return f"Largest files by chunk count: {listing}."
+
+
+def file_has_indexable_content(path: Path) -> bool:
+    """
+    True if chunking `path` would produce at least one chunk, i.e. it holds
+    something other than whitespace after the same decoding chunk_file uses.
+    Independent of any token budget, so sync_repo's index-consistency probe can
+    run before the embedding model is loaded (the "no changes" path never loads
+    it). Raises OSError like chunk_file.
+    """
+    return bool(path.read_text(encoding="utf-8", errors="ignore").strip())
+
+
+def manifest_to_json(files: dict, preserved=()) -> str:
+    """
+    Serialize a {file: hash} map as the versioned manifest, plus the set of
+    preserved-but-untracked paths (MANIFEST_PRESERVED_KEY) when there are any.
+    The key is left out when the set is empty, so a manifest that has none is
+    byte-for-byte what it was before the key existed.
+    """
+    doc = {MANIFEST_FORMAT_KEY: MANIFEST_FORMAT_VERSION, MANIFEST_FILES_KEY: files}
+    if preserved:
+        doc[MANIFEST_PRESERVED_KEY] = sorted(set(preserved))
+    return json.dumps(doc, indent=2, sort_keys=True)
+
+
+def parse_manifest(data) -> Optional[dict]:
+    """
+    The {file: hash} map inside a parsed manifest document, or None when
+    `data` is not a manifest this code version understands: the
+    old flat map, a newer format version, or anything malformed. None means
+    "ignore it", which makes every file count as changed.
+    """
+    if not isinstance(data, dict) or data.get(MANIFEST_FORMAT_KEY) != MANIFEST_FORMAT_VERSION:
+        return None
+    files = data.get(MANIFEST_FILES_KEY)
+    if not isinstance(files, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in files.items()):
+        return None
+    return files
+
+
+def parse_manifest_preserved(data) -> set:
+    """
+    The set of preserved-but-untracked paths in a parsed manifest document
+    (MANIFEST_PRESERVED_KEY), or an empty set when there are none: a manifest
+    written before the key existed, one without it, one this code does not
+    understand at all (parse_manifest says None), or a value of the wrong shape.
+    Empty is the safe reading in every case: it only means those paths are not
+    watched for deletion, which is what happened before the key existed.
+    """
+    if parse_manifest(data) is None:
+        return set()
+    raw = data.get(MANIFEST_PRESERVED_KEY)
+    if not isinstance(raw, list):
+        return set()
+    return {path for path in raw if isinstance(path, str) and path}
+
+
+def is_old_format_manifest(data) -> bool:
+    """
+    True for a parsed manifest document in the old flat {file: hash} shape
+    that holds at least one entry. `claude-runway-setup upgrade`
+    uses it to find a manifest worth removing; an empty one is the same as no
+    manifest, and a malformed or newer-format one is not "old".
+    """
+    return (
+        isinstance(data, dict)
+        and bool(data)
+        and MANIFEST_FORMAT_KEY not in data
+        and all(isinstance(k, str) and isinstance(v, str) for k, v in data.items())
+    )
+
+
 def scoped_extensions(scope: str, include_extensions: Optional[set] = None) -> set:
     """
     Returns the file extensions to include. If include_extensions is given,
@@ -928,11 +1312,24 @@ def scoped_extensions(scope: str, include_extensions: Optional[set] = None) -> s
     return extensions
 
 
-def chunk_file(path: Path, rel_path: str, chunk_size: int, overlap: int):
+def chunk_file(path: Path, rel_path: str, chunk_size: int, overlap: int, budget: Optional[TokenBudget] = None):
     """
     Chunk a single file, picking the code or doc chunker based on extension.
     Yields (content, metadata) tuples. Used both for full-repo builds and for
     re-chunking individual changed files during an incremental sync.
+
+    With a `budget` the file is cut by the embedding model's token
+    window over a stream of characters (chunk_stream), `chunk_size` and
+    `overlap` are ignored (the overlap is budget.overlap_tokens), and each
+    chunk's metadata carries `line_number` (1-based line of the file where the
+    chunk's text begins) and `char_range` ("start-end": character offsets of the
+    chunk's text in the decoded file, end exclusive, so text[start:end] is the
+    stored text). Every indexing entry point passes a budget.
+
+    Without one, the older line-window chunkers run and metadata carries
+    `line_range` instead; they stay for callers that exercise the pure
+    functions, and no indexing entry point may use them, because their chunks
+    are sized in lines while the embedder reads tokens.
     """
     # encoding is explicit on purpose. Without it, decoding follows the
     # platform locale (cp1252 on a default Windows box, UTF-8 on macOS/Linux),
@@ -944,6 +1341,23 @@ def chunk_file(path: Path, rel_path: str, chunk_size: int, overlap: int):
     text = path.read_text(encoding="utf-8", errors="ignore")
     suffix = path.suffix.lower()
     file_type = "doc" if suffix in DOC_EXTENSIONS else "code"
+    if budget is not None:
+        # Offsets are into `text` exactly as decoded above (UTF-8, undecodable
+        # bytes dropped, newlines normalized to \n by read_text), never bytes.
+        line_number = 1
+        counted_to = 0
+        for chunk, start, end in chunk_stream(text, budget, _preferred_cuts(text, suffix)):
+            # Chunks start at strictly increasing offsets, so the line number
+            # is a running count of the newlines passed since the last chunk.
+            line_number += text.count("\n", counted_to, start)
+            counted_to = start
+            yield chunk, {
+                "file_path": rel_path,
+                "line_number": line_number,
+                "char_range": f"{start}-{end}",
+                "type": file_type,
+            }
+        return
     if suffix in MARKDOWN_EXTENSIONS:
         generator = chunk_markdown(text, chunk_size, overlap)
     elif suffix in BRACE_BLOCK_EXTENSIONS:
@@ -975,6 +1389,8 @@ def build_entries(
     extra_exclude_dirs: Optional[set] = None,
     respect_gitignore: bool = True,
     extra_exclude_files: Optional[set] = None,
+    budget: Optional[TokenBudget] = None,
+    on_file: Optional[Callable[[str, int], None]] = None,
 ) -> tuple:
     """
     Returns (entries, skipped): entries is a list of (content, metadata)
@@ -988,6 +1404,11 @@ def build_entries(
     files by name (see iter_files). respect_gitignore additionally skips
     anything the repo's own .gitignore excludes (silently a no-op if there's
     no .gitignore or the optional pathspec package isn't installed).
+
+    budget is passed through to chunk_file. on_file, if given, is
+    called as on_file(rel_path, chunk_count) after each file that was chunked,
+    so a caller can show per-file progress: with no per-file chunk cap, one
+    minified file can become thousands of chunks.
     """
     gitignore_spec = load_gitignore_spec(repo_path) if respect_gitignore else None
     extensions = scoped_extensions(scope, include_extensions)
@@ -996,7 +1417,10 @@ def build_entries(
     for f in iter_files(repo_path, extensions, extra_exclude_dirs, gitignore_spec, extra_exclude_files):
         rel = str(f.relative_to(repo_path))
         try:
-            entries.extend(chunk_file(f, rel, chunk_size, overlap))
+            before = len(entries)
+            entries.extend(chunk_file(f, rel, chunk_size, overlap, budget))
+            if on_file is not None:
+                on_file(rel, len(entries) - before)
         except OSError as e:
             skipped.append((rel, str(e)))
     return entries, skipped
@@ -1011,6 +1435,7 @@ def iter_entries(
     extra_exclude_dirs: Optional[set] = None,
     respect_gitignore: bool = True,
     extra_exclude_files: Optional[set] = None,
+    budget: Optional[TokenBudget] = None,
 ) -> Generator:
     """
     Generator variant of build_entries() -- yields one (content, metadata)
@@ -1037,14 +1462,15 @@ def iter_entries(
 
     All filtering parameters (scope, include_extensions, extra_exclude_dirs,
     respect_gitignore, extra_exclude_files) work identically to build_entries()
-    -- keep them consistent between calls for the same repo.
+    -- keep them consistent between calls for the same repo. budget is passed
+    through to chunk_file.
     """
     gitignore_spec = load_gitignore_spec(repo_path) if respect_gitignore else None
     extensions = scoped_extensions(scope, include_extensions)
     for f in iter_files(repo_path, extensions, extra_exclude_dirs, gitignore_spec, extra_exclude_files):
         rel = str(f.relative_to(repo_path))
         try:
-            yield from chunk_file(f, rel, chunk_size, overlap)
+            yield from chunk_file(f, rel, chunk_size, overlap, budget)
         except OSError as e:
             yield None, (rel, str(e))
 
@@ -1056,6 +1482,8 @@ def compute_file_hashes(
     extra_exclude_dirs: Optional[set] = None,
     respect_gitignore: bool = True,
     extra_exclude_files: Optional[set] = None,
+    on_progress: Optional[Callable[[int], None]] = None,
+    progress_every: int = HASH_PROGRESS_EVERY,
 ) -> tuple:
     """
     Returns (hashes, skipped). hashes maps relative file path -> sha256 hex
@@ -1070,17 +1498,30 @@ def compute_file_hashes(
     build_entries -- keep them consistent between calls or the diff will
     look like every file changed. extra_exclude_files skips individual
     files by name (see iter_files).
+
+    on_progress, if given, is called with the running number of
+    files visited (hashed or skipped) after every progress_every-th one. It is
+    a plain synchronous callable because this function runs in a worker
+    thread: the caller decides how to get the figure to its client. There is no
+    total because the directory walk is lazy, and no call for the final count,
+    which the caller already has from the return value. An exception from the
+    callback propagates and stops the scan: the callers' only failure is a
+    cancelled call, which should stop the work, not be swallowed.
     """
     gitignore_spec = load_gitignore_spec(repo_path) if respect_gitignore else None
     extensions = scoped_extensions(scope, include_extensions)
     hashes = {}
     skipped = []
+    visited = 0
     for f in iter_files(repo_path, extensions, extra_exclude_dirs, gitignore_spec, extra_exclude_files):
         rel = str(f.relative_to(repo_path))
         try:
             hashes[rel] = hashlib.sha256(f.read_bytes()).hexdigest()
         except OSError as e:
             skipped.append((rel, str(e)))
+        visited += 1
+        if on_progress is not None and progress_every > 0 and visited % progress_every == 0:
+            on_progress(visited)
     return hashes, skipped
 
 
