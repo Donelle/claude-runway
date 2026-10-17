@@ -10,7 +10,8 @@ tells it to call a tool with an attacker's URL, and the configured credential
 goes with the request.
 
 This module is the one place that rule lives, so the ingest server, the
-memory-bank server and the qdrant server's compact tools cannot drift apart:
+memory-bank server, the qdrant server's compact tools and the ingest CLI
+(whose --qdrant-url/--qdrant-api-key play the same role) cannot drift apart:
 
   - an explicit key always wins (the caller chose both the host and the key);
   - the configured default key is used only when the resolved URL IS the

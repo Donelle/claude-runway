@@ -17,6 +17,8 @@ Usage:
 fall back to the same QDRANT_URL/QDRANT_API_KEY/EMBEDDING_MODEL/
 INDEX_INCLUDE_EXTENSIONS/INDEX_EXCLUDE_DIRS env vars the codebase-indexer MCP
 server reads, read from this shell's environment (not from .mcp.json).
+QDRANT_API_KEY is used only when --qdrant-url is QDRANT_URL (or the built-in
+default); any other --qdrant-url needs its own --qdrant-api-key.
 
 Chunking is by the embedding model's own token window, not by line count:
 the model embeds only the first N tokens of a text (N is read
@@ -92,6 +94,7 @@ from qdrant_batch_store import store_batch, ensure_file_path_index, FIELD_INDEXE
 from qdrant_index_prep import prepare_collection_for_index
 from qdrant_model_check import check_embedding_model_mismatch
 from qdrant_retry import call_with_retry
+from qdrant_credentials import resolve_qdrant_credentials
 from sync_manifest_lib import (
     discard_manifest,
     index_baseline,
@@ -394,8 +397,10 @@ def parse_args():
     p.add_argument("--collection", required=True, help="Qdrant collection name (must match your MCP server's COLLECTION_NAME)")
     p.add_argument("--qdrant-url", default=env["qdrant_url"],
                     help="Default: $QDRANT_URL if set, else http://localhost:6333")
-    p.add_argument("--qdrant-api-key", default=env["qdrant_api_key"],
-                    help="Default: $QDRANT_API_KEY if set, else none (unauthenticated)")
+    p.add_argument("--qdrant-api-key", default=None,
+                    help="Default: $QDRANT_API_KEY if set, but only when --qdrant-url is the configured URL "
+                         "($QDRANT_URL, or the built-in default). Any other --qdrant-url gets no key unless this "
+                         "flag is passed")
     p.add_argument("--embedding-model", default=env["embedding_model"],
                     help="Must match your MCP server's EMBEDDING_MODEL exactly. Default: $EMBEDDING_MODEL "
                          "if set, else sentence-transformers/all-MiniLM-L6-v2. Only the shell environment "
@@ -437,9 +442,19 @@ def parse_args():
                          "mismatch -- so it can no longer rebuild a collection's vector schema after an "
                          "EMBEDDING_MODEL change (drop the collection manually for that)")
     args = p.parse_args()
-    # A negative overlap is meaningless. The upper bound is the model's
-    # window, which is
-    # only known once the model is loaded, so ingest() checks it then.
+    # The same key rule the MCP tools follow (libs/qdrant_credentials.py): an
+    # explicit --qdrant-api-key always wins, $QDRANT_API_KEY goes only to the
+    # configured URL ($QDRANT_URL, or the built-in default), and any other
+    # --qdrant-url gets no key, so the exported credential never reaches a
+    # host named on the command line.
+    args.qdrant_url, args.qdrant_api_key = resolve_qdrant_credentials(
+        args.qdrant_url,
+        args.qdrant_api_key,
+        default_url=env["qdrant_url"],
+        default_api_key=env["qdrant_api_key"],
+    )
+    # A negative overlap is meaningless. The upper bound is the model's window,
+    # which is only known once the model is loaded, so ingest() checks it then.
     # p.error() is argparse's own idiom: prints usage + this message to stderr
     # and exits 2, same as any other bad-argument combination argparse itself
     # would catch.

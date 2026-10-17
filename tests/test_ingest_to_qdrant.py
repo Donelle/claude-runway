@@ -403,6 +403,39 @@ class CliParityWithMcpServer(unittest.TestCase):
         self.assertEqual(args.include_ext, ".rs")
         self.assertEqual(args.exclude_dirs, "flagdir")
 
+    def test_env_api_key_is_not_sent_to_a_different_qdrant_url(self):
+        # The exported key belongs to $QDRANT_URL. A --qdrant-url naming any
+        # other host must not carry it there.
+        args = self._parse(self.BASE_ARGV + ["--qdrant-url", "https://other.example"], {
+            "QDRANT_URL": "http://configured:6333",
+            "QDRANT_API_KEY": "secret",
+        })
+        self.assertEqual(args.qdrant_url, "https://other.example")
+        self.assertIsNone(args.qdrant_api_key)
+
+    def test_explicit_api_key_is_kept_for_a_different_qdrant_url(self):
+        args = self._parse(self.BASE_ARGV + [
+            "--qdrant-url", "https://other.example", "--qdrant-api-key", "other-key",
+        ], {"QDRANT_URL": "http://configured:6333", "QDRANT_API_KEY": "secret"})
+        self.assertEqual(args.qdrant_api_key, "other-key")
+
+    def test_env_api_key_kept_when_qdrant_url_flag_names_the_configured_url(self):
+        # Spelling out the configured URL, trailing slash and all, is still the
+        # configured endpoint.
+        args = self._parse(self.BASE_ARGV + ["--qdrant-url", "http://configured:6333/"], {
+            "QDRANT_URL": "http://configured:6333",
+            "QDRANT_API_KEY": "secret",
+        })
+        self.assertEqual(args.qdrant_api_key, "secret")
+
+    def test_env_api_key_goes_to_the_built_in_default_url_when_qdrant_url_is_unset(self):
+        args = self._parse(self.BASE_ARGV, {"QDRANT_API_KEY": "secret"})
+        self.assertEqual(args.qdrant_url, "http://localhost:6333")
+        self.assertEqual(args.qdrant_api_key, "secret")
+        foreign = self._parse(self.BASE_ARGV + ["--qdrant-url", "https://other.example"],
+                              {"QDRANT_API_KEY": "secret"})
+        self.assertIsNone(foreign.qdrant_api_key)
+
     def test_parse_args_built_in_defaults_with_no_env(self):
         args = self._parse(self.BASE_ARGV, {})
         self.assertEqual(args.qdrant_url, "http://localhost:6333")
