@@ -8,6 +8,7 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+.mypy_cache/
 
 # Local dogfood install of this toolkit on itself -- contains machine-specific
 # absolute paths, so it is not portable to another clone.
@@ -16,6 +17,7 @@ dist/
 .ai-docs/
 .claude/
 CLAUDE.md
+.ai-plans/
 
 # Written into the repo root by sync_repo/index_repo to track what's already
 # indexed -- per-checkout state that shouldn't be committed.
