@@ -136,6 +136,11 @@ class CheckDualEnvVars(unittest.TestCase):
     def _check(self, mcp_env, shell_env):
         return doctor_lib.check_dual_env_vars(mcp_env, shell_env, home_dir=self.home_dir)
 
+    def _check_savings_db(self, mcp_env, shell_env):
+        # The analytics block is where CLAUDE_RUNWAY_SAVINGS_DB is compared:
+        # it is the one server that reads the savings database.
+        return doctor_lib.check_dual_env_vars(mcp_env, shell_env, home_dir=self.home_dir, server="analytics")
+
     def test_var_absent_from_mcp_env_is_never_flagged(self):
         # Absent means "inherits from the shell" -- the exact same source
         # this check compares against, so it can never diverge.
@@ -221,7 +226,7 @@ class CheckDualEnvVars(unittest.TestCase):
 
     def test_savings_db_both_blank_is_not_a_mismatch(self):
         # The default needs no coordination -- both sides derive it identically.
-        self.assertEqual(self._check({"CLAUDE_RUNWAY_SAVINGS_DB": ""}, {}), [])
+        self.assertEqual(self._check_savings_db({"CLAUDE_RUNWAY_SAVINGS_DB": ""}, {}), [])
 
     # The "/custom/..." literals below go through os.path.abspath(): without a
     # drive letter they aren't absolute on Windows, so doctor_lib would
@@ -229,27 +234,30 @@ class CheckDualEnvVars(unittest.TestCase):
     # the literal. abspath() leaves them unchanged on POSIX.
 
     def test_savings_db_overridden_on_mcp_side_only_is_flagged(self):
-        custom = os.path.abspath("/custom/savings.db")
-        mcp_env = {"CLAUDE_RUNWAY_SAVINGS_DB": custom}
-        mismatches = self._check(mcp_env, {})
+        # os.path.abspath gives a drive-letter path on Windows so the override
+        # is truly absolute on both platforms and str(Path(...)) normalizes
+        # separators the same way the production code does.
+        abs_path = os.path.abspath("/custom/savings.db")
+        mcp_env = {"CLAUDE_RUNWAY_SAVINGS_DB": abs_path}
+        mismatches = self._check_savings_db(mcp_env, {})
         self.assertEqual(len(mismatches), 1)
-        self.assertEqual(mismatches[0].mcp_json_value, custom)
+        self.assertEqual(mismatches[0].mcp_json_value, abs_path)
         self.assertEqual(mismatches[0].shell_value, str(self.home_dir / ".claude" / "claude-runway" / "savings.db"))
 
     def test_savings_db_overridden_differently_on_both_sides_is_flagged(self):
-        custom_a = os.path.abspath("/custom/a.db")
-        custom_b = os.path.abspath("/custom/b.db")
-        mcp_env = {"CLAUDE_RUNWAY_SAVINGS_DB": custom_a}
-        shell_env = {"CLAUDE_RUNWAY_SAVINGS_DB": custom_b}
-        mismatches = self._check(mcp_env, shell_env)
+        abs_a = os.path.abspath("/custom/a.db")
+        abs_b = os.path.abspath("/custom/b.db")
+        mcp_env = {"CLAUDE_RUNWAY_SAVINGS_DB": abs_a}
+        shell_env = {"CLAUDE_RUNWAY_SAVINGS_DB": abs_b}
+        mismatches = self._check_savings_db(mcp_env, shell_env)
         self.assertEqual(len(mismatches), 1)
-        self.assertEqual(mismatches[0].mcp_json_value, custom_a)
-        self.assertEqual(mismatches[0].shell_value, custom_b)
+        self.assertEqual(mismatches[0].mcp_json_value, abs_a)
+        self.assertEqual(mismatches[0].shell_value, abs_b)
 
     def test_savings_db_overridden_identically_on_both_sides_is_not_a_mismatch(self):
         mcp_env = {"CLAUDE_RUNWAY_SAVINGS_DB": "/custom/a.db"}
         shell_env = {"CLAUDE_RUNWAY_SAVINGS_DB": "/custom/a.db"}
-        self.assertEqual(self._check(mcp_env, shell_env), [])
+        self.assertEqual(self._check_savings_db(mcp_env, shell_env), [])
 
     def test_savings_db_tilde_path_matches_its_expanded_absolute_equivalent(self):
         # Regression for a review finding: this previously
@@ -259,7 +267,7 @@ class CheckDualEnvVars(unittest.TestCase):
         # reported as a mismatch.
         mcp_env = {"CLAUDE_RUNWAY_SAVINGS_DB": "~/savings.db"}
         shell_env = {"CLAUDE_RUNWAY_SAVINGS_DB": str(self.home_dir / "savings.db")}
-        self.assertEqual(self._check(mcp_env, shell_env), [])
+        self.assertEqual(self._check_savings_db(mcp_env, shell_env), [])
 
     def test_savings_db_relative_path_is_anchored_to_home_dir_before_comparing(self):
         # resolve_db_path() anchors a still-relative override to Path.home()
@@ -267,18 +275,18 @@ class CheckDualEnvVars(unittest.TestCase):
         # are the same real path.
         mcp_env = {"CLAUDE_RUNWAY_SAVINGS_DB": "relative/savings.db"}
         shell_env = {"CLAUDE_RUNWAY_SAVINGS_DB": str(self.home_dir / "relative" / "savings.db")}
-        self.assertEqual(self._check(mcp_env, shell_env), [])
+        self.assertEqual(self._check_savings_db(mcp_env, shell_env), [])
 
     def test_savings_db_tilde_path_still_flagged_against_a_genuinely_different_path(self):
         # The fix must only stop FALSE positives -- a real divergence still
         # needs to be reported.
+        abs_different = os.path.abspath("/completely/different/path.db")
         mcp_env = {"CLAUDE_RUNWAY_SAVINGS_DB": "~/savings.db"}
-        different = os.path.abspath("/completely/different/path.db")
-        shell_env = {"CLAUDE_RUNWAY_SAVINGS_DB": different}
-        mismatches = self._check(mcp_env, shell_env)
+        shell_env = {"CLAUDE_RUNWAY_SAVINGS_DB": abs_different}
+        mismatches = self._check_savings_db(mcp_env, shell_env)
         self.assertEqual(len(mismatches), 1)
         self.assertEqual(mismatches[0].mcp_json_value, str(self.home_dir / "savings.db"))
-        self.assertEqual(mismatches[0].shell_value, different)
+        self.assertEqual(mismatches[0].shell_value, abs_different)
 
     def test_multiple_mismatches_all_reported(self):
         mcp_env = {
@@ -297,10 +305,12 @@ class RunDoctor(unittest.TestCase):
         self.target_repo.mkdir()
         self.home_dir = Path("/home/testuser")
 
-    def _write_mcp_json(self, local_compress_env=None):
+    def _write_mcp_json(self, local_compress_env=None, analytics_env=None):
         servers = {"qdrant": {"command": "x", "env": {}}}
         if local_compress_env is not None:
             servers["local-compress"] = {"command": "x", "env": local_compress_env}
+        if analytics_env is not None:
+            servers["analytics"] = {"command": "x", "env": analytics_env}
         (self.target_repo / ".mcp.json").write_text(json.dumps({"mcpServers": servers}), encoding="utf-8")
 
     def test_no_local_compress_server_reports_not_configured(self):
@@ -346,11 +356,86 @@ class RunDoctor(unittest.TestCase):
         # doesn't blow up and produces SOME savings-db-shaped default
         # (Path.home() varies per machine, so we can't assert an exact
         # value here without duplicating resolve_db_path's own logic).
-        self._write_mcp_json(local_compress_env={"CLAUDE_RUNWAY_SAVINGS_DB": "/custom/a.db"})
+        self._write_mcp_json(analytics_env={"CLAUDE_RUNWAY_SAVINGS_DB": "/custom/a.db"})
         result = doctor_lib.run_doctor(self.target_repo, shell_env={})
-        self.assertTrue(result.local_compress_configured)
+        self.assertTrue(result.analytics_checked)
         self.assertEqual(len(result.mismatches), 1)
         self.assertTrue(result.mismatches[0].shell_value.endswith("savings.db"))
+
+
+class SavingsDbIsCheckedInTheAnalyticsBlock(unittest.TestCase):
+    """`CLAUDE_RUNWAY_SAVINGS_DB` is read by the `analytics`
+    server (and the hooks), never by `local-compress`, so doctor compares the
+    analytics copy against the shell and ignores an inert local-compress one."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.target_repo = Path(self._tmpdir.name) / "my-project"
+        self.target_repo.mkdir()
+        self.home_dir = Path("/home/testuser")
+        self.abs_a = os.path.abspath("/custom/a.db")
+        self.abs_b = os.path.abspath("/custom/b.db")
+
+    def _write(self, local_compress_env=None, analytics_env=None):
+        servers = {"qdrant": {"command": "x", "env": {}}}
+        if local_compress_env is not None:
+            servers["local-compress"] = {"command": "x", "env": local_compress_env}
+        if analytics_env is not None:
+            servers["analytics"] = {"command": "x", "env": analytics_env}
+        (self.target_repo / ".mcp.json").write_text(json.dumps({"mcpServers": servers}), encoding="utf-8")
+
+    def _doctor(self, shell_env):
+        return doctor_lib.run_doctor(self.target_repo, shell_env=shell_env, home_dir=self.home_dir)
+
+    def test_an_analytics_block_that_disagrees_with_the_shell_is_reported_against_analytics(self):
+        # The split the ticket names: the hooks write one database (shell),
+        # the savings tools read another (analytics block).
+        self._write(local_compress_env={}, analytics_env={"CLAUDE_RUNWAY_SAVINGS_DB": self.abs_a})
+        [mismatch] = self._doctor({"CLAUDE_RUNWAY_SAVINGS_DB": self.abs_b}).mismatches
+        self.assertEqual(mismatch.var, "CLAUDE_RUNWAY_SAVINGS_DB")
+        self.assertEqual(mismatch.server, "analytics")
+        self.assertEqual(mismatch.mcp_json_value, str(Path(self.abs_a)))
+        self.assertEqual(mismatch.shell_value, str(Path(self.abs_b)))
+
+    def test_an_analytics_block_that_agrees_with_the_shell_is_ok(self):
+        self._write(analytics_env={"CLAUDE_RUNWAY_SAVINGS_DB": self.abs_a})
+        result = self._doctor({"CLAUDE_RUNWAY_SAVINGS_DB": self.abs_a})
+        self.assertEqual(result.mismatches, [])
+        self.assertTrue(result.analytics_checked)
+
+    def test_an_inert_local_compress_copy_is_not_compared(self):
+        # Before the fix this was flagged, although no server reads it there.
+        self._write(local_compress_env={"CLAUDE_RUNWAY_SAVINGS_DB": self.abs_a})
+        result = self._doctor({"CLAUDE_RUNWAY_SAVINGS_DB": self.abs_b})
+        self.assertEqual(result.mismatches, [])
+        self.assertTrue(result.local_compress_configured)
+        self.assertFalse(result.analytics_checked)
+
+    def test_an_analytics_block_without_the_override_inherits_and_is_not_checked(self):
+        # Absent means the server inherits the shell's value: nothing to diverge.
+        self._write(analytics_env={"CLAUDE_RUNWAY_TRACK_SAVINGS": "1"})
+        result = self._doctor({"CLAUDE_RUNWAY_SAVINGS_DB": self.abs_b})
+        self.assertEqual(result.mismatches, [])
+        self.assertFalse(result.analytics_checked)
+
+    def test_analytics_track_savings_is_not_compared_a_second_time(self):
+        # init/upgrade always write "1" there next to a local-compress copy
+        # that is already compared; reporting it twice would only add noise.
+        self._write(
+            local_compress_env={"CLAUDE_RUNWAY_TRACK_SAVINGS": "1"},
+            analytics_env={"CLAUDE_RUNWAY_TRACK_SAVINGS": "1"},
+        )
+        [mismatch] = self._doctor({}).mismatches
+        self.assertEqual((mismatch.var, mismatch.server), ("CLAUDE_RUNWAY_TRACK_SAVINGS", "local-compress"))
+
+    def test_a_malformed_analytics_block_is_a_config_error(self):
+        (self.target_repo / ".mcp.json").write_text(json.dumps({"mcpServers": {"analytics": []}}), encoding="utf-8")
+        self.assertIsNotNone(self._doctor({}).config_error)
+
+    def test_every_dual_var_is_compared_in_at_least_one_block(self):
+        compared = {var for server_vars in doctor_lib.SERVER_DUAL_ENV_VARS.values() for var in server_vars}
+        self.assertEqual(compared, set(doctor_lib.DUAL_ENV_VARS))
 
 
 class QdrantBlockIsCheckedToo(unittest.TestCase):

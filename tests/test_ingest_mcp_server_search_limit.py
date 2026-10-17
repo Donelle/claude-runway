@@ -109,10 +109,18 @@ class WiringTest(unittest.TestCase):
         for target, kwargs in (
             ("call_with_retry", {"side_effect": lambda fn, *a, **kw: fn(*a, **kw)}),
             ("_save_manifest", {}),
+            # index_repo also removes the manifest of the checkout it indexes
+            # (REPO_ROOT here, indexed into the configured default collection).
+            ("_discard_manifest", {}),
             ("chunk_file", {"side_effect": lambda *a, **kw: iter([("content", {"file_path": "x"})])}),
             ("ensure_file_path_index", {}),
             ("iter_entries", {"return_value": iter([])}),
             ("_recompute_search_limit", {}),
+            # An empty manifest against an existing collection is a rebuild;
+            # its extra Qdrant calls are covered in
+            # test_ingest_mcp_server_rebuild.py, not wiring.
+            ("_non_chunk_points_warning", {"return_value": ""}),
+            ("_delete_orphaned_chunks", {"return_value": []}),
         ):
             patcher = patch.object(_ims, target, **kwargs)
             setattr(self, "m_" + target, patcher.start())

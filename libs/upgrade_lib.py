@@ -45,6 +45,7 @@ from typing import Callable, Optional
 # Flat import, matching every other libs/*.py module's own convention (see
 # setup_project_lib.py's module docstring for why: libs/ is added to
 # sys.path directly by callers, not treated as a real Python package).
+from qdrant_ingest_lib import MANIFEST_FILENAME, is_old_format_manifest
 from setup_project_lib import (
     COMPRESS_HOOK_SCRIPT,
     LEGACY_COMPRESS_HOOK_SCRIPT,
@@ -93,6 +94,57 @@ class Migration:
     note: str  # printed after apply; blank when there's nothing to customize
     detect: Callable[[dict, dict], bool]
     apply: Callable[[dict, dict, MigrationContext], "tuple[dict, dict]"]
+
+
+@dataclass
+class RepoMigration:
+    """
+    One named, independently-detectable gap in a FILE inside the target repo
+    (not in its `.mcp.json`/`.claude/settings.json`), and its fix.
+
+    Same shape as `Migration` for everything a prompt or a printout reads (`id`,
+    `title`, `kind`, `description`, `note`), but `detect(target_repo) -> bool`
+    and `apply(target_repo) -> None` take the repo path and touch disk. Kept
+    config-only in spirit: an apply may delete or rewrite a bookkeeping file,
+    never run indexing or embedding code.
+    """
+
+    id: str
+    title: str
+    kind: str  # "add" | "remove" | "update"
+    description: str
+    note: str
+    detect: Callable[[Path], bool]
+    apply: Callable[[Path], None]
+
+
+# ---------------------------------------------------------------------------
+# index-manifest-old-format
+# ---------------------------------------------------------------------------
+
+
+def _detect_old_format_manifest(target_repo: Path) -> bool:
+    """
+    True when the repo's `.qdrant_index_manifest.json` is in the old flat
+    `{file: hash}` format and holds at least one entry.
+
+    The manifest is versioned now (see `qdrant_ingest_lib.MANIFEST_FORMAT_VERSION`),
+    so `sync_repo` already ignores an old-format one and rebuilds by itself; this
+    migration exists to say so out loud and to remove the stale file, not for
+    correctness. Idempotent by construction: once the file is deleted (or
+    rewritten by the next sync in the new format) this returns False. An absent,
+    unreadable, empty or new-format manifest is not pending.
+    """
+    manifest_path = Path(target_repo) / MANIFEST_FILENAME
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return is_old_format_manifest(data)
+
+
+def _apply_old_format_manifest(target_repo: Path) -> None:
+    (Path(target_repo) / MANIFEST_FILENAME).unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -742,11 +794,55 @@ def _apply_analytics_server_missing(
     return mcp_json, settings_json
 
 
+# ---------------------------------------------------------------------------
+# local-compress-savings-db-inert
+# ---------------------------------------------------------------------------
+
+_SAVINGS_DB_KEY = "CLAUDE_RUNWAY_SAVINGS_DB"
+
+
+def _detect_local_compress_savings_db_inert(mcp_json: dict, settings_json: dict) -> bool:
+    """
+    True when the `local-compress` block's env still has a
+    `CLAUDE_RUNWAY_SAVINGS_DB` key (blank or not). That server only reads
+    `CLAUDE_RUNWAY_TRACK_SAVINGS` (to mark a compressed result for the hook);
+    it never opens the savings database, so the key there is inert. Every
+    earlier `init` wrote it, blank unless `--savings-db` was given.
+    """
+    return _SAVINGS_DB_KEY in _local_compress_env(mcp_json)
+
+
+def _apply_local_compress_savings_db_inert(
+    mcp_json: dict, settings_json: dict, ctx: MigrationContext
+) -> "tuple[dict, dict]":
+    """
+    Removes just that one key from the `local-compress` env block; every
+    other key, server and the whole of `settings.json` are left as they were.
+
+    A no-op while `analytics-server-missing` is still pending:
+    that migration carries this very value over into the new `analytics`
+    block, so removing it first (or at all, if the user declined that one)
+    would lose a real override before the one server that reads it has it.
+    The guard runs here rather than in `detect` because `run_upgrade` computes
+    the pending list once, before anything is applied: in a single run where
+    both are accepted, `analytics-server-missing` (earlier in `MIGRATIONS`)
+    has already added the block by the time this runs, so the removal goes
+    ahead; if it was declined, this changes nothing and `run_upgrade` reports
+    it as still pending (same pattern as `record-session-id-sessionstart`).
+    """
+    if _detect_analytics_server_missing(mcp_json, settings_json):
+        return mcp_json, settings_json
+    mcp_json = copy.deepcopy(mcp_json)
+    _local_compress_env(mcp_json).pop(_SAVINGS_DB_KEY, None)
+    return mcp_json, settings_json
+
+
 # List order is both display and apply order when more than one migration is
 # pending; `detect` alone decides whether each one is shown at all. Order only
 # matters where one migration's guard depends on another:
 # record-session-id-sessionstart needs record-session-id-hooks-missing to
-# appear (and be applied) earlier in this list.
+# appear (and be applied) earlier in this list, and
+# local-compress-savings-db-inert needs analytics-server-missing earlier.
 MIGRATIONS: "list[Migration]" = [
     Migration(
         id="memory-bank-server-missing",
@@ -886,7 +982,7 @@ MIGRATIONS: "list[Migration]" = [
             "local-compress, so /my-savings and /my-metrics stop working until it is added. Adds the "
             "analytics block, carrying over any CLAUDE_RUNWAY_SAVINGS_DB / CLAUDE_RUNWAY_METRICS_DB "
             "override from the local-compress block. Recording is unaffected either way: the "
-            "local-compress server and the hooks still write savings events without it."
+            "hooks still write savings events without it."
         ),
         note=(
             "Restart Claude Code to load the new server. A project that does not track savings is not "
@@ -895,7 +991,63 @@ MIGRATIONS: "list[Migration]" = [
         detect=_detect_analytics_server_missing,
         apply=_apply_analytics_server_missing,
     ),
+    # Must stay AFTER analytics-server-missing: that one reads this key to
+    # carry an override over, and this one's apply is a no-op until it has.
+    Migration(
+        id="local-compress-savings-db-inert",
+        title="Remove the unused CLAUDE_RUNWAY_SAVINGS_DB from the local-compress server env",
+        kind="remove",
+        description=(
+            "This project's local-compress block still sets CLAUDE_RUNWAY_SAVINGS_DB, which that server "
+            "does not read: it never opens the savings database. The hooks write it (reading the shell "
+            "export) and the analytics server reads it (from its own block). Removes just that key; "
+            "CLAUDE_RUNWAY_TRACK_SAVINGS, which local-compress does read, stays."
+        ),
+        note=(
+            "If the removed value was a non-default path, keep it in the analytics block and your shell "
+            "export; `claude-runway-doctor` compares those two. If analytics-server-missing is also "
+            "pending, this changes nothing until that one has carried the value over."
+        ),
+        detect=_detect_local_compress_savings_db_inert,
+        apply=_apply_local_compress_savings_db_inert,
+    ),
 ]
+
+
+# Migrations on files inside the target repo, shown and applied after every
+# config migration above.
+REPO_MIGRATIONS: "list[RepoMigration]" = [
+    RepoMigration(
+        id="index-manifest-old-format",
+        title="Remove the old-format sync manifest so the next sync_repo rebuilds the index",
+        kind="remove",
+        description=(
+            "This repo has a .qdrant_index_manifest.json in the old format. Chunks are now cut by the "
+            "embedding model's token window instead of by line count, and their position metadata is "
+            "line_number + char_range instead of line_range, so every file has to be re-chunked and "
+            "re-embedded. The manifest only records file content, not how files were chunked, so it cannot "
+            "tell. Deletes it: the next sync_repo finds no manifest, rebuilds the whole index, and writes a "
+            "new versioned one. Nothing is embedded or sent to Qdrant by this command."
+        ),
+        note=(
+            "Cost: the first sync_repo afterwards re-embeds the WHOLE repo in one long call, and the "
+            "collection ends up with several times as many chunks as before -- more for minified or "
+            "generated files, which are indexed in full with no per-file cap. It reports per-file "
+            "progress and names the files that produced the most chunks. Run it when you are ready. "
+            "A file that is still on disk but outside that first rebuild's scope keeps its old chunks "
+            "and is recorded as kept in the new manifest, so later syncs remove its chunks if it is "
+            "deleted."
+        ),
+        detect=_detect_old_format_manifest,
+        apply=_apply_old_format_manifest,
+    ),
+]
+
+
+def pending_repo_migrations(target_repo: "Path | str") -> "list[RepoMigration]":
+    """Pure helper: every repo-file migration whose `detect` currently returns
+    True for `target_repo`, in `REPO_MIGRATIONS`' order."""
+    return [m for m in REPO_MIGRATIONS if m.detect(Path(target_repo))]
 
 
 def pending_migrations(mcp_json: dict, settings_json: dict) -> "list[Migration]":
@@ -963,14 +1115,14 @@ def _atomic_write_json(path: Path, data: dict) -> None:
         raise
 
 
-def _format_migration_block(migration: Migration, index: int, total: int) -> str:
+def _format_migration_block(migration: "Migration | RepoMigration", index: int, total: int) -> str:
     lines = [f"[{index}/{total}] {migration.kind.upper()}: {migration.title}", f"      {migration.description}"]
     if migration.note:
         lines.append(f"      Note: {migration.note}")
     return "\n".join(lines)
 
 
-def _console_prompt(migration: Migration, index: int, total: int) -> bool:
+def _console_prompt(migration: "Migration | RepoMigration", index: int, total: int) -> bool:
     """Default, real interactive prompt -- prints this migration's block
     then reads a Y/n answer from stdin. Blank input (just pressing Enter)
     defaults to Yes, matching the issue's own illustrated "Apply? [Y/n]"."""
@@ -987,7 +1139,7 @@ def run_upgrade(
     *,
     auto_yes: bool = False,
     dry_run: bool = False,
-    prompt_fn: Optional[Callable[[Migration, int, int], bool]] = None,
+    prompt_fn: Optional[Callable[["Migration | RepoMigration", int, int], bool]] = None,
 ) -> "list[str]":
     """
     Reads `target_repo`'s current `.mcp.json`/`.claude/settings.json`
@@ -1042,12 +1194,14 @@ def run_upgrade(
         return []
 
     pending = pending_migrations(mcp_json, settings_json)
+    repo_pending = pending_repo_migrations(target_repo)
+    total = len(pending) + len(repo_pending)
 
-    if not pending:
+    if not total:
         print("\nNo pending upgrades -- .mcp.json/.claude/settings.json already reflect every known migration.")
         return []
 
-    print(f"\nFound {len(pending)} pending upgrade(s):")
+    print(f"\nFound {total} pending upgrade(s):")
 
     ask = prompt_fn or _console_prompt
     applied: "list[str]" = []
@@ -1058,16 +1212,16 @@ def run_upgrade(
     for index, migration in enumerate(pending, start=1):
         if dry_run:
             print()
-            print(_format_migration_block(migration, index, len(pending)))
+            print(_format_migration_block(migration, index, total))
             applied.append(migration.id)
             continue
         if auto_yes:
             print()
-            print(_format_migration_block(migration, index, len(pending)))
+            print(_format_migration_block(migration, index, total))
             print("      Auto-applying (--auto-yes).")
             accept = True
         else:
-            accept = ask(migration, index, len(pending))
+            accept = ask(migration, index, total)
         if not accept:
             skipped += 1
             continue
@@ -1099,17 +1253,39 @@ def run_upgrade(
         settings_dirty = settings_dirty or settings_changed
         applied.append(migration.id)
 
-    if dry_run:
-        print(f"\nDry run: no changes written. {len(pending)} pending upgrade(s) would be applied.")
-        return applied
-
     # Write only documents some applied migration actually changed:
     # an unconditional both-file write would materialize a settings.json a
     # --skip-hooks project opted out of, and re-indent an untouched .mcp.json.
-    if mcp_dirty:
-        _atomic_write_json(mcp_json_path, mcp_json)
-    if settings_dirty:
-        _atomic_write_json(settings_path, settings_json)
+    if not dry_run:
+        if mcp_dirty:
+            _atomic_write_json(mcp_json_path, mcp_json)
+        if settings_dirty:
+            _atomic_write_json(settings_path, settings_json)
+
+    # Repo-file migrations come after the config ones, numbered on
+    # from them. They act on disk, so the config files are already written.
+    for index, repo_migration in enumerate(repo_pending, start=len(pending) + 1):
+        if dry_run:
+            print()
+            print(_format_migration_block(repo_migration, index, total))
+            applied.append(repo_migration.id)
+            continue
+        if auto_yes:
+            print()
+            print(_format_migration_block(repo_migration, index, total))
+            print("      Auto-applying (--auto-yes).")
+            accept = True
+        else:
+            accept = ask(repo_migration, index, total)
+        if not accept:
+            skipped += 1
+            continue
+        repo_migration.apply(target_repo)
+        applied.append(repo_migration.id)
+
+    if dry_run:
+        print(f"\nDry run: no changes written. {total} pending upgrade(s) would be applied.")
+        return applied
 
     noop_note = f", {noop} had nothing to change (still pending)" if noop else ""
     print(f"\nDone. {len(applied)} change(s) applied, {skipped} skipped{noop_note}.")

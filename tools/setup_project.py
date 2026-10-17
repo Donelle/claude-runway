@@ -197,9 +197,10 @@ _DEFAULT_LMSTUDIO_URL = "http://localhost:1234/v1"
 def _hook_env_reminders(args: argparse.Namespace) -> list:
     """
     --track-savings/--lmstudio-model/--lmstudio-url/--savings-db only reach
-    the MCP servers' env blocks in the generated .mcp.json (local-compress,
-    for the two LM Studio values also qdrant, and for --track-savings/
-    --savings-db the opt-in analytics block) --
+    the MCP servers' env blocks in the generated .mcp.json (local-compress
+    for all but --savings-db, for the two LM Studio values also qdrant, and
+    for --track-savings/--savings-db the opt-in analytics block, the only
+    server that opens the savings database) --
     they do NOT reach compress_output.py/session_end_savings.py, the
     hook scripts written into .claude/settings.json, since Claude Code hook
     entries have no env field of their own and instead inherit the shell's
@@ -745,7 +746,10 @@ def parse_args() -> argparse.Namespace:
         "savings_detail/savings_trend, get_metrics, record_metric); without this flag that block is not written",
     )
     init.add_argument(
-        "--savings-db", default="", help="Override the savings tracker DB path (leave blank for the default)"
+        "--savings-db",
+        default="",
+        help="Override the savings tracker DB path (leave blank for the default). Written into the `analytics` "
+        "block with --track-savings; the hooks read it from the shell, so export it there too",
     )
     init.add_argument(
         "--metrics-db",

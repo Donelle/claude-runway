@@ -2,13 +2,15 @@
 """
 Doctor/validator for a target project's dual-config `CLAUDE_RUNWAY_*` env
 vars -- diffs `.mcp.json`'s `local-compress` env block (and the `qdrant`
-block's LM Studio values, which `compact_store` compresses with) against the
-live shell environment for each variable README's "Environment variables" table
-marks "both" (`CLAUDE_RUNWAY_LMSTUDIO_URL`/`_MODEL`/`_TRACK_SAVINGS`/
-`_SAVINGS_DB`), flagging any mismatch instead of relying on a human to
-notice that the MCP-server side (`compress_file`/`fetch_url`) and the
-hook side (`compress_output.py`/`session_end_savings.py`) have quietly
-drifted apart (GROW-02 in `.plans/code-review-2026-08-18.md`).
+block's LM Studio values, which `compact_store` compresses with, and the
+`analytics` block's savings DB override, which its savings tools read)
+against the live shell environment for each variable the "Environment
+variables" doc marks "both" (`CLAUDE_RUNWAY_LMSTUDIO_URL`/`_MODEL`/
+`_TRACK_SAVINGS` in `local-compress`, `_SAVINGS_DB` in `analytics`), flagging
+any mismatch instead of relying on a human to notice that the MCP-server
+side (`compress_file`/`fetch_url`, the savings tools) and the hook side
+(`compress_output.py`/`session_end_savings.py`) have quietly drifted apart
+(GROW-02 in `.plans/code-review-2026-08-18.md`).
 
 Usage:
     python tools/doctor.py /path/to/target-repo
@@ -64,7 +66,7 @@ def _format_env_report(result: DoctorResult) -> str:
         # reported "nothing to check" and exited 0 instead of surfacing
         # the real problem.
         return f"error: {result.config_error}"
-    if not result.local_compress_configured and not result.qdrant_checked:
+    if not (result.local_compress_configured or result.qdrant_checked or result.analytics_checked):
         return (
             f"No 'local-compress' server found in {result.mcp_json_path} -- nothing to check "
             "(expected if this project only uses the Qdrant memory piece, e.g. --qdrant-only)."

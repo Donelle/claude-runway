@@ -46,6 +46,7 @@ from qdrant_client import QdrantClient
 from qdrant_ingest_lib import ensure_persistent_fastembed_cache
 from qdrant_retry import call_with_retry
 from qdrant_model_check import check_embedding_model_mismatch
+from qdrant_credentials import resolve_qdrant_credentials
 from mcp_tool_introspect import tool_count
 from session_id_lib import SessionIdStrategy, session_id as _resolve_session_id
 import memory_bank_lib as mb
@@ -488,13 +489,14 @@ async def transfer_memories(
     # qdrant_url is tool input, so falling back to DEFAULT_QDRANT_API_KEY for
     # ANY url would hand this project's Qdrant credential to whatever host a
     # call names. A different endpoint gets only the key passed with it.
-    url = qdrant_url or DEFAULT_QDRANT_URL
-    if qdrant_api_key:
-        api_key = qdrant_api_key
-    elif url == DEFAULT_QDRANT_URL:
-        api_key = DEFAULT_QDRANT_API_KEY
-    else:
-        api_key = None
+    # The rule itself lives in libs/qdrant_credentials.py, shared with the
+    # codebase-indexer server so the two cannot drift apart.
+    url, api_key = resolve_qdrant_credentials(
+        qdrant_url,
+        qdrant_api_key,
+        default_url=DEFAULT_QDRANT_URL,
+        default_api_key=DEFAULT_QDRANT_API_KEY,
+    )
     client = QdrantClient(url=url, api_key=api_key)
     # A dry run never embeds anything, and FastEmbedProvider's constructor
     # eagerly loads the ONNX model (see recall()'s comment above), so only

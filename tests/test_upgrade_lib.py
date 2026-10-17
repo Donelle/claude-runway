@@ -24,22 +24,27 @@ ADD the core block without touching that existing one.
 """
 
 import copy
+import io
 import json
 import os
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 REPO_ROOT = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, str(REPO_ROOT / "libs"))
 
+from qdrant_ingest_lib import MANIFEST_FILENAME, manifest_to_json  # noqa: E402
 from upgrade_lib import (  # noqa: E402
     COMPACT_TOOLS_MATCHER,
     MIGRATIONS,
+    REPO_MIGRATIONS,
     MigrationContext,
     is_project_configured,
     pending_migrations,
+    pending_repo_migrations,
     run_upgrade,
 )
 
@@ -831,8 +836,9 @@ class PendingMigrations(unittest.TestCase):
             "mcpServers": {
                 "qdrant": {"command": "/old/venv/bin/mcp-server-qdrant", "env": {}},
                 "codebase-indexer": {"env": {}},
-                # Tracking on, no analytics block: analytics-server-missing too.
-                "local-compress": {"env": {"CLAUDE_RUNWAY_TRACK_SAVINGS": "1"}},
+                # Tracking on, no analytics block: analytics-server-missing too;
+                # the leftover SAVINGS_DB key: local-compress-savings-db-inert too.
+                "local-compress": {"env": {"CLAUDE_RUNWAY_TRACK_SAVINGS": "1", "CLAUDE_RUNWAY_SAVINGS_DB": ""}},
             }
         }
         settings_json = {
@@ -1006,6 +1012,11 @@ class RunUpgradeEndToEnd(unittest.TestCase):
             analytics["env"],
             {"CLAUDE_RUNWAY_TRACK_SAVINGS": "1", "CLAUDE_RUNWAY_SAVINGS_DB": "/data/savings.db"},
         )
+        # ...and only then was the inert local-compress copy removed,
+        # in the same run, leaving the setting local-compress does read.
+        compress_env = mcp_json["mcpServers"]["local-compress"]["env"]
+        self.assertNotIn("CLAUDE_RUNWAY_SAVINGS_DB", compress_env)
+        self.assertEqual(compress_env["CLAUDE_RUNWAY_TRACK_SAVINGS"], "1")
         # record_session_id.py must now live under SessionStart (not PostToolUse).
         start_scripts = [
             Path(a).name
@@ -1224,6 +1235,110 @@ class RunUpgradeWritesOnlyChangedFiles(unittest.TestCase):
         self.assertEqual(self.mcp_path.read_text(encoding="utf-8"), self._MCP_COMPACT)
 
 
+class IndexManifestOldFormat(unittest.TestCase):
+    """The sync manifest is versioned, `sync_repo` ignores an
+    old-format one by itself, and `upgrade` removes the stale file and says the
+    next sync will re-index. It stays config-only: nothing here embeds anything.
+
+    A fully migrated project is built first (run_upgrade with auto_yes on a
+    minimal config), so the only thing left pending is the manifest."""
+
+    _OLD_MANIFEST = json.dumps({"a.py": "hash-a", "docs/b.md": "hash-b"})
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.target_repo = Path(self._tmpdir.name) / "proj"
+        self.target_repo.mkdir()
+        (self.target_repo / ".mcp.json").write_text(
+            '{"mcpServers":{"qdrant":{"command":"/x/bin/mcp-server-qdrant","env":{"COLLECTION_NAME":"p"}}}}',
+            encoding="utf-8",
+        )
+        (self.target_repo / ".claude").mkdir()
+        (self.target_repo / ".claude" / "settings.json").write_text("{}", encoding="utf-8")
+        run_upgrade(self.target_repo, REPO_ROOT, _VENV_PYTHON, auto_yes=True)
+        self.manifest = self.target_repo / MANIFEST_FILENAME
+
+    def _ids(self, repo=None):
+        return [m.id for m in pending_repo_migrations(repo or self.target_repo)]
+
+    def test_registered_with_a_stable_id(self):
+        self.assertEqual([m.id for m in REPO_MIGRATIONS], ["index-manifest-old-format"])
+
+    def test_not_pending_without_a_manifest(self):
+        self.assertEqual(self._ids(), [])
+
+    def test_pending_for_an_old_flat_manifest(self):
+        self.manifest.write_text(self._OLD_MANIFEST, encoding="utf-8")
+        self.assertEqual(self._ids(), ["index-manifest-old-format"])
+
+    def test_not_pending_for_a_new_format_manifest(self):
+        self.manifest.write_text(manifest_to_json({"a.py": "hash-a"}), encoding="utf-8")
+        self.assertEqual(self._ids(), [])
+
+    def test_not_pending_for_empty_unreadable_or_foreign_manifests(self):
+        for text in ("{}", "not json", "[1, 2]", json.dumps({"a.py": 5})):
+            with self.subTest(text=text):
+                self.manifest.write_text(text, encoding="utf-8")
+                self.assertEqual(self._ids(), [])
+
+    def test_dry_run_reports_it_and_deletes_nothing(self):
+        self.manifest.write_text(self._OLD_MANIFEST, encoding="utf-8")
+        applied = run_upgrade(self.target_repo, REPO_ROOT, _VENV_PYTHON, dry_run=True)
+        self.assertEqual(applied, ["index-manifest-old-format"])
+        self.assertTrue(self.manifest.exists())
+
+    def test_auto_yes_deletes_it_and_a_second_run_has_nothing_pending(self):
+        self.manifest.write_text(self._OLD_MANIFEST, encoding="utf-8")
+        applied = run_upgrade(self.target_repo, REPO_ROOT, _VENV_PYTHON, auto_yes=True)
+        self.assertEqual(applied, ["index-manifest-old-format"])
+        self.assertFalse(self.manifest.exists())
+        self.assertEqual(run_upgrade(self.target_repo, REPO_ROOT, _VENV_PYTHON, auto_yes=True), [])
+
+    def test_idempotent_against_a_manifest_the_next_sync_wrote(self):
+        """The reason the manifest is versioned rather than just deleted once:
+        after the rebuild writes a new-format one, `upgrade` must leave it alone."""
+        self.manifest.write_text(self._OLD_MANIFEST, encoding="utf-8")
+        run_upgrade(self.target_repo, REPO_ROOT, _VENV_PYTHON, auto_yes=True)
+        self.manifest.write_text(manifest_to_json({"a.py": "fresh"}), encoding="utf-8")
+        self.assertEqual(run_upgrade(self.target_repo, REPO_ROOT, _VENV_PYTHON, auto_yes=True), [])
+        self.assertTrue(self.manifest.exists())
+
+    def test_declining_keeps_the_file_and_it_stays_pending(self):
+        self.manifest.write_text(self._OLD_MANIFEST, encoding="utf-8")
+        applied = run_upgrade(self.target_repo, REPO_ROOT, _VENV_PYTHON, prompt_fn=lambda m, i, t: False)
+        self.assertEqual(applied, [])
+        self.assertTrue(self.manifest.exists())
+        self.assertEqual(self._ids(), ["index-manifest-old-format"])
+
+    def test_is_numbered_after_the_config_migrations_and_prompted_like_them(self):
+        self.manifest.write_text(self._OLD_MANIFEST, encoding="utf-8")
+        # Re-open a config gap so both kinds are pending in one run.
+        (self.target_repo / ".claude" / "settings.json").write_text("{}", encoding="utf-8")
+        seen = []
+
+        def _accept(migration, index, total):
+            seen.append((migration.id, index, total))
+            return True
+
+        run_upgrade(self.target_repo, REPO_ROOT, _VENV_PYTHON, prompt_fn=_accept)
+        ids = [i for i, _, _ in seen]
+        self.assertEqual(ids[-1], "index-manifest-old-format")
+        self.assertEqual([n for _, n, _ in seen], list(range(1, len(seen) + 1)))
+        self.assertEqual({t for _, _, t in seen}, {len(seen)})
+
+    def test_description_and_note_state_the_cost(self):
+        migration = REPO_MIGRATIONS[0]
+        self.assertIn("re-embeds the WHOLE repo", migration.note)
+        self.assertIn("no per-file cap", migration.note)
+        self.assertIn("Nothing is embedded", migration.description)
+
+    def test_a_project_with_only_the_manifest_pending_is_not_reported_as_up_to_date(self):
+        self.manifest.write_text(self._OLD_MANIFEST, encoding="utf-8")
+        applied = run_upgrade(self.target_repo, REPO_ROOT, _VENV_PYTHON, dry_run=True)
+        self.assertNotEqual(applied, [])
+
+
 class CompressHookMatcherCoversCompactTools(unittest.TestCase):
     """The compact tools moved from `mcp__local-compress__` to `mcp__qdrant__`.
     A compress-hook matcher `init` wrote before that no longer reaches the hook
@@ -1398,6 +1513,108 @@ class AnalyticsServerMissing(unittest.TestCase):
         before = self._mcp(CLAUDE_RUNWAY_TRACK_SAVINGS="1", CLAUDE_RUNWAY_SAVINGS_DB="/data/s.db")
         after = _migration(self._ID).apply(before, {}, _ctx())[0]
         self.assertEqual(after["mcpServers"]["local-compress"], before["mcpServers"]["local-compress"])
+
+
+class LocalCompressSavingsDbInert(unittest.TestCase):
+    """The `local-compress` server never opens the savings database,
+    so the `CLAUDE_RUNWAY_SAVINGS_DB` every older `init` wrote into its block is
+    inert. `upgrade` removes it, but only after `analytics-server-missing` has
+    carried a real override over into the block that does read it."""
+
+    _ID = "local-compress-savings-db-inert"
+
+    def _mcp(self, analytics=False, **compress_env):
+        servers = {
+            "qdrant": {"command": "/venv/bin/python", "args": ["/t/tools/qdrant_mcp_server.py"], "env": {}},
+            "local-compress": {"command": "/venv/bin/python", "env": dict(compress_env)},
+        }
+        if analytics:
+            servers["analytics"] = {"command": "/venv/bin/python", "env": {"CLAUDE_RUNWAY_TRACK_SAVINGS": "1"}}
+        return {"mcpServers": servers}
+
+    def test_detect_true_whenever_the_key_is_present_blank_or_not(self):
+        for value in ("", "/data/s.db"):
+            with self.subTest(value=value):
+                self.assertTrue(_migration(self._ID).detect(self._mcp(CLAUDE_RUNWAY_SAVINGS_DB=value), {}))
+
+    def test_detect_false_without_the_key_or_with_an_odd_shape(self):
+        self.assertFalse(_migration(self._ID).detect(self._mcp(CLAUDE_RUNWAY_TRACK_SAVINGS="1"), {}))
+        self.assertFalse(_migration(self._ID).detect({}, {}))
+        self.assertFalse(_migration(self._ID).detect({"mcpServers": None}, {}))
+        self.assertFalse(_migration(self._ID).detect({"mcpServers": {"local-compress": None}}, {}))
+        self.assertFalse(_migration(self._ID).detect({"mcpServers": {"local-compress": {"env": []}}}, {}))
+        # The key in some other block is not this migration's business.
+        mcp = self._mcp(analytics=True)
+        mcp["mcpServers"]["analytics"]["env"]["CLAUDE_RUNWAY_SAVINGS_DB"] = "/data/s.db"
+        self.assertFalse(_migration(self._ID).detect(mcp, {}))
+
+    def test_apply_removes_only_that_key_and_never_mutates_its_input(self):
+        before = self._mcp(
+            CLAUDE_RUNWAY_LMSTUDIO_URL="http://lm:1234/v1",
+            CLAUDE_RUNWAY_TRACK_SAVINGS="",
+            CLAUDE_RUNWAY_SAVINGS_DB="",
+        )
+        settings = {"hooks": {"SessionStart": []}}
+        snapshot = copy.deepcopy(before)
+        after, after_settings = _migration(self._ID).apply(before, settings, _ctx())
+        self.assertEqual(before, snapshot)
+        self.assertEqual(after_settings, settings)
+        expected = copy.deepcopy(before)
+        del expected["mcpServers"]["local-compress"]["env"]["CLAUDE_RUNWAY_SAVINGS_DB"]
+        self.assertEqual(after, expected)
+        self.assertFalse(_migration(self._ID).detect(after, {}))
+
+    def test_apply_is_a_no_op_while_the_analytics_carry_over_is_still_pending(self):
+        # Tracking on, no analytics block: removing the key now would lose the
+        # override analytics-server-missing is about to carry over.
+        before = self._mcp(CLAUDE_RUNWAY_TRACK_SAVINGS="1", CLAUDE_RUNWAY_SAVINGS_DB="/data/s.db")
+        after = _migration(self._ID).apply(before, {}, _ctx())[0]
+        self.assertEqual(after, before)
+        # Once the analytics block exists, the removal goes ahead.
+        with_analytics = self._mcp(analytics=True, CLAUDE_RUNWAY_TRACK_SAVINGS="1", CLAUDE_RUNWAY_SAVINGS_DB="/x")
+        removed = _migration(self._ID).apply(with_analytics, {}, _ctx())[0]
+        self.assertNotIn("CLAUDE_RUNWAY_SAVINGS_DB", removed["mcpServers"]["local-compress"]["env"])
+
+    def test_apply_removes_it_when_tracking_is_off(self):
+        # No analytics block is ever offered then, so nothing waits on the value.
+        before = self._mcp(CLAUDE_RUNWAY_TRACK_SAVINGS="", CLAUDE_RUNWAY_SAVINGS_DB="/data/s.db")
+        after = _migration(self._ID).apply(before, {}, _ctx())[0]
+        self.assertNotIn("CLAUDE_RUNWAY_SAVINGS_DB", after["mcpServers"]["local-compress"]["env"])
+
+    def test_it_comes_after_analytics_server_missing(self):
+        ids = [m.id for m in MIGRATIONS]
+        self.assertLess(ids.index("analytics-server-missing"), ids.index(self._ID))
+
+    def _run(self, mcp_json, **kwargs):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        target = Path(tmp.name)
+        (target / ".mcp.json").write_text(json.dumps(mcp_json), encoding="utf-8")
+        with redirect_stdout(io.StringIO()):
+            applied = run_upgrade(target, REPO_ROOT, _VENV_PYTHON, **kwargs)
+        return applied, json.loads((target / ".mcp.json").read_text(encoding="utf-8"))
+
+    def test_one_run_carries_the_override_over_then_removes_the_inert_copy(self):
+        applied, after = self._run(
+            self._mcp(CLAUDE_RUNWAY_TRACK_SAVINGS="1", CLAUDE_RUNWAY_SAVINGS_DB="/data/s.db"), auto_yes=True
+        )
+        # (This minimal config has other migrations pending too; only these two matter here.)
+        ours = [i for i in applied if i in ("analytics-server-missing", self._ID)]
+        self.assertEqual(ours, ["analytics-server-missing", self._ID])
+        self.assertEqual(after["mcpServers"]["analytics"]["env"]["CLAUDE_RUNWAY_SAVINGS_DB"], "/data/s.db")
+        self.assertEqual(after["mcpServers"]["local-compress"]["env"], {"CLAUDE_RUNWAY_TRACK_SAVINGS": "1"})
+
+    def test_declining_the_carry_over_keeps_the_value_and_leaves_this_pending(self):
+        def accept_only_this_one(migration, index, total):
+            # Declines analytics-server-missing (and the unrelated others this
+            # minimal config also has pending), accepts only this migration.
+            return migration.id == self._ID
+
+        before = self._mcp(CLAUDE_RUNWAY_TRACK_SAVINGS="1", CLAUDE_RUNWAY_SAVINGS_DB="/data/s.db")
+        applied, after = self._run(before, prompt_fn=accept_only_this_one)
+        self.assertEqual(applied, [])
+        self.assertEqual(after, before)
+        self.assertIn(self._ID, {m.id for m in pending_migrations(after, {})})
 
 
 class CompressHookRenamed(unittest.TestCase):

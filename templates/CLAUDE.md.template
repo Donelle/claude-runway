@@ -7,13 +7,13 @@
 
 ## Vector memory (Qdrant MCP)
 
-Five tools from the `qdrant` server: `qdrant-find` (semantic search) and `qdrant-store` (save a note for later retrieval) for this project's own knowledge, and `compact_store`/`compact_find`/`compact_prune` for conversation compacts (see below), plus `index_repo`/`sync_repo`/`preview_index`/`get_collection_info`/`find_in_collection`/`set_collection_description`/`list_collections` from the codebase-indexer server.
+Five tools from the `qdrant` server: `qdrant-find` (semantic search over this project's collection) and `qdrant-store` (save a piece of text there so `qdrant-find` can return it by meaning), and `compact_store`/`compact_find`/`compact_prune` for conversation compacts (see below), plus `index_repo`/`sync_repo`/`preview_index`/`get_collection_info`/`find_in_collection`/`set_collection_description`/`list_collections` from the codebase-indexer server.
 
-Prefer `qdrant-find` over Grep/Read for conceptual lookups — "where is X handled," "how does Y work," "what did we decide about Z." Use Grep directly for exact identifiers, error strings, or known symbols.
+Prefer `qdrant-find` over Grep/Read for conceptual lookups — "where is X handled," "how does Y work," "which files deal with Z." Use Grep directly for exact identifiers, error strings, or known symbols.
 
-Treat results as leads, not facts. If a result's metadata includes file_path and line_range, open only that span with Read rather than the whole file.
+Treat results as leads, not facts. If a result's metadata includes file_path and line_number, read from that line with Read (offset=line_number, with a limit) rather than the whole file; a chunk is short, so its text in the hit shows how far it runs. Points indexed before token-window chunking carry `line_range` ("start-end") instead. `qdrant-find` returns 10 hits unless you pass `limit`: raise it when what you want is not in the first 10.
 
-Storage convention for qdrant-store: always include file_path + line_range (or source/url for non-code) and a one-line summary in metadata. Store distilled findings after solving a problem, not raw text or in-progress reasoning.
+Storage convention for qdrant-store: store short text, not raw file dumps. When the text is about a file, add file_path + line_number metadata; when it comes from elsewhere, add source/url; otherwise metadata is optional.
 
 Run sync_repo at the start of a session (or after a batch of edits) to keep the index current — it only re-embeds files that changed, so it's cheap to run often. Use index_repo with reset=true only for first-time indexing or after changing chunking/embedding settings. Call get_collection_info if qdrant-find comes back empty, to check whether the collection actually has data.
 
@@ -25,7 +25,7 @@ Dedup within a session: if the same conceptual question resurfaces, reuse the ea
 
 ## Durable memory (memory-bank MCP)
 
-Three tools: `remember`, `recall`, `forget` — a durable, cross-session knowledge store, separate from `qdrant-store`/`qdrant-find` above (those are for THIS project's own conceptual notes; memory-bank is for lessons, decisions, and corrections meant to survive a fresh session, and can span every project on this machine).
+Three tools: `remember`, `recall`, `forget` — a durable, cross-session knowledge store, separate from `qdrant-store`/`qdrant-find` above (those work on this project's own collection, whatever you and the user choose to put in it). memory-bank is for lessons, decisions, and corrections meant to survive a fresh session, and can span every project on this machine.
 
 Call `recall` before finalizing a non-trivial change — a past correction, root cause, or design rationale relevant to the current task may already be stored. It defaults to this project's own memories plus anything tagged general (applies everywhere); only pass `repo=<name>` or `all_repos=True` when you genuinely need a different or broader scope than that.
 
@@ -76,4 +76,4 @@ Reporting CLIs that sit beside these tools and answer what they cannot (run them
 
 Include this section only for a project that has the claude-runway skills installed. Slash commands, each answering one question: `/my-setup-clauderunway` (configure or upgrade this project's `.mcp.json` and `.claude/settings.json`; needs `CLAUDE_RUNWAY_DIR` exported), `/my-compact` and `/my-resume` (save and restore a conversation, see the compacts paragraph above), `/my-savings` and `/my-metrics` (read the `analytics` server, see above).
 
-Two CLIs, run from the claude-runway checkout (they read files and never call a model), to diagnose a setup: `tools/doctor.py <project>` reports whether `.mcp.json`'s `local-compress` env block and the live shell disagree on the `CLAUDE_RUNWAY_*` variables that must match ("why is compression not happening?"), and `tools/measure_startup_context.py` measures what the MCP servers add to a session's starting context from real transcripts ("what does this toolkit cost me before I type anything?").
+Two CLIs, run from the claude-runway checkout (they read files and never call a model), to diagnose a setup: `tools/doctor.py <project>` reports whether `.mcp.json`'s env blocks (`local-compress`, `qdrant`, `analytics`) and the live shell disagree on the `CLAUDE_RUNWAY_*` variables that must match ("why is compression not happening?"), and `tools/measure_startup_context.py` measures what the MCP servers add to a session's starting context from real transcripts ("what does this toolkit cost me before I type anything?").

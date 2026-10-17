@@ -8,11 +8,15 @@ Each assertion fails when something is added without its docs line:
   `docs/skills-and-hooks.md`, and every skill is also named in the template;
 - every environment variable the code (or a shipped skill) reads is named in
   `docs/environment-variables.md`, apart from a short allow-list of
-  intentionally internal ones.
+  intentionally internal ones;
+- the `qdrant-find`/`qdrant-store` descriptions, and the template outside its
+  memory-bank section, never assign the lessons/decisions purpose that belongs
+  to memory-bank.
 
 Stdlib only, no network.
 """
 
+import ast
 import re
 import unittest
 from pathlib import Path
@@ -87,6 +91,70 @@ class McpToolsInTemplate(unittest.TestCase):
             if not _mentioned(name, template)
         ]
         self.assertEqual(missing, [], "tools absent from templates/CLAUDE.md.template")
+
+
+class QdrantToolsStayContentAgnostic(unittest.TestCase):
+    """`qdrant-store`/`qdrant-find` take and rank whatever text they are given;
+    the server has no notion of what a stored point is "for". Lessons,
+    corrections and design decisions belong to memory-bank, and the template's
+    memory-bank section is the one place that says so. If the qdrant tools'
+    descriptions (or the rest of the template) also asked for them, two
+    instructions would compete after every resolved root cause, and the notes
+    written to the project collection would sit beside the indexer's chunks
+    where a per-file delete can remove them."""
+
+    # Wording that assigns a purpose of the memory-bank kind.
+    _MEMORY_BANK_PURPOSE = re.compile(
+        r"\blessons?\b|\bdecisions?\b|\bdecide[ds]?\b|\broot[- ]causes?\b|\brationale\b|\bcorrections?\b",
+        re.IGNORECASE,
+    )
+
+    @staticmethod
+    def _qdrant_tool_descriptions() -> dict[str, str]:
+        tree = ast.parse(_read("tools/qdrant_mcp_server.py"))
+        wanted = {"qdrant_find": "qdrant-find", "qdrant_store": "qdrant-store"}
+        out = {
+            wanted[node.name]: ast.get_docstring(node) or ""
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)) and node.name in wanted
+        }
+        return out
+
+    @staticmethod
+    def _split_template() -> tuple[str, str]:
+        """(memory-bank section, everything else) of the template."""
+        template = _read("templates/CLAUDE.md.template")
+        start = template.index("## Durable memory (memory-bank MCP)")
+        nxt = template.find("\n## ", start + 1)
+        end = len(template) if nxt == -1 else nxt
+        return template[start:end], template[:start] + template[end:]
+
+    def test_descriptions_are_found(self):
+        # Guards the AST lookup: a silent miss would make the next test vacuous.
+        found = self._qdrant_tool_descriptions()
+        self.assertEqual(sorted(found), ["qdrant-find", "qdrant-store"])
+        for name, text in found.items():
+            self.assertTrue(text.strip(), f"{name}: empty description")
+
+    def test_descriptions_do_not_assign_a_memory_bank_purpose(self):
+        for name, text in self._qdrant_tool_descriptions().items():
+            self.assertIsNone(
+                self._MEMORY_BANK_PURPOSE.search(text),
+                f"{name}'s description names lessons/decisions, which memory-bank is for",
+            )
+
+    def test_only_the_memory_bank_section_of_the_template_names_that_purpose(self):
+        memory_bank, rest = self._split_template()
+        self.assertIsNotNone(
+            self._MEMORY_BANK_PURPOSE.search(memory_bank),
+            "the memory-bank section should be where lessons/decisions are named",
+        )
+        hit = self._MEMORY_BANK_PURPOSE.search(rest)
+        self.assertIsNone(hit, f"template outside its memory-bank section mentions {hit.group(0)!r}" if hit else "")
+
+    def test_template_does_not_ask_for_notes_after_solving_a_problem(self):
+        template = _read("templates/CLAUDE.md.template")
+        self.assertNotIn("distilled finding", template.lower())
 
 
 class HooksAndSkillsInDocs(unittest.TestCase):

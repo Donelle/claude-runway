@@ -83,6 +83,13 @@ class IndexRepoPreflightWarningTest(unittest.TestCase):
         self._index_patcher = patch.object(_ims, "ensure_file_path_index")
         self.mock_ensure_index = self._index_patcher.start()
 
+        # These tests index REPO_ROOT, the real checkout: index_repo writes (and
+        # on reset removes) the repo's sync manifest, which must not touch it.
+        for name in ("_save_manifest", "_discard_manifest"):
+            patcher = patch.object(_ims, name)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     def tearDown(self):
         self._retry_patcher.stop()
         self._store_batch_patcher.stop()

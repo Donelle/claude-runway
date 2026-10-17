@@ -3,7 +3,8 @@ Shared, dependency-free logic behind `tools/doctor.py` -- a validator that
 diffs each dual-config `CLAUDE_RUNWAY_*` env var (the ones
 docs/environment-variables.md's table marks "both") between a target repo's
 `.mcp.json` `local-compress` env block (and the `qdrant` block, which holds
-the LM Studio values `compact_store` compresses with) and the live shell
+the LM Studio values `compact_store` compresses with, and the `analytics`
+block, which holds the savings DB override) and the live shell
 environment, flagging any mismatch instead of relying on a human to notice silently
 split behavior (GROW-02 in `.plans/code-review-2026-08-18.md`).
 Extends the same "loud instead of silent" idea `local_compress_lib.py`'s
@@ -57,15 +58,15 @@ DEFAULT_LMSTUDIO_URL = "http://localhost:1234/v1"
 _AUTO_DETECT_MODEL = "(auto-detect -- no model pinned)"
 
 # Every CLAUDE_RUNWAY_* var docs/environment-variables.md's table marks "both" -- i.e.
-# genuinely needs matching values in .mcp.json's local-compress env block
-# (the two LMSTUDIO ones also in the qdrant block) AND the shell. Deliberately excluded from this list:
+# genuinely needs matching values in .mcp.json AND the shell; which server
+# block each is compared in is SERVER_DUAL_ENV_VARS below. Deliberately excluded from this list:
 # - CLAUDE_RUNWAY_COMPRESS_THRESHOLD_CHARS: shell-only (compress_output.py
 #   is the sole reader); an .mcp.json copy is inert.
 # - CLAUDE_RUNWAY_CACHE_DB: read by both codebase-indexer MCP server AND
 #   redirect_webfetch_to_fetch_url.py hook. Shell export is the
 #   override channel (hooks have no env field in settings.json), not .mcp.json.
-#   doctor.py only checks the local-compress env block; flagging a mismatch
-#   for a var that's not a local-compress concern would be misleading.
+#   No block doctor.py checks reads it; flagging a mismatch for it there
+#   would be misleading.
 # - CLAUDE_RUNWAY_WEBFETCH_FAILED_URL_TTL: hook-only; no .mcp.json counterpart.
 # - CLAUDE_RUNWAY_LMSTUDIO_TIMEOUT_SECONDS: read by both halves via
 #   libs/lmstudio_client.py's build_client(), but deliberately not declared in
@@ -78,6 +79,29 @@ DUAL_ENV_VARS = (
     "CLAUDE_RUNWAY_TRACK_SAVINGS",
     "CLAUDE_RUNWAY_SAVINGS_DB",
 )
+
+# Which of DUAL_ENV_VARS each checked server actually READS, so a copy in a
+# block whose server ignores it is never compared: comparing an
+# inert copy would flag a harmless difference while missing the real one.
+#   - local-compress: the LM Studio values, and TRACK_SAVINGS (it marks a
+#     compressed result for the hook to record). Not SAVINGS_DB: it never
+#     opens the savings database; `upgrade` removes a leftover copy.
+#   - qdrant: the LM Studio values `compact_store` compresses with.
+#   - analytics: SAVINGS_DB, the database its savings tools read, which must
+#     be the same file the hooks write (from the shell), or the tracker
+#     splits across two databases. Its TRACK_SAVINGS is not compared here:
+#     `init`/`upgrade` always write it as "1" alongside a local-compress
+#     block that carries the same setting, which is already checked above,
+#     so comparing it again would only report one mismatch twice.
+SERVER_DUAL_ENV_VARS = {
+    "local-compress": (
+        "CLAUDE_RUNWAY_LMSTUDIO_URL",
+        "CLAUDE_RUNWAY_LMSTUDIO_MODEL",
+        "CLAUDE_RUNWAY_TRACK_SAVINGS",
+    ),
+    "qdrant": ("CLAUDE_RUNWAY_LMSTUDIO_URL", "CLAUDE_RUNWAY_LMSTUDIO_MODEL"),
+    "analytics": ("CLAUDE_RUNWAY_SAVINGS_DB",),
+}
 
 
 def _is_truthy_track_savings(value: Optional[str]) -> bool:
@@ -156,7 +180,8 @@ class DualEnvMismatch:
     var: str
     mcp_json_value: str
     shell_value: str
-    # Which `.mcp.json` server block held the value (`local-compress` or `qdrant`).
+    # Which `.mcp.json` server block held the value (`local-compress`, `qdrant`
+    # or `analytics`).
     server: str = "local-compress"
 
 
@@ -262,15 +287,16 @@ def check_dual_env_vars(
     mcp_env: Mapping[str, str], shell_env: Mapping[str, str], *, home_dir: Path, server: str = "local-compress"
 ) -> list:
     """
-    Diffs every var in `DUAL_ENV_VARS` between `mcp_env` (the `server`
-    block's `.mcp.json` env) and `shell_env`
+    Diffs every var `server` reads (`SERVER_DUAL_ENV_VARS[server]`; a server
+    not listed there is a caller bug and raises `KeyError`) between `mcp_env`
+    (the `server` block's `.mcp.json` env) and `shell_env`
     (typically `os.environ`), returning one `DualEnvMismatch` per var whose
     effective values disagree. A var absent from `mcp_env` is skipped
     entirely -- it inherits straight from `shell_env` (the exact same
     source this check compares against), so it can never actually diverge.
     """
     mismatches = []
-    for var in DUAL_ENV_VARS:
+    for var in SERVER_DUAL_ENV_VARS[server]:
         if var not in mcp_env:
             continue
         mcp_norm = _normalize(var, mcp_env[var], home_dir=home_dir)
@@ -305,6 +331,9 @@ class DoctorResult:
     # LM Studio values), so there was something to check there even with no
     # local-compress server (a `--qdrant-only` setup).
     qdrant_checked: bool = False
+    # True when the `analytics` block carries a `CLAUDE_RUNWAY_SAVINGS_DB`
+    # override, the one server that reads that database.
+    analytics_checked: bool = False
     config_error: Optional[str] = None
     # Hook events in .claude/settings.json still invoking the pre-rename
     # compress_bash_output.py (see find_legacy_compress_hook_events).
@@ -358,6 +387,7 @@ def run_doctor(target_repo: Path, *, shell_env: Mapping[str, str], home_dir: Opt
     try:
         compress_env = load_server_env(mcp_json_path, "local-compress")
         qdrant_env = load_server_env(mcp_json_path, "qdrant")
+        analytics_env = load_server_env(mcp_json_path, "analytics")
     except MalformedMcpJsonError as exc:
         return DoctorResult(mcp_json_path=mcp_json_path, local_compress_configured=False, config_error=str(exc))
     legacy_events = find_legacy_compress_hook_events(Path(target_repo))
@@ -367,13 +397,26 @@ def run_doctor(target_repo: Path, *, shell_env: Mapping[str, str], home_dir: Opt
     # The qdrant block holds the LM Studio URL/model compact_store compresses
     # with, which the shell (and the hooks) must agree with just like the
     # local-compress block's copy. Its other vars are not dual-config ones.
-    qdrant_checked = qdrant_env is not None and any(var in qdrant_env for var in DUAL_ENV_VARS)
+    qdrant_checked = _carries_any(qdrant_env, "qdrant")
     if qdrant_env is not None:
         mismatches += check_dual_env_vars(qdrant_env, shell_env, home_dir=resolved_home, server="qdrant")
+    # The analytics block holds the savings DB override its tools read; the
+    # hooks write that database from the shell's value.
+    analytics_checked = _carries_any(analytics_env, "analytics")
+    if analytics_env is not None:
+        mismatches += check_dual_env_vars(analytics_env, shell_env, home_dir=resolved_home, server="analytics")
     return DoctorResult(
         mcp_json_path=mcp_json_path,
         local_compress_configured=compress_env is not None,
         mismatches=mismatches,
         qdrant_checked=qdrant_checked,
+        analytics_checked=analytics_checked,
         legacy_compress_hook_events=legacy_events,
     )
+
+
+def _carries_any(env: Optional[dict], server: str) -> bool:
+    """True when `env` (a server's env block, `None` if the server is not
+    configured) holds at least one var `server` reads, i.e. there is
+    something of that block to compare against the shell."""
+    return env is not None and any(var in env for var in SERVER_DUAL_ENV_VARS[server])

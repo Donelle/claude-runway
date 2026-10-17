@@ -312,8 +312,12 @@ def build_mcp_servers(
         compress["args"] = [f"{tools_repo_str}/tools/compress_mcp_server.py"]
         compress["env"]["CLAUDE_RUNWAY_LMSTUDIO_URL"] = lmstudio_url
         compress["env"]["CLAUDE_RUNWAY_LMSTUDIO_MODEL"] = lmstudio_model
+        # TRACK_SAVINGS stays here: this server reads it to decide whether to
+        # mark a compressed result for the hook to record. SAVINGS_DB does
+        # not: this server never opens the savings database (the hooks write
+        # it, the `analytics` server below reads it), so a copy here would be
+        # inert and would only mislead `doctor` and anyone reading the config.
         compress["env"]["CLAUDE_RUNWAY_TRACK_SAVINGS"] = "1" if track_savings else ""
-        compress["env"]["CLAUDE_RUNWAY_SAVINGS_DB"] = savings_db
     else:
         del servers["local-compress"]
 

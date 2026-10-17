@@ -92,6 +92,13 @@ class IndexRepoResetGuardTest(unittest.TestCase):
         self._index_patcher.start()
         self.addCleanup(self._index_patcher.stop)
 
+        # These tests index REPO_ROOT, the real checkout: index_repo writes (and
+        # on reset removes) the repo's sync manifest, which must not touch it.
+        for name in ("_save_manifest", "_discard_manifest"):
+            patcher = patch.object(_ims, name)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     def _make_client(self, exists=True):
         client = MagicMock()
         client.collection_exists.return_value = exists
@@ -200,6 +207,16 @@ class SyncRepoDeleteFilterTest(unittest.TestCase):
         self._chunk_file_patcher = patch.object(_ims, "chunk_file", return_value=iter([]))
         self._chunk_file_patcher.start()
         self.addCleanup(self._chunk_file_patcher.stop)
+
+        # An empty manifest against an existing collection is a rebuild,
+        # which adds a non-chunk-points count before the per-file delete
+        # and an orphan sweep after the store. Both are tested on their own in
+        # test_ingest_mcp_server_rebuild.py; here they are stubbed so
+        # `client.delete` still sees only the per-file delete these tests pin.
+        for helper, value in (("_non_chunk_points_warning", ""), ("_delete_orphaned_chunks", [])):
+            patcher = patch.object(_ims, helper, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
         self._store_batch_patcher = patch.object(_ims, "store_batch", new_callable=AsyncMock)
         self._store_batch_patcher.start()
@@ -355,9 +372,11 @@ class SyncRepoMissingCollectionTest(unittest.TestCase):
         self.assertIn("no indexed file chunks", result)
 
     def test_manifest_of_only_zero_chunk_files_is_not_an_error(self):
-        # a file that hashes but chunks to nothing (empty /
-        # whitespace-only) is in the manifest yet never creates a point.
-        with patch.object(_ims, "chunk_file", side_effect=lambda *a, **kw: iter([])):
+        # A file that hashes but chunks to nothing (empty /
+        # whitespace-only) is in the manifest yet never creates a point. The
+        # probe asks file_has_indexable_content (no token budget is
+        # available yet at that point), not chunk_file.
+        with patch.object(_ims, "file_has_indexable_content", return_value=False):
             result = self._sync(self._client(exists=False), {"a.py": "h1", "b.py": "h2"})
         self.assertIn("No changes since last sync", result)
 
@@ -426,10 +445,10 @@ class SyncRepoMissingCollectionTest(unittest.TestCase):
         # unknown, not a proven zero-chunk file, so it must not permit the
         # zero-chunk exception.
         with patch.object(_ims, "compute_file_hashes", return_value=({"a.py": "h1"}, [("b.py", "boom")])), \
-             patch.object(_ims, "chunk_file", side_effect=lambda *a, **kw: iter([])):
+             patch.object(_ims, "file_has_indexable_content", return_value=False):
             result = self._sync(self._client(exists=False), {"a.py": "h1", "b.py": "h2"})
         self.assertIn("Error", result)
-        with patch.object(_ims, "chunk_file", side_effect=OSError("transient")):
+        with patch.object(_ims, "file_has_indexable_content", side_effect=OSError("transient")):
             result = self._sync(self._client(exists=False), {"a.py": "h1", "b.py": "h2"})
         self.assertIn("Error", result)
 

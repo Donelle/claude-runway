@@ -96,6 +96,27 @@ class DoctorCli(unittest.TestCase):
         self.assertIn("http://localhost:9999/v1", output)
         self.assertIn("http://localhost:1234/v1", output)
 
+    def test_analytics_savings_db_mismatch_exits_one_and_names_the_analytics_block(self):
+        # The analytics block is where the savings DB is compared,
+        # and a config whose only dual-config value is there is not "nothing
+        # to check".
+        block_path = os.path.abspath("/custom/block.db")
+        shell_path = os.path.abspath("/custom/shell.db")
+        servers = {
+            "qdrant": {"command": "x", "env": {}},
+            "analytics": {"command": "x", "env": {"CLAUDE_RUNWAY_SAVINGS_DB": block_path}},
+        }
+        (self.target_repo / ".mcp.json").write_text(json.dumps({"mcpServers": servers}), encoding="utf-8")
+        with mock.patch.dict(os.environ, {"CLAUDE_RUNWAY_SAVINGS_DB": shell_path}, clear=False):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                exit_code = self.mod.main([str(self.target_repo)])
+        output = buf.getvalue()
+        self.assertEqual(exit_code, 1)
+        self.assertIn(".mcp.json (analytics):", output)
+        self.assertIn("CLAUDE_RUNWAY_SAVINGS_DB", output)
+        self.assertNotIn("nothing to check", output)
+
     def test_stale_legacy_compress_hook_exits_one_and_points_at_upgrade(self):
         # compress_bash_output.py was renamed; a settings.json
         # still pointing at it must fail the doctor even with no env mismatch.

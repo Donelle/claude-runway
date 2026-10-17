@@ -1260,7 +1260,9 @@ class RegisteredToolSet(unittest.TestCase):
 
         mod = _load_qdrant_mcp_server()
         tools = {t.name: t for t in asyncio.run(mod.mcp.list_tools())}
-        self.assertEqual(set(tools["qdrant-find"].input_schema["properties"]), {"query"})
+        # `limit` is optional: the package this replaced took only
+        # `query`, and a call that passes just that must keep working.
+        self.assertEqual(set(tools["qdrant-find"].input_schema["properties"]), {"query", "limit"})
         self.assertEqual(tools["qdrant-find"].input_schema["required"], ["query"])
         self.assertEqual(set(tools["qdrant-store"].input_schema["properties"]), {"information", "metadata"})
         self.assertEqual(tools["qdrant-store"].input_schema["required"], ["information"])
@@ -1274,8 +1276,18 @@ class RegisteredToolSet(unittest.TestCase):
         store = tools["qdrant-store"].description or ""
         self.assertIn("BEFORE grepping", find)
         self.assertIn("Do NOT use for exact string", find)
-        self.assertIn("file_path and line_range", store)
-        self.assertIn("Do not store speculative", store)
+        self.assertIn("file_path and line_number", store)
+        self.assertNotIn("line_range", store)
+        # Hits from before token-window chunking still carry line_range, so
+        # find's description tells the reader about both shapes.
+        self.assertIn("line_number", find)
+        self.assertIn("char_range", find)
+        self.assertIn("line_range", find)
+        self.assertIn("speculative", store)
+        # The locator metadata is advice, not a requirement: a file_path tag on
+        # text that is not about a file only exposes it to the indexer's per-file delete.
+        self.assertNotIn("ALWAYS", store)
+        self.assertIn("optional", store)
 
     def test_this_server_does_not_register_the_compression_tools(self):
         names = {info.name for info in _load_qdrant_mcp_server().mcp._tool_manager.list_tools()}
@@ -1437,6 +1449,31 @@ class QdrantFindAndStoreTools(unittest.TestCase):
             _run(mod.qdrant_store(f"note {i}", None))
         results = _run(mod.qdrant_find("note 0"))
         self.assertEqual(len(results) - 1, mod.SEARCH_LIMIT)
+
+    def test_find_limit_defaults_to_ten_and_an_explicit_one_wins(self):
+        """Repetitive content can fill a fixed top 10 and push the
+        wanted chunk past it, so the caller can ask for more (or fewer)."""
+        mod = self._server()
+        self.assertEqual(mod.SEARCH_LIMIT, 10)
+        for i in range(mod.SEARCH_LIMIT + 5):
+            _run(mod.qdrant_store(f"note {i}", None))
+        self.assertEqual(len(_run(mod.qdrant_find("note 0", limit=3))) - 1, 3)
+        self.assertEqual(len(_run(mod.qdrant_find("note 0", limit=mod.SEARCH_LIMIT + 5))) - 1, mod.SEARCH_LIMIT + 5)
+
+    def test_find_rejects_a_limit_below_one(self):
+        mod = self._server()
+        for bad in (0, -1):
+            with self.subTest(limit=bad):
+                results = _run(mod.qdrant_find("note", limit=bad))
+                self.assertEqual(len(results), 1)
+                self.assertTrue(results[0].startswith("Error: limit must be 1 or greater"))
+
+    def test_store_then_find_round_trips_the_new_position_metadata(self):
+        mod = self._server()
+        metadata = {"file_path": "src/auth.py", "line_number": 12, "char_range": "340-910"}
+        _run(mod.qdrant_store("auth is handled in middleware", metadata))
+        results = _run(mod.qdrant_find("auth is handled in middleware"))
+        self.assertIn(json.dumps(metadata), results[1])
 
     def test_both_tools_report_a_missing_collection_name_instead_of_crashing(self):
         mod = self._server()
