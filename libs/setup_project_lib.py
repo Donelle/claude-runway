@@ -33,7 +33,7 @@ def default_collection_name(repo_path: Path) -> str:
     directory name, e.g. "My Cool App!" -> "my-cool-app".
 
     This is only a convenience DEFAULT, not a collision-proofed identifier.
-    tools/qdrant_mcp_server.py's `_sanitize_project` is not one either: it
+    mcpservers/qdrant_mcp_server.py's `_sanitize_project` is not one either: it
     appends no hash, so names differing only in punctuation/whitespace map to
     the same conversation-compacts collection, and per-project isolation there
     comes from payload filtering on read/prune. Here the collection name is a
@@ -65,6 +65,136 @@ def load_json(path: Path) -> dict:
     """Loads a JSON file (a template, or an already-existing target config)."""
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+class MalformedConfigError(Exception):
+    """
+    Raised when a target project's EXISTING `.mcp.json`/`.claude/settings.json`
+    cannot be used as the base of a merge: not valid JSON (or unreadable), a
+    top level that is not an object, or an `mcpServers`/`hooks` member that is
+    present but not an object (an explicit `null` counts as present -- see
+    `check_object_member`).
+
+    One shared error for `init`, `upgrade` and `doctor`: `doctor`
+    was hardened against these shapes first (it reports them as a config
+    error); `init`/`upgrade` read the very same files and used to crash with a
+    raw `AttributeError`/`TypeError`/`JSONDecodeError` from deep inside the
+    merge code instead. The message names the file and the problem, so the
+    CLI can print it as a one-line `error:` and exit nonzero BEFORE anything
+    is written. `doctor_lib.MalformedMcpJsonError` is an alias of this class.
+    """
+
+
+def read_config_object(path: Path) -> dict:
+    """
+    Reads an existing config file that must hold a JSON object, raising
+    `MalformedConfigError` for a file that cannot be read or parsed (invalid
+    JSON, bad encoding, a directory in its place) and for a top level that is
+    not an object. The caller checks the file exists first: a MISSING config
+    is a legitimate state each caller handles itself (`{}` for `init`/
+    `upgrade`, "nothing to check" for `doctor`), not an error.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+        raise MalformedConfigError(f"{path} could not be read as valid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise MalformedConfigError(f"{path}'s top level is a {type(data).__name__}, expected an object")
+    return data
+
+
+def check_object_member(path: Path, data: dict, key: str) -> dict:
+    """
+    Returns `data[key]`, or `{}` if the key is ABSENT; raises
+    `MalformedConfigError` if it is present but not an object. Presence is
+    decided by key membership, not by the value being `None`: `.get(key)` and
+    `setdefault(key, {})` both hand back an explicit JSON `null` as-is, which
+    is exactly how `"mcpServers": null` and `"hooks": null` used to crash the
+    merge code.
+    """
+    if key not in data:
+        return {}
+    value = data[key]
+    if not isinstance(value, dict):
+        raise MalformedConfigError(f"{path}'s \"{key}\" is a {type(value).__name__}, expected an object")
+    return value
+
+
+def _is_string_list(value: object) -> bool:
+    """True for a JSON list whose every element is a string (`args` shape)."""
+    return isinstance(value, list) and all(isinstance(v, str) for v in value)
+
+
+def load_existing_mcp_json(path: Path) -> dict:
+    """
+    The target's existing `.mcp.json` for `init`/`upgrade` (`{}` when the file
+    does not exist), validated once at the load boundary so the merge and
+    migration code can rely on `mcpServers` being an object when present.
+    Raises `MalformedConfigError` otherwise.
+    """
+    if not path.exists():
+        return {}
+    data = read_config_object(path)
+    servers = check_object_member(path, data, "mcpServers")
+    # The migrations and the merge read each server block's `env` through
+    # chained `.get()`s, so a server entry (or its `env`) that is not an object
+    # crashes them just like a non-object `mcpServers` does.
+    for name, server in servers.items():
+        if not isinstance(server, dict):
+            raise MalformedConfigError(
+                f"{path}'s \"{name}\" server is a {type(server).__name__}, expected an object"
+            )
+        if "env" in server and not isinstance(server["env"], dict):
+            raise MalformedConfigError(
+                f"{path}'s \"{name}\".\"env\" is a {type(server['env']).__name__}, expected an object"
+            )
+        # `args` is iterated by the qdrant-server migration's launcher check.
+        if not _is_string_list(server.get("args", [])):
+            raise MalformedConfigError(f"{path}'s \"{name}\" server has \"args\" that is not a list of strings")
+    return data
+
+
+def load_existing_settings_json(path: Path) -> dict:
+    """
+    The target's existing `.claude/settings.json` for `init`/`upgrade` (`{}`
+    when the file does not exist); see `load_existing_mcp_json`. Validates
+    `hooks` is an object when present. Raises `MalformedConfigError` otherwise.
+    """
+    if not path.exists():
+        return {}
+    data = read_config_object(path)
+    hooks = check_object_member(path, data, "hooks")
+    # The same shape rule one level at a time down to the `args` the merge and
+    # migrations match script names against: event -> list of blocks, block ->
+    # object whose `hooks` is a list of objects, hook `args` -> list of strings.
+    for event, blocks in hooks.items():
+        where = f"{path}'s \"hooks\".\"{event}\""
+        if not isinstance(blocks, list):
+            raise MalformedConfigError(f"{where} is a {type(blocks).__name__}, expected a list")
+        for block in blocks:
+            if not isinstance(block, dict):
+                raise MalformedConfigError(f"{where} has a {type(block).__name__} entry, expected an object")
+            inner = block.get("hooks", [])
+            if not isinstance(inner, list):
+                raise MalformedConfigError(
+                    f"{where} has a block whose \"hooks\" is a {type(inner).__name__}, expected a list"
+                )
+            for hook in inner:
+                if not isinstance(hook, dict):
+                    raise MalformedConfigError(
+                        f"{where} has a hook that is a {type(hook).__name__}, expected an object"
+                    )
+                if not _is_string_list(hook.get("args", [])):
+                    raise MalformedConfigError(f"{where} has a hook whose \"args\" is not a list of strings")
+            # The compress-hook migrations put each block's matcher in sets and
+            # compare it as text, so a list/number there is unhashable or silently
+            # never matches.
+            if not isinstance(block.get("matcher", ""), str):
+                raise MalformedConfigError(
+                    f"{where} has a block whose \"matcher\" is a {type(block['matcher']).__name__}, expected a string"
+                )
+    return data
 
 
 _PLACEHOLDER_MARKERS = ("REPLACE-WITH-", "/absolute/path/to/")
@@ -120,6 +250,10 @@ def build_mcp_servers(
     embedding_model: str = "",
     memory_bank_embedding_model: str = "",
     compact_embedding_model: str = "",
+    codebase_reviewer: bool = False,
+    reviewers_file: str = "",
+    max_reviewers: str = "",
+    max_review_rounds: str = "",
 ) -> dict:
     """
     Returns a fresh `mcpServers` dict (deep-copied from `template`, never
@@ -198,9 +332,10 @@ def build_mcp_servers(
     here) preserves the existing identity independent of whatever
     `collection_name` resolves to on that run.
 
-    `qdrant_api_key` is applied to the three Qdrant-talking servers'
-    `QDRANT_API_KEY` (`qdrant`, `codebase-indexer` and `memory-bank`, which
-    all read the exact same variable so a single project's `.mcp.json` keeps
+    `qdrant_api_key` is applied to the Qdrant-talking servers'
+    `QDRANT_API_KEY` (`qdrant`, `codebase-indexer` and `memory-bank`, plus
+    `codebase-reviewer` when that opt-in block is written, which all read the
+    exact same variable so a single project's `.mcp.json` keeps
     every one of them aligned). Found in review: since this script
     previously always replaced these servers' `env` blocks wholesale with
     values it computed, an authenticated remote-Qdrant setup's
@@ -221,6 +356,15 @@ def build_mcp_servers(
     `metrics_db` reach that block only when non-blank. A non-blank
     `metrics_db` is also written into the `memory-bank` block, which writes
     into the same shared store, so the two stay on one file.
+
+    `codebase_reviewer` decides whether the opt-in `codebase-reviewer` block is
+    emitted at all (dropped from the result otherwise). `reviewers_file` is the
+    block's `REVIEWERS_FILE`, which is REQUIRED by that server and has NO
+    default: blank is written as blank (the server then refuses to run a review
+    and says why), never a made-up path, and no reviewers file is ever created.
+    `max_reviewers`/`max_review_rounds` override the template's values only when
+    non-blank. The block's Qdrant settings follow `qdrant_url`/`qdrant_api_key`
+    like every other server's.
 
     The `qdrant` block also carries `lmstudio_url`/`lmstudio_model`, which
     only `compact_store` uses (to compress a summary before storing it), so a
@@ -251,7 +395,7 @@ def build_mcp_servers(
 
     qdrant = servers["qdrant"]
     qdrant["command"] = venv_python_str
-    qdrant["args"] = [f"{tools_repo_str}/tools/qdrant_mcp_server.py"]
+    qdrant["args"] = [f"{tools_repo_str}/mcpservers/qdrant_mcp_server.py"]
     qdrant["env"]["QDRANT_URL"] = qdrant_url
     qdrant["env"]["QDRANT_API_KEY"] = qdrant_api_key
     qdrant["env"]["COLLECTION_NAME"] = collection_name
@@ -269,7 +413,7 @@ def build_mcp_servers(
 
     indexer = servers["codebase-indexer"]
     indexer["command"] = venv_python_str
-    indexer["args"] = [f"{tools_repo_str}/tools/ingest_mcp_server.py"]
+    indexer["args"] = [f"{tools_repo_str}/mcpservers/ingest_mcp_server.py"]
     indexer["env"]["QDRANT_URL"] = qdrant_url
     indexer["env"]["QDRANT_API_KEY"] = qdrant_api_key
     indexer["env"]["COLLECTION_NAME"] = collection_name
@@ -280,7 +424,7 @@ def build_mcp_servers(
 
     memory_bank = servers["memory-bank"]
     memory_bank["command"] = venv_python_str
-    memory_bank["args"] = [f"{tools_repo_str}/tools/memory_bank_mcp_server.py"]
+    memory_bank["args"] = [f"{tools_repo_str}/mcpservers/memory_bank_mcp_server.py"]
     memory_bank["env"]["QDRANT_URL"] = qdrant_url
     memory_bank["env"]["QDRANT_API_KEY"] = qdrant_api_key
     memory_bank["env"]["MEMORY_BANK_ID"] = resolved_memory_bank_id
@@ -309,7 +453,7 @@ def build_mcp_servers(
     if include_compress:
         compress = servers["local-compress"]
         compress["command"] = venv_python_str
-        compress["args"] = [f"{tools_repo_str}/tools/compress_mcp_server.py"]
+        compress["args"] = [f"{tools_repo_str}/mcpservers/compress_mcp_server.py"]
         compress["env"]["CLAUDE_RUNWAY_LMSTUDIO_URL"] = lmstudio_url
         compress["env"]["CLAUDE_RUNWAY_LMSTUDIO_MODEL"] = lmstudio_model
         # TRACK_SAVINGS stays here: this server reads it to decide whether to
@@ -330,7 +474,7 @@ def build_mcp_servers(
     if track_savings and include_compress:
         analytics = servers["analytics"]
         analytics["command"] = venv_python_str
-        analytics["args"] = [f"{tools_repo_str}/tools/analytics_mcp_server.py"]
+        analytics["args"] = [f"{tools_repo_str}/mcpservers/analytics_mcp_server.py"]
         analytics["env"]["CLAUDE_RUNWAY_TRACK_SAVINGS"] = "1"
         if savings_db:
             analytics["env"]["CLAUDE_RUNWAY_SAVINGS_DB"] = savings_db
@@ -338,6 +482,25 @@ def build_mcp_servers(
             analytics["env"]["CLAUDE_RUNWAY_METRICS_DB"] = metrics_db
     else:
         del servers["analytics"]
+
+    # The `codebase-reviewer` server is opt-in and independent of every other
+    # server (it needs neither local-compress nor the savings tracker), so it is
+    # written only when asked for. REVIEWERS_FILE is written exactly as given,
+    # blank included: the server requires it and has no default, so inventing a
+    # path here would hide the one thing the user must supply.
+    if codebase_reviewer:
+        reviewer = servers["codebase-reviewer"]
+        reviewer["command"] = venv_python_str
+        reviewer["args"] = [f"{tools_repo_str}/mcpservers/codebase_reviewer_mcp_server.py"]
+        reviewer["env"]["QDRANT_URL"] = qdrant_url
+        reviewer["env"]["QDRANT_API_KEY"] = qdrant_api_key
+        reviewer["env"]["REVIEWERS_FILE"] = reviewers_file
+        if max_reviewers:
+            reviewer["env"]["MAX_REVIEWERS"] = max_reviewers
+        if max_review_rounds:
+            reviewer["env"]["MAX_REVIEW_ROUNDS"] = max_review_rounds
+    else:
+        del servers["codebase-reviewer"]
 
     return servers
 
@@ -413,6 +576,124 @@ def resolve_memory_bank_embedding_model(explicit: str, existing_mcp: dict, templ
          with no memory-bank block).
     """
     return (explicit or "").strip() or existing_memory_bank_model(existing_mcp) or template_default
+
+
+# ---------------------------------------------------------------------------
+# Savings tracker offer
+# ---------------------------------------------------------------------------
+# The savings tracker is opt-in, and the `analytics` MCP server that serves
+# /my-savings and /my-metrics is written only with it. Before this, a CLI user
+# ran `init`, got a config with no `analytics` block, and met an unknown-tool
+# error from those two skills with nothing saying why (only
+# /my-setup-clauderunway asked, as its Q4). `init` and `upgrade` now ask the
+# same question with the same wording, from this one place so the two cannot
+# drift apart from each other or from that skill.
+
+# The values `savings_ledger.tracking_enabled()` accepts, case-insensitive and
+# whitespace-trimmed. Duplicated rather than imported for the same reason
+# `doctor_lib` does: this module must not load the savings stack.
+TRACK_SAVINGS_TRUTHY = frozenset({"1", "true", "yes"})
+
+# Same wording as the Q4 option descriptions in skills/my-setup-clauderunway.
+SAVINGS_TRACKER_ENABLED_DESCRIPTION = "Set CLAUDE_RUNWAY_TRACK_SAVINGS=1; also requires a shell export"
+SAVINGS_TRACKER_DISABLED_DESCRIPTION = "No token savings tracking"
+
+SAVINGS_TRACKER_SHELL_EXPORT_REMINDER = (
+    "Export CLAUDE_RUNWAY_TRACK_SAVINGS=1 in your shell too (e.g. in ~/.zshrc/~/.bashrc, wherever `claude` is "
+    "launched from): the generated hooks have no env block of their own and inherit the shell's environment, "
+    "so without it they record no savings events."
+)
+
+
+def _mcp_server_block(mcp_json: dict, name: str) -> "Optional[dict]":
+    servers = mcp_json.get("mcpServers") if isinstance(mcp_json, dict) else None
+    block = servers.get(name) if isinstance(servers, dict) else None
+    return block if isinstance(block, dict) else None
+
+
+def has_analytics_block(mcp_json: dict) -> bool:
+    """True when `mcp_json` already has an `analytics` MCP server block."""
+    return _mcp_server_block(mcp_json, "analytics") is not None
+
+
+def has_codebase_reviewer_block(mcp_json: dict) -> bool:
+    """True when `mcp_json` already has a `codebase-reviewer` MCP server block."""
+    return _mcp_server_block(mcp_json, "codebase-reviewer") is not None
+
+
+# What `init` and `upgrade` say about the one setting the reviewer server cannot
+# work without. Defined once so the two cannot drift apart. They never write a
+# default path or a default reviewers file: which models a user has, and what
+# they should be asked to look for, is the user's to decide.
+REVIEWERS_FILE_REQUIRED_WARNING = (
+    "the codebase-reviewer server's REVIEWERS_FILE is not set. It is REQUIRED and has no default: until you "
+    "point it at your own reviewers JSON file (the `env` block of the `codebase-reviewer` server in .mcp.json, "
+    "or `init --reviewers-file PATH`), the server refuses to run any review and says so. No default path "
+    "and no reviewers file were written."
+)
+
+
+def ask_codebase_reviewer(*, default_enabled: bool = False, input_fn=None, print_fn=print) -> bool:
+    """
+    Asks whether to add the opt-in `codebase-reviewer` MCP server and returns
+    the answer, with the same blank-input and closed-stdin rules as
+    `ask_savings_tracker`. Callers only ask on a terminal.
+    """
+    input_fn = input_fn or input
+    print_fn("")
+    print_fn(
+        "Local review loop (opt-in): adds the `codebase-reviewer` MCP server, which runs local models on LM Studio "
+        "to review a change before Copilot does. It needs a reviewers file (the models, prompts and rubric) that "
+        "you write yourself; REVIEWERS_FILE is required and has no default, and nothing here creates one."
+    )
+    hint = "[Y/n]" if default_enabled else "[y/N]"
+    try:
+        answer = input_fn(f"Add the codebase-reviewer server? {hint} ").strip().lower()
+    except EOFError:
+        print_fn(f"(no input available -- {'kept' if default_enabled else 'not added'})")
+        return default_enabled
+    if not answer:
+        return default_enabled
+    return answer in ("y", "yes")
+
+
+def local_compress_tracks_savings(mcp_json: dict) -> bool:
+    """True when the `local-compress` block's `CLAUDE_RUNWAY_TRACK_SAVINGS` is a truthy string."""
+    block = _mcp_server_block(mcp_json, "local-compress")
+    env = block.get("env") if block is not None else None
+    raw = env.get("CLAUDE_RUNWAY_TRACK_SAVINGS") if isinstance(env, dict) else None
+    return isinstance(raw, str) and raw.strip().lower() in TRACK_SAVINGS_TRUTHY
+
+
+def ask_savings_tracker(*, default_enabled: bool = False, input_fn=None, print_fn=print) -> bool:
+    """
+    Asks whether to enable the savings tracker and returns the answer.
+
+    Blank input takes `default_enabled`, which a caller sets when the project
+    already tracks savings or already has the `analytics` block, so pressing
+    Enter on a re-run keeps it rather than removing it. A closed stdin
+    (`EOFError`) also takes the default instead of crashing. The question is
+    only meaningful on a terminal; callers check that first and never call
+    this for a non-interactive run. `input_fn=None` reads `input` at call
+    time, not at import, so a test can patch `builtins.input`.
+    """
+    input_fn = input_fn or input
+    print_fn("")
+    print_fn(
+        "Savings tracker (opt-in): counts what local compression saves, and adds the `analytics` MCP server "
+        "that /my-savings and /my-metrics need (without it, both fail with an unknown-tool error)."
+    )
+    print_fn(f"  Enabled  - {SAVINGS_TRACKER_ENABLED_DESCRIPTION}")
+    print_fn(f"  Disabled - {SAVINGS_TRACKER_DISABLED_DESCRIPTION}")
+    hint = "[Y/n]" if default_enabled else "[y/N]"
+    try:
+        answer = input_fn(f"Enable the savings tracker? {hint} ").strip().lower()
+    except EOFError:
+        print_fn(f"(no input available -- {'kept enabled' if default_enabled else 'left disabled'})")
+        return default_enabled
+    if not answer:
+        return default_enabled
+    return answer in ("y", "yes")
 
 
 # What an install that predates the compact embedding-model setting actually
@@ -608,6 +889,13 @@ def build_settings_hooks(
 # toolkit-owned server a prior run added but this run omits (e.g.
 # `--qdrant-only` after a previous run had configured local-compress) --
 # see merge_mcp_json's docstring.
+#
+# `codebase-reviewer` is deliberately NOT in this tuple. Every other opt-in
+# block here (local-compress, analytics) is reset to each run's flags, so a bare
+# re-run drops it. The reviewer block holds the path to the user's own reviewers
+# file, which no flag of this run can reconstruct, so `run_setup` keeps an
+# existing block (carrying its REVIEWERS_FILE and limits over) instead of
+# letting this merge remove it.
 _OWNED_MCP_SERVER_KEYS = ("qdrant", "codebase-indexer", "memory-bank", "local-compress", "analytics")
 
 
@@ -844,7 +1132,7 @@ def plan_skill_installs(tools_repo_dir: Path, skills_dir: Path) -> list:
     `tools_repo_dir/skills/*/SKILL.md` (the shipped
     source of truth: the SAME path for a clone and a pipx/`uv tool install`,
     since `skills/` is shipped as wheel data files (setup.py's `data_files()`)
-    landing as a sibling of `libs/tools/templates/hooks` under `<env>/src/`,
+    landing as a sibling of `libs/tools/mcpservers/templates/hooks` under `<env>/src/`,
     exactly the same "sibling directories" arithmetic every other
     TOOLS_REPO_DIR-relative path in this module already relies on) and
     reports what installing into `skills_dir` would do to each one -- never
@@ -1007,6 +1295,8 @@ def run_setup(
     templates_dir: Optional[Path] = None,
     embedding_model: str = "",
     memory_bank_embedding_model: str = "",
+    codebase_reviewer: bool = False,
+    reviewers_file: str = "",
 ) -> SetupResult:
     """
     Pure computation (no disk writes to `target_repo`) of the final
@@ -1029,6 +1319,20 @@ def run_setup(
     (template default for a block that does not exist). A non-blank value that
     differs from the existing one adds a WARNING, because the shared collection
     is locked to the model that created it.
+
+    `codebase_reviewer`/`reviewers_file` (CLI `--codebase-reviewer`/`--reviewers-file`)
+    add the opt-in `codebase-reviewer` block; a `reviewers_file` alone implies
+    the block. Unlike the other opt-in blocks, an existing one is KEPT by a run
+    that passes neither, because its settings are the user's own and no flag of
+    a later run can restore them. `REVIEWERS_FILE`, `MAX_REVIEWERS` and
+    `MAX_REVIEW_ROUNDS` are carried over key by key, including a key's ABSENCE
+    (an absent key inherits the shell's value and a present one masks it, so
+    writing a template default there would override a working export), and any
+    custom env entries the user added stay too; a non-blank `reviewers_file`
+    replaces the carried path, and the Qdrant settings follow this run's flags
+    like every other server's. A block whose `REVIEWERS_FILE` is blank adds a
+    WARNING to `changes`: the setting is required and has no default, and none
+    is written.
 
     `include_hooks=False` corresponds to the CLI's `--skip-hooks`: don't
     touch `.claude/settings.json` at all, even if it already has this
@@ -1065,7 +1369,7 @@ def run_setup(
     # model that will actually be written). See resolve_embedding_model for
     # the explicit > existing > template rule.
     mcp_json_path = target_repo / ".mcp.json"
-    existing_mcp = load_json(mcp_json_path) if mcp_json_path.exists() else {}
+    existing_mcp = load_existing_mcp_json(mcp_json_path)
     template_embedding_model = mcp_template["mcpServers"]["qdrant"]["env"]["EMBEDDING_MODEL"]
     previous_embedding_model = existing_embedding_model(existing_mcp)
     resolved_embedding_model = resolve_embedding_model(embedding_model, existing_mcp, template_embedding_model)
@@ -1076,6 +1380,16 @@ def run_setup(
     resolved_memory_bank_model = resolve_memory_bank_embedding_model(
         memory_bank_embedding_model, existing_mcp, template_memory_bank_model
     )
+
+    # The reviewer block is kept across re-runs (see the docstring): include it
+    # when asked, or when the target already has one, and carry the user's own
+    # values over from it.
+    had_reviewer_block = has_codebase_reviewer_block(existing_mcp)
+    # A block with no `env` (or an oddly shaped one) is an EXISTING block with
+    # nothing set, so every key is absent and inherits the shell: an empty env,
+    # never None (None means "no block", and takes the fresh-block path).
+    existing_reviewer_env: Optional[dict] = (_server_env(existing_mcp, "codebase-reviewer") or {}) if had_reviewer_block else None
+    include_reviewer = bool(codebase_reviewer or reviewers_file.strip() or had_reviewer_block)
 
     generated_servers = build_mcp_servers(
         mcp_template,
@@ -1100,7 +1414,29 @@ def run_setup(
         embedding_model=resolved_embedding_model,
         memory_bank_embedding_model=resolved_memory_bank_model,
         compact_embedding_model=resolve_compact_embedding_model(existing_mcp, resolved_embedding_model),
+        codebase_reviewer=include_reviewer,
+        reviewers_file=reviewers_file.strip(),
     )
+    reviewer_file_unset = False
+    if include_reviewer:
+        reviewer_env = generated_servers["codebase-reviewer"]["env"]
+        if existing_reviewer_env is not None:
+            # Keep the existing block's state for the user's own settings,
+            # key by key. A key ABSENT from the block inherits the shell's
+            # value at run time, while a key PRESENT (even blank) masks it, so
+            # writing the template's "3" or a blank path where the block had
+            # nothing would silently override a working shell export. An
+            # explicit --reviewers-file still wins.
+            for key in ("REVIEWERS_FILE", "MAX_REVIEWERS", "MAX_REVIEW_ROUNDS"):
+                if key == "REVIEWERS_FILE" and reviewers_file.strip():
+                    continue
+                if key in existing_reviewer_env:
+                    reviewer_env[key] = existing_reviewer_env[key]
+                else:
+                    reviewer_env.pop(key, None)
+        # Warn only when the block itself says "no file" (blank): a key that is
+        # absent from an existing block may be supplied by the shell.
+        reviewer_file_unset = "REVIEWERS_FILE" in reviewer_env and not str(reviewer_env["REVIEWERS_FILE"]).strip()
     unresolved = find_unresolved_placeholders(generated_servers)
     if unresolved:
         raise RuntimeError(
@@ -1108,7 +1444,21 @@ def run_setup(
         )
 
     final_mcp = merge_mcp_json(existing_mcp, generated_servers)
+    if include_reviewer and existing_reviewer_env is not None:
+        # Custom entries the user added to the kept block (an LM Studio URL,
+        # say) survive. Added to the merged document only, never to
+        # `generated_servers`, which --dry-run prints: that preview must show
+        # what this toolkit contributes, not echo the user's own env values.
+        # merge_mcp_json puts the generated block object itself into the
+        # result, so it is copied first: editing it in place would edit
+        # `generated_servers` too.
+        final_reviewer = copy.deepcopy(generated_servers["codebase-reviewer"])
+        for key, value in existing_reviewer_env.items():
+            final_reviewer["env"].setdefault(key, value)
+        final_mcp["mcpServers"]["codebase-reviewer"] = final_reviewer
     changes = [f"mcpServers ({', '.join(sorted(generated_servers))}) -> {mcp_json_path}"]
+    if reviewer_file_unset:
+        changes.append(f"WARNING: {REVIEWERS_FILE_REQUIRED_WARNING}")
     if previous_embedding_model and resolved_embedding_model != previous_embedding_model:
         # Only reachable via an explicit --embedding-model that differs from
         # what's configured: the drop-and-reindex scenario the README documents.
@@ -1156,7 +1506,7 @@ def run_setup(
 
     # Found in review: a target repo directory named e.g. "memory-bank"
     # with both COLLECTION_NAME and MEMORY_BANK_COLLECTION left at their
-    # defaults resolves them to the SAME string -- tools/ingest_mcp_server.py's
+    # defaults resolves them to the SAME string -- mcpservers/ingest_mcp_server.py's
     # reserved-collection-name guard then refuses EVERY index_repo/sync_repo
     # call for this project, since its own code-index collection IS the
     # reserved memory-bank name. Warn at setup time rather than leaving this
@@ -1187,13 +1537,13 @@ def run_setup(
             )
 
         settings_path = target_repo / ".claude" / "settings.json"
-        existing_settings = load_json(settings_path) if settings_path.exists() else {}
+        existing_settings = load_existing_settings_json(settings_path)
         final_settings = merge_settings_hooks(existing_settings, generated_hooks)
         changes.append(f"hooks ({', '.join(sorted(generated_hooks))}) -> {settings_path}")
     elif clean_hooks_if_unused:
         settings_path = target_repo / ".claude" / "settings.json"
         if settings_path.exists():
-            existing_settings = load_json(settings_path)
+            existing_settings = load_existing_settings_json(settings_path)
             cleaned_settings = strip_toolkit_hooks(existing_settings)
             if cleaned_settings != existing_settings:
                 final_settings = cleaned_settings

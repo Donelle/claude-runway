@@ -47,7 +47,7 @@ if [ ! -x "$RUFF" ] || [ ! -x "$PYRIGHT" ]; then
 fi
 
 echo "pre-push: ruff check (F, B)..."
-"$RUFF" check libs tools hooks tests
+"$RUFF" check libs tools mcpservers hooks tests
 
 echo "pre-push: pyright..."
 # --pythonpath explicitly: pyproject.toml's

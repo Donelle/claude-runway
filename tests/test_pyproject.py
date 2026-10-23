@@ -3,8 +3,8 @@
 console-script entry points the issue actually names (ingest_to_qdrant.py,
 setup_project.py, doctor.py), confirms the `claude_runway` shim package
 they now route through is declared and present, and builds a REAL wheel to
-confirm libs/tools/hooks/templates/skills land under
-<wheel>.data/data/src/{libs,tools,hooks,templates,skills} -- the
+confirm libs/tools/mcpservers/hooks/templates/skills land under
+<wheel>.data/data/src/{libs,tools,mcpservers,hooks,templates,skills} -- the
 whole point, replacing the old top-level `[tool.setuptools] packages`
 layout that put these five directly in site-packages.
 
@@ -111,7 +111,7 @@ class PyprojectTomlIsWellFormed(unittest.TestCase):
             self.assertIn(expected, deps)
 
     def test_third_party_qdrant_server_packages_are_not_dependencies(self):
-        # This repo serves `qdrant` from its own tools/qdrant_mcp_server.py, so
+        # This repo serves `qdrant` from its own mcpservers/qdrant_mcp_server.py, so
         # neither the third-party server package nor the compatibility pin that
         # only existed for it may come back in either install file.
         deps = [d.lower() for d in self.data["project"]["dependencies"]]
@@ -123,7 +123,7 @@ class PyprojectTomlIsWellFormed(unittest.TestCase):
     def test_local_compress_dependencies_are_base_not_optional(self):
         # claude-runway-setup's OWN default
         # behavior (no --qdrant-only) generates a .mcp.json that enables
-        # tools/compress_mcp_server.py and its hooks, pointed at this same
+        # mcpservers/compress_mcp_server.py and its hooks, pointed at this same
         # install's interpreter -- confirmed live that leaving
         # openai/requests/trafilatura as an opt-in extra meant a plain
         # default `pipx install claude-runway` + `claude-runway-setup init`
@@ -178,8 +178,8 @@ def _build_wheel() -> Optional[str]:
 )
 class BuiltWheelHasExpectedDataLayout(unittest.TestCase):
     """The core acceptance criterion: a real built wheel must ship
-    libs/tools/hooks/templates/skills as DATA files landing under
-    <env>/src/{libs,tools,hooks,templates,skills} at install time (wheel
+    libs/tools/mcpservers/hooks/templates/skills as DATA files landing under
+    <env>/src/{libs,tools,mcpservers,hooks,templates,skills} at install time (wheel
     spec: the "data" category installs relative to sys.prefix) -- not as
     site-packages packages. Confirmed live that
     this "data" category's install-to-sys.prefix rule is a wheel-spec
@@ -260,7 +260,7 @@ class BuiltWheelHasExpectedDataLayout(unittest.TestCase):
         # wouldn't catch setup.py's glob failing to pick them up.
         data_names = self._data_src_names()
         for rel_path in (
-            "tools/memory_bank_mcp_server.py",
+            "mcpservers/memory_bank_mcp_server.py",
             "libs/memory_bank_lib.py",
             "libs/memory_events_lib.py",
         ):
@@ -269,6 +269,39 @@ class BuiltWheelHasExpectedDataLayout(unittest.TestCase):
                     any(n.endswith(f"/data/src/{rel_path}") for n in data_names),
                     f"{rel_path} missing from the built wheel's data files",
                 )
+
+    def test_codebase_reviewer_libs_are_present_in_the_built_wheel(self):
+        # The server imports these three by bare name from <env>/src/libs, so a
+        # wheel that shipped the script without them would crash on startup.
+        data_names = self._data_src_names()
+        for rel_path in (
+            "libs/codebase_reviewer_config_lib.py",
+            "libs/lmstudio_model_loader_lib.py",
+            "libs/reviewer_scheduler_lib.py",
+        ):
+            with self.subTest(rel_path=rel_path):
+                self.assertTrue(
+                    any(n.endswith(f"/data/src/{rel_path}") for n in data_names),
+                    f"{rel_path} missing from the built wheel's data files",
+                )
+
+    def test_all_six_mcp_servers_ship_under_mcpservers(self):
+        # The servers moved from tools/ to mcpservers/. Without setup.py's
+        # `_flat_data_files("mcpservers", "*.py")` entry the wheel would
+        # silently lose all six while every other directory still shipped.
+        data_names = self._data_src_names()
+        for stem in ("compress", "analytics", "qdrant", "ingest", "memory_bank", "codebase_reviewer"):
+            rel_path = f"mcpservers/{stem}_mcp_server.py"
+            with self.subTest(rel_path=rel_path):
+                self.assertTrue(
+                    any(n.endswith(f"/data/src/{rel_path}") for n in data_names),
+                    f"{rel_path} missing from the built wheel's data files",
+                )
+        # ...and none of them is still shipped from the old location.
+        self.assertFalse(
+            [n for n in data_names if n.endswith("_mcp_server.py") and "/data/src/tools/" in n],
+            "an MCP server script is still shipped under src/tools/",
+        )
 
     def test_every_skill_subdirectory_ships_distinctly_not_collapsed(self):
         # Regression guard for the exact bug found during

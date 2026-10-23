@@ -12,13 +12,13 @@ Setup:
 
 Register in .mcp.json (adjust the path to wherever you save this file). Set
 QDRANT_URL / COLLECTION_NAME / EMBEDDING_MODEL here -- these are the SAME env
-var names tools/qdrant_mcp_server.py reads, so one project config drives both
+var names mcpservers/qdrant_mcp_server.py reads, so one project config drives both
 servers and they can't drift apart:
 {
   "mcpServers": {
     "codebase-indexer": {
       "command": "python",
-      "args": ["/absolute/path/to/tools/ingest_mcp_server.py"],
+      "args": ["/absolute/path/to/mcpservers/ingest_mcp_server.py"],
       "env": {
         "QDRANT_URL": "http://localhost:6333",
         "COLLECTION_NAME": "<this-project's-collection-name>",
@@ -445,7 +445,7 @@ def _chunk_lines_note(chunk_lines: int) -> str:
         f"not by line count."
     )
 
-# Same env var names tools/qdrant_mcp_server.py reads, so a single project .mcp.json
+# Same env var names mcpservers/qdrant_mcp_server.py reads, so a single project .mcp.json
 # config keeps this server and the qdrant-find/qdrant-store server aligned.
 # Resolved through qdrant_ingest_lib.ingest_env_defaults -- the
 # same helper ingest_to_qdrant.py's argparse defaults come from, so the two

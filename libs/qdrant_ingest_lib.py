@@ -150,8 +150,9 @@ def ingest_env_defaults(environ=None) -> dict:
 
     Only reads the process environment. For the MCP server that is its
     .mcp.json env block plus whatever it inherited; for the CLI it is the
-    shell it was run from, which normally does NOT carry .mcp.json's values
-    (the memory-bank collection name is one case of that gap).
+    shell it was run from, which normally does NOT carry .mcp.json's values;
+    for the memory-bank collection name the CLI closes that gap with
+    resolve_memory_bank_collection below.
     """
     env = os.environ if environ is None else environ
     return {
@@ -162,6 +163,99 @@ def ingest_env_defaults(environ=None) -> dict:
         "exclude_dirs": env.get("INDEX_EXCLUDE_DIRS") or None,
         "memory_bank_collection": env.get("MEMORY_BANK_COLLECTION") or FALLBACK_MEMORY_BANK_COLLECTION,
     }
+
+
+# The .mcp.json server blocks that carry MEMORY_BANK_COLLECTION, in the order
+# resolve_memory_bank_collection consults them. setup_project_lib writes the
+# same value into both; codebase-indexer comes first because its copy is the
+# one index_repo/sync_repo actually guard with, and memory-bank (the server
+# that owns the collection) is the fallback for a hand-edited config that only
+# set it there.
+MEMORY_BANK_MCP_JSON_SERVERS = ("codebase-indexer", "memory-bank")
+
+
+@dataclass(frozen=True)
+class MemoryBankCollection:
+    """Which collection is the shared memory bank, and where that came from.
+    `source` is human-readable, for an error message; `warning` is set when a
+    .mcp.json that exists could not be read and was skipped."""
+
+    name: str
+    source: str
+    warning: Optional[str] = None
+
+
+def resolve_memory_bank_collection(
+    explicit: Optional[str], repo_path, environ=None
+) -> MemoryBankCollection:
+    """
+    Resolves the shared memory-bank collection name for a caller that, unlike
+    the MCP servers, does not run with .mcp.json's env block:
+    ingest_to_qdrant.py runs from a normal shell, and this toolkit never asks
+    for MEMORY_BANK_COLLECTION to be exported there -- the value lives in
+    .mcp.json. Reading only the shell meant a project with a custom name had
+    its memory bank refused by index_repo but not by the CLI.
+
+    Order, first non-blank wins:
+      1. `explicit` (the CLI's --memory-bank-collection)
+      2. MEMORY_BANK_COLLECTION in `environ` (default os.environ); a blank or
+         whitespace-only value counts as unset
+      3. `<repo_path>/.mcp.json`, each MEMORY_BANK_MCP_JSON_SERVERS block's env
+      4. FALLBACK_MEMORY_BANK_COLLECTION ("memory-bank")
+
+    `repo_path` may be None to skip step 3. The file is read with
+    doctor_lib.load_server_env, the loader `doctor` already uses for the same
+    file, so the two cannot disagree about what a well-formed block is. It is
+    imported here rather than at module level to keep this module free of
+    import-time dependencies (the MCP server imports it too). A missing file
+    or server block falls through silently. A malformed one never raises:
+    this guard must not turn a broken .mcp.json into a crashed index run, so
+    the block is skipped and `warning` says so, and the caller decides whether
+    to print it.
+    """
+    if explicit and explicit.strip():
+        return MemoryBankCollection(explicit.strip(), "--memory-bank-collection")
+    env = os.environ if environ is None else environ
+    # Whitespace-only counts as unset too, not just "" (PR review): a value of
+    # "  " is truthy, and returning it would let it outrank .mcp.json's real
+    # name and leave that collection unprotected. Every source here strips.
+    env_value = (env.get("MEMORY_BANK_COLLECTION") or "").strip()
+    if env_value:
+        return MemoryBankCollection(env_value, "the MEMORY_BANK_COLLECTION environment variable")
+    # A dict, not a list, to drop repeats: a file that is not valid JSON (or
+    # has a malformed "mcpServers") fails with the same message for every
+    # server block, and saying it twice adds nothing.
+    problems: dict = {}
+    if repo_path is not None:
+        from doctor_lib import MalformedMcpJsonError, load_server_env
+
+        mcp_json_path = Path(repo_path) / ".mcp.json"
+        for server in MEMORY_BANK_MCP_JSON_SERVERS:
+            try:
+                server_env = load_server_env(mcp_json_path, server)
+            except MalformedMcpJsonError as exc:
+                problems[str(exc)] = None
+                continue
+            value = (server_env or {}).get("MEMORY_BANK_COLLECTION", "").strip()
+            if value:
+                return MemoryBankCollection(
+                    value,
+                    f"MEMORY_BANK_COLLECTION in {mcp_json_path}'s \"{server}\" block",
+                    # An earlier block that could not be read is still worth
+                    # reporting, even though a later one supplied the name.
+                    _unreadable_mcp_json_warning(problems, f"using '{value}' from the \"{server}\" block"),
+                )
+    return MemoryBankCollection(
+        FALLBACK_MEMORY_BANK_COLLECTION,
+        "the built-in default",
+        _unreadable_mcp_json_warning(problems, f"using the default '{FALLBACK_MEMORY_BANK_COLLECTION}'"),
+    )
+
+
+def _unreadable_mcp_json_warning(problems: dict, outcome: str) -> Optional[str]:
+    if not problems:
+        return None
+    return f"could not read MEMORY_BANK_COLLECTION from .mcp.json ({'; '.join(problems)}); {outcome}"
 
 
 def normalize_extensions(extensions) -> set:

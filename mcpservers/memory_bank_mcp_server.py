@@ -3,7 +3,9 @@
 MCP server exposing `remember`/`recall`/`forget` -- durable, cross-session
 knowledge storage independent of the code index -- plus
 `transfer_memories`, which copies a legacy collection's
-in-scope memories into the shared collection. Where
+in-scope memories into the shared collection, and `copy_memories`, which
+copies another project's memories into the calling project inside that
+shared collection. Where
 `codebase-indexer` remembers what a repo's CODE looks like, this server
 remembers what a project (or, via `general=True`, every project) has
 LEARNED: a cited incident's root cause, a design decision and its rationale,
@@ -76,7 +78,7 @@ DEFAULT_MEMORY_BANK_ID = os.environ.get("MEMORY_BANK_ID")
 
 # This server has no access to Claude Code's own session_id --
 # only hooks get one, via their stdin payload (see
-# tools/compress_mcp_server.py's _append_savings_footer docstring for the
+# mcpservers/compress_mcp_server.py's _attach_savings_metrics docstring for the
 # identical constraint on the local-compress server). Delegates to
 # libs/session_id_lib.py's SessionIdStrategy.PROXY rather
 # than minting its own uuid.uuid4().hex here -- same process-lifetime,
@@ -515,6 +517,86 @@ async def transfer_memories(
     # default=str: a Qdrant point id in `errors` can be an int or a UUID
     # string, both fine, but this keeps any other odd id type from failing
     # the whole report at serialization time.
+    return json.dumps(report, indent=2, default=str)
+
+
+@mcp.tool()
+async def copy_memories(
+    source_repo: str,
+    kind: str = "all",
+    dry_run: bool = True,
+) -> str:
+    """
+    Copy another project's memories (all of them, or one kind) into THIS
+    project, inside the shared memory-bank collection. A pull: run it from the
+    project that should receive the memories. There is no way to write under
+    another project's name, so "copy to project B" means running this from a
+    session in project B.
+
+    source_repo: REQUIRED, the exact repo tag to copy from -- the other
+    project's MEMORY_BANK_ID, as the user named it. Don't guess one. "general"
+    is refused: every project's recall already includes general memories.
+    kind: "all" (the default), or one kind to copy -- e.g. "lesson",
+    "decision", "reference", "instruction", "project", "correction".
+    dry_run: defaults to True -- reports every memory that WOULD be copied
+    (its kind and summary) without writing or embedding anything. Show the
+    user that report so they can say which memories only make sense in the
+    source project (re-run with a single `kind` to narrow it, since there is no
+    per-memory selection), then pass dry_run=False only once they agree.
+
+    Reads by a filtered scan of the source project's memories, not a top-k
+    search, so none is missed (as long as nothing writes to the source during
+    the run). Each copy is a NEW memory under this project's tag: re-embedded
+    with this project's EMBEDDING_MODEL, a fresh created_at, weight kept, no
+    link back to the original, so it can drift from it. The source memories
+    are never changed. Re-running is safe: a memory this tool already copied
+    here is counted under already_present and left alone -- but a memory
+    copied earlier by hand with remember() is not recognized and would be
+    written again, so check the dry-run report against what is already here.
+
+    Returns a JSON report: would_copy/copied, already_present, memories (each
+    {id, kind, summary, status}), errors (per memory), and error (only when
+    the run stopped early or was refused, including when this project's
+    MEMORY_BANK_ID is missing or invalid).
+    """
+    # Same boundary remember() enforces: no write is ever possible without a
+    # valid, non-placeholder, non-"general" MEMORY_BANK_ID for this project --
+    # and that ID is the ONLY target this tool can write under. Checked before
+    # any client/provider is built, so a misconfigured project pays for nothing.
+    caller_repo, error = mb.resolve_repo(DEFAULT_MEMORY_BANK_ID, general=False)
+    if error:
+        # JSON like every other outcome of this tool, so a caller can parse
+        # every result the same way.
+        return json.dumps({"source_repo": source_repo, "kind": kind, "dry_run": dry_run, "error": error}, indent=2)
+    assert caller_repo is not None  # resolve_repo returns a repo whenever error is None
+
+    kind = kind.strip()
+    if not kind:
+        return json.dumps(
+            {"source_repo": source_repo, "kind": kind, "dry_run": dry_run,
+             "error": 'kind must be "all" or the name of one kind (got an empty string).'},
+            indent=2,
+        )
+    kind_filter = None if kind == "all" else kind
+
+    client = QdrantClient(url=DEFAULT_QDRANT_URL, api_key=DEFAULT_QDRANT_API_KEY)
+    # A dry run never embeds anything, and FastEmbedProvider's constructor
+    # eagerly loads the ONNX model (see recall()'s comment above), so only a
+    # real write pays for it.
+    embedding_provider = None if dry_run else FastEmbedProvider(DEFAULT_EMBEDDING_MODEL)
+
+    report = await mb.copy_points(
+        client, embedding_provider,
+        DEFAULT_MEMORY_BANK_COLLECTION,
+        source_repo=source_repo,
+        caller_repo=caller_repo,
+        embedding_model=DEFAULT_EMBEDDING_MODEL,
+        kind=kind_filter,
+        dry_run=dry_run,
+    )
+    # default=str: a Qdrant point id can be an int or a UUID string, both
+    # fine, but this keeps any other odd id type from failing the whole report
+    # at serialization time.
     return json.dumps(report, indent=2, default=str)
 
 

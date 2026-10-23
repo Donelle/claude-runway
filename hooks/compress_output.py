@@ -18,10 +18,12 @@ For tools it compresses itself (Bash/Grep/Glob/etc. below), it logs directly.
 For the local-compress MCP server's own credited tools (compress_file,
 compress_command_output, fetch_url -- matcher extended to
 mcp__local-compress__*), the server can't write the ledger itself (no
-session_id), so it appends a small machine-readable footer to its result
-instead; this hook strips that footer before Claude ever sees it and logs
-the numbers it carries. When tracking is off, none of this runs and behavior
-is unchanged from before this feature existed.
+session_id), so it returns a small JSON envelope instead --
+{"compressed_text": <what Claude should see>, "metrics": {...}} -- and this
+hook parses it with json.loads (strictly: anything that is not exactly that
+envelope is ordinary tool output and is left alone), replaces the tool output
+with compressed_text and logs the metrics. When tracking is off, none of
+this runs and behavior is unchanged from before this feature existed.
 
 The actual dividing line for what belongs in the matcher isn't "runs
 locally" -- WebFetch/WebSearch run through Anthropic's own infrastructure,
@@ -216,6 +218,7 @@ for _dir in _candidates:
 try:
     from lmstudio_client import build_client
     from local_compress_lib import compress, stale_env_warning
+    from savings_envelope_lib import parse_envelope_text
 except ImportError as e:
     # Fail open, but say why via stderr (stdout is reserved for the
     # hookSpecificOutput JSON contract) so a broken install is visible in
@@ -264,7 +267,7 @@ def _record_savings_event(session_id, tool, raw_chars, out_chars, credited, sour
     `raw_chars`/`out_chars` are the EXACT character counts
     of the content before and after compression -- the only size the ledger
     records now; the chars / 3.5 token estimate was dropped. Either one
-    being None (a savings footer from an MCP server that predates character counts carries
+    being None (metrics from an MCP server that predates character counts carry
     only token estimates) means there is nothing honest to record, so the event
     is skipped. `tool_use_id` is the PostToolUse payload's id for this tool
     call, kept so SessionEnd can join the event to its transcript turn and model
@@ -325,17 +328,17 @@ if _STALE_ENV:
     print(f"compress_output.py: {_STALE_ENV}", file=sys.stderr)
 SUPPORTED_TOOLS = {"Bash", "Grep", "WebFetch", "Glob", "WebSearch"}
 # MCP tools whose credited compression the server itself performs -- this hook's
-# job for these is only to strip the machine-readable savings footer
-# (SAVINGS_FOOTER_RE below) before Claude sees it, and log the
-# numbers it carries. See compress_mcp_server.py's _append_savings_footer.
+# job for these is only to unwrap the savings envelope (_handle_mcp_savings_envelope
+# below) so Claude sees just the compressed text, and log the metrics it
+# carries. See compress_mcp_server.py's _attach_savings_metrics.
 MCP_SAVINGS_TOOL_PREFIX = "mcp__local-compress__"
 # Tool names (without the mcp__local-compress__ prefix) that already run
 # their OWN compression -- with the caller's own focus/preserve_identifiers/
-# preserve_sections -- regardless of whether a savings footer ends up on the
-# result. compress_text never emits a footer at all (by design, since it's
-# never credited toward savings); the other three omit one whenever
+# preserve_sections -- regardless of whether a savings envelope ends up on the
+# result. compress_text never emits one at all (by design, since it's
+# never credited toward savings); the other three omit it whenever
 # CLAUDE_RUNWAY_TRACK_SAVINGS is off server-side even though real
-# compression still happened. The no-footer fallback below must never
+# compression still happened. The no-envelope fallback below must never
 # re-compress these generically -- doing so would discard exactly what the
 # first pass was told to preserve (this is /my-compact's own
 # real usage, which sets preserve_identifiers=preserve_sections=True).
@@ -358,7 +361,6 @@ _QDRANT_COMPACT_MCP_TOOLS = {"compact_store", "compact_find", "compact_prune"}
 # to `mcp__analytics__.*`. (The qdrant server's `compact_prune`, a list of
 # pruned compact ids, is the same class and is handled by its own branch.)
 MCP_ANALYTICS_TOOL_PREFIX = "mcp__analytics__"
-SAVINGS_FOOTER_RE = re.compile(r"\n?<!--CLAUDE_RUNWAY_SAVINGS:(\{.*?\})-->\s*\Z", re.DOTALL)
 # Below this length, a string is assumed to be metadata (a URL, a file
 # count, a status word) rather than content worth compressing or blanking --
 # applies only to the generic (non-Bash) path.
@@ -953,52 +955,69 @@ def _handle_generic(tool_response):
     return ("updated", updated, raw_text, compressed_text)
 
 
-def _extract_savings_footer(text):
-    """If text ends with a CLAUDE_RUNWAY_SAVINGS footer, return (parsed_dict,
-    text_with_footer_stripped); otherwise (None, text) unchanged."""
-    if not isinstance(text, str):
-        return None, text
-    m = SAVINGS_FOOTER_RE.search(text)
-    if not m:
-        return None, text
-    try:
-        data = json.loads(m.group(1))
-    except json.JSONDecodeError:
-        return None, text
-    return data, text[:m.start()]
+def _accepted(envelope, tool):
+    """The envelope, if it came from the tool that was called (or no tool was
+    named); otherwise None."""
+    if envelope is None or (tool is not None and envelope["metrics"]["tool"] != tool):
+        return None
+    return envelope
 
 
-def _handle_mcp_savings_footer(tool_response):
+def _handle_mcp_savings_envelope(tool_response, tool=None):
     """
-    Strips compress_mcp_server.py's machine-readable savings footer from a
-    credited MCP tool's output (see compress_mcp_server.py's
-    _append_savings_footer) before Claude ever sees it, returning the
-    parsed savings data alongside the footer-stripped payload. The real
-    shape of an MCP tool's tool_response isn't documented any more than any
-    other non-Bash tool's is (see module docstring), so this walks every
-    string leaf the same way _handle_generic does, rather than assuming a
-    specific shape, and stops at the first leaf carrying the footer.
-    Returns (None, None) if no footer is present -- i.e. tracking was off
-    server-side, or nothing was actually compressed, so there's nothing to
-    strip or log.
+    Unwraps compress_mcp_server.py's savings envelope (see its
+    _attach_savings_metrics and libs/savings_envelope_lib.py, which defines
+    what an envelope is) from a credited MCP tool's output, returning
+    (metrics, updated) where `updated` is what Claude should see instead: the
+    envelope's compressed_text, in the same shape the response arrived in.
+    Returns (None, None) if the output is not that envelope -- i.e. tracking
+    was off server-side, or nothing was compressed, so there is nothing to
+    unwrap or log.
+
+    `tool` is the bare name of the tool that was called. When given, the
+    envelope is accepted only if its own metrics name that same tool, so a
+    result from a tool that never emits one (compress_text, list_local_models)
+    can never be taken for one, and an envelope-shaped file read by
+    compress_file cannot claim to be another tool's.
+
+    The shapes handled are the ones a tool_response is known to take: a plain
+    string (what Claude Code sends for a `str` return: the MCP layer's
+    `{"result": ...}` JSON, captured live and pinned in the tests), the
+    already-unwrapped dict `{"result": "<text>"}`, and a single text block.
+    Nothing else is searched: a tool_response is not walked for a string that
+    merely looks like the envelope.
     """
     if isinstance(tool_response, str):
-        data, stripped = _extract_savings_footer(tool_response)
-        return (data, stripped) if data is not None else (None, None)
+        envelope = _accepted(parse_envelope_text(tool_response), tool)
+        if envelope is not None:
+            return envelope["metrics"], envelope["compressed_text"]
+        return None, None
 
-    for path, s in _walk_strings(tool_response):
-        data, stripped = _extract_savings_footer(s)
-        if data is not None:
-            updated = _deep_copy(tool_response)
-            _set_path(updated, path, stripped)
-            return data, updated
+    if isinstance(tool_response, dict) and isinstance(tool_response.get("result"), str):
+        envelope = _accepted(parse_envelope_text(tool_response["result"]), tool)
+        if envelope is not None:
+            updated = dict(tool_response)
+            updated["result"] = envelope["compressed_text"]
+            return envelope["metrics"], updated
+        return None, None
+
+    if (
+        isinstance(tool_response, list) and len(tool_response) == 1
+        and isinstance(tool_response[0], dict) and tool_response[0].get("type") == "text"
+        and isinstance(tool_response[0].get("text"), str)
+    ):
+        envelope = _accepted(parse_envelope_text(tool_response[0]["text"]), tool)
+        if envelope is not None:
+            block = dict(tool_response[0])
+            block["text"] = envelope["compressed_text"]
+            return envelope["metrics"], [block]
     return None, None
 
 
-def _footer_chars(value):
-    """A savings footer's char count, or None if absent/malformed (a footer
-    written before character counts were recorded has none, and the event is then not
-    recorded) -- bool is excluded since it's an int subclass."""
+def _metric_chars(value):
+    """A savings metric's char count, or None if absent/malformed (metrics
+    written before character counts were recorded have none, and the event is
+    then not recorded) -- bool is excluded since it's an int subclass."""
     if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
         return value
     return None
@@ -1009,7 +1028,7 @@ def _finish_compression_outcome(outcome, tool_name, source, session_id, project,
     """
     Shared tail for turning an _handle_bash/_handle_generic `outcome` into
     the right hook response -- used by both the ordinary Bash/Grep/etc. path
-    and the MCP-tool no-footer fallback below. Always calls
+    and the MCP-tool no-envelope fallback below. Always calls
     sys.exit(0) itself, matching every other terminal branch in main().
     """
     if outcome is None:
@@ -1107,18 +1126,19 @@ def _dispatch(payload):
     if tool_name and tool_name.startswith(MCP_SAVINGS_TOOL_PREFIX):
         if tool_response is None:
             sys.exit(0)
-        data, updated = _handle_mcp_savings_footer(tool_response)
-        if data is not None:
+        bare_tool_name = tool_name[len(MCP_SAVINGS_TOOL_PREFIX):]
+        metrics, updated = _handle_mcp_savings_envelope(tool_response, bare_tool_name)
+        if metrics is not None:
             _record_savings_event(
-                session_id, data.get("tool", tool_name),
-                _footer_chars(data.get("raw_chars")), _footer_chars(data.get("out_chars")),
-                data.get("credited", True), data.get("source", ""),
+                session_id, metrics["tool"],
+                _metric_chars(metrics.get("raw_chars")), _metric_chars(metrics.get("out_chars")),
+                metrics["credited"], metrics["source"],
                 project=project, agent_id=agent_id, agent_type=agent_type,
                 tool_use_id=tool_use_id,
             )
             _emit_updated(updated)
             sys.exit(0)
-        # No footer. If this is one of the tools that already ran its OWN
+        # No envelope. If this is one of the tools that already ran its OWN
         # compression (see _SELF_COMPRESSING_MCP_TOOLS's comment), leave it
         # alone regardless of size -- re-compressing it generically here
         # would discard exactly what that first pass was told to preserve.
@@ -1127,7 +1147,6 @@ def _dispatch(payload):
         # the same size-based compression every other matched tool gets,
         # otherwise every one of THOSE calls is a complete no-op regardless
         # of size, the opposite of what this hook exists to do.
-        bare_tool_name = tool_name[len(MCP_SAVINGS_TOOL_PREFIX):]
         if bare_tool_name in _SELF_COMPRESSING_MCP_TOOLS:
             sys.exit(0)
         outcome = _handle_generic(tool_response)
@@ -1140,7 +1159,7 @@ def _dispatch(payload):
 
     # The compact tools live on the qdrant server (they used to be on
     # local-compress). They never compress anything themselves and carry no
-    # savings footer, so they take the same size-based path as any other
+    # savings envelope, so they take the same size-based path as any other
     # matched tool, with the two exemptions below. Every OTHER tool on this
     # server (`qdrant-find`, `qdrant-store`) is never compressed, and the
     # matcher does not list them; this check keeps that true even if a

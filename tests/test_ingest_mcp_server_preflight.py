@@ -22,7 +22,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "libs"))
-sys.path.insert(0, os.path.join(REPO_ROOT, "tools"))
+sys.path.insert(0, os.path.join(REPO_ROOT, "mcpservers"))
 
 # Minimal env so module-level DEFAULT_* constants don't explode on import --
 # same pattern established in test_qdrant_ingest_lib.py and

@@ -41,6 +41,23 @@ import redirect_webfetch_to_fetch_url as redirect_hook  # noqa: E402
 import session_end_savings as session_end_hook  # noqa: E402
 
 
+def _envelope(text, metrics):
+    """The string compress_mcp_server.py's _attach_savings_metrics returns."""
+    return json.dumps({"compressed_text": text, "metrics": metrics})
+
+
+def _mcp_wrapped(returned):
+    """What Claude Code hands the hook as `tool_response` for an MCP tool that
+    returned a `str`: the MCP layer's `{"result": "<returned string>"}`, as one
+    JSON string (captured live; see SavingsEnvelopeRealShape below)."""
+    return json.dumps({"result": returned})
+
+
+def _credited_response(metrics, text="[compressed 1000 -> 100 chars]\nGIST"):
+    """A credited local-compress tool's tool_response, as the hook receives it."""
+    return _mcp_wrapped(_envelope(text, metrics))
+
+
 # Commands whose output must reach Claude byte-exact (hook skips compression).
 MUST_SKIP = [
     # --- git: the tool reached for to verify state -----------------------
@@ -434,10 +451,10 @@ class RecordSavingsEventForwardsProject(unittest.TestCase):
 class MainDerivesProjectFromPayloadCwd(unittest.TestCase):
     """End-to-end through main() itself -- confirms the actual wiring (not
     just record_event's signature): payload["cwd"] really does reach
-    record_event as `project`. Drives the MCP-footer-strip path specifically
+    record_event as `project`. Drives the MCP savings-envelope path specifically
     (a tool_name starting with mcp__local-compress__) because it never calls
-    compress()/LM Studio -- it only parses an already-compressed footer a
-    credited MCP tool call would have appended, so this needs neither a
+    compress()/LM Studio -- it only parses the already-compressed envelope a
+    credited MCP tool call would have returned, so this needs neither a
     live model nor network access."""
 
     def setUp(self):
@@ -466,15 +483,15 @@ class MainDerivesProjectFromPayloadCwd(unittest.TestCase):
         return out.getvalue()
 
     def test_cwd_derived_project_reaches_record_event(self):
-        footer = json.dumps({
+        metrics = {
             "tool": "compress_file", "raw_chars": 1000, "out_chars": 100,
             "credited": True, "source": "some/file.log",
-        })
+        }
         payload = {
             "session_id": "sess-1",
             "cwd": "/Users/someone/repos/my-actual-project",
             "tool_name": "mcp__local-compress__compress_file",
-            "tool_response": f"[compressed 1000 -> 100 chars]\n<!--CLAUDE_RUNWAY_SAVINGS:{footer}-->",
+            "tool_response": _credited_response(metrics),
         }
         self._run_main(payload)
         self.assertEqual(len(self.stub.calls), 1)
@@ -483,8 +500,8 @@ class MainDerivesProjectFromPayloadCwd(unittest.TestCase):
 
 
 class MainThreadsAgentFieldsToRecordEvent(unittest.TestCase):
-    """end-to-end through main() -- the payload's agent_id/agent_type
-    reach record_event on EVERY recording path (MCP footer, generic MCP, Bash),
+    """End-to-end through main() -- the payload's agent_id/agent_type
+    reach record_event on EVERY recording path (MCP envelope, generic MCP, Bash),
     not just the one _record_savings_event unit test above covers. Uses the same
     stub ledger / fake compress as the neighboring classes, so no live model."""
 
@@ -520,14 +537,14 @@ class MainThreadsAgentFieldsToRecordEvent(unittest.TestCase):
         self.assertEqual(len(self.stub.calls), 1)
         return self.stub.calls[0][1]
 
-    def test_mcp_footer_path(self):
-        footer = json.dumps({"tool": "compress_file", "raw_chars": 1000, "out_chars": 100,
-                             "credited": True, "source": "f.log"})
+    def test_mcp_envelope_path(self):
+        metrics = {"tool": "compress_file", "raw_chars": 1000, "out_chars": 100,
+                   "credited": True, "source": "f.log"}
         self._run_main({
             "session_id": "s", "cwd": "/repos/p",
             "agent_id": "agent-9", "agent_type": "general-purpose",
             "tool_name": "mcp__local-compress__compress_file",
-            "tool_response": f"[compressed 1000 -> 100 chars]\n<!--CLAUDE_RUNWAY_SAVINGS:{footer}-->",
+            "tool_response": _credited_response(metrics),
         })
         kwargs = self._single_call_kwargs()
         self.assertEqual(kwargs.get("agent_id"), "agent-9")
@@ -586,13 +603,13 @@ class MainThreadsCharsAndToolUseId(MainThreadsAgentFieldsToRecordEvent):
     reach record_event on every recording path. Inherits the stub/fake-compress
     setUp and _run_main helpers; its own inherited tests are re-run harmlessly."""
 
-    def test_mcp_footer_path_forwards_footer_chars_and_tool_use_id(self):
-        footer = json.dumps({"tool": "compress_file", "raw_chars": 3500, "out_chars": 350,
-                             "credited": True, "source": "f.log"})
+    def test_mcp_envelope_path_forwards_metric_chars_and_tool_use_id(self):
+        metrics = {"tool": "compress_file", "raw_chars": 3500, "out_chars": 350,
+                   "credited": True, "source": "f.log"}
         self._run_main({
             "session_id": "s", "cwd": "/repos/p", "tool_use_id": "toolu_abc",
             "tool_name": "mcp__local-compress__compress_file",
-            "tool_response": f"[compressed 3500 -> 350 chars]\n<!--CLAUDE_RUNWAY_SAVINGS:{footer}-->",
+            "tool_response": _credited_response(metrics, "[compressed 3500 -> 350 chars]\nGIST"),
         })
         self.assertEqual(len(self.stub.calls), 1)
         args, kwargs = self.stub.calls[0]
@@ -600,30 +617,38 @@ class MainThreadsCharsAndToolUseId(MainThreadsAgentFieldsToRecordEvent):
         self.assertEqual((args[2], args[3]), (3500, 350))
         self.assertEqual(kwargs.get("tool_use_id"), "toolu_abc")
 
-    def test_footer_without_char_counts_is_stripped_but_not_recorded(self):
-        # A footer from an MCP server that predates character counts carries only the chars / 3.5
-        # estimates. There is no exact size to record (the estimate was dropped),
-        # but the footer must still be stripped so Claude never sees it.
-        footer = json.dumps({"tool": "compress_file", "raw_tokens": 1000, "out_tokens": 100,
-                             "credited": True, "source": "f.log"})
+    def test_metrics_written_before_char_counts_are_unwrapped_but_not_recorded(self):
+        # Metrics from an MCP server that predates character counts carry only
+        # the chars / 3.5 estimates. There is no exact size to record (the
+        # estimate was dropped), but the envelope must still be unwrapped so
+        # Claude never sees the JSON.
+        metrics = {"tool": "compress_file", "raw_tokens": 1000, "out_tokens": 100,
+                   "credited": True, "source": "f.log"}
         printed = self._run_main({
             "session_id": "s", "cwd": "/repos/p",
             "tool_name": "mcp__local-compress__compress_file",
-            "tool_response": f"[compressed 1000 -> 100 chars]\n<!--CLAUDE_RUNWAY_SAVINGS:{footer}-->",
+            "tool_response": _credited_response(metrics),
         })
         self.assertEqual(len(self.stub.calls), 0)
-        self.assertIn("[compressed 1000 -> 100 chars]", printed)
-        self.assertNotIn("CLAUDE_RUNWAY_SAVINGS", printed)
+        self.assertEqual(
+            json.loads(printed)["hookSpecificOutput"]["updatedToolOutput"],
+            "[compressed 1000 -> 100 chars]\nGIST",
+        )
 
-    def test_malformed_footer_chars_are_not_recorded(self):
-        footer = json.dumps({"tool": "compress_file", "raw_chars": "lots", "out_chars": True,
-                             "credited": True, "source": "f.log"})
-        self._run_main({
+    def test_malformed_metric_chars_are_not_recorded(self):
+        metrics = {"tool": "compress_file", "raw_chars": "lots", "out_chars": True,
+                   "credited": True, "source": "f.log"}
+        printed = self._run_main({
             "session_id": "s", "cwd": "/repos/p",
             "tool_name": "mcp__local-compress__compress_file",
-            "tool_response": f"[compressed 1000 -> 100 chars]\n<!--CLAUDE_RUNWAY_SAVINGS:{footer}-->",
+            "tool_response": _credited_response(metrics),
         })
         self.assertEqual(len(self.stub.calls), 0)
+        # Still unwrapped, so the JSON never reaches Claude.
+        self.assertEqual(
+            json.loads(printed)["hookSpecificOutput"]["updatedToolOutput"],
+            "[compressed 1000 -> 100 chars]\nGIST",
+        )
 
     def test_bash_path_records_exact_lengths_of_both_texts(self):
         stdout = "LOG LINE. " * 600
@@ -677,10 +702,10 @@ async def _fake_compress(text, skip_if_under_chars=2000, **kwargs):
     return f"[compressed {len(text)} -> 4 chars across 1 chunk(s), ~99% smaller]\nGIST"
 
 
-class MainFallsBackToGenericForNonFooterMcpTools(unittest.TestCase):
-    """An MCP tool call that carries NO savings footer
+class MainFallsBackToGenericForNonEnvelopeMcpTools(unittest.TestCase):
+    """An MCP tool call that carries NO savings envelope
     (mcp__qdrant__compact_find / compact_store, mcp__local-compress__list_local_models
-    -- none of these ever call _append_savings_footer) must still get the same
+    -- none of these ever call _attach_savings_metrics) must still get the same
     size-based compression every other matched tool gets, not a silent no-op
     regardless of size. Exception: every tool on the analytics
     server (savings_summary/detail/trend, get_metrics, record_metric) and
@@ -716,9 +741,9 @@ class MainFallsBackToGenericForNonFooterMcpTools(unittest.TestCase):
             sys.stdin = real_stdin
         return out.getvalue()
 
-    def test_large_no_footer_response_gets_compressed_and_recorded(self):
+    def test_large_no_envelope_response_gets_compressed_and_recorded(self):
         # compact_find can return up to 10 full stored compacts -- simulated
-        # here as one large string well over THRESHOLD, no footer attached.
+        # here as one large string well over THRESHOLD, no envelope.
         big_response = "STORED COMPACT CONTENT. " * 200  # well over THRESHOLD
         self.assertGreater(len(big_response), hook.THRESHOLD)
         payload = {
@@ -736,7 +761,7 @@ class MainFallsBackToGenericForNonFooterMcpTools(unittest.TestCase):
         self.assertEqual(args[1], "hook:mcp__qdrant__compact_find")
         self.assertEqual(kwargs.get("project"), "my-project")
 
-    def test_small_no_footer_response_is_left_untouched(self):
+    def test_small_no_envelope_response_is_left_untouched(self):
         # Regression guard: this fallback must not start compressing small
         # compact_find results that were never a problem in the first place.
         small_response = "just one short compact"
@@ -751,8 +776,8 @@ class MainFallsBackToGenericForNonFooterMcpTools(unittest.TestCase):
         self.assertEqual(printed, "")  # no hookSpecificOutput at all -- true no-op
         self.assertEqual(len(self.stub.calls), 0)
 
-    def test_self_compressing_tool_without_footer_is_never_double_compressed(self):
-        # compress_text never emits a footer at
+    def test_self_compressing_tool_without_envelope_is_never_double_compressed(self):
+        # Review finding (Copilot): compress_text never emits an envelope at
         # all, and compress_file/compress_command_output/fetch_url omit one
         # whenever tracking is off server-side even though real compression
         # already ran -- with the caller's own focus/preserve_identifiers/
@@ -841,25 +866,25 @@ class MainFallsBackToGenericForNonFooterMcpTools(unittest.TestCase):
         self.assertEqual(hook._QDRANT_COMPACT_MCP_TOOLS, {"compact_store", "compact_find", "compact_prune"})
         self.assertFalse(hasattr(hook, "_EXACT_OUTPUT_MCP_TOOLS"))
 
-    def test_footer_path_still_takes_priority_over_the_fallback(self):
-        # Regression guard for the existing footer-path behavior --
+    def test_envelope_path_still_takes_priority_over_the_fallback(self):
+        # Regression guard for the existing credited-tool behavior --
         # confirms the refactor into _finish_compression_outcome() didn't
-        # change what happens when a footer IS present.
-        footer = json.dumps({
+        # change what happens when an envelope IS present.
+        metrics = {
             "tool": "compress_file", "raw_chars": 1000, "out_chars": 100,
             "credited": True, "source": "some/file.log",
-        })
+        }
         payload = {
             "session_id": "sess-1",
             "cwd": "/repos/my-project",
             "tool_name": "mcp__local-compress__compress_file",
-            "tool_response": f"[compressed 1000 -> 100 chars]\n<!--CLAUDE_RUNWAY_SAVINGS:{footer}-->",
+            "tool_response": _credited_response(metrics),
         }
         self._run_main(payload)
         self.assertEqual(len(self.stub.calls), 1)
         args, _ = self.stub.calls[0]
-        # tool name comes from the footer's own "tool" field here, not
-        # prefixed with "hook:" -- that's the credited-footer path's
+        # tool name comes from the metrics' own "tool" field here, not
+        # prefixed with "hook:" -- that's the credited-envelope path's
         # existing (unchanged) behavior, distinct from the fallback path's
         # "hook:<tool_name>" naming asserted above.
         self.assertEqual(args[1], "compress_file")
@@ -1070,7 +1095,7 @@ class HandleGenericGroupsBySiblingRecord(unittest.TestCase):
     compressed independently, not concatenated into one blob whose result
     then overwrites only the largest field while every other record's field
     is silently blanked to "". Uses the same hook.compress monkeypatch
-    pattern as MainFallsBackToGenericForNonFooterMcpTools above, but calls
+    pattern as MainFallsBackToGenericForNonEnvelopeMcpTools above, but calls
     _handle_generic directly since that's where the grouping logic lives."""
 
     def setUp(self):
@@ -1360,9 +1385,9 @@ class MainHandlesGenericMcpTools(unittest.TestCase):
     def test_github_search_code_savings_event_recorded(self):
         # Confirms the generic mcp__ path records a savings event via
         # _finish_compression_outcome, which logs the tool as "hook:{tool_name}"
-        # -- the same "hook:" prefix used for all non-footer paths (Bash, Grep,
+        # -- the same "hook:" prefix used for all non-envelope paths (Bash, Grep,
         # etc. included), mirroring the existing assertion at test case
-        # test_large_no_footer_response_gets_compressed_and_recorded.
+        # test_large_no_envelope_response_gets_compressed_and_recorded.
         # Sized dynamically so this passes regardless of the configured threshold.
         big_response = "SEARCH RESULTS " * (hook.THRESHOLD // 10 + 50)
         self.assertGreater(len(big_response), hook.THRESHOLD)
@@ -1382,24 +1407,140 @@ class MainHandlesGenericMcpTools(unittest.TestCase):
     def test_mcp_local_compress_path_still_takes_precedence(self):
         # Regression guard: the new generic mcp__ branch must come AFTER
         # the mcp__local-compress__ check, not before it -- a local-compress
-        # tool with a savings footer must still go through the footer-strip
+        # tool with a savings envelope must still go through the envelope
         # path and NOT be re-processed generically.
-        footer = json.dumps({
+        metrics = {
             "tool": "compress_file", "raw_chars": 500, "out_chars": 50,
             "credited": True, "source": "some/file.log",
-        })
+        }
         payload = {
             "session_id": "sess-3",
             "cwd": "/repos/my-project",
             "tool_name": "mcp__local-compress__compress_file",
-            "tool_response": f"[compressed]\n<!--CLAUDE_RUNWAY_SAVINGS:{footer}-->",
+            "tool_response": _credited_response(metrics, "[compressed]\nGIST"),
         }
         self._run_main(payload)
         self.assertEqual(len(self.stub.calls), 1)
         args, _ = self.stub.calls[0]
-        # Footer path tags the event with the footer's own tool name, not
+        # Envelope path tags the event with the metrics' own tool name, not
         # "hook:mcp__local-compress__compress_file" -- unchanged behavior.
         self.assertEqual(args[1], "compress_file")
+
+
+class SavingsEnvelopeParsingIsStrict(unittest.TestCase):
+    """The hook accepts the savings envelope only when it is exactly the shape
+    the server writes. Anything else is ordinary tool output: not unwrapped, not
+    recorded, and never repaired."""
+
+    GOOD_METRICS = {"tool": "compress_file", "raw_chars": 10, "out_chars": 5, "credited": True, "source": "f"}
+
+    def test_a_non_matching_json_tool_output_is_left_alone(self):
+        # A compressed JSON file is a legitimate tool result; nothing about it
+        # is a savings envelope.
+        for text in (
+            json.dumps({"name": "pkg", "version": "1.0"}),
+            json.dumps([1, 2, 3]),
+            json.dumps({"compressed_text": "x"}),  # no metrics
+            json.dumps({"metrics": {}}),  # no text
+            json.dumps({"compressed_text": "x", "metrics": self.GOOD_METRICS, "extra": 1}),
+            json.dumps({"compressed_text": 5, "metrics": self.GOOD_METRICS}),
+            json.dumps({"compressed_text": "x", "metrics": "nope"}),
+            json.dumps({"compressed_text": "x", "metrics": dict(self.GOOD_METRICS, tool=3)}),
+            json.dumps({"compressed_text": "x", "metrics": dict(self.GOOD_METRICS, credited="yes")}),
+            json.dumps({"compressed_text": "x", "metrics": dict(self.GOOD_METRICS, source=None)}),
+            "plain text, not JSON at all",
+            "",
+        ):
+            for response in (text, _mcp_wrapped(text), {"result": text}):
+                with self.subTest(response=response):
+                    self.assertEqual(hook._handle_mcp_savings_envelope(response), (None, None))
+
+    def test_a_parse_failure_at_either_layer_is_not_repaired(self):
+        good = _envelope("kept", self.GOOD_METRICS)
+        for response in (
+            good[:-1],  # truncated inner JSON
+            '{"result": "' + good[:-1].replace('"', '\\"') + '"}',  # outer ok, inner truncated
+            '{"result": ' + json.dumps(good)[:-3],  # outer truncated
+            "<!--CLAUDE_RUNWAY_SAVINGS:" + json.dumps(self.GOOD_METRICS) + "-->",  # the old marker
+        ):
+            with self.subTest(response=response):
+                self.assertEqual(hook._handle_mcp_savings_envelope(response), (None, None))
+
+    def test_only_two_layers_are_decoded(self):
+        # A third layer of wrapping is not unwrapped: the real path has exactly two.
+        triple = json.dumps({"result": json.dumps({"result": _envelope("kept", self.GOOD_METRICS)})})
+        self.assertEqual(hook._handle_mcp_savings_envelope(triple), (None, None))
+
+    def test_a_response_that_merely_contains_an_envelope_is_not_searched(self):
+        embedded = {"other": _envelope("kept", self.GOOD_METRICS)}
+        self.assertEqual(hook._handle_mcp_savings_envelope(embedded), (None, None))
+        self.assertEqual(
+            hook._handle_mcp_savings_envelope("prefix " + _envelope("kept", self.GOOD_METRICS)), (None, None),
+        )
+
+    def test_non_matching_output_through_main_is_neither_stripped_nor_recorded(self):
+        stub = _StubSavingsLedger()
+        real_ledger, real_available = hook.savings_ledger, hook._SAVINGS_LEDGER_AVAILABLE
+        hook.savings_ledger, hook._SAVINGS_LEDGER_AVAILABLE = stub, True
+        self.addCleanup(setattr, hook, "savings_ledger", real_ledger)
+        self.addCleanup(setattr, hook, "_SAVINGS_LEDGER_AVAILABLE", real_available)
+        payload = {
+            "session_id": "s", "cwd": "/repos/p", "tool_name": "mcp__local-compress__compress_file",
+            "tool_response": _mcp_wrapped(json.dumps({"compressed_text": "x", "metrics": "not a dict"})),
+        }
+        real_stdin = sys.stdin
+        sys.stdin = io.StringIO(json.dumps(payload))
+        out = io.StringIO()
+        try:
+            with redirect_stdout(out):
+                try:
+                    hook.main()
+                except SystemExit:
+                    pass
+        finally:
+            sys.stdin = real_stdin
+        # compress_file is self-compressing, so a non-envelope result is a true
+        # no-op: nothing printed (output untouched) and nothing recorded.
+        self.assertEqual(out.getvalue(), "")
+        self.assertEqual(stub.calls, [])
+
+    def test_an_envelope_from_a_tool_that_never_emits_one_is_left_alone_through_main(self):
+        # compress_text is never credited and never wraps its result, so
+        # envelope-shaped text from it is just text: not unwrapped, not recorded.
+        stub = _StubSavingsLedger()
+        real_ledger, real_available = hook.savings_ledger, hook._SAVINGS_LEDGER_AVAILABLE
+        hook.savings_ledger, hook._SAVINGS_LEDGER_AVAILABLE = stub, True
+        self.addCleanup(setattr, hook, "savings_ledger", real_ledger)
+        self.addCleanup(setattr, hook, "_SAVINGS_LEDGER_AVAILABLE", real_available)
+        payload = {
+            "session_id": "s", "cwd": "/repos/p", "tool_name": "mcp__local-compress__compress_text",
+            "tool_response": _credited_response(self.GOOD_METRICS),
+        }
+        real_stdin = sys.stdin
+        sys.stdin = io.StringIO(json.dumps(payload))
+        out = io.StringIO()
+        try:
+            with redirect_stdout(out):
+                try:
+                    hook.main()
+                except SystemExit:
+                    pass
+        finally:
+            sys.stdin = real_stdin
+        self.assertEqual(out.getvalue(), "")
+        self.assertEqual(stub.calls, [])
+
+    def test_the_metric_chars_helper_skips_malformed_counts(self):
+        for bad in (None, "5", 5.5, True, False, -1, [], {}):
+            with self.subTest(bad=bad):
+                self.assertIsNone(hook._metric_chars(bad))
+        self.assertEqual(hook._metric_chars(0), 0)
+        self.assertEqual(hook._metric_chars(7), 7)
+
+    def test_the_old_footer_names_are_gone(self):
+        for name in ("SAVINGS_FOOTER_RE", "_extract_savings_footer", "_handle_mcp_savings_footer", "_footer_chars"):
+            with self.subTest(name=name):
+                self.assertFalse(hasattr(hook, name))
 
 
 def _windows_style_stdin(payload_bytes):

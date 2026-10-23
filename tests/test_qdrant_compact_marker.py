@@ -20,7 +20,7 @@ from unittest.mock import MagicMock, patch
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "libs"))
-sys.path.insert(0, os.path.join(REPO_ROOT, "tools"))
+sys.path.insert(0, os.path.join(REPO_ROOT, "mcpservers"))
 sys.path.insert(0, os.path.join(REPO_ROOT, "tests"))
 
 os.environ.setdefault("QDRANT_URL", "http://localhost:6333")

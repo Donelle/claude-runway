@@ -25,11 +25,14 @@ REPO_ROOT = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, str(REPO_ROOT / "libs"))
 
 from setup_project_lib import (  # noqa: E402
+    MalformedConfigError,
     build_mcp_servers,
     build_settings_hooks,
     default_collection_name,
     default_skills_dir,
     find_unresolved_placeholders,
+    load_existing_mcp_json,
+    load_existing_settings_json,
     load_json,
     merge_mcp_json,
     merge_settings_hooks,
@@ -99,7 +102,7 @@ class BuildMcpServers(unittest.TestCase):
         servers = self._build()
         self.assertEqual(servers["qdrant"]["command"], "/home/user/tools/claude-runway/.venv/bin/python")
         self.assertEqual(
-            servers["qdrant"]["args"], ["/home/user/tools/claude-runway/tools/qdrant_mcp_server.py"]
+            servers["qdrant"]["args"], ["/home/user/tools/claude-runway/mcpservers/qdrant_mcp_server.py"]
         )
 
     def test_qdrant_block_no_longer_carries_the_third_party_servers_settings(self):
@@ -139,10 +142,10 @@ class BuildMcpServers(unittest.TestCase):
         servers = self._build(track_savings=True)
         block = servers["analytics"]
         self.assertEqual(block["command"], "/home/user/tools/claude-runway/.venv/bin/python")
-        self.assertEqual(block["args"], ["/home/user/tools/claude-runway/tools/analytics_mcp_server.py"])
+        self.assertEqual(block["args"], ["/home/user/tools/claude-runway/mcpservers/analytics_mcp_server.py"])
         # No DB override: neither key is written (a blank one would mask inheritance).
         self.assertEqual(block["env"], {"CLAUDE_RUNWAY_TRACK_SAVINGS": "1"})
-        # local-compress keeps its own TRACK_SAVINGS: its footer feeds the tracker.
+        # local-compress keeps its own TRACK_SAVINGS: its savings metrics feed the tracker.
         self.assertEqual(servers["local-compress"]["env"]["CLAUDE_RUNWAY_TRACK_SAVINGS"], "1")
         self.assertEqual(find_unresolved_placeholders(servers), [])
 
@@ -1284,6 +1287,186 @@ class CompactEmbeddingModelOnInit(unittest.TestCase):
     def test_a_config_with_only_unrelated_servers_counts_as_empty(self):
         self._write({"github": {"command": "gh-mcp"}})
         self.assertEqual(self._model(self._run()), "sentence-transformers/all-MiniLM-L6-v2")
+
+
+# Malformed-but-realistic shapes of an EXISTING .mcp.json / settings.json, as
+# (label, raw JSON text, fragment the error message must contain). Each
+# one used to crash init/upgrade with a raw AttributeError/TypeError/
+# JSONDecodeError.
+_BAD_MCP_JSON = [
+    ("invalid json", "{not json", "could not be read as valid JSON"),
+    ("empty file", "", "could not be read as valid JSON"),
+    ("top level list", "[]", "top level is a list"),
+    ("top level null", "null", "top level is a NoneType"),
+    ("mcpServers null", '{"mcpServers": null}', '"mcpServers" is a NoneType'),
+    ("mcpServers list", '{"mcpServers": []}', '"mcpServers" is a list'),
+    ("server null", '{"mcpServers": {"qdrant": null}}', '"qdrant" server is a NoneType'),
+    ("server env list", '{"mcpServers": {"qdrant": {"env": []}}}', '"qdrant"."env" is a list'),
+    ("server args not list", '{"mcpServers": {"qdrant": {"args": 1}}}', '"qdrant" server has "args"'),
+    ("server args non-string", '{"mcpServers": {"qdrant": {"args": [1]}}}', '"qdrant" server has "args"'),
+]
+
+_BAD_SETTINGS_JSON = [
+    ("invalid json", "{not json", "could not be read as valid JSON"),
+    ("top level string", '"x"', "top level is a str"),
+    ("hooks null", '{"hooks": null}', '"hooks" is a NoneType'),
+    ("hooks list", '{"hooks": []}', '"hooks" is a list'),
+    ("event null", '{"hooks": {"PostToolUse": null}}', '"hooks"."PostToolUse" is a NoneType, expected a list'),
+    ("block not object", '{"hooks": {"PostToolUse": ["x"]}}', "has a str entry, expected an object"),
+    ("block hooks null", '{"hooks": {"PostToolUse": [{"hooks": null}]}}', '"hooks" is a NoneType, expected a list'),
+    ("inner hook not object", '{"hooks": {"PostToolUse": [{"hooks": [1]}]}}', "has a hook that is a int"),
+    ("args not list", '{"hooks": {"PostToolUse": [{"hooks": [{"args": "x"}]}]}}', "not a list of strings"),
+    ("matcher list", '{"hooks": {"PostToolUse": [{"matcher": ["Bash", "Grep"], "hooks": []}]}}', '"matcher" is a list'),
+    ("matcher number", '{"hooks": {"PostToolUse": [{"matcher": 1, "hooks": []}]}}', '"matcher" is a int'),
+    ("args non-string",'{"hooks": {"PostToolUse": [{"hooks": [{"args": [1]}]}]}}', "not a list of strings"),
+]
+
+
+class MalformedExistingConfig(unittest.TestCase):
+    """The load boundary of init/upgrade validates an existing
+    config's shape once, raising MalformedConfigError (the same error doctor
+    reports) instead of letting the merge internals crash."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.target_repo = Path(self._tmpdir.name) / "my-target-project"
+        (self.target_repo / ".claude").mkdir(parents=True)
+
+    def test_mcp_json_loader_rejects_every_bad_shape_naming_the_file(self):
+        path = self.target_repo / ".mcp.json"
+        for label, text, fragment in _BAD_MCP_JSON:
+            with self.subTest(label):
+                path.write_text(text, encoding="utf-8")
+                with self.assertRaises(MalformedConfigError) as ctx:
+                    load_existing_mcp_json(path)
+                self.assertIn(str(path), str(ctx.exception))
+                self.assertIn(fragment, str(ctx.exception))
+
+    def test_settings_loader_rejects_every_bad_shape_naming_the_file(self):
+        path = self.target_repo / ".claude" / "settings.json"
+        for label, text, fragment in _BAD_SETTINGS_JSON:
+            with self.subTest(label):
+                path.write_text(text, encoding="utf-8")
+                with self.assertRaises(MalformedConfigError) as ctx:
+                    load_existing_settings_json(path)
+                self.assertIn(str(path), str(ctx.exception))
+                self.assertIn(fragment, str(ctx.exception))
+
+    def test_a_directory_in_place_of_the_file_is_malformed_not_a_crash(self):
+        path = self.target_repo / ".mcp.json"
+        path.mkdir()
+        with self.assertRaises(MalformedConfigError):
+            load_existing_mcp_json(path)
+
+    def test_missing_files_load_as_empty(self):
+        self.assertEqual(load_existing_mcp_json(self.target_repo / ".mcp.json"), {})
+        self.assertEqual(load_existing_settings_json(self.target_repo / ".claude" / "settings.json"), {})
+
+    def test_valid_configs_load_unchanged(self):
+        mcp = {"mcpServers": {"mine": {"command": "x", "env": {"A": "b"}}}, "other": 1}
+        settings = {
+            "hooks": {"PostToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "c", "args": ["a"]}]}]},
+            "permissions": {"allow": []},
+        }
+        (self.target_repo / ".mcp.json").write_text(json.dumps(mcp), encoding="utf-8")
+        (self.target_repo / ".claude" / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
+        self.assertEqual(load_existing_mcp_json(self.target_repo / ".mcp.json"), mcp)
+        self.assertEqual(load_existing_settings_json(self.target_repo / ".claude" / "settings.json"), settings)
+
+    def test_absent_mcp_servers_and_hooks_keys_are_fine(self):
+        (self.target_repo / ".mcp.json").write_text("{}", encoding="utf-8")
+        (self.target_repo / ".claude" / "settings.json").write_text('{"model": "x"}', encoding="utf-8")
+        self.assertEqual(load_existing_mcp_json(self.target_repo / ".mcp.json"), {})
+        self.assertEqual(load_existing_settings_json(self.target_repo / ".claude" / "settings.json"), {"model": "x"})
+
+    def test_run_setup_raises_malformed_error_for_a_bad_mcp_json(self):
+        path = self.target_repo / ".mcp.json"
+        for label, text, fragment in _BAD_MCP_JSON:
+            with self.subTest(label):
+                path.write_text(text, encoding="utf-8")
+                with self.assertRaises(MalformedConfigError) as ctx:
+                    run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
+                self.assertIn(fragment, str(ctx.exception))
+
+    def test_run_setup_raises_malformed_error_for_a_bad_settings_json(self):
+        path = self.target_repo / ".claude" / "settings.json"
+        for label, text, fragment in _BAD_SETTINGS_JSON:
+            with self.subTest(label):
+                path.write_text(text, encoding="utf-8")
+                with self.assertRaises(MalformedConfigError) as ctx:
+                    run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
+                self.assertIn(fragment, str(ctx.exception))
+
+    def test_run_setup_cleaning_hooks_also_validates_settings(self):
+        # The include_hooks=False / clean_hooks_if_unused path reads
+        # settings.json through strip_toolkit_hooks, which crashed the same way.
+        (self.target_repo / ".claude" / "settings.json").write_text('{"hooks": null}', encoding="utf-8")
+        with self.assertRaises(MalformedConfigError):
+            run_setup(
+                self.target_repo, REPO_ROOT, home_dir=Path("/home/user"),
+                include_hooks=False, clean_hooks_if_unused=True,
+            )
+
+    def test_run_setup_ignores_settings_json_when_hooks_are_skipped(self):
+        # --skip-hooks never reads settings.json, so its shape is not init's problem.
+        (self.target_repo / ".claude" / "settings.json").write_text("{not json", encoding="utf-8")
+        result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"), include_hooks=False)
+        self.assertIsNone(result.settings_json)
+
+    def test_doctor_reports_the_same_error_class(self):
+        # doctor_lib's old name is an alias of the shared error, so the three
+        # CLIs cannot drift apart on what counts as malformed.
+        import doctor_lib
+
+        self.assertIs(doctor_lib.MalformedMcpJsonError, MalformedConfigError)
+
+
+class SavingsTrackerQuestion(unittest.TestCase):
+    """The question `init` and `upgrade` share, and the small
+    readers that decide its default."""
+
+    @staticmethod
+    def _ask(answer, **kw):
+        lines = []
+
+        def _input(prompt=""):
+            lines.append(prompt)
+            if isinstance(answer, BaseException):
+                raise answer
+            return answer
+
+        from setup_project_lib import ask_savings_tracker
+
+        return ask_savings_tracker(input_fn=_input, print_fn=lines.append, **kw), lines
+
+    def test_answers(self):
+        for answer, default, expected in (
+            ("y", False, True), ("YES", False, True), (" Yes ", False, True),
+            ("n", False, False), ("no", False, False), ("", False, False), ("maybe", False, False),
+            ("", True, True), ("n", True, False), ("no", True, False),
+        ):
+            with self.subTest(answer=answer, default=default):
+                self.assertIs(self._ask(answer, default_enabled=default)[0], expected)
+
+    def test_closed_stdin_takes_the_default(self):
+        self.assertIs(self._ask(EOFError(), default_enabled=False)[0], False)
+        self.assertIs(self._ask(EOFError(), default_enabled=True)[0], True)
+
+    def test_prompt_hint_shows_the_default(self):
+        self.assertIn("[y/N]", self._ask("", default_enabled=False)[1][-1])
+        self.assertIn("[Y/n]", self._ask("", default_enabled=True)[1][-1])
+
+    def test_readers_tolerate_odd_shapes(self):
+        from setup_project_lib import has_analytics_block, local_compress_tracks_savings
+
+        for odd in ({}, {"mcpServers": []}, {"mcpServers": {"analytics": None, "local-compress": "x"}}):
+            with self.subTest(odd=odd):
+                self.assertFalse(has_analytics_block(odd))
+                self.assertFalse(local_compress_tracks_savings(odd))
+        tracking = {"mcpServers": {"local-compress": {"env": {"CLAUDE_RUNWAY_TRACK_SAVINGS": " TRUE "}}}}
+        self.assertTrue(local_compress_tracks_savings(tracking))
+        self.assertTrue(has_analytics_block({"mcpServers": {"analytics": {}}}))
 
 
 if __name__ == "__main__":

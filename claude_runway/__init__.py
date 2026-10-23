@@ -3,9 +3,9 @@
 """
 Tiny importable shim package backing claude-runway's 3 console-script entry
 points. Exists purely to bridge a gap `[project.scripts]`
-otherwise can't close: pyproject.toml ships libs/tools/hooks/templates/
-skills as wheel DATA files under <env>/src/{libs,tools,hooks,templates,
-skills} (see setup.py), not as `[tool.setuptools] packages` -- so, unlike
+otherwise can't close: pyproject.toml ships libs/tools/mcpservers/hooks/
+templates/skills as wheel DATA files under <env>/src/{libs,tools,mcpservers,
+hooks,templates,skills} (see setup.py), not as `[tool.setuptools] packages` -- so, unlike
 the earlier layout, `tools` is no longer importable on sys.path just because
 the package installed successfully. Python's own console-script mechanism
 still needs SOME real, importable site-packages module for an entry point

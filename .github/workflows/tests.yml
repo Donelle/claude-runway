@@ -66,7 +66,7 @@ jobs:
           pip install -r requirements-dev.txt --index-url https://pypi.org/simple
 
       - name: Lint (ruff)
-        run: ruff check libs tools hooks tests
+        run: ruff check libs tools mcpservers hooks tests
 
       - name: Type check (Pyright)
         # --pythonpath explicitly: this job
@@ -89,7 +89,7 @@ jobs:
   # On each of Windows/macOS/Linux, a
   # `uv tool install`/pipx-style install (built wheel installed into a
   # FRESH environment, not this checkout's own venv) must put
-  # libs/tools/hooks/templates/skills under <env>/src/, all 3 console
+  # libs/tools/mcpservers/hooks/templates/skills under <env>/src/, all 3 console
   # scripts must run, and `claude-runway-setup init --dry-run` must
   # generate config whose script/hook paths exist on disk. A separate job
   # (not a step in `test` above) because it needs the OS matrix below --
@@ -166,10 +166,16 @@ jobs:
           # SIBLING of the venv's own bin/Scripts directory -- not back in
           # site-packages.
           "$VENV_PY" -c "import sys, os
-          for name in ('libs', 'tools', 'hooks', 'templates', 'skills'):
+          for name in ('libs', 'tools', 'mcpservers', 'hooks', 'templates', 'skills'):
               p = os.path.join(sys.prefix, 'src', name)
               assert os.path.isdir(p), 'missing ' + p
-          print('OK: libs/tools/hooks/templates/skills all present under <env>/src/')"
+          # The six MCP servers Claude Code launches must all ship: a wheel
+          # built without the mcpservers/ data-files entry would silently lose
+          # them while every directory check above still passed.
+          for server in ('compress', 'analytics', 'qdrant', 'ingest', 'memory_bank', 'codebase_reviewer'):
+              p = os.path.join(sys.prefix, 'src', 'mcpservers', server + '_mcp_server.py')
+              assert os.path.isfile(p), 'missing ' + p
+          print('OK: libs/tools/mcpservers/hooks/templates/skills all present under <env>/src/')"
 
           "$VENV_BIN/claude-runway-doctor" --help
           # Each CLI reports the installed, git-derived version.

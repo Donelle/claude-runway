@@ -20,9 +20,11 @@ that launches `claude` for that project -- it reads `os.environ` from
 whatever process runs it, matching the README's own "set both" advice.
 
 Also flags a .claude/settings.json still running the renamed-away
-`compress_bash_output.py` hook (`upgrade` fixes it).
+`compress_bash_output.py` hook (`upgrade` fixes it), and, for a
+project with a `codebase-reviewer` server, a missing, blank, unreadable or
+invalid reviewers file (REVIEWERS_FILE is required and has no default).
 
-Exit code is 1 if any mismatch (or stale hook) is found, 0 otherwise (including when
+Exit code is 1 if any mismatch (or stale hook, or unusable reviewers file) is found, 0 otherwise (including when
 there is nothing to check -- e.g. a `--qdrant-only` setup whose `qdrant` block
 carries no dual-config values -- which is a valid state, not a misconfiguration) -- usable as a CI/
 pre-flight gate, not just an interactive report.
@@ -53,8 +55,24 @@ def _legacy_hook_note(result: DoctorResult) -> str:
     )
 
 
+def _reviewers_file_note(result: DoctorResult) -> str:
+    """Extra section for a project with a `codebase-reviewer` block: whether its
+    reviewers file (REVIEWERS_FILE, required, no default) loads. Empty when the
+    project has no such block."""
+    if not result.reviewer_checked:
+        return ""
+    if result.reviewers_file_problem:
+        return (
+            "\n\nProblem: the codebase-reviewer server's reviewers file cannot be used, so it would run no review.\n"
+            f"{result.reviewers_file_problem}\n"
+            "Fix: set REVIEWERS_FILE in that server's env block in .mcp.json to your own reviewers JSON file "
+            "(it has no default), and correct what is listed above."
+        )
+    return f"\n\nReviewers file OK: {result.reviewers_file_summary}."
+
+
 def format_report(result: DoctorResult) -> str:
-    return _format_env_report(result) + _legacy_hook_note(result)
+    return _format_env_report(result) + _reviewers_file_note(result) + _legacy_hook_note(result)
 
 
 def _format_env_report(result: DoctorResult) -> str:
@@ -114,7 +132,16 @@ def main(argv=None) -> int:
 
     result = run_doctor(target_repo, shell_env=os.environ)
     print(format_report(result))
-    return 1 if (result.config_error or result.mismatches or result.legacy_compress_hook_events) else 0
+    return (
+        1
+        if (
+            result.config_error
+            or result.mismatches
+            or result.legacy_compress_hook_events
+            or result.reviewers_file_problem
+        )
+        else 0
+    )
 
 
 if __name__ == "__main__":
