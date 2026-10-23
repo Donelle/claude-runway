@@ -3,8 +3,9 @@ Shared, dependency-free logic behind `tools/setup_project.py` -- computing
 defaults and patching `templates/mcp.json.template` /
 `templates/settings.json.template` into a real, ready-to-use `.mcp.json` /
 `.claude/settings.json` for a target project repo, instead of the manual
-copy-and-hand-edit flow docs/installation.md's steps 4/4b/4c otherwise require (step 5's manual
-CLAUDE.md edit is NOT covered here).
+copy-and-hand-edit flow docs/installation.md's steps 4/4b/4c otherwise require -- and
+bringing the target's `CLAUDE.md` in line with `templates/CLAUDE.md.template`'s usage
+sections for the servers written (step 5; see `plan_claude_md`).
 Kept separate from `tools/setup_project.py` (the thin CLI) the
 same way `qdrant_ingest_lib.py`/`local_compress_lib.py` are kept separate
 from their own CLI/MCP-server callers -- pure functions here are what make
@@ -1231,6 +1232,268 @@ def plan_skill_installs(tools_repo_dir: Path, skills_dir: Path) -> list:
     return plans
 
 
+# ---------------------------------------------------------------------------
+# CLAUDE.md: the usage guidance a configured project needs.
+#
+# `.mcp.json` gives Claude the tools; the sections of `templates/CLAUDE.md.template`
+# tell it when to reach for each one (and when not to). Until `init` wrote them,
+# only `/my-setup-clauderunway` (which needs a full clone) did, so a pipx/`uv
+# tool install` user got working servers and no guidance. The template is read
+# from `run_setup`'s `templates_dir`, the same place `mcp.json.template` comes
+# from: `<env>/src/templates/` in a tool install (setup.py ships every
+# `templates/*.template`), the checkout's `templates/` otherwise.
+# ---------------------------------------------------------------------------
+
+CLAUDE_MD_TEMPLATE_NAME = "CLAUDE.md.template"
+CLAUDE_MD_FILENAME = "CLAUDE.md"
+
+CLAUDE_MD_QDRANT_HEADING = "## Vector memory (Qdrant MCP)"
+CLAUDE_MD_MEMORY_BANK_HEADING = "## Durable memory (memory-bank MCP)"
+CLAUDE_MD_COMPRESS_HEADING = "## Local compression (LM Studio MCP)"
+CLAUDE_MD_ANALYTICS_HEADING = "## Analytics (opt-in MCP server)"
+CLAUDE_MD_REVIEWER_HEADING = "## Local review (opt-in MCP server)"
+
+# Every section `init` manages, in template order (which is also the order
+# missing sections are appended in). Each is tied to the server it describes,
+# and `init` keeps the two in step: a section is added when its server is in
+# the `.mcp.json` this run writes and removed when it is not, so CLAUDE.md
+# never points Claude at tools that are not connected (the template's own
+# "only include a section if that project actually has the corresponding MCP
+# server configured" rule). The template's "Setup and diagnostics" section is
+# deliberately NOT here: it depends on which skills a person installed, which
+# nothing in `.mcp.json` records, so `init` leaves it to them.
+CLAUDE_MD_SECTION_SERVERS = (
+    (CLAUDE_MD_QDRANT_HEADING, "qdrant"),
+    (CLAUDE_MD_MEMORY_BANK_HEADING, "memory-bank"),
+    (CLAUDE_MD_COMPRESS_HEADING, "local-compress"),
+    (CLAUDE_MD_ANALYTICS_HEADING, "analytics"),
+    (CLAUDE_MD_REVIEWER_HEADING, "codebase-reviewer"),
+)
+
+# A level-1 or level-2 ATX heading ends a section. A level-3+ heading inside a
+# section is part of it. Up to three leading spaces are still a heading in
+# Markdown; four make it an indented code block.
+_SECTION_BOUNDARY_RE = re.compile(r"^ {0,3}#{1,2}(?:[ \t]|$)")
+# Opening/closing line of a fenced code block (``` or ~~~, up to three spaces in).
+_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+
+
+def _heading_line_indices(lines: list) -> list:
+    """
+    Indices of the level-1/2 heading lines in `lines`, skipping anything
+    inside a fenced code block, so a `## ...` line that is an example inside a
+    fence is never mistaken for a section boundary (or for a section that is
+    already present). A fence closes on a run of the same character at least
+    as long as the one that opened it, as in CommonMark.
+    """
+    indices = []
+    fence: Optional[str] = None
+    for i, line in enumerate(lines):
+        text = line.rstrip("\r\n")
+        match = _FENCE_RE.match(text)
+        if fence is None:
+            if match:
+                fence = match.group(1)
+            elif _SECTION_BOUNDARY_RE.match(text):
+                indices.append(i)
+        elif match and match.group(1)[0] == fence[0] and len(match.group(1)) >= len(fence):
+            # Only a bare fence closes one: text after the closing run would
+            # make it an info string, which CommonMark only allows on an opener.
+            if not text.strip()[len(match.group(1)):].strip():
+                fence = None
+    return indices
+
+
+def _is_heading(line: str, heading: str) -> bool:
+    """Whether `line` is exactly `heading` (trailing whitespace and the line ending ignored)."""
+    return line.rstrip() == heading
+
+
+def _section_spans(lines: list, heading: str) -> list:
+    """
+    `(start, end)` line-index spans of every section headed exactly `heading`
+    (outside fenced code), `end` exclusive: from the heading line through to
+    the next level-1/2 heading, or the end of the file.
+    """
+    boundaries = _heading_line_indices(lines)
+    spans = []
+    for pos, start in enumerate(boundaries):
+        if _is_heading(lines[start], heading):
+            end = boundaries[pos + 1] if pos + 1 < len(boundaries) else len(lines)
+            spans.append((start, end))
+    return spans
+
+
+def extract_claude_md_sections(template_text: str) -> dict:
+    """
+    `{heading: section text}` for every heading in `CLAUDE_MD_SECTION_SERVERS`,
+    cut verbatim from the CLAUDE.md template: the heading line through the
+    last non-blank line before the next level-1/2 heading (or the end of the
+    file), with `\\n` line endings and no trailing newline. The HTML comment at
+    the top of the template sits before the first heading, so it is never part
+    of a section. Raises `ValueError` naming any managed heading the template
+    lacks: that is a template/code mismatch to fix here, not something to
+    paper over by writing a CLAUDE.md without the section.
+    """
+    lines = template_text.splitlines()
+    sections = {}
+    missing = []
+    for heading, _server in CLAUDE_MD_SECTION_SERVERS:
+        spans = _section_spans(lines, heading)
+        if not spans:
+            missing.append(heading)
+            continue
+        start, end = spans[0]
+        body = lines[start:end]
+        while body and not body[-1].strip():
+            body.pop()
+        sections[heading] = "\n".join(body)
+    if missing:
+        raise ValueError(f"setup_project_lib bug: {CLAUDE_MD_TEMPLATE_NAME} has no section(s) {missing}")
+    return sections
+
+
+def wanted_claude_md_headings(mcp_servers: dict) -> list:
+    """
+    The managed headings whose server is in `mcp_servers` (the `mcpServers`
+    of the `.mcp.json` this run writes), in template order.
+    """
+    return [heading for heading, server in CLAUDE_MD_SECTION_SERVERS if server in mcp_servers]
+
+
+@dataclass
+class ClaudeMdPlan:
+    """
+    What `init` does to the target's CLAUDE.md. `content` is the full text to
+    write, or None when the file is already in the wanted state (nothing to
+    write: re-running `init` never rewrites it). `created` is True when the
+    file does not exist yet. `added`/`removed` name the headings (without the
+    leading `## `) for the CLI to report.
+    """
+
+    path: Path
+    content: Optional[str]
+    created: bool
+    added: list = field(default_factory=list)
+    removed: list = field(default_factory=list)
+
+
+def plan_claude_md(existing_text: Optional[str], sections: dict, wanted: list) -> "tuple[Optional[str], list, list]":
+    """
+    Pure computation of the new CLAUDE.md text. Returns `(content, added,
+    removed)`, `content` None when nothing changes.
+
+    `existing_text` None means there is no CLAUDE.md: the result is the
+    `wanted` sections, a blank line apart. Otherwise the file is edited, and
+    only in two ways, so nothing a person wrote is lost:
+      - a managed section NOT in `wanted` is removed: its heading line through
+        to the next level-1/2 heading (or the end of the file). When it ran to
+        the end of the file, the blank lines before it go too, so the file
+        does not end in a gap. Every copy of it goes, should there be two.
+      - a `wanted` section with no heading line in the file is appended, after
+        one blank line, in template order. A section already present is left
+        exactly as it is, even if its text differs from the template's now:
+        it may have been edited on purpose, and replacing it is not this
+        step's call.
+    The file's own line ending is kept (CRLF if it uses any, else LF), and
+    so is a leading UTF-8 byte-order mark, which would otherwise hide a
+    heading on the first line.
+    """
+    wanted_set = set(wanted)
+    if existing_text is None:
+        if not wanted:
+            return None, [], []
+        return "\n\n".join(sections[h] for h in wanted) + "\n", list(wanted), []
+
+    bom = ""
+    text = existing_text
+    if text.startswith("﻿"):
+        bom, text = "﻿", text[1:]
+    newline = "\r\n" if "\r\n" in text else "\n"
+    lines = text.splitlines(keepends=True)
+
+    removed = []
+    for heading, _server in CLAUDE_MD_SECTION_SERVERS:
+        if heading in wanted_set:
+            continue
+        spans = _section_spans(lines, heading)
+        if not spans:
+            continue
+        removed.append(heading)
+        # Last span first, so earlier indices stay valid while cutting.
+        for start, end in reversed(spans):
+            if end == len(lines):
+                while start > 0 and not lines[start - 1].strip():
+                    start -= 1
+            del lines[start:end]
+
+    present = set()
+    for index in _heading_line_indices(lines):
+        present.add(lines[index].rstrip())
+    added = [h for h in wanted if h not in present]
+
+    new_text = "".join(lines)
+    for heading in added:
+        if new_text:
+            if not new_text.endswith(("\n", "\r")):
+                new_text += newline
+            if not new_text.endswith(newline + newline):
+                new_text += newline
+        new_text += sections[heading].replace("\n", newline) + newline
+
+    if not added and not removed:
+        return None, [], []
+    return bom + new_text, added, removed
+
+
+def read_claude_md(path: Path) -> Optional[str]:
+    """
+    The target's CLAUDE.md as text, or None when it does not exist. Read as
+    UTF-8 with `surrogateescape`, the same error handler `_atomic_write`
+    encodes with, so bytes that are not valid UTF-8 survive a rewrite
+    unchanged instead of failing the run or being replaced. A CLAUDE.md that
+    exists but cannot be read (a directory in its place, no permission) raises
+    `MalformedConfigError`, which `init` reports as a one-line error before
+    writing anything.
+    """
+    if not path.exists() and not path.is_symlink():
+        return None
+    try:
+        return path.read_bytes().decode("utf-8", errors=SKILL_TEXT_ERRORS)
+    except OSError as exc:
+        raise MalformedConfigError(f"{path} could not be read: {exc}") from exc
+
+
+def plan_claude_md_update(target_repo: Path, templates_dir: Path, mcp_servers: dict) -> ClaudeMdPlan:
+    """
+    Reads the template and the target's current CLAUDE.md (writes nothing)
+    and plans the edit that brings the managed sections in line with
+    `mcp_servers`. See `plan_claude_md` for the rules.
+    """
+    template_text = (Path(templates_dir) / CLAUDE_MD_TEMPLATE_NAME).read_text(encoding="utf-8")
+    sections = extract_claude_md_sections(template_text)
+    path = Path(target_repo) / CLAUDE_MD_FILENAME
+    existing = read_claude_md(path)
+    content, added, removed = plan_claude_md(existing, sections, wanted_claude_md_headings(mcp_servers))
+    return ClaudeMdPlan(
+        path=path,
+        content=content,
+        created=existing is None and content is not None,
+        added=[h[3:] for h in added],
+        removed=[h[3:] for h in removed],
+    )
+
+
+def describe_claude_md_plan(plan: ClaudeMdPlan) -> str:
+    """One-line summary of a CLAUDE.md plan that changes something, for `changes`."""
+    parts = []
+    if plan.added:
+        parts.append(("new file with " if plan.created else "add ") + ", ".join(plan.added))
+    if plan.removed:
+        parts.append("remove " + ", ".join(plan.removed))
+    return f"CLAUDE.md ({'; '.join(parts)}) -> {plan.path}"
+
+
 @dataclass
 class SetupResult:
     """
@@ -1259,6 +1522,11 @@ class SetupResult:
     from what it builds. So --qdrant-only's `changes` entry summarizes a
     real (non-empty) `generated_settings_hooks` value, same as a normal
     run -- callers/dry-run code should not assume it's None for this mode.
+
+    `claude_md` is the planned CLAUDE.md edit (see `ClaudeMdPlan`), or None
+    when the caller asked to leave CLAUDE.md alone (`claude_md=False`, the
+    CLI's `--skip-claude-md`). A plan whose `content` is None means CLAUDE.md
+    is already up to date.
     """
 
     mcp_json: dict
@@ -1266,6 +1534,7 @@ class SetupResult:
     generated_mcp_servers: dict
     generated_settings_hooks: Optional[dict]
     changes: list = field(default_factory=list)
+    claude_md: Optional[ClaudeMdPlan] = None
 
 
 def run_setup(
@@ -1297,6 +1566,7 @@ def run_setup(
     memory_bank_embedding_model: str = "",
     codebase_reviewer: bool = False,
     reviewers_file: str = "",
+    claude_md: bool = True,
 ) -> SetupResult:
     """
     Pure computation (no disk writes to `target_repo`) of the final
@@ -1349,6 +1619,14 @@ def run_setup(
     STALE compress-gated block a prior full setup left behind, as a normal
     part of that same write -- no separate "clean, don't add" branch
     required for that case anymore.
+
+    `claude_md=False` corresponds to the CLI's `--skip-claude-md`: leave the
+    target's CLAUDE.md alone. Otherwise the result carries a `ClaudeMdPlan`
+    that adds the template's usage section for every server in the merged
+    `.mcp.json` and removes the section of a managed server that is not there
+    (see `plan_claude_md`). Keyed on the merged document, not this run's
+    flags, so a server block kept from before (the reviewer's) keeps its
+    guidance too.
     """
     target_repo = Path(target_repo)
     tools_repo_dir = Path(tools_repo_dir)
@@ -1549,10 +1827,17 @@ def run_setup(
                 final_settings = cleaned_settings
                 changes.append(f"hooks (removing this toolkit's own blocks, --qdrant-only) -> {settings_path}")
 
+    claude_md_plan: Optional[ClaudeMdPlan] = None
+    if claude_md:
+        claude_md_plan = plan_claude_md_update(target_repo, templates_dir, final_mcp.get("mcpServers", {}))
+        if claude_md_plan.content is not None:
+            changes.append(describe_claude_md_plan(claude_md_plan))
+
     return SetupResult(
         mcp_json=final_mcp,
         settings_json=final_settings,
         generated_mcp_servers=generated_servers,
         generated_settings_hooks=generated_hooks,
         changes=changes,
+        claude_md=claude_md_plan,
     )
