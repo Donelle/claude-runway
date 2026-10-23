@@ -152,8 +152,11 @@ def _git_diff(repo_path: str, base_ref: str, head_ref: str, context_lines: int) 
             raise ReviewError(f"{name} {ref!r} is not a usable git ref")
     # Explicit prefixes: the parser strips `a/` and `b/`, and a repository or user setting such as
     # `diff.noprefix` would otherwise make a change to `b/auth.py` read as `auth.py`.
-    command = ["git", "-C", str(root), "diff", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/",
-               f"--unified={context_lines}", f"{base_ref}...{head_ref}", "--"]
+    # --no-ext-diff and --no-textconv: a repository's config can name a `diff.external` or
+    # `diff.<driver>.textconv` command, which git would run during the diff. Reviewing a repository
+    # must not run its commands, and reviewers must see the real content, not a converted form.
+    command = ["git", "-C", str(root), "diff", "--no-color", "--no-ext-diff", "--no-textconv",
+               "--src-prefix=a/", "--dst-prefix=b/", f"--unified={context_lines}", f"{base_ref}...{head_ref}", "--"]
     try:
         done = subprocess.run(command, capture_output=True, timeout=GIT_TIMEOUT_SECONDS, check=False)
     except (OSError, subprocess.TimeoutExpired) as exc:

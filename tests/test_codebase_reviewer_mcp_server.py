@@ -411,6 +411,34 @@ class ReviewTool(unittest.TestCase):
                 self.assertIn("+++ b/b/auth.py", diff)
                 self.assertEqual([section.path for section in split_diff(diff)], ["b/auth.py"])
 
+    def test_the_diff_runs_no_command_the_repositorys_config_names(self):
+        # A textconv or external diff driver in the reviewed repository's config is a command git would run.
+        repo = self.dir / "repo-drivers"
+        repo.mkdir()
+        marker = self.dir / "driver-ran"
+        env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull, "GIT_AUTHOR_NAME": "t",
+               "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+
+        def git(*args):
+            subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, env=env)
+
+        git("init", "-q", "-b", "main")
+        (repo / ".gitattributes").write_text("*.txt diff=conv\n", encoding="utf-8")
+        (repo / "a.txt").write_text("one\n", encoding="utf-8")
+        git("add", ".")
+        git("commit", "-q", "-m", "base")
+        git("checkout", "-q", "-b", "feature")
+        (repo / "a.txt").write_text("two\n", encoding="utf-8")
+        git("commit", "-q", "-am", "change")
+        driver = f"sh -c 'touch \"{marker}\"; tr a-z A-Z < \"$0\"'"
+        git("config", "diff.conv.textconv", driver)
+        git("config", "diff.external", f"sh -c 'touch \"{marker}\"'")
+        with mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}):
+            diff = self.mod._git_diff(str(repo), "main", "feature", 3)
+        self.assertFalse(marker.exists())
+        self.assertIn("+two", diff)
+        self.assertNotIn("TWO", diff)
+
     def test_the_default_range_end_is_head_and_the_context_default_is_20(self):
         captured = {}
 
