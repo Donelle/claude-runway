@@ -20,8 +20,12 @@ CLAUDE.md
 .ai-plans/
 
 # Written into the repo root by sync_repo/index_repo to track what's already
-# indexed -- per-checkout state that shouldn't be committed.
+# indexed -- per-checkout state that shouldn't be committed. With it, the lock
+# that keeps two runs from using it at once and the temp file an interrupted
+# atomic write can leave behind.
 .qdrant_index_manifest.json
+.qdrant_index_manifest.json.lock
+.qdrant_index_manifest.json.*.tmp
 
 # Local scratch state and uv-generated lock file -- per-machine, never committed.
 :m*

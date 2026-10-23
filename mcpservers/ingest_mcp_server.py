@@ -75,6 +75,7 @@ from qdrant_ingest_lib import (
 )
 from sync_manifest_lib import (
     UNVERIFIED_HASH,
+    ManifestLock,
     discard_manifest,
     index_baseline,
     invalidation_error,
@@ -94,7 +95,7 @@ from qdrant_collection_hints import (
 )
 from qdrant_compact_marker import collection_is_marked_compact, is_marked_compact
 from qdrant_model_check import check_embedding_model_mismatch
-from qdrant_credentials import resolve_qdrant_credentials
+from qdrant_credentials import resolve_qdrant_credentials, same_endpoint
 from mcp_tool_introspect import tool_count
 import memory_bank_lib as mb
 
@@ -493,6 +494,19 @@ def _resolve_credentials(
     )
 
 
+def _is_own_collection(collection: str, qdrant_url: str) -> bool:
+    """
+    Whether a call targets this project's own collection: the configured
+    COLLECTION_NAME on the configured QDRANT_URL. Only that collection owns the
+    checkout's sync manifest (and so its lock) and gets COLLECTION_DESCRIPTION
+    stamped on it. The URL is compared with qdrant_credentials.same_endpoint,
+    the rule _resolve_credentials already applies, so a trailing slash cannot
+    make a call that the key rule treats as this project's own Qdrant skip the
+    manifest lock here. Defaults are read at call time, like _resolve_credentials.
+    """
+    return collection == DEFAULT_COLLECTION and same_endpoint(qdrant_url, DEFAULT_QDRANT_URL)
+
+
 def _skipped_summary(skipped: list) -> str:
     """
     Formats a (rel_path, error) skip list from build_entries/
@@ -842,7 +856,64 @@ async def index_repo(
     collection (the configured COLLECTION_NAME on the configured QDRANT_URL);
     indexing the checkout into any other collection leaves it alone and says
     so.
+
+    A run into this project's own collection holds the checkout's manifest
+    lock (.qdrant_index_manifest.json.lock) from before it prepares and counts
+    the collection to the end, whether or not it ends up writing the
+    manifest: whether it may write one depends on that count, which no other
+    manifest user may change in between. If another index_repo, sync_repo or
+    CLI --write-manifest run on the same checkout holds it, this returns an
+    error at once, before anything is deleted or stored; run it again once
+    that one has finished. A run into any other collection never takes the
+    lock.
     """
+    # _index_repo takes the lock (see ManifestLock in
+    # libs/sync_manifest_lib.py) only for this project's own collection, the
+    # one whose manifest it may write. Released here however the run ends --
+    # returned, raised or cancelled.
+    manifest_lock = ManifestLock(Path(repo_path).resolve())
+    try:
+        return await _index_repo(
+            repo_path,
+            collection=collection,
+            qdrant_url=qdrant_url,
+            qdrant_api_key=qdrant_api_key,
+            embedding_model=embedding_model,
+            scope=scope,
+            include_extensions=include_extensions,
+            exclude_dirs=exclude_dirs,
+            respect_gitignore=respect_gitignore,
+            chunk_lines=chunk_lines,
+            overlap=overlap,
+            reset=reset,
+            force=force,
+            ctx=ctx,
+            manifest_lock=manifest_lock,
+        )
+    finally:
+        manifest_lock.release()
+
+
+async def _index_repo(
+    repo_path: str,
+    *,
+    collection: Optional[str],
+    qdrant_url: Optional[str],
+    qdrant_api_key: Optional[str],
+    embedding_model: Optional[str],
+    scope: str,
+    include_extensions: Optional[str],
+    exclude_dirs: Optional[str],
+    respect_gitignore: bool,
+    chunk_lines: int,
+    overlap: int,
+    reset: bool,
+    force: bool,
+    ctx: Context,
+    manifest_lock: ManifestLock,
+) -> str:
+    """index_repo's body (see its docstring), run with the manifest lock its
+    caller releases."""
     # Checked first, before even the filesystem -- cheapest possible input to
     # validate, and the whole point is catching this before any real
     # work (chunking every file in the repo) happens on a bad value. The upper
@@ -896,14 +967,29 @@ async def index_repo(
     # same test the collection description uses further down); indexing the
     # checkout into some other collection must not replace the baseline of the
     # one sync_repo keeps up to date from the same checkout.
-    owns_manifest = collection == DEFAULT_COLLECTION and qdrant_url == DEFAULT_QDRANT_URL
+    owns_manifest = _is_own_collection(collection, qdrant_url)
+    if owns_manifest:
+        # Taken BEFORE the collection is prepared and counted, not when the
+        # manifest is first touched: whether this run may write a baseline
+        # rests on the collection being absent or empty (points_before below),
+        # and a sync_repo finishing in between could fill it and save its own
+        # manifest, after which this run would append duplicates and record a
+        # baseline that did not describe them. Holding the lock from here
+        # means no other manifest user can change the collection between the
+        # count and the save. A run into another collection never locks.
+        busy = manifest_lock.acquire()
+        if busy:
+            return busy
 
     def _invalidate_manifest() -> Optional[str]:
         # An error string, in the shape prepare_collection_for_index aborts on
         # (the wording is shared with the CLI, libs/sync_manifest_lib.py).
         # _discard_manifest is looked up here, at call time, so it stays
-        # patchable as this module's own name.
-        return invalidation_error(repo, _discard_manifest)
+        # patchable as this module's own name. The lock is already held (taken
+        # above for every run into this project's own collection, the only
+        # runs that get here); passing it keeps "never removed unlocked" true
+        # whatever the call site.
+        return invalidation_error(repo, _discard_manifest, manifest_lock)
 
     def _duplicate_risk_warning(existing_count: int) -> Optional[str]:
         # Checked BEFORE the expensive embedding work -- surface
@@ -1262,7 +1348,7 @@ async def index_repo(
     # explicit collection/qdrant_url override means the caller is indexing
     # something else, which must not get this project's own
     # COLLECTION_DESCRIPTION stamped onto it.
-    if collection == DEFAULT_COLLECTION and qdrant_url == DEFAULT_QDRANT_URL:
+    if owns_manifest:
         _sync_static_collection_description(collection, qdrant_url, qdrant_api_key)
 
     # Fail-open (never raises) -- see _recompute_search_limit.
@@ -1350,7 +1436,58 @@ async def sync_repo(
     file being chunked, "i/N" over the changed files, and chunks embedded and
     stored. The short Qdrant-side steps between them (consistency checks, the
     batched delete of replaced chunks, orphan cleanup on a rebuild) send none.
+
+    Holds the checkout's manifest lock (.qdrant_index_manifest.json.lock, safe
+    to gitignore too) from reading the manifest to saving it, so two
+    overlapping syncs on one checkout -- two sessions each syncing at start,
+    say -- cannot leave a manifest that disagrees with the collection. If
+    another sync_repo, an index_repo into this project's own collection or a
+    CLI --write-manifest run on the same checkout holds it, this returns an
+    error at once, before
+    anything is read, deleted or stored; run it again once that one has
+    finished.
     """
+    # Released here however the run ends -- returned, raised or cancelled;
+    # _sync_repo takes it right before it reads the manifest.
+    manifest_lock = ManifestLock(Path(repo_path).resolve())
+    try:
+        return await _sync_repo(
+            repo_path,
+            collection=collection,
+            qdrant_url=qdrant_url,
+            qdrant_api_key=qdrant_api_key,
+            embedding_model=embedding_model,
+            scope=scope,
+            include_extensions=include_extensions,
+            exclude_dirs=exclude_dirs,
+            respect_gitignore=respect_gitignore,
+            chunk_lines=chunk_lines,
+            overlap=overlap,
+            ctx=ctx,
+            manifest_lock=manifest_lock,
+        )
+    finally:
+        manifest_lock.release()
+
+
+async def _sync_repo(
+    repo_path: str,
+    *,
+    collection: Optional[str],
+    qdrant_url: Optional[str],
+    qdrant_api_key: Optional[str],
+    embedding_model: Optional[str],
+    scope: str,
+    include_extensions: Optional[str],
+    exclude_dirs: Optional[str],
+    respect_gitignore: bool,
+    chunk_lines: int,
+    overlap: int,
+    ctx: Context,
+    manifest_lock: ManifestLock,
+) -> str:
+    """sync_repo's body (see its docstring), run with the manifest lock its
+    caller releases."""
     # See index_repo's identical check above.
     chunk_err = validate_token_overlap(overlap)
     if chunk_err:
@@ -1380,6 +1517,13 @@ async def sync_repo(
     resolved_include_extensions = parse_csv_set(include_extensions) or DEFAULT_INCLUDE_EXTENSIONS
     resolved_exclude_dirs = parse_csv_set(exclude_dirs) or DEFAULT_EXTRA_EXCLUDE_DIRS
 
+    # From here to the final _save_manifest this run owns the manifest: a
+    # second run reading it in between could save over this one's result with
+    # hashes for chunks it then replaced (see libs/sync_manifest_lib.py's
+    # module docstring for the exact sequence), so it is refused instead.
+    busy = manifest_lock.acquire()
+    if busy:
+        return busy
     preserved_before: set = set()
     manifest = _load_manifest(repo, preserved_before)
     # Run off the event loop -- this is a synchronous scan that can take
@@ -1776,7 +1920,7 @@ async def sync_repo(
 
     # Only for THIS project's own default collection/instance -- see the
     # matching guard in index_repo above for why.
-    if collection == DEFAULT_COLLECTION and qdrant_url == DEFAULT_QDRANT_URL:
+    if _is_own_collection(collection, qdrant_url):
         _sync_static_collection_description(collection, qdrant_url, qdrant_api_key)
 
     # A file that failed to hash OR failed to chunk this round must not lose
