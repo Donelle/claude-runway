@@ -109,7 +109,6 @@ from sync_manifest_lib import (
     save_manifest,
     unindexed_hashed_files,
 )
-import memory_bank_lib as mb
 
 # Must run before FastEmbedProvider(...) is constructed in ingest() below --
 # see the function's own docstring for why this can't just be
@@ -140,10 +139,11 @@ async def ingest(args):
     memory_bank = resolve_memory_bank_collection(args.memory_bank_collection, args.repo_path)
     if memory_bank.warning:
         print(f"Warning: {memory_bank.warning}", file=sys.stderr)
-    if mb.is_memory_bank_collection_name(args.collection, memory_bank.name):
+    reserved_by = memory_bank.reserved_source(args.collection)
+    if reserved_by:
         print(
             f"Error: '{args.collection}' is configured as the shared memory-bank "
-            f"collection ({memory_bank.source}). Refusing to index into it -- "
+            f"collection ({reserved_by}). Refusing to index into it -- "
             f"that collection is reserved for every project's durable memories. "
             f"Use a different --collection for this project's code index.",
             file=sys.stderr,

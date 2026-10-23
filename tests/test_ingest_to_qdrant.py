@@ -29,6 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # fake_token_bud
 
 import ingest_to_qdrant as mod  # noqa: E402
 from fake_token_budget import word_budget  # noqa: E402
+import memory_bank_lib  # noqa: E402
 import qdrant_ingest_lib as lib  # noqa: E402
 from qdrant_ingest_lib import MANIFEST_FILENAME, MANIFEST_FORMAT_VERSION, TokenBudgetError  # noqa: E402
 from sync_manifest_lib import UNVERIFIED_HASH, discard_manifest, load_manifest, save_manifest  # noqa: E402
@@ -156,7 +157,7 @@ class NonDryRunStillPerformsCollectionMaintenance(unittest.TestCase):
         fake_client.delete.assert_called_once()
         kwargs = fake_client.delete.call_args.kwargs
         self.assertEqual(kwargs["collection_name"], "test-collection")
-        self.assertEqual(kwargs["points_selector"], mod.mb.memory_bank_exclusion_filter())
+        self.assertEqual(kwargs["points_selector"], memory_bank_lib.memory_bank_exclusion_filter())
         # fail_closed=True is what makes an inconclusive check block the delete.
         self.assertTrue(fake_check.call_args.kwargs["fail_closed"])
 
@@ -325,6 +326,18 @@ class ResetRefusesMemoryBankCollection(unittest.TestCase):
             with self.subTest(reset=reset):
                 err = self._assert_refused(collection="team-memory", reset=reset)
                 self.assertIn('"codebase-indexer" block', err)
+
+    def test_every_name_is_refused_when_the_mcp_json_blocks_disagree(self):
+        # memory-bank stores in team-memory; taking only codebase-indexer's name left it open.
+        self._write_mcp_json(json.dumps({"mcpServers": {
+            "codebase-indexer": {"env": {"MEMORY_BANK_COLLECTION": "memory-bank"}},
+            "memory-bank": {"env": {"MEMORY_BANK_COLLECTION": "team-memory"}},
+        }}))
+        for collection, block in (("team-memory", '"memory-bank" block'), ("memory-bank", '"codebase-indexer" block')):
+            with self.subTest(collection=collection):
+                err = self._assert_refused(collection=collection, reset=False)
+                self.assertIn(block, err)
+                self.assertIn("disagree", err)
 
     def test_default_name_is_still_refused_with_nothing_configured(self):
         self._assert_refused(collection="memory-bank", reset=True)

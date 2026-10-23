@@ -1940,7 +1940,7 @@ class ResolveMemoryBankCollection(unittest.TestCase):
         """The issue's exact case: a custom name only in .mcp.json."""
         self._write_mcp_json(self._servers(
             codebase_indexer={"MEMORY_BANK_COLLECTION": "team-memory"},
-            memory_bank={"MEMORY_BANK_COLLECTION": "other"},
+            memory_bank={"MEMORY_BANK_COLLECTION": " team-memory "},
         ))
         # Whitespace-only must fall through too (PR review): "  " is truthy
         # and used to win, leaving team-memory unprotected.
@@ -1950,6 +1950,31 @@ class ResolveMemoryBankCollection(unittest.TestCase):
                 self.assertEqual(got.name, "team-memory")
                 self.assertIn('"codebase-indexer"', got.source)
                 self.assertIsNone(got.warning)
+                self.assertEqual(got.also_reserved, ())
+
+    def test_blocks_that_disagree_reserve_every_name_and_warn(self):
+        # A hand edit can leave the blocks apart. memory-bank's name is where memories are
+        # stored, so taking only codebase-indexer's would leave that collection open to the CLI.
+        self._write_mcp_json(self._servers(
+            codebase_indexer={"MEMORY_BANK_COLLECTION": "memory-bank"},
+            memory_bank={"MEMORY_BANK_COLLECTION": "team-memory"},
+        ))
+        got = self.resolve(None, self.repo, {})
+        self.assertEqual(got.name, "memory-bank")
+        self.assertIn('"codebase-indexer"', got.reserved_source("memory-bank"))
+        self.assertIn('"memory-bank"', got.reserved_source("team-memory"))
+        self.assertIsNone(got.reserved_source("my-code"))
+        self.assertIn("disagree", got.warning)
+        self.assertIn("'team-memory'", got.warning)
+
+    def test_a_malformed_block_is_reported_even_when_an_earlier_one_named_the_collection(self):
+        self._write_mcp_json({"mcpServers": {
+            "codebase-indexer": {"env": {"MEMORY_BANK_COLLECTION": "team-memory"}},
+            "memory-bank": {"env": {"MEMORY_BANK_COLLECTION": 5}},
+        }})
+        got = self.resolve(None, self.repo, {})
+        self.assertEqual((got.name, got.also_reserved), ("team-memory", ()))
+        self.assertIn("memory-bank", got.warning)
 
     def test_memory_bank_block_is_the_fallback_inside_mcp_json(self):
         for indexer_env in ({}, {"MEMORY_BANK_COLLECTION": "  "}):

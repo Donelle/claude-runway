@@ -170,7 +170,9 @@ def ingest_env_defaults(environ=None) -> dict:
 # same value into both; codebase-indexer comes first because its copy is the
 # one index_repo/sync_repo actually guard with, and memory-bank (the server
 # that owns the collection) is the fallback for a hand-edited config that only
-# set it there.
+# set it there. When a hand edit leaves the two blocks naming different
+# collections, both names are reserved: memory-bank's is where memories are
+# stored, and codebase-indexer's is the one index_repo guards.
 MEMORY_BANK_MCP_JSON_SERVERS = ("codebase-indexer", "memory-bank")
 
 
@@ -178,11 +180,23 @@ MEMORY_BANK_MCP_JSON_SERVERS = ("codebase-indexer", "memory-bank")
 class MemoryBankCollection:
     """Which collection is the shared memory bank, and where that came from.
     `source` is human-readable, for an error message; `warning` is set when a
-    .mcp.json that exists could not be read and was skipped."""
+    .mcp.json that exists could not be read and was skipped, or when its
+    blocks disagree. `also_reserved` holds the other (name, source) pairs when
+    .mcp.json's blocks name different collections; use `reserved_source` to
+    check a collection against all of them."""
 
     name: str
     source: str
     warning: Optional[str] = None
+    also_reserved: tuple = ()
+
+    def reserved_source(self, collection: str) -> Optional[str]:
+        """Where `collection` is configured as the memory bank, or None if it
+        is not one of the reserved names."""
+        for name, source in ((self.name, self.source), *self.also_reserved):
+            if collection == name:
+                return source
+        return None
 
 
 def resolve_memory_bank_collection(
@@ -202,6 +216,10 @@ def resolve_memory_bank_collection(
          whitespace-only value counts as unset
       3. `<repo_path>/.mcp.json`, each MEMORY_BANK_MCP_JSON_SERVERS block's env
       4. FALLBACK_MEMORY_BANK_COLLECTION ("memory-bank")
+
+    Every block in step 3 is read, not just the first with a name: if the
+    blocks name different collections, the others go in `also_reserved` and
+    `warning` reports the disagreement, so the CLI refuses all of them.
 
     `repo_path` may be None to skip step 3. The file is read with
     doctor_lib.load_server_env, the loader `doctor` already uses for the same
@@ -230,6 +248,7 @@ def resolve_memory_bank_collection(
         from doctor_lib import MalformedMcpJsonError, load_server_env
 
         mcp_json_path = Path(repo_path) / ".mcp.json"
+        found = []  # (server, name), in MEMORY_BANK_MCP_JSON_SERVERS order
         for server in MEMORY_BANK_MCP_JSON_SERVERS:
             try:
                 server_env = load_server_env(mcp_json_path, server)
@@ -238,13 +257,21 @@ def resolve_memory_bank_collection(
                 continue
             value = (server_env or {}).get("MEMORY_BANK_COLLECTION", "").strip()
             if value:
-                return MemoryBankCollection(
-                    value,
-                    f"MEMORY_BANK_COLLECTION in {mcp_json_path}'s \"{server}\" block",
-                    # An earlier block that could not be read is still worth
-                    # reporting, even though a later one supplied the name.
-                    _unreadable_mcp_json_warning(problems, f"using '{value}' from the \"{server}\" block"),
-                )
+                found.append((server, value))
+        if found:
+            server, value = found[0]
+
+            def source(block):
+                return f"MEMORY_BANK_COLLECTION in {mcp_json_path}'s \"{block}\" block"
+
+            others = tuple((name, source(block)) for block, name in found[1:] if name != value)
+            # A block that could not be read is still worth reporting, even
+            # though another one supplied the name.
+            warnings = [_unreadable_mcp_json_warning(problems, f"using '{value}' from the \"{server}\" block")]
+            if others:
+                named = ", ".join(f"\"{block}\" says '{name}'" for block, name in found)
+                warnings.append(f".mcp.json's blocks disagree on MEMORY_BANK_COLLECTION ({named}); refusing all of them")
+            return MemoryBankCollection(value, source(server), "; ".join(w for w in warnings if w) or None, others)
     return MemoryBankCollection(
         FALLBACK_MEMORY_BANK_COLLECTION,
         "the built-in default",
