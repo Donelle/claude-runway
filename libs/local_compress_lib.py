@@ -737,8 +737,9 @@ COMPACT_FOCUS = (
     "specificity needed to continue the work. Tighten prose, do not drop facts."
 )
 
-# The two notices compress() prepends when preserve_sections is set and no
-# model request succeeded. What follows each is a blank line, the usual
+# The three notices compress() prepends when preserve_sections is set and no
+# model request succeeded (unreachable, all timed out, all rejected with an
+# HTTP 400). What follows each is a blank line, the usual
 # "[compressed N -> M chars ...]" statistics header (it describes a run that did
 # nothing, so it is a false claim once the notice is gone), another blank line,
 # and the content, which is complete (just not summarized). A caller storing the
@@ -756,7 +757,7 @@ def strip_total_outage_notice(result: str) -> Optional[str]:
     that did not happen. Returns None when `result` is not that shape, so a
     caller can tell "nothing was compressed" apart from a real result.
     """
-    if not (result.startswith(_UNREACHABLE_PREFIX) or result.startswith(_ALL_TIMED_OUT_PREFIX)):
+    if not result.startswith((_UNREACHABLE_PREFIX, _ALL_TIMED_OUT_PREFIX, _ALL_REJECTED_PREFIX)):
         return None
     _, sep, body = result.partition("\n\n")
     if not sep:
@@ -1400,21 +1401,86 @@ def append_trailing_summary_if_missing(original: str, summary: str) -> str:
 _failure_state = threading.local()
 
 
-def take_failure_kind() -> Optional[str]:
-    """Return and clear why this thread's last complete() call failed.
+def take_failure() -> Tuple[Optional[str], Optional[str]]:
+    """Return and clear (kind, detail) for this thread's last complete() failure.
 
+    kind:
     "timeout" -- the request exceeded the per-request timeout (LM Studio may
     be busy, e.g. its parallel-request slots are all taken and the request sat
     in its queue, or unreachable: the SDK's timeout error also covers a
-    connection that never got established); "other" -- anything else (connection refused,
-    model not found, ...); None -- no reason was recorded, e.g. complete() was
-    replaced by a test stub, or nothing failed. Callers must treat None as
-    "unknown" and fall back to the generic failure wording. Clearing on read
-    means a stale reason can never leak into a later, unrelated failure.
+    connection that never got established); "bad_request" -- LM Studio was
+    reached and answered HTTP 400 (most often the chunk does not
+    fit the loaded model's context window, so the server IS running and
+    "check it's still running" is the wrong advice); "other" -- anything else
+    (connection refused, model not found, ...); None -- no reason was
+    recorded, e.g. complete() was replaced by a test stub, or nothing failed.
+    Callers must treat None as "unknown" and fall back to the generic failure
+    wording.
+
+    detail: the server's own message for a "bad_request" (already
+    credential-redacted, whitespace-collapsed and truncated by
+    _server_error_detail), otherwise None.
+
+    Clearing on read means a stale reason can never leak into a later,
+    unrelated failure.
     """
     kind = getattr(_failure_state, "kind", None)
+    detail = getattr(_failure_state, "detail", None)
     _failure_state.kind = None
-    return kind
+    _failure_state.detail = None
+    return kind, detail
+
+
+def take_failure_kind() -> Optional[str]:
+    """Return and clear why this thread's last complete() call failed (the
+    kind half of take_failure(); see there for the values). Reading clears the
+    detail too, so a caller that wants the detail uses take_failure()."""
+    return take_failure()[0]
+
+
+# How much of a server's error text goes into a user-facing message.
+# The text can echo the model's own input, so it is capped.
+_SERVER_DETAIL_MAX_CHARS = 200
+
+
+def _server_error_detail(exc: BaseException) -> Optional[str]:
+    """The server's message for an HTTP error, made safe to show.
+
+    Source order: `exc.body` first (the OpenAI SDK parses the response JSON
+    into it: LM Studio sends `{"error": "<text>"}`, which arrives as the bare
+    string, while an OpenAI-shaped `{"error": {"message": ...}}` arrives as a
+    dict), then `exc.message`/`str(exc)`. `.body` goes first because for
+    LM Studio's string-shaped error the SDK's `.message` is the noisy
+    "Error code: 400 - {'error': ...}" repr rather than the text itself.
+
+    Redaction runs BEFORE truncation and whitespace-collapsing: cutting a
+    credential in half first would leave a fragment the pattern no longer
+    matches. Collapsing whitespace keeps the text on one line, which the
+    outage-notice parsing (it splits on a blank line) and a one-line error
+    message both rely on.
+    """
+    body = getattr(exc, "body", None)
+    text: Optional[str] = None
+    if isinstance(body, str):
+        text = body
+    elif isinstance(body, dict):
+        for candidate in (body.get("message"), body.get("error")):
+            if isinstance(candidate, str):
+                text = candidate
+                break
+            if isinstance(candidate, dict) and isinstance(candidate.get("message"), str):
+                text = candidate["message"]
+                break
+    if not text:
+        message = getattr(exc, "message", None)
+        text = message if isinstance(message, str) and message else str(exc)
+    text, _ = redact_credentials(text)
+    text = " ".join(text.split())
+    if not text:
+        return None
+    if len(text) > _SERVER_DETAIL_MAX_CHARS:
+        text = text[:_SERVER_DETAIL_MAX_CHARS].rstrip() + "..."
+    return text
 
 
 def complete(oai_client, model: str, system: str, content: str) -> Optional[str]:
@@ -1432,6 +1498,7 @@ def complete(oai_client, model: str, system: str, content: str) -> Optional[str]
     from "not a connection error"). `oai_client` is any object with an
     OpenAI-shaped `chat.completions.create(...)`; the caller builds it."""
     _failure_state.kind = None
+    _failure_state.detail = None
     try:
         response = oai_client.chat.completions.create(
             model=model,
@@ -1444,16 +1511,30 @@ def complete(oai_client, model: str, system: str, content: str) -> Optional[str]
     except CompletionTimeout:
         _failure_state.kind = "timeout"
         return None
-    except Exception:
-        _failure_state.kind = "other"
+    except Exception as e:
+        # An HTTP 400 means LM Studio was reached and refused THIS request
+        # -- typically a chunk whose token count overflows the
+        # loaded model's context window. Detected by duck-typing the
+        # `status_code` the OpenAI SDK's status errors carry, because this
+        # module never imports a client SDK. Everything else (connection
+        # refused, a missing model's 404, ...) stays "other".
+        if getattr(e, "status_code", None) == 400:
+            _failure_state.kind = "bad_request"
+            _failure_state.detail = _server_error_detail(e)
+        else:
+            _failure_state.kind = "other"
         return None
     return response.choices[0].message.content or ""
 
 
 _ALL_TIMED_OUT_PREFIX = "[LM Studio timed out on every request"
+# Every request in a preserve_sections run got an HTTP 400.
+_ALL_REJECTED_PREFIX = "[LM Studio rejected every request"
 
 
-def _request_failed_message(where: str, kind: Optional[str], base_url: Optional[str]) -> str:
+def _request_failed_message(
+    where: str, kind: Optional[str], base_url: Optional[str], detail: Optional[str] = None,
+) -> str:
     """Wording for a failed LM Studio request.
 
     A timeout means the request did not finish in time -- typically because
@@ -1464,7 +1545,21 @@ def _request_failed_message(where: str, kind: Optional[str], base_url: Optional[
     reader to "check it's still running". Anything else, including an unknown reason (kind is None, e.g. a
     stubbed complete()), keeps the original wording, which is the right advice
     for a refused connection or a missing model.
+
+    A "bad_request" (HTTP 400) means LM Studio is running and
+    refused the request, so telling the reader to check the server sends them
+    to the wrong place. The wording says "most often" rather than "is" a
+    context overflow, because a 400 is not proof of one; `detail` is the
+    server's own (already redacted and truncated) text, shown so the reader
+    can judge for themselves.
     """
+    if kind == "bad_request":
+        shown = f" (LM Studio said: {detail})" if detail else ""
+        return (
+            f"Error: LM Studio rejected the request {where}{shown} -- most often the "
+            f"chunk is too large for the loaded model's context window: retry with a "
+            f"smaller chunk_chars, or load the model with a larger context length in LM Studio."
+        )
     if kind == "timeout":
         return (
             f"Error: LM Studio request timed out after {resolve_request_timeout():g}s "
@@ -1477,15 +1572,18 @@ def _request_failed_message(where: str, kind: Optional[str], base_url: Optional[
     )
 
 
-def _classify_relevant_with_reason(*args) -> Tuple[Optional[bool], Optional[str]]:
-    """classify_relevant() plus why it failed, read on the SAME worker thread.
+def _classify_relevant_with_reason(
+    *args,
+) -> Tuple[Optional[bool], Tuple[Optional[str], Optional[str]]]:
+    """classify_relevant() plus why it failed, as (kind, detail), read on the
+    SAME worker thread.
 
     complete()'s failure reason is thread-local, and the relevance requests run
     in executor threads, so the event-loop thread cannot read it afterwards --
     it has to be taken here, immediately after the call.
     """
     result = classify_relevant(*args)
-    return result, (take_failure_kind() if result is None else None)
+    return result, (take_failure() if result is None else (None, None))
 
 
 def classify_relevant(
@@ -1801,8 +1899,9 @@ async def _compress_each_section(text, focus, oai_client, model, base_url, prese
     outright (complete() itself returned None) and none succeeded -- that
     case gets an "[LM Studio appears unreachable ...]" line prepended instead
     (or "[LM Studio timed out on every request ...]" when every failure was a
-    timeout), so a total outage during this run is distinguishable from a normal one
-    without regressing the content-preserving fallback itself:
+    timeout, or "[LM Studio rejected every request ...]" when every failure was
+    an HTTP 400), so a total outage during this run is distinguishable from a
+    normal one without regressing the content-preserving fallback itself:
     each section's original body is still preserved either way, never
     dropped -- though "preserved" means kept out of the model's summarizing
     pass, not a promise of byte-for-byte identity: redact_and_disclose()
@@ -1838,8 +1937,11 @@ async def _compress_each_section(text, focus, oai_client, model, base_url, prese
     # Why each failed request failed, so an outage made up ENTIRELY
     # of timeouts (usually a busy LM Studio, though a timeout can also mean it
     # was unreachable) gets the neutral "timed out" wording, not the
-    # connection-refused "appears unreachable" one.
-    failure_kinds: list = []
+    # connection-refused "appears unreachable" one. Likewise an outage made up
+    # entirely of HTTP 400 rejections: the server answered every
+    # request, so "appears unreachable" would be false. Each entry is the
+    # (kind, detail) pair from take_failure().
+    failures: list = []
     # A prose run in a mixed section got a live answer (empty or NOT RELEVANT)
     # that falls back uncounted: it proves LM Studio answered, so the all-timed-out
     # message must not fire even when a sibling run timed out.
@@ -1883,7 +1985,7 @@ async def _compress_each_section(text, focus, oai_client, model, base_url, prese
                 if raw is None:
                     run_parts.append(run_text)
                     prose_failed = True
-                    failure_kinds.append(take_failure_kind())
+                    failures.append(take_failure())
                     continue
                 stripped = raw.strip()
                 if not stripped or "NOT RELEVANT" in stripped.upper():
@@ -1932,7 +2034,7 @@ async def _compress_each_section(text, focus, oai_client, model, base_url, prese
         if raw_summary is None:
             parts.append(f"{heading}\n{body}")
             request_failed_count += 1
-            failure_kinds.append(take_failure_kind())
+            failures.append(take_failure())
             continue
         summary = raw_summary.strip()
         # A failed call, an empty/whitespace response, or a NOT_RELEVANT
@@ -2006,8 +2108,8 @@ async def _compress_each_section(text, focus, oai_client, model, base_url, prese
     # request actually failed" condition, regardless of how many sections
     # were verbatim. Deliberately prepended rather than appended, and
     # deliberately NOT made part of the "[compressed ...]" line itself:
-    # compress_mcp_server.py's savings-tracker footer credits a result only
-    # when it starts with "[compressed" (see _append_savings_footer) -- and
+    # compress_mcp_server.py's savings-tracker envelope credits a result only
+    # when it starts with "[compressed" (see _attach_savings_metrics) -- and
     # no compression actually happened here, so it must not qualify for
     # credit either.
     #
@@ -2025,7 +2127,20 @@ async def _compress_each_section(text, focus, oai_client, model, base_url, prese
         and request_failed_count > 0
         and not live_fallback_seen
     ):
-        if failure_kinds and all(k == "timeout" for k in failure_kinds):
+        if failures and all(k == "bad_request" for k, _d in failures):
+            # Every failed request was a 400: LM Studio answered each one and
+            # refused it, typically because a section does not fit the loaded
+            # model's context window. The first server message is shown (it is
+            # already one line, so the notice's blank-line parsing still holds).
+            first_detail = next((d for _k, d in failures if d), None)
+            shown = f" (LM Studio said: {first_detail})" if first_detail else ""
+            result = (
+                f"{_ALL_REJECTED_PREFIX} -- LM Studio is running but refused them{shown}; "
+                "most often a section is too large for the loaded model's context window, so "
+                "load the model with a larger context length in LM Studio; "
+                f"no section was compressed; original content preserved]\n\n{result}"
+            )
+        elif failures and all(k == "timeout" for k, _d in failures):
             # Every failed request timed out: usually LM Studio was too busy
             # to finish in time, but a timeout can also mean it was
             # unreachable, so the wording names both. A different prefix from
@@ -2087,15 +2202,16 @@ async def compress(
     empty-but-live response don't count toward it -- and for why the wording
     says "preserved" rather than "unchanged": redact_and_disclose() still
     runs regardless, so a credential-shaped value is still replaced even in
-    a fallback section). When every failed request was
-    a timeout, the prefix is "[LM Studio timed out on every request ..." instead.
-    This is NOT an
+    a fallback section). When every failed request was a timeout, the prefix
+    is "[LM Studio timed out on every request ..." instead, and when every one
+    was an HTTP 400 it is "[LM Studio rejected every request ..." (the server
+    answered, so "unreachable" would be false). This is NOT an
     "Error:"-prefixed string -- the content is fully present and usable
     either way -- so a caller parsing only for "Error:" vs. everything-else
     still works unchanged; a caller that specifically wants to detect this
     distinct total-outage signal should check for either the "[LM Studio
-    appears unreachable" or the "[LM Studio timed out on every request"
-    prefix instead.
+    appears unreachable", "[LM Studio timed out on every request" or
+    "[LM Studio rejected every request" prefix instead.
 
     max_chars, if given, truncates to the first N chars of `text` before
     anything else happens. If not given but `focus` looks positional (see
@@ -2345,13 +2461,14 @@ async def compress(
             # Only cache fully successful section runs. Two cases skip caching:
             #
             # 1. Total outage: a result prepended with "[LM Studio appears
-            #    unreachable ...]" (or the all-timeouts variant, _ALL_TIMED_OUT_PREFIX)
+            #    unreachable ...]" (or the all-timeouts or all-rejected variants,
+            #    _ALL_TIMED_OUT_PREFIX / _ALL_REJECTED_PREFIX)
             #    means every model request that was SENT failed outright.
             #    Caching this would make repeated calls keep returning the
             #    degraded preserved-content output instead of retrying once
-            #    LM Studio recovers. Those two prefixes are the only markers
+            #    LM Studio recovers. Those three prefixes are the only markers
             #    _compress_each_section emits for this case, so checking for
-            #    both here is both necessary and sufficient.
+            #    all of them here is both necessary and sufficient.
             #
             # 2. Partial failure: a result containing "kept verbatim after a
             #    failed call" means at least one prose section had a transient
@@ -2369,6 +2486,7 @@ async def compress(
             _is_fully_successful = (
                 not section_result.startswith("[LM Studio appears unreachable")
                 and not section_result.startswith(_ALL_TIMED_OUT_PREFIX)
+                and not section_result.startswith(_ALL_REJECTED_PREFIX)
                 and "kept verbatim after a failed call" not in section_result
             )
             if _is_fully_successful:
@@ -2412,13 +2530,13 @@ async def compress(
             for i, chunk in enumerate(chunks, 1)
         ]
         relevance_pairs = list(await asyncio.gather(*futures))
-        relevance_results = [r for r, _kind in relevance_pairs]
+        relevance_results = [r for r, _failure in relevance_pairs]
         # Check for any None (request failure) before proceeding.
         # Report the first failed chunk index for parity with the old error.
-        for i, (result, kind) in enumerate(relevance_pairs, 1):
+        for i, (result, (kind, detail)) in enumerate(relevance_pairs, 1):
             if result is None:
                 return _request_failed_message(
-                    f"while checking relevance (chunk {i}/{len(chunks)})", kind, base_url,
+                    f"while checking relevance (chunk {i}/{len(chunks)})", kind, base_url, detail,
                 )
 
     # Phase 2: extraction -- sequential, in document order, for relevant chunks.
@@ -2443,7 +2561,8 @@ async def compress(
             chunk,
         )
         if summary is None:
-            return _request_failed_message(f"(chunk {i}/{len(chunks)})", take_failure_kind(), base_url)
+            kind, detail = take_failure()
+            return _request_failed_message(f"(chunk {i}/{len(chunks)})", kind, base_url, detail)
         summary = summary.strip()
         # Belt-and-suspenders: even a chunk the classifier called relevant
         # can still come back marked NOT_RELEVANT from the extraction call
@@ -2485,8 +2604,9 @@ async def compress(
             combined,
         )
         if compressed is None:
+            kind, detail = take_failure()
             return _request_failed_message(
-                "while combining chunk summaries", take_failure_kind(), base_url,
+                "while combining chunk summaries", kind, base_url, detail,
             )
         compressed = compressed.strip()
     # Both branches above leave `compressed` a plain `str` (the None case

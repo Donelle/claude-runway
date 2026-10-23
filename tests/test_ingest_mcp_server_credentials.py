@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests that every tools/ingest_mcp_server.py tool taking qdrant_url/
+"""Tests that every mcpservers/ingest_mcp_server.py tool taking qdrant_url/
 qdrant_api_key resolves them through the shared credential rule, so the
 configured QDRANT_API_KEY is never sent to a caller-supplied host. Asserts on
 the kwargs each tool hands to QdrantClient. Stdlib-only, no network: the client
@@ -17,7 +17,7 @@ from unittest.mock import patch
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "libs"))
-sys.path.insert(0, os.path.join(REPO_ROOT, "tools"))
+sys.path.insert(0, os.path.join(REPO_ROOT, "mcpservers"))
 
 os.environ.setdefault("QDRANT_URL", "http://localhost:6333")
 os.environ.setdefault("COLLECTION_NAME", "test-collection")

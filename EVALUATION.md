@@ -38,6 +38,7 @@ This repo has two independent core pieces (Qdrant memory, local compression) plu
   - [Step E4: Measure the fixed overhead](#step-e4-measure-the-fixed-overhead)
   - [Step E5: remember:recall ratio (diagnostic only)](#step-e5-rememberrecall-ratio-diagnostic-only)
   - [Step E6: Why this track is harder to run than A-C](#step-e6-why-this-track-is-harder-to-run-than-a-c)
+- [Track F: Local code review quality (not a token measurement)](#track-f-local-code-review-quality-not-a-token-measurement)
 - [Compute the result (all measured tracks)](#compute-the-result-all-measured-tracks)
 - [Caveats](#caveats)
 
@@ -257,7 +258,7 @@ Report two numbers per scenario set, not one — averaging only over successes o
 
 ### Step E4: Measure the fixed overhead
 
-Same as Step A4/B4: measure the starting-context cost from transcripts with `tools/measure_startup_context.py` rather than estimating it from schema text. `memory-bank`'s tools (`remember`/`recall`/`forget`/`transfer_memories`) are among the servers the survey checks for deferral. `python tools/report_tool_counts.py`'s server loop includes `memory-bank` (`memory_bank_mcp_server`) alongside `local-compress` and `codebase-indexer` and reports its live tool count and tool-description size in characters (a proxy for the JSON schema), through the same shared `libs/mcp_tool_introspect.py` utility -- run it rather than hand-typing a number here, since a hand-typed count has gone stale before.
+Same as Step A4/B4: measure the starting-context cost from transcripts with `tools/measure_startup_context.py` rather than estimating it from schema text. `memory-bank`'s tools (`remember`/`recall`/`forget`/`transfer_memories`/`copy_memories`) are among the servers the survey checks for deferral. `python tools/report_tool_counts.py`'s server loop includes `memory-bank` (`memory_bank_mcp_server`) alongside `local-compress` and `codebase-indexer` and reports its live tool count and tool-description size in characters (a proxy for the JSON schema), through the same shared `libs/mcp_tool_introspect.py` utility -- run it rather than hand-typing a number here, since a hand-typed count has gone stale before.
 
 ### Step E5: remember:recall ratio (diagnostic only)
 
@@ -269,6 +270,20 @@ Same role as Track D's savings estimate — a cheap diagnostic number, not a pas
 - **The re-derivation cost in baseline is inherently variable** (same caveat Track C2 raises about re-establishing context not being a fixed-cost operation) — a scenario that happens to be quick to re-derive understates the savings a harder scenario would show, so scenario selection matters more here than in Track A/B's more uniform lookups.
 - **Small N is structural** — credible scenarios have to come from real, previously-researched findings, so this track won't reach Track A's 8-12-task sample size. Treat results as directional.
 - **Reuse value compounds over a memory's lifetime in a way one baseline/treatment pairing can't capture** — a stored finding reused 5 times pays for itself 5 times over, but this protocol only measures a single reuse instance per scenario.
+
+## Track F: Local code review quality (not a token measurement)
+
+This track asks a different question from A to E: not "does it use fewer tokens" but "do the local-model reviewers find what matters, without crying wolf". It is measured by the scripts in `harness/` (see `harness/README.md`), which run the codebase reviewer against a real LM Studio. Nothing in `harness/` is run by CI.
+
+- **Seeded cases** (`harness/cases.py`): small repositories with defects planted at known lines, correct code that merely looks suspicious (decoys), and a clean case. Each run reports which defects were found, which decoys drew a false alarm, and how many findings landed nowhere.
+- **Parity with Copilot** (`harness/collect_copilot_history.py`, then `--history`): the existing Copilot reviews of a past PR are recorded read-only, the diff is reviewed again exactly as it stood at the commit Copilot reviewed, and the report says how many of Copilot's findings the local reviewers also raised, and how many further findings Copilot did not. The harness never requests or starts a Copilot review.
+- **Model choice**: `harness/README.md` lists the recommended models for each role. Use an `-Instruct` build: a base model never ends its turn, and the harness's up-front probe reports that in seconds.
+
+How to run it so the result means something:
+
+- Compare changes on identical input: the same case, the same model, with `--runs N` greater than 1 once a reviewer's temperature is above 0.
+- A finding Copilot did not raise is not automatically wrong. Treat the count as "to be judged", and judge a sample by hand.
+- One model, one repository and a handful of cases: treat results as directional, as with Track E.
 
 ## Compute the result (all measured tracks)
 

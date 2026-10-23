@@ -1,5 +1,5 @@
 """
-Embedding-model mismatch check shared by `tools/ingest_mcp_server.py`
+Embedding-model mismatch check shared by `mcpservers/ingest_mcp_server.py`
 (`find_in_collection`, `index_repo`, `sync_repo`) and `libs/memory_bank_lib.py`.
 Relocated here from `ingest_mcp_server.py` (where it was a private,
 single-file function used only by `find_in_collection`) rather than

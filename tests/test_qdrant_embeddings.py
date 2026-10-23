@@ -211,10 +211,13 @@ class RealDefaultModel(unittest.TestCase):
         for chunk, _, _ in chunk_stream(text, budget):
             self.assertLessEqual(len(budget.token_spans(chunk)), budget.max_tokens)
             # What fastembed would embed (truncated, with [CLS]/[SEP]) is the
-            # whole chunk: nothing was cut off.
-            self.assertEqual(
-                len(model.model.tokenizer.encode(chunk).ids), len(budget.token_spans(chunk)) + 2
-            )
+            # whole chunk: nothing was cut off. Count the real tokens with the
+            # attention mask, not len(ids): the shared tokenizer pads, and a
+            # model snapshot whose tokenizer.json has a fixed-length padding
+            # block makes len(ids) the window for every text.
+            encoding = model.model.tokenizer.encode(chunk)
+            self.assertEqual(sum(encoding.attention_mask), len(budget.token_spans(chunk)) + 2)
+            self.assertEqual(len(encoding.overflowing), 0)
 
 
 if __name__ == "__main__":

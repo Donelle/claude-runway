@@ -16,7 +16,8 @@ session. `init --track-savings` writes the block; without it the tools do not
 exist, and calling one is an unknown-tool error, not an empty result.
 
 Recording does NOT go through this server. Savings events are written by the
-`local-compress` server's footer and by hooks/compress_output.py, and rolled
+`local-compress` server's savings metrics (which hooks/compress_output.py
+unwraps and writes) and by that hook's own compression, and rolled
 up by hooks/session_end_savings.py, whether or not this server is configured.
 Memory-bank's counters reach metrics_lib through libs/memory_events_lib.py.
 The one writer that uses a tool here is `record_metric`, for anything
@@ -27,7 +28,7 @@ Project minimum: Python 3.11.
 Register in .mcp.json (or let `setup_project.py init --track-savings` do it):
     "analytics": {
       "command": "python",
-      "args": ["/absolute/path/to/tools/analytics_mcp_server.py"],
+      "args": ["/absolute/path/to/mcpservers/analytics_mcp_server.py"],
       "env": {"CLAUDE_RUNWAY_TRACK_SAVINGS": "1"}
     }
 CLAUDE_RUNWAY_SAVINGS_DB and CLAUDE_RUNWAY_METRICS_DB are optional overrides.

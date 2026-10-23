@@ -37,6 +37,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -49,9 +50,17 @@ from qdrant_ingest_lib import MANIFEST_FILENAME, is_old_format_manifest
 from setup_project_lib import (
     COMPRESS_HOOK_SCRIPT,
     LEGACY_COMPRESS_HOOK_SCRIPT,
+    REVIEWERS_FILE_REQUIRED_WARNING,
+    SAVINGS_TRACKER_SHELL_EXPORT_REMINDER,
+    TRACK_SAVINGS_TRUTHY,
     build_mcp_servers,
     build_settings_hooks,
+    has_analytics_block,
+    has_codebase_reviewer_block,
+    load_existing_mcp_json,
+    load_existing_settings_json,
     load_json,
+    local_compress_tracks_savings,
     resolve_compact_embedding_model,
 )
 
@@ -455,7 +464,7 @@ def _apply_qdrant_server_replaced(
     mcp_json: dict, settings_json: dict, ctx: MigrationContext
 ) -> "tuple[dict, dict]":
     """
-    Rewrites the `qdrant` block to start `tools/qdrant_mcp_server.py` under the
+    Rewrites the `qdrant` block to start `mcpservers/qdrant_mcp_server.py` under the
     venv interpreter, with the env that server reads, reusing `build_mcp_servers`
     (the SAME function `init` uses) so it cannot drift from a fresh `init`.
     Only the `qdrant` KEY is taken from the result; every other server, and the
@@ -733,10 +742,9 @@ def _apply_compress_hook_matcher_missing_compact_tools(
 # analytics-server-missing (follows the savings and metrics tools' move)
 # ---------------------------------------------------------------------------
 
-# The values `savings_ledger.tracking_enabled()` accepts, case-insensitive and
-# whitespace-trimmed. Duplicated rather than imported for the same reason
-# `doctor_lib` does: this module must not load the savings stack.
-_TRACK_SAVINGS_TRUTHY = frozenset({"1", "true", "yes"})
+# The values `savings_ledger.tracking_enabled()` accepts: defined once in
+# `setup_project_lib` (which `init`'s savings question shares), not duplicated.
+_TRACK_SAVINGS_TRUTHY = TRACK_SAVINGS_TRUTHY
 
 
 def _local_compress_env(mcp_json: dict) -> dict:
@@ -753,14 +761,44 @@ def _detect_analytics_server_missing(mcp_json: dict, settings_json: dict) -> boo
     `analytics` block. That block now serves `savings_summary`/`savings_detail`/
     `savings_trend`, `get_metrics` and `record_metric`, so `/my-savings` and
     `/my-metrics` stop working after the tools leave `local-compress` until it
-    is added. A project with tracking off is deliberately not offered it: the
-    server is opt-in.
+    is added. A project with tracking off is deliberately not offered THIS
+    migration: the server is opt-in. An interactive `upgrade` asks about the
+    tracker separately, before the migrations are listed (`run_upgrade`'s
+    `offer_savings_fn`), and a yes turns tracking on so this one then applies.
     """
     servers = mcp_json.get("mcpServers")
     if isinstance(servers, dict) and "analytics" in servers:
         return False
     raw = _local_compress_env(mcp_json).get("CLAUDE_RUNWAY_TRACK_SAVINGS")
     return isinstance(raw, str) and raw.strip().lower() in _TRACK_SAVINGS_TRUTHY
+
+
+def _existing_metrics_db(mcp_json: dict) -> str:
+    """
+    The `CLAUDE_RUNWAY_METRICS_DB` override this project already has, so a new
+    `analytics` block reads the same file. `init --metrics-db` writes it into
+    the `memory-bank` block in EVERY mode (that server writes into the store),
+    and into `analytics` only with `--track-savings`; a project that never
+    tracked savings therefore has it only in `memory-bank`. An older config
+    can have it in `local-compress` instead, which is the fallback. First
+    non-blank wins, in the same order the setup skill reads it. Without this,
+    adding `analytics` for a project with a custom metrics database would
+    silently split the data: `memory-bank` writes the custom file while
+    `analytics` reads and writes the default one.
+    """
+    servers = mcp_json.get("mcpServers")
+    if not isinstance(servers, dict):
+        return ""
+    for name in ("memory-bank", "local-compress"):
+        block = servers.get(name)
+        value = _env_str(block.get("env") if isinstance(block, dict) else None, "CLAUDE_RUNWAY_METRICS_DB")
+        # Blank is checked on the stripped text, but the ORIGINAL is returned:
+        # `metrics_lib.resolve_db_path()` does not strip, and `memory-bank` keeps
+        # its own value untouched, so trimming here would point `analytics` at a
+        # different file than the one `memory-bank` writes.
+        if value.strip():
+            return value
+    return ""
 
 
 def _apply_analytics_server_missing(
@@ -771,9 +809,10 @@ def _apply_analytics_server_missing(
     `init --track-savings` uses) so it cannot drift from a fresh `init`. Only
     the `analytics` KEY is taken from the result; every other server, and the
     whole of `settings.json`, is left as it was. A non-blank
-    `CLAUDE_RUNWAY_SAVINGS_DB` / `CLAUDE_RUNWAY_METRICS_DB` in the
-    `local-compress` block is carried over, so the server reads the same files
-    the tools read before they moved.
+    `CLAUDE_RUNWAY_SAVINGS_DB` in the `local-compress` block and a non-blank
+    `CLAUDE_RUNWAY_METRICS_DB` in the `memory-bank` block (else `local-compress`)
+    are carried over, so the server reads the same files the tools read before
+    they moved, and the same metrics file `memory-bank` writes.
     """
     mcp_json = copy.deepcopy(mcp_json)
     servers = mcp_json.setdefault("mcpServers", {})
@@ -787,7 +826,7 @@ def _apply_analytics_server_missing(
         home_dir=Path.home(),
         track_savings=True,
         savings_db=_env_str(compress_env, "CLAUDE_RUNWAY_SAVINGS_DB").strip(),
-        metrics_db=_env_str(compress_env, "CLAUDE_RUNWAY_METRICS_DB").strip(),
+        metrics_db=_existing_metrics_db(mcp_json),
         include_compress=True,
     )
     servers["analytics"] = generated["analytics"]
@@ -834,6 +873,81 @@ def _apply_local_compress_savings_db_inert(
         return mcp_json, settings_json
     mcp_json = copy.deepcopy(mcp_json)
     _local_compress_env(mcp_json).pop(_SAVINGS_DB_KEY, None)
+    return mcp_json, settings_json
+
+
+# ---------------------------------------------------------------------------
+# mcp-server-scripts-moved
+# ---------------------------------------------------------------------------
+#
+# The five MCP server scripts moved from `tools/` to `mcpservers/` (same file
+# names). Every `.mcp.json` written before that hardcodes
+# `<checkout>/tools/<server>.py`, so after a pull all five servers fail to start
+# until the path is rewritten. Detection is by the OLD path alone, which is what
+# makes a re-run a no-op: once rewritten, nothing matches any more.
+
+_MOVED_MCP_SERVER_SCRIPTS = (
+    "compress_mcp_server",
+    "analytics_mcp_server",
+    "qdrant_mcp_server",
+    "ingest_mcp_server",
+    "memory_bank_mcp_server",
+)
+
+# `tools` as a whole path segment (either separator, so a Windows path written
+# with backslashes is caught too) directly followed by one of the five script
+# names and end of string. Anchoring on the segment and the exact file name
+# means a user's own script that happens to sit in some other `tools/` folder,
+# or a path merely ending in `compress_mcp_server.py` elsewhere, is not touched.
+_OLD_MCP_SERVER_PATH = re.compile(
+    r"(^|[\\/])tools([\\/])((?:" + "|".join(_MOVED_MCP_SERVER_SCRIPTS) + r")\.py)$"
+)
+
+
+def _rewrite_moved_server_path(value: object) -> "Optional[str]":
+    """The `mcpservers/` form of an old `tools/<server>.py` path, keeping the
+    separator the old path used, or None when `value` is not such a path."""
+    if not isinstance(value, str):
+        return None
+    new, count = _OLD_MCP_SERVER_PATH.subn(r"\1mcpservers\2\3", value)
+    return new if count else None
+
+
+def _detect_mcp_server_scripts_moved(mcp_json: dict, settings_json: dict) -> bool:
+    """True when any server block still launches one of the five scripts from
+    its old `tools/` location (a bare script path in `args`)."""
+    servers = mcp_json.get("mcpServers", {})
+    if not isinstance(servers, dict):
+        return False
+    for block in servers.values():
+        if not isinstance(block, dict):
+            continue
+        for arg in block.get("args") or []:
+            if _rewrite_moved_server_path(arg) is not None:
+                return True
+    return False
+
+
+def _apply_mcp_server_scripts_moved(
+    mcp_json: dict, settings_json: dict, ctx: MigrationContext
+) -> "tuple[dict, dict]":
+    """
+    Rewrites each matching `args` entry from `.../tools/<server>.py` to
+    `.../mcpservers/<server>.py`, and nothing else: the venv `command`, every
+    `env` value, every other server and the whole of `settings.json` are left
+    as they were. Pure path rewriting rather than regenerating the blocks with
+    `build_mcp_servers`, so a hand-edited block keeps everything the user put
+    in it. A pipx or `uv tool` install has the same `tools/` segment under
+    `<env>/src/`, so its paths are rewritten by the same rule.
+    """
+    mcp_json = copy.deepcopy(mcp_json)
+    servers = mcp_json.get("mcpServers", {})
+    for block in servers.values():
+        if not isinstance(block, dict) or not isinstance(block.get("args"), list):
+            continue
+        block["args"] = [
+            _rewrite_moved_server_path(arg) or arg for arg in block["args"]
+        ]
     return mcp_json, settings_json
 
 
@@ -900,7 +1014,7 @@ MIGRATIONS: "list[Migration]" = [
         kind="update",
         description=(
             "The 'qdrant' server in .mcp.json still launches the third-party mcp-server-qdrant console "
-            "script. This repo now ships its own (tools/qdrant_mcp_server.py): same qdrant-find and "
+            "script. This repo now ships its own (mcpservers/qdrant_mcp_server.py): same qdrant-find and "
             "qdrant-store tools under the same names, plus the conversation-compact tools "
             "(compact_store, compact_find, compact_prune) that /my-compact and /my-resume use, which "
             "have moved there from local-compress. Rewrites the qdrant block to the new command and env, "
@@ -980,13 +1094,15 @@ MIGRATIONS: "list[Migration]" = [
             "but its .mcp.json has no 'analytics' server. The savings and metrics tools (savings_summary, "
             "savings_detail, savings_trend, get_metrics, record_metric) have moved there from "
             "local-compress, so /my-savings and /my-metrics stop working until it is added. Adds the "
-            "analytics block, carrying over any CLAUDE_RUNWAY_SAVINGS_DB / CLAUDE_RUNWAY_METRICS_DB "
-            "override from the local-compress block. Recording is unaffected either way: the "
+            "analytics block, carrying over any CLAUDE_RUNWAY_SAVINGS_DB override from the "
+            "local-compress block and any CLAUDE_RUNWAY_METRICS_DB override from the memory-bank "
+            "(or, in an older config, local-compress) block. Recording is unaffected either way: the "
             "hooks still write savings events without it."
         ),
         note=(
             "Restart Claude Code to load the new server. A project that does not track savings is not "
-            "offered this; `init --track-savings` writes the block for a new setup."
+            "offered this migration; an interactive `upgrade` asks about the tracker first, and "
+            "`init --track-savings` writes the block for a new setup."
         ),
         detect=_detect_analytics_server_missing,
         apply=_apply_analytics_server_missing,
@@ -1010,6 +1126,26 @@ MIGRATIONS: "list[Migration]" = [
         ),
         detect=_detect_local_compress_savings_db_inert,
         apply=_apply_local_compress_savings_db_inert,
+    ),
+    Migration(
+        id="mcp-server-scripts-moved",
+        title="Point the MCP servers at mcpservers/ instead of tools/",
+        kind="update",
+        description=(
+            "This project's .mcp.json launches one or more of the five MCP server scripts "
+            "(qdrant, ingest, memory_bank, compress, analytics) from tools/, where they no longer "
+            "are: they moved to mcpservers/ (same file names), so those servers fail to start until "
+            "the path is rewritten. Rewrites just the script path in each such server's args from "
+            ".../tools/<server>.py to .../mcpservers/<server>.py; the venv command, env values, "
+            "every other server and .claude/settings.json are left untouched."
+        ),
+        note=(
+            "Restart Claude Code to load the servers from their new location. A pipx or `uv tool` "
+            "install needs reinstalling first (`pipx upgrade claude-runway` / `uv tool upgrade "
+            "claude-runway`), since the old install has no mcpservers/ directory yet."
+        ),
+        detect=_detect_mcp_server_scripts_moved,
+        apply=_apply_mcp_server_scripts_moved,
     ),
 ]
 
@@ -1089,7 +1225,7 @@ def is_project_configured(target_repo: "Path | str") -> bool:
     mcp_json_path = Path(target_repo) / ".mcp.json"
     if not mcp_json_path.exists():
         return False
-    return _has_qdrant_server(load_json(mcp_json_path))
+    return _has_qdrant_server(load_existing_mcp_json(mcp_json_path))
 
 
 def _atomic_write_json(path: Path, data: dict) -> None:
@@ -1132,6 +1268,79 @@ def _console_prompt(migration: "Migration | RepoMigration", index: int, total: i
     return answer not in ("n", "no")
 
 
+def _savings_offer_applies(mcp_json: dict) -> bool:
+    """
+    True when the savings tracker could be offered: the project has
+    a `local-compress` block (the tracker needs it; a `--qdrant-only` project
+    deliberately has none), no `analytics` block, and tracking is not already
+    on. A project with tracking already on is not asked: it is simply missing
+    the block, and `analytics-server-missing` offers that on its own.
+    """
+    servers = mcp_json.get("mcpServers")
+    block = servers.get("local-compress") if isinstance(servers, dict) else None
+    return (
+        isinstance(block, dict)
+        and not has_analytics_block(mcp_json)
+        and not local_compress_tracks_savings(mcp_json)
+    )
+
+
+def _enable_savings_tracking(mcp_json: dict) -> dict:
+    """
+    A copy of `mcp_json` with `CLAUDE_RUNWAY_TRACK_SAVINGS=1` in the
+    `local-compress` env block -- exactly what `init --track-savings` writes
+    there. That makes `analytics-server-missing` detect the project, so the
+    `analytics` block itself is added by that migration (the one function,
+    `build_mcp_servers`, that `init` also uses), not by a second code path.
+    """
+    mcp_json = copy.deepcopy(mcp_json)
+    block = mcp_json["mcpServers"]["local-compress"]
+    if not isinstance(block.get("env"), dict):
+        block["env"] = {}
+    block["env"]["CLAUDE_RUNWAY_TRACK_SAVINGS"] = "1"
+    return mcp_json
+
+
+# The offer's id in `run_upgrade`'s returned list. Not a `Migration`: those are
+# detected from the config alone and reappear on every run until applied, which
+# would nag every project that never wants a local review loop. This is asked
+# once per interactive run instead, like the savings tracker.
+CODEBASE_REVIEWER_OFFER_ID = "codebase-reviewer-server-offer"
+
+
+def _reviewer_offer_applies(mcp_json: dict) -> bool:
+    """True when the `codebase-reviewer` server could be offered: the project has
+    none yet."""
+    return not has_codebase_reviewer_block(mcp_json)
+
+
+def _add_codebase_reviewer_block(mcp_json: dict, ctx: MigrationContext) -> dict:
+    """
+    A copy of `mcp_json` with the `codebase-reviewer` block added through
+    `build_mcp_servers` (the one function `init --codebase-reviewer` also uses,
+    so the two cannot drift). `REVIEWERS_FILE` is left BLANK: the server
+    requires it and has no default, and no default path or reviewers file is
+    ever written. The block's Qdrant URL and key follow the project's own
+    `qdrant` block; every other server and `settings.json` are untouched.
+    """
+    mcp_json = copy.deepcopy(mcp_json)
+    servers = mcp_json.setdefault("mcpServers", {})
+    qdrant_env = servers.get("qdrant", {}).get("env") if isinstance(servers.get("qdrant"), dict) else None
+    template = load_json(Path(ctx.tools_repo_dir) / "templates" / "mcp.json.template")
+    generated = build_mcp_servers(
+        template,
+        collection_name="project",
+        venv_python=ctx.venv_python,
+        tools_repo_dir=ctx.tools_repo_dir,
+        home_dir=Path.home(),
+        qdrant_url=_env_str(qdrant_env, "QDRANT_URL").strip() or "http://localhost:6333",
+        qdrant_api_key=_env_str(qdrant_env, "QDRANT_API_KEY"),
+        codebase_reviewer=True,
+    )
+    servers["codebase-reviewer"] = generated["codebase-reviewer"]
+    return mcp_json
+
+
 def run_upgrade(
     target_repo: "Path | str",
     tools_repo_dir: "Path | str",
@@ -1140,6 +1349,8 @@ def run_upgrade(
     auto_yes: bool = False,
     dry_run: bool = False,
     prompt_fn: Optional[Callable[["Migration | RepoMigration", int, int], bool]] = None,
+    offer_savings_fn: Optional[Callable[[], bool]] = None,
+    offer_reviewer_fn: Optional[Callable[[], bool]] = None,
 ) -> "list[str]":
     """
     Reads `target_repo`'s current `.mcp.json`/`.claude/settings.json`
@@ -1166,6 +1377,26 @@ def run_upgrade(
     reappear on the next run -- no permanent-dismiss mechanism in v1, per
     the issue's own spec.
 
+    `offer_savings_fn` is the interactive "enable the savings
+    tracker?" question for a project that has never tracked savings and has no
+    `analytics` server, so `/my-savings` and `/my-metrics` would fail with an
+    unknown-tool error and nothing would say why. It is asked at most once,
+    before the migrations are listed, and only when the caller passes one
+    AND neither `dry_run` nor `auto_yes` is set: `None` (the default), a
+    dry run and `--auto-yes` all keep today's behavior of leaving the tracker
+    off. A yes turns tracking on in the `local-compress` block and applies
+    `analytics-server-missing` without asking a second time; the rest of the
+    flow is unchanged.
+
+    `offer_reviewer_fn` is the same kind of one-time interactive question for
+    the opt-in `codebase-reviewer` server, asked (after the savings one) only
+    when the project has no such block, the caller passes one, and neither
+    `dry_run` nor `auto_yes` is set. A yes adds the block with `REVIEWERS_FILE`
+    BLANK and prints a warning that the setting is required and has no default:
+    no path and no reviewers file are ever written. The change is written even
+    when no migration is pending, and `CODEBASE_REVIEWER_OFFER_ID` is added to
+    the returned list.
+
     Returns the list of migration `id`s that were (or, for `--dry-run`, would
     have been) applied, in `MIGRATIONS`' display order. Returns `[]` with an
     error printed (no exception, no files touched) if `target_repo` has no
@@ -1180,8 +1411,8 @@ def run_upgrade(
 
     mcp_json_path = target_repo / ".mcp.json"
     settings_path = target_repo / ".claude" / "settings.json"
-    mcp_json = load_json(mcp_json_path) if mcp_json_path.exists() else {}
-    settings_json = load_json(settings_path) if settings_path.exists() else {}
+    mcp_json = load_existing_mcp_json(mcp_json_path)
+    settings_json = load_existing_settings_json(settings_path)
 
     print(f"Checking {target_repo} for pending upgrades...")
 
@@ -1193,11 +1424,39 @@ def run_upgrade(
         )
         return []
 
+    savings_offer_accepted = False
+    if (
+        offer_savings_fn is not None
+        and not dry_run
+        and not auto_yes
+        and _savings_offer_applies(mcp_json)
+        and offer_savings_fn()
+    ):
+        mcp_json = _enable_savings_tracking(mcp_json)
+        savings_offer_accepted = True
+
+    reviewer_offer_accepted = False
+    if (
+        offer_reviewer_fn is not None
+        and not dry_run
+        and not auto_yes
+        and _reviewer_offer_applies(mcp_json)
+        and offer_reviewer_fn()
+    ):
+        mcp_json = _add_codebase_reviewer_block(mcp_json, ctx)
+        reviewer_offer_accepted = True
+
     pending = pending_migrations(mcp_json, settings_json)
     repo_pending = pending_repo_migrations(target_repo)
     total = len(pending) + len(repo_pending)
 
     if not total:
+        if reviewer_offer_accepted:
+            # The offer changed .mcp.json with no migration to carry the write.
+            _atomic_write_json(mcp_json_path, mcp_json)
+            print("\nAdded the codebase-reviewer MCP server to .mcp.json.")
+            print(f"WARNING: {REVIEWERS_FILE_REQUIRED_WARNING}")
+            return [CODEBASE_REVIEWER_OFFER_ID]
         print("\nNo pending upgrades -- .mcp.json/.claude/settings.json already reflect every known migration.")
         return []
 
@@ -1207,8 +1466,12 @@ def run_upgrade(
     applied: "list[str]" = []
     skipped = 0
     noop = 0
-    mcp_dirty = False
+    # The accepted offer changed mcp_json before any migration ran. The
+    # analytics migration it triggers writes it again, but keep the flag
+    # honest in case that migration ever stops detecting it.
+    mcp_dirty = savings_offer_accepted or reviewer_offer_accepted
     settings_dirty = False
+    applied_offer: "list[str]" = [CODEBASE_REVIEWER_OFFER_ID] if reviewer_offer_accepted else []
     for index, migration in enumerate(pending, start=1):
         if dry_run:
             print()
@@ -1219,6 +1482,12 @@ def run_upgrade(
             print()
             print(_format_migration_block(migration, index, total))
             print("      Auto-applying (--auto-yes).")
+            accept = True
+        elif savings_offer_accepted and migration.id == "analytics-server-missing":
+            # The user just said yes to exactly this; do not ask again.
+            print()
+            print(_format_migration_block(migration, index, total))
+            print("      Applying (you chose to enable the savings tracker).")
             accept = True
         else:
             accept = ask(migration, index, total)
@@ -1286,6 +1555,12 @@ def run_upgrade(
     if dry_run:
         print(f"\nDry run: no changes written. {total} pending upgrade(s) would be applied.")
         return applied
+
+    if savings_offer_accepted:
+        print(f"\nSavings tracker: {SAVINGS_TRACKER_SHELL_EXPORT_REMINDER}")
+    if reviewer_offer_accepted:
+        print(f"\nAdded the codebase-reviewer MCP server to .mcp.json.\nWARNING: {REVIEWERS_FILE_REQUIRED_WARNING}")
+        applied = applied_offer + applied
 
     noop_note = f", {noop} had nothing to change (still pending)" if noop else ""
     print(f"\nDone. {len(applied)} change(s) applied, {skipped} skipped{noop_note}.")

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for the token-budget chunking wiring in tools/ingest_mcp_server.py:
+"""Tests for the token-budget chunking wiring in mcpservers/ingest_mcp_server.py:
 index_repo, sync_repo and preview_index chunk by the embedding
 model's window, fail before touching anything when it cannot be read, report
 per-file progress and the largest files, read both metadata shapes, and
@@ -25,7 +25,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "libs"))
-sys.path.insert(0, os.path.join(REPO_ROOT, "tools"))
+sys.path.insert(0, os.path.join(REPO_ROOT, "mcpservers"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 os.environ.setdefault("QDRANT_URL", "http://localhost:6333")

@@ -303,10 +303,10 @@ class PathExtractionHeuristic(unittest.TestCase):
         )
 
     def test_extracts_relative_paths_with_extension(self):
-        body = "- `libs/local_compress_lib.py` — compress logic\n- `tools/compress_mcp_server.py`"
+        body = "- `libs/local_compress_lib.py` — compress logic\n- `mcpservers/compress_mcp_server.py`"
         paths = extract_important_file_paths(self._compact(body))
         self.assertIn("libs/local_compress_lib.py", paths)
-        self.assertIn("tools/compress_mcp_server.py", paths)
+        self.assertIn("mcpservers/compress_mcp_server.py", paths)
 
     def test_skips_absolute_paths(self):
         # Absolute paths are out-of-scope -- the scope filter must remove them.

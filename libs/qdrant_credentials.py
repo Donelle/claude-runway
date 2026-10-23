@@ -1,5 +1,6 @@
 """
-Resolve the (url, api_key) pair an MCP tool should hand to QdrantClient.
+Resolve the (url, api_key) pair an MCP tool or the ingest CLI should hand to
+QdrantClient.
 
 Several tools accept an optional `qdrant_url`/`qdrant_api_key` as TOOL INPUT,
 i.e. text the model chooses. If a call passes its own qdrant_url but no key
@@ -8,6 +9,10 @@ key in the `api-key` header to whatever host the call named. The realistic
 trigger is prompt injection: text in a file, page or issue the model reads
 tells it to call a tool with an attacker's URL, and the configured credential
 goes with the request.
+
+The standalone ingest CLI (tools/ingest_to_qdrant.py) has the same exposure
+through its --qdrant-url flag: a model can run it through Bash, and a mistyped
+or copied URL would otherwise receive the exported QDRANT_API_KEY.
 
 This module is the one place that rule lives, so the ingest server, the
 memory-bank server, the qdrant server's compact tools and the ingest CLI

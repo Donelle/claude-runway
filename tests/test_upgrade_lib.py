@@ -37,6 +37,7 @@ REPO_ROOT = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, str(REPO_ROOT / "libs"))
 
 from qdrant_ingest_lib import MANIFEST_FILENAME, manifest_to_json  # noqa: E402
+from setup_project_lib import MalformedConfigError, run_setup  # noqa: E402
 from upgrade_lib import (  # noqa: E402
     COMPACT_TOOLS_MATCHER,
     MIGRATIONS,
@@ -411,7 +412,7 @@ class ObsoleteMigrationsAreGone(unittest.TestCase):
         self.assertNotIn("local-compress-embedding-model-missing", ids)
 
     def test_a_block_without_hf_hub_offline_is_not_pending_on_its_own(self):
-        mcp_json = {"mcpServers": {"qdrant": {"command": "/venv/bin/python", "args": ["/t/tools/qdrant_mcp_server.py"],
+        mcp_json = {"mcpServers": {"qdrant": {"command": "/venv/bin/python", "args": ["/t/mcpservers/qdrant_mcp_server.py"],
                                               "env": {"COLLECTION_NAME": "p"}},
                                    "memory-bank": {"env": {}}, "codebase-indexer": {"env": {"MEMORY_BANK_COLLECTION": "m"}}}}
         settings = {"hooks": {"SessionStart": [{"hooks": [{"args": ["/x/hooks/record_session_id.py"]}]}],
@@ -604,7 +605,7 @@ class QdrantServerReplaced(unittest.TestCase):
     a model-named vector, so the compact embedding model has to carry over."""
 
     _ID = "qdrant-server-replaced"
-    _SERVER = f"{REPO_ROOT.as_posix()}/tools/qdrant_mcp_server.py"
+    _SERVER = f"{REPO_ROOT.as_posix()}/mcpservers/qdrant_mcp_server.py"
 
     def _migration(self):
         return _migration(self._ID)
@@ -835,7 +836,8 @@ class PendingMigrations(unittest.TestCase):
         mcp_json = {
             "mcpServers": {
                 "qdrant": {"command": "/old/venv/bin/mcp-server-qdrant", "env": {}},
-                "codebase-indexer": {"env": {}},
+                # Still launched from the old tools/ folder: mcp-server-scripts-moved too.
+                "codebase-indexer": {"args": ["/old/tools-repo/tools/ingest_mcp_server.py"], "env": {}},
                 # Tracking on, no analytics block: analytics-server-missing too;
                 # the leftover SAVINGS_DB key: local-compress-savings-db-inert too.
                 "local-compress": {"env": {"CLAUDE_RUNWAY_TRACK_SAVINGS": "1", "CLAUDE_RUNWAY_SAVINGS_DB": ""}},
@@ -855,7 +857,7 @@ class PendingMigrations(unittest.TestCase):
     def test_none_pending_on_a_fully_up_to_date_project(self):
         mcp_json = {
             "mcpServers": {
-                "qdrant": {"command": "/venv/bin/python", "args": ["/t/tools/qdrant_mcp_server.py"], "env": {}},
+                "qdrant": {"command": "/venv/bin/python", "args": ["/t/mcpservers/qdrant_mcp_server.py"], "env": {}},
                 "codebase-indexer": {"env": {"MEMORY_BANK_COLLECTION": "memory-bank"}},
                 "memory-bank": {"env": {}},
             }
@@ -930,7 +932,12 @@ class RunUpgradeEndToEnd(unittest.TestCase):
                             "command": "/old/venv/bin/mcp-server-qdrant",
                             "env": {"QDRANT_URL": "http://localhost:6333", "COLLECTION_NAME": "my-target-project"},
                         },
-                        "codebase-indexer": {"env": {"COLLECTION_NAME": "my-target-project"}},
+                        # Launched from the old tools/ folder, before the servers moved
+                        # to mcpservers/.
+                        "codebase-indexer": {
+                            "args": ["/old/tools-repo/tools/ingest_mcp_server.py"],
+                            "env": {"COLLECTION_NAME": "my-target-project"},
+                        },
                         # No EMBEDDING_MODEL in the local-compress env: compacts were stored
                         # under the legacy model.
                         # Savings tracking is on with a non-default DB, so the analytics
@@ -1002,12 +1009,17 @@ class RunUpgradeEndToEnd(unittest.TestCase):
         self.assertIn("memory-bank", mcp_json["mcpServers"])
         qdrant = mcp_json["mcpServers"]["qdrant"]
         self.assertEqual(qdrant["command"], "/fake/venv/bin/python")
-        self.assertTrue(qdrant["args"][0].endswith("tools/qdrant_mcp_server.py"))
+        self.assertTrue(qdrant["args"][0].endswith("mcpservers/qdrant_mcp_server.py"))
         self.assertEqual(qdrant["env"]["COMPACT_EMBEDDING_MODEL"], "BAAI/bge-small-en")
         self.assertEqual(qdrant["env"]["COMPACT_COLLECTION"], "conversation-compacts")
+        # The server that was still on the old tools/ path moved with its args
+        # otherwise untouched (mcp-server-scripts-moved).
+        self.assertEqual(
+            mcp_json["mcpServers"]["codebase-indexer"]["args"], ["/old/tools-repo/mcpservers/ingest_mcp_server.py"]
+        )
         analytics = mcp_json["mcpServers"]["analytics"]
         self.assertEqual(analytics["command"], "/fake/venv/bin/python")
-        self.assertTrue(analytics["args"][0].endswith("tools/analytics_mcp_server.py"))
+        self.assertTrue(analytics["args"][0].endswith("mcpservers/analytics_mcp_server.py"))
         self.assertEqual(
             analytics["env"],
             {"CLAUDE_RUNWAY_TRACK_SAVINGS": "1", "CLAUDE_RUNWAY_SAVINGS_DB": "/data/savings.db"},
@@ -1430,7 +1442,7 @@ class AnalyticsServerMissing(unittest.TestCase):
 
     def _mcp(self, **compress_env):
         return {"mcpServers": {
-            "qdrant": {"command": "/venv/bin/python", "args": ["/t/tools/qdrant_mcp_server.py"], "env": {}},
+            "qdrant": {"command": "/venv/bin/python", "args": ["/t/mcpservers/qdrant_mcp_server.py"], "env": {}},
             "local-compress": {"command": "/venv/bin/python", "env": dict(compress_env)},
         }}
 
@@ -1464,7 +1476,7 @@ class AnalyticsServerMissing(unittest.TestCase):
         block = after["mcpServers"]["analytics"]
         self.assertEqual(block["command"], "/fake/venv/bin/python")
         self.assertEqual(block["type"], "stdio")
-        self.assertEqual(block["args"], [(REPO_ROOT / "tools" / "analytics_mcp_server.py").as_posix()])
+        self.assertEqual(block["args"], [(REPO_ROOT / "mcpservers" / "analytics_mcp_server.py").as_posix()])
         # No DB override was set, so neither key is written (a blank one would mask inheritance).
         self.assertEqual(block["env"], {"CLAUDE_RUNWAY_TRACK_SAVINGS": "1"})
         expected = copy.deepcopy(before)
@@ -1487,6 +1499,39 @@ class AnalyticsServerMissing(unittest.TestCase):
             },
         )
 
+    def test_apply_carries_the_metrics_db_over_from_memory_bank(self):
+        # `init --metrics-db` writes the override into memory-bank in every mode,
+        # and into analytics only with --track-savings, so a project that never
+        # tracked savings has it only there. Dropping it would split the data:
+        # memory-bank writes the custom file, analytics reads the default one.
+        before = self._mcp(CLAUDE_RUNWAY_TRACK_SAVINGS="1")
+        before["mcpServers"]["memory-bank"] = {"env": {"CLAUDE_RUNWAY_METRICS_DB": "/data/m.db"}}
+        after = _migration(self._ID).apply(before, {}, _ctx())[0]
+        self.assertEqual(
+            after["mcpServers"]["analytics"]["env"],
+            {"CLAUDE_RUNWAY_TRACK_SAVINGS": "1", "CLAUDE_RUNWAY_METRICS_DB": "/data/m.db"},
+        )
+
+    def test_metrics_db_is_carried_over_verbatim_not_trimmed(self):
+        # metrics_lib.resolve_db_path() does not strip and memory-bank keeps its
+        # own value as written, so a trimmed copy would be a different file.
+        for name in ("memory-bank", "local-compress"):
+            with self.subTest(source=name):
+                before = self._mcp(CLAUDE_RUNWAY_TRACK_SAVINGS="1")
+                before["mcpServers"].setdefault(name, {"env": {}})["env"]["CLAUDE_RUNWAY_METRICS_DB"] = " /data/m.db "
+                after = _migration(self._ID).apply(before, {}, _ctx())[0]
+                self.assertEqual(after["mcpServers"]["analytics"]["env"]["CLAUDE_RUNWAY_METRICS_DB"], " /data/m.db ")
+
+    def test_metrics_db_prefers_memory_bank_then_falls_back_to_local_compress(self):
+        both = self._mcp(CLAUDE_RUNWAY_TRACK_SAVINGS="1", CLAUDE_RUNWAY_METRICS_DB="/legacy/m.db")
+        both["mcpServers"]["memory-bank"] = {"env": {"CLAUDE_RUNWAY_METRICS_DB": "/data/m.db"}}
+        after = _migration(self._ID).apply(both, {}, _ctx())[0]
+        self.assertEqual(after["mcpServers"]["analytics"]["env"]["CLAUDE_RUNWAY_METRICS_DB"], "/data/m.db")
+        # A blank memory-bank value is not an override: the legacy one is used.
+        both["mcpServers"]["memory-bank"] = {"env": {"CLAUDE_RUNWAY_METRICS_DB": "  "}}
+        after = _migration(self._ID).apply(both, {}, _ctx())[0]
+        self.assertEqual(after["mcpServers"]["analytics"]["env"]["CLAUDE_RUNWAY_METRICS_DB"], "/legacy/m.db")
+
     def test_apply_leaves_no_placeholder_behind(self):
         from setup_project_lib import find_unresolved_placeholders
 
@@ -1508,7 +1553,7 @@ class AnalyticsServerMissing(unittest.TestCase):
         self.assertEqual(twice, once)
 
     def test_it_never_touches_the_local_compress_block(self):
-        # That block keeps TRACK_SAVINGS: the compression server's footer, which
+        # That block keeps TRACK_SAVINGS: the compression server's savings metrics, which
         # the hook turns into savings events, still depends on it.
         before = self._mcp(CLAUDE_RUNWAY_TRACK_SAVINGS="1", CLAUDE_RUNWAY_SAVINGS_DB="/data/s.db")
         after = _migration(self._ID).apply(before, {}, _ctx())[0]
@@ -1525,7 +1570,7 @@ class LocalCompressSavingsDbInert(unittest.TestCase):
 
     def _mcp(self, analytics=False, **compress_env):
         servers = {
-            "qdrant": {"command": "/venv/bin/python", "args": ["/t/tools/qdrant_mcp_server.py"], "env": {}},
+            "qdrant": {"command": "/venv/bin/python", "args": ["/t/mcpservers/qdrant_mcp_server.py"], "env": {}},
             "local-compress": {"command": "/venv/bin/python", "env": dict(compress_env)},
         }
         if analytics:
@@ -1722,6 +1767,129 @@ class CompressHookRenamed(unittest.TestCase):
         self.assertTrue(_is_toolkit_owned_hook({"args": [self.NEW]}))
 
 
+class McpServerScriptsMoved(unittest.TestCase):
+    """The five server scripts moved from tools/ to mcpservers/. A config
+    written before the move names the old path, so every server fails to start
+    until `upgrade` rewrites it. Detection is by that old path alone, which is
+    what makes a re-run a no-op."""
+
+    _ID = "mcp-server-scripts-moved"
+    _SCRIPTS = (
+        ("qdrant", "qdrant_mcp_server"),
+        ("codebase-indexer", "ingest_mcp_server"),
+        ("memory-bank", "memory_bank_mcp_server"),
+        ("local-compress", "compress_mcp_server"),
+        ("analytics", "analytics_mcp_server"),
+    )
+
+    def _old(self, root: str = "/home/u/claude-runway") -> dict:
+        return {
+            "mcpServers": {
+                name: {
+                    "command": "/venv/bin/python",
+                    "type": "stdio",
+                    "args": [f"{root}/tools/{stem}.py"],
+                    "env": {"KEEP": name},
+                }
+                for name, stem in self._SCRIPTS
+            }
+        }
+
+    def _apply(self, mcp_json: dict) -> dict:
+        return _migration(self._ID).apply(mcp_json, {}, _ctx())[0]
+
+    def test_detect_true_for_a_config_naming_the_old_paths(self):
+        self.assertTrue(_migration(self._ID).detect(self._old(), {}))
+
+    def test_detect_true_when_only_one_server_still_has_the_old_path(self):
+        mcp_json = self._apply(self._old())
+        mcp_json["mcpServers"]["analytics"]["args"] = ["/home/u/claude-runway/tools/analytics_mcp_server.py"]
+        self.assertTrue(_migration(self._ID).detect(mcp_json, {}))
+
+    def test_apply_rewrites_each_of_the_five_paths(self):
+        after = self._apply(self._old())["mcpServers"]
+        for name, stem in self._SCRIPTS:
+            self.assertEqual(after[name]["args"], [f"/home/u/claude-runway/mcpservers/{stem}.py"], name)
+
+    def test_apply_changes_only_the_script_path(self):
+        before = self._old()
+        after = self._apply(before)
+        for name, _ in self._SCRIPTS:
+            for key in ("command", "type", "env"):
+                self.assertEqual(after["mcpServers"][name][key], before["mcpServers"][name][key], (name, key))
+        # And it never mutates its input.
+        self.assertEqual(before, self._old())
+
+    def test_a_current_config_is_left_alone(self):
+        current = self._apply(self._old())
+        self.assertFalse(_migration(self._ID).detect(current, {}))
+        self.assertEqual(self._apply(current), current)
+
+    def test_apply_is_idempotent(self):
+        once = self._apply(self._old())
+        self.assertEqual(self._apply(once), once)
+
+    def test_a_pipx_env_path_is_rewritten_too(self):
+        mcp_json = self._old("/home/u/.local/pipx/venvs/claude-runway/src")
+        after = self._apply(mcp_json)["mcpServers"]["qdrant"]["args"]
+        self.assertEqual(after, ["/home/u/.local/pipx/venvs/claude-runway/src/mcpservers/qdrant_mcp_server.py"])
+
+    def test_a_windows_backslash_path_keeps_its_separators(self):
+        mcp_json = {
+            "mcpServers": {
+                "qdrant": {"command": "python", "args": ["C:\\repos\\claude-runway\\tools\\qdrant_mcp_server.py"]}
+            }
+        }
+        migration = _migration(self._ID)
+        self.assertTrue(migration.detect(mcp_json, {}))
+        after = self._apply(mcp_json)["mcpServers"]["qdrant"]["args"]
+        self.assertEqual(after, ["C:\\repos\\claude-runway\\mcpservers\\qdrant_mcp_server.py"])
+
+    def test_a_users_own_script_in_a_tools_folder_is_not_touched(self):
+        mcp_json = {
+            "mcpServers": {
+                "mine": {"command": "python", "args": ["/home/u/tools/my_server.py"]},
+                # Right directory, but not one of the five moved scripts.
+                "other": {"command": "python", "args": ["/home/u/claude-runway/tools/doctor.py"]},
+                # One of the five names, but not under a `tools` path segment.
+                "lookalike": {"command": "python", "args": ["/home/u/mytools/qdrant_mcp_server.py"]},
+            }
+        }
+        self.assertFalse(_migration(self._ID).detect(mcp_json, {}))
+        self.assertEqual(self._apply(mcp_json), mcp_json)
+
+    def test_a_block_without_args_or_with_odd_shapes_does_not_break_detect_or_apply(self):
+        mcp_json = {"mcpServers": {"a": {"command": "x"}, "b": {"args": None}, "c": "not-a-dict", "d": {"args": [1, None]}}}
+        migration = _migration(self._ID)
+        self.assertFalse(migration.detect(mcp_json, {}))
+        self.assertEqual(self._apply(mcp_json), mcp_json)
+        self.assertFalse(migration.detect({}, {}))
+
+    def test_settings_json_is_returned_untouched(self):
+        settings = {"hooks": {"SessionStart": []}}
+        _, settings_after = _migration(self._ID).apply(self._old(), settings, _ctx())
+        self.assertEqual(settings_after, settings)
+
+    def test_run_upgrade_lists_it_in_dry_run_then_applies_it_and_a_rerun_is_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp)
+            (target / ".mcp.json").write_text(json.dumps(self._old(REPO_ROOT.as_posix())), encoding="utf-8")
+            before = (target / ".mcp.json").read_bytes()
+            listed = run_upgrade(target, REPO_ROOT, _VENV_PYTHON, dry_run=True)
+            self.assertIn(self._ID, listed)
+            self.assertEqual((target / ".mcp.json").read_bytes(), before)
+
+            applied = run_upgrade(target, REPO_ROOT, _VENV_PYTHON, auto_yes=True)
+            self.assertIn(self._ID, applied)
+            written = json.loads((target / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"]
+            for name, stem in self._SCRIPTS:
+                script = Path(written[name]["args"][0])
+                self.assertEqual(script.parent.name, "mcpservers", name)
+                # The rewritten path is where the script really lives.
+                self.assertTrue((REPO_ROOT / "mcpservers" / f"{stem}.py").is_file(), stem)
+            self.assertEqual(run_upgrade(target, REPO_ROOT, _VENV_PYTHON, auto_yes=True), [])
+
+
 class UpgradeChainFromPreSplitProject(unittest.TestCase):
     """A project written before the `qdrant`/`analytics` split: the `qdrant`
     block launches the third-party console script, savings tracking is on and
@@ -1785,6 +1953,10 @@ class UpgradeChainFromPreSplitProject(unittest.TestCase):
         upgraded = self._mcp()["mcpServers"]
 
         self.assertEqual(upgraded["analytics"], fresh["analytics"])
+        # The pre-split project also launched its compress server from the old
+        # tools/ folder; the path migration moves that to mcpservers/ in the
+        # same run, with nothing else in the block touched.
+        self.assertEqual(upgraded["local-compress"]["args"], ["/old/mcpservers/compress_mcp_server.py"])
         # Compacts that predate the setting stay pinned to the model they were
         # stored with; that is the one deliberate difference from a new install.
         fresh_qdrant = copy.deepcopy(fresh["qdrant"])
@@ -1796,6 +1968,206 @@ class UpgradeChainFromPreSplitProject(unittest.TestCase):
         before = (self.target_repo / ".mcp.json").read_bytes()
         self.assertEqual(run_upgrade(self.target_repo, REPO_ROOT, _VENV_PYTHON, auto_yes=True), [])
         self.assertEqual((self.target_repo / ".mcp.json").read_bytes(), before)
+
+
+class MalformedExistingConfig(unittest.TestCase):
+    """upgrade refuses a malformed existing config with the shared
+    MalformedConfigError, before prompting or writing anything."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.target = Path(self._tmpdir.name) / "project"
+        (self.target / ".claude").mkdir(parents=True)
+        self.mcp_path = self.target / ".mcp.json"
+        self.settings_path = self.target / ".claude" / "settings.json"
+
+    def test_is_project_configured_raises_for_a_bad_mcp_json(self):
+        for label, text in [
+            ("mcpServers null", '{"mcpServers": null}'),
+            ("mcpServers list", '{"mcpServers": []}'),
+            ("top level list", "[]"),
+            ("invalid json", "{not json"),
+        ]:
+            with self.subTest(label):
+                self.mcp_path.write_text(text, encoding="utf-8")
+                with self.assertRaises(MalformedConfigError):
+                    is_project_configured(self.target)
+
+    def test_run_upgrade_raises_for_a_bad_mcp_json_and_writes_nothing(self):
+        self.mcp_path.write_text('{"mcpServers": null}', encoding="utf-8")
+        with self.assertRaises(MalformedConfigError) as ctx:
+            run_upgrade(self.target, REPO_ROOT, _VENV_PYTHON, auto_yes=True)
+        self.assertIn(str(self.mcp_path), str(ctx.exception))
+        self.assertEqual(self.mcp_path.read_text(encoding="utf-8"), '{"mcpServers": null}')
+        self.assertFalse(self.settings_path.exists())
+
+    def test_run_upgrade_raises_for_a_bad_settings_json_and_writes_nothing(self):
+        mcp_text = json.dumps({"mcpServers": {"qdrant": {}}})
+        self.mcp_path.write_text(mcp_text, encoding="utf-8")
+        for label, text in [
+            ("hooks null", '{"hooks": null}'),
+            ("hooks list", '{"hooks": []}'),
+            ("event null", '{"hooks": {"PostToolUse": null}}'),
+            ("invalid json", "{not json"),
+        ]:
+            with self.subTest(label):
+                self.settings_path.write_text(text, encoding="utf-8")
+                with self.assertRaises(MalformedConfigError) as ctx:
+                    run_upgrade(self.target, REPO_ROOT, _VENV_PYTHON, auto_yes=True)
+                self.assertIn(str(self.settings_path), str(ctx.exception))
+                self.assertEqual(self.mcp_path.read_text(encoding="utf-8"), mcp_text)
+                self.assertEqual(self.settings_path.read_text(encoding="utf-8"), text)
+
+    def test_server_args_that_are_not_a_list_raise_instead_of_a_typeerror(self):
+        # Review finding on the PR: `"args": 1` passed the loader and then
+        # crashed list(args) in the qdrant-server migration's detect.
+        self.mcp_path.write_text(json.dumps({"mcpServers": {"qdrant": {"args": 1}}}), encoding="utf-8")
+        with self.assertRaises(MalformedConfigError):
+            run_upgrade(self.target, REPO_ROOT, _VENV_PYTHON, auto_yes=True)
+
+    def test_a_list_matcher_on_a_legacy_compress_hook_raises_instead_of_a_typeerror(self):
+        # Review finding on the PR: a list `matcher` passed the loader and then
+        # was put in a set by the compress-hook-renamed migration (unhashable).
+        self.mcp_path.write_text(json.dumps({"mcpServers": {"qdrant": {"command": "x"}}}), encoding="utf-8")
+        legacy = {
+            "hooks": {
+                "PostToolUse": [
+                    {
+                        "matcher": ["Bash", "Grep"],
+                        "hooks": [{"type": "command", "command": "py", "args": ["/x/hooks/compress_bash_output.py"]}],
+                    }
+                ]
+            }
+        }
+        self.settings_path.write_text(json.dumps(legacy), encoding="utf-8")
+        with self.assertRaises(MalformedConfigError) as ctx:
+            run_upgrade(self.target, REPO_ROOT, _VENV_PYTHON, auto_yes=True)
+        self.assertIn('"matcher" is a list', str(ctx.exception))
+
+
+class SavingsTrackerOffer(unittest.TestCase):
+    """A project that never tracked savings has no `analytics`
+    server, so /my-savings and /my-metrics fail with an unknown-tool error and
+    nothing says why. An interactive `upgrade` asks (the caller passes
+    `offer_savings_fn`); a yes turns tracking on and adds the block through
+    `analytics-server-missing`, without a second question."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.target = Path(self._tmpdir.name) / "proj"
+        self.target.mkdir()
+        self.mcp_path = self.target / ".mcp.json"
+
+    def _init_project(self, **kwargs):
+        # A fully current config as a bare `init` writes it: nothing else is pending.
+        result = run_setup(self.target, REPO_ROOT, home_dir=Path("/home/user"), **kwargs)
+        self.mcp_path.write_text(json.dumps(result.mcp_json), encoding="utf-8")
+        (self.target / ".claude").mkdir(exist_ok=True)
+        (self.target / ".claude" / "settings.json").write_text(json.dumps(result.settings_json), encoding="utf-8")
+
+    def _servers(self):
+        return json.loads(self.mcp_path.read_text(encoding="utf-8"))["mcpServers"]
+
+    def _run(self, **kwargs):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            applied = run_upgrade(self.target, REPO_ROOT, _VENV_PYTHON, **kwargs)
+        return applied, buf.getvalue()
+
+    def test_precondition_a_bare_init_is_fully_current_and_has_no_analytics(self):
+        self._init_project()
+        self.assertNotIn("analytics", self._servers())
+        applied, out = self._run(auto_yes=True)
+        self.assertEqual(applied, [])
+        self.assertIn("No pending upgrades", out)
+
+    def test_yes_enables_tracking_adds_analytics_and_does_not_ask_twice(self):
+        self._init_project()
+        asked = []
+
+        def _unexpected(migration, index, total):
+            raise AssertionError(f"asked a second time about {migration.id}")
+
+        applied, out = self._run(prompt_fn=_unexpected, offer_savings_fn=lambda: asked.append(1) or True)
+        self.assertEqual(asked, [1])
+        self.assertEqual(applied, ["analytics-server-missing"])
+        servers = self._servers()
+        self.assertEqual(servers["local-compress"]["env"]["CLAUDE_RUNWAY_TRACK_SAVINGS"], "1")
+        self.assertEqual(servers["analytics"]["env"]["CLAUDE_RUNWAY_TRACK_SAVINGS"], "1")
+        # The block is the one `init --track-savings` writes, not a variant of it.
+        expected = run_setup(
+            Path(self._tmpdir.name) / "other", REPO_ROOT, home_dir=Path("/home/user"), track_savings=True,
+        ).generated_mcp_servers["analytics"]
+        self.assertEqual(servers["analytics"]["args"], expected["args"])
+        # The hooks read the shell, not .mcp.json, so the export is called out.
+        self.assertIn("Export CLAUDE_RUNWAY_TRACK_SAVINGS=1 in your shell", out)
+
+    def test_yes_keeps_a_custom_metrics_db_so_memory_bank_and_analytics_share_one_file(self):
+        # Project set up with `init --metrics-db` and tracking off: the override
+        # lives only in the memory-bank block. The new analytics block must read
+        # the same file, or /my-metrics would show an empty default database.
+        self._init_project(metrics_db="/data/metrics.db")
+        self.assertEqual(self._servers()["memory-bank"]["env"]["CLAUDE_RUNWAY_METRICS_DB"], "/data/metrics.db")
+        self._run(prompt_fn=lambda m, i, t: True, offer_savings_fn=lambda: True)
+        servers = self._servers()
+        self.assertEqual(servers["analytics"]["env"]["CLAUDE_RUNWAY_METRICS_DB"], "/data/metrics.db")
+        self.assertEqual(servers["memory-bank"]["env"]["CLAUDE_RUNWAY_METRICS_DB"], "/data/metrics.db")
+
+    def test_no_leaves_the_project_untouched(self):
+        self._init_project()
+        before = self.mcp_path.read_text(encoding="utf-8")
+        applied, out = self._run(prompt_fn=lambda m, i, t: True, offer_savings_fn=lambda: False)
+        self.assertEqual(applied, [])
+        self.assertEqual(self.mcp_path.read_text(encoding="utf-8"), before)
+        self.assertIn("No pending upgrades", out)
+
+    def test_no_offer_function_never_asks(self):
+        # The library default: a caller that passes nothing keeps tracking off.
+        self._init_project()
+        applied, _ = self._run(prompt_fn=lambda m, i, t: True)
+        self.assertEqual(applied, [])
+        self.assertNotIn("analytics", self._servers())
+
+    def test_auto_yes_and_dry_run_never_ask(self):
+        self._init_project()
+
+        def _explode():
+            raise AssertionError("must not ask")
+
+        for kwargs in ({"auto_yes": True}, {"dry_run": True}):
+            with self.subTest(**kwargs):
+                applied, _ = self._run(offer_savings_fn=_explode, **kwargs)
+                self.assertEqual(applied, [])
+                self.assertNotIn("analytics", self._servers())
+
+    def test_not_asked_when_the_project_already_tracks_or_has_the_block(self):
+        def _explode():
+            raise AssertionError("must not ask")
+
+        # Tracking already on, block missing: analytics-server-missing's own offer.
+        self._init_project(track_savings=True)
+        servers = json.loads(self.mcp_path.read_text(encoding="utf-8"))
+        del servers["mcpServers"]["analytics"]
+        self.mcp_path.write_text(json.dumps(servers), encoding="utf-8")
+        applied, _ = self._run(prompt_fn=lambda m, i, t: True, offer_savings_fn=_explode)
+        self.assertEqual(applied, ["analytics-server-missing"])
+        # Fully set up: nothing to ask or do.
+        applied, _ = self._run(prompt_fn=lambda m, i, t: True, offer_savings_fn=_explode)
+        self.assertEqual(applied, [])
+
+    def test_not_asked_for_a_qdrant_only_project(self):
+        # No local-compress block means no tracker to offer.
+        self._init_project(include_compress=False)
+        self.assertNotIn("local-compress", self._servers())
+
+        def _explode():
+            raise AssertionError("must not ask")
+
+        applied, _ = self._run(prompt_fn=lambda m, i, t: True, offer_savings_fn=_explode)
+        self.assertNotIn("analytics", self._servers())
+        self.assertNotIn("analytics-server-missing", applied)
 
 
 if __name__ == "__main__":

@@ -52,6 +52,11 @@ def _load_setup_project():
     spec = importlib.util.spec_from_file_location("setup_project", REPO_ROOT / "tools" / "setup_project.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    # init/upgrade ask about the savings tracker when stdin is a
+    # terminal. A developer running this suite from one must not hit a real
+    # prompt, so every fresh copy starts non-interactive; the tests of the
+    # question itself pin it to True where they need it.
+    mod._stdin_is_interactive = lambda: False
     return mod
 
 
@@ -162,6 +167,8 @@ def _init_args(target_repo, **overrides) -> argparse.Namespace:
         memory_bank_id="",
         embedding_model="",
         memory_bank_embedding_model="",
+        codebase_reviewer=False,
+        reviewers_file="",
         qdrant_only=False,
         skip_hooks=False,
         install_skills=False,
@@ -976,7 +983,7 @@ class UpgradeSubcommand(unittest.TestCase):
         # in CI while passing locally.
         captured = {}
 
-        def _fake_run_upgrade(target_repo, tools_repo_dir, venv_python, *, auto_yes, dry_run):
+        def _fake_run_upgrade(target_repo, tools_repo_dir, venv_python, *, auto_yes, dry_run, **_kw):
             captured.update(
                 target_repo=target_repo, tools_repo_dir=tools_repo_dir, venv_python=venv_python,
                 auto_yes=auto_yes, dry_run=dry_run,
@@ -1002,7 +1009,7 @@ class UpgradeSubcommand(unittest.TestCase):
         fake_python = Path("/opt/pipx/venvs/claude-runway/bin/python")
         captured = {}
 
-        def _fake_run_upgrade(target_repo, tools_repo_dir, venv_python, *, auto_yes, dry_run):
+        def _fake_run_upgrade(target_repo, tools_repo_dir, venv_python, *, auto_yes, dry_run, **_kw):
             captured["venv_python"] = venv_python
             return []
 
@@ -1012,6 +1019,177 @@ class UpgradeSubcommand(unittest.TestCase):
             self.mod.cmd_upgrade(args)
 
         self.assertEqual(captured["venv_python"], fake_python)
+
+
+class InitOffersSavingsTracker(unittest.TestCase):
+    """`init` never mentioned the savings tracker, so a CLI user got
+    a config with no `analytics` server and /my-savings and /my-metrics failed
+    with an unknown-tool error. It now asks (same wording as
+    /my-setup-clauderunway's Q4) when a person can answer, and says so when
+    the tracker ends up off."""
+
+    def setUp(self):
+        self.mod = _load_setup_project()
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.target_repo = Path(self._tmpdir.name) / "my-project"
+        self.target_repo.mkdir()
+
+    def _init(self, *, tty, answer=None, **overrides):
+        """Runs cmd_init for real (dry_run=False unless overridden); returns
+        (stdout, prompts asked). `answer` is what the user types."""
+        self.mod._stdin_is_interactive = lambda: tty
+        prompts = []
+
+        def _fake_input(prompt=""):
+            prompts.append(prompt)
+            if answer is None:
+                raise AssertionError("must not prompt")
+            return answer
+
+        overrides.setdefault("dry_run", False)
+        buf = io.StringIO()
+        with redirect_stdout(buf), mock.patch("builtins.input", _fake_input):
+            self.mod.cmd_init(_init_args(self.target_repo, **overrides))
+        return buf.getvalue(), prompts
+
+    def _servers(self):
+        return json.loads((self.target_repo / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"]
+
+    def test_yes_writes_the_analytics_block_and_the_shell_export_reminder(self):
+        out, prompts = self._init(tty=True, answer="y")
+        self.assertEqual(len(prompts), 1)
+        self.assertIn("analytics", self._servers())
+        self.assertEqual(self._servers()["local-compress"]["env"]["CLAUDE_RUNWAY_TRACK_SAVINGS"], "1")
+        self.assertIn("CLAUDE_RUNWAY_TRACK_SAVINGS=1", out)
+        self.assertNotIn("savings tracker is off", out)
+
+    def test_the_question_uses_the_skills_q4_wording(self):
+        out, _ = self._init(tty=True, answer="n")
+        enabled = "Set CLAUDE_RUNWAY_TRACK_SAVINGS=1; also requires a shell export"
+        disabled = "No token savings tracking"
+        self.assertIn(enabled, out)
+        self.assertIn(disabled, out)
+        skill = (REPO_ROOT / "skills" / "my-setup-clauderunway" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn(enabled, skill)
+        self.assertIn(disabled, skill)
+
+    def test_blank_or_no_keeps_it_off_and_says_how_to_enable_it(self):
+        for answer in ("", "n", "no"):
+            with self.subTest(answer=answer):
+                shutil.rmtree(self.target_repo)
+                self.target_repo.mkdir()
+                out, prompts = self._init(tty=True, answer=answer)
+                self.assertEqual(len(prompts), 1)
+                self.assertNotIn("analytics", self._servers())
+                self.assertIn("savings tracker is off", out)
+                self.assertIn("/my-savings and /my-metrics", out)
+                self.assertIn("--track-savings", out)
+                self.assertIn("CLAUDE_RUNWAY_TRACK_SAVINGS=1", out)
+
+    def test_no_terminal_never_asks_and_keeps_the_off_default(self):
+        out, prompts = self._init(tty=False)
+        self.assertEqual(prompts, [])
+        self.assertNotIn("analytics", self._servers())
+        self.assertIn("savings tracker is off", out)
+
+    def test_explicit_track_savings_skips_the_question_and_the_note(self):
+        out, prompts = self._init(tty=True, track_savings=True)
+        self.assertEqual(prompts, [])
+        self.assertIn("analytics", self._servers())
+        self.assertNotIn("savings tracker is off", out)
+
+    def test_dry_run_never_asks_but_still_explains(self):
+        out, prompts = self._init(tty=True, dry_run=True)
+        self.assertEqual(prompts, [])
+        self.assertIn("savings tracker is off", out)
+        self.assertFalse((self.target_repo / ".mcp.json").exists())
+
+    def test_qdrant_only_never_asks_and_adds_no_note(self):
+        out, prompts = self._init(tty=True, qdrant_only=True)
+        self.assertEqual(prompts, [])
+        self.assertNotIn("savings tracker", out)
+
+    def test_enter_on_a_rerun_keeps_an_existing_analytics_block(self):
+        self._init(tty=False, track_savings=True)
+        out, prompts = self._init(tty=True, answer="")
+        self.assertEqual(len(prompts), 1)
+        self.assertIn("[Y/n]", prompts[0])
+        self.assertIn("analytics", self._servers())
+        self.assertEqual(self._servers()["local-compress"]["env"]["CLAUDE_RUNWAY_TRACK_SAVINGS"], "1")
+        self.assertNotIn("is removing", out)
+
+    def test_bare_rerun_without_a_terminal_says_it_removes_the_analytics_block(self):
+        self._init(tty=False, track_savings=True)
+        out, _ = self._init(tty=False)
+        self.assertNotIn("analytics", self._servers())
+        self.assertIn("is removing the existing `analytics` MCP server", out)
+        self.assertIn("--track-savings", out)
+
+    def test_dry_run_of_that_rerun_says_would_remove_and_removes_nothing(self):
+        self._init(tty=False, track_savings=True)
+        out, _ = self._init(tty=False, dry_run=True)
+        self.assertIn("would remove the existing `analytics` MCP server", out)
+        self.assertIn("analytics", self._servers())
+
+    def test_qdrant_only_rerun_says_it_removes_the_analytics_block(self):
+        self._init(tty=False, track_savings=True)
+        out, _ = self._init(tty=False, qdrant_only=True)
+        self.assertNotIn("analytics", self._servers())
+        self.assertIn("--qdrant-only is removing the existing `analytics` MCP server", out)
+
+    def test_unusable_existing_mcp_json_still_reports_the_real_error(self):
+        # The pre-read for the question must not swallow or replace init's own
+        # malformed-config error.
+        (self.target_repo / ".mcp.json").write_text("{not json", encoding="utf-8")
+        self.mod._stdin_is_interactive = lambda: True
+        with mock.patch("builtins.input", lambda p="": "n"), redirect_stdout(io.StringIO()), \
+             mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            with self.assertRaises(SystemExit) as ctx:
+                self.mod.cmd_init(_init_args(self.target_repo, dry_run=False))
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("re-run init", err.getvalue())
+
+
+class UpgradeOffersSavingsTracker(unittest.TestCase):
+    """`cmd_upgrade` hands run_upgrade the question only when a
+    person can answer it."""
+
+    def setUp(self):
+        self.mod = _load_setup_project()
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.target_repo = Path(self._tmpdir.name) / "my-project"
+        self.target_repo.mkdir()
+        (self.target_repo / ".mcp.json").write_text(json.dumps({"mcpServers": {"qdrant": {}}}), encoding="utf-8")
+        home_patch = mock.patch.object(Path, "home", return_value=Path(self._tmpdir.name) / "fake-home")
+        home_patch.start()
+        self.addCleanup(home_patch.stop)
+
+    def _offer_passed(self, *, tty, **flags):
+        self.mod._stdin_is_interactive = lambda: tty
+        captured = {}
+
+        def _fake_run_upgrade(target_repo, tools_repo_dir, venv_python, **kw):
+            captured.update(kw)
+            return []
+
+        args = argparse.Namespace(
+            target_repo=str(self.target_repo), dry_run=flags.get("dry_run", False),
+            auto_yes=flags.get("auto_yes", False), skills_dir=str(Path(self._tmpdir.name) / "skills"),
+        )
+        with mock.patch.object(self.mod, "run_upgrade", side_effect=_fake_run_upgrade), \
+             redirect_stdout(io.StringIO()):
+            self.mod.cmd_upgrade(args)
+        return captured["offer_savings_fn"]
+
+    def test_interactive_run_passes_the_question(self):
+        self.assertIs(self._offer_passed(tty=True), self.mod.ask_savings_tracker)
+
+    def test_no_terminal_auto_yes_and_dry_run_pass_none(self):
+        self.assertIsNone(self._offer_passed(tty=False))
+        self.assertIsNone(self._offer_passed(tty=True, auto_yes=True))
+        self.assertIsNone(self._offer_passed(tty=True, dry_run=True))
 
 
 class UpgradeSkillRefresh(unittest.TestCase):
@@ -1154,6 +1332,169 @@ class UpgradeSkillRefresh(unittest.TestCase):
         for name in ("my-savings", "my-setup-clauderunway"):
             shipped = (REPO_ROOT / "skills" / name / "SKILL.md").read_text(encoding="utf-8")
             self.assertNotIn("EVALUATION.md", shipped, name)
+
+
+class UpgradeSkillSourceNotice(unittest.TestCase):
+    """`upgrade`'s skill refresh names an installed snapshot as its
+    source and warns per stale skill when the $CLAUDE_RUNWAY_DIR checkout ships
+    a different copy. Message-only: what is written never depends on either.
+    Temp dirs throughout; `get_version` and CLAUDE_RUNWAY_DIR are patched."""
+
+    def setUp(self):
+        self.mod = _load_setup_project()
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        root = Path(self._tmpdir.name)
+        self.tools = root / "snapshot"
+        self.checkout = root / "checkout"
+        for base, body in ((self.tools, "snapshot wording\n"), (self.checkout, "checkout wording\n")):
+            (base / "skills" / "my-savings").mkdir(parents=True)
+            (base / "skills" / "my-savings" / "SKILL.md").write_text(body, encoding="utf-8")
+        self.skills = root / "skills-dest"
+        (self.skills / "my-savings").mkdir(parents=True)
+        self.installed = self.skills / "my-savings" / "SKILL.md"
+        self.installed.write_text("stale\n", encoding="utf-8")
+        version_patch = mock.patch.object(self.mod, "get_version", return_value="9.9.9.test")
+        version_patch.start()
+        self.addCleanup(version_patch.stop)
+
+    def _refresh(self, *, env=None, tools=None, **kw):
+        kw.setdefault("auto_yes", True)
+        kw.setdefault("dry_run", False)
+        buf = io.StringIO()
+        with mock.patch.dict(os.environ, {"CLAUDE_RUNWAY_DIR": env if env is not None else ""}), \
+             redirect_stdout(buf):
+            done = self.mod.refresh_installed_skills(self.skills, tools_repo_dir=tools or self.tools, **kw)
+        return done, buf.getvalue()
+
+    def test_snapshot_source_is_named_with_path_and_version(self):
+        done, out = self._refresh()
+        self.assertEqual(done, ["my-savings"])
+        self.assertIn("Comparing against the skills shipped with this install", out)
+        self.assertIn(str(self.tools / "skills"), out)
+        self.assertIn("9.9.9.test", out)
+
+    def test_source_checkout_is_not_labelled_a_snapshot(self):
+        (self.tools / ".git").mkdir()
+        _, out = self._refresh()
+        self.assertNotIn("Comparing against", out)
+
+    def test_worktree_git_file_counts_as_a_checkout(self):
+        (self.tools / ".git").write_text("gitdir: elsewhere\n", encoding="utf-8")
+        self.assertFalse(self.mod._is_installed_snapshot(self.tools))
+
+    def test_differing_checkout_copy_warns_and_still_refreshes(self):
+        done, out = self._refresh(env=str(self.checkout))
+        self.assertEqual(done, ["my-savings"])
+        self.assertEqual(self.installed.read_text(encoding="utf-8"), "snapshot wording\n")
+        self.assertIn(f"Warning: the checkout at {self.checkout} ships a different my-savings", out)
+        self.assertIn("/my-setup-clauderunway upgrade", out)
+        self.assertIn("uv tool install --reinstall", out)
+
+    def test_warning_also_shown_in_dry_run_and_nothing_is_written(self):
+        done, out = self._refresh(env=str(self.checkout), dry_run=True, auto_yes=False)
+        self.assertEqual(done, ["my-savings"])
+        self.assertEqual(self.installed.read_text(encoding="utf-8"), "stale\n")
+        self.assertIn("Would refresh my-savings", out)
+        self.assertIn("ships a different my-savings", out)
+
+    def test_declining_still_shows_the_warning_and_skips(self):
+        done, out = self._refresh(env=str(self.checkout), auto_yes=False, prompt_fn=lambda p: False)
+        self.assertEqual(done, [])
+        self.assertIn("ships a different my-savings", out)
+        self.assertIn("Skipped", out)
+
+    def test_no_warning_when_checkout_copy_matches_the_snapshot(self):
+        (self.checkout / "skills" / "my-savings" / "SKILL.md").write_text("snapshot wording\n", encoding="utf-8")
+        _, out = self._refresh(env=str(self.checkout))
+        self.assertNotIn("Warning", out)
+
+    def test_no_warning_when_env_is_unset_empty_or_not_a_directory(self):
+        for env in ("", "   ", str(Path(self._tmpdir.name) / "nowhere")):
+            self.installed.write_text("stale\n", encoding="utf-8")
+            _, out = self._refresh(env=env)
+            self.assertNotIn("Warning", out, repr(env))
+
+    def test_no_warning_when_env_points_at_the_source_itself(self):
+        _, out = self._refresh(env=str(self.tools))
+        self.assertNotIn("Warning", out)
+
+    def test_no_warning_when_checkout_lacks_that_skill(self):
+        (self.checkout / "skills" / "my-savings" / "SKILL.md").unlink()
+        _, out = self._refresh(env=str(self.checkout))
+        self.assertNotIn("Warning", out)
+
+    def test_up_to_date_skill_gets_no_warning(self):
+        self.installed.write_text("snapshot wording\n", encoding="utf-8")
+        done, out = self._refresh(env=str(self.checkout))
+        self.assertEqual(done, [])
+        self.assertNotIn("Warning", out)
+
+
+class MalformedExistingConfigExitsCleanly(unittest.TestCase):
+    """init/upgrade on a malformed existing config print a one-line
+    `error:` naming the file and exit 1, with no traceback and nothing written."""
+
+    def setUp(self):
+        self.mod = _load_setup_project()
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.target_repo = Path(self._tmpdir.name) / "my-project"
+        (self.target_repo / ".claude").mkdir(parents=True)
+        # cmd_upgrade also refreshes skills under the home dir:
+        # keep any such access off the real home.
+        home_patch = mock.patch.object(Path, "home", return_value=Path(self._tmpdir.name) / "fake-home")
+        home_patch.start()
+        self.addCleanup(home_patch.stop)
+
+    def _run(self, fn, args):
+        err = io.StringIO()
+        with mock.patch.object(sys, "stderr", err), redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as ctx:
+                fn(args)
+        self.assertEqual(ctx.exception.code, 1)
+        return err.getvalue()
+
+    def test_init_with_a_null_mcp_servers_exits_one_without_writing(self):
+        mcp = self.target_repo / ".mcp.json"
+        mcp.write_text('{"mcpServers": null}', encoding="utf-8")
+        message = self._run(self.mod.cmd_init, _init_args(self.target_repo, dry_run=False))
+        self.assertTrue(message.startswith("error: "))
+        self.assertIn(str(mcp), message)
+        self.assertIn('"mcpServers" is a NoneType', message)
+        self.assertEqual(mcp.read_text(encoding="utf-8"), '{"mcpServers": null}')
+        self.assertFalse((self.target_repo / ".claude" / "settings.json").exists())
+
+    def test_init_with_a_null_hooks_exits_one_without_writing_either_file(self):
+        settings = self.target_repo / ".claude" / "settings.json"
+        settings.write_text('{"hooks": null}', encoding="utf-8")
+        message = self._run(self.mod.cmd_init, _init_args(self.target_repo, dry_run=False))
+        self.assertIn(str(settings), message)
+        self.assertEqual(settings.read_text(encoding="utf-8"), '{"hooks": null}')
+        self.assertFalse((self.target_repo / ".mcp.json").exists())
+
+    def test_init_with_invalid_json_exits_one(self):
+        (self.target_repo / ".mcp.json").write_text("{not json", encoding="utf-8")
+        message = self._run(self.mod.cmd_init, _init_args(self.target_repo))
+        self.assertIn("could not be read as valid JSON", message)
+
+    def test_upgrade_with_a_null_mcp_servers_exits_one_not_unconfigured(self):
+        (self.target_repo / ".mcp.json").write_text('{"mcpServers": null}', encoding="utf-8")
+        args = argparse.Namespace(target_repo=str(self.target_repo), dry_run=False, auto_yes=True, skills_dir="")
+        message = self._run(self.mod.cmd_upgrade, args)
+        self.assertIn('"mcpServers" is a NoneType', message)
+        self.assertNotIn("no existing toolkit configuration", message)
+
+    def test_upgrade_with_a_null_hooks_exits_one_without_writing(self):
+        mcp_text = json.dumps({"mcpServers": {"qdrant": {}}})
+        (self.target_repo / ".mcp.json").write_text(mcp_text, encoding="utf-8")
+        settings = self.target_repo / ".claude" / "settings.json"
+        settings.write_text('{"hooks": null}', encoding="utf-8")
+        args = argparse.Namespace(target_repo=str(self.target_repo), dry_run=False, auto_yes=True, skills_dir="")
+        message = self._run(self.mod.cmd_upgrade, args)
+        self.assertIn(str(settings), message)
+        self.assertEqual((self.target_repo / ".mcp.json").read_text(encoding="utf-8"), mcp_text)
+        self.assertEqual(settings.read_text(encoding="utf-8"), '{"hooks": null}')
 
 
 if __name__ == "__main__":

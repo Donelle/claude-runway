@@ -22,21 +22,25 @@ What counts as a reference (the rules are intentionally narrow):
     (``/issues/<N>/comments``) or without a number (``/issues/comments/<id>``)
     are not references and are allowed.
 
-Excluded: ``.plans/`` (gitignored, never shipped), and the fixture data
-listed in ``CODE_FIXTURE_ALLOWLIST`` below (numbers that are test input, not
-citations).
+Excluded: ``.plans/`` and ``.ai-plans/`` (gitignored local plan folders,
+never shipped), and the fixture data listed in ``CODE_FIXTURE_ALLOWLIST``
+below (numbers that are test input, not citations).
 """
 
 import os
 import re
 import subprocess
+import tempfile
 import unittest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Directories skipped when falling back to a filesystem walk (no git available).
 # `git ls-files` already excludes all of these, being untracked or ignored.
-_SKIP_DIRS = {".git", ".venv", ".plans", "node_modules", "__pycache__", "worktrees"}
+_SKIP_DIRS = {".git", ".venv", ".plans", ".ai-plans", "node_modules", "__pycache__", "worktrees"}
+
+# The gitignored local plan folders, which cite tickets by design.
+_PLAN_PREFIXES = (".plans/", ".ai-plans/")
 
 TICKET_REF = re.compile(
     r"""
@@ -50,7 +54,7 @@ TICKET_REF = re.compile(
 
 
 def tracked_markdown_files(root: str = REPO_ROOT) -> list[str]:
-    """Repo-relative paths of every tracked ``*.md`` file, minus ``.plans/``."""
+    """Repo-relative paths of every tracked ``*.md`` file, minus the plan folders."""
     try:
         out = subprocess.run(
             ["git", "ls-files", "*.md"],
@@ -70,7 +74,7 @@ def tracked_markdown_files(root: str = REPO_ROOT) -> list[str]:
                 if name.endswith(".md"):
                     rel = os.path.relpath(os.path.join(dirpath, name), root)
                     paths.append(rel.replace(os.sep, "/"))
-    return sorted(p for p in paths if not p.startswith(".plans/"))
+    return sorted(p for p in paths if not p.startswith(_PLAN_PREFIXES))
 
 
 def find_ticket_refs(text: str) -> list[tuple[int, str]]:
@@ -129,7 +133,19 @@ class NoTicketRefsInMarkdownTests(unittest.TestCase):
     def test_tracked_markdown_found(self):
         files = tracked_markdown_files()
         self.assertIn("README.md", files)
-        self.assertFalse([f for f in files if f.startswith(".plans/")])
+        self.assertFalse([f for f in files if f.startswith(_PLAN_PREFIXES)])
+
+    def test_filesystem_walk_skips_both_plan_folders(self):
+        # Without git (a source tarball) the walk sees untracked files too. The
+        # local plan folders cite tickets by design and are never shipped, so a
+        # file in either must not make this guard fail.
+        with tempfile.TemporaryDirectory() as root:
+            for rel in ("README.md", ".plans/1-plan.md", ".ai-plans/ticket-work-order.md"):
+                path = os.path.join(root, rel)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("fixed in #1\n")
+            self.assertEqual(tracked_markdown_files(root), ["README.md"])
 
     def test_no_ticket_or_pr_references_in_tracked_markdown(self):
         offenders = []

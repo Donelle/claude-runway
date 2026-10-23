@@ -530,11 +530,43 @@ async def _compress_for_storage(information: str) -> tuple[str, str]:
     # redacted) behind a notice. Keep the content, drop the notice.
     fallback = strip_total_outage_notice(result)
     if fallback is not None:
-        return fallback, "stored uncompressed: LM Studio did not respond"
+        return fallback, "stored uncompressed: LM Studio returned no summary (unreachable, timed out or rejected the request)"
     if result.startswith("[compressed "):
         header = result.split("]", 1)[0].lstrip("[")
         return result, header
     return result, "stored uncompressed: the summary was under the compression threshold"
+
+
+def _stored_at_now() -> str:
+    """
+    The UTC wall-clock time a compact is being stored, as a fixed-width ISO
+    string. Fixed width (always microseconds, always the `Z`
+    suffix) is what makes plain string comparison a correct time ordering,
+    the same property the YYYY-MM-DD `date` already relies on. A separate
+    function so tests can pin the clock without patching `datetime`.
+    """
+    import datetime as _dt
+    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _recency_key(payload: Optional[dict]) -> tuple:
+    """
+    Sort key for "which compact is newer" over a point's payload:
+    the caller-supplied `date` first, then `stored_at`. `date` is
+    day-granular, so two compacts made the same day tie on it alone and
+    would stay in Qdrant scroll order, which follows the point ids and is
+    effectively random. `stored_at` breaks that tie.
+
+    A compact stored before `stored_at` existed has none and gets "", which
+    sorts older than any real timestamp on the same date; such compacts keep
+    the scroll order among themselves, as before. A missing or non-string
+    value of either field also degrades to "" rather than raising, since
+    this runs over every point in a collection, including hand-written ones.
+    """
+    payload = payload or {}
+    date = payload.get("date", "")
+    stored_at = payload.get("stored_at", "")
+    return (date if isinstance(date, str) else "", stored_at if isinstance(stored_at, str) else "")
 
 
 @mcp.tool()
@@ -722,6 +754,11 @@ async def compact_store(
                 payload={
                     "document": information, "project": project, "label": label, "date": date,
                     "information": information, "metadata": {"source": COMPACT_SOURCE},
+                    # `date` is day-granular, so this is what orders
+                    # compacts made the same day. An idempotent overwrite (same
+                    # project/label/date, same point id) refreshes it, which is
+                    # right: it is the same compact, saved again just now.
+                    "stored_at": _stored_at_now(),
                 },
             )
         ],
@@ -770,9 +807,9 @@ def _sibling_compact_collections(client: QdrantClient, exclude: list) -> list:
 
 def _most_recent_sibling_entry(client: QdrantClient, collection_name: str):
     """
-    Fetch one collection's most-recently-dated compact, keyed by ISO date
-    string (lexicographic sort, same assumption compact_find's own
-    date-sort already relies on). Used ONLY by _candidate_hint, a
+    Fetch one collection's most recent compact, keyed by ISO date string
+    then `stored_at` (lexicographic sort, same assumption compact_find's own
+    sort already relies on; see _recency_key). Used ONLY by _candidate_hint, a
     best-effort DISPLAY hint -- authoritative project resolution
     (_collections_for_project) now uses _collection_contains_project
     instead, precisely because "most recent point" is the wrong question
@@ -808,7 +845,8 @@ def _most_recent_sibling_entry(client: QdrantClient, collection_name: str):
             break
     if not all_points:
         return None
-    best = max(all_points, key=lambda p: (p.payload or {}).get("date", ""))
+    # Date alone ties for same-day compacts; see _recency_key.
+    best = max(all_points, key=lambda p: _recency_key(p.payload))
     payload = best.payload or {}
     return payload.get("date", "?"), payload.get("label", "(no label)"), payload.get("project", "?")
 
@@ -901,8 +939,11 @@ async def compact_find(
     collection is passed explicitly via the collection param.
 
     Called by /my-resume instead of qdrant-find. Returns compacts sorted by
-    date descending (most recent first), each with its date, label, and full
-    content, ready for /my-resume to present as a selection list.
+    date descending (most recent first; compacts sharing a date are ordered
+    by the time they were stored, newest first -- compacts stored before that
+    timestamp existed count as oldest on their date), each with its date,
+    label, and full content, ready for /my-resume to present as a selection
+    list.
 
     When query is omitted, uses scroll (payload filter only, no vector
     ranking) so date-sort is reliable and recent entries are never buried by
@@ -1109,6 +1150,12 @@ async def compact_find(
                     break
         if case_insensitive_target is not None:
             all_points = [p for p in all_points if (p.payload or {}).get("project", "").casefold() == case_insensitive_target]
+        # Newest first by (date, stored_at): date alone ties for
+        # same-day compacts. sort() is stable and reverse=True keeps equal
+        # keys in their original order, so compacts that predate stored_at
+        # keep the order they always had. Sorted here, on the points, because
+        # `entries` carries no stored_at.
+        all_points.sort(key=lambda p: _recency_key(p.payload), reverse=True)
         entries = [
             (
                 p.id, (p.payload or {}).get("date", ""), (p.payload or {}).get("label", ""),
@@ -1121,8 +1168,6 @@ async def compact_find(
             # one entry's fields.
             for p in all_points
         ]
-        # Date is now index 1 (id is 0) -- sort key updated to match.
-        entries.sort(key=lambda e: e[1], reverse=True)
         entries = entries[:limit]
 
     if not entries:
@@ -1165,7 +1210,8 @@ async def compact_prune(
     can be caught and aborted before any data is lost.
 
     `keep_last_n=N` retains the N most recent compacts by parsed ISO date
-    and deletes the rest. Compacts whose stored date is missing, malformed,
+    (compacts sharing a date are ordered by when they were stored) and
+    deletes the rest. Compacts whose stored date is missing, malformed,
     or calendar-invalid (e.g. "2026-99-99") cannot be date-ranked and are
     always preserved outside the N quota -- `keep_last_n=0` does NOT
     delete such entries. `keep_last_n=1` keeps only the most recently
@@ -1288,7 +1334,16 @@ async def compact_prune(
     # Sort parseable entries by date descending (most recent first).
     # All entries in `parseable` have a non-None _parse_date -- the list was
     # built by filtering out None results above, so the cast is safe.
-    parseable.sort(key=lambda cp: _parse_date(cp[1]) or _dt.date.min, reverse=True)
+    # Ties on the day are broken by `stored_at`, so keep_last_n
+    # keeps the compact actually saved last rather than whichever came first
+    # in scroll order; a compact without one counts as oldest that day.
+    parseable.sort(
+        key=lambda cp: (
+            _parse_date(cp[1]) or _dt.date.min,
+            _recency_key(cp[1].payload)[1],
+        ),
+        reverse=True,
+    )
 
     # Determine which points to delete.
     if keep_last_n is not None:

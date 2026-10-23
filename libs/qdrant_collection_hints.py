@@ -1,6 +1,6 @@
 """
 Persistent, cross-session cache for per-collection description hints.
-tools/ingest_mcp_server.py's list_collections tool surfaces these
+mcpservers/ingest_mcp_server.py's list_collections tool surfaces these
 hints so a model can pick the right collection for find_in_collection on its
 own, instead of the user always having to name it explicitly.
 

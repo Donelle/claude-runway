@@ -1,9 +1,9 @@
 # Core -- required for the Qdrant codebase-memory piece (qdrant_mcp_server.py,
-# ingest_to_qdrant.py, ingest_mcp_server.py) and the memory-bank piece (tools/memory_bank_mcp_server.py)
-# -- memory-bank reuses this same Qdrant client machinery (mcp,
-# this repo's own libs/qdrant_embeddings.py FastEmbedProvider, qdrant-client), so no separate
-# dependency section is needed for it. Install these even if you're not using
-# local-compress.
+# ingest_to_qdrant.py, ingest_mcp_server.py) and the memory-bank piece
+# (mcpservers/memory_bank_mcp_server.py) -- memory-bank reuses this same
+# Qdrant client machinery (mcp, this repo's own libs/qdrant_embeddings.py
+# FastEmbedProvider, qdrant-client), so no separate dependency section is
+# needed for it. Install these even if you're not using local-compress.
 #
 # The servers use `mcp.server.mcpserver.MCPServer`, the officially
 # supported path in mcp>=2.0.0 (the older module path was removed there).
@@ -16,7 +16,7 @@ pydantic_settings
 # hooks/redirect_webfetch_to_fetch_url.py) -- only needed if you're using that
 # piece. If compress_mcp_server.py fails to start with "MCP error -32000:
 # Connection closed" in Claude Code, run it directly
-# (python /absolute/path/to/tools/compress_mcp_server.py) to see which of these is
+# (python /absolute/path/to/mcpservers/compress_mcp_server.py) to see which of these is
 # missing -- a crash on a missing import here looks exactly like a dead
 # connection to Claude Code, with no clearer error surfaced.
 openai

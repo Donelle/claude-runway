@@ -191,7 +191,7 @@ class ServerAndCliShareTheseFunctions(unittest.TestCase):
     """One implementation, two callers: the format cannot drift."""
 
     def test_the_server_uses_the_shared_functions(self):
-        sys.path.insert(0, os.path.join(REPO_ROOT, "tools"))
+        sys.path.insert(0, os.path.join(REPO_ROOT, "mcpservers"))
         os.environ.setdefault("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
         import ingest_mcp_server as ims
 

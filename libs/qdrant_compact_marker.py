@@ -1,7 +1,7 @@
 """
 Collection-metadata marker for conversation-compact collections.
 
-`compact_store` (tools/qdrant_mcp_server.py) writes saved conversation
+`compact_store` (mcpservers/qdrant_mcp_server.py) writes saved conversation
 summaries for /my-compact and /my-resume into their own collections, which
 are only ever read back by project through `compact_find` -- never by
 semantic search. Nothing used to say so: `find_in_collection` would search

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for tools/qdrant_mcp_server.py.
+"""Tests for mcpservers/qdrant_mcp_server.py.
 
 Stdlib-only (unittest, no pytest) and no network -- needs neither a live model
 nor a real database (a fake Qdrant client and a fake embedding provider stand
@@ -24,7 +24,7 @@ from unittest import mock
 
 REPO_ROOT = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, str(REPO_ROOT / "libs"))
-sys.path.insert(0, str(REPO_ROOT / "tools"))
+sys.path.insert(0, str(REPO_ROOT / "mcpservers"))
 
 
 async def _identity_compression(information):
@@ -42,7 +42,7 @@ def _load_qdrant_mcp_server(stub_compression=True):
     replaced by a no-op; the compression tests load the module with it off.
     """
     spec = importlib.util.spec_from_file_location(
-        "qdrant_mcp_server", REPO_ROOT / "tools" / "qdrant_mcp_server.py"
+        "qdrant_mcp_server", REPO_ROOT / "mcpservers" / "qdrant_mcp_server.py"
     )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -715,6 +715,139 @@ class MostRecentSiblingEntryPaginatesFully(unittest.TestCase):
         self.assertEqual(label, "newest")
 
 
+class SameDayCompactsAreOrderedByStoredAt(unittest.TestCase):
+    """Regression coverage: `date` is day-granular, so two
+    compacts made the same day tied on it and stayed in Qdrant scroll order
+    (point-id order, effectively random). compact_store now records a
+    `stored_at` UTC timestamp, and compact_find, the latest-compact lookup and
+    compact_prune's keep_last_n all break date ties on it."""
+
+    def _patched_module(self):
+        mod = _load_qdrant_mcp_server()
+        mod.QdrantClient = _make_fake_qdrant_client_class()
+        mod.FastEmbedProvider = _FakeEmbeddingProvider
+        return mod
+
+    @staticmethod
+    def _put(mod, label, date, stored_at=None, collection=None):
+        """Write a point straight into the fake store, in call order, so the
+        fake's scroll order (insertion order) is under the test's control.
+        `stored_at=None` models a compact stored before the field existed."""
+        payload = {
+            "project": "proj", "label": label, "date": date,
+            "information": f"content of {label}", "metadata": {"source": mod.COMPACT_SOURCE},
+        }
+        if stored_at is not None:
+            payload["stored_at"] = stored_at
+        mod.QdrantClient().upsert(
+            collection or f"{mod.COMPACT_COLLECTION}-proj",
+            [mod.qdrant_models.PointStruct(id=str(mod.uuid.uuid4()), vector={"fake-vector": [0.1, 0.2, 0.3]}, payload=payload)],
+        )
+
+    @staticmethod
+    def _labels_in_order(result):
+        import re
+        return re.findall(r"--- \d+\. \S+ — (\S+) \(id:", result)
+
+    def test_compact_store_records_a_fixed_width_utc_timestamp(self):
+        mod = self._patched_module()
+        _run(mod.compact_store(information="x", project="proj", label="l", date="2026-10-13"))
+        [point] = list(next(iter(mod.QdrantClient().collections.values())).values())
+        self.assertRegex(point.payload["stored_at"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$")
+        # The date field the caller passed is untouched.
+        self.assertEqual(point.payload["date"], "2026-10-13")
+
+    def test_a_retry_with_the_same_identity_refreshes_stored_at(self):
+        mod = self._patched_module()
+        clock = iter(["2026-10-13T10:00:00.000000Z", "2026-10-13T11:00:00.000000Z"])
+        mod._stored_at_now = lambda: next(clock)
+        for _ in range(2):
+            _run(mod.compact_store(information="x", project="proj", label="l", date="2026-10-13"))
+        [point] = list(next(iter(mod.QdrantClient().collections.values())).values())
+        self.assertEqual(point.payload["stored_at"], "2026-10-13T11:00:00.000000Z")
+
+    def test_compact_find_lists_the_later_stored_compact_first(self):
+        # Stored through compact_store with a pinned clock: the second call is
+        # the later one, and without the tiebreak it would come out second
+        # (scroll order), which is the bug.
+        mod = self._patched_module()
+        clock = iter(["2026-10-13T09:00:00.000000Z", "2026-10-13T15:30:00.000000Z"])
+        mod._stored_at_now = lambda: next(clock)
+        _run(mod.compact_store(information="a", project="proj", label="savings-tracker", date="2026-10-13"))
+        _run(mod.compact_store(information="b", project="proj", label="mcp-server-split", date="2026-10-13"))
+        result = _run(mod.compact_find(project="proj"))
+        self.assertEqual(self._labels_in_order(result), ["mcp-server-split", "savings-tracker"])
+
+    def test_date_still_outranks_stored_at(self):
+        # A later day wins even when its timestamp is earlier in the day than
+        # the older day's: stored_at only breaks ties.
+        mod = self._patched_module()
+        self._put(mod, "older-day", "2026-10-12", "2026-10-12T23:59:00.000000Z")
+        self._put(mod, "newer-day", "2026-10-13", "2026-10-13T00:01:00.000000Z")
+        result = _run(mod.compact_find(project="proj"))
+        self.assertEqual(self._labels_in_order(result), ["newer-day", "older-day"])
+
+    def test_a_compact_without_stored_at_sorts_older_than_one_with_it(self):
+        mod = self._patched_module()
+        # Legacy first in scroll order, so only "missing counts as oldest"
+        # (not scroll order) can put the stamped compact on top.
+        self._put(mod, "legacy", "2026-10-13")
+        self._put(mod, "new", "2026-10-13", "2026-10-13T08:00:00.000000Z")
+        result = _run(mod.compact_find(project="proj"))
+        self.assertEqual(self._labels_in_order(result), ["new", "legacy"])
+
+    def test_compacts_without_stored_at_keep_scroll_order_among_themselves(self):
+        mod = self._patched_module()
+        self._put(mod, "first", "2026-10-13")
+        self._put(mod, "second", "2026-10-13")
+        result = _run(mod.compact_find(project="proj"))
+        self.assertEqual(self._labels_in_order(result), ["first", "second"])
+
+    def test_a_non_string_stored_at_does_not_break_the_sort(self):
+        mod = self._patched_module()
+        self._put(mod, "bad", "2026-10-13", 12345)
+        self._put(mod, "good", "2026-10-13", "2026-10-13T08:00:00.000000Z")
+        result = _run(mod.compact_find(project="proj"))
+        self.assertEqual(self._labels_in_order(result), ["good", "bad"])
+
+    def test_latest_compact_lookup_picks_the_later_stored_one(self):
+        mod = self._patched_module()
+        col = f"{mod.COMPACT_COLLECTION}-proj"
+        self._put(mod, "earlier", "2026-10-13", "2026-10-13T09:00:00.000000Z")
+        self._put(mod, "later", "2026-10-13", "2026-10-13T15:30:00.000000Z")
+        # Reverse scroll order too, so a pass is not an accident of ordering.
+        self._put(mod, "earliest", "2026-10-13", "2026-10-13T01:00:00.000000Z")
+        date, label, project = mod._most_recent_sibling_entry(mod.QdrantClient(), col)
+        self.assertEqual((date, label), ("2026-10-13", "later"))
+
+    def test_latest_compact_lookup_prefers_a_stamped_one_over_a_legacy_one(self):
+        mod = self._patched_module()
+        col = f"{mod.COMPACT_COLLECTION}-proj"
+        self._put(mod, "legacy", "2026-10-13")
+        self._put(mod, "new", "2026-10-13", "2026-10-13T09:00:00.000000Z")
+        _date, label, _project = mod._most_recent_sibling_entry(mod.QdrantClient(), col)
+        self.assertEqual(label, "new")
+
+    def test_keep_last_n_keeps_the_later_stored_of_two_same_day_compacts(self):
+        mod = self._patched_module()
+        # Earlier one is first in scroll order, so a tie broken by scroll
+        # order would keep it and delete the newer compact.
+        self._put(mod, "earlier", "2026-10-13", "2026-10-13T09:00:00.000000Z")
+        self._put(mod, "later", "2026-10-13", "2026-10-13T15:30:00.000000Z")
+        result = _run(mod.compact_prune(project="proj", keep_last_n=1, dry_run=False))
+        self.assertIn("Deleted 1 compact(s)", result)
+        [remaining] = list(next(iter(mod.QdrantClient().collections.values())).values())
+        self.assertEqual(remaining.payload["label"], "later")
+
+    def test_keep_last_n_deletes_a_legacy_compact_before_a_stamped_one(self):
+        mod = self._patched_module()
+        self._put(mod, "legacy", "2026-10-13")
+        self._put(mod, "new", "2026-10-13", "2026-10-13T09:00:00.000000Z")
+        _run(mod.compact_prune(project="proj", keep_last_n=1, dry_run=False))
+        [remaining] = list(next(iter(mod.QdrantClient().collections.values())).values())
+        self.assertEqual(remaining.payload["label"], "new")
+
+
 class CompactFindDoesNotLeakOtherProjectsFromAnUnprovenCollection(unittest.TestCase):
     """Regression coverage for a real cross-project leakage bug flagged in
     PR review (round 3): _collections_for_project only proves a
@@ -1308,7 +1441,7 @@ class ServerStartsOverStdio(unittest.TestCase):
 
         params = StdioServerParameters(
             command=sys.executable,
-            args=[str(REPO_ROOT / "tools" / "qdrant_mcp_server.py")],
+            args=[str(REPO_ROOT / "mcpservers" / "qdrant_mcp_server.py")],
             env={"QDRANT_URL": "http://127.0.0.1:9", "COLLECTION_NAME": "never-contacted"},
         )
 

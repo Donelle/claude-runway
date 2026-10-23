@@ -1,7 +1,7 @@
 """Drift tests: everything the toolkit ships must be named where users look for it.
 
 Each assertion fails when something is added without its docs line:
-- every `@mcp.tool()` on every `tools/*_mcp_server.py` is named in
+- every `@mcp.tool()` on every `mcpservers/*_mcp_server.py` is named in
   `templates/CLAUDE.md.template` (a model in an installed project only learns
   a tool exists from that template);
 - every hook in `hooks/` and every directory in `skills/` is named in
@@ -30,8 +30,9 @@ INTERNAL_ENV_VARS = {
     "HOME",
     "USERPROFILE",
     "PATH",
-    # The savings footer's HTML-comment marker (`<!--CLAUDE_RUNWAY_SAVINGS:...-->`),
-    # not a setting.
+    # The HTML-comment marker (`<!--CLAUDE_RUNWAY_SAVINGS:...-->`) the savings
+    # metrics used to travel in, still named in docstrings and tests that explain
+    # why it was replaced; not a setting.
     "CLAUDE_RUNWAY_SAVINGS",
 }
 
@@ -57,7 +58,7 @@ def _mentioned(name: str, text: str) -> bool:
 def registered_tool_names() -> dict[str, list[str]]:
     """Server file -> the names its tools are registered under."""
     out: dict[str, list[str]] = {}
-    for path in sorted((ROOT / "tools").glob("*_mcp_server.py")):
+    for path in sorted((ROOT / "mcpservers").glob("*_mcp_server.py")):
         found = [explicit or func for explicit, func in _TOOL_DECORATOR.findall(path.read_text(encoding="utf-8"))]
         out[path.name] = found
     return out
@@ -65,7 +66,7 @@ def registered_tool_names() -> dict[str, list[str]]:
 
 def env_vars_read() -> set[str]:
     names: set[str] = set()
-    for directory in ("libs", "tools", "hooks"):
+    for directory in ("libs", "tools", "mcpservers", "hooks"):
         for path in (ROOT / directory).glob("*.py"):
             text = path.read_text(encoding="utf-8")
             names.update(_ENV_READ.findall(text))
@@ -111,7 +112,7 @@ class QdrantToolsStayContentAgnostic(unittest.TestCase):
 
     @staticmethod
     def _qdrant_tool_descriptions() -> dict[str, str]:
-        tree = ast.parse(_read("tools/qdrant_mcp_server.py"))
+        tree = ast.parse(_read("mcpservers/qdrant_mcp_server.py"))
         wanted = {"qdrant_find": "qdrant-find", "qdrant_store": "qdrant-store"}
         out = {
             wanted[node.name]: ast.get_docstring(node) or ""
@@ -151,6 +152,16 @@ class QdrantToolsStayContentAgnostic(unittest.TestCase):
         )
         hit = self._MEMORY_BANK_PURPOSE.search(rest)
         self.assertIsNone(hit, f"template outside its memory-bank section mentions {hit.group(0)!r}" if hit else "")
+
+    def test_copy_memories_is_documented_where_it_is_used(self):
+        # test_every_registered_tool_is_in_the_template only needs the name
+        # anywhere in the template; copy_memories writes memories, so it must be
+        # in the memory-bank section (where the dry-run-first rule lives), and
+        # the memory-bank page must describe it.
+        memory_bank, _ = self._split_template()
+        self.assertTrue(_mentioned("copy_memories", memory_bank), "copy_memories missing from the memory-bank section")
+        self.assertIn("dry_run", memory_bank.split("copy_memories", 1)[1])
+        self.assertTrue(_mentioned("copy_memories", _read("docs/memory-bank.md")))
 
     def test_template_does_not_ask_for_notes_after_solving_a_problem(self):
         template = _read("templates/CLAUDE.md.template")

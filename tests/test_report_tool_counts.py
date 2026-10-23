@@ -112,6 +112,19 @@ class AnalyticsServerIsReported(unittest.TestCase):
         self.assertIn("analytics (analytics_mcp_server.py): 5 tools", output)
 
 
+class CodebaseReviewerServerIsReported(unittest.TestCase):
+    def test_it_reports_its_two_tools(self):
+        count, chars = _rtc._report_repo_server("codebase_reviewer_mcp_server")
+        self.assertEqual(count, 2)  # list_reviewers and review
+        self.assertGreater(chars, 0)
+
+    def test_main_prints_its_line(self):
+        captured = io.StringIO()
+        with redirect_stdout(captured):
+            _rtc.main()
+        self.assertIn("codebase-reviewer (codebase_reviewer_mcp_server.py): 2 tools", captured.getvalue())
+
+
 class MainReportsAllServersAndExitsCleanly(unittest.TestCase):
     def test_main_prints_all_server_labels_and_returns_zero(self):
         captured = io.StringIO()

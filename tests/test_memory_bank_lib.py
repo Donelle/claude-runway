@@ -1280,5 +1280,314 @@ class TransferPointsTest(_PatchRetryMixin, unittest.TestCase):
         self.assertEqual(report["already_present"], 2)
 
 
+class ScrollCollectionFilterTest(_PatchRetryMixin, unittest.TestCase):
+    """scroll_collection's optional scroll_filter."""
+
+    def test_filter_is_passed_to_every_page(self):
+        client = MagicMock()
+        client.collection_exists.return_value = True
+        client.scroll.side_effect = [([], "off1"), ([], None)]
+        flt = models.Filter(must=[models.FieldCondition(key="k", match=models.MatchValue(value="v"))])
+        mb.scroll_collection(client, "col", scroll_filter=flt)
+        self.assertEqual(client.scroll.call_count, 2)
+        for c in client.scroll.call_args_list:
+            self.assertIs(c.kwargs["scroll_filter"], flt)
+
+
+class CopyPointIdTest(unittest.TestCase):
+    def test_deterministic(self):
+        self.assertEqual(mb.copy_point_id("memory-bank", "p1", "proj-b"), mb.copy_point_id("memory-bank", "p1", "proj-b"))
+
+    def test_target_repo_is_part_of_the_id(self):
+        # The collision transfer_point_id would have for an in-collection copy:
+        # one source memory copied into two projects must get two ids.
+        self.assertNotEqual(mb.copy_point_id("memory-bank", "p1", "proj-b"), mb.copy_point_id("memory-bank", "p1", "proj-c"))
+
+    def test_source_point_and_collection_are_part_of_the_id(self):
+        base = mb.copy_point_id("memory-bank", "p1", "proj-b")
+        self.assertNotEqual(base, mb.copy_point_id("memory-bank", "p2", "proj-b"))
+        self.assertNotEqual(base, mb.copy_point_id("other", "p1", "proj-b"))
+
+    def test_colon_in_a_name_cannot_make_two_triples_collide(self):
+        self.assertNotEqual(mb.copy_point_id("a:b", "c", "d"), mb.copy_point_id("a", "b:c", "d"))
+        self.assertNotEqual(mb.copy_point_id("c", "a", "b:d"), mb.copy_point_id("c", "a:b", "d"))
+
+    def test_is_a_valid_uuid_string_and_not_the_transfer_id(self):
+        import uuid
+        value = mb.copy_point_id("memory-bank", 42, "proj-b")
+        self.assertEqual(str(uuid.UUID(value)), value)
+        self.assertNotEqual(value, mb.transfer_point_id("memory-bank", 42))
+
+    def test_namespace_is_pinned(self):
+        # Changing the namespace would make every earlier copy look new on a
+        # re-run and duplicate it.
+        self.assertEqual(str(mb.COPY_ID_NAMESPACE), "b3a5d2c1-8e47-5f06-a9d3-2c7e1f4b6a80")
+        self.assertNotEqual(mb.COPY_ID_NAMESPACE, mb.TRANSFER_ID_NAMESPACE)
+        self.assertEqual(
+            mb.copy_point_id("memory-bank", "p1", "proj-b"),
+            str(__import__("uuid").uuid5(mb.COPY_ID_NAMESPACE, '["memory-bank", "p1", "proj-b"]')),
+        )
+
+
+class CopyPointsTest(_PatchRetryMixin, unittest.TestCase):
+    """copy_points' target boundary, filtered read, check-before-write
+    dedup, dry run, and per-point error handling. remember_point is mocked --
+    its own write behavior is covered by RememberPointTest above."""
+
+    COLLECTION = "memory-bank"
+    SOURCE_REPO = "proj-b"
+    ME = "proj-a"
+
+    @staticmethod
+    def _rec(pid, repo="proj-b", **meta):
+        r = MagicMock()
+        r.id = pid
+        doc = meta.pop("document", "sum-" + str(pid))
+        r.payload = {"document": doc, "metadata": {"repo": repo, "description": "d", "kind": "lesson", **meta}}
+        return r
+
+    def _client(self, records, exists=True, present_source_ids=(), target_repo=None):
+        client = MagicMock()
+        client.collection_exists.return_value = exists
+        client.scroll.return_value = (records, None)
+        present = {mb.copy_point_id(self.COLLECTION, sid, target_repo or self.ME) for sid in present_source_ids}
+
+        def _retrieve(collection_name, ids, **kw):
+            return [MagicMock(id=i, payload={"metadata": {"pending": False}}) for i in ids if i in present]
+
+        client.retrieve.side_effect = _retrieve
+        return client
+
+    def _copy(self, client, dry_run=True, remember=None, source_repo=None, kind=None, caller_repo=None):
+        remember = remember or AsyncMock(return_value=("id", 1.0, None))
+        with patch.object(mb, "remember_point", new=remember):
+            report = _run(mb.copy_points(
+                client, _make_provider(), self.COLLECTION, self.SOURCE_REPO if source_repo is None else source_repo,
+                caller_repo=caller_repo or self.ME, embedding_model="m", kind=kind, dry_run=dry_run,
+            ))
+        return report, remember
+
+    def test_dry_run_is_a_report_only_and_lists_each_memory(self):
+        records = [
+            self._rec("a", document="zeta", kind="lesson"),
+            self._rec("b", document="alpha", kind="decision"),
+            self._rec("c", document="beta", kind="lesson"),
+        ]
+        report, remember = self._copy(self._client(records), dry_run=True)
+        remember.assert_not_called()
+        self.assertIs(report["dry_run"], True)
+        self.assertEqual(report["would_copy"], 3)
+        self.assertNotIn("copied", report)
+        self.assertEqual(report["already_present"], 0)
+        self.assertEqual(report["target_repo"], self.ME)
+        self.assertEqual(report["source_repo"], self.SOURCE_REPO)
+        self.assertEqual(report["kind"], "all")
+        # Sorted by kind, then summary; each carries kind and summary.
+        self.assertEqual(
+            [(m["kind"], m["summary"], m["status"]) for m in report["memories"]],
+            [("decision", "alpha", "would_copy"), ("lesson", "beta", "would_copy"), ("lesson", "zeta", "would_copy")],
+        )
+        self.assertNotIn("error", report)
+
+    def test_dry_run_needs_no_embedding_provider(self):
+        report = _run(mb.copy_points(
+            self._client([self._rec("a")]), None, self.COLLECTION, self.SOURCE_REPO,
+            caller_repo=self.ME, embedding_model="m", dry_run=True,
+        ))
+        self.assertEqual(report["would_copy"], 1)
+
+    def test_real_run_writes_under_the_callers_repo_with_a_copy_id(self):
+        records = [self._rec("a", document="the summary", description="the desc", kind="decision", weight=2.0)]
+        report, remember = self._copy(self._client(records), dry_run=False)
+        self.assertEqual(report["copied"], 1)
+        self.assertNotIn("would_copy", report)
+        self.assertEqual(report["memories"][0]["status"], "copied")
+        kw = remember.call_args.kwargs
+        self.assertEqual(kw["repo"], self.ME)
+        self.assertNotEqual(kw["repo"], mb.GENERAL_REPO)
+        self.assertEqual(kw["summary"], "the summary")
+        self.assertEqual(kw["description"], "the desc")
+        self.assertEqual(kw["kind"], "decision")
+        self.assertEqual(kw["weight"], 2.0)
+        self.assertEqual(kw["embedding_model"], "m")
+        self.assertEqual(kw["point_id"], mb.copy_point_id(self.COLLECTION, "a", self.ME))
+        self.assertEqual(remember.call_args.args[2], self.COLLECTION)
+
+    def test_nothing_is_ever_written_under_another_repo_or_general(self):
+        records = [self._rec("a"), self._rec("b", kind="decision")]
+        _, remember = self._copy(self._client(records), dry_run=False)
+        self.assertEqual({c.kwargs["repo"] for c in remember.call_args_list}, {self.ME})
+
+    def test_scroll_filter_is_source_repo_scoped_and_excludes_pending(self):
+        client = self._client([self._rec("a")])
+        self._copy(client)
+        flt = client.scroll.call_args.kwargs["scroll_filter"]
+        must = {c.key: c.match.value for c in flt.must}
+        self.assertEqual(must, {mb.SOURCE_FIELD: mb.MEMORY_BANK_SOURCE, mb.REPO_FIELD: self.SOURCE_REPO})
+        self.assertEqual([(c.key, c.match.value) for c in flt.must_not], [(mb.PENDING_FIELD, True)])
+        self.assertEqual(client.scroll.call_args.kwargs["collection_name"], self.COLLECTION)
+
+    def test_kind_adds_a_kind_condition_and_is_reported(self):
+        client = self._client([self._rec("a")])
+        report, _ = self._copy(client, kind="decision")
+        flt = client.scroll.call_args.kwargs["scroll_filter"]
+        must = {c.key: c.match.value for c in flt.must}
+        self.assertEqual(must[mb.KIND_FIELD], "decision")
+        self.assertEqual(report["kind"], "decision")
+
+    def test_all_kinds_has_no_kind_condition(self):
+        client = self._client([self._rec("a")])
+        self._copy(client, kind=None)
+        flt = client.scroll.call_args.kwargs["scroll_filter"]
+        self.assertNotIn(mb.KIND_FIELD, [c.key for c in flt.must])
+
+    def test_general_source_is_refused_and_nothing_is_read_or_written(self):
+        client = self._client([self._rec("a", repo=mb.GENERAL_REPO)])
+        report, remember = self._copy(client, source_repo=mb.GENERAL_REPO, dry_run=False)
+        self.assertIn("general", report["error"])
+        client.scroll.assert_not_called()
+        remember.assert_not_called()
+
+    def test_own_repo_as_source_is_refused(self):
+        client = self._client([self._rec("a", repo=self.ME)])
+        report, remember = self._copy(client, source_repo=self.ME, dry_run=False)
+        self.assertIn("error", report)
+        client.scroll.assert_not_called()
+        remember.assert_not_called()
+
+    def test_blank_source_repo_is_refused(self):
+        for blank in ("", "   "):
+            client = self._client([])
+            report, remember = self._copy(client, source_repo=blank, dry_run=False)
+            self.assertIn("required", report["error"])
+            client.scroll.assert_not_called()
+            remember.assert_not_called()
+
+    def test_missing_collection_reports_error_without_scrolling(self):
+        client = self._client([], exists=False)
+        report, remember = self._copy(client, dry_run=False)
+        self.assertIn("does not exist", report["error"])
+        client.scroll.assert_not_called()
+        remember.assert_not_called()
+
+    def test_no_matching_memories_is_a_clean_empty_report(self):
+        report, remember = self._copy(self._client([]), dry_run=False)
+        self.assertEqual(report["copied"], 0)
+        self.assertEqual(report["memories"], [])
+        self.assertNotIn("error", report)
+        remember.assert_not_called()
+
+    def test_already_present_copies_are_skipped_not_rewritten(self):
+        records = [self._rec("a"), self._rec("b")]
+        client = self._client(records, present_source_ids=["a"])
+        report, remember = self._copy(client, dry_run=False)
+        self.assertEqual(report["already_present"], 1)
+        self.assertEqual(report["copied"], 1)
+        remember.assert_called_once()
+        self.assertEqual(remember.call_args.kwargs["point_id"], mb.copy_point_id(self.COLLECTION, "b", self.ME))
+        self.assertEqual({m["id"]: m["status"] for m in report["memories"]}, {"a": "already_present", "b": "copied"})
+
+    def test_dry_run_also_reports_already_present(self):
+        client = self._client([self._rec("a")], present_source_ids=["a"])
+        report, _ = self._copy(client, dry_run=True)
+        self.assertEqual(report["already_present"], 1)
+        self.assertEqual(report["would_copy"], 0)
+
+    def test_same_source_copied_into_two_projects_does_not_collide(self):
+        # What transfer_point_id could not do for an in-collection copy: project
+        # A already holding a copy must not make project C's copy look present.
+        records = [self._rec("a")]
+        client = self._client(records, present_source_ids=["a"], target_repo="proj-a")
+        report, remember = self._copy(client, dry_run=False, caller_repo="proj-c")
+        self.assertEqual(report["already_present"], 0)
+        self.assertEqual(report["copied"], 1)
+        self.assertEqual(remember.call_args.kwargs["repo"], "proj-c")
+
+    def test_pending_copy_is_rewritten_not_counted_present(self):
+        client = self._client([self._rec("a"), self._rec("b")])
+        stuck = mb.copy_point_id(self.COLLECTION, "a", self.ME)
+        done = mb.copy_point_id(self.COLLECTION, "b", self.ME)
+        client.retrieve.side_effect = lambda collection_name, ids, **kw: [
+            MagicMock(id=stuck, payload={"metadata": {"pending": True}}),
+            MagicMock(id=done, payload={"metadata": {"pending": False}}),
+        ]
+        report, remember = self._copy(client, dry_run=False)
+        self.assertEqual(report["already_present"], 1)
+        self.assertEqual(report["copied"], 1)
+        self.assertEqual(remember.call_args.kwargs["point_id"], stuck)
+
+    def test_second_real_run_is_all_already_present(self):
+        records = [self._rec("a"), self._rec("b")]
+        _, first = self._copy(self._client(records), dry_run=False)
+        written = [c.kwargs["point_id"] for c in first.call_args_list]
+        client = self._client(records)
+        client.retrieve.side_effect = lambda collection_name, ids, **kw: [
+            MagicMock(id=i, payload={"metadata": {"pending": False}}) for i in ids if i in written
+        ]
+        report, second = self._copy(client, dry_run=False)
+        second.assert_not_called()
+        self.assertEqual(report["already_present"], 2)
+        self.assertEqual(report["copied"], 0)
+
+    def test_invalid_fields_go_to_errors_not_the_collection(self):
+        records = [
+            self._rec("empty-summary", document="  "),
+            self._rec("no-kind", kind=None),
+            self._rec("neg-weight", weight=-1),
+            self._rec("ok"),
+        ]
+        report, remember = self._copy(self._client(records), dry_run=False)
+        self.assertEqual({e["id"] for e in report["errors"]}, {"empty-summary", "no-kind", "neg-weight"})
+        self.assertEqual(report["copied"], 1)
+        remember.assert_called_once()
+        self.assertEqual([m["id"] for m in report["memories"]], ["ok"])
+
+    def test_scroll_errors_are_reported(self):
+        bad = MagicMock()
+        bad.id = "no-meta"
+        bad.payload = {"document": "x"}
+        report, _ = self._copy(self._client([bad, self._rec("a")]), dry_run=False)
+        self.assertEqual([e["id"] for e in report["errors"]], ["no-meta"])
+        self.assertEqual(report["copied"], 1)
+
+    def test_one_failing_write_does_not_abort_the_run(self):
+        remember = AsyncMock(side_effect=[RuntimeError("boom"), ("id", 1.0, None)])
+        report, _ = self._copy(self._client([self._rec("a"), self._rec("b")]), dry_run=False, remember=remember)
+        self.assertEqual(report["copied"], 1)
+        self.assertEqual(len(report["errors"]), 1)
+        self.assertIn("boom", report["errors"][0]["error"])
+        self.assertEqual(len(report["memories"]), 1)
+
+    def test_embedding_mismatch_stops_the_run(self):
+        remember = AsyncMock(return_value=(None, None, "Error: mismatch"))
+        report, _ = self._copy(self._client([self._rec("a"), self._rec("b")]), dry_run=False, remember=remember)
+        self.assertEqual(report["error"], "Error: mismatch")
+        self.assertEqual(remember.call_count, 1)
+        self.assertEqual(report["copied"], 0)
+
+
+class FinishedPointIdsTest(_PatchRetryMixin, unittest.TestCase):
+    """The lookup transfer_points and copy_points now share."""
+
+    def test_missing_collection_or_no_ids_skips_retrieve(self):
+        client = MagicMock()
+        client.collection_exists.return_value = False
+        self.assertEqual(mb._finished_point_ids(client, "c", ["a"]), set())
+        self.assertEqual(mb._finished_point_ids(client, "c", []), set())
+        client.retrieve.assert_not_called()
+
+    def test_batches_and_excludes_pending(self):
+        client = MagicMock()
+        client.collection_exists.return_value = True
+        ids = [f"id{i}" for i in range(mb._SCROLL_BATCH_SIZE + 1)]
+        client.retrieve.side_effect = lambda collection_name, ids, **kw: [
+            MagicMock(id=i, payload={"metadata": {"pending": i == "id0"}}) for i in ids
+        ]
+        found = mb._finished_point_ids(client, "c", ids)
+        self.assertEqual(client.retrieve.call_count, 2)
+        self.assertNotIn("id0", found)
+        self.assertEqual(len(found), len(ids) - 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -3,7 +3,7 @@ Shared, cross-tool metrics store -- ONE generic SQLite table
 any domain in this toolkit can write into (memory-bank's recall/remember
 events, my-gh-autowork's per-ticket run metrics, whatever comes next),
 behind ONE small `MetricsStore` class and ONE new MCP tool
-(`get_metrics`, in tools/analytics_mcp_server.py -- see that file).
+(`get_metrics`, in mcpservers/analytics_mcp_server.py -- see that file).
 
 Why this exists instead of "add a new MCP tool per domain": the toolkit's
 connected MCP servers already expose many tools (`python
@@ -57,7 +57,7 @@ actual domain operation being measured), matching
 (summary/by_event_type/trend/detail) do NOT fail open -- they raise, the same way
 `savings_ledger.py`'s query_* functions do; it's the CALLER's job to decide
 whether a read failure should produce a friendly error string (see
-`get_metrics` in tools/analytics_mcp_server.py, which wraps these in a
+`get_metrics` in mcpservers/analytics_mcp_server.py, which wraps these in a
 try/except exactly like `savings_summary`/`savings_detail`/`savings_trend`
 already do) or propagate further.
 """
@@ -360,7 +360,7 @@ class MetricsStore:
     # -------------------------------------------------------------------
     # Reads -- raise on failure (see module docstring); callers wrap these
     # in their own try/except when a friendlier error string is wanted
-    # (e.g. tools/analytics_mcp_server.py's get_metrics tool).
+    # (e.g. mcpservers/analytics_mcp_server.py's get_metrics tool).
     # -------------------------------------------------------------------
 
     def summary(self, metric_id: str, session_id: Optional[str] = None) -> dict:
@@ -613,7 +613,7 @@ class MetricsStore:
 
 
 # ---------------------------------------------------------------------------
-# Formatting -- shared by the get_metrics MCP tool (tools/analytics_mcp_server.py)
+# Formatting -- shared by the get_metrics MCP tool (mcpservers/analytics_mcp_server.py)
 # and skills/my-metrics/SKILL.md, so both surfaces render identically. Kept
 # deliberately simpler than savings_ledger.py's formatting (no bars/sparklines) --
 # this generic store has no domain-specific rendering (skills/my-metrics is

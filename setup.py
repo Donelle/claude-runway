@@ -3,8 +3,8 @@
 Computes the wheel's `data_files` list at BUILD time --
 supplements pyproject.toml's static `[project]`/`[tool.setuptools]` tables
 with the one thing PEP 621 has no declarative equivalent for: shipping
-libs/, tools/, hooks/, templates/, and skills/ as wheel DATA files under
-<env>/src/{libs,tools,hooks,templates,skills} instead of as
+libs/, tools/, mcpservers/, hooks/, templates/, and skills/ as wheel DATA files
+under <env>/src/{libs,tools,mcpservers,hooks,templates,skills} instead of as
 `[tool.setuptools] packages` (which previously put them directly in
 site-packages -- the generic top-level-namespace layout this project moved
 away from; see pyproject.toml's own `[tool.setuptools]` comment block).
@@ -28,12 +28,19 @@ named SKILL.md into just one, silently dropping every skill but the last
 last skill's SKILL.md in the built wheel). One tuple per subdirectory
 preserves each skill's own name as part of the install path instead.
 
-Every script under tools/ and hooks/ already computes its own repo root
-from `__file__` and resolves libs/'s and templates/'s content relative to
-that (e.g. tools/setup_project.py's `TOOLS_REPO_DIR`, each hook's `_root`/
-`_candidates` lookup) -- that arithmetic keeps resolving correctly here
-because these five directories are still installed as SIBLINGS of each
-other, just under <env>/src/ instead of directly under site-packages.
+Every script under tools/, mcpservers/ and hooks/ already computes its own
+repo root from `__file__` and resolves libs/'s and templates/'s content
+relative to that (e.g. tools/setup_project.py's `TOOLS_REPO_DIR`, each hook's
+`_root`/`_candidates` lookup, each MCP server's `dirname(dirname(__file__))`
+libs/ insert) -- that arithmetic keeps resolving correctly here because these
+six directories are still installed as SIBLINGS of each other, just under
+<env>/src/ instead of directly under site-packages.
+
+mcpservers/ holds the MCP servers Claude Code launches
+(`*_mcp_server.py`), kept apart from tools/ (the CLIs a person runs). It must
+never get an `__init__.py`: a folder named `mcp` would shadow the SDK package
+the servers import, and the `mcpservers` name plus no `__init__.py` keeps the
+SDK's `mcp` unambiguous.
 """
 
 import glob
@@ -82,6 +89,7 @@ def data_files() -> list[tuple[str, list[str]]]:
     entries = [
         _flat_data_files("libs", "*.py"),
         _flat_data_files("tools", "*.py"),
+        _flat_data_files("mcpservers", "*.py"),
         _flat_data_files("hooks", "*.py"),
         _flat_data_files("templates", "*.template"),
     ]

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for the memory-bank guards added to tools/ingest_mcp_server.py:
+"""Tests for the memory-bank guards added to mcpservers/ingest_mcp_server.py:
 
 
 - index_repo/sync_repo refuse outright when their target collection matches
@@ -28,7 +28,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "libs"))
-sys.path.insert(0, os.path.join(REPO_ROOT, "tools"))
+sys.path.insert(0, os.path.join(REPO_ROOT, "mcpservers"))
 
 os.environ.setdefault("QDRANT_URL", "http://localhost:6333")
 os.environ.setdefault("COLLECTION_NAME", "test-collection")

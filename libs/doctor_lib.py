@@ -52,7 +52,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping, Optional
 
-from setup_project_lib import LEGACY_COMPRESS_HOOK_SCRIPT
+from codebase_reviewer_config_lib import ConfigError, ReviewersConfig, load_reviewers_file, read_settings
+from setup_project_lib import (
+    LEGACY_COMPRESS_HOOK_SCRIPT,
+    MalformedConfigError,
+    check_object_member,
+    read_config_object,
+)
 
 DEFAULT_LMSTUDIO_URL = "http://localhost:1234/v1"
 _AUTO_DETECT_MODEL = "(auto-detect -- no model pinned)"
@@ -185,30 +191,28 @@ class DualEnvMismatch:
     server: str = "local-compress"
 
 
-class MalformedMcpJsonError(Exception):
-    """
-    Raised when `.mcp.json` EXISTS and (for the JSON-parse step) parses,
-    but its shape is invalid enough that this module can't safely tell
-    whether `local-compress` is configured or not -- e.g. `"mcpServers":
-    null` or a list, `"local-compress"` present but not an object
-    (including an explicit `null` value, distinguished from a genuinely
-    ABSENT key -- see `load_local_compress_env`), a non-object `env`
-    block, a non-string value inside `env`, or the file itself being
-    unreadable/not valid JSON at all.
-
-    Deliberately distinct from returning `None` (a MISSING file, or valid
-    JSON that simply omits `local-compress` -- e.g. a genuine
-    `--qdrant-only` setup): both of those legitimately mean "nothing to
-    check here," but a malformed/unreadable config is a real problem the
-    caller must not silently treat the same way. Found in review:
-    the previous code returned `None` for a malformed shape it hadn't
-    anticipated too, which conflated "nothing configured" (exit 0) with
-    "config is broken" (should exit nonzero) -- and for the shapes it
-    HADN'T anticipated at all (`"mcpServers": null` or a list), it instead
-    raised an uncaught `AttributeError` from the blind `.get()` chain,
-    which is strictly worse: an unhandled crash rather than either
-    reportable outcome.
-    """
+# `.mcp.json` EXISTS but its shape is invalid enough that this module can't
+# safely tell whether `local-compress` is configured or not -- e.g. `"mcpServers":
+# null` or a list, `"local-compress"` present but not an object (including an
+# explicit `null` value, distinguished from a genuinely ABSENT key -- see
+# `load_server_env`), a non-object `env` block, a non-string value inside
+# `env`, or the file itself being unreadable/not valid JSON at all.
+#
+# Deliberately distinct from returning `None` (a MISSING file, or valid JSON
+# that simply omits `local-compress` -- e.g. a genuine `--qdrant-only` setup):
+# both of those legitimately mean "nothing to check here," but a malformed/
+# unreadable config is a real problem the caller must not silently treat the
+# same way. Found in review: the previous code returned `None` for a
+# malformed shape it hadn't anticipated too, which conflated "nothing
+# configured" (exit 0) with "config is broken" (should exit nonzero) -- and
+# for the shapes it HADN'T anticipated at all (`"mcpServers": null` or a
+# list), it instead raised an uncaught `AttributeError` from the blind
+# `.get()` chain, which is strictly worse.
+#
+# This is the same class `init`/`upgrade` raise for the same files
+# (`setup_project_lib.MalformedConfigError`), so the three CLIs report a
+# malformed config identically; the old name stays for existing callers.
+MalformedMcpJsonError = MalformedConfigError
 
 
 def load_local_compress_env(mcp_json_path: Path) -> Optional[dict]:
@@ -222,26 +226,17 @@ def load_server_env(mcp_json_path: Path, server_name: str) -> Optional[dict]:
     or `None` if the file doesn't exist, or exists and parses as valid
     JSON but simply doesn't configure that server (e.g. no `local-compress`
     in a `--qdrant-only` setup) -- either of which means there's nothing to
-    dual-check here. Raises `MalformedMcpJsonError` (see its docstring) for
+    dual-check here. Raises `MalformedMcpJsonError` (see the comment above it) for
     every other bad shape, rather than silently treating it the same as
     "nothing configured," or crashing with an unhandled `AttributeError`
     on a `.get()` chain that assumed every level was already a dict.
     """
     if not mcp_json_path.is_file():
         return None
-    try:
-        with open(mcp_json_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
-        raise MalformedMcpJsonError(f"{mcp_json_path} could not be read as valid JSON: {exc}") from exc
-    if not isinstance(data, dict):
-        raise MalformedMcpJsonError(f"{mcp_json_path}'s top level is a {type(data).__name__}, expected an object")
-
-    mcp_servers = data.get("mcpServers", {})
-    if not isinstance(mcp_servers, dict):
-        raise MalformedMcpJsonError(
-            f"{mcp_json_path}'s \"mcpServers\" is a {type(mcp_servers).__name__}, expected an object"
-        )
+    # The parse and the top-level/`mcpServers` shape checks are the shared
+    # ones `init`/`upgrade` use too, with the same messages.
+    data = read_config_object(mcp_json_path)
+    mcp_servers = check_object_member(mcp_json_path, data, "mcpServers")
 
     if server_name not in mcp_servers:
         return None  # valid config, simply no such server configured
@@ -335,6 +330,13 @@ class DoctorResult:
     # override, the one server that reads that database.
     analytics_checked: bool = False
     config_error: Optional[str] = None
+    # True when `.mcp.json` has a `codebase-reviewer` block, so its reviewers
+    # file was checked. `reviewers_file_problem` is then the full message
+    # (naming the file and every problem) when it is missing, unreadable or
+    # invalid, or when a numeric setting is bad; None when all is well.
+    reviewer_checked: bool = False
+    reviewers_file_problem: Optional[str] = None
+    reviewers_file_summary: str = ""
     # Hook events in .claude/settings.json still invoking the pre-rename
     # compress_bash_output.py (see find_legacy_compress_hook_events).
     legacy_compress_hook_events: list = field(default_factory=list)
@@ -388,6 +390,7 @@ def run_doctor(target_repo: Path, *, shell_env: Mapping[str, str], home_dir: Opt
         compress_env = load_server_env(mcp_json_path, "local-compress")
         qdrant_env = load_server_env(mcp_json_path, "qdrant")
         analytics_env = load_server_env(mcp_json_path, "analytics")
+        reviewer_env = load_server_env(mcp_json_path, "codebase-reviewer")
     except MalformedMcpJsonError as exc:
         return DoctorResult(mcp_json_path=mcp_json_path, local_compress_configured=False, config_error=str(exc))
     legacy_events = find_legacy_compress_hook_events(Path(target_repo))
@@ -405,14 +408,46 @@ def run_doctor(target_repo: Path, *, shell_env: Mapping[str, str], home_dir: Opt
     analytics_checked = _carries_any(analytics_env, "analytics")
     if analytics_env is not None:
         mismatches += check_dual_env_vars(analytics_env, shell_env, home_dir=resolved_home, server="analytics")
+    reviewer_problem, reviewer_summary = _check_reviewers_file(reviewer_env, shell_env, Path(target_repo))
     return DoctorResult(
         mcp_json_path=mcp_json_path,
         local_compress_configured=compress_env is not None,
         mismatches=mismatches,
         qdrant_checked=qdrant_checked,
         analytics_checked=analytics_checked,
+        reviewer_checked=reviewer_env is not None,
+        reviewers_file_problem=reviewer_problem,
+        reviewers_file_summary=reviewer_summary,
         legacy_compress_hook_events=legacy_events,
     )
+
+
+def _check_reviewers_file(
+    reviewer_env: Optional[dict], shell_env: Mapping[str, str], target_repo: Path
+) -> "tuple[Optional[str], str]":
+    """
+    For a project with a `codebase-reviewer` block, loads its reviewers file the
+    way the server will and returns `(problem, summary)`: `problem` is None
+    when the file is fine, else the message that names the file and what is
+    wrong (the server's own, so the two never disagree); `summary` describes a
+    good file. `(None, "")` when the project has no such block.
+
+    The values the server sees are the shell environment with the block's `env`
+    on top: a key PRESENT in the block wins even when blank (blank is then "not
+    set", the required-setting error), a key absent from it inherits the shell.
+    A relative path resolves against the project directory, where Claude Code
+    launches the server from. Settings are checked too: a bad `MAX_REVIEWERS`
+    makes the server refuse to run just as a bad file does.
+    """
+    if reviewer_env is None:
+        return None, ""
+    effective = {**shell_env, **reviewer_env}
+    try:
+        read_settings(effective)
+        config: ReviewersConfig = load_reviewers_file(effective.get("REVIEWERS_FILE", ""), base_dir=target_repo)
+    except ConfigError as exc:
+        return str(exc), ""
+    return None, f"{config.path} ({len(config.reviewers)} reviewer(s), {len(config.rubric)} rubric entr{'y' if len(config.rubric) == 1 else 'ies'})"
 
 
 def _carries_any(env: Optional[dict], server: str) -> bool:

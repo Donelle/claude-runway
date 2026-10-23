@@ -24,6 +24,7 @@ import unittest
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SKILL_PATH = os.path.join(REPO_ROOT, ".claude", "skills", "my-gh-autowork", "SKILL.md")
 SETTINGS_TEMPLATE_PATH = os.path.join(REPO_ROOT, "templates", "settings.json.template")
+README_PATH = os.path.join(REPO_ROOT, "README.md")
 
 # Mirrors the regex embedded in SKILL.md's Step 0 preflight check:
 #   jq -e '(.permissions.allow // []) | any(test("^Bash\\((git|gh|uv)[ :)]|^Bash\\(\\.venv/(bin|Scripts)/"))'
@@ -202,8 +203,12 @@ class SettingsTemplateContentRequirements(unittest.TestCase):
         self.assertIn("arbitrary-command-execution bypass", self.content)
         self.assertIn("git -c alias", self.content)
 
-    def test_permissions_note_prefers_project_scope(self):
-        self.assertIn("PREFERRED", self.content)
+    def test_permissions_note_no_longer_calls_project_scope_preferred(self):
+        # Project-scoped permissions.allow is irrelevant to the auto mode classifier
+        # (autoMode is read from the user-level file only), so the note must not present
+        # project scope as the PREFERRED fix for the classifier's denial.
+        self.assertNotIn("PREFERRED", self.content)
+        self.assertNotIn("project-scoped", self.content)
 
     def test_permissions_note_does_not_present_narrow_rules_as_safe(self):
         # Even the narrow per-subcommand rules still permit code execution through
@@ -234,6 +239,83 @@ class SettingsTemplateContentRequirements(unittest.TestCase):
         # trailing comma or unescaped quote in the note would break every
         # consumer of this template (setup_project_lib.py's load_json()).
         json.loads(self.content)
+
+
+INSTALLATION_PATH = os.path.join(REPO_ROOT, "docs", "installation.md")
+
+
+class AutoModeAllowDocumentation(unittest.TestCase):
+    """The classifier's [Merge Without Review] denial is cleared by `autoMode.allow` in the
+    user-level ~/.claude/settings.json, not by a Bash permission rule. Every place that
+    used to point at the Bash rules for it must now name the real lever, and must not
+    claim a Bash rule (or project scope) is the cause or the fix."""
+
+    def _read(self, path):
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+
+    def _template_note(self):
+        import json
+
+        return json.loads(self._read(SETTINGS_TEMPLATE_PATH))["_permissions_note"]
+
+    def _documents(self):
+        return {
+            "README.md": self._read(README_PATH),
+            "docs/installation.md": self._read(INSTALLATION_PATH),
+            "SKILL.md": self._read(SKILL_PATH),
+            "settings.json.template _permissions_note": self._template_note(),
+        }
+
+    def test_every_place_names_the_real_lever(self):
+        for name, text in self._documents().items():
+            with self.subTest(document=name):
+                self.assertIn("autoMode.allow", text)
+                self.assertIn("Merge Without Review", text)
+                self.assertIn("~/.claude/settings.json", text)
+
+    def test_every_place_keeps_the_built_in_rules(self):
+        # An `allow` list without the literal "$defaults" replaces the built-in rules.
+        for name, text in self._documents().items():
+            with self.subTest(document=name):
+                self.assertIn('"$defaults"', text)
+
+    def test_every_place_says_how_to_confirm(self):
+        for name, text in self._documents().items():
+            with self.subTest(document=name):
+                self.assertIn("claude auto-mode config", text)
+
+    def test_every_place_says_claude_cannot_make_the_edit(self):
+        for name, text in self._documents().items():
+            with self.subTest(document=name):
+                self.assertIn("Self-Modification", text)
+
+    def test_every_place_says_autoMode_is_user_scope_only(self):
+        for name, text in self._documents().items():
+            with self.subTest(document=name):
+                self.assertIn(".claude/settings.local.json", text)
+
+    def test_bash_rules_are_described_as_a_separate_layer(self):
+        for name, text in self._documents().items():
+            with self.subTest(document=name):
+                self.assertIn("after the permission rules", text.lower())
+
+    def test_skill_preflight_does_not_present_a_bash_rule_as_the_classifier_cause(self):
+        content = self._read(SKILL_PATH)
+        start = content.find("Baseline Bash permission preflight")
+        self.assertNotEqual(start, -1)
+        preflight = content[start : start + 1200]
+        self.assertIn("and nothing more", preflight)
+        self.assertIn("a missing Bash rule is not its cause", preflight)
+        # the old framing called a missing rule a "precondition of the one workaround
+        # that has actually worked"
+        self.assertNotIn("workaround that has actually worked", content)
+
+    def test_documents_the_suggested_entry_in_each_place(self):
+        for name, text in self._documents().items():
+            with self.subTest(document=name):
+                self.assertIn("review_on_push", text)
+                self.assertIn("this is deliberate, not a review bypass", text)
 
 
 class BaselinePermissionRegexLogic(unittest.TestCase):

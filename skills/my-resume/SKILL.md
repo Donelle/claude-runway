@@ -12,7 +12,7 @@ Optional argument: a keyword or phrase to narrow which compact to find (e.g., `/
    - `project`: the working directory name from step 1
    - `query` (optional): the argument if one was provided (e.g., `"auth refactor"`)
 
-   Note: `compact_find` filters by `project` using Qdrant's native payload filter — it only returns compacts for this project. When no `query` is provided, results are sorted by date descending. When a `query` keyword is provided, results are relevance-ordered (most semantically similar first). Do NOT use `qdrant-find` here — that searches the shared codebase collection where compacts are buried under code chunks.
+   Note: `compact_find` filters by `project` using Qdrant's native payload filter — it only returns compacts for this project. When no `query` is provided, results are sorted newest first (by date, then by the time each was stored, so two compacts from the same day are in the order they were made). When a `query` keyword is provided, results are relevance-ordered (most semantically similar first). Do NOT use `qdrant-find` here — that searches the shared codebase collection where compacts are buried under code chunks.
 
 3. **Handle results by count**:
 

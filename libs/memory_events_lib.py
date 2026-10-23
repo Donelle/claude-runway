@@ -36,9 +36,9 @@ rollup (most-recalled memories, memories never recalled, retrieval trend
 over time) is computed later via GROUP BY, not maintained in place.
 
 Session identity -- a real constraint, not a shortcut: this file is written
-from `tools/memory_bank_mcp_server.py`, an MCP server, which (unlike a hook)
+from `mcpservers/memory_bank_mcp_server.py`, an MCP server, which (unlike a hook)
 has NO access to Claude Code's actual session_id -- see
-`tools/compress_mcp_server.py`'s `_append_savings_footer` docstring, which
+`mcpservers/compress_mcp_server.py`'s `_attach_savings_metrics` docstring, which
 documents the identical limitation for the local-compress server. A stdio
 MCP server subprocess is spawned fresh per Claude Code session (one process
 per session -- see `libs/qdrant_collection_hints.py`'s docstring for the
@@ -49,7 +49,7 @@ and passes it in as `session_id` on every call here -- a documented proxy
 for "this session," not Claude Code's own internal id.
 
 `turn` is likewise caller-maintained (a plain in-process counter), not
-computed in this module -- see the caller (`tools/memory_bank_mcp_server.py`)
+computed in this module -- see the caller (`mcpservers/memory_bank_mcp_server.py`)
 for why it increments once per tool CALL, not once per event row.
 
 Follows this repo's small, function-based, dependency-light interface over
@@ -237,7 +237,7 @@ def record_memory_metric(event_type: str, session_id: Optional[str] = None) -> N
     "remember", "forget") -- raises ValueError otherwise, same fail-loud-on-
     caller-bug convention as `record_memory_event`'s own `_VALID_EVENT_TYPES`
     check (this module is only ever invoked by this repo's own three call
-    sites in tools/memory_bank_mcp_server.py). Note this set is intentionally
+    sites in mcpservers/memory_bank_mcp_server.py). Note this set is intentionally
     WIDER than `_VALID_EVENT_TYPES` -- "forget" is valid here even though
     `record_memory_event` rejects it, because a plain call count carries none
     of the "autonomous removal" concern that excludes forget from the richer
@@ -247,7 +247,7 @@ def record_memory_metric(event_type: str, session_id: Optional[str] = None) -> N
     -- callers must invoke this unconditionally for every tool invocation
     (including one that goes on to hit a validation error, an embedding
     mismatch, or returns zero results), matching the existing `turn`
-    counter's philosophy in tools/memory_bank_mcp_server.py: a counter meant
+    counter's philosophy in mcpservers/memory_bank_mcp_server.py: a counter meant
     to answer "how often is this called" undercounts if it silently skips
     failed attempts.
 

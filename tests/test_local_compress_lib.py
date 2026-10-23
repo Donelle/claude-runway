@@ -1093,9 +1093,9 @@ class CompressEarlyReturnDisclosure(unittest.TestCase):
         self.assertEqual(self._run(text, max_chars=500), text)
 
     def test_disclosure_note_never_looks_like_real_compression(self):
-        # compress_mcp_server.py's savings-tracker footer credits savings
+        # compress_mcp_server.py's savings-tracker envelope credits savings
         # only when the result starts with "[compressed" (see
-        # _append_savings_footer) -- no compression ran here, so the
+        # _attach_savings_metrics) -- no compression ran here, so the
         # disclosure note must never trip that detection.
         text = "x" * 10_000
         result = self._run(text, max_chars=500)
@@ -3075,6 +3075,147 @@ class TimeoutVersusConnectionFailureReporting(unittest.TestCase):
             L.complete, L.resolve_model = real
         self.assertIn("LM Studio request failed (chunk 1/1) -- check it's still running", out)
 
+    # -- HTTP 400 rejections ---------------------------------------------------
+
+    _CTX_MSG = (
+        "The number of tokens to keep from the initial prompt is greater than the "
+        "context length. Try to load the model with a larger context length, or "
+        "provide a shorter input"
+    )
+
+    @staticmethod
+    def _http_error(status, body=None, message="Error code: 400 - noisy repr"):
+        """An exception shaped like the OpenAI SDK's status errors: `status_code`,
+        a parsed `body` and a `message`. The library duck-types these, so no
+        `openai` import is needed here."""
+        class _HttpError(Exception):
+            pass
+        e = _HttpError(message)
+        e.status_code = status
+        e.body = body
+        e.message = message
+        return e
+
+    def _ctx_error(self):
+        return self._http_error(400, self._CTX_MSG)
+
+    def test_complete_records_a_400_with_the_server_message_and_clears_on_read(self):
+        import local_compress_lib as L
+        self.assertIsNone(L.complete(self._fake_client([self._ctx_error()]), "m", "s", "c"))
+        self.assertEqual(L.take_failure(), ("bad_request", self._CTX_MSG))
+        self.assertEqual(L.take_failure(), (None, None), "reading must clear kind and detail")
+
+    def test_take_failure_kind_also_clears_the_detail(self):
+        import local_compress_lib as L
+        L.complete(self._fake_client([self._ctx_error()]), "m", "s", "c")
+        self.assertEqual(L.take_failure_kind(), "bad_request")
+        self.assertEqual(L.take_failure(), (None, None))
+
+    def test_a_later_failure_does_not_inherit_a_400s_detail(self):
+        import local_compress_lib as L
+        L.complete(self._fake_client([self._ctx_error()]), "m", "s", "c")
+        L.complete(self._fake_client([self._conn_error()]), "m", "s", "c")
+        self.assertEqual(L.take_failure(), ("other", None))
+
+    def test_only_a_400_is_a_bad_request(self):
+        import local_compress_lib as L
+        for exc, kind in (
+            (self._http_error(404, {"message": "model not found"}), "other"),
+            (self._http_error(500, "boom"), "other"),
+            (self._http_error(None, "no status"), "other"),
+            (self._conn_error(), "other"),
+            (self._timeout(), "timeout"),
+        ):
+            with self.subTest(exc=repr(exc)):
+                self.assertIsNone(L.complete(self._fake_client([exc]), "m", "s", "c"))
+                self.assertEqual(L.take_failure_kind(), kind)
+
+    def test_server_message_shapes(self):
+        import local_compress_lib as L
+        # LM Studio's own shape: {"error": "<text>"} reaches the SDK's .body as the bare string.
+        self.assertEqual(L._server_error_detail(self._http_error(400, "plain text")), "plain text")
+        # OpenAI shape: {"error": {"message": ...}} arrives as {"message": ...}.
+        self.assertEqual(L._server_error_detail(self._http_error(400, {"message": "nested"})), "nested")
+        self.assertEqual(
+            L._server_error_detail(self._http_error(400, {"error": {"message": "deep"}})), "deep",
+        )
+        # No usable body: fall back to the exception's own message.
+        self.assertEqual(
+            L._server_error_detail(self._http_error(400, None, message="from message")), "from message",
+        )
+        # Nothing but whitespace is no message at all.
+        self.assertIsNone(L._server_error_detail(self._http_error(400, "   ", message="")))
+
+    def test_server_message_is_one_line_truncated_and_redacted(self):
+        import local_compress_lib as L
+        multi = L._server_error_detail(self._http_error(400, "line one\n\nline   two\ttabbed"))
+        self.assertEqual(multi, "line one line two tabbed")
+        long = L._server_error_detail(self._http_error(400, "x " * 500))
+        assert long is not None
+        self.assertLessEqual(len(long), L._SERVER_DETAIL_MAX_CHARS + 3)
+        self.assertTrue(long.endswith("..."))
+        secret = "sk-" + "a1B2c3D4" * 5
+        redacted = L._server_error_detail(
+            self._http_error(400, f"bad request, api_key={secret} was in the prompt")
+        )
+        assert redacted is not None
+        self.assertNotIn(secret, redacted)
+        self.assertIn("[REDACTED-CREDENTIAL]", redacted)
+        # Redaction runs before truncation: a credential straddling the cut must
+        # not leave a recognisable fragment behind.
+        straddle = L._server_error_detail(
+            self._http_error(400, "y" * (L._SERVER_DETAIL_MAX_CHARS - 12) + f" api_key={secret}")
+        )
+        assert straddle is not None
+        self.assertNotIn(secret[:20], straddle)
+
+    def _assert_rejected_wording(self, out, where):
+        self.assertTrue(out.startswith("Error: LM Studio rejected the request"), out)
+        self.assertIn(where, out)
+        self.assertIn(self._CTX_MSG, out)
+        self.assertIn("smaller chunk_chars", out)
+        self.assertIn("larger context length", out)
+        self.assertNotIn("check it's still running", out)
+        self.assertNotIn("timed out", out)
+
+    def test_extraction_400_message(self):
+        out = self._compress([self._ctx_error()], "x" * 300, chunk_chars=1000)
+        self._assert_rejected_wording(out, "(chunk 1/1)")
+
+    def test_reduce_400_message(self):
+        text = "A" * 100 + " " + "B" * 100 + " " + "C" * 100
+
+        def fail_on_combine(kwargs):
+            system = kwargs["messages"][0]["content"]
+            return self._ctx_error() if "combining partial summaries" in system else self._ok()
+
+        out = self._compress([fail_on_combine], text, chunk_chars=100)
+        self._assert_rejected_wording(out, "while combining chunk summaries")
+
+    def test_relevance_400_message_travels_from_the_worker_thread(self):
+        text = "A" * 100 + " " + "B" * 100
+        out = self._compress(
+            [self._ctx_error()], text, focus="chocolate cake recipes", chunk_chars=100,
+        )
+        self._assert_rejected_wording(out, "while checking relevance (chunk")
+
+    def test_a_400_without_a_message_still_gets_the_advice(self):
+        out = self._compress([self._http_error(400, None, message="")], "x" * 300, chunk_chars=1000)
+        self.assertTrue(out.startswith("Error: LM Studio rejected the request (chunk 1/1) --"), out)
+        self.assertNotIn("LM Studio said", out)
+        self.assertIn("smaller chunk_chars", out)
+
+    def test_timeout_and_connection_wording_unchanged_by_the_400_branch(self):
+        out = self._compress([self._timeout()], "x" * 300, chunk_chars=1000)
+        self.assertIn("timed out after", out)
+        out = self._compress([self._conn_error()], "x" * 300, chunk_chars=1000)
+        self.assertIn("LM Studio request failed (chunk 1/1) -- check it's still running", out)
+        out = self._compress(
+            [self._http_error(404, {"message": "model not found"})], "x" * 300, chunk_chars=1000,
+        )
+        self.assertIn("LM Studio request failed (chunk 1/1) -- check it's still running", out)
+        self.assertNotIn("rejected", out)
+
     # -- the preserve_sections total-outage prefix ---------------------------
 
     _SECTIONS = (
@@ -3098,6 +3239,47 @@ class TimeoutVersusConnectionFailureReporting(unittest.TestCase):
     def test_mixed_timeout_and_connection_failures_stay_unreachable(self):
         out = self._sections([self._timeout(), self._conn_error()])
         self.assertTrue(out.startswith("[LM Studio appears unreachable"), out)
+
+    def test_all_400s_is_reported_as_rejected_not_unreachable(self):
+        out = self._sections([self._ctx_error()])
+        self.assertTrue(out.startswith("[LM Studio rejected every request"), out)
+        self.assertIn(self._CTX_MSG, out.split("\n\n", 1)[0])
+        self.assertIn("context window", out)
+        self.assertNotIn("appears unreachable", out)
+        self.assertIn("original content preserved", out)
+
+    def test_all_400s_in_a_mixed_section_prose_run_path(self):
+        # A section mixing prose and a bullet run goes through the per-run
+        # request path (a different failure-collection site than a plain section).
+        # Fewer than half the lines are bullets, so the section is not verbatim.
+        text = (
+            "## Background\nSome narrative prose that explains the situation in detail.\n"
+            "A second line of narrative prose continues the explanation.\n\n"
+            "- one\n\nMore narrative prose after the list ends here.\n"
+        )
+        out = self._compress([self._ctx_error()], text, focus="handoff", preserve_sections=True)
+        self.assertTrue(out.startswith("[LM Studio rejected every request"), out)
+
+    def test_400s_mixed_with_other_failures_stay_unreachable(self):
+        out = self._sections([self._ctx_error(), self._conn_error()])
+        self.assertTrue(out.startswith("[LM Studio appears unreachable"), out)
+        out = self._sections([self._ctx_error(), self._timeout()])
+        self.assertTrue(out.startswith("[LM Studio appears unreachable"), out)
+
+    def test_all_400s_result_is_not_cached(self):
+        out = self._sections([self._ctx_error()])
+        self.assertTrue(out.startswith("[LM Studio rejected every request"), out)
+        out = self._sections([self._ok("compressed prose")])
+        self.assertTrue(out.startswith("[compressed"), out)
+
+    def test_strip_total_outage_notice_handles_the_rejected_notice(self):
+        from local_compress_lib import strip_total_outage_notice
+        out = self._sections([self._ctx_error()])
+        stripped = strip_total_outage_notice(out)
+        assert stripped is not None
+        self.assertTrue(stripped.startswith("## "), stripped[:120])
+        self.assertNotIn("[LM Studio", stripped)
+        self.assertNotIn("[compressed ", stripped)
 
     def test_all_timeouts_result_is_not_cached(self):
         out = self._sections([self._timeout()])

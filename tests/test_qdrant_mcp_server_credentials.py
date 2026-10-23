@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests that every tools/qdrant_mcp_server.py tool taking qdrant_url/
+"""Tests that every mcpservers/qdrant_mcp_server.py tool taking qdrant_url/
 qdrant_api_key (the three compact tools) resolves them through the shared
 credential rule, so the configured QDRANT_API_KEY is never sent to a
 caller-supplied host. Asserts on the kwargs each tool hands to QdrantClient.
@@ -21,7 +21,7 @@ from unittest.mock import patch
 
 REPO_ROOT = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, str(REPO_ROOT / "libs"))
-sys.path.insert(0, str(REPO_ROOT / "tools"))
+sys.path.insert(0, str(REPO_ROOT / "mcpservers"))
 
 CONFIGURED_URL = "http://configured-qdrant:6333"
 CONFIGURED_KEY = "configured-secret"
@@ -35,7 +35,7 @@ async def _identity_compression(information):
 def _load_module():
     # A fresh copy per test, like tests/test_qdrant_mcp_server.py, so patching
     # one module's globals cannot leak into another test.
-    spec = importlib.util.spec_from_file_location("qdrant_mcp_server_creds", REPO_ROOT / "tools" / "qdrant_mcp_server.py")
+    spec = importlib.util.spec_from_file_location("qdrant_mcp_server_creds", REPO_ROOT / "mcpservers" / "qdrant_mcp_server.py")
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)

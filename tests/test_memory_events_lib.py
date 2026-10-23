@@ -133,7 +133,7 @@ class RecordMemoryEventRoundTrip(RecordMemoryEventTestCase):
         self.assertEqual(row[8], "proj-a")
 
     def test_multiple_events_share_a_turn(self):
-        # Mirrors how tools/memory_bank_mcp_server.py's recall() logs one row
+        # Mirrors how mcpservers/memory_bank_mcp_server.py's recall() logs one row
         # per hit but a single shared turn value for the whole call.
         for point_id in ("p1", "p2", "p3"):
             ev.record_memory_event(
