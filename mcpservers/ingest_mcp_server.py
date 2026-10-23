@@ -75,6 +75,7 @@ from qdrant_ingest_lib import (
 )
 from sync_manifest_lib import (
     UNVERIFIED_HASH,
+    ManifestLock,
     discard_manifest,
     index_baseline,
     invalidation_error,
@@ -842,7 +843,62 @@ async def index_repo(
     collection (the configured COLLECTION_NAME on the configured QDRANT_URL);
     indexing the checkout into any other collection leaves it alone and says
     so.
+
+    A run that writes the manifest holds the checkout's manifest lock
+    (.qdrant_index_manifest.json.lock) from removing the old manifest to
+    writing the new one. If another index_repo, sync_repo or CLI
+    --write-manifest run on the same checkout holds it, this returns an error
+    at once, before anything is deleted or stored; run it again once that one
+    has finished. A run that leaves the manifest alone never takes the lock.
     """
+    # The lock is taken lazily, by _index_repo's _invalidate_manifest, which
+    # only a run that writes a baseline ever calls (see ManifestLock in
+    # libs/sync_manifest_lib.py): a run that never touches the manifest is
+    # never refused because a sync is running. Released here however the run
+    # ends -- returned, raised or cancelled.
+    manifest_lock = ManifestLock(Path(repo_path).resolve())
+    try:
+        return await _index_repo(
+            repo_path,
+            collection=collection,
+            qdrant_url=qdrant_url,
+            qdrant_api_key=qdrant_api_key,
+            embedding_model=embedding_model,
+            scope=scope,
+            include_extensions=include_extensions,
+            exclude_dirs=exclude_dirs,
+            respect_gitignore=respect_gitignore,
+            chunk_lines=chunk_lines,
+            overlap=overlap,
+            reset=reset,
+            force=force,
+            ctx=ctx,
+            manifest_lock=manifest_lock,
+        )
+    finally:
+        manifest_lock.release()
+
+
+async def _index_repo(
+    repo_path: str,
+    *,
+    collection: Optional[str],
+    qdrant_url: Optional[str],
+    qdrant_api_key: Optional[str],
+    embedding_model: Optional[str],
+    scope: str,
+    include_extensions: Optional[str],
+    exclude_dirs: Optional[str],
+    respect_gitignore: bool,
+    chunk_lines: int,
+    overlap: int,
+    reset: bool,
+    force: bool,
+    ctx: Context,
+    manifest_lock: ManifestLock,
+) -> str:
+    """index_repo's body (see its docstring), run with the manifest lock its
+    caller releases."""
     # Checked first, before even the filesystem -- cheapest possible input to
     # validate, and the whole point is catching this before any real
     # work (chunking every file in the repo) happens on a bad value. The upper
@@ -902,8 +958,10 @@ async def index_repo(
         # An error string, in the shape prepare_collection_for_index aborts on
         # (the wording is shared with the CLI, libs/sync_manifest_lib.py).
         # _discard_manifest is looked up here, at call time, so it stays
-        # patchable as this module's own name.
-        return invalidation_error(repo, _discard_manifest)
+        # patchable as this module's own name. Takes the manifest lock first:
+        # this is the run's first manifest access, and a lock another run
+        # holds stops it here, before the reset's delete or the first store.
+        return invalidation_error(repo, _discard_manifest, manifest_lock)
 
     def _duplicate_risk_warning(existing_count: int) -> Optional[str]:
         # Checked BEFORE the expensive embedding work -- surface
@@ -1350,7 +1408,57 @@ async def sync_repo(
     file being chunked, "i/N" over the changed files, and chunks embedded and
     stored. The short Qdrant-side steps between them (consistency checks, the
     batched delete of replaced chunks, orphan cleanup on a rebuild) send none.
+
+    Holds the checkout's manifest lock (.qdrant_index_manifest.json.lock, safe
+    to gitignore too) from reading the manifest to saving it, so two
+    overlapping syncs on one checkout -- two sessions each syncing at start,
+    say -- cannot leave a manifest that disagrees with the collection. If
+    another sync_repo, a manifest-writing index_repo or a CLI --write-manifest
+    run on the same checkout holds it, this returns an error at once, before
+    anything is read, deleted or stored; run it again once that one has
+    finished.
     """
+    # Released here however the run ends -- returned, raised or cancelled;
+    # _sync_repo takes it right before it reads the manifest.
+    manifest_lock = ManifestLock(Path(repo_path).resolve())
+    try:
+        return await _sync_repo(
+            repo_path,
+            collection=collection,
+            qdrant_url=qdrant_url,
+            qdrant_api_key=qdrant_api_key,
+            embedding_model=embedding_model,
+            scope=scope,
+            include_extensions=include_extensions,
+            exclude_dirs=exclude_dirs,
+            respect_gitignore=respect_gitignore,
+            chunk_lines=chunk_lines,
+            overlap=overlap,
+            ctx=ctx,
+            manifest_lock=manifest_lock,
+        )
+    finally:
+        manifest_lock.release()
+
+
+async def _sync_repo(
+    repo_path: str,
+    *,
+    collection: Optional[str],
+    qdrant_url: Optional[str],
+    qdrant_api_key: Optional[str],
+    embedding_model: Optional[str],
+    scope: str,
+    include_extensions: Optional[str],
+    exclude_dirs: Optional[str],
+    respect_gitignore: bool,
+    chunk_lines: int,
+    overlap: int,
+    ctx: Context,
+    manifest_lock: ManifestLock,
+) -> str:
+    """sync_repo's body (see its docstring), run with the manifest lock its
+    caller releases."""
     # See index_repo's identical check above.
     chunk_err = validate_token_overlap(overlap)
     if chunk_err:
@@ -1380,6 +1488,13 @@ async def sync_repo(
     resolved_include_extensions = parse_csv_set(include_extensions) or DEFAULT_INCLUDE_EXTENSIONS
     resolved_exclude_dirs = parse_csv_set(exclude_dirs) or DEFAULT_EXTRA_EXCLUDE_DIRS
 
+    # From here to the final _save_manifest this run owns the manifest: a
+    # second run reading it in between could save over this one's result with
+    # hashes for chunks it then replaced (see libs/sync_manifest_lib.py's
+    # module docstring for the exact sequence), so it is refused instead.
+    busy = manifest_lock.acquire()
+    if busy:
+        return busy
     preserved_before: set = set()
     manifest = _load_manifest(repo, preserved_before)
     # Run off the event loop -- this is a synchronous scan that can take

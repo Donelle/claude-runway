@@ -73,6 +73,32 @@ EXCLUDE_DIRS = {
 # itself -- the CLI was the one caller that didn't.
 MANIFEST_FILENAME = ".qdrant_index_manifest.json"
 
+# Side files a caller-owned bookkeeping file such as the manifest has next to
+# it: the lock that serializes its writers (`<name>.lock`, which stays on disk
+# between runs) and the temp files its atomic write goes through
+# (`<name>.<random>.tmp`, normally gone once the write finishes, but a crash
+# between creating and renaming one can leave it behind). iter_files skips both
+# for every name in extra_exclude_files, so neither can be hashed or indexed
+# even under an extension list that happens to include .lock or .tmp.
+BOOKKEEPING_LOCK_SUFFIX = ".lock"
+BOOKKEEPING_TEMP_SUFFIX = ".tmp"
+MANIFEST_LOCK_FILENAME = MANIFEST_FILENAME + BOOKKEEPING_LOCK_SUFFIX
+
+
+def is_excluded_file_name(name: str, exclude_files) -> bool:
+    """
+    Whether iter_files skips a file called `name`: it is one of
+    `exclude_files`, or one of their side files (see BOOKKEEPING_LOCK_SUFFIX).
+    The temp-file match needs both the `<name>.` prefix and the .tmp suffix, so
+    an unrelated file that merely starts with an excluded name is still indexed.
+    """
+    for base in exclude_files:
+        if name == base or name == base + BOOKKEEPING_LOCK_SUFFIX:
+            return True
+        if name.startswith(base + ".") and name.endswith(BOOKKEEPING_TEMP_SUFFIX):
+            return True
+    return False
+
 # How many files compute_file_hashes visits between two on_progress calls.
 # Reading and hashing one file is quick, so a per-file report
 # would cost more MCP round-trips than the hashing itself on a large repo;
@@ -330,7 +356,8 @@ def iter_files(
     extra_exclude_files skips any file whose name (basename, not full path)
     appears in the set -- intended for caller-owned bookkeeping files like the
     sync manifest that should never be indexed regardless of scope, extension
-    filter, or gitignore state.
+    filter, or gitignore state. Each listed name's lock and atomic-write temp
+    files are skipped with it (see is_excluded_file_name).
     """
     exclude_dirs = EXCLUDE_DIRS | (extra_exclude_dirs or set())
     exclude_files = extra_exclude_files or set()
@@ -344,7 +371,7 @@ def iter_files(
         rel = path.relative_to(repo_path)
         if any(part in exclude_dirs for part in rel.parts):
             continue
-        if path.name in exclude_files:
+        if is_excluded_file_name(path.name, exclude_files):
             continue
         if gitignore_spec is not None and gitignore_spec.match_file(str(rel)):
             continue

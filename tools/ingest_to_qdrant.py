@@ -45,7 +45,10 @@ does not record which collection it describes: pass it only when --collection
 writes only when this run leaves the collection holding exactly what it indexed
 (--reset, or a collection that was absent or empty), never on --dry-run or after
 a failed run. Without the flag the CLI writes no manifest, and the next
-sync_repo re-chunks and re-embeds every file.
+sync_repo re-chunks and re-embeds every file. A run that writes it holds the
+checkout's manifest lock (.qdrant_index_manifest.json.lock) from removing the
+old manifest to writing the new one, and stops with an error, before deleting
+or storing anything, if a sync_repo or index_repo on the same checkout holds it.
 
 Run this once to seed the collection, then re-run periodically (or on a
 schedule) to pick up changes. Re-running without --reset will add duplicate
@@ -103,6 +106,7 @@ from qdrant_model_check import check_embedding_model_mismatch
 from qdrant_retry import call_with_retry
 from qdrant_credentials import resolve_qdrant_credentials
 from sync_manifest_lib import (
+    ManifestLock,
     discard_manifest,
     index_baseline,
     invalidation_error,
@@ -117,6 +121,19 @@ ensure_persistent_fastembed_cache()
 
 
 async def ingest(args):
+    # The manifest lock (ManifestLock, libs/sync_manifest_lib.py) is taken
+    # lazily, by _ingest's _invalidate_manifest, which only a run that writes a
+    # baseline ever calls: a run without --write-manifest never touches the
+    # manifest and never locks. Released here however the run ends, including
+    # the sys.exit() calls _ingest makes on an error.
+    manifest_lock = ManifestLock(Path(args.repo_path).resolve())
+    try:
+        await _ingest(args, manifest_lock)
+    finally:
+        manifest_lock.release()
+
+
+async def _ingest(args, manifest_lock: ManifestLock):
     # --reset used to be a raw delete_collection with none of the protections
     # index_repo(reset=True) has.
     # Layer 1 (name refusal), ported from index_repo: the shared memory-bank
@@ -189,8 +206,11 @@ async def ingest(args):
     def _invalidate_manifest():
         # An error string, in the shape prepare_collection_for_index aborts on.
         # discard_manifest is looked up here, at call time, so it stays
-        # patchable as this module's own name.
-        return invalidation_error(repo_path, discard_manifest)
+        # patchable as this module's own name. Takes the manifest lock first
+        # (only --write-manifest runs ever get here), so a sync_repo or another
+        # run already using this checkout's manifest stops this one before the
+        # reset's delete or the first store; ingest() releases it.
+        return invalidation_error(repo_path, discard_manifest, manifest_lock)
 
     def _provider_with_budget(model_name: str):
         # Built together so that on --reset an unreadable token
@@ -447,7 +467,10 @@ def parse_args():
                          "is one file per checkout and does not say which collection it describes. Written only with "
                          "--reset or into a collection that was absent or empty; never on --dry-run or after a failed "
                          "run. The old manifest is removed before anything is deleted or stored. Into a populated "
-                         "collection without --reset, the manifest is left alone and a message says why")
+                         "collection without --reset, the manifest is left alone and a message says why. A run that "
+                         "writes it holds the checkout's manifest lock (.qdrant_index_manifest.json.lock) and stops "
+                         "with an error, before deleting or storing anything, if a sync_repo or index_repo on the "
+                         "same checkout already holds it")
     p.add_argument("--reset", action="store_true", help="Delete the collection's existing points before indexing (avoids duplicate chunks on re-runs). "
                          "Like index_repo(reset=True), this is a filtered delete that keeps the "
                          "collection itself, any memory-bank points and marked conversation compacts, "
