@@ -3,6 +3,12 @@
   if that project actually has the corresponding MCP server configured in
   its .mcp.json -- referencing tools that aren't connected just wastes
   context on instructions Claude can't act on.
+
+  `setup_project.py init` / `claude-runway-setup init` does this for you: it
+  adds the section for each server it writes and removes the section of one
+  it no longer writes (all but "Setup and diagnostics", which you copy
+  yourself). It finds sections by their exact `## ` heading lines, so keep
+  those unchanged here.
 -->
 
 ## Vector memory (Qdrant MCP)

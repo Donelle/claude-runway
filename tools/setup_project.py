@@ -8,6 +8,16 @@ manual copy-and-hand-edit flow in `docs/installation.md`'s steps 4/4b/5.
 Also structurally prevents stale hand-typed example paths
 (BUG-14) recurring, since every path here is computed, not typed.
 
+`init` also brings the target's `CLAUDE.md` in line with the servers it
+writes (`--skip-claude-md` to leave it alone): it creates the file, or
+appends the usage section from `templates/CLAUDE.md.template` for each
+configured server that lacks one, and removes the section of a toolkit
+server that is no longer configured (Local compression under
+`--qdrant-only`, Analytics without the savings tracker). Nothing else in
+the file changes, and a run with nothing to add or remove does not rewrite
+it. The template is read from this install's own `templates/`, so this
+works the same from a clone and from a pipx/`uv tool install`.
+
 Usage:
     python tools/setup_project.py init /path/to/target-repo
     python tools/setup_project.py init /path/to/target-repo --dry-run
@@ -177,6 +187,16 @@ def _write_json(path: Path, data: dict) -> None:
     """Thin JSON-serializing wrapper over _atomic_write -- see that
     function's docstring for the actual atomicity mechanics."""
     _atomic_write(path, json.dumps(data, indent=2) + "\n")
+
+
+def _write_claude_md(path: Path, content: str) -> None:
+    """
+    Writes the planned CLAUDE.md through `_atomic_write`. A CLAUDE.md that is
+    a symlink (to a shared AGENTS.md, say) is written at the file it points
+    to: `os.replace` onto the link itself would swap the link for a regular
+    file and silently cut the project off from the shared one.
+    """
+    _atomic_write(path.resolve() if path.is_symlink() else path, content)
 
 
 _REDACTED = "***REDACTED***"
@@ -465,6 +485,7 @@ def cmd_init(args: argparse.Namespace) -> None:
             memory_bank_embedding_model=args.memory_bank_embedding_model,
             codebase_reviewer=args.codebase_reviewer,
             reviewers_file=args.reviewers_file,
+            claude_md=not args.skip_claude_md,
             include_compress=not args.qdrant_only,
             include_hooks=include_hooks,
             # clean_hooks_if_unused's own special-case path is only relevant
@@ -486,6 +507,8 @@ def cmd_init(args: argparse.Namespace) -> None:
 
     for change in result.changes:
         print(("Would write " if args.dry_run else "Writing ") + change)
+    if result.claude_md is not None and result.claude_md.content is None:
+        print(f"CLAUDE.md already up to date, no changes ({result.claude_md.path})")
 
     # NOT the same condition as include_hooks: --skip-hooks leaves
     # settings.json (and therefore any hooks a PRIOR full setup already
@@ -637,6 +660,11 @@ def cmd_init(args: argparse.Namespace) -> None:
         _write_json(target_repo / ".mcp.json", result.mcp_json)
         if result.settings_json is not None:
             _write_json(target_repo / ".claude" / "settings.json", result.settings_json)
+    # CLAUDE.md last: it only describes the servers, so if a config write
+    # above failed it is left as it was rather than describing a config that
+    # never landed.
+    if result.claude_md is not None and result.claude_md.content is not None:
+        _write_claude_md(result.claude_md.path, result.claude_md.content)
 
     print("\nDone. Remember to:")
     print(next_step_note)
@@ -1036,6 +1064,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Configure local-compress in .mcp.json but don't write/merge .claude/settings.json's hooks "
         "(leaves any existing settings.json completely untouched, unlike --qdrant-only)",
+    )
+    init.add_argument(
+        "--skip-claude-md",
+        action="store_true",
+        help="Leave the target's CLAUDE.md untouched. By default init creates it, or adds to it the "
+        "usage section from templates/CLAUDE.md.template for each server it writes and removes the "
+        "section of a toolkit server that is no longer configured (e.g. Local compression under "
+        "--qdrant-only); nothing else in the file is changed, and a re-run that has nothing to add or "
+        "remove does not rewrite it",
     )
     init.add_argument(
         "--install-skills",

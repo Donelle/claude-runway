@@ -171,6 +171,7 @@ def _init_args(target_repo, **overrides) -> argparse.Namespace:
         reviewers_file="",
         qdrant_only=False,
         skip_hooks=False,
+        skip_claude_md=False,
         install_skills=False,
         skills_dir="",
         dry_run=True,
