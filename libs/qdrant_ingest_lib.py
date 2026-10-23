@@ -181,9 +181,9 @@ class MemoryBankCollection:
     """Which collection is the shared memory bank, and where that came from.
     `source` is human-readable, for an error message; `warning` is set when a
     .mcp.json that exists could not be read and was skipped, or when its
-    blocks disagree. `also_reserved` holds the other (name, source) pairs when
-    .mcp.json's blocks name different collections; use `reserved_source` to
-    check a collection against all of them."""
+    sources disagree. `also_reserved` holds a (name, source) pair for each
+    other collection a .mcp.json block names; use `reserved_source` to check a
+    collection against all of them."""
 
     name: str
     source: str
@@ -210,18 +210,20 @@ def resolve_memory_bank_collection(
     .mcp.json. Reading only the shell meant a project with a custom name had
     its memory bank refused by index_repo but not by the CLI.
 
-    Order, first non-blank wins:
+    `name` comes from the first non-blank of:
       1. `explicit` (the CLI's --memory-bank-collection)
       2. MEMORY_BANK_COLLECTION in `environ` (default os.environ); a blank or
          whitespace-only value counts as unset
       3. `<repo_path>/.mcp.json`, each MEMORY_BANK_MCP_JSON_SERVERS block's env
       4. FALLBACK_MEMORY_BANK_COLLECTION ("memory-bank")
 
-    Every block in step 3 is read, not just the first with a name: if the
-    blocks name different collections, the others go in `also_reserved` and
-    `warning` reports the disagreement, so the CLI refuses all of them.
+    Every .mcp.json block is read even when step 1 or 2 supplies the name,
+    because those blocks say where the MCP servers actually store memories,
+    and an override does not move them. Any name a block gives that differs
+    from `name` goes in `also_reserved`, and `warning` reports the
+    disagreement, so the CLI refuses all of them.
 
-    `repo_path` may be None to skip step 3. The file is read with
+    `repo_path` may be None to skip reading .mcp.json. The file is read with
     doctor_lib.load_server_env, the loader `doctor` already uses for the same
     file, so the two cannot disagree about what a well-formed block is. It is
     imported here rather than at module level to keep this module free of
@@ -231,24 +233,27 @@ def resolve_memory_bank_collection(
     the block is skipped and `warning` says so, and the caller decides whether
     to print it.
     """
-    if explicit and explicit.strip():
-        return MemoryBankCollection(explicit.strip(), "--memory-bank-collection")
     env = os.environ if environ is None else environ
     # Whitespace-only counts as unset too, not just "" (PR review): a value of
     # "  " is truthy, and returning it would let it outrank .mcp.json's real
     # name and leave that collection unprotected. Every source here strips.
     env_value = (env.get("MEMORY_BANK_COLLECTION") or "").strip()
-    if env_value:
-        return MemoryBankCollection(env_value, "the MEMORY_BANK_COLLECTION environment variable")
+    # (name, source for an error message, short label for the warnings)
+    if explicit and explicit.strip():
+        primary = (explicit.strip(), "--memory-bank-collection", "--memory-bank-collection")
+    elif env_value:
+        primary = (env_value, "the MEMORY_BANK_COLLECTION environment variable", "the shell")
+    else:
+        primary = None
     # A dict, not a list, to drop repeats: a file that is not valid JSON (or
     # has a malformed "mcpServers") fails with the same message for every
     # server block, and saying it twice adds nothing.
     problems: dict = {}
+    found = []  # (name, source, label), in MEMORY_BANK_MCP_JSON_SERVERS order
     if repo_path is not None:
         from doctor_lib import MalformedMcpJsonError, load_server_env
 
         mcp_json_path = Path(repo_path) / ".mcp.json"
-        found = []  # (server, name), in MEMORY_BANK_MCP_JSON_SERVERS order
         for server in MEMORY_BANK_MCP_JSON_SERVERS:
             try:
                 server_env = load_server_env(mcp_json_path, server)
@@ -257,26 +262,29 @@ def resolve_memory_bank_collection(
                 continue
             value = (server_env or {}).get("MEMORY_BANK_COLLECTION", "").strip()
             if value:
-                found.append((server, value))
-        if found:
-            server, value = found[0]
-
-            def source(block):
-                return f"MEMORY_BANK_COLLECTION in {mcp_json_path}'s \"{block}\" block"
-
-            others = tuple((name, source(block)) for block, name in found[1:] if name != value)
-            # A block that could not be read is still worth reporting, even
-            # though another one supplied the name.
-            warnings = [_unreadable_mcp_json_warning(problems, f"using '{value}' from the \"{server}\" block")]
-            if others:
-                named = ", ".join(f"\"{block}\" says '{name}'" for block, name in found)
-                warnings.append(f".mcp.json's blocks disagree on MEMORY_BANK_COLLECTION ({named}); refusing all of them")
-            return MemoryBankCollection(value, source(server), "; ".join(w for w in warnings if w) or None, others)
-    return MemoryBankCollection(
-        FALLBACK_MEMORY_BANK_COLLECTION,
-        "the built-in default",
-        _unreadable_mcp_json_warning(problems, f"using the default '{FALLBACK_MEMORY_BANK_COLLECTION}'"),
-    )
+                found.append((value, f"MEMORY_BANK_COLLECTION in {mcp_json_path}'s \"{server}\" block",
+                              f"the \"{server}\" block"))
+    if primary is None and found:
+        primary = found[0]
+    if primary is None:
+        return MemoryBankCollection(
+            FALLBACK_MEMORY_BANK_COLLECTION,
+            "the built-in default",
+            _unreadable_mcp_json_warning(problems, f"using the default '{FALLBACK_MEMORY_BANK_COLLECTION}'"),
+        )
+    name, source, label = primary
+    others: dict = {}  # name -> source, first block wins, so a name repeated across blocks is listed once
+    for other, other_source, _ in found:
+        if other != name:
+            others.setdefault(other, other_source)
+    # A block that could not be read is still worth reporting, even though
+    # another source supplied the name.
+    warnings = [_unreadable_mcp_json_warning(problems, f"using '{name}' from {label}")]
+    if others:
+        sources = [primary] + [entry for entry in found if entry is not primary]
+        named = ", ".join(f"{entry_label} says '{entry_name}'" for entry_name, _, entry_label in sources)
+        warnings.append(f"MEMORY_BANK_COLLECTION disagrees across its sources ({named}); refusing all of them")
+    return MemoryBankCollection(name, source, "; ".join(w for w in warnings if w) or None, tuple(others.items()))
 
 
 def _unreadable_mcp_json_warning(problems: dict, outcome: str) -> Optional[str]:

@@ -339,6 +339,16 @@ class ResetRefusesMemoryBankCollection(unittest.TestCase):
                 self.assertIn(block, err)
                 self.assertIn("disagree", err)
 
+    def test_an_override_does_not_unreserve_the_mcp_json_name(self):
+        self._write_mcp_json(json.dumps({"mcpServers": {
+            "memory-bank": {"env": {"MEMORY_BANK_COLLECTION": "team-memory"}},
+        }}))
+        err = self._assert_refused(collection="team-memory", reset=False, memory_bank_collection="memory-bank")
+        self.assertIn('"memory-bank" block', err)
+        os.environ["MEMORY_BANK_COLLECTION"] = "memory-bank"
+        err = self._assert_refused(collection="team-memory", reset=False)
+        self.assertIn('"memory-bank" block', err)
+
     def test_default_name_is_still_refused_with_nothing_configured(self):
         self._assert_refused(collection="memory-bank", reset=True)
 

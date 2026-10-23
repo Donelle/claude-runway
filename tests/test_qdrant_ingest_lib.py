@@ -1928,7 +1928,36 @@ class ResolveMemoryBankCollection(unittest.TestCase):
     def test_explicit_flag_wins_over_every_other_source(self):
         self._write_mcp_json(self._servers(codebase_indexer={"MEMORY_BANK_COLLECTION": "from-json"}))
         got = self.resolve("from-flag", self.repo, {"MEMORY_BANK_COLLECTION": "from-env"})
-        self.assertEqual((got.name, got.source, got.warning), ("from-flag", "--memory-bank-collection", None))
+        self.assertEqual((got.name, got.source), ("from-flag", "--memory-bank-collection"))
+        # .mcp.json's name is still reserved: an override does not move where the servers store.
+        self.assertIn('"codebase-indexer"', got.reserved_source("from-json"))
+        self.assertIsNone(got.reserved_source("from-env"))
+        self.assertIn("disagree", got.warning)
+
+    def test_an_override_that_matches_mcp_json_adds_nothing(self):
+        self._write_mcp_json(self._servers(codebase_indexer={"MEMORY_BANK_COLLECTION": "team-memory"},
+                                           memory_bank={"MEMORY_BANK_COLLECTION": "team-memory"}))
+        for flag, env in (("team-memory", {}), (None, {"MEMORY_BANK_COLLECTION": "team-memory"})):
+            with self.subTest(flag=flag, env=env):
+                got = self.resolve(flag, self.repo, env)
+                self.assertEqual((got.name, got.warning, got.also_reserved), ("team-memory", None, ()))
+
+    def test_an_override_still_reserves_the_memory_bank_blocks_name(self):
+        # memory-bank stores in team-memory whatever the flag or the shell says.
+        self._write_mcp_json(self._servers(memory_bank={"MEMORY_BANK_COLLECTION": "team-memory"}))
+        for flag, env in (("memory-bank", {}), (None, {"MEMORY_BANK_COLLECTION": "memory-bank"})):
+            with self.subTest(flag=flag, env=env):
+                got = self.resolve(flag, self.repo, env)
+                self.assertEqual(got.name, "memory-bank")
+                self.assertIn('"memory-bank" block', got.reserved_source("team-memory"))
+                self.assertIn("'team-memory'", got.warning)
+
+    def test_a_name_both_blocks_give_is_reserved_once(self):
+        self._write_mcp_json(self._servers(codebase_indexer={"MEMORY_BANK_COLLECTION": "team-memory"},
+                                           memory_bank={"MEMORY_BANK_COLLECTION": "team-memory"}))
+        got = self.resolve("memory-bank", self.repo, {})
+        self.assertEqual([name for name, _ in got.also_reserved], ["team-memory"])
+        self.assertIn('"codebase-indexer"', got.reserved_source("team-memory"))
 
     def test_environment_wins_over_mcp_json(self):
         self._write_mcp_json(self._servers(codebase_indexer={"MEMORY_BANK_COLLECTION": "from-json"}))
