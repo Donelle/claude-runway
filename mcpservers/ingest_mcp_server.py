@@ -844,18 +844,20 @@ async def index_repo(
     indexing the checkout into any other collection leaves it alone and says
     so.
 
-    A run that writes the manifest holds the checkout's manifest lock
-    (.qdrant_index_manifest.json.lock) from removing the old manifest to
-    writing the new one. If another index_repo, sync_repo or CLI
-    --write-manifest run on the same checkout holds it, this returns an error
-    at once, before anything is deleted or stored; run it again once that one
-    has finished. A run that leaves the manifest alone never takes the lock.
+    A run into this project's own collection holds the checkout's manifest
+    lock (.qdrant_index_manifest.json.lock) from before it prepares and counts
+    the collection to the end, whether or not it ends up writing the
+    manifest: whether it may write one depends on that count, which no other
+    manifest user may change in between. If another index_repo, sync_repo or
+    CLI --write-manifest run on the same checkout holds it, this returns an
+    error at once, before anything is deleted or stored; run it again once
+    that one has finished. A run into any other collection never takes the
+    lock.
     """
-    # The lock is taken lazily, by _index_repo's _invalidate_manifest, which
-    # only a run that writes a baseline ever calls (see ManifestLock in
-    # libs/sync_manifest_lib.py): a run that never touches the manifest is
-    # never refused because a sync is running. Released here however the run
-    # ends -- returned, raised or cancelled.
+    # _index_repo takes the lock (see ManifestLock in
+    # libs/sync_manifest_lib.py) only for this project's own collection, the
+    # one whose manifest it may write. Released here however the run ends --
+    # returned, raised or cancelled.
     manifest_lock = ManifestLock(Path(repo_path).resolve())
     try:
         return await _index_repo(
@@ -953,14 +955,27 @@ async def _index_repo(
     # checkout into some other collection must not replace the baseline of the
     # one sync_repo keeps up to date from the same checkout.
     owns_manifest = collection == DEFAULT_COLLECTION and qdrant_url == DEFAULT_QDRANT_URL
+    if owns_manifest:
+        # Taken BEFORE the collection is prepared and counted, not when the
+        # manifest is first touched: whether this run may write a baseline
+        # rests on the collection being absent or empty (points_before below),
+        # and a sync_repo finishing in between could fill it and save its own
+        # manifest, after which this run would append duplicates and record a
+        # baseline that did not describe them. Holding the lock from here
+        # means no other manifest user can change the collection between the
+        # count and the save. A run into another collection never locks.
+        busy = manifest_lock.acquire()
+        if busy:
+            return busy
 
     def _invalidate_manifest() -> Optional[str]:
         # An error string, in the shape prepare_collection_for_index aborts on
         # (the wording is shared with the CLI, libs/sync_manifest_lib.py).
         # _discard_manifest is looked up here, at call time, so it stays
-        # patchable as this module's own name. Takes the manifest lock first:
-        # this is the run's first manifest access, and a lock another run
-        # holds stops it here, before the reset's delete or the first store.
+        # patchable as this module's own name. The lock is already held (taken
+        # above for every run into this project's own collection, the only
+        # runs that get here); passing it keeps "never removed unlocked" true
+        # whatever the call site.
         return invalidation_error(repo, _discard_manifest, manifest_lock)
 
     def _duplicate_risk_warning(existing_count: int) -> Optional[str]:
@@ -1413,8 +1428,9 @@ async def sync_repo(
     to gitignore too) from reading the manifest to saving it, so two
     overlapping syncs on one checkout -- two sessions each syncing at start,
     say -- cannot leave a manifest that disagrees with the collection. If
-    another sync_repo, a manifest-writing index_repo or a CLI --write-manifest
-    run on the same checkout holds it, this returns an error at once, before
+    another sync_repo, an index_repo into this project's own collection or a
+    CLI --write-manifest run on the same checkout holds it, this returns an
+    error at once, before
     anything is read, deleted or stored; run it again once that one has
     finished.
     """

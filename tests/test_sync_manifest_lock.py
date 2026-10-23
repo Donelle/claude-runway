@@ -124,22 +124,65 @@ class ManifestLockInProcess(RepoTestCase):
         self.assertTrue(lock_path.exists())
         self.assertEqual(lock_path.read_bytes(), b"")
 
-    def test_a_lock_file_that_cannot_be_opened_fails_open(self):
+    def test_a_read_only_checkout_fails_open(self):
+        # The manifest cannot be written there either, so there is nothing
+        # for an overlapping run to get out of step.
         lock = lib.ManifestLock(self.repo)
-        with mock.patch.object(lib, "_open_lock_file", return_value=None):
+        with mock.patch.object(lib, "_open_lock_file", side_effect=OSError(errno.EROFS, "read-only")):
             self.assertIsNone(lock.acquire())
         self.assertFalse(lock.held)
         lock.release()
 
+    def test_a_repo_root_this_user_cannot_write_fails_open(self):
+        lock = lib.ManifestLock(self.repo)
+        with mock.patch.object(lib, "_open_lock_file", side_effect=OSError(errno.EACCES, "denied")), \
+             mock.patch.object(lib.os, "access", return_value=False):
+            self.assertIsNone(lock.acquire())
+        self.assertFalse(lock.held)
+
+    def test_any_other_failure_to_open_the_lock_file_refuses_the_run(self):
+        # Including a permission error on the lock file in a WRITABLE repo
+        # root: the manifest could still be written there, unlocked.
+        for error in (OSError(errno.EIO, "I/O error"), OSError(errno.EACCES, "denied")):
+            with self.subTest(errno=error.errno):
+                lock = lib.ManifestLock(self.repo)
+                with mock.patch.object(lib, "_open_lock_file", side_effect=error):
+                    message = lock.acquire()
+                self.assertTrue(message.startswith("Error: could not lock this checkout's sync manifest"), message)
+                self.assertIn("Nothing was deleted or indexed", message)
+                self.assertFalse(lock.held)
+
     def test_a_filesystem_without_lock_support_fails_open_and_closes_the_descriptor(self):
+        real_close = os.close
+        for code in sorted(lib._LOCKING_UNSUPPORTED_ERRNOS):
+            with self.subTest(errno=code):
+                lock = lib.ManifestLock(self.repo)
+                closed: list = []
+                with mock.patch.object(lib, "_try_lock", side_effect=OSError(code, "no locks")), \
+                     mock.patch.object(lib.os, "close", side_effect=lambda fd, c=closed: c.append(fd) or real_close(fd)):
+                    self.assertIsNone(lock.acquire())
+                self.assertFalse(lock.held)
+                self.assertEqual(len(closed), 1)
+
+    def test_any_other_lock_error_refuses_the_run_and_closes_the_descriptor(self):
+        # Running unlocked on, say, an I/O error is exactly what lets two runs
+        # leave the manifest out of step with the collection.
         lock = lib.ManifestLock(self.repo)
         closed = []
         real_close = os.close
-        with mock.patch.object(lib, "_try_lock", side_effect=OSError(errno.ENOLCK, "no locks available")), \
+        with mock.patch.object(lib, "_try_lock", side_effect=OSError(errno.EIO, "I/O error")), \
              mock.patch.object(lib.os, "close", side_effect=lambda fd: closed.append(fd) or real_close(fd)):
-            self.assertIsNone(lock.acquire())
+            message = lock.acquire()
+        self.assertTrue(message.startswith("Error: could not lock this checkout's sync manifest"), message)
+        self.assertIn("I/O error", message)
         self.assertFalse(lock.held)
         self.assertEqual(len(closed), 1)
+
+    def test_the_real_open_raises_when_neither_mode_works(self):
+        with mock.patch.object(lib.os, "open", side_effect=OSError(errno.EIO, "I/O error")):
+            with self.assertRaises(OSError) as caught:
+                lib._open_lock_file(self.repo / MANIFEST_LOCK_FILENAME)
+        self.assertEqual(caught.exception.errno, errno.EIO)
 
     @unittest.skipIf(sys.platform == "win32", "POSIX permission bits")
     def test_a_lock_file_this_user_cannot_write_still_locks(self):
@@ -570,19 +613,42 @@ class IndexRepoHoldsTheLockOnlyWhenItWritesTheManifest(RepoTestCase):
         self.assertIn("The sync manifest was not written", result)
         self.assertEqual(len(self.stored), 1)
 
-    def test_a_force_run_into_a_populated_collection_never_takes_the_lock(self):
+    def test_the_lock_is_already_held_while_the_collection_is_prepared_and_counted(self):
+        # Whether this run may write a baseline rests on the collection being
+        # absent or empty when prepared. Taking the lock only afterwards let a
+        # sync_repo fill the collection and save its manifest in between, and
+        # this run then appended duplicates and wrote a baseline that did not
+        # describe them.
+        seen = []
+        real_prep = _ims.prepare_collection_for_index
+
+        def prep(*a, **kw):
+            seen.append(lib.ManifestLock(self.repo).acquire())
+            return real_prep(*a, **kw)
+
+        with mock.patch.object(_ims, "prepare_collection_for_index", side_effect=prep):
+            self.assertIn("Wrote the sync manifest", self._index())
+        self.assertEqual(len(seen), 1)
+        self.assertTrue(seen[0].startswith(BUSY_PREFIX), seen[0])
+
+    def test_every_run_into_its_own_collection_is_refused_while_the_lock_is_held(self):
+        # Including one that would end up not writing the manifest (force into
+        # a populated collection): that is only known after the count, which
+        # has to happen under the lock.
         self.client.collection_exists.return_value = True
         self.client.get_collection.return_value = mock.MagicMock(points_count=7)
         self.client.count.return_value = mock.MagicMock(count=7)
         self._hold()
         result = self._index(force=True)
-        self.assertIn("The sync manifest was not written", result)
-        self.assertEqual(len(self.stored), 1)
+        self.assertTrue(result.startswith(BUSY_PREFIX), result)
+        self.store.assert_not_called()
+        self.client.get_collection.assert_not_called()
 
     def test_the_docstring_says_when_it_holds_the_lock(self):
         doc = " ".join((_ims.index_repo.__doc__ or "").split())
         self.assertIn(MANIFEST_LOCK_FILENAME, doc)
-        self.assertIn("never takes the lock", doc)
+        self.assertIn("before it prepares and counts the collection", doc)
+        self.assertIn("A run into any other collection never takes the lock", doc)
 
 
 class ToolsKeepTheirSignatures(unittest.TestCase):
@@ -659,6 +725,35 @@ class CliHoldsTheLockOnlyWithWriteManifest(RepoTestCase):
             self._ingest(reset=True)
         self.client.delete.assert_not_called()
         self.store.assert_not_called()
+
+    def test_the_lock_is_already_held_while_the_collection_is_prepared_and_counted(self):
+        # Same race as index_repo's: the clean-slate decision must be made
+        # under the lock, not before it.
+        seen = []
+        real_prep = _cli.prepare_collection_for_index
+
+        def prep(*a, **kw):
+            seen.append(lib.ManifestLock(self.repo).acquire())
+            return real_prep(*a, **kw)
+
+        with mock.patch.object(_cli, "prepare_collection_for_index", side_effect=prep):
+            self._ingest()
+        self.assertEqual(len(seen), 1)
+        self.assertTrue(seen[0].startswith(BUSY_PREFIX), seen[0])
+        self.assertIn("Wrote the sync manifest", self.out.getvalue())
+
+    def test_a_refused_run_never_reaches_qdrant(self):
+        self._hold()
+        with mock.patch.object(_cli, "prepare_collection_for_index") as prep, self.assertRaises(SystemExit):
+            self._ingest()
+        prep.assert_not_called()
+        self.client.collection_exists.assert_not_called()
+
+    def test_a_dry_run_with_write_manifest_never_takes_the_lock(self):
+        self._hold()
+        self._ingest(dry_run=True)
+        self.assertIn("dry run, not storing", self.out.getvalue())
+        self.assertNotIn(BUSY_PREFIX, self.err.getvalue())
 
     def test_write_manifest_holds_the_lock_through_the_store_and_releases_it(self):
         self._ingest()

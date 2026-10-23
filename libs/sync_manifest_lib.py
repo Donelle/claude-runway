@@ -25,10 +25,12 @@ once. Two separate guards cover that:
   B stores the new chunks, then slower A replaces them with the old ones and
   saves, and B saves last. The collection then holds the old chunks while the
   manifest records the new hash, and every later sync skips the file as
-  unchanged. Every run that reads or replaces the manifest holds the lock from
-  its first manifest access (the load, or the removal of the old one) to its
-  final save, and a second run is refused at once with a clear message instead
-  of queueing behind a long embed.
+  unchanged. Every run that reads or may replace the manifest holds the lock
+  from before its first decision that depends on it (sync_repo: reading the
+  manifest; index_repo and the CLI: counting the collection, since a baseline
+  is only written into one that was absent or empty) to its final save, and a
+  second run is refused at once with a clear message instead of queueing
+  behind a long embed.
 """
 
 import errno
@@ -243,11 +245,13 @@ class ManifestLock:
     that created a new one each hold "the" lock at once. It is safe to
     gitignore alongside the manifest, and iter_files never indexes it.
 
-    Fails open, as before the lock existed, in two cases, where `held` stays
-    False and acquire() returns None: the lock file cannot be opened (a
-    read-only checkout, where the manifest cannot be written either), and a
-    filesystem that does not support the OS lock (some network mounts). Only a
-    lock that another run demonstrably holds refuses the run.
+    Fails open, as before the lock existed, in exactly two cases, where `held`
+    stays False and acquire() returns None: a checkout that cannot be written
+    at all (see _checkout_is_read_only; the manifest cannot be written there
+    either), and a filesystem that does not support the OS lock (see
+    _LOCKING_UNSUPPORTED_ERRNOS). Any other failure to open or lock the file
+    returns manifest_lock_error_message, so the run stops rather than going
+    ahead unprotected.
     """
 
     def __init__(self, repo: Path):
@@ -262,17 +266,22 @@ class ManifestLock:
         if self._fd is not None:
             return None
         path = self.repo / MANIFEST_LOCK_FILENAME
-        fd = _open_lock_file(path)
-        if fd is None:
-            return None
+        try:
+            fd = _open_lock_file(path)
+        except OSError as e:
+            if _checkout_is_read_only(self.repo, e):
+                return None
+            return manifest_lock_error_message(self.repo, e)
         try:
             _try_lock(fd)
         except ManifestLockBusy:
             os.close(fd)
             return manifest_lock_busy_message(self.repo)
-        except OSError:
+        except OSError as e:
             os.close(fd)
-            return None
+            if e.errno in _LOCKING_UNSUPPORTED_ERRNOS:
+                return None
+            return manifest_lock_error_message(self.repo, e)
         self._fd = fd
         return None
 
@@ -289,20 +298,60 @@ class ManifestLock:
             os.close(fd)
 
 
-def _open_lock_file(path: Path) -> Optional[int]:
-    """A descriptor for the lock file, creating it if needed, or None when it
-    cannot be opened. Falls back to read-only for a lock file another user
-    created without write permission for this one: both OS locks work on a
-    read-only descriptor, so the two users are still serialized."""
+# The errors a lock call gives when the filesystem cannot lock at all (some
+# network and FUSE mounts), as opposed to failing this once. Only these fail
+# open; anything else -- an I/O error, say -- refuses the run, because running
+# unlocked is exactly what lets two runs leave the manifest out of step with
+# the collection.
+_LOCKING_UNSUPPORTED_ERRNOS = frozenset(
+    code
+    for code in (
+        getattr(errno, "ENOLCK", None),
+        getattr(errno, "EOPNOTSUPP", None),
+        getattr(errno, "ENOTSUP", None),
+        getattr(errno, "ENOSYS", None),
+    )
+    if code is not None
+)
+
+
+def _checkout_is_read_only(repo: Path, error: OSError) -> bool:
+    """Whether a lock file that could not be opened means the checkout cannot
+    be written at all -- a read-only filesystem, or a repo root this user may
+    not create files in. The manifest cannot be written there either (its
+    temp file is created in the same directory), so there is nothing for an
+    overlapping run to get out of step, and the run goes ahead unlocked as it
+    did before the lock existed. Any other failure refuses the run."""
+    if error.errno == errno.EROFS:
+        return True
+    return error.errno in (errno.EACCES, errno.EPERM) and not os.access(repo, os.W_OK)
+
+
+def manifest_lock_error_message(repo: Path, error: OSError) -> str:
+    """What a run returns or prints when the lock could not be taken for a
+    reason other than another run holding it. Same guarantee as
+    manifest_lock_busy_message: nothing has been deleted or stored yet."""
+    return (
+        f"Error: could not lock this checkout's sync manifest ({repo / MANIFEST_LOCK_FILENAME}: {error}). "
+        f"Nothing was deleted or indexed: without the lock an overlapping index or sync run could leave the "
+        f"manifest out of step with the collection."
+    )
+
+
+def _open_lock_file(path: Path) -> int:
+    """A descriptor for the lock file, creating it if needed. Falls back to
+    read-only for a lock file another user created without write permission
+    for this one: both OS locks work on a read-only descriptor, so the two
+    users are still serialized. Raises the read-write attempt's OSError when
+    neither works."""
     binary = getattr(os, "O_BINARY", 0)
     try:
         return os.open(path, os.O_RDWR | os.O_CREAT | binary, 0o666)
-    except OSError:
-        pass
-    try:
-        return os.open(path, os.O_RDONLY | binary)
-    except OSError:
-        return None
+    except OSError as first_error:
+        try:
+            return os.open(path, os.O_RDONLY | binary)
+        except OSError:
+            raise first_error from None
 
 
 def discard_manifest(repo: Path) -> None:

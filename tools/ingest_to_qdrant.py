@@ -45,10 +45,10 @@ does not record which collection it describes: pass it only when --collection
 writes only when this run leaves the collection holding exactly what it indexed
 (--reset, or a collection that was absent or empty), never on --dry-run or after
 a failed run. Without the flag the CLI writes no manifest, and the next
-sync_repo re-chunks and re-embeds every file. A run that writes it holds the
-checkout's manifest lock (.qdrant_index_manifest.json.lock) from removing the
-old manifest to writing the new one, and stops with an error, before deleting
-or storing anything, if a sync_repo or index_repo on the same checkout holds it.
+sync_repo re-chunks and re-embeds every file. With the flag, a real run holds
+the checkout's manifest lock (.qdrant_index_manifest.json.lock) from before it
+counts the collection to the end, and stops with an error, before deleting or
+storing anything, if a sync_repo or index_repo on the same checkout holds it.
 
 Run this once to seed the collection, then re-run periodically (or on a
 schedule) to pick up changes. Re-running without --reset will add duplicate
@@ -121,11 +121,11 @@ ensure_persistent_fastembed_cache()
 
 
 async def ingest(args):
-    # The manifest lock (ManifestLock, libs/sync_manifest_lib.py) is taken
-    # lazily, by _ingest's _invalidate_manifest, which only a run that writes a
-    # baseline ever calls: a run without --write-manifest never touches the
-    # manifest and never locks. Released here however the run ends, including
-    # the sys.exit() calls _ingest makes on an error.
+    # The manifest lock (ManifestLock, libs/sync_manifest_lib.py) is taken by
+    # _ingest for a real --write-manifest run, before it prepares the
+    # collection; a run without the flag never touches the manifest and never
+    # locks. Released here however the run ends, including the sys.exit()
+    # calls _ingest makes on an error.
     manifest_lock = ManifestLock(Path(args.repo_path).resolve())
     try:
         await _ingest(args, manifest_lock)
@@ -181,6 +181,19 @@ async def _ingest(args, manifest_lock: ManifestLock):
     # --write-manifest: a preview writes nothing, the manifest
     # included, so the flag only counts on a real run.
     write_manifest = args.write_manifest and not args.dry_run
+    if write_manifest:
+        # Taken BEFORE the collection is prepared and counted: whether this run
+        # may write a baseline rests on the collection being absent or empty
+        # (points_before below), and a sync_repo finishing in between could
+        # fill it and save its own manifest, after which this run would append
+        # duplicates and record a baseline that did not describe them. Held
+        # from here, no other manifest user can change the collection between
+        # the count and the save. Without --write-manifest the CLI never
+        # touches the manifest and never locks.
+        lock_error = manifest_lock.acquire()
+        if lock_error:
+            print(lock_error, file=sys.stderr)
+            sys.exit(1)
     # How many points the collection held before this run added to it. Stays 0
     # for a collection that does not exist yet; --reset never consults it (the
     # wipe makes this run's own chunks the whole index).
@@ -206,10 +219,9 @@ async def _ingest(args, manifest_lock: ManifestLock):
     def _invalidate_manifest():
         # An error string, in the shape prepare_collection_for_index aborts on.
         # discard_manifest is looked up here, at call time, so it stays
-        # patchable as this module's own name. Takes the manifest lock first
-        # (only --write-manifest runs ever get here), so a sync_repo or another
-        # run already using this checkout's manifest stops this one before the
-        # reset's delete or the first store; ingest() releases it.
+        # patchable as this module's own name. Only --write-manifest runs get
+        # here, and they already hold the lock (taken above); passing it keeps
+        # "never removed unlocked" true whatever the call site.
         return invalidation_error(repo_path, discard_manifest, manifest_lock)
 
     def _provider_with_budget(model_name: str):
@@ -467,10 +479,10 @@ def parse_args():
                          "is one file per checkout and does not say which collection it describes. Written only with "
                          "--reset or into a collection that was absent or empty; never on --dry-run or after a failed "
                          "run. The old manifest is removed before anything is deleted or stored. Into a populated "
-                         "collection without --reset, the manifest is left alone and a message says why. A run that "
-                         "writes it holds the checkout's manifest lock (.qdrant_index_manifest.json.lock) and stops "
-                         "with an error, before deleting or storing anything, if a sync_repo or index_repo on the "
-                         "same checkout already holds it")
+                         "collection without --reset, the manifest is left alone and a message says why. A run with "
+                         "this flag holds the checkout's manifest lock (.qdrant_index_manifest.json.lock) for the "
+                         "whole run and stops with an error, before deleting or storing anything, if a sync_repo or "
+                         "index_repo on the same checkout already holds it")
     p.add_argument("--reset", action="store_true", help="Delete the collection's existing points before indexing (avoids duplicate chunks on re-runs). "
                          "Like index_repo(reset=True), this is a filtered delete that keeps the "
                          "collection itself, any memory-bank points and marked conversation compacts, "
