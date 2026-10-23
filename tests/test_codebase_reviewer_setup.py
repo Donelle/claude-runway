@@ -328,8 +328,8 @@ class InitCli(unittest.TestCase):
         self.assertEqual(self._mcp()[BLOCK]["env"]["REVIEWERS_FILE"], "")
         self.assertIn("REVIEWERS_FILE", out)
         self.assertIn("REQUIRED and has no default", out)
-        # Only the config files init always writes: no reviewers file anywhere.
-        self.assertEqual({p.name for p in self.target.iterdir()} - before, {".mcp.json", ".claude"})
+        # Only the files init always writes: no reviewers file anywhere.
+        self.assertEqual({p.name for p in self.target.iterdir()} - before, {".mcp.json", ".claude", "CLAUDE.md"})
         self.assertEqual(list(self.target.rglob("*reviewers*")), [])
 
     def test_reviewers_file_flag_writes_the_given_path_verbatim_with_no_warning(self):

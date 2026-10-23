@@ -185,8 +185,6 @@ qdrant-only at some point silently computes a fresh `<collection-name>-conversat
 as if no prior compact history could possibly exist, when it might (found in a Copilot review). Only relevant if Q1 (step 3) ends up "Full setup" — a project going TO
 qdrant-only, or staying qdrant-only, never reaches Q5 at all (step 4 is skipped entirely).
 
-Check whether `CLAUDE.md` exists in the current directory and, if so, read it.
-
 ### 3. Ask configuration questions — scope, collection name, and memory-bank collection
 
 Use `AskUserQuestion` with three questions:
@@ -337,8 +335,7 @@ Show the full command to the user before running it.
 Run it using Bash (macOS/Linux) or PowerShell (Windows). Capture both stdout and
 stderr.
 
-If the command exits non-zero, show the full output and stop — do not proceed to
-CLAUDE.md.
+If the command exits non-zero, show the full output and stop.
 
 If it succeeds, extract the "Run the initial index" command line that
 `setup_project.py` prints at the end (the `ingest_to_qdrant.py ...` line). You
@@ -348,73 +345,21 @@ will include this in the final summary.
 (`subprocess.list2cmdline`). Run it in **Command Prompt** (`cmd.exe`), not
 PowerShell — cmd.exe quoting uses double quotes which PowerShell would expand.
 
-### 6. Create or update CLAUDE.md
+### 6. CLAUDE.md (done by step 5's command)
 
-Read the template at `$CLAUDE_RUNWAY_DIR/templates/CLAUDE.md.template`.
+`setup_project.py init` already created or updated the project's `CLAUDE.md` in step 5:
+do not edit it yourself. Its output has one line for it: `Writing CLAUDE.md (...)`, naming
+the sections it added (`new file with ...` when it created the file) and removed, or
+`CLAUDE.md already up to date, no changes`. Use that line in the summary below.
 
-From that file, extract four sections as verbatim text:
-- **Qdrant section**: everything from the line `## Vector memory (Qdrant MCP)` up to (but not including) the blank line that immediately precedes the next `##` heading.
-- **Durable memory section**: everything from the line `## Durable memory (memory-bank MCP)` up to (but not including) the blank line that immediately precedes the next `##` heading.
-- **LM Studio section**: everything from the line `## Local compression (LM Studio MCP)` up to (but not including) the blank line that immediately precedes the next `##` heading, or to the end of the file if there is none.
-- **Analytics section**: everything from the line `## Analytics (opt-in MCP server)` to the end of the file (or the blank line before the next `##` heading, if any).
-
-Do **not** include the HTML comment block at the top of the template — that is a
-template note, not guidance for Claude.
-
-The Durable memory section is added unconditionally, the same as the Qdrant section
-(NOT gated on full-setup vs. qdrant-only the way the LM Studio section is) — `setup_project.py`
-always wires up the `memory-bank` MCP server regardless of which setup mode was chosen (it's
-part of the Qdrant memory piece, not the LM Studio piece), so the CLAUDE.md guidance for it
-must always be present too, or a connected `memory-bank` server would have no usage guidance
-telling Claude when to `remember`/`recall`/`forget`.
-
-**If `CLAUDE.md` does not exist in the target project:**
-
-Create it with:
-```
-<Qdrant section>
-
-<Durable memory section>
-
-<LM Studio section>   # only if full setup (not qdrant-only)
-
-<Analytics section>   # only if the savings tracker was enabled (Q4) in a full setup
-```
-
-**If `CLAUDE.md` already exists:**
-
-Check whether it already contains `## Vector memory (Qdrant MCP)`.
-- If missing: append the Qdrant section (preceded by a blank line).
-
-Check whether it already contains `## Durable memory (memory-bank MCP)`.
-- If missing: append the Durable memory section (preceded by a blank line). Always add
-  this if missing, regardless of qdrant-only vs. full setup — see the note above.
-
-Check whether it already contains `## Local compression (LM Studio MCP)`.
-- If this is a **full setup** and the section is missing: append it (preceded by a blank line).
-- If this is **qdrant-only** and the section IS present: remove it. The section spans
-  from the `## Local compression (LM Studio MCP)` heading line through to (but not
-  including) the next `##` heading line, or end of file if there is none. Remove the
-  blank line immediately preceding the heading as well. This keeps CLAUDE.md consistent
-  with `.mcp.json` — leaving LM Studio guidance in place when `local-compress` is gone
-  would instruct Claude to call tools that are no longer connected.
-
-Check whether it already contains `## Analytics (opt-in MCP server)`.
-- If the savings tracker was enabled in a **full setup** and the section is missing: append it
-  (preceded by a blank line). `setup_project.py init --track-savings` is what wrote the
-  `analytics` block it describes.
-- If the tracker is **not** enabled, or this is **qdrant-only**, and the section IS present: remove
-  it the same way as the LM Studio section above (heading line through to, but not including, the
-  next `##` heading or end of file, plus the blank line before it). `init` without
-  `--track-savings` removes the `analytics` block, so leaving the section would point Claude at
-  tools that are no longer connected.
-
-If all sections were already in the desired state (Qdrant and Durable memory present,
-LM Studio present for full setup or absent for qdrant-only, Analytics present only with the
-savings tracker enabled), note "CLAUDE.md already up to date — no changes made."
-
-Never modify or remove any content already in CLAUDE.md other than the LM Studio and
-Analytics section removals described above.
+What it does, so you can answer questions about it: it reads `templates/CLAUDE.md.template`
+from the same install and keeps the usage sections in step with the servers it just wrote.
+Vector memory and Durable memory are always present; Local compression only for a full
+setup (removed for qdrant-only); Analytics only with the savings tracker (removed
+otherwise); Local review only when `.mcp.json` has a `codebase-reviewer` block. A missing
+section is appended after a blank line, a section already present is left as it is, and
+nothing else in the file is touched. The template's "Setup and diagnostics" section is not
+managed; offer to copy it in if the user has the claude-runway skills installed and wants it.
 
 ### 7. Report results and next steps
 
@@ -425,7 +370,7 @@ Done. Configured <target-project-path>:
 
   ✓ .mcp.json              — qdrant, codebase-indexer, memory-bank[, local-compress][, analytics — only with the savings tracker]
   ✓ .claude/settings.json  — SessionStart/SessionEnd record_session_id.py hook (always)[; PostToolUse, PreToolUse, SessionEnd hooks — only if full setup]
-  ✓ CLAUDE.md              — <what was added or "already up to date">
+  ✓ CLAUDE.md              — <the sections init added/removed, or "already up to date">
 
 Next: run the initial index (from inside the tools repo, venv activated):
   <exact ingest_to_qdrant.py command from setup_project.py output>     # with --dry-run to preview
@@ -529,7 +474,7 @@ the key into context, and do NOT stop for it — just proceed.
    only read at startup, so the upgrade has no effect on the running session.
 
 `upgrade` does not touch `CLAUDE.md`; it has no CLAUDE.md step (that is `init`-only,
-step 6). The migration list lives in `libs/upgrade_lib.py` (`MIGRATIONS`) and is the
+see step 6). The migration list lives in `libs/upgrade_lib.py` (`MIGRATIONS`) and is the
 single source of truth for which CONFIG changes an upgrade can make; this skill adds nothing
 to it. The skill refresh is separate from `MIGRATIONS`: it compares each already-installed
 skill with the shipped `skills/*/SKILL.md` (`plan_skill_installs` in

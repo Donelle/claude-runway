@@ -68,7 +68,7 @@ The script warns (rather than silently allowing) two collisions:
 - **Bad memories don't stop the run.** A memory with an empty summary, a missing `kind`, or a weight that is negative, infinite or not a number goes into `errors`, as does one whose write fails. An embedding-model mismatch applies to the whole collection, so it stops the run and is returned as `error`. A dry run cannot detect that mismatch.
 - **The source is never changed.** There is no delete option.
 
-For the exact usage guidance Claude should follow when deciding whether to call these tools, see `templates/CLAUDE.md.template`'s "Durable memory (memory-bank MCP)" section — copy it into a project's `CLAUDE.md` alongside the Qdrant/local-compress sections it already documents.
+For the exact usage guidance Claude should follow when deciding whether to call these tools, see `templates/CLAUDE.md.template`'s "Durable memory (memory-bank MCP)" section — `init` writes it into a project's `CLAUDE.md` alongside the Qdrant/local-compress sections (see [Installation](installation.md)'s step 5), or copy it there by hand.
 
 ## Usage event logging
 
