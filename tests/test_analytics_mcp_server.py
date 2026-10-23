@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for tools/analytics_mcp_server.py.
+"""Tests for mcpservers/analytics_mcp_server.py.
 
 Stdlib-only (unittest, no pytest) and no network -- needs neither a live model
 nor a real database (every test points the metrics/savings DB at a temp path):
@@ -21,13 +21,13 @@ from unittest import mock
 
 REPO_ROOT = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, str(REPO_ROOT / "libs"))
-sys.path.insert(0, str(REPO_ROOT / "tools"))
+sys.path.insert(0, str(REPO_ROOT / "mcpservers"))
 
 
 def _load_analytics_mcp_server():
     """Loads a FRESH copy of the module per call (its own MCPServer instance)."""
     spec = importlib.util.spec_from_file_location(
-        "analytics_mcp_server", REPO_ROOT / "tools" / "analytics_mcp_server.py"
+        "analytics_mcp_server", REPO_ROOT / "mcpservers" / "analytics_mcp_server.py"
     )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -52,7 +52,7 @@ class RegisteredToolSet(unittest.TestCase):
     def test_loading_it_imports_no_model_client_or_qdrant_stack(self):
         # The point of a separate server: it needs only `mcp` and the two SQLite
         # libraries, so it must not pull in the compression or Qdrant stacks.
-        source = (REPO_ROOT / "tools" / "analytics_mcp_server.py").read_text()
+        source = (REPO_ROOT / "mcpservers" / "analytics_mcp_server.py").read_text()
         for forbidden in ("openai", "lmstudio_client", "local_compress_lib", "qdrant_client", "fastembed", "trafilatura"):
             self.assertNotIn(f"import {forbidden}", source)
             self.assertNotIn(f"from {forbidden}", source)
@@ -443,7 +443,7 @@ class WordingForTheMovedToolsStaysInSync(unittest.TestCase):
     def test_the_mcp_template_has_an_opt_in_analytics_block(self):
         template = json.loads(self._read("templates", "mcp.json.template"))
         block = template["mcpServers"]["analytics"]
-        self.assertEqual(block["args"], ["/absolute/path/to/tools/analytics_mcp_server.py"])
+        self.assertEqual(block["args"], ["/absolute/path/to/mcpservers/analytics_mcp_server.py"])
         self.assertIn("OPTIONAL", block["_comment"])
 
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tests for check_embedding_model_mismatch in libs/qdrant_model_check.py
-(relocated here from tools/ingest_mcp_server.py
-so tools/memory_bank_mcp_server.py can reuse the identical check).
+(relocated here from mcpservers/ingest_mcp_server.py
+so mcpservers/memory_bank_mcp_server.py can reuse the identical check).
 
 Stdlib-only (unittest, no pytest) and no network -- all QdrantClient and
 FastEmbedProvider calls are mocked, so these run without a live Qdrant
@@ -17,7 +17,7 @@ from unittest.mock import MagicMock, patch
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "libs"))
-sys.path.insert(0, os.path.join(REPO_ROOT, "tools"))
+sys.path.insert(0, os.path.join(REPO_ROOT, "mcpservers"))
 
 import qdrant_model_check as _qmc  # noqa: E402
 from qdrant_client.http.models import models as _m  # noqa: E402

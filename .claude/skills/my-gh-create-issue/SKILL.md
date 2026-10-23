@@ -74,7 +74,7 @@ Any of `type=`/`theme=`/`priority=` may be omitted — missing ones get inferred
    **Proposal:** {the concrete shape of the fix/feature}
    ```
 
-   Only add a `Tracked in ...` footer line if this issue genuinely originates from an existing plan doc in `.plans/` — don't fabricate a reference to one that doesn't exist for this issue.
+   Only add a `Tracked in ...` footer line if this issue genuinely originates from an existing note in `.ai-plans/` — don't fabricate a reference to one that doesn't exist for this issue.
 
 8. **Check for duplicates** before filing:
    ```bash
@@ -83,7 +83,7 @@ Any of `type=`/`theme=`/`priority=` may be omitted — missing ones get inferred
    Always pass `--limit`: `gh issue list` silently truncates to the 30 newest results without it, so an older matching issue can be dropped and a duplicate filed (this has happened before).
    If a close match exists, show it to the user and ask whether to link/comment on that one instead of filing a new one.
 
-9. **Save a draft** to `.plans/{slug}.md` (kebab-case slug from the title) — same "draft before publish" step as `/my-create-task`, and gives the user something concrete to review before it becomes a public issue.
+9. **Save a draft** to `.ai-plans/{slug}.md` (kebab-case slug from the title) — same "draft before publish" step as `/my-create-task`, and gives the user something concrete to review before it becomes a public issue. Not `.plans/`: that folder holds only the `{N}-plan.md`/`{N}-research.md`/`{N}-validate.md` artifacts of tickets being worked, while drafts, the backlog work order and standalone notes live in `.ai-plans/`. Both are gitignored.
 
    ⛔ **STOP HERE. Show the drafted title, body, and labels to the user and wait for explicit approval before creating the issue.**
 
@@ -96,11 +96,13 @@ Any of `type=`/`theme=`/`priority=` may be omitted — missing ones get inferred
     ```bash
     gh issue create -R Donelle/claude-runway \
       --title "<title>" \
-      --body-file .plans/{slug}.md \
+      --body-file .ai-plans/{slug}.md \
       --label "<type>,<priority>,<theme if any>"
     ```
 
-12. **Confirm with**:
+12. **Delete the draft** (`.ai-plans/{slug}.md`) once the issue exists. The issue body now holds its full text, and a leftover copy only drifts from it.
+
+13. **Confirm with**:
     - Issue URL and number
     - Labels applied
     - Next step: `/my-gh-code-it {N}` whenever ready to work it

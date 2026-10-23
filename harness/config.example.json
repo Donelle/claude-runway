@@ -1,0 +1,49 @@
+{
+  "stages": ["reasoning"],
+  "reviewers": [
+    {
+      "name": "injection",
+      "model": "qwen2.5-coder-7b-instruct-mlx",
+      "prompt": "You review Python changes ONLY for injection: shell, SQL, path or argument injection from untrusted input.",
+      "active": true,
+      "type": ["reasoning"],
+      "loadOnDemand": true,
+      "contextLength": 8192
+    },
+    {
+      "name": "bounds-and-state",
+      "model": "qwen2.5-coder-7b-instruct-mlx",
+      "prompt": "You review Python changes ONLY for off-by-one errors, bad slicing, empty-input crashes, wrong formulas, and state shared between calls.",
+      "active": true,
+      "type": ["reasoning"],
+      "loadOnDemand": true,
+      "contextLength": 8192
+    },
+    {
+      "name": "verifier",
+      "model": "deepseek-r1-distill-qwen-7b",
+      "prompt": "You confirm a reported defect with a concrete failing input, or reject it.",
+      "active": true,
+      "type": ["verifier"],
+      "loadOnDemand": true,
+      "contextLength": 8192
+    },
+    {
+      "name": "classifier",
+      "model": "qwen2.5-coder-3b-instruct-8bit",
+      "prompt": "You match a verified finding to one rubric entry and say how sure you are, from 1 to 5.",
+      "active": true,
+      "type": ["classifier"],
+      "loadOnDemand": true,
+      "contextLength": 8192
+    }
+  ],
+  "rubric": [
+    {"name": "injection-or-traversal", "level": "high", "score": 3,
+     "definition": "Untrusted input reaches a shell, a SQL statement or a filesystem path without validation."},
+    {"name": "crash-on-input", "level": "moderate", "score": 3,
+     "definition": "A valid or empty input makes the code raise an unhandled exception."},
+    {"name": "style-only", "level": "low", "score": 4,
+     "definition": "Naming, formatting or readability, with no effect on behaviour."}
+  ]
+}

@@ -33,7 +33,7 @@ Setup:
          "mcpServers": {
            "local-compress": {
              "command": "python",
-             "args": ["/absolute/path/to/tools/compress_mcp_server.py"],
+             "args": ["/absolute/path/to/mcpservers/compress_mcp_server.py"],
              "env": {
                "CLAUDE_RUNWAY_LMSTUDIO_URL": "http://localhost:1234/v1",
                "CLAUDE_RUNWAY_LMSTUDIO_MODEL": "<exact model id loaded in LM Studio>"
@@ -88,6 +88,7 @@ from local_compress_lib import (
     fetch_loaded_models,
     redact_credentials,
 )
+from savings_envelope_lib import text_is_envelope
 
 # savings_ledger is optional at import time (e.g. an older checkout of just
 # this file without libs/savings_ledger.py) -- fails open to "tracking off"
@@ -124,33 +125,78 @@ MAX_FETCH_URL_BYTES = 10 * 1024 * 1024
 mcp = MCPServer("local-compress")
 
 
-def _append_savings_footer(outer_text: str, inner_result: str, tool: str, raw_text: str, credited: bool, source: str = "") -> str:
+def _wrap_unrecorded(text: str, tool: str) -> str:
+    """A genuine envelope around `text` that the hook unwraps and does not
+    record (null counts), for text that must not be returned bare. Falls back
+    to the bare text if it cannot be serialized and round-tripped, like the
+    tracked path."""
+    envelope = {
+        "compressed_text": text,
+        "metrics": {"tool": tool, "raw_chars": None, "out_chars": None, "credited": False, "source": ""},
+    }
+    try:
+        text.encode("utf-8")
+        payload = json.dumps(envelope)
+        if json.loads(payload) != envelope:
+            return text
+    except (ValueError, TypeError):
+        return text
+    return payload
+
+
+def _attach_savings_metrics(outer_text: str, inner_result: str, tool: str, raw_text: str, credited: bool, source: str = "") -> str:
     """
-    Appends a machine-readable savings footer to a credited tool's return
-    value, ONLY when CLAUDE_RUNWAY_TRACK_SAVINGS is on and actual compression
-    happened. Detection reuses compress()'s own self-documenting "[compressed
-    X -> Y chars]" prefix (see local_compress_lib.compress's docstring)
-    rather than re-deriving "did compression actually happen" separately.
+    Returns a credited tool's result as a JSON envelope carrying the savings
+    metrics next to the text Claude should see, ONLY when
+    CLAUDE_RUNWAY_TRACK_SAVINGS is on and actual compression happened:
+
+        {"compressed_text": "<exactly what Claude should see>",
+         "metrics": {"tool": ..., "raw_chars": ..., "out_chars": ...,
+                     "credited": ..., "source": ...}}
+
+    Detection reuses compress()'s own self-documenting "[compressed X -> Y
+    chars]" prefix (see local_compress_lib.compress's docstring) rather than
+    re-deriving "did compression actually happen" separately.
 
     inner_result is what compress() returned (used only for that detection);
     outer_text is the full string this tool actually returns to Claude
-    (which may wrap inner_result with an exit-code/fetch-size line) -- the
-    footer is appended there, and out_chars is measured on it, since that's
-    what Claude will actually see.
+    (which may wrap inner_result with an exit-code/fetch-size line) --
+    out_chars is measured on it, since that's what Claude will actually see.
 
-    hooks/compress_output.py is the one that STRIPS this footer before
-    Claude ever reads it and logs the numbers to the savings ledger -- this
-    MCP server can't write the ledger itself because (unlike a hook) it has
-    no access to Claude Code's session_id. When tracking is off, this is a
-    pure no-op, so tool output stays byte-identical to before this feature
-    existed.
+    hooks/compress_output.py is the one that UNWRAPS this envelope before
+    Claude ever reads it (it replaces the tool output with compressed_text)
+    and logs the metrics to the savings ledger -- this MCP server can't write
+    the ledger itself because (unlike a hook) it has no access to Claude
+    Code's session_id. When tracking is off, or nothing was compressed, this
+    returns the text unchanged, so tool output stays byte-identical to before
+    this feature existed -- with one exception: text the hook would itself
+    take for an envelope (a small JSON file that has exactly the envelope's
+    shape, handed back uncompressed) is wrapped by _wrap_unrecorded, because
+    the hook decides from the text alone and must never replace a file's
+    contents with a "compressed_text" the file itself supplied.
+
+    The envelope replaced an `<!--CLAUDE_RUNWAY_SAVINGS:{...}-->` comment
+    appended to the text: the hook never saw that, because Claude Code hands
+    it the MCP layer's own `{"result": "<returned string>"}` JSON, so the
+    returned text ends in `-->"}` and a pattern anchored at the end of the
+    text matched nothing. This is parsed with json.loads instead, never
+    matched against the end of a string. The text is JSON-encoded twice by
+    the time the hook sees it (once here, once by the MCP layer), and the
+    hook decodes exactly those two layers.
+
+    The envelope is built only by passing a real dict to json.dumps (never
+    by concatenating text into JSON), and is round-tripped before it is
+    returned. Any serialization problem -- including text that cannot be
+    encoded as UTF-8 at all, such as a lone surrogate -- returns the plain
+    outer_text with no metrics, so a tracking problem can never corrupt or
+    drop what Claude sees.
 
     `source` is redacted (not just truncated) before being embedded here:
     it's the raw caller-supplied value --
     compress_command_output passes the actual shell command, which can
     itself carry a credential (e.g. `curl -H 'Authorization: Bearer ghp_...'`)
     even when the compressed BODY the command produced is properly
-    redacted. This footer gets persisted into the savings ledger by
+    redacted. These metrics get persisted into the savings ledger by
     hooks/compress_output.py, so an unredacted `source` would turn a
     transient secret in a command line into a durable one in that database
     -- same class of problem redact_and_disclose() already exists to
@@ -160,19 +206,40 @@ def _append_savings_footer(outer_text: str, inner_result: str, tool: str, raw_te
     before the cutoff can split it.
     """
     if not TRACK_SAVINGS or not inner_result.startswith("[compressed"):
+        # Plain text goes back as it is -- except text the hook would take for an
+        # envelope. compress_file hands a small file back unchanged, and a file
+        # that IS envelope-shaped JSON would otherwise be unwrapped and recorded
+        # as if this server had written it, whether or not tracking is on here.
+        # That one case is wrapped in a genuine envelope with null counts, which
+        # the hook unwraps and does not record (see libs/savings_envelope_lib.py).
+        if text_is_envelope(outer_text):
+            return _wrap_unrecorded(outer_text, tool)
         return outer_text
     redacted_source, _ = redact_credentials(source) if source else ("", 0)
-    footer = json.dumps({
+    metrics = {
         "tool": tool,
-        # Exact character counts. The chars / 3.5 token
-        # estimates this footer used to carry are gone: a token count depends on
-        # the model's vocabulary, which is not public.
+        # Exact character counts. The chars / 3.5 token estimates these
+        # metrics used to carry are gone: a token count depends on the
+        # model's vocabulary, which is not public.
         "raw_chars": len(raw_text),
         "out_chars": len(outer_text),
         "credited": credited,
         "source": redacted_source[:200],
-    })
-    return f"{outer_text}\n<!--CLAUDE_RUNWAY_SAVINGS:{footer}-->"
+    }
+    envelope = {"compressed_text": outer_text, "metrics": metrics}
+    try:
+        # json.dumps escapes a lone surrogate instead of raising, but the MCP
+        # layer cannot carry one as text, so treat it as unserializable here
+        # rather than hand the hook something it would pass on to Claude.
+        outer_text.encode("utf-8")
+        metrics["source"].encode("utf-8")
+        payload = json.dumps(envelope)
+        if json.loads(payload) != envelope:
+            return outer_text
+    except (ValueError, TypeError):
+        # UnicodeEncodeError and JSONDecodeError are both ValueError.
+        return outer_text
+    return payload
 
 
 @mcp.tool()
@@ -315,7 +382,7 @@ async def compress_file(
         return f"Error: {path} is not a file."
     text = _decode_file_bytes(path.read_bytes())
     result = await _compress(text, focus, skip_if_under_chars, chunk_chars, max_total_chars, model, base_url, ctx, max_chars)
-    return _append_savings_footer(result, result, tool="compress_file", raw_text=text, credited=True, source=file_path)
+    return _attach_savings_metrics(result, result, tool="compress_file", raw_text=text, credited=True, source=file_path)
 
 
 @mcp.tool()
@@ -386,7 +453,7 @@ async def compress_command_output(
         preserve_identifiers=preserve_identifiers, preserve_sections=preserve_sections,
     )
     wrapped = f"[exit code {proc.returncode}]\n{result}"
-    return _append_savings_footer(wrapped, result, tool="compress_command_output", raw_text=combined, credited=True, source=command)
+    return _attach_savings_metrics(wrapped, result, tool="compress_command_output", raw_text=combined, credited=True, source=command)
 
 
 @mcp.tool()
@@ -589,7 +656,7 @@ async def fetch_url(
     # server-side summary (already compressed, per this repo's own testing),
     # not the raw page -- so we log the event for visibility but never count
     # it toward the headline savings number. See EVALUATION.md Track D.
-    return _append_savings_footer(wrapped, result, tool="fetch_url", raw_text=text, credited=False, source=url)
+    return _attach_savings_metrics(wrapped, result, tool="fetch_url", raw_text=text, credited=False, source=url)
 
 
 @mcp.tool()

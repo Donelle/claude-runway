@@ -29,6 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # fake_token_bud
 
 import ingest_to_qdrant as mod  # noqa: E402
 from fake_token_budget import word_budget  # noqa: E402
+import memory_bank_lib  # noqa: E402
 import qdrant_ingest_lib as lib  # noqa: E402
 from qdrant_ingest_lib import MANIFEST_FILENAME, MANIFEST_FORMAT_VERSION, TokenBudgetError  # noqa: E402
 from sync_manifest_lib import UNVERIFIED_HASH, discard_manifest, load_manifest, save_manifest  # noqa: E402
@@ -59,6 +60,7 @@ def _args(**overrides) -> argparse.Namespace:
         dry_run=False,
         reset=False,
         write_manifest=False,
+        memory_bank_collection=None,
     )
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -155,7 +157,7 @@ class NonDryRunStillPerformsCollectionMaintenance(unittest.TestCase):
         fake_client.delete.assert_called_once()
         kwargs = fake_client.delete.call_args.kwargs
         self.assertEqual(kwargs["collection_name"], "test-collection")
-        self.assertEqual(kwargs["points_selector"], mod.mb.memory_bank_exclusion_filter())
+        self.assertEqual(kwargs["points_selector"], memory_bank_lib.memory_bank_exclusion_filter())
         # fail_closed=True is what makes an inconclusive check block the delete.
         self.assertTrue(fake_check.call_args.kwargs["fail_closed"])
 
@@ -256,39 +258,131 @@ class SharedPreparationWithIndexRepo(unittest.TestCase):
 
 
 class ResetRefusesMemoryBankCollection(unittest.TestCase):
-    """--Reset against the configured memory-bank collection is
-    refused outright, before any Qdrant client is even constructed."""
+    """The configured memory-bank collection is refused outright, before any
+    Qdrant client is even constructed. It is refused on every run, not only
+    --reset (as index_repo/sync_repo refuse it), and with the name also read
+    from --repo-path's .mcp.json, where setup writes it -- the shell normally
+    doesn't export MEMORY_BANK_COLLECTION, so a custom name there used to go
+    unprotected by the CLI while index_repo refused it."""
+
+    def setUp(self):
+        # The developer's own shell may export MEMORY_BANK_COLLECTION, which
+        # would outrank the .mcp.json these tests write.
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("MEMORY_BANK_COLLECTION", None)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.repo = Path(tmp.name)
+        (self.repo / "a.md").write_text("# Title\n\nbody\n")
+
+    def _write_mcp_json(self, text):
+        (self.repo / ".mcp.json").write_text(text, encoding="utf-8")
+
+    def _run_ingest(self, fake_client_cls, err, **overrides):
+        with mock.patch.object(mod, "QdrantClient", fake_client_cls), \
+             mock.patch.object(mod, "FastEmbedProvider", new=_provider_mock()), \
+             mock.patch.object(mod, "QdrantConnector"), \
+             mock.patch.object(mod, "store_batch", new=mock.AsyncMock(return_value=0)) as fake_store:
+            with redirect_stdout(io.StringIO()), redirect_stderr(err):
+                _run(mod.ingest(_args(repo_path=str(self.repo), **overrides)))
+        return fake_store
 
     def _assert_refused(self, **overrides):
         fake_client_cls = mock.MagicMock()
         err = io.StringIO()
-        with mock.patch.object(mod, "QdrantClient", fake_client_cls), \
-             mock.patch.object(mod, "DEFAULT_MEMORY_BANK_COLLECTION", "my-shared-bank"), \
-             mock.patch.object(mod, "FastEmbedProvider", new=_provider_mock()), \
-             mock.patch.object(mod, "QdrantConnector"):
-            with redirect_stderr(err), self.assertRaises(SystemExit) as cm:
-                _run(mod.ingest(_args(collection="my-shared-bank", reset=True, **overrides)))
+        with self.assertRaises(SystemExit) as cm:
+            self._run_ingest(fake_client_cls, err, **{"collection": "my-shared-bank", **overrides})
         self.assertEqual(cm.exception.code, 1)
         self.assertIn("memory-bank", err.getvalue())
         fake_client_cls.assert_not_called()
+        return err.getvalue()
 
     def test_reset_of_memory_bank_collection_is_refused(self):
-        self._assert_refused(dry_run=False)
+        self._assert_refused(reset=True, dry_run=False, memory_bank_collection="my-shared-bank")
 
     def test_refusal_also_applies_alongside_dry_run(self):
-        self._assert_refused(dry_run=True)
+        self._assert_refused(reset=True, dry_run=True, memory_bank_collection="my-shared-bank")
 
-    def test_non_reset_ingest_into_memory_bank_name_is_not_this_guards_concern(self):
-        """Scope pin: only --reset is guarded here."""
+    def test_plain_ingest_into_memory_bank_collection_is_refused_too(self):
+        """This used to be pinned as NOT refused (only --reset was guarded);
+        index_repo/sync_repo refuse it regardless of reset/force."""
+        self._assert_refused(reset=False, memory_bank_collection="my-shared-bank")
+
+    def test_name_from_the_shell_environment_is_refused(self):
+        os.environ["MEMORY_BANK_COLLECTION"] = "my-shared-bank"
+        err = self._assert_refused(reset=True)
+        self.assertIn("MEMORY_BANK_COLLECTION environment variable", err)
+
+    def test_custom_name_only_in_mcp_json_is_refused(self):
+        """The issue's exact reproduction: `--reset --collection team-memory`
+        with team-memory set only in .mcp.json's codebase-indexer block. On
+        main this ran (the shell gave the "memory-bank" default)."""
+        self._write_mcp_json(json.dumps({"mcpServers": {
+            "codebase-indexer": {"env": {"MEMORY_BANK_COLLECTION": "team-memory"}},
+        }}))
+        for reset in (True, False):
+            with self.subTest(reset=reset):
+                err = self._assert_refused(collection="team-memory", reset=reset)
+                self.assertIn('"codebase-indexer" block', err)
+
+    def test_every_name_is_refused_when_the_mcp_json_blocks_disagree(self):
+        # memory-bank stores in team-memory; taking only codebase-indexer's name left it open.
+        self._write_mcp_json(json.dumps({"mcpServers": {
+            "codebase-indexer": {"env": {"MEMORY_BANK_COLLECTION": "memory-bank"}},
+            "memory-bank": {"env": {"MEMORY_BANK_COLLECTION": "team-memory"}},
+        }}))
+        for collection, block in (("team-memory", '"memory-bank" block'), ("memory-bank", '"codebase-indexer" block')):
+            with self.subTest(collection=collection):
+                err = self._assert_refused(collection=collection, reset=False)
+                self.assertIn(block, err)
+                self.assertIn("disagree", err)
+
+    def test_an_override_does_not_unreserve_the_mcp_json_name(self):
+        self._write_mcp_json(json.dumps({"mcpServers": {
+            "memory-bank": {"env": {"MEMORY_BANK_COLLECTION": "team-memory"}},
+        }}))
+        err = self._assert_refused(collection="team-memory", reset=False, memory_bank_collection="memory-bank")
+        self.assertIn('"memory-bank" block', err)
+        os.environ["MEMORY_BANK_COLLECTION"] = "memory-bank"
+        err = self._assert_refused(collection="team-memory", reset=False)
+        self.assertIn('"memory-bank" block', err)
+
+    def test_default_name_is_still_refused_with_nothing_configured(self):
+        self._assert_refused(collection="memory-bank", reset=True)
+
+    def test_other_collection_still_indexes(self):
+        self._write_mcp_json(json.dumps({"mcpServers": {
+            "codebase-indexer": {"env": {"MEMORY_BANK_COLLECTION": "team-memory"}},
+        }}))
         fake_client = mock.MagicMock()
         fake_client.collection_exists.return_value = False
-        with mock.patch.object(mod, "QdrantClient", return_value=fake_client), \
-             mock.patch.object(mod, "DEFAULT_MEMORY_BANK_COLLECTION", "my-shared-bank"), \
-             mock.patch.object(mod, "FastEmbedProvider", new=_provider_mock()), \
-             mock.patch.object(mod, "QdrantConnector"), \
-             mock.patch.object(mod, "store_batch", new=mock.AsyncMock(return_value=0)):
-            with redirect_stdout(io.StringIO()):
-                _run(mod.ingest(_args(collection="my-shared-bank", reset=False)))
+        fake_store = self._run_ingest(
+            mock.MagicMock(return_value=fake_client), io.StringIO(), collection="memory-bank"
+        )
+        fake_store.assert_awaited_once()
+
+    def test_malformed_mcp_json_warns_and_does_not_crash(self):
+        self._write_mcp_json("{not json")
+        fake_client = mock.MagicMock()
+        fake_client.collection_exists.return_value = False
+        err = io.StringIO()
+        fake_store = self._run_ingest(
+            mock.MagicMock(return_value=fake_client), err, collection="test-collection"
+        )
+        fake_store.assert_awaited_once()
+        self.assertIn("Warning: could not read MEMORY_BANK_COLLECTION", err.getvalue())
+        # And the default is still protected while the file is unreadable.
+        self._assert_refused(collection="memory-bank")
+
+    def test_flag_is_parsed(self):
+        argv = ["ingest_to_qdrant.py", "--repo-path", ".", "--collection", "c",
+                "--memory-bank-collection", "team-memory"]
+        with mock.patch.object(sys, "argv", argv):
+            self.assertEqual(mod.parse_args().memory_bank_collection, "team-memory")
+        with mock.patch.object(sys, "argv", argv[:5]):
+            self.assertIsNone(mod.parse_args().memory_bank_collection)
 
 
 def _dry_run_indexed_paths(args) -> set:
@@ -449,6 +543,53 @@ class CliParityWithMcpServer(unittest.TestCase):
         with self.assertRaises(SystemExit), redirect_stdout(out):
             self._parse(["--help"], {"QDRANT_API_KEY": "super-secret-key"})
         self.assertNotIn("super-secret-key", out.getvalue())
+
+
+class CliScopesApiKeyToConfiguredUrl(unittest.TestCase):
+    """The CLI sends $QDRANT_API_KEY only to $QDRANT_URL (or the built-in
+    default URL when QDRANT_URL is unset), the rule libs/qdrant_credentials.py
+    applies to the MCP tools. The two leak tests (foreign URL, and the foreign
+    half of the built-in-default test) guard against sending the key to
+    another host; the other two guard the cases that must keep the key."""
+
+    BASE_ARGV = ["--repo-path", "/tmp/repo", "--collection", "c"]
+
+    def _parse(self, argv, env):
+        with mock.patch.dict(os.environ, env, clear=True), \
+             mock.patch.object(sys, "argv", ["ingest_to_qdrant.py", *self.BASE_ARGV, *argv]):
+            return mod.parse_args()
+
+    def test_foreign_url_gets_no_key(self):
+        args = self._parse(
+            ["--qdrant-url", "https://other.example"],
+            {"QDRANT_URL": "http://configured:6333", "QDRANT_API_KEY": "secret-key"},
+        )
+        self.assertEqual(args.qdrant_url, "https://other.example")
+        self.assertIsNone(args.qdrant_api_key)
+
+    def test_explicit_key_is_kept_for_a_foreign_url(self):
+        args = self._parse(
+            ["--qdrant-url", "https://other.example", "--qdrant-api-key", "other-key"],
+            {"QDRANT_URL": "http://configured:6333", "QDRANT_API_KEY": "secret-key"},
+        )
+        self.assertEqual(args.qdrant_url, "https://other.example")
+        self.assertEqual(args.qdrant_api_key, "other-key")
+
+    def test_configured_url_with_trailing_slash_keeps_the_key(self):
+        args = self._parse(
+            ["--qdrant-url", "http://configured:6333/"],
+            {"QDRANT_URL": "http://configured:6333", "QDRANT_API_KEY": "secret-key"},
+        )
+        self.assertEqual(args.qdrant_url, "http://configured:6333/")
+        self.assertEqual(args.qdrant_api_key, "secret-key")
+
+    def test_built_in_default_url_gets_the_key_and_a_foreign_one_does_not(self):
+        env = {"QDRANT_API_KEY": "secret-key"}  # QDRANT_URL unset
+        default_args = self._parse([], env)
+        self.assertEqual(default_args.qdrant_url, "http://localhost:6333")
+        self.assertEqual(default_args.qdrant_api_key, "secret-key")
+        foreign_args = self._parse(["--qdrant-url", "https://other.example"], env)
+        self.assertIsNone(foreign_args.qdrant_api_key)
 
 
 class TokenBudgetChunkingInTheCli(unittest.TestCase):

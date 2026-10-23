@@ -43,7 +43,7 @@ from qdrant_retry import async_call_with_retry
 UPSERT_BATCH_SIZE = 250
 
 # Must match the nested key sync_repo's own delete-by-filter already uses
-# (tools/ingest_mcp_server.py's models.FieldCondition(key="metadata.file_path",
+# (mcpservers/ingest_mcp_server.py's models.FieldCondition(key="metadata.file_path",
 # ...)): store()/store_batch() write {"document": ..., METADATA_PATH:
 # entry.metadata}, and entry.metadata itself has a "file_path" key (see
 # qdrant_ingest_lib.py's chunk_file), so the indexable field is the NESTED

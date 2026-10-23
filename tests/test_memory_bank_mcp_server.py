@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for tools/memory_bank_mcp_server.py's tool-layer argument
+"""Tests for mcpservers/memory_bank_mcp_server.py's tool-layer argument
 validation and tool registration.
 
 Stdlib-only (unittest, no pytest), no network -- these only cover
@@ -24,7 +24,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "libs"))
-sys.path.insert(0, os.path.join(REPO_ROOT, "tools"))
+sys.path.insert(0, os.path.join(REPO_ROOT, "mcpservers"))
 
 # Minimal env so module-level DEFAULT_* constants don't explode on import --
 # same pattern established in test_ingest_mcp_server_tool_count.py.
@@ -546,10 +546,93 @@ class TransferMemoriesToolTest(unittest.TestCase):
             _mbs.transfer_memories()  # type: ignore[call-arg]
 
 
+class CopyMemoriesToolTest(unittest.TestCase):
+    """copy_memories' tool-layer wiring. The copy logic itself is
+    covered by test_memory_bank_lib.py's CopyPointsTest."""
+
+    @staticmethod
+    def _fake_report(dry_run=True):
+        return {"collection": "memory-bank", "source_repo": "proj-b", "target_repo": "x", "kind": "all",
+                "dry_run": dry_run, ("would_copy" if dry_run else "copied"): 0,
+                "already_present": 0, "memories": [], "errors": []}
+
+    def test_dry_run_is_the_default_and_builds_no_embedding_provider(self):
+        with patch("memory_bank_mcp_server.QdrantClient"), \
+             patch("memory_bank_mcp_server.FastEmbedProvider") as mock_provider_cls, \
+             patch.object(_mb, "copy_points", new=AsyncMock(return_value=self._fake_report())) as mock_copy:
+            result = _run(_mbs.copy_memories(source_repo="proj-b"))
+        mock_provider_cls.assert_not_called()
+        kwargs = mock_copy.call_args.kwargs
+        self.assertIs(kwargs["dry_run"], True)
+        self.assertEqual(kwargs["source_repo"], "proj-b")
+        self.assertIsNone(kwargs["kind"])  # "all" reaches the lib as no kind filter
+        self.assertEqual(mock_copy.call_args.args[2], _mbs.DEFAULT_MEMORY_BANK_COLLECTION)
+        self.assertIsNone(mock_copy.call_args.args[1])
+        self.assertIn("would_copy", __import__("json").loads(result))
+
+    def test_target_is_always_this_projects_own_repo(self):
+        with patch("memory_bank_mcp_server.QdrantClient"), \
+             patch.object(_mb, "copy_points", new=AsyncMock(return_value=self._fake_report())) as mock_copy:
+            _run(_mbs.copy_memories(source_repo="proj-b"))
+        self.assertEqual(mock_copy.call_args.kwargs["caller_repo"], _mbs.DEFAULT_MEMORY_BANK_ID)
+
+    def test_has_no_parameter_that_could_name_another_target(self):
+        import inspect
+        self.assertEqual(
+            list(inspect.signature(_mbs.copy_memories).parameters), ["source_repo", "kind", "dry_run"]
+        )
+
+    def test_real_run_builds_embedding_provider(self):
+        with patch("memory_bank_mcp_server.QdrantClient"), \
+             patch("memory_bank_mcp_server.FastEmbedProvider") as mock_provider_cls, \
+             patch.object(_mb, "copy_points", new=AsyncMock(return_value=self._fake_report(False))) as mock_copy:
+            _run(_mbs.copy_memories(source_repo="proj-b", dry_run=False))
+        mock_provider_cls.assert_called_once_with(_mbs.DEFAULT_EMBEDDING_MODEL)
+        self.assertIs(mock_copy.call_args.kwargs["dry_run"], False)
+
+    def test_one_kind_reaches_the_lib_stripped(self):
+        with patch("memory_bank_mcp_server.QdrantClient"), \
+             patch.object(_mb, "copy_points", new=AsyncMock(return_value=self._fake_report())) as mock_copy:
+            _run(_mbs.copy_memories(source_repo="proj-b", kind=" lesson "))
+        self.assertEqual(mock_copy.call_args.kwargs["kind"], "lesson")
+
+    def test_empty_kind_is_an_error_before_any_client(self):
+        with patch("memory_bank_mcp_server.QdrantClient") as mock_client_cls, \
+             patch.object(_mb, "copy_points", new=AsyncMock()) as mock_copy:
+            result = _run(_mbs.copy_memories(source_repo="proj-b", kind="  "))
+        self.assertIn("kind", __import__("json").loads(result)["error"])
+        mock_client_cls.assert_not_called()
+        mock_copy.assert_not_called()
+
+    def test_misconfigured_memory_bank_id_returns_error_before_any_client(self):
+        with patch.object(_mbs, "DEFAULT_MEMORY_BANK_ID", None), \
+             patch("memory_bank_mcp_server.QdrantClient") as mock_client_cls, \
+             patch.object(_mb, "copy_points", new=AsyncMock()) as mock_copy:
+            result = _run(_mbs.copy_memories(source_repo="proj-b", dry_run=False))
+        report = __import__("json").loads(result)
+        self.assertIn("MEMORY_BANK_ID", report["error"])
+        self.assertEqual(report["source_repo"], "proj-b")
+        mock_client_cls.assert_not_called()
+        mock_copy.assert_not_called()
+
+    def test_general_memory_bank_id_is_refused(self):
+        # resolve_repo refuses a project whose own id is the reserved sentinel.
+        with patch.object(_mbs, "DEFAULT_MEMORY_BANK_ID", _mb.GENERAL_REPO), \
+             patch("memory_bank_mcp_server.QdrantClient"), \
+             patch.object(_mb, "copy_points", new=AsyncMock()) as mock_copy:
+            result = _run(_mbs.copy_memories(source_repo="proj-b"))
+        self.assertIn("error", __import__("json").loads(result))
+        mock_copy.assert_not_called()
+
+    def test_source_repo_is_required(self):
+        with self.assertRaises(TypeError):
+            _mbs.copy_memories()  # type: ignore[call-arg]
+
+
 class ToolRegistrationTest(unittest.TestCase):
-    def test_registers_exactly_four_tools(self):
+    def test_registers_exactly_five_tools(self):
         from mcp_tool_introspect import tool_count
-        self.assertEqual(tool_count(_mbs.mcp), 4)
+        self.assertEqual(tool_count(_mbs.mcp), 5)
 
     def test_logs_tool_count_to_stderr_not_stdout(self):
         captured_err = io.StringIO()
@@ -558,7 +641,7 @@ class ToolRegistrationTest(unittest.TestCase):
         with redirect_stderr(captured_err), contextlib.redirect_stdout(captured_out):
             _mbs._log_registered_tool_count()
         self.assertIn("memory-bank", captured_err.getvalue())
-        self.assertIn("4", captured_err.getvalue())
+        self.assertIn("5", captured_err.getvalue())
         self.assertEqual(captured_out.getvalue(), "")
 
 

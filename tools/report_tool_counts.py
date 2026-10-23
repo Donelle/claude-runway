@@ -3,8 +3,8 @@
 Prints the LIVE `@mcp.tool()` count AND the size, in characters, of each
 tool's description text (name + signature + docstring, a proxy for the JSON
 tool schema -- see below) for every MCP server this repo's users connect (this repo's own
-`qdrant_mcp_server.py`/`compress_mcp_server.py`/`analytics_mcp_server.py`/
-`ingest_mcp_server.py`/`memory_bank_mcp_server.py`) -- instead of a number
+`mcpservers/qdrant_mcp_server.py`/`compress_mcp_server.py`/`analytics_mcp_server.py`/
+`ingest_mcp_server.py`/`memory_bank_mcp_server.py`/`codebase_reviewer_mcp_server.py`) -- instead of a number
 hand-copied into EVALUATION.md that goes stale as tools are added. See
 libs/mcp_tool_introspect.py's docstring for the history of that exact
 failure mode, and GROW-05 for why one shared,
@@ -21,7 +21,7 @@ adds to a session's starting context, use tools/measure_startup_context.py,
 which reads it from session transcripts; this script only reports how many
 tools there are and how big their descriptions are. Also
 used as a CI smoke check (see .github/workflows/tests.yml): a nonzero
-exit code here means one of the five servers failed to construct or
+exit code here means one of the six servers failed to construct or
 enumerate its own tools, which is a real regression worth failing the
 build on.
 
@@ -41,7 +41,7 @@ terminal or CI runner with no other infrastructure up.
 
 Note: importing `compress_mcp_server` requires `openai`/`requests`/
 `trafilatura` (see requirements.txt); importing `analytics_mcp_server`
-needs only `mcp`; importing `qdrant_mcp_server`,
+needs only `mcp`, and `codebase_reviewer_mcp_server` needs `mcp` and `openai`; importing `qdrant_mcp_server`,
 `ingest_mcp_server` and `memory_bank_mcp_server` requires `qdrant-client`
 and `fastembed`. All are already required for the CI job's
 `pip install -r requirements.txt` step to succeed at all, so no extra
@@ -54,18 +54,18 @@ import os
 import sys
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-TOOLS_DIR = os.path.join(REPO_ROOT, "tools")
+MCPSERVERS_DIR = os.path.join(REPO_ROOT, "mcpservers")
 LIBS_DIR = os.path.join(REPO_ROOT, "libs")
 
 sys.path.insert(0, LIBS_DIR)
-sys.path.insert(0, TOOLS_DIR)
+sys.path.insert(0, MCPSERVERS_DIR)
 
 from mcp_tool_introspect import describe_tools, tool_count  # noqa: E402
 
 
 def _report_repo_server(module_name: str) -> tuple:
     """
-    Imports one of THIS repo's own tool modules and returns
+    Imports one of THIS repo's own MCP server modules (from mcpservers/) and returns
     (tool_count, schema_chars), or raises -- callers decide
     whether a failure here should be fatal (main() below treats it as
     fatal, since a broken import means the numbers can't be trusted at
@@ -95,6 +95,7 @@ def main() -> int:
         ("qdrant", "qdrant_mcp_server"),
         ("codebase-indexer", "ingest_mcp_server"),
         ("memory-bank", "memory_bank_mcp_server"),
+        ("codebase-reviewer", "codebase_reviewer_mcp_server"),
     ):
         try:
             count, chars = _report_repo_server(module_name)

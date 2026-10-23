@@ -20,6 +20,12 @@ server reads, read from this shell's environment (not from .mcp.json).
 QDRANT_API_KEY is used only when --qdrant-url is QDRANT_URL (or the built-in
 default); any other --qdrant-url needs its own --qdrant-api-key.
 
+--collection is refused on every run if it is the shared memory-bank
+collection, as index_repo/sync_repo refuse it. That name comes from
+--memory-bank-collection, else $MEMORY_BANK_COLLECTION, else
+MEMORY_BANK_COLLECTION in --repo-path's .mcp.json (where setup writes it, the
+codebase-indexer block first), else "memory-bank".
+
 Chunking is by the embedding model's own token window, not by line count:
 the model embeds only the first N tokens of a text (N is read
 from the loaded model), so each chunk is cut to fit that window. --overlap is
@@ -88,6 +94,7 @@ from qdrant_ingest_lib import (
     format_largest_files,
     ingest_env_defaults,
     parse_csv_set,
+    resolve_memory_bank_collection,
     validate_token_overlap,
 )
 from qdrant_batch_store import store_batch, ensure_file_path_index, FIELD_INDEXES
@@ -102,37 +109,43 @@ from sync_manifest_lib import (
     save_manifest,
     unindexed_hashed_files,
 )
-import memory_bank_lib as mb
 
 # Must run before FastEmbedProvider(...) is constructed in ingest() below --
 # see the function's own docstring for why this can't just be
 # a .mcp.json/shell env value.
 ensure_persistent_fastembed_cache()
 
-# Same env var + default the MCP servers read (tools/ingest_mcp_server.py's
-# DEFAULT_MEMORY_BANK_COLLECTION, both via ingest_env_defaults), so the CLI's
-# --reset guard below agrees with index_repo's about which collection is the
-# shared memory bank. Read at import time like the server does; an
-# interactive shell that doesn't export MEMORY_BANK_COLLECTION falls back to
-# the "memory-bank" default, which is the name a stock install uses anyway
-# (a custom name that lives only in .mcp.json is not picked up here).
-DEFAULT_MEMORY_BANK_COLLECTION = ingest_env_defaults()["memory_bank_collection"]
-
 
 async def ingest(args):
-    # --Reset used to be a raw delete_collection with none of
-    # the protections index_repo(reset=True) has.
-    # Layer 1 (name refusal), ported from index_repo: pointing --reset at
-    # the shared memory-bank collection would irreversibly destroy every
-    # project's durable memories. Checked BEFORE the dry-run guard and
-    # before any Qdrant client exists, so it needs no network and a
-    # refused command fails fast even when combined with --dry-run.
-    if args.reset and mb.is_memory_bank_collection_name(args.collection, DEFAULT_MEMORY_BANK_COLLECTION):
+    # --reset used to be a raw delete_collection with none of the protections
+    # index_repo(reset=True) has.
+    # Layer 1 (name refusal), ported from index_repo: the shared memory-bank
+    # collection is reserved for every project's durable memories, so no code
+    # index goes there. It is not the only protection -- --reset's filtered
+    # delete keeps memory-bank points, and recall only matches points with
+    # the memory-bank source marker -- but it stops the mistake at the name
+    # instead of relying on those. Refused on EVERY run, as
+    # index_repo/sync_repo refuse it regardless of reset/force; this used
+    # to guard --reset only. Checked BEFORE the dry-run guard and before any
+    # Qdrant client exists, so it needs no network and a refused command
+    # fails fast even when combined with --dry-run.
+    #
+    # The name is resolved per run, not at import: the MCP
+    # server reads MEMORY_BANK_COLLECTION from its .mcp.json env block, but
+    # this CLI runs from a shell that normally doesn't export it, so reading
+    # only the shell left a custom name unprotected here while index_repo
+    # refused it. resolve_memory_bank_collection also reads --repo-path's
+    # .mcp.json, after the flag and the shell variable.
+    memory_bank = resolve_memory_bank_collection(args.memory_bank_collection, args.repo_path)
+    if memory_bank.warning:
+        print(f"Warning: {memory_bank.warning}", file=sys.stderr)
+    reserved_by = memory_bank.reserved_source(args.collection)
+    if reserved_by:
         print(
             f"Error: '{args.collection}' is configured as the shared memory-bank "
-            f"collection (MEMORY_BANK_COLLECTION). Refusing to --reset it -- that "
-            f"would wipe every project's durable memories. Use a different "
-            f"--collection for this project's code index.",
+            f"collection ({reserved_by}). Refusing to index into it -- "
+            f"that collection is reserved for every project's durable memories. "
+            f"Use a different --collection for this project's code index.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -437,10 +450,16 @@ def parse_args():
                          "collection without --reset, the manifest is left alone and a message says why")
     p.add_argument("--reset", action="store_true", help="Delete the collection's existing points before indexing (avoids duplicate chunks on re-runs). "
                          "Like index_repo(reset=True), this is a filtered delete that keeps the "
-                         "collection itself, any memory-bank points and marked conversation compacts, refuses the configured "
-                         "MEMORY_BANK_COLLECTION outright, and aborts before deleting on an embedding-model "
+                         "collection itself, any memory-bank points and marked conversation compacts, "
+                         "and aborts before deleting on an embedding-model "
                          "mismatch -- so it can no longer rebuild a collection's vector schema after an "
-                         "EMBEDDING_MODEL change (drop the collection manually for that)")
+                         "EMBEDDING_MODEL change (drop the collection manually for that). The shared memory-bank "
+                         "collection is refused outright, with or without --reset (see --memory-bank-collection)")
+    p.add_argument("--memory-bank-collection", default=None,
+                    help="Name of the shared memory-bank collection, which this CLI refuses to index into on any run, "
+                         "as index_repo/sync_repo do. Default: $MEMORY_BANK_COLLECTION if set, else "
+                         "MEMORY_BANK_COLLECTION from --repo-path's .mcp.json (the codebase-indexer block, then the "
+                         "memory-bank block), else 'memory-bank'")
     args = p.parse_args()
     # The same key rule the MCP tools follow (libs/qdrant_credentials.py): an
     # explicit --qdrant-api-key always wins, $QDRANT_API_KEY goes only to the

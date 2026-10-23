@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for tools/compress_mcp_server.py.
+"""Tests for mcpservers/compress_mcp_server.py.
 
 Stdlib-only (unittest, no pytest) and no network -- needs neither a live model
 nor a real database:
@@ -23,7 +23,8 @@ from unittest import mock
 
 REPO_ROOT = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, str(REPO_ROOT / "libs"))
-sys.path.insert(0, str(REPO_ROOT / "tools"))
+sys.path.insert(0, str(REPO_ROOT / "mcpservers"))
+sys.path.insert(0, str(REPO_ROOT / "hooks"))
 
 
 def _load_compress_mcp_server():
@@ -36,7 +37,7 @@ def _load_compress_mcp_server():
     reliably patch the real thing regardless of which load called it.
     """
     spec = importlib.util.spec_from_file_location(
-        "compress_mcp_server", REPO_ROOT / "tools" / "compress_mcp_server.py"
+        "compress_mcp_server", REPO_ROOT / "mcpservers" / "compress_mcp_server.py"
     )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -182,9 +183,9 @@ class CompressCommandOutputDefaultsToRedaction(unittest.TestCase):
         secret = "ghp_" + ("a" * 36)
         # The secret comes from the command's STDOUT here, not its own
         # command line text, to keep this test focused on the compressed
-        # BODY's redaction specifically -- the savings footer's "source"
+        # BODY's redaction specifically -- the savings metrics' "source"
         # field (a separate leak vector: the raw command line itself, which
-        # is also now redacted -- see SavingsFooterRedactsSourceCredentials
+        # is also now redacted -- see SavingsMetricsRedactSourceCredentials
         # below) is exercised by its own dedicated
         # test instead. Passing it via an env var keeps the command line
         # itself secret-free while still producing the secret in stdout.
@@ -252,83 +253,372 @@ class CompressCommandOutputDefaultsToRedaction(unittest.TestCase):
         self.assertIn("credential-shaped value(s) redacted", result)
 
 
-class SavingsFooterRedactsSourceCredentials(unittest.TestCase):
+_COMPRESSED = "[compressed 100 -> 10 chars across 1 chunk(s), ~90% smaller]\n\nsummary"
+
+
+class SavingsMetricsRedactSourceCredentials(unittest.TestCase):
     """Regression coverage for a review finding, round 3 (Copilot):
-    _append_savings_footer's "source" field echoed the raw caller-supplied
+    _attach_savings_metrics's "source" field echoed the raw caller-supplied
     value (compress_command_output passes the actual shell command)
-    verbatim and unredacted into the savings footer -- so a command like
+    verbatim and unredacted into the savings metrics -- so a command like
     `curl -H 'Authorization: Bearer ghp_...'` still leaked its embedded
     credential via that field even though the compressed BODY the command
-    produced was properly redacted. That footer gets persisted into the
+    produced was properly redacted. Those metrics get persisted into the
     savings ledger by hooks/compress_output.py, turning a transient
     secret in a command line into a durable one in that database.
     """
 
-    def test_source_credential_is_redacted_in_the_footer(self):
+    def _metrics(self, source):
         mod = _load_compress_mcp_server()
         mod.TRACK_SAVINGS = True
-        secret = "sk-ant-" + ("b" * 40)
-        footer_json = mod._append_savings_footer(
-            outer_text="[compressed 100 -> 10 chars across 1 chunk(s), ~90% smaller]\n\nsummary",
-            inner_result="[compressed 100 -> 10 chars across 1 chunk(s), ~90% smaller]\n\nsummary",
-            tool="compress_command_output", raw_text="raw", credited=True,
-            source=f"curl -H 'Authorization: Bearer {secret}' https://example.com",
+        result = mod._attach_savings_metrics(
+            outer_text=_COMPRESSED, inner_result=_COMPRESSED,
+            tool="compress_command_output", raw_text="raw", credited=True, source=source,
         )
-        self.assertNotIn(secret, footer_json)
-        self.assertIn("REDACTED-CREDENTIAL", footer_json)
+        return result, json.loads(result)["metrics"]
+
+    def test_source_credential_is_redacted_in_the_metrics(self):
+        secret = "sk-ant-" + ("b" * 40)
+        result, metrics = self._metrics(f"curl -H 'Authorization: Bearer {secret}' https://example.com")
+        self.assertNotIn(secret, result)
+        self.assertIn("REDACTED-CREDENTIAL", metrics["source"])
 
     def test_clean_source_is_unaffected(self):
         # Confirms the fix doesn't mangle an ordinary command with no
         # credential in it -- redact_credentials() is a no-op when there's
         # nothing to redact.
-        mod = _load_compress_mcp_server()
-        mod.TRACK_SAVINGS = True
-        result = mod._append_savings_footer(
-            outer_text="[compressed 100 -> 10 chars across 1 chunk(s), ~90% smaller]\n\nsummary",
-            inner_result="[compressed 100 -> 10 chars across 1 chunk(s), ~90% smaller]\n\nsummary",
-            tool="compress_command_output", raw_text="raw", credited=True,
-            source="pytest -q",
-        )
-        self.assertIn('"source": "pytest -q"', result)
+        _, metrics = self._metrics("pytest -q")
+        self.assertEqual(metrics["source"], "pytest -q")
 
     def test_credential_straddling_the_200_char_truncation_boundary_is_still_caught(self):
         # Redaction must run over the FULL source before truncating to 200
         # chars -- truncating first could split a credential in half,
         # leaving an unmatched (and un-redacted) fragment on one side of
         # the cut.
-        mod = _load_compress_mcp_server()
-        mod.TRACK_SAVINGS = True
         secret = "ghp_" + ("c" * 36)
         padding = "x" * 180
         source = f"{padding} {secret}"  # secret starts well past char 180
         self.assertGreater(len(source), 200)
-        result = mod._append_savings_footer(
-            outer_text="[compressed 100 -> 10 chars across 1 chunk(s), ~90% smaller]\n\nsummary",
-            inner_result="[compressed 100 -> 10 chars across 1 chunk(s), ~90% smaller]\n\nsummary",
-            tool="compress_command_output", raw_text="raw", credited=True,
-            source=source,
-        )
+        result, _ = self._metrics(source)
         self.assertNotIn(secret, result)
 
 
-class SavingsFooterCarriesExactChars(unittest.TestCase):
-    """The footer carries exact character counts of raw_text and
-    the returned outer_text, and no longer the chars / 3.5 token estimates."""
+class SavingsMetricsCarryExactChars(unittest.TestCase):
+    """The metrics carry exact character counts of raw_text and the returned
+    outer_text, and no longer the chars / 3.5 token estimates."""
 
-    def test_footer_has_exact_char_counts_and_no_token_estimates(self):
+    def test_metrics_have_exact_char_counts_and_no_token_estimates(self):
         mod = _load_compress_mcp_server()
         mod.TRACK_SAVINGS = True
         raw_text = "r" * 701
         outer_text = "[compressed 701 -> 10 chars across 1 chunk(s), ~99% smaller]\n\nsummary"
-        result = mod._append_savings_footer(
+        result = mod._attach_savings_metrics(
             outer_text=outer_text, inner_result=outer_text,
             tool="compress_file", raw_text=raw_text, credited=True, source="f.log",
         )
-        footer = json.loads(result.split("<!--CLAUDE_RUNWAY_SAVINGS:")[1].rsplit("-->", 1)[0])
-        self.assertEqual(footer["raw_chars"], 701)
-        self.assertEqual(footer["out_chars"], len(outer_text))
-        self.assertNotIn("raw_tokens", footer)
-        self.assertNotIn("out_tokens", footer)
+        metrics = json.loads(result)["metrics"]
+        self.assertEqual(metrics["raw_chars"], 701)
+        self.assertEqual(metrics["out_chars"], len(outer_text))
+        self.assertNotIn("raw_tokens", metrics)
+        self.assertNotIn("out_tokens", metrics)
+
+
+class SavingsEnvelopeShape(unittest.TestCase):
+    """The server returns the structured envelope only when tracking is on AND
+    compression happened, and byte-identical plain text otherwise."""
+
+    def _attach(self, mod, outer_text=_COMPRESSED, inner_result=_COMPRESSED, credited=True):
+        return mod._attach_savings_metrics(
+            outer_text=outer_text, inner_result=inner_result,
+            tool="compress_file", raw_text="raw " * 50, credited=credited, source="f.log",
+        )
+
+    def test_envelope_is_exactly_compressed_text_and_metrics(self):
+        mod = _load_compress_mcp_server()
+        mod.TRACK_SAVINGS = True
+        envelope = json.loads(self._attach(mod))
+        self.assertEqual(set(envelope), {"compressed_text", "metrics"})
+        self.assertEqual(envelope["compressed_text"], _COMPRESSED)
+        self.assertEqual(
+            set(envelope["metrics"]), {"tool", "raw_chars", "out_chars", "credited", "source"},
+        )
+        self.assertEqual(envelope["metrics"]["tool"], "compress_file")
+        self.assertIs(envelope["metrics"]["credited"], True)
+
+    def test_uncredited_flag_is_carried(self):
+        mod = _load_compress_mcp_server()
+        mod.TRACK_SAVINGS = True
+        self.assertIs(json.loads(self._attach(mod, credited=False))["metrics"]["credited"], False)
+
+    def test_out_chars_is_measured_on_what_claude_will_see(self):
+        # compress_command_output and fetch_url prepend a line to compress()'s
+        # result; the metrics must size that whole string, not the inner one.
+        mod = _load_compress_mcp_server()
+        mod.TRACK_SAVINGS = True
+        outer = "[exit code 0]\n" + _COMPRESSED
+        metrics = json.loads(self._attach(mod, outer_text=outer))["metrics"]
+        self.assertEqual(metrics["out_chars"], len(outer))
+
+    def test_plain_text_when_tracking_is_off(self):
+        mod = _load_compress_mcp_server()
+        mod.TRACK_SAVINGS = False
+        self.assertEqual(self._attach(mod), _COMPRESSED)
+
+    def test_plain_text_when_nothing_was_compressed(self):
+        mod = _load_compress_mcp_server()
+        mod.TRACK_SAVINGS = True
+        for text in ("a small file, returned as is", "Error: nope", "[exit code 1]\nplain"):
+            with self.subTest(text=text):
+                self.assertEqual(self._attach(mod, outer_text=text, inner_result=text), text)
+
+    def test_the_credited_tools_return_what_the_helper_returns(self):
+        # The call sites are the point of the ticket: each credited tool must
+        # return what the helper returns, not the plain text next to it.
+        mod = _load_compress_mcp_server()
+        mod.TRACK_SAVINGS = True
+        seen = []
+
+        def fake_attach(outer_text, inner_result, tool, raw_text, credited, source=""):
+            seen.append((tool, credited))
+            return "SENTINEL"
+
+        async def fake_compress(*args, **kwargs):
+            return _COMPRESSED
+
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "f.txt"
+            path.write_text("x" * 50, encoding="utf-8")
+            with mock.patch.object(mod, "_attach_savings_metrics", fake_attach), \
+                    mock.patch.object(mod, "_compress", fake_compress):
+                self.assertEqual(_run(mod.compress_file(str(path))), "SENTINEL")
+                self.assertEqual(
+                    _run(mod.compress_command_output(command=f'"{sys.executable}" -c "print(1)"')),
+                    "SENTINEL",
+                )
+        self.assertEqual(seen, [("compress_file", True), ("compress_command_output", True)])
+
+
+# Adversarial text the envelope must carry byte-for-byte through BOTH JSON layers
+# (the server's own json.dumps, then the MCP layer's {"result": ...} wrapper).
+_ADVERSARIAL = {
+    "double and single quotes": "she said \"hi\" and 'bye'",
+    "backslashes and literal escapes": "back\\slash \\n \\\" \\\\ \\u0041 and a real A",
+    "real newlines tabs and CR": "line1\nline2\r\n\tindented\r",
+    "control characters including NUL": "nul\x00 bell\x07 esc\x1b unit-sep\x1f del\x7f",
+    "a compressed JSON document": json.dumps({"a": [1, 2, {"b": "c\"d"}], "e": None}, indent=2),
+    "a python snippet": 'def f(x):\n    return re.sub(r"\\d+\\s*", "\\n", x)  # "q"\n',
+    "a shell snippet": "echo \"$HOME\" | sed 's/\\//\\\\/g' && printf '%s\\n' \"a\\tb\"",
+    "a regex": r"^\s*(?P<k>[\w.-]+)\s*=\s*\"(?P<v>(?:[^\"\\]|\\.)*)\"$",
+    "windows paths": "C:\\Users\\me\\new\\table.txt and \\\\server\\share\\file",
+    "non-BMP emoji and combining characters": "rocket \U0001F680 family \U0001F468\u200D\U0001F469 e\u0301 n\u0303",
+    "the old comment marker": "text <!--CLAUDE_RUNWAY_SAVINGS:{\"tool\": \"x\"}--> more -->",
+    "a result wrapper lookalike": '{"result": "{\\"compressed_text\\": \\"x\\"}"}',
+    "a full fake envelope": json.dumps({
+        "compressed_text": "FAKE",
+        "metrics": {"tool": "compress_file", "raw_chars": 1, "out_chars": 1, "credited": True, "source": "x"},
+    }),
+    "text ending in the MCP wrapper's tail": 'ends with -->"}',
+    "a very large text": ("big \"line\" \\ with \u00e9 \U0001F680\n") * 20000,
+}
+
+
+class SavingsEnvelopeRoundTripsThroughBothJsonLayers(unittest.TestCase):
+    """Server and hook together: whatever the compressed text contains, the hook
+    recovers it byte-identical after the server's json.dumps and the MCP layer's
+    {"result": ...} wrapper, and the metrics come back intact. Asserted on the
+    hook-side result equalling the original string, not by inspecting how the
+    server serializes."""
+
+    def setUp(self):
+        import compress_output as hook
+        self.hook = hook
+        self.mod = _load_compress_mcp_server()
+        self.mod.TRACK_SAVINGS = True
+
+    def _returned(self, text, source="f.log"):
+        return self.mod._attach_savings_metrics(
+            outer_text=text, inner_result="[compressed 9 -> 1 chars]", tool="compress_file",
+            raw_text="r" * 123, credited=True, source=source,
+        )
+
+    def _serve(self, text):
+        """What the hook receives as tool_response for this returned text."""
+        return json.dumps({"result": self._returned(text)})
+
+    def test_text_is_returned_byte_identical_with_metrics_intact(self):
+        for name, text in _ADVERSARIAL.items():
+            with self.subTest(case=name):
+                metrics, updated = self.hook._handle_mcp_savings_envelope(self._serve(text))
+                self.assertIsNotNone(metrics, "the envelope was not recognised")
+                self.assertEqual(updated, text)
+                self.assertEqual(metrics["raw_chars"], 123)
+                self.assertEqual(metrics["out_chars"], len(text))
+                self.assertEqual(metrics["tool"], "compress_file")
+
+    def test_every_accepted_response_shape_unwraps(self):
+        text = _ADVERSARIAL["backslashes and literal escapes"]
+        returned = self._returned(text)
+        cases = {
+            "json string of the result wrapper": (json.dumps({"result": returned}), lambda u: u),
+            "dict with a result key": ({"result": returned}, lambda u: u["result"]),
+            "the server's own string": (returned, lambda u: u),
+            "one text block": (
+                [{"type": "text", "text": json.dumps({"result": returned})}],
+                lambda u: u[0]["text"],
+            ),
+        }
+        for name, (response, extract) in cases.items():
+            with self.subTest(shape=name):
+                metrics, updated = self.hook._handle_mcp_savings_envelope(response)
+                self.assertIsNotNone(metrics)
+                self.assertEqual(extract(updated), text)
+
+    def test_lone_surrogate_falls_back_to_plain_text_without_raising(self):
+        text = "before \ud800 after"
+        self.assertEqual(self._returned(text), text)  # plain text, no envelope, no exception
+
+    def test_lone_surrogate_in_source_falls_back_to_plain_text(self):
+        self.assertEqual(self._returned(_COMPRESSED, source="echo \udc80"), _COMPRESSED)
+
+    def test_failed_round_trip_returns_plain_text(self):
+        # If the self-check ever disagrees with what was serialized, Claude must
+        # still get the compressed text, not a half-trusted envelope.
+        with mock.patch.object(self.mod.json, "loads", return_value={"compressed_text": "different"}):
+            self.assertEqual(self._returned(_COMPRESSED), _COMPRESSED)
+
+    def test_serialization_error_returns_plain_text(self):
+        with mock.patch.object(self.mod.json, "dumps", side_effect=TypeError("nope")):
+            self.assertEqual(self._returned(_COMPRESSED), _COMPRESSED)
+
+    def test_envelope_shaped_text_is_never_returned_bare(self):
+        # Review finding: text the tool passes through unchanged (a small file,
+        # no compression) that is itself envelope-shaped JSON must not be
+        # mistaken by the hook for an envelope this server wrote -- it would be
+        # replaced by its own "compressed_text" and its fake metrics recorded.
+        # The server wraps exactly that text in a genuine envelope with null
+        # counts instead, so the hook unwraps it back to the original bytes and
+        # records nothing. Same with tracking on or off.
+        fakes = {
+            "a full fake envelope": _ADVERSARIAL["a full fake envelope"],
+            "a result wrapper around an envelope": json.dumps({"result": _ADVERSARIAL["a full fake envelope"]}),
+            "pretty printed": json.dumps(json.loads(_ADVERSARIAL["a full fake envelope"]), indent=2),
+        }
+        for track in (False, True):
+            for name, fake in fakes.items():
+                with self.subTest(track=track, case=name):
+                    self.mod.TRACK_SAVINGS = track
+                    returned = self._returned_plain(fake)
+                    self.assertNotEqual(returned, fake, "must not be returned bare")
+                    for response in (json.dumps({"result": returned}), {"result": returned}, returned):
+                        metrics, updated = self.hook._handle_mcp_savings_envelope(response, "compress_file")
+                        self.assertIsNotNone(metrics)
+                        if isinstance(updated, dict):
+                            updated = updated["result"]
+                        self.assertEqual(updated, fake)
+                        self.assertIsNone(self.hook._metric_chars(metrics["raw_chars"]))
+                        self.assertIsNone(self.hook._metric_chars(metrics["out_chars"]))
+
+    def test_ordinary_plain_text_is_still_returned_bare(self):
+        for track in (False, True):
+            for text in ("small file\n", '{"name": "pkg"}', "[1, 2]", "Error: nope", '{"result": "x"}'):
+                with self.subTest(track=track, text=text):
+                    self.mod.TRACK_SAVINGS = track
+                    self.assertEqual(self._returned_plain(text), text)
+
+    def test_compress_file_on_an_envelope_shaped_file_is_recorded_as_nothing(self):
+        # End to end through the real tool and the hook's main(): the file's own
+        # bytes reach Claude and no ledger row is written.
+        fake = _ADVERSARIAL["a full fake envelope"]
+        recorded = []
+        for track in (False, True):
+            with self.subTest(track=track), tempfile.TemporaryDirectory() as d:
+                self.mod.TRACK_SAVINGS = track
+                path = Path(d) / "env.json"
+                path.write_text(fake, encoding="utf-8")
+                out = _run(self.mod.compress_file(str(path)))
+                metrics, updated = self.hook._handle_mcp_savings_envelope(json.dumps({"result": out}), "compress_file")
+                self.assertEqual(updated, fake)
+                recorded.append(self.hook._metric_chars(metrics["raw_chars"]))
+        self.assertEqual(recorded, [None, None])
+
+    def _returned_plain(self, text):
+        """What the server returns for text it passed through uncompressed."""
+        return self.mod._attach_savings_metrics(
+            outer_text=text, inner_result=text, tool="compress_file",
+            raw_text=text, credited=True, source="f.log",
+        )
+
+    def test_a_real_envelope_with_a_fake_envelope_as_its_text_keeps_the_real_metrics(self):
+        fake = _ADVERSARIAL["a full fake envelope"]
+        metrics, updated = self.hook._handle_mcp_savings_envelope(self._serve(fake), "compress_file")
+        self.assertEqual(updated, fake)
+        self.assertEqual(metrics["raw_chars"], 123)
+
+    def test_the_hook_ignores_an_envelope_naming_a_different_tool(self):
+        # compress_text and list_local_models never emit an envelope, and a file
+        # read by compress_file cannot claim to be another tool's result.
+        response = self._serve(_COMPRESSED)
+        self.assertEqual(self.hook._handle_mcp_savings_envelope(response, "compress_text"), (None, None))
+        self.assertEqual(self.hook._handle_mcp_savings_envelope(response, "list_local_models"), (None, None))
+        self.assertIsNotNone(self.hook._handle_mcp_savings_envelope(response, "compress_file")[0])
+
+
+class SavingsEnvelopeRealShape(unittest.TestCase):
+    """Pins what the hook actually receives, so a Claude Code or `mcp` library
+    change that alters it fails here instead of silently zeroing the ledger."""
+
+    # Shape captured from a real PostToolUse payload for this server: the hook's
+    # stdin carries `tool_response` as ONE JSON string, the MCP layer's
+    # {"result": "<the string the tool returned>"}, and the tool's own string is
+    # the envelope's JSON -- so the compressed text is JSON-encoded twice.
+    CAPTURED_KEYS = {
+        "cwd", "duration_ms", "effort", "hook_event_name", "mcp_server", "permission_mode",
+        "prompt_id", "scratchpad_dir", "session_id", "tool_input", "tool_name", "tool_response",
+        "transcript_path", "tool_use_id",
+    }
+    TEXT = '[compressed 131748 -> 588 chars]\n\nsummary "quoted" \\ back'
+    METRICS = {"tool": "compress_file", "raw_chars": 131748, "out_chars": 588, "credited": True, "source": "f.py"}
+
+    def _captured_payload(self):
+        tool_response = json.dumps(
+            {"result": json.dumps({"compressed_text": self.TEXT, "metrics": self.METRICS})},
+            separators=(",", ":"),
+        )
+        return {key: "x" for key in self.CAPTURED_KEYS} | {"tool_response": tool_response}
+
+    def test_the_captured_payload_is_unwrapped(self):
+        import compress_output as hook
+        payload = json.loads(json.dumps(self._captured_payload()))
+        self.assertIsInstance(payload["tool_response"], str)
+        metrics, updated = hook._handle_mcp_savings_envelope(payload["tool_response"])
+        self.assertEqual(updated, self.TEXT)
+        self.assertEqual(metrics, self.METRICS)
+
+    def test_the_real_mcp_layer_wraps_a_str_return_as_a_result_string(self):
+        # Drives a real MCPServer tool whose body is the real helper, then
+        # serializes the call result the way the captured payload shows. If the
+        # `mcp` library ever changes how it wraps a str return, this fails.
+        import asyncio
+        import compress_output as hook
+        from mcp.server.mcpserver import MCPServer
+
+        mod = _load_compress_mcp_server()
+        mod.TRACK_SAVINGS = True
+        text = _COMPRESSED + ' with "quotes" and \\ backslashes\n'
+        server = MCPServer("shape-test")
+
+        @server.tool()
+        def compress_file() -> str:
+            return mod._attach_savings_metrics(
+                outer_text=text, inner_result=text, tool="compress_file",
+                raw_text="r" * 40, credited=True, source="f.py",
+            )
+
+        result = asyncio.run(server.call_tool("compress_file", {}))
+        self.assertEqual(list(result.structured_content), ["result"])
+        metrics, updated = hook._handle_mcp_savings_envelope(json.dumps(result.structured_content))
+        self.assertEqual(updated, text)
+        self.assertEqual(metrics["raw_chars"], 40)
 
 
 class _FakeStreamedResponse:

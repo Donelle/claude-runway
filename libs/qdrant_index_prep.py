@@ -1,6 +1,6 @@
 """
 Shared "prepare a collection for a full index" step, used by
-both tools/ingest_mcp_server.py's index_repo and tools/ingest_to_qdrant.py's
+both mcpservers/ingest_mcp_server.py's index_repo and tools/ingest_to_qdrant.py's
 ingest().
 
 Before this module, each of those hand-rolled the same sequence -- on reset,

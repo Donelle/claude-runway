@@ -39,6 +39,8 @@ Set `general=True` on `remember` ONLY when the user explicitly signals this appl
 
 A fourth tool, `transfer_memories(source_collection, dry_run=True)`, copies memories from a legacy Qdrant collection into memory-bank. Use it only when the user asks for a migration and names the source collection. Run it with the default `dry_run=True` first, show the user the report, and pass `dry_run=False` only after they agree. It only migrates points tagged with this project or `general`, and never deletes the source.
 
+A fifth tool, `copy_memories(source_repo, kind="all", dry_run=True)`, copies another project's memories (all, or one `kind`) into THIS project. Use it only when the user asks for it and names the exact `source_repo` (the other project's `MEMORY_BANK_ID`; don't guess one). It always writes under this project's own tag, so to copy memories into another project, run it from a session in that project. Run it with the default `dry_run=True` first, show the user the report (each memory's kind and summary, plus the counts), and pass `dry_run=False` only after they agree; there is no per-memory selection, so to leave some out, re-run with a single `kind`. `general` is not a valid source, since every project already recalls general memories.
+
 **memory-bank takes priority over Claude Code's own local/auto memory system (the files under `~/.claude/projects/.../memory/`) for anything both could hold.** When a finding is a lesson, a correction, or a design decision with rationale — the kind of thing the local memory system's own "feedback"/"project" categories describe — write it via `remember`, not to a local memory file, so there's one source of truth instead of two copies that can drift apart. Reserve the local memory system for what `remember` structurally can't do: things that need to be loaded automatically into every session's context with no explicit retrieval step (user profile/collaboration preferences), and cross-tool reference pointers. If genuinely unsure which one fits, prefer `remember`.
 
 ## Local compression (LM Studio MCP)
@@ -71,6 +73,18 @@ Reporting CLIs that sit beside these tools and answer what they cannot (run them
 - `tools/autowork_cost.py report`: per-ticket cost of `/my-gh-autowork` runs from subagent transcripts: tokens by model, cache-read share, tool calls and wall clock.
 - `tools/context_breakdown.py`: what a subagent's starting context is made of and why it grows (subcommands `start`, `calibrate`, `growth`, `reads`).
 - `tools/report_tool_counts.py`: how many tools each claude-runway MCP server exposes and how big their descriptions are.
+
+## Local review (opt-in MCP server)
+
+Include this section only if the project's `.mcp.json` has a `codebase-reviewer` server. `init --codebase-reviewer` writes that block (an interactive `upgrade` offers it); without it the tool does not exist, and calling it is an unknown-tool error.
+
+The server runs local models on LM Studio to review a change before Copilot does. Which models, prompts and rubric it uses is entirely the user's: they live in the reviewers file that the block's `REVIEWERS_FILE` points at. That setting is required and has no default, and nothing in this toolkit writes one.
+
+- `list_reviewers(check_models=...)`: validates the reviewers file and shows the settings, the rubric, every reviewer and the stage plan (reasoning, then verifier, then classifier). It runs no review and loads no model. If the file is missing, unreadable or invalid it returns an "Error:" naming the file and every problem: report that to the user, do not guess a path or write a reviewers file yourself. With `check_models=true` it also says which models that must already be loaded are not.
+
+- `review(type, params)`: runs a local review on LM Studio and returns only the findings; the diff never enters your context. One tool for every kind of review: `type` picks it and `params` is a dict of that type's arguments. Today there is one type, `"reasoning"`: `review(type="reasoning", params={"repo_path": "...", "base_ref": "origin/main"})` has every active reasoning reviewer read the diff `base_ref...head_ref` (`head_ref` defaults to `HEAD`; optional `context_lines` and `chunk_chars`) and returns ALL their findings, grouped by class with duplicates merged. Those findings are NOT verified or classified yet, so treat them as leads to check, not as confirmed defects. Call it with `params={}` to get a type's keys, defaults and an example. A bad type, key or value, a missing reviewers file, or a model that must be loaded but is not comes back as one "Error:" naming everything wrong: report it to the user rather than guessing around it. A review can take minutes on a large diff.
+
+The verifier and classifier stages arrive in later releases as further `type` values of the same tool.
 
 ## Setup and diagnostics (claude-runway skills and CLIs)
 

@@ -1,5 +1,5 @@
 """
-Shared, dependency-light logic behind `tools/memory_bank_mcp_server.py`:
+Shared, dependency-light logic behind `mcpservers/memory_bank_mcp_server.py`:
 `remember`/`recall`/`forget` persist durable, cross-session
 lessons into ONE shared Qdrant collection across every project (not each
 project's own code-index collection), tagged by writing project so lookups
@@ -22,7 +22,7 @@ calling model's own judgment:
   - `source` -- always "memory-bank", fixed by this module, never
     model-settable. The structural "is this actually a memory-bank record"
     signal `index_repo(reset=true)`/`sync_repo` key their guard exclusions
-    off of (see tools/ingest_mcp_server.py).
+    off of (see mcpservers/ingest_mcp_server.py).
   - `repo` -- the writing project's own MEMORY_BANK_ID (a plain identifier,
     not necessarily a real Qdrant collection name), or the reserved
     GENERAL_REPO sentinel when the caller explicitly asked for
@@ -44,6 +44,7 @@ calling model's own judgment:
 
 from __future__ import annotations
 
+import json
 import math
 import time
 import uuid
@@ -58,7 +59,7 @@ from qdrant_model_check import check_embedding_model_mismatch
 # call site -- the shared check's DEFAULT text tells a caller
 # to "use index_repo(reset=true)"/mentions "find_in_collection", both wrong
 # here: index_repo refuses to ever touch the shared memory-bank collection
-# (see is_memory_bank_collection_name's callers in tools/ingest_mcp_server.py),
+# (see is_memory_bank_collection_name's callers in mcpservers/ingest_mcp_server.py),
 # and memory-bank isn't a cross-repo lookup.
 MISMATCH_RECOVERY_HINT = (
     "This shared memory-bank collection was created with a different embedding "
@@ -425,7 +426,7 @@ async def remember_point(
     `created_at` is the EXACT `time.time()`
     value this function itself stamped into `metadata.created_at` below --
     returned so a caller logging a memory-events row for this write (see
-    `tools/memory_bank_mcp_server.py`'s `remember()`) can record the real
+    `mcpservers/memory_bank_mcp_server.py`'s `remember()`) can record the real
     creation timestamp instead of re-sampling `time.time()` after this
     function returns. Re-sampling would drift from the real stamped value by
     however long the upsert + set_payload round trips (plus any
@@ -636,7 +637,12 @@ async def recall_points(
 _SCROLL_BATCH_SIZE = 1000
 
 
-def scroll_collection(client: "QdrantClient", source: str, batch_size: int = _SCROLL_BATCH_SIZE) -> tuple:
+def scroll_collection(
+    client: "QdrantClient",
+    source: str,
+    batch_size: int = _SCROLL_BATCH_SIZE,
+    scroll_filter: Optional[models.Filter] = None,
+) -> tuple:
     """
     Read-only, COMPLETE-for-an-unchanged-collection enumeration of every point
     in `source` -- for reading a foreign/legacy
@@ -666,14 +672,20 @@ def scroll_collection(client: "QdrantClient", source: str, batch_size: int = _SC
         the whole scroll, since `source` may be any collection at all. A
         missing collection yields `([], [{"id": None, "error": ...}])`.
 
-    Deliberately applies NO source/pending filter: the point is to see
+    Applies NO source/pending filter by default: the point is to see
     everything in `source`, and callers decide what to do with each point.
+    `scroll_filter` is the one opt-in narrowing, for a caller
+    that wants a complete walk of a SUBSET (`copy_points` reads one repo's
+    points of the shared collection this way) rather than a top-k search; it
+    is passed to Qdrant unchanged and, when None, no `scroll_filter` argument
+    is sent at all, so every existing caller behaves exactly as before.
     """
     if not call_with_retry(client.collection_exists, source):
         return [], [{"id": None, "error": f"collection '{source}' does not exist."}]
     points: list = []
     errors: list = []
     offset = None
+    extra: dict = {} if scroll_filter is None else {"scroll_filter": scroll_filter}
     while True:
         records, offset = call_with_retry(
             client.scroll,
@@ -682,6 +694,7 @@ def scroll_collection(client: "QdrantClient", source: str, batch_size: int = _SC
             offset=offset,
             with_payload=True,
             with_vectors=False,
+            **extra,
         )
         for record in records:
             payload = record.payload
@@ -757,6 +770,41 @@ def _transfer_field_error(point: dict) -> Optional[str]:
     if not math.isfinite(weight) or weight < 0:
         return f"metadata.weight must be a finite number 0 or greater (got {weight})."
     return None
+
+
+def _finished_point_ids(client: "QdrantClient", collection: str, ids: list) -> set:
+    """
+    Which of `ids` already exist in `collection` as a FINISHED write -- the
+    check-before-write lookup `transfer_points` and `copy_points` share
+    (pulled out of `transfer_points` unchanged).
+
+    One retrieve per batch instead of one per point. A collection that
+    doesn't exist yet holds nothing, so there is nothing to look up.
+
+    Only a FINISHED write counts as present (found in review, second pass):
+    remember_point upserts with pending=True and clears it in a second
+    call, so a run whose second call failed leaves the id in the collection
+    with pending=True -- hidden from recall and wipe (see _scope_filter /
+    _own_repo_filter). Counting that as already present would make it
+    permanent; leaving it out lets the next run rewrite the same id and
+    finish it. Hence payload is fetched (the pending flag only).
+    """
+    present: set = set()
+    if ids and call_with_retry(client.collection_exists, collection):
+        for start in range(0, len(ids), _SCROLL_BATCH_SIZE):
+            found = call_with_retry(
+                client.retrieve,
+                collection_name=collection,
+                ids=ids[start:start + _SCROLL_BATCH_SIZE],
+                with_payload=[PENDING_FIELD],
+                with_vectors=False,
+            )
+            for record in found:
+                meta = (record.payload or {}).get("metadata")
+                if isinstance(meta, dict) and meta.get("pending") is True:
+                    continue
+                present.add(str(record.id))
+    return present
 
 
 async def transfer_points(
@@ -884,32 +932,7 @@ async def transfer_points(
             continue
         candidates.append((transfer_point_id(source, point["id"]), scope, point))
 
-    # One retrieve per batch instead of one per point. A target that doesn't
-    # exist yet holds nothing, so there is nothing to look up.
-    #
-    # Only a FINISHED write counts as present:
-    # remember_point upserts with pending=True and clears it in a second
-    # call, so a run whose second call failed leaves the id in the target
-    # with pending=True -- hidden from recall and wipe (see _scope_filter /
-    # _own_repo_filter). Counting that as already_present would make it
-    # permanent; leaving it out lets the next run rewrite the same id and
-    # finish it. Hence payload is fetched (the pending flag only).
-    present: set = set()
-    if candidates and call_with_retry(client.collection_exists, target_backing):
-        ids = [c[0] for c in candidates]
-        for start in range(0, len(ids), _SCROLL_BATCH_SIZE):
-            found = call_with_retry(
-                client.retrieve,
-                collection_name=target_backing,
-                ids=ids[start:start + _SCROLL_BATCH_SIZE],
-                with_payload=[PENDING_FIELD],
-                with_vectors=False,
-            )
-            for record in found:
-                meta = (record.payload or {}).get("metadata")
-                if isinstance(meta, dict) and meta.get("pending") is True:
-                    continue
-                present.add(str(record.id))
+    present = _finished_point_ids(client, target_backing, [c[0] for c in candidates])
 
     for target_id, scope, point in candidates:
         if target_id in present:
@@ -936,6 +959,177 @@ async def transfer_points(
             report["error"] = mismatch
             return report
         report[bucket][scope] += 1
+    return report
+
+
+# Fixed namespace for copy_point_id. Own value, never shared with
+# TRANSFER_ID_NAMESPACE, and never to be changed: every id a past copy_points
+# run wrote derives from it, so a new one would make a re-run see none of them
+# as already present and copy every memory a second time.
+COPY_ID_NAMESPACE = uuid.UUID("b3a5d2c1-8e47-5f06-a9d3-2c7e1f4b6a80")
+
+
+def copy_point_id(collection: str, source_point_id, target_repo: str) -> str:
+    """
+    Deterministic id for one memory copied into `target_repo`:
+    `uuid5(COPY_ID_NAMESPACE, <collection, source point id, target repo>)`.
+
+    Not `transfer_point_id`: that one hashes `"<source>:<source_point_id>"`,
+    and for an in-collection copy the source is always the memory-bank
+    collection, so the same source memory copied into two different projects
+    would map to ONE id and the second project's copy would be taken for the
+    first's. The target repo is therefore part of the name. The name is a JSON
+    array rather than a joined string, so a `:` inside a collection or repo
+    name cannot make two different triples produce the same text.
+    """
+    return str(uuid.uuid5(COPY_ID_NAMESPACE, json.dumps([collection, str(source_point_id), target_repo])))
+
+
+async def copy_points(
+    client: "QdrantClient",
+    embedding_provider,
+    collection: str,
+    source_repo: str,
+    caller_repo: str,
+    embedding_model: str,
+    kind: Optional[str] = None,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Copies one project's memories (all of them, or one `kind`) in the shared
+    memory-bank collection `collection` into the CALLER's own repo tag.
+    Returns a report dict; never raises for a per-point problem.
+
+    The target is always `caller_repo`, never a parameter: a session can only
+    write memories under its own `MEMORY_BANK_ID`, the same boundary `remember`
+    and `transfer_points` enforce ("no cross-repo write override").
+    "Copy to repo B" means running this from a session in repo B.
+
+    Refused with an `error` and nothing read or written:
+      * `source_repo` empty -- there is nothing to match.
+      * `source_repo == GENERAL_REPO` -- every project's `recall` already
+        includes general memories by default, so a copy would only create a
+        project-scoped duplicate, and this function never writes `general`.
+      * `source_repo == caller_repo` -- a copy into itself.
+
+    Reads by a FILTERED scroll (`metadata.source == memory-bank`, `metadata.repo
+    == source_repo`, `metadata.kind == kind` when given, not pending), so it is
+    complete rather than a top-k `recall` -- complete for a source nothing is
+    writing to, see `scroll_collection`'s caveat. A pending point is a write
+    that has not finished (invisible to `recall`) and is not copied.
+
+    Writes go through `remember_point`, so the embedding, the model-mismatch
+    check and the pending marker are exactly `remember`'s. Each copy is a NEW
+    point: fresh `created_at`, re-embedded with this project's model, `weight`
+    kept, no link back to its source (it can drift from it, and a fresh
+    `created_at` makes time-to-first-reuse look shorter than it is for that
+    memory).
+
+    Idempotency is check-before-write on a `copy_point_id` id, as in
+    `transfer_points`: a memory whose copy already exists (finished, not
+    pending) is counted in `already_present` and left alone; a half-written
+    one is rewritten. Dedup only recognizes copies this function wrote: a
+    memory copied by hand with `remember()` has a random id and would be
+    written again, so the dry-run report is how a caller checks first.
+
+    `dry_run=True` (the default) does everything except the write and reports
+    `would_copy` instead of `copied`; it never embeds, so `embedding_provider`
+    may be None there. A dry run cannot detect an embedding-model mismatch on
+    the collection, which only shows up on the first real write; that mismatch
+    is collection-wide, so it stops the run and is returned as `error`.
+
+    Read-only against the source memories: nothing here changes or deletes
+    them.
+
+    Report keys: collection, source_repo, target_repo, kind ("all" or the
+    kind), dry_run, `would_copy` or `copied` (n), already_present (n),
+    memories (one {"id" (the source memory's), "kind", "summary", "status"}
+    per memory found, sorted by kind then summary, where status is
+    would_copy/copied/already_present -- a memory that could not be copied is
+    in `errors` instead), errors (list of {"id", "error"}), and `error`
+    (str, only when the run stopped early or was refused).
+    """
+    bucket = "would_copy" if dry_run else "copied"
+    report: dict = {
+        "collection": collection,
+        "source_repo": source_repo,
+        "target_repo": caller_repo,
+        "kind": kind or "all",
+        "dry_run": dry_run,
+        bucket: 0,
+        "already_present": 0,
+        "memories": [],
+        "errors": [],
+    }
+    if not source_repo or not source_repo.strip():
+        report["error"] = "source_repo is required: the exact repo tag to copy from."
+        return report
+    if source_repo == GENERAL_REPO:
+        report["error"] = (
+            f"source_repo '{GENERAL_REPO}' cannot be copied: every project's recall already "
+            f"includes general memories by default, so a copy would only create a project-scoped "
+            f"duplicate, and this tool never writes general memories."
+        )
+        return report
+    if source_repo == caller_repo:
+        report["error"] = f"source_repo '{source_repo}' is this project's own repo tag -- nothing to copy into itself."
+        return report
+    if not call_with_retry(client.collection_exists, collection):
+        report["error"] = f"collection '{collection}' does not exist, so there are no memories to copy."
+        return report
+
+    must: list = [
+        models.FieldCondition(key=SOURCE_FIELD, match=models.MatchValue(value=MEMORY_BANK_SOURCE)),
+        models.FieldCondition(key=REPO_FIELD, match=models.MatchValue(value=source_repo)),
+    ]
+    if kind:
+        must.append(models.FieldCondition(key=KIND_FIELD, match=models.MatchValue(value=kind)))
+    scroll_filter = models.Filter(
+        must=must,
+        must_not=[models.FieldCondition(key=PENDING_FIELD, match=models.MatchValue(value=True))],
+    )
+    points, scroll_errors = scroll_collection(client, collection, scroll_filter=scroll_filter)
+    report["errors"].extend(scroll_errors)
+
+    candidates: list = []
+    for point in points:
+        field_error = _transfer_field_error(point)
+        if field_error:
+            report["errors"].append({"id": point["id"], "error": field_error})
+            continue
+        candidates.append((copy_point_id(collection, point["id"], caller_repo), point))
+    # A stable order for the report, so a dry run and the real run that follows
+    # it list the same memories in the same places.
+    candidates.sort(key=lambda c: (c[1]["kind"], c[1]["summary"]))
+
+    present = _finished_point_ids(client, collection, [c[0] for c in candidates])
+
+    for target_id, point in candidates:
+        entry = {"id": point["id"], "kind": point["kind"], "summary": point["summary"]}
+        if target_id in present:
+            report["already_present"] += 1
+            report["memories"].append({**entry, "status": "already_present"})
+            continue
+        if not dry_run:
+            try:
+                _, _, mismatch = await remember_point(
+                    client, embedding_provider, collection,
+                    summary=point["summary"],
+                    description=point["description"],
+                    kind=point["kind"],
+                    repo=caller_repo,
+                    embedding_model=embedding_model,
+                    weight=point["weight"],
+                    point_id=target_id,
+                )
+            except Exception as e:  # one bad point must not abort the whole run
+                report["errors"].append({"id": point["id"], "error": f"write failed: {e}"})
+                continue
+            if mismatch:
+                report["error"] = mismatch
+                return report
+        report[bucket] += 1
+        report["memories"].append({**entry, "status": bucket})
     return report
 
 

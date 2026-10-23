@@ -21,6 +21,7 @@ import asyncio
 import os
 import sys
 import unittest
+import uuid
 from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "libs"))
@@ -112,7 +113,13 @@ class OnDiskFormat(unittest.TestCase):
         [record] = _run(go())
         self.assertEqual(record.payload, {"document": "hello", "metadata": {"file_path": "a.py"}})
         self.assertEqual(list(record.vector), ["fast-test-model"])
-        self.assertRegex(str(record.id), r"^[0-9a-f]{32}$")
+        # What a client reports back is not the string we stored: Qdrant
+        # canonicalizes UUID ids, and qdrant-client 1.20.0's in-memory mode
+        # returns the dashed form where 1.18/1.19 echoed the undashed one. So
+        # check the id is a UUID whose hex is 32 characters, whichever spelling
+        # comes back; the stored spelling (uuid4().hex) is pinned directly,
+        # without a client, by test_point_ids_are_uuid4_hex above.
+        self.assertRegex(uuid.UUID(str(record.id)).hex, r"^[0-9a-f]{32}$")
 
     def test_embedding_provider_vector_size_matches_fastembeds_model_table(self):
         """get_vector_size leans on a private fastembed classmethod; this fails

@@ -32,7 +32,24 @@ ALSO refreshes product skills that are already installed under
 ones -- a second, separate step after the config migrations (same
 `--dry-run`/`--auto-yes` semantics), which rewrites only the body of an
 installed SKILL.md (its own frontmatter is kept) and never installs a skill
-that is not already there.
+that is not already there. Run as the `claude-runway-setup` console script,
+that refresh compares against the skills shipped with that
+install -- a snapshot taken when it was installed, not a checkout's
+`skills/` -- so it says so, and warns about each stale skill whose copy in
+the `CLAUDE_RUNWAY_DIR` checkout differs; `/my-setup-clauderunway upgrade`
+reads the checkout itself.
+
+The savings tracker is opt-in (it is what writes the `analytics` MCP server behind
+/my-savings and /my-metrics). `init` and `upgrade` ask whether to enable it, with the same
+wording as /my-setup-clauderunway's Q4, but only when stdin is a terminal: a pipe or CI run,
+`--dry-run`, `--auto-yes` (upgrade) and `--qdrant-only` (init) never ask and keep it off, and an
+explicit `--track-savings` skips the question. When it ends up off, `init` says what that
+costs and how to turn it on.
+
+The `codebase-reviewer` MCP server (the local review loop) is opt-in too: `init --codebase-reviewer`
+(optionally `--reviewers-file PATH`) writes its block, and an interactive `upgrade` offers it. Its
+REVIEWERS_FILE is required and has no default, so neither command ever writes a default path or a
+reviewers file; both warn when it is not set.
 
 The templates stay the single source of truth: this script loads and
 patches them (see libs/setup_project_lib.py) rather than duplicating their
@@ -61,13 +78,19 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 
 from setup_project_lib import (  # noqa: E402
     SKILL_TEXT_ERRORS,
+    MalformedConfigError,
+    ask_codebase_reviewer,
+    ask_savings_tracker,
     default_skills_dir,
+    has_analytics_block,
+    load_existing_mcp_json,
+    local_compress_tracks_savings,
     plan_skill_installs,
     run_setup,
     venv_python_path,
 )
 from upgrade_lib import is_project_configured, run_upgrade  # noqa: E402
-from version_lib import version_string  # noqa: E402
+from version_lib import get_version, version_string  # noqa: E402
 
 TOOLS_REPO_DIR = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -184,7 +207,8 @@ def _redact_secrets(mcp_servers: dict) -> dict:
 
 _QDRANT_MCP_JSON_COMMIT_CAUTION = (
     "  - WARNING: --qdrant-api-key was set, so .mcp.json now contains that credential in PLAINTEXT "
-    "across three env blocks (qdrant/codebase-indexer/memory-bank). Do NOT commit .mcp.json as-is "
+    "across the env blocks of the Qdrant-talking servers (qdrant/codebase-indexer/memory-bank, and "
+    "codebase-reviewer when present). Do NOT commit .mcp.json as-is "
     "if this repo is or will be shared -- either keep .mcp.json out of version control for this "
     "project (add it to .gitignore) or manage the key through your own untracked mechanism instead "
     "of committing it."
@@ -243,6 +267,64 @@ def _metrics_db_reminder(args: argparse.Namespace) -> str:
         "a shell (e.g. tools/autowork_cost.py) read it from the shell environment, so export the same "
         "value there too, or they will read the default database and miss these events."
     )
+
+
+def _stdin_is_interactive() -> bool:
+    """
+    True when stdin is a terminal, i.e. a person can answer a question. A
+    pipe, a CI run and a redirected file are not, and neither is a closed
+    stdin; any of those keeps `init`/`upgrade` non-interactive. A function,
+    not an inline `isatty()`, so tests can pin it.
+    """
+    try:
+        return sys.stdin.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def _existing_mcp_json_or_empty(target_repo: Path) -> dict:
+    """The target's current `.mcp.json`, or {} when it is absent or unusable.
+    A malformed file is not reported here: `run_setup` reads it again right
+    after and raises `MalformedConfigError` with the message the user needs."""
+    try:
+        return load_existing_mcp_json(target_repo / ".mcp.json")
+    except MalformedConfigError:
+        return {}
+
+
+_SAVINGS_OFF_NOTE = (
+    "\nNote: the savings tracker is off, so no `analytics` MCP server is written. /my-savings and /my-metrics "
+    "will fail with an unknown-tool error until it is. To enable it, re-run init with --track-savings and "
+    "`export CLAUDE_RUNWAY_TRACK_SAVINGS=1` in your shell (see docs/savings-tracker.md)."
+)
+
+
+def _savings_tracker_note(args: argparse.Namespace, *, had_analytics: bool) -> str:
+    """
+    What `init` says about the savings tracker when it ends up off,
+    or "" when it is on or the setup is `--qdrant-only` (no
+    local-compress, so no tracker to offer). A run that removes an `analytics`
+    block an earlier run wrote says so rather than doing it silently: a bare
+    re-run resets every toolkit-owned setting to this run's flags.
+    """
+    if args.track_savings:
+        return ""
+    verb = "would remove" if args.dry_run else "is removing"
+    if args.qdrant_only:
+        if not had_analytics:
+            return ""
+        return (
+            f"\nNote: --qdrant-only {verb} the existing `analytics` MCP server along with local-compress, so "
+            "/my-savings and /my-metrics stop working. Re-run without --qdrant-only (and with --track-savings) "
+            "to keep it."
+        )
+    if had_analytics:
+        return (
+            f"\nNote: this run {verb} the existing `analytics` MCP server because the savings tracker is off "
+            "(init resets it to this run's flags), so /my-savings and /my-metrics stop working. Pass "
+            "--track-savings to keep it."
+        )
+    return _SAVINGS_OFF_NOTE
 
 
 def _quote_command(argv: list, *, windows: bool) -> str:
@@ -343,39 +425,64 @@ def cmd_init(args: argparse.Namespace) -> None:
     # to its own pure venv_python_path default exactly as before,
     # so this is a no-op for every existing user/test of that flow.
     venv_python_override = _pip_installed_venv_python()
-    result = run_setup(
-        target_repo,
-        TOOLS_REPO_DIR,
-        collection_name=args.collection_name,
-        venv_python=venv_python_override,
-        windows=(os.name == "nt"),
-        qdrant_url=args.qdrant_url,
-        qdrant_api_key=args.qdrant_api_key,
-        collection_description=args.collection_description,
-        include_extensions=args.include_extensions,
-        exclude_dirs=args.exclude_dirs,
-        lmstudio_url=args.lmstudio_url,
-        lmstudio_model=args.lmstudio_model,
-        track_savings=args.track_savings,
-        savings_db=args.savings_db,
-        metrics_db=args.metrics_db,
-        compact_collection=args.compact_collection,
-        memory_bank_collection=args.memory_bank_collection,
-        memory_bank_id=args.memory_bank_id,
-        embedding_model=args.embedding_model,
-        memory_bank_embedding_model=args.memory_bank_embedding_model,
-        include_compress=not args.qdrant_only,
-        include_hooks=include_hooks,
-        # clean_hooks_if_unused's own special-case path is only relevant
-        # when include_hooks=False (--skip-hooks now, exclusively) -- since
-        # --qdrant-only keeps include_hooks=True (core hooks are
-        # always written), build_settings_hooks(include_compress=False)
-        # already drops the compress-gated blocks, and merge_settings_hooks
-        # strips any STALE compress-gated block a prior full setup left in
-        # an existing settings.json as part of the normal include_hooks=True
-        # path -- no separate cleanup branch needed for that case anymore.
-        clean_hooks_if_unused=False,
-    )
+
+    # The savings tracker (and with it the `analytics` server that
+    # /my-savings and /my-metrics need) is opt-in, and a CLI user was never
+    # told. Ask once, with the wording /my-setup-clauderunway's Q4 uses, only
+    # when nobody has answered already and a person can: an explicit
+    # --track-savings skips the question, a non-terminal stdin, --dry-run (a
+    # preview writes and asks nothing) and --qdrant-only (no local-compress,
+    # so no tracker) keep the off default. Blank input keeps whatever the
+    # project already has, so pressing Enter on a re-run cannot drop it.
+    existing_mcp = _existing_mcp_json_or_empty(target_repo)
+    had_analytics = has_analytics_block(existing_mcp)
+    if not args.track_savings and not args.qdrant_only and not args.dry_run and _stdin_is_interactive():
+        args.track_savings = ask_savings_tracker(
+            default_enabled=had_analytics or local_compress_tracks_savings(existing_mcp)
+        )
+
+    try:
+        result = run_setup(
+            target_repo,
+            TOOLS_REPO_DIR,
+            collection_name=args.collection_name,
+            venv_python=venv_python_override,
+            windows=(os.name == "nt"),
+            qdrant_url=args.qdrant_url,
+            qdrant_api_key=args.qdrant_api_key,
+            collection_description=args.collection_description,
+            include_extensions=args.include_extensions,
+            exclude_dirs=args.exclude_dirs,
+            lmstudio_url=args.lmstudio_url,
+            lmstudio_model=args.lmstudio_model,
+            track_savings=args.track_savings,
+            savings_db=args.savings_db,
+            metrics_db=args.metrics_db,
+            compact_collection=args.compact_collection,
+            memory_bank_collection=args.memory_bank_collection,
+            memory_bank_id=args.memory_bank_id,
+            embedding_model=args.embedding_model,
+            memory_bank_embedding_model=args.memory_bank_embedding_model,
+            codebase_reviewer=args.codebase_reviewer,
+            reviewers_file=args.reviewers_file,
+            include_compress=not args.qdrant_only,
+            include_hooks=include_hooks,
+            # clean_hooks_if_unused's own special-case path is only relevant
+            # when include_hooks=False (--skip-hooks now, exclusively) -- since
+            # --qdrant-only keeps include_hooks=True (core hooks are
+            # always written), build_settings_hooks(include_compress=False)
+            # already drops the compress-gated blocks, and merge_settings_hooks
+            # strips any STALE compress-gated block a prior full setup left in
+            # an existing settings.json as part of the normal include_hooks=True
+            # path -- no separate cleanup branch needed for that case anymore.
+            clean_hooks_if_unused=False,
+        )
+    except MalformedConfigError as exc:
+        # An existing .mcp.json/.claude/settings.json that is not
+        # valid JSON or has the wrong shape. run_setup reads both before it
+        # computes anything to write, so nothing has been written yet.
+        print(f"error: {exc} -- fix or remove it, then re-run init", file=sys.stderr)
+        sys.exit(1)
 
     for change in result.changes:
         print(("Would write " if args.dry_run else "Writing ") + change)
@@ -412,6 +519,9 @@ def cmd_init(args: argparse.Namespace) -> None:
     metrics_reminder = _metrics_db_reminder(args)
     if metrics_reminder:
         print(metrics_reminder)
+    savings_note = _savings_tracker_note(args, had_analytics=had_analytics)
+    if savings_note:
+        print(savings_note)
 
     # Use the ACTUAL resolved collection name/Qdrant URL/include-exclude
     # filters from this run, not a generic placeholder -- found in review across two
@@ -560,6 +670,44 @@ def _confirm_skill_refresh(plan) -> bool:
     return answer not in ("n", "no")
 
 
+def _is_installed_snapshot(tools_repo_dir: Path) -> bool:
+    """
+    True when `tools_repo_dir` is the copy a `pipx`/`uv tool install` shipped
+    to `<env>/src` rather than a source checkout. Same rule as
+    `version_lib._checkout_root`: a checkout has `.git` (a directory, or a
+    file in a worktree) right above `tools/`, an installed copy does not.
+    Not `_pip_installed_venv_python()`, which is also true for a clone that
+    has no `.venv` yet.
+    """
+    return not (Path(tools_repo_dir) / ".git").exists()
+
+
+def _differing_checkout_skill(plan, tools_repo_dir: Path) -> "Path | None":
+    """
+    The `$CLAUDE_RUNWAY_DIR` checkout's SKILL.md for `plan`'s skill when it
+    exists, is a different checkout from `tools_repo_dir`, and differs from
+    the copy `plan` would write; else None. Compares the two
+    shipped files byte for byte, so the installed copy's own frontmatter
+    plays no part. Says nothing about which one is newer: no skill carries a
+    version stamp.
+    """
+    raw = os.environ.get("CLAUDE_RUNWAY_DIR", "").strip()
+    if not raw:
+        return None
+    checkout = Path(raw).expanduser()
+    if not checkout.is_dir():
+        return None
+    try:
+        if checkout.resolve() == Path(tools_repo_dir).resolve():
+            return None
+        theirs = checkout / "skills" / plan.name / "SKILL.md"
+        if theirs.is_file() and theirs.read_bytes() != plan.source.read_bytes():
+            return theirs
+    except OSError:
+        return None
+    return None
+
+
 def refresh_installed_skills(
     skills_dir: Path,
     *,
@@ -583,11 +731,26 @@ def refresh_installed_skills(
     stale skill, every one with `auto_yes`, none written with `dry_run`
     (which also never prompts). Returns the names refreshed (or, for
     `dry_run`, that would be).
+
+    Run as the `claude-runway-setup` console script, the shipped
+    skills are the install-time snapshot under `<env>/src/skills`, not a
+    checkout's `skills/` (which `/my-setup-clauderunway` reads), so the two
+    routes can offer different refreshes. Overwriting with the snapshot's copy
+    is intended; this only makes it visible. A snapshot source is named up
+    front (path and version), and each stale skill whose copy in the
+    `$CLAUDE_RUNWAY_DIR` checkout differs gets a warning. Nothing about what
+    is written, prompted or skipped depends on either message.
     """
-    plans = plan_skill_installs(tools_repo_dir or TOOLS_REPO_DIR, skills_dir)
+    source_dir = Path(tools_repo_dir or TOOLS_REPO_DIR)
+    plans = plan_skill_installs(source_dir, skills_dir)
     stale = [p for p in plans if p.action == "update"]
     not_installed = [p for p in plans if p.action == "install"]
     print(f"\nChecking installed skills under {skills_dir}...")
+    if _is_installed_snapshot(source_dir):
+        print(
+            f"  Comparing against the skills shipped with this install ({source_dir / 'skills'}, "
+            f"{get_version()}), not a source checkout."
+        )
     if not stale:
         installed = len(plans) - len(not_installed)
         print(
@@ -601,11 +764,22 @@ def refresh_installed_skills(
     refreshed: list = []
     for plan in stale:
         note = " (keeping its existing frontmatter)" if plan.frontmatter_preserved else ""
+        differing = _differing_checkout_skill(plan, source_dir)
+        warning = (
+            f"      Warning: the checkout at {os.environ.get('CLAUDE_RUNWAY_DIR', '').strip()} ships a different "
+            f"{plan.name}; this writes this install's copy. To match the checkout, run "
+            "`/my-setup-clauderunway upgrade`, or reinstall (`uv tool install --reinstall ...` / "
+            "`pipx install --force ...`)."
+        )
         if dry_run:
             print(f"  - Would refresh {plan.name} -> {plan.dest}{note}")
+            if differing:
+                print(warning)
             refreshed.append(plan.name)
             continue
         print(f"  - {plan.name} -> {plan.dest}{note}")
+        if differing:
+            print(warning)
         if not (auto_yes or ask(plan)):
             print("      Skipped.")
             continue
@@ -652,7 +826,14 @@ def cmd_upgrade(args: argparse.Namespace) -> None:
     if not target_repo.is_dir():
         print(f"error: target repo path does not exist or is not a directory: {target_repo}", file=sys.stderr)
         sys.exit(1)
-    if not is_project_configured(target_repo):
+    try:
+        configured = is_project_configured(target_repo)
+    except MalformedConfigError as exc:
+        # An unusable .mcp.json is reported as such, not as "no
+        # toolkit configuration" (which would send the user to `init`).
+        print(f"error: {exc} -- fix or remove it, then re-run upgrade", file=sys.stderr)
+        sys.exit(1)
+    if not configured:
         print(
             f"error: {target_repo} has no existing toolkit configuration (.mcp.json with a 'qdrant' "
             "server) -- `upgrade` only applies migrations to an ALREADY-configured project. Run "
@@ -664,13 +845,30 @@ def cmd_upgrade(args: argparse.Namespace) -> None:
     venv_python_override = _pip_installed_venv_python()
     resolved_venv_python = venv_python_override or venv_python_path(TOOLS_REPO_DIR, windows=(os.name == "nt"))
 
-    run_upgrade(
-        target_repo,
-        TOOLS_REPO_DIR,
-        resolved_venv_python,
-        auto_yes=args.auto_yes,
-        dry_run=args.dry_run,
-    )
+    try:
+        run_upgrade(
+            target_repo,
+            TOOLS_REPO_DIR,
+            resolved_venv_python,
+            auto_yes=args.auto_yes,
+            dry_run=args.dry_run,
+            # Ask about the savings tracker only when a person is
+            # there to answer; --auto-yes and --dry-run never ask (run_upgrade
+            # also checks both), and a pipe/CI run has nobody to ask.
+            offer_savings_fn=(
+                ask_savings_tracker if not args.auto_yes and not args.dry_run and _stdin_is_interactive() else None
+            ),
+            # Same rule for the opt-in codebase-reviewer server: only a person
+            # at a terminal is asked, and --auto-yes/--dry-run never add it.
+            offer_reviewer_fn=(
+                ask_codebase_reviewer if not args.auto_yes and not args.dry_run and _stdin_is_interactive() else None
+            ),
+        )
+    except MalformedConfigError as exc:
+        # .claude/settings.json is only read here (is_project_configured reads
+        # .mcp.json alone); run_upgrade loads both before it prompts or writes.
+        print(f"error: {exc} -- fix or remove it, then re-run upgrade", file=sys.stderr)
+        sys.exit(1)
 
     # Config migrations never touched installed skills, so a user
     # who only ran `upgrade` kept stale skill text indefinitely. Runs after
@@ -743,7 +941,23 @@ def parse_args() -> argparse.Namespace:
         "--track-savings",
         action="store_true",
         help="Enable the opt-in savings tracker. Also writes the opt-in `analytics` server (savings_summary/"
-        "savings_detail/savings_trend, get_metrics, record_metric); without this flag that block is not written",
+        "savings_detail/savings_trend, get_metrics, record_metric); without this flag that block is not "
+        "written, unless you answer yes when init asks on a terminal (passing the flag skips the question)",
+    )
+    init.add_argument(
+        "--codebase-reviewer",
+        action="store_true",
+        help="Add the opt-in `codebase-reviewer` MCP server (the local review loop). Its REVIEWERS_FILE setting is "
+        "REQUIRED and has no default: init never writes a default path or a default reviewers file, so without "
+        "--reviewers-file the block is written with REVIEWERS_FILE blank and init warns. An existing "
+        "codebase-reviewer block is kept (with its REVIEWERS_FILE) on a re-run without this flag",
+    )
+    init.add_argument(
+        "--reviewers-file",
+        default="",
+        help="Path to YOUR reviewers JSON file (the models, prompts and rubric), written as the codebase-reviewer "
+        "block's REVIEWERS_FILE exactly as given. Implies --codebase-reviewer. The file is not created or checked "
+        "here; `claude-runway-doctor` reports a missing or invalid one",
     )
     init.add_argument(
         "--savings-db",
@@ -761,7 +975,7 @@ def parse_args() -> argparse.Namespace:
         "--memory-bank-collection",
         default="",
         help="Base Qdrant collection name the memory-bank server's remember/recall/forget tools share "
-        "across EVERY project (tools/memory_bank_mcp_server.py's MEMORY_BANK_COLLECTION); leave blank to "
+        "across EVERY project (mcpservers/memory_bank_mcp_server.py's MEMORY_BANK_COLLECTION); leave blank to "
         "use the 'memory-bank' default. Unlike --collection-name, this is deliberately meant to be the SAME "
         "value across every project on a machine -- every project's memories need to agree on this to "
         "actually be found by each other. Only change it if you're deliberately isolating a separate "
@@ -861,7 +1075,9 @@ def parse_args() -> argparse.Namespace:
     upgrade.add_argument(
         "--auto-yes",
         action="store_true",
-        help="Apply every pending migration and refresh every stale installed skill without prompting (for scripting/CI)",
+        help="Apply every pending migration and refresh every stale installed skill without prompting (for "
+        "scripting/CI); also skips the questions about enabling the savings tracker and adding the "
+        "codebase-reviewer server, leaving both off",
     )
     upgrade.add_argument(
         "--skills-dir",

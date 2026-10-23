@@ -28,6 +28,7 @@ The first three were found by indexing this repo with its own indexer:
 """
 
 import hashlib
+import json
 import os
 import sys
 import tempfile
@@ -1196,7 +1197,7 @@ class McpToolsValidateChunkParamsBeforeAnyWork(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         import sys as _sys
-        tools_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools")
+        tools_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "mcpservers")
         _sys.path.insert(0, tools_dir)
         # Minimal env so module-level code (DEFAULT_* constants) doesn't
         # explode on import -- these tools already default gracefully to
@@ -1247,7 +1248,7 @@ class IndexRepoDocumentsTheOrphanedChunkLimitation(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        tools_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools")
+        tools_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "mcpservers")
         sys.path.insert(0, tools_dir)
         os.environ.setdefault("QDRANT_URL", "http://localhost:6333")
         os.environ.setdefault("COLLECTION_NAME", "test-collection")
@@ -1285,7 +1286,7 @@ class SyncRepoPreservesEmbeddingsOnChunkAndHashFailures(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        tools_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools")
+        tools_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "mcpservers")
         sys.path.insert(0, tools_dir)
         os.environ.setdefault("QDRANT_URL", "http://localhost:6333")
         os.environ.setdefault("COLLECTION_NAME", "test-collection")
@@ -1499,7 +1500,7 @@ class ManifestSelfIndex(unittest.TestCase):
         """Guards the filename constant -- if MANIFEST_FILENAME ever changes,
         this fails loudly rather than silently re-exposing the bug."""
         tools_dir = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "mcpservers"
         )
         if tools_dir not in sys.path:
             sys.path.insert(0, tools_dir)
@@ -1901,6 +1902,174 @@ class SharedIngestDefaults(unittest.TestCase):
     def test_env_defaults_reads_os_environ_by_default(self):
         with mock.patch.dict(os.environ, {"QDRANT_URL": "http://from-os:6333"}, clear=True):
             self.assertEqual(self.lib.ingest_env_defaults()["qdrant_url"], "http://from-os:6333")
+
+
+class ResolveMemoryBankCollection(unittest.TestCase):
+    """The CLI resolves the shared memory-bank collection name
+    from the flag, then the shell, then the repo's .mcp.json, then the
+    default, so a name set only in .mcp.json is protected as index_repo
+    protects it. A malformed .mcp.json must never crash the guard."""
+
+    def setUp(self):
+        import qdrant_ingest_lib
+        self.resolve = qdrant_ingest_lib.resolve_memory_bank_collection
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.repo = Path(tmp.name)
+
+    def _write_mcp_json(self, content):
+        text = content if isinstance(content, str) else json.dumps(content)
+        (self.repo / ".mcp.json").write_text(text, encoding="utf-8")
+
+    @staticmethod
+    def _servers(**blocks):
+        return {"mcpServers": {name.replace("_", "-"): {"env": env} for name, env in blocks.items()}}
+
+    def test_explicit_flag_wins_over_every_other_source(self):
+        self._write_mcp_json(self._servers(codebase_indexer={"MEMORY_BANK_COLLECTION": "from-json"}))
+        got = self.resolve("from-flag", self.repo, {"MEMORY_BANK_COLLECTION": "from-env"})
+        self.assertEqual((got.name, got.source), ("from-flag", "--memory-bank-collection"))
+        # .mcp.json's name is still reserved: an override does not move where the servers store.
+        self.assertIn('"codebase-indexer"', got.reserved_source("from-json"))
+        self.assertIsNone(got.reserved_source("from-env"))
+        self.assertIn("disagree", got.warning)
+
+    def test_an_override_that_matches_mcp_json_adds_nothing(self):
+        self._write_mcp_json(self._servers(codebase_indexer={"MEMORY_BANK_COLLECTION": "team-memory"},
+                                           memory_bank={"MEMORY_BANK_COLLECTION": "team-memory"}))
+        for flag, env in (("team-memory", {}), (None, {"MEMORY_BANK_COLLECTION": "team-memory"})):
+            with self.subTest(flag=flag, env=env):
+                got = self.resolve(flag, self.repo, env)
+                self.assertEqual((got.name, got.warning, got.also_reserved), ("team-memory", None, ()))
+
+    def test_an_override_still_reserves_the_memory_bank_blocks_name(self):
+        # memory-bank stores in team-memory whatever the flag or the shell says.
+        self._write_mcp_json(self._servers(memory_bank={"MEMORY_BANK_COLLECTION": "team-memory"}))
+        for flag, env in (("memory-bank", {}), (None, {"MEMORY_BANK_COLLECTION": "memory-bank"})):
+            with self.subTest(flag=flag, env=env):
+                got = self.resolve(flag, self.repo, env)
+                self.assertEqual(got.name, "memory-bank")
+                self.assertIn('"memory-bank" block', got.reserved_source("team-memory"))
+                self.assertIn("'team-memory'", got.warning)
+
+    def test_a_name_both_blocks_give_is_reserved_once(self):
+        self._write_mcp_json(self._servers(codebase_indexer={"MEMORY_BANK_COLLECTION": "team-memory"},
+                                           memory_bank={"MEMORY_BANK_COLLECTION": "team-memory"}))
+        got = self.resolve("memory-bank", self.repo, {})
+        self.assertEqual([name for name, _ in got.also_reserved], ["team-memory"])
+        self.assertIn('"codebase-indexer"', got.reserved_source("team-memory"))
+
+    def test_environment_wins_over_mcp_json(self):
+        self._write_mcp_json(self._servers(codebase_indexer={"MEMORY_BANK_COLLECTION": "from-json"}))
+        got = self.resolve(None, self.repo, {"MEMORY_BANK_COLLECTION": " from-env "})
+        self.assertEqual(got.name, "from-env")
+        self.assertIn("environment", got.source)
+
+    def test_mcp_json_codebase_indexer_block_is_read_when_the_shell_has_nothing(self):
+        """The issue's exact case: a custom name only in .mcp.json."""
+        self._write_mcp_json(self._servers(
+            codebase_indexer={"MEMORY_BANK_COLLECTION": "team-memory"},
+            memory_bank={"MEMORY_BANK_COLLECTION": " team-memory "},
+        ))
+        # Whitespace-only must fall through too (PR review): "  " is truthy
+        # and used to win, leaving team-memory unprotected.
+        for env in ({}, {"MEMORY_BANK_COLLECTION": ""}, {"MEMORY_BANK_COLLECTION": "  "}):
+            with self.subTest(env=env):
+                got = self.resolve(None, self.repo, env)
+                self.assertEqual(got.name, "team-memory")
+                self.assertIn('"codebase-indexer"', got.source)
+                self.assertIsNone(got.warning)
+                self.assertEqual(got.also_reserved, ())
+
+    def test_blocks_that_disagree_reserve_every_name_and_warn(self):
+        # A hand edit can leave the blocks apart. memory-bank's name is where memories are
+        # stored, so taking only codebase-indexer's would leave that collection open to the CLI.
+        self._write_mcp_json(self._servers(
+            codebase_indexer={"MEMORY_BANK_COLLECTION": "memory-bank"},
+            memory_bank={"MEMORY_BANK_COLLECTION": "team-memory"},
+        ))
+        got = self.resolve(None, self.repo, {})
+        self.assertEqual(got.name, "memory-bank")
+        self.assertIn('"codebase-indexer"', got.reserved_source("memory-bank"))
+        self.assertIn('"memory-bank"', got.reserved_source("team-memory"))
+        self.assertIsNone(got.reserved_source("my-code"))
+        self.assertIn("disagree", got.warning)
+        self.assertIn("'team-memory'", got.warning)
+
+    def test_a_malformed_block_is_reported_even_when_an_earlier_one_named_the_collection(self):
+        self._write_mcp_json({"mcpServers": {
+            "codebase-indexer": {"env": {"MEMORY_BANK_COLLECTION": "team-memory"}},
+            "memory-bank": {"env": {"MEMORY_BANK_COLLECTION": 5}},
+        }})
+        got = self.resolve(None, self.repo, {})
+        self.assertEqual((got.name, got.also_reserved), ("team-memory", ()))
+        self.assertIn("memory-bank", got.warning)
+
+    def test_memory_bank_block_is_the_fallback_inside_mcp_json(self):
+        for indexer_env in ({}, {"MEMORY_BANK_COLLECTION": "  "}):
+            with self.subTest(indexer_env=indexer_env):
+                self._write_mcp_json(self._servers(
+                    codebase_indexer=indexer_env,
+                    memory_bank={"MEMORY_BANK_COLLECTION": "team-memory"},
+                ))
+                got = self.resolve(None, self.repo, {})
+                self.assertEqual(got.name, "team-memory")
+                self.assertIn('"memory-bank"', got.source)
+
+    def test_default_when_nothing_is_configured(self):
+        for setup in ("no file", "no servers", "no key"):
+            with self.subTest(setup=setup):
+                if setup == "no servers":
+                    self._write_mcp_json({"mcpServers": {}})
+                elif setup == "no key":
+                    self._write_mcp_json(self._servers(codebase_indexer={"COLLECTION_NAME": "x"}))
+                got = self.resolve(None, self.repo, {})
+                self.assertEqual((got.name, got.warning), ("memory-bank", None))
+
+    def test_repo_path_none_skips_mcp_json(self):
+        got = self.resolve(None, None, {})
+        self.assertEqual((got.name, got.warning), ("memory-bank", None))
+
+    def test_reads_os_environ_by_default(self):
+        with mock.patch.dict(os.environ, {"MEMORY_BANK_COLLECTION": "from-os"}, clear=True):
+            self.assertEqual(self.resolve(None, self.repo).name, "from-os")
+
+    def test_malformed_mcp_json_falls_through_to_the_default_with_a_warning(self):
+        cases = {
+            "not json": "{not json",
+            "top level a list": "[]",
+            "mcpServers a list": json.dumps({"mcpServers": []}),
+            "server block null": json.dumps({"mcpServers": {"codebase-indexer": None}}),
+            "env a string": json.dumps({"mcpServers": {"codebase-indexer": {"env": "x"}}}),
+            "non-string value": json.dumps(
+                {"mcpServers": {"codebase-indexer": {"env": {"MEMORY_BANK_COLLECTION": 5}}}}
+            ),
+        }
+        for label, text in cases.items():
+            with self.subTest(case=label):
+                self._write_mcp_json(text)
+                got = self.resolve(None, self.repo, {})
+                self.assertEqual(got.name, "memory-bank")
+                self.assertIsNotNone(got.warning)
+                self.assertIn("using the default 'memory-bank'", got.warning)
+
+    def test_whole_file_problem_is_reported_once(self):
+        self._write_mcp_json("{not json")
+        got = self.resolve(None, self.repo, {})
+        self.assertEqual(got.warning.count("could not be read as valid JSON"), 1)
+
+    def test_a_malformed_block_does_not_hide_a_good_later_one(self):
+        self._write_mcp_json({"mcpServers": {
+            "codebase-indexer": {"env": {"MEMORY_BANK_COLLECTION": 5}},
+            "memory-bank": {"env": {"MEMORY_BANK_COLLECTION": "team-memory"}},
+        }})
+        got = self.resolve(None, self.repo, {})
+        self.assertEqual(got.name, "team-memory")
+        self.assertIn("codebase-indexer", got.warning)
+
+    def test_explicit_blank_flag_counts_as_unset(self):
+        got = self.resolve("  ", None, {"MEMORY_BANK_COLLECTION": "from-env"})
+        self.assertEqual(got.name, "from-env")
 
 
 if __name__ == "__main__":
