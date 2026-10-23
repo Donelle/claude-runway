@@ -95,7 +95,7 @@ from qdrant_collection_hints import (
 )
 from qdrant_compact_marker import collection_is_marked_compact, is_marked_compact
 from qdrant_model_check import check_embedding_model_mismatch
-from qdrant_credentials import resolve_qdrant_credentials
+from qdrant_credentials import resolve_qdrant_credentials, same_endpoint
 from mcp_tool_introspect import tool_count
 import memory_bank_lib as mb
 
@@ -492,6 +492,19 @@ def _resolve_credentials(
         default_url=DEFAULT_QDRANT_URL,
         default_api_key=DEFAULT_QDRANT_API_KEY,
     )
+
+
+def _is_own_collection(collection: str, qdrant_url: str) -> bool:
+    """
+    Whether a call targets this project's own collection: the configured
+    COLLECTION_NAME on the configured QDRANT_URL. Only that collection owns the
+    checkout's sync manifest (and so its lock) and gets COLLECTION_DESCRIPTION
+    stamped on it. The URL is compared with qdrant_credentials.same_endpoint,
+    the rule _resolve_credentials already applies, so a trailing slash cannot
+    make a call that the key rule treats as this project's own Qdrant skip the
+    manifest lock here. Defaults are read at call time, like _resolve_credentials.
+    """
+    return collection == DEFAULT_COLLECTION and same_endpoint(qdrant_url, DEFAULT_QDRANT_URL)
 
 
 def _skipped_summary(skipped: list) -> str:
@@ -954,7 +967,7 @@ async def _index_repo(
     # same test the collection description uses further down); indexing the
     # checkout into some other collection must not replace the baseline of the
     # one sync_repo keeps up to date from the same checkout.
-    owns_manifest = collection == DEFAULT_COLLECTION and qdrant_url == DEFAULT_QDRANT_URL
+    owns_manifest = _is_own_collection(collection, qdrant_url)
     if owns_manifest:
         # Taken BEFORE the collection is prepared and counted, not when the
         # manifest is first touched: whether this run may write a baseline
@@ -1335,7 +1348,7 @@ async def _index_repo(
     # explicit collection/qdrant_url override means the caller is indexing
     # something else, which must not get this project's own
     # COLLECTION_DESCRIPTION stamped onto it.
-    if collection == DEFAULT_COLLECTION and qdrant_url == DEFAULT_QDRANT_URL:
+    if owns_manifest:
         _sync_static_collection_description(collection, qdrant_url, qdrant_api_key)
 
     # Fail-open (never raises) -- see _recompute_search_limit.
@@ -1907,7 +1920,7 @@ async def _sync_repo(
 
     # Only for THIS project's own default collection/instance -- see the
     # matching guard in index_repo above for why.
-    if collection == DEFAULT_COLLECTION and qdrant_url == DEFAULT_QDRANT_URL:
+    if _is_own_collection(collection, qdrant_url):
         _sync_static_collection_description(collection, qdrant_url, qdrant_api_key)
 
     # A file that failed to hash OR failed to chunk this round must not lose

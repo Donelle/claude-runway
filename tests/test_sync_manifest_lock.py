@@ -613,6 +613,21 @@ class IndexRepoHoldsTheLockOnlyWhenItWritesTheManifest(RepoTestCase):
         self.assertIn("The sync manifest was not written", result)
         self.assertEqual(len(self.stored), 1)
 
+    def test_a_trailing_slash_on_the_configured_url_is_still_this_projects_collection(self):
+        # _resolve_credentials already treats it as the configured endpoint; an
+        # exact string comparison here let such a run skip the lock (and the
+        # manifest) while a sync on the same checkout was running.
+        url = _ims.DEFAULT_QDRANT_URL.rstrip("/") + "/"
+        self._hold()
+        result = self._index(qdrant_url=url)
+        self.assertTrue(result.startswith(BUSY_PREFIX), result)
+        self.store.assert_not_called()
+
+    def test_a_trailing_slash_run_writes_the_manifest_like_any_own_collection_run(self):
+        url = _ims.DEFAULT_QDRANT_URL.rstrip("/") + "/"
+        self.assertIn("Wrote the sync manifest", self._index(qdrant_url=url))
+        self.assertTrue(self.manifest_path.exists())
+
     def test_the_lock_is_already_held_while_the_collection_is_prepared_and_counted(self):
         # Whether this run may write a baseline rests on the collection being
         # absent or empty when prepared. Taking the lock only afterwards let a
