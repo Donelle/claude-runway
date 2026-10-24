@@ -2,7 +2,7 @@
 """Harness 4 of 4: every configured reviewer, against test code with known answers.
 
     .venv/bin/python harness/live_all_reviewers.py                       # orders case, three lenses on one model
-    .venv/bin/python harness/live_all_reviewers.py --reviewers-file my-reviewers.json --case orders --runs 3
+    .venv/bin/python harness/live_all_reviewers.py --config my-reviewers.json --case orders --runs 3   # a reviewers file as it stands
     .venv/bin/python harness/live_all_reviewers.py --config my-config.json --runs 3   # reviewers, rubric and stages from a config
 
 The other three harnesses isolate one stage. This one runs the whole reviewers
@@ -11,23 +11,22 @@ swapped, resident and on-demand mixed) over the four-file `orders` case, and
 scores the result: which of its six defects were found, which of its three
 decoys drew a false alarm.
 
-Without --reviewers-file or --config it builds three reasoning reviewers on --model, each
+Without --config it builds three reasoning reviewers on --model, each
 with a narrower lens (injection, bounds and state, general), which also
 exercises the scheduler's grouping of reviewers that share a model.
 
-With --reviewers-file (or --config, below) it uses that file's reviewers and rubric as written. Every
+With --config it uses that file's reviewers and rubric as written (a reviewers file is a valid config). Every
 stage the `review` tool has runs; for a stage it does not have yet, the output
 says so. Today that is reasoning only. The verifier and classifier
 stages join here once they exist, and this is the script that should show them
 working together: the decoy false alarms disappearing after verification, and
 each surviving finding carrying a rubric level.
 
---config is --reviewers-file plus a `stages` list: it picks which of reasoning, verifier and classifier to test
+--config also takes a `stages` list: it picks which of reasoning, verifier and classifier to test
 (see README.md), and a stage it leaves out is not run even when reviewers are configured for it.
 """
 
 import argparse
-import json
 import sys
 import tempfile
 from pathlib import Path
@@ -55,22 +54,13 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--history", default=None, metavar="SNAPSHOT",
                         help="replay a Copilot review from a snapshot (collect_copilot_history.py) instead of --case, and score parity with it")
     parser.add_argument("--round", type=int, default=1, help="which Copilot review of the snapshot to replay (default 1)")
-    parser.add_argument("--reviewers-file", default=None, help="a reviewers file to run as written, instead of the three default lenses "
-                                                               "(--config takes the same file, plus a stage list)")
-    args = h.finish_args(parser.parse_args(argv))
-    if args.config and args.reviewers_file:
-        raise SystemExit("--config and --reviewers-file both name the reviewers; pass one of them.")
-    return args
+    return h.finish_args(parser.parse_args(argv))
 
 
 def build_config(args: argparse.Namespace) -> tuple:
-    """(reviewer entries, rubric) from --config's reviewers, else --reviewers-file, else three lenses on --model."""
+    """(reviewer entries, rubric) from --config's reviewers, else three lenses on --model."""
     if args.config_data is not None and args.config_data.reviewers:
         return list(args.config_data.reviewers), list(args.config_data.rubric)
-    if args.reviewers_file:
-        path = Path(args.reviewers_file).expanduser().resolve()
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        return h.absolutize_config(raw["reviewers"], raw.get("rubric", []), path.parent)
     entries = [h.reviewer_entry(name, args.model, prompt=lens, prompt_file=None, on_demand=not args.resident, context=args.context)
                for name, lens in LENSES]
     return entries, list(RUBRIC)
