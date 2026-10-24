@@ -54,6 +54,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--history", default=None, metavar="SNAPSHOT",
                         help="replay a Copilot review from a snapshot (collect_copilot_history.py) instead of --case, and score parity with it")
     parser.add_argument("--round", type=int, default=1, help="which Copilot review of the snapshot to replay (default 1)")
+    raw = sys.argv[1:] if argv is None else argv
+    if any(a == "--reviewers-file" or a.startswith("--reviewers-file=") for a in raw):
+        # Removed in favor of --config; say where to go instead of argparse's bare "unrecognized arguments".
+        parser.error("--reviewers-file was removed: pass the same file with --config (a reviewers file is a valid config as it stands)")
     return h.finish_args(parser.parse_args(argv))
 
 
