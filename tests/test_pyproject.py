@@ -17,9 +17,8 @@ catch setup.py itself regressing (e.g. back to a single shared "src/skills"
 target, which silently drops every skill but one -- confirmed live during
 development, see setup.py's docstring).
 
-Stdlib-only for the TOML-parsing tests (tomllib, Python 3.11+) -- skips
-itself on an older interpreter rather than adding a new third-party
-TOML-parsing dependency just for this one test. The wheel-building tests
+Stdlib-only for the TOML-parsing tests (tomllib, always present: the project
+minimum is Python 3.12). The wheel-building tests
 need `build`/`wheel`/`setuptools` (requirements-dev.txt) and are skipped
 (not failed) if those aren't importable, so a bare `requirements.txt`-only
 environment doesn't spuriously fail unittest discovery.
@@ -38,10 +37,7 @@ from typing import Optional
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PYPROJECT_PATH = os.path.join(REPO_ROOT, "pyproject.toml")
 
-try:
-    import tomllib
-except ImportError:  # Python < 3.11
-    tomllib = None
+import tomllib
 
 try:
     import build as _build_pkg  # noqa: F401
@@ -52,11 +48,16 @@ except ImportError:
     _BUILD_TOOLING_AVAILABLE = False
 
 
-@unittest.skipIf(tomllib is None, "tomllib requires Python 3.11+")
 class PyprojectTomlIsWellFormed(unittest.TestCase):
     def setUp(self):
         with open(PYPROJECT_PATH, "rb") as f:
             self.data = tomllib.load(f)
+
+    def test_the_python_floor_is_the_project_minimum_that_ci_and_pyright_run_on(self):
+        # 3.12 is what CI, the bootstrap scripts and Pyright run on and what docs/prerequisites.md states;
+        # a looser `requires-python` would promise support for versions nobody tests.
+        self.assertEqual(self.data["project"]["requires-python"], ">=3.12")
+        self.assertEqual(self.data["tool"]["pyright"]["pythonVersion"], "3.12")
 
     def test_declares_the_three_named_console_scripts_via_the_shim(self):
         # These no longer point straight at tools.*:main --

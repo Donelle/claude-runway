@@ -24,7 +24,12 @@ Also flags a .claude/settings.json still running the renamed-away
 project with a `codebase-reviewer` server, a missing, blank, unreadable or
 invalid reviewers file (REVIEWERS_FILE is required and has no default).
 
-Exit code is 1 if any mismatch (or stale hook, or unusable reviewers file) is found, 0 otherwise (including when
+Also reports whether the SessionEnd PR-round capture hook (`hooks/session_end_pr_rounds.py`)
+is registered and whether `CLAUDE_RUNWAY_CAPTURE_PR_ROUNDS` is on in this shell: a missing hook is only a
+note unless the opt-in is on (then nothing records the rounds, which is a problem; `upgrade` fixes it).
+
+Exit code is 1 if any mismatch (or stale hook, or unusable reviewers file, or the capture opted in
+without its hook) is found, 0 otherwise (including when
 there is nothing to check -- e.g. a `--qdrant-only` setup whose `qdrant` block
 carries no dual-config values -- which is a valid state, not a misconfiguration) -- usable as a CI/
 pre-flight gate, not just an interactive report.
@@ -71,8 +76,40 @@ def _reviewers_file_note(result: DoctorResult) -> str:
     return f"\n\nReviewers file OK: {result.reviewers_file_summary}."
 
 
+def pr_round_capture_problem(result: DoctorResult) -> bool:
+    """True when the opt-in is on in the shell but the hook is not registered: the user
+    expects rounds to be recorded and nothing will do it. A missing hook with the opt-in off
+    is only a note (the capture is optional)."""
+    return result.pr_round_capture_enabled and result.pr_round_capture_hook != "present"
+
+
+def _pr_round_capture_note(result: DoctorResult) -> str:
+    """Extra section: is the SessionEnd PR-round capture hook registered, and is
+    the opt-in on in this shell."""
+    state = "on" if result.pr_round_capture_enabled else "off"
+    if result.pr_round_capture_hook == "present":
+        if result.pr_round_capture_enabled:
+            return "\n\nPR round capture hook: present, and CLAUDE_RUNWAY_CAPTURE_PR_ROUNDS is on in this shell."
+        return (
+            "\n\nPR round capture hook: present, but CLAUDE_RUNWAY_CAPTURE_PR_ROUNDS is off in this shell, "
+            "so it records nothing. Export it as 1 to opt in."
+        )
+    if pr_round_capture_problem(result):
+        return (
+            f"\n\nProblem: CLAUDE_RUNWAY_CAPTURE_PR_ROUNDS is {state} in this shell but "
+            ".claude/settings.json has no SessionEnd hook for hooks/session_end_pr_rounds.py, so no review round "
+            "is recorded. Fix: `claude-runway-setup upgrade <target_repo>` (migration pr-round-capture-hook-missing)."
+        )
+    return (
+        "\n\nPR round capture hook: missing (optional; CLAUDE_RUNWAY_CAPTURE_PR_ROUNDS is off). Add it with "
+        "`claude-runway-setup upgrade <target_repo>` (migration pr-round-capture-hook-missing), then export "
+        "CLAUDE_RUNWAY_CAPTURE_PR_ROUNDS=1 to opt in."
+    )
+
+
 def format_report(result: DoctorResult) -> str:
-    return _format_env_report(result) + _reviewers_file_note(result) + _legacy_hook_note(result)
+    return (_format_env_report(result) + _reviewers_file_note(result) + _legacy_hook_note(result)
+            + _pr_round_capture_note(result))
 
 
 def _format_env_report(result: DoctorResult) -> str:
@@ -139,6 +176,7 @@ def main(argv=None) -> int:
             or result.mismatches
             or result.legacy_compress_hook_events
             or result.reviewers_file_problem
+            or pr_round_capture_problem(result)
         )
         else 0
     )

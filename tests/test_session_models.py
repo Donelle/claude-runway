@@ -310,7 +310,7 @@ class MySavingsSkillContent(unittest.TestCase):
     def test_the_installed_skill_does_not_point_at_evaluation_md(self):
         # The skill is installed into ~/.claude/skills/, where the repo's
         # EVALUATION.md does not exist, so a pointer to it cannot be followed.
-        skill = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "skills", "my-savings", "SKILL.md")
+        skill = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "skills", "cr-savings", "SKILL.md")
         with open(skill, encoding="utf-8") as f:
             text = f.read()
         self.assertNotIn("EVALUATION.md", text)

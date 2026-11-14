@@ -1,7 +1,7 @@
 """
 Shared, cross-tool metrics store -- ONE generic SQLite table
 any domain in this toolkit can write into (memory-bank's recall/remember
-events, my-gh-autowork's per-ticket run metrics, whatever comes next),
+events, cr-gh-autowork's per-ticket run metrics, whatever comes next),
 behind ONE small `MetricsStore` class and ONE new MCP tool
 (`get_metrics`, in mcpservers/analytics_mcp_server.py -- see that file).
 
@@ -21,7 +21,7 @@ memory_events_lib.py's `memory-events.db` -- both are genuinely tailored
 schemas that already work well for their one specific domain each,
 migrating them onto this generic store is an explicit follow-up, not part
 of this module's scope.
-my-gh-autowork's per-ticket outcome logging writes into
+cr-gh-autowork's per-ticket outcome logging writes into
 this store (`metric_id="autowork"`), as does memory_events_lib's
 `record_memory_metric` (`metric_id="memory-bank"`).
 
@@ -193,6 +193,56 @@ class MetricsStore:
     # Writes -- fail open (see module docstring)
     # -------------------------------------------------------------------
 
+    @staticmethod
+    def _prepare(metric_id: str, event_type: str, value: float, metadata: Optional[dict],
+                 event_timestamp: Optional[str]) -> tuple:
+        """The validation every write shares (record() and record_if_absent()): returns
+        `(True, metadata_json)` or `(False, None)` after logging why to stderr. Nothing has
+        touched the database yet; see record()'s docstring for each rule's reason."""
+        if not math.isfinite(value):
+            print(f"[claude-runway] refusing to record non-finite metric value for {metric_id}/{event_type}: {value!r}", file=sys.stderr)
+            return False, None
+        if event_timestamp is not None:
+            try:
+                # A regex only checks
+                # character SHAPE, not that the value is a real calendar
+                # date/time -- it would accept "2026-99-99T99:99:99Z" and
+                # persist it, which trend()'s datetime.fromisoformat parsing
+                # then raises ValueError on for every future call against
+                # this metric_id, not just this one row (confirmed by
+                # reproduction). datetime.strptime performs real
+                # calendar/time validation, not just character-class
+                # matching.
+                #
+                # Strptime alone still
+                # isn't sufficient -- it's lenient about zero-padding, so it
+                # happily parses "2026-8-5T01:02:03Z" (non-zero-padded month/
+                # day) and would have persisted that non-canonical string
+                # verbatim, only for trend()'s datetime.fromisoformat (which
+                # requires the STRICT zero-padded form) to raise on it later
+                # (confirmed by reproduction: strptime parses it, fromisoformat
+                # rejects it). Reformatting the parsed value back through
+                # strftime and requiring an EXACT round-trip match to the
+                # original string is what actually enforces the canonical
+                # "YYYY-MM-DDTHH:MM:SSZ" shape AND real calendar validity
+                # together -- a value that round-trips has to be both.
+                parsed = datetime.strptime(event_timestamp, "%Y-%m-%dT%H:%M:%SZ")
+                if parsed.strftime("%Y-%m-%dT%H:%M:%SZ") != event_timestamp:
+                    raise ValueError("not canonical (fails strict round-trip)")
+            except (TypeError, ValueError):
+                print(
+                    f"[claude-runway] refusing to record metric {metric_id}/{event_type} with invalid "
+                    f"event_timestamp override (expected canonical ISO 8601 UTC 'YYYY-MM-DDTHH:MM:SSZ'): {event_timestamp!r}",
+                    file=sys.stderr,
+                )
+                return False, None
+        try:
+            metadata_json = json.dumps(metadata) if metadata is not None else None
+        except (TypeError, ValueError) as e:
+            print(f"[claude-runway] could not serialize metrics metadata for {metric_id}/{event_type}: {e}", file=sys.stderr)
+            return False, None
+        return True, metadata_json
+
     def record(
         self,
         metric_id: str,
@@ -259,47 +309,8 @@ class MetricsStore:
         the offending row, which read-only aggregate methods have no
         business doing.
         """
-        if not math.isfinite(value):
-            print(f"[claude-runway] refusing to record non-finite metric value for {metric_id}/{event_type}: {value!r}", file=sys.stderr)
-            return False
-        if event_timestamp is not None:
-            try:
-                # a regex only checks
-                # character SHAPE, not that the value is a real calendar
-                # date/time -- it would accept "2026-99-99T99:99:99Z" and
-                # persist it, which trend()'s datetime.fromisoformat parsing
-                # then raises ValueError on for every future call against
-                # this metric_id, not just this one row (confirmed by
-                # reproduction). datetime.strptime performs real
-                # calendar/time validation, not just character-class
-                # matching.
-                #
-                # Strptime alone still
-                # isn't sufficient -- it's lenient about zero-padding, so it
-                # happily parses "2026-8-5T01:02:03Z" (non-zero-padded month/
-                # day) and would have persisted that non-canonical string
-                # verbatim, only for trend()'s datetime.fromisoformat (which
-                # requires the STRICT zero-padded form) to raise on it later
-                # (confirmed by reproduction: strptime parses it, fromisoformat
-                # rejects it). Reformatting the parsed value back through
-                # strftime and requiring an EXACT round-trip match to the
-                # original string is what actually enforces the canonical
-                # "YYYY-MM-DDTHH:MM:SSZ" shape AND real calendar validity
-                # together -- a value that round-trips has to be both.
-                parsed = datetime.strptime(event_timestamp, "%Y-%m-%dT%H:%M:%SZ")
-                if parsed.strftime("%Y-%m-%dT%H:%M:%SZ") != event_timestamp:
-                    raise ValueError("not canonical (fails strict round-trip)")
-            except (TypeError, ValueError):
-                print(
-                    f"[claude-runway] refusing to record metric {metric_id}/{event_type} with invalid "
-                    f"event_timestamp override (expected canonical ISO 8601 UTC 'YYYY-MM-DDTHH:MM:SSZ'): {event_timestamp!r}",
-                    file=sys.stderr,
-                )
-                return False
-        try:
-            metadata_json = json.dumps(metadata) if metadata is not None else None
-        except (TypeError, ValueError) as e:
-            print(f"[claude-runway] could not serialize metrics metadata for {metric_id}/{event_type}: {e}", file=sys.stderr)
+        ok, metadata_json = self._prepare(metric_id, event_type, value, metadata, event_timestamp)
+        if not ok:
             return False
         # `conn` is closed in a `finally`, not just after a successful
         # `with conn:` block -- `with conn:` only manages the transaction
@@ -328,6 +339,73 @@ class MetricsStore:
         except (sqlite3.Error, OSError) as e:
             print(f"[claude-runway] could not record metric {metric_id}/{event_type}: {e}", file=sys.stderr)
             return False
+        finally:
+            if conn is not None:
+                conn.close()
+
+    def record_if_absent(
+        self,
+        metric_id: str,
+        event_type: str,
+        key: dict,
+        value: float = 1.0,
+        metadata: Optional[dict] = None,
+        session_id: Optional[str] = None,
+        event_timestamp: Optional[str] = None,
+    ) -> str:
+        """
+        Append one row unless a row of the same `metric_id`/`event_type` already carries every
+        `key` field with an equal value in its `metadata`, so that running the same writer twice
+        over the same input (a session end and then a backfill) never double-counts. Returns
+        `"written"`, `"exists"` (nothing written) or `"failed"` (logged to stderr, never raised:
+        the same fail-open rule as record(), including its validation).
+
+        The check and the insert run in ONE write transaction (`BEGIN IMMEDIATE` takes the
+        database's write lock before the check reads), so two writers racing over the same key
+        cannot both pass the check. `key` must be a non-empty dict whose values are JSON scalars
+        (None included, which matches a row whose field is null or absent) and each field must
+        also be present in `metadata`, so the row that is written is the row a later check finds;
+        anything else is `"failed"`. The check reads the metadata of every row of that
+        `event_type` (the table has no index on a metadata field), which is fine for the few
+        thousand rows a per-PR log holds and is the price of a schema with no per-domain columns.
+        """
+        if (not isinstance(key, dict) or not key or not isinstance(metadata, dict)
+                or any(not isinstance(v, (str, int, float, bool, type(None))) or metadata.get(k) != v
+                       for k, v in key.items())):
+            print(f"[claude-runway] record_if_absent for {metric_id}/{event_type} needs a non-empty scalar `key` "
+                  f"whose fields are all in `metadata`", file=sys.stderr)
+            return "failed"
+        ok, metadata_json = self._prepare(metric_id, event_type, value, metadata, event_timestamp)
+        if not ok:
+            return "failed"
+        conn: Optional[sqlite3.Connection] = None
+        try:
+            conn = _connect(self._resolve_path())
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                for (existing,) in conn.execute(
+                        "SELECT metadata FROM metrics WHERE metric_id = ? AND event_type = ?", (metric_id, event_type)):
+                    try:
+                        decoded = json.loads(existing) if existing is not None else None
+                    except (TypeError, ValueError):
+                        continue
+                    if isinstance(decoded, dict) and all(decoded.get(k) == v for k, v in key.items()):
+                        conn.rollback()
+                        return "exists"
+                conn.execute(
+                    "INSERT INTO metrics (metric_id, event_type, value, metadata, event_timestamp, session_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (metric_id, event_type, float(value), metadata_json,
+                     event_timestamp or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), session_id),
+                )
+                conn.commit()
+                return "written"
+            except BaseException:
+                conn.rollback()
+                raise
+        except (sqlite3.Error, OSError) as e:
+            print(f"[claude-runway] could not record metric {metric_id}/{event_type}: {e}", file=sys.stderr)
+            return "failed"
         finally:
             if conn is not None:
                 conn.close()
@@ -372,7 +450,7 @@ class MetricsStore:
 
         `session_id`, when given, narrows the aggregate to rows
         matching BOTH `metric_id` AND this exact `session_id` -- e.g. one
-        specific `my-gh-autowork` attempt's `f"issue-{n}-{HHMMSS}"` marker
+        specific `cr-gh-autowork` attempt's `f"issue-{n}-{HHMMSS}"` marker
         rather than that metric_id's entire history.
         Omitting it (the default) keeps today's metric_id-only aggregate
         unchanged -- existing callers see no behavior change.
@@ -458,7 +536,7 @@ class MetricsStore:
         Ordered by `event_timestamp DESC, id DESC` -- NOT `event_timestamp`
         alone (Copilot review on this PR): `event_timestamp` only has
         one-second resolution, so multiple events genuinely can tie (a
-        my-gh-autowork run's own findings/metadata are typically all logged
+        cr-gh-autowork run's own findings/metadata are typically all logged
         within the same second). With only `event_timestamp DESC`, SQLite's
         tie-break among equal keys is not "most recently inserted first" --
         confirmed live with 15 same-second rows, `LIMIT 12` returned the
@@ -614,9 +692,9 @@ class MetricsStore:
 
 # ---------------------------------------------------------------------------
 # Formatting -- shared by the get_metrics MCP tool (mcpservers/analytics_mcp_server.py)
-# and skills/my-metrics/SKILL.md, so both surfaces render identically. Kept
+# and skills/cr-metrics/SKILL.md, so both surfaces render identically. Kept
 # deliberately simpler than savings_ledger.py's formatting (no bars/sparklines) --
-# this generic store has no domain-specific rendering (skills/my-metrics is
+# this generic store has no domain-specific rendering (skills/cr-metrics is
 # the thin consumer that prints these views verbatim).
 # ---------------------------------------------------------------------------
 

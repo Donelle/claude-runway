@@ -5,7 +5,7 @@ Code) can trigger re-indexing on demand -- e.g. right after cloning a repo,
 or when it notices qdrant-find is coming back empty -- instead of you
 running ingest_to_qdrant.py by hand every time.
 
-Project minimum: Python 3.12 (policy floor; the dependency chain supports >=3.10).
+Project minimum: Python 3.12.
 
 Setup:
     pip install "mcp[cli]" qdrant-client fastembed pydantic_settings --break-system-packages
@@ -300,8 +300,7 @@ async def _announce_warning(ctx, message: str) -> None:
     notification and to stderr; the same text is also kept in the result.
 
     Fail-open: a notification that cannot be sent must never fail or block the
-    sync. Some clients do not render MCP notifications at all (see the README's
-    Known limitations), which is why the result repeats it.
+    sync. Some clients do not render MCP notifications at all (see docs/known-limitations.md), which is why the result repeats it.
     """
     print(f"[claude-runway] {message}", file=sys.stderr)
     if ctx is None:
@@ -576,6 +575,16 @@ def _sync_static_collection_description(collection: Optional[str], qdrant_url: s
     without re-checking it against live Qdrant.
     """
     if not DEFAULT_COLLECTION_DESCRIPTION or not collection:
+        return
+    # Same guard index_repo/sync_repo have: a project misconfigured with
+    # COLLECTION_NAME == MEMORY_BANK_COLLECTION must never stamp its code-index
+    # description onto the shared memory-bank collection.
+    if mb.is_memory_bank_collection_name(collection, DEFAULT_MEMORY_BANK_COLLECTION):
+        print(
+            f"[claude-runway] not syncing COLLECTION_DESCRIPTION: '{collection}' is the shared "
+            f"memory-bank collection (MEMORY_BANK_COLLECTION)",
+            file=sys.stderr,
+        )
         return
     try:
         client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
@@ -2273,7 +2282,11 @@ def list_collections(
     lines = [f"Collections at {qdrant_url}:"]
     listed = 0
     for name in names:
-        marker = " (this project's own)" if name == DEFAULT_COLLECTION else ""
+        # "Own" means this project's collection on this project's own Qdrant
+        # instance: the same name on an explicit qdrant_url override pointing at a
+        # different instance is someone else's collection.
+        is_own = name == DEFAULT_COLLECTION and qdrant_url == DEFAULT_QDRANT_URL
+        marker = " (this project's own)" if is_own else ""
         needs_description_fetch = include_descriptions and name not in descriptions
         # Every collection's metadata is read so conversation-
         # compact collections (marked by compact_store) can be skipped

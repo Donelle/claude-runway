@@ -11,7 +11,7 @@ This exists because that exact drift already happened twice on this repo:
 - `compress_mcp_server.py`'s `_log_fixed_overhead()`
   hardcoded a 5-tool tuple. `compact_store`/`compact_find`/
   `savings_summary`/`savings_detail` shipped later and were never added to
-  it -- the /my-savings "tool overhead" annotation (since removed)
+  it -- the /cr-savings "tool overhead" annotation (since removed)
   silently undercounted for months, with no error to notice.
 - EVALUATION.md's Track A/B prose separately hardcoded
   "6 total" and "5 total" tool counts that drifted the same way.

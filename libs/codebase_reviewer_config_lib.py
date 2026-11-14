@@ -32,7 +32,10 @@ part cannot live in the env block):
         {"name": "classifier", "model": "<served model id>",
          "promptFile": "optional/path/to/a/prompt.md",
          "active": true, "type": ["classifier"],
-         "loadOnDemand": true, "contextLength": 32768}
+         "loadOnDemand": true, "contextLength": 32768},
+        {"name": "lines", "model": "<served model id>", "prompt": "...",
+         "replyFormat": "lines", "translator": "optional/path/to/a/script.py",
+         "active": true, "type": ["reasoning"], "loadOnDemand": false}
       ]
     }
 
@@ -40,11 +43,27 @@ A reviewer's prompt is `prompt` (text), `promptFile` (a path to a markdown file)
 or both: one of the two is required, and when both are set they are merged into
 one prompt, the `prompt` text first, then the file's text (`load_prompt`).
 
+`replyFormat` (reasoning reviewers) is how the server reads the model's reply: `lines`
+(the default; plain `key: value` lines, which small models write reliably) or `json`.
+A `promptFile`, when present, replaces the built-in reply instructions for that format
+(`reasoning_reviewer_lib.build_system_prompt`), so the file has to describe the format
+`replyFormat` selects. `translator` is an optional script that turns a model's own reply
+format into the `replyFormat` format; the server's readers stay strict, and a translator
+is how a model with some other format is used (`reply_translator_lib`).
+
 `level` is one of the server's own fixed levels, lowest to highest (`LEVELS`).
-`score` is the minimum confidence, 1-5, a classifier needs for a finding to
-match that entry (the classifier stage that uses it is a later piece of work;
-this module only validates it). `contextLength` is used only when
+`score` is a probability above 0 and at most 1, such as 0.7: the average probability
+the classifiers' "does this finding fall under this definition?" answers need to reach
+for a finding to match that entry (`libs/classifier_reviewer_lib.py` applies it; this
+module validates it and reads an entry's definition with `load_definition`). The
+classifiers are never shown it.
+`contextLength` is used only when
 `loadOnDemand` is true.
+
+`tools` (optional, default none) is the list of tools the reviewer may ask for in its reply (`need: ...`;
+`KNOWN_TOOLS`). A reviewer with `tools` gets the feedback loop in `reviewer_need_lib`; without it, the reviewer's prompt and
+requests are exactly what they were. `contextShare` (optional, above 0 and at most 1, default 0.25) is the share of the
+reviewer's room that the looked-up text may fill across all the loop's rounds; it is ignored without `tools`.
 """
 
 import json
@@ -63,15 +82,31 @@ LEVELS = ("low", "moderate", "high")
 # entry). Each stage depends on the one before it.
 ROLES = ("reasoning", "verifier", "classifier")
 
-SCORE_MIN = 1
-SCORE_MAX = 5
+# How a reasoning reviewer's reply is read. `lines` is the default: plain
+# `key: value` lines gave no format failures on the small models that mis-escape
+# code inside JSON. `json` stays selectable, and the verifier always
+# replies in JSON, whatever this says.
+REPLY_FORMATS = ("lines", "json")
+DEFAULT_REPLY_FORMAT = "lines"
+
+# A rubric entry's `score` is a probability: above 0, at most 1.
 
 DEFAULT_MAX_REVIEWERS = 3
 DEFAULT_MAX_REVIEW_ROUNDS = 3
 
+# The tools a reviewer may be given with `tools`: the names `reviewer_tools_lib.TOOL_NAMES` runs. Spelled out
+# here because that module imports the reasoning stage, which imports this one; a test keeps the two lists equal.
+KNOWN_TOOLS = ("read_file", "grep")
+# The share of a reviewer's room (its context minus its system prompt and reply reserve) that the looked-up text of the
+# `need:` loop may fill, across all rounds, when `contextShare` is not set (the default).
+DEFAULT_CONTEXT_SHARE = 0.25
+
 _RUBRIC_KEYS = frozenset({"name", "level", "definition", "definitionFile", "score"})
 _REVIEWER_KEYS = frozenset(
-    {"name", "model", "prompt", "promptFile", "active", "type", "loadOnDemand", "contextLength"}
+    {
+        "name", "model", "prompt", "promptFile", "active", "type", "loadOnDemand", "contextLength",
+        "replyFormat", "translator", "tools", "contextShare",
+    }
 )
 _TOP_LEVEL_KEYS = frozenset({"rubric", "reviewers"})
 
@@ -93,9 +128,9 @@ class RubricEntry:
     name: str
     level: str
     definition: str
-    score: int
+    score: float
     # Resolved path of the optional free-text definition file; "" when absent.
-    # Validated as readable at load time, read by the classifier stage.
+    # Validated as readable at load time, read by `load_definition` when a classifier runs.
     definition_file: str = ""
 
 
@@ -114,6 +149,17 @@ class Reviewer:
     # readable and non-blank at load time, read again by `load_prompt` when a
     # review runs, so an edit to the file applies without a restart.
     prompt_file: str = ""
+    # How the reasoning stage reads this reviewer's reply (REPLY_FORMATS). With a
+    # `translator`, it is the format the translator's output is read in.
+    reply_format: str = DEFAULT_REPLY_FORMAT
+    # Resolved path of the optional `translator` script; "" when absent. Validated
+    # as readable (and, unless it is a .py file, executable) at load time.
+    translator: str = ""
+    # The tools this reviewer may ask for in a `need:` reply (KNOWN_TOOLS names, in file order). Empty, the default, is no
+    # loop at all: the reviewer's prompt and requests are exactly what they were before the loop existed.
+    tools: tuple = ()
+    # The share of the reviewer's room the looked-up text may fill across the loop's rounds. Used only with `tools`.
+    context_share: float = DEFAULT_CONTEXT_SHARE
 
 
 @dataclass(frozen=True)
@@ -206,6 +252,15 @@ def _int_in_range(value: object, low: int, high: Optional[int] = None) -> Option
     return value
 
 
+def _probability(value: object) -> Optional[float]:
+    """`value` as a float if it is a number above 0 and at most 1, else None. A bool is not a number here."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not 0 < value <= 1:
+        return None
+    return float(value)
+
+
 def _required_string(raw: dict, key: str, where: str, problems: list) -> Optional[str]:
     """`raw[key]` if it is a non-blank string, else records a problem and returns None."""
     value = raw.get(key)
@@ -252,10 +307,10 @@ def _validate_rubric(rubric: object, base_dir: Path, problems: list) -> list:
         if level not in LEVELS:
             problems.append(f"{where}: 'level' must be one of {', '.join(LEVELS)} (got {level!r})")
         definition = _required_string(raw, "definition", where, problems)
-        score = _int_in_range(raw.get("score"), SCORE_MIN, SCORE_MAX)
+        score = _probability(raw.get("score"))
         if score is None:
             problems.append(
-                f"{where}: 'score' must be a whole number from {SCORE_MIN} to {SCORE_MAX} (got {raw.get('score')!r})"
+                f"{where}: 'score' must be a probability above 0 and at most 1, such as 0.7 (got {raw.get('score')!r})"
             )
         definition_file: Optional[str] = ""
         if "definitionFile" in raw:
@@ -348,6 +403,72 @@ def _validate_prompt_sources(raw: dict, base_dir: Path, where: str, problems: li
     return (prompt, prompt_file or "") if ok else None
 
 
+def _validate_reply_format(raw: dict, where: str, problems: list) -> Optional[str]:
+    """The reviewer's `replyFormat` (the default when absent), or None with a problem recorded."""
+    if "replyFormat" not in raw:
+        return DEFAULT_REPLY_FORMAT
+    value = raw["replyFormat"]
+    if isinstance(value, str) and value in REPLY_FORMATS:
+        return value
+    problems.append(f"{where}: 'replyFormat' must be one of {', '.join(REPLY_FORMATS)} (got {value!r})")
+    return None
+
+
+def _validate_tools(raw: dict, where: str, problems: list) -> Optional[tuple]:
+    """The reviewer's `tools` as a tuple of unique known names, `()` when the key is absent, None (with problems) when bad."""
+    if "tools" not in raw:
+        return ()
+    value = raw["tools"]
+    if not isinstance(value, list):
+        problems.append(f"{where}: 'tools' must be a list of tool names (got {value!r})")
+        return None
+    ok = True
+    names: list = []
+    for item in value:
+        if not isinstance(item, str) or item not in KNOWN_TOOLS:
+            problems.append(f"{where}: 'tools' has {item!r}, which is not a tool (the tools are: {', '.join(KNOWN_TOOLS)})")
+            ok = False
+        elif item in names:
+            problems.append(f"{where}: 'tools' lists {item!r} twice")
+            ok = False
+        else:
+            names.append(item)
+    return tuple(names) if ok else None
+
+
+def _validate_context_share(raw: dict, where: str, problems: list) -> Optional[float]:
+    if "contextShare" not in raw:
+        return DEFAULT_CONTEXT_SHARE
+    share = _probability(raw["contextShare"])
+    if share is None:
+        problems.append(f"{where}: 'contextShare' must be a number above 0 and at most 1 (got {raw['contextShare']!r})")
+    return share
+
+
+def _validate_translator(raw: dict, base_dir: Path, where: str, problems: list) -> Optional[str]:
+    """The resolved path of the reviewer's `translator` ("" when absent), or None with a problem recorded.
+
+    It is a script the server will run, so it must exist as a regular file and be readable; a `.py` file runs
+    under the server's own Python, so anything else must also be executable (a check that means little on
+    Windows, where it only confirms the file can be read)."""
+    if "translator" not in raw:
+        return ""
+    value = raw["translator"]
+    if not isinstance(value, str) or not value.strip():
+        problems.append(f"{where}: 'translator' must be a non-empty path string (got {value!r})")
+        return None
+    resolved = _resolve_path(value, base_dir)
+    if not resolved.is_file():
+        problems.append(f"{where}: 'translator' {str(resolved)!r} is not a file")
+        return None
+    needs_exec = resolved.suffix.lower() != ".py" and os.name != "nt"
+    if not os.access(resolved, os.R_OK) or (needs_exec and not os.access(resolved, os.X_OK)):
+        why = "is not executable (only a .py file runs without it)" if needs_exec and os.access(resolved, os.R_OK) else "cannot be read"
+        problems.append(f"{where}: 'translator' {str(resolved)!r} {why}")
+        return None
+    return str(resolved)
+
+
 def _validate_reviewers(reviewers: object, base_dir: Path, problems: list) -> list:
     entries: list = []
     if not isinstance(reviewers, list):
@@ -370,9 +491,13 @@ def _validate_reviewers(reviewers: object, base_dir: Path, problems: list) -> li
                 seen[name] = index
         model = _required_string(raw, "model", where, problems)
         prompt_sources = _validate_prompt_sources(raw, base_dir, where, problems)
+        reply_format = _validate_reply_format(raw, where, problems)
+        translator = _validate_translator(raw, base_dir, where, problems)
         active = _required_bool(raw, "active", where, problems)
         roles = _validate_roles(raw, where, problems)
         load_on_demand = _required_bool(raw, "loadOnDemand", where, problems)
+        tools = _validate_tools(raw, where, problems)
+        context_share = _validate_context_share(raw, where, problems)
         context_length: Optional[int] = None
         context_ok = True
         if "contextLength" in raw:
@@ -386,9 +511,13 @@ def _validate_reviewers(reviewers: object, base_dir: Path, problems: list) -> li
             name is not None
             and model is not None
             and prompt_sources is not None
+            and reply_format is not None
+            and translator is not None
             and active is not None
             and roles is not None
             and load_on_demand is not None
+            and tools is not None
+            and context_share is not None
             and context_ok
         ):
             entries.append(
@@ -401,6 +530,10 @@ def _validate_reviewers(reviewers: object, base_dir: Path, problems: list) -> li
                     roles=roles,
                     load_on_demand=load_on_demand,
                     context_length=context_length,
+                    reply_format=reply_format,
+                    translator=translator,
+                    tools=tools,
+                    context_share=context_share,
                 )
             )
     return entries
@@ -559,6 +692,25 @@ def load_prompt(reviewer: Reviewer) -> str:
     return "\n\n".join(parts)
 
 
+def load_definition(entry: RubricEntry) -> str:
+    """A rubric entry's full definition: its `definition` text, then the `definitionFile` content after a blank line.
+
+    The file is read here, at run time, like `load_prompt`'s, so an edit applies to the next review. A file that has
+    become unreadable since the reviewers file was validated is a `ConfigError` naming the entry and the path. A blank
+    file adds nothing (the inline `definition` is required, so there is always some text)."""
+    parts = [entry.definition.strip()]
+    if entry.definition_file:
+        try:
+            text = Path(entry.definition_file).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ConfigError(
+                f"rubric entry {entry.name!r}: 'definitionFile' {entry.definition_file!r} cannot be read ({_describe(exc)})"
+            ) from exc
+        if text.strip():
+            parts.append(text.strip())
+    return "\n\n".join(part for part in parts if part)
+
+
 def advisories(config: ReviewersConfig) -> list:
     """Plain-language notes on how the active REASONING reviewers divide the work. Never an error:
     a setup that triggers one is valid, and what to do about it is the user's call.
@@ -568,7 +720,9 @@ def advisories(config: ReviewersConfig) -> list:
     says what the current setup implies:
     - a single reasoning reviewer has to cover every kind of defect by itself;
     - two reviewers on the same model with the same prompt (and so, at temperature 0, the same
-      answers) only repeat each other."""
+      answers) only repeat each other;
+    - a reviewer with a `promptFile` is not given the built-in reply instructions (the file replaces them), so
+      its replies are only readable when the file describes the format `replyFormat` selects."""
     reasoning = config.active_reviewers("reasoning")
     notes: list = []
     if len(reasoning) == 1:
@@ -578,6 +732,13 @@ def advisories(config: ReviewersConfig) -> list:
             "Small models usually do better on one narrow question at a time: to split the work, add reviewers "
             "on the same model with narrower prompts (reviewers that share a model load it once)."
         )
+    for reviewer in reasoning:
+        if reviewer.prompt_file:
+            notes.append(
+                f"Reviewer {reviewer.name!r} has a 'promptFile', which replaces the built-in reply instructions, so "
+                f"its replies are read as {reviewer.reply_format!r}: the file has to tell the model to reply in that "
+                "format (or name a 'translator' that converts the model's own format into it)."
+            )
     by_key: dict = {}
     for reviewer in reasoning:
         try:
@@ -593,6 +754,28 @@ def advisories(config: ReviewersConfig) -> list:
                 f"Reviewers {', '.join(repr(n) for n in names)} use the same model ({model!r}) and the same prompt, so they "
                 "will raise the same findings: give each its own lens, or drop all but one."
             )
+    for reviewer in config.active_reviewers("verifier"):
+        if reviewer.prompt_file and tuple(reviewer.roles) == ("verifier",):
+            notes.append(
+                f"Reviewer {reviewer.name!r} is a verifier with a 'promptFile', which replaces the built-in verifier instructions, so "
+                "its file has to tell the model how to verify and to reply with the JSON verdict (verdict, failing_input, "
+                "wrong_result, reasoning)"
+                + (" and, because it has 'tools', how to ask for lookups: the server adds no lookup instructions after it." if reviewer.tools
+                   else ".")
+            )
+    for reviewer in config.active_reviewers("reasoning"):
+        if reviewer.prompt_file and reviewer.tools:
+            notes.append(
+                f"Reviewer {reviewer.name!r} has 'tools' and a 'promptFile', so its file has to tell the model how to ask for "
+                "lookups: the server adds no lookup instructions after it."
+            )
+    for reviewer in config.active_reviewers():
+        if reviewer.tools and reviewer.context_length is None:
+            notes.append(
+                f"Reviewer {reviewer.name!r} has 'tools' but no 'contextLength', so its room is the assumed "
+                "8,192 tokens, and the looked-up text may use only a share of that: set 'contextLength' to the length "
+                "its model is loaded with, or lookups will be cut short."
+            )
     return notes
 
 
@@ -607,18 +790,30 @@ def describe_config(config: ReviewersConfig, settings: Optional[ReviewerSettings
         lines.append(f"Reviewers file: {config.path}")
     lines.append(f"Rubric ({len(config.rubric)}):")
     for entry in config.rubric:
-        lines.append(f"  - {entry.name} [{entry.level}, min confidence {entry.score}]")
+        lines.append(f"  - {entry.name} [{entry.level}, min average probability {entry.score:g}]")
     lines.append(f"Reviewers ({len(config.reviewers)}):")
     for r in config.reviewers:
         state = "active" if r.active else "inactive"
         load = "loaded on demand" + (f", context {r.context_length}" if r.context_length else "") if r.load_on_demand else "must already be loaded"
-        lines.append(f"  - {r.name}: {state}, {'/'.join(r.roles)}, model {r.model} ({load}); prompt: {_prompt_source(r)}")
+        extras = ""
+        if "reasoning" in r.roles:
+            if r.reply_format != DEFAULT_REPLY_FORMAT:
+                extras += f"; reply format: {r.reply_format}"
+            if r.translator:
+                extras += f"; translator: {r.translator}"
+        if r.tools:
+            extras += f"; tools: {', '.join(r.tools)} (up to {r.context_share:g} of its room for what they return)"
+        lines.append(f"  - {r.name}: {state}, {'/'.join(r.roles)}, model {r.model} ({load}); prompt: {_prompt_source(r)}{extras}")
     return "\n".join(lines)
 
 
 __all__ = [
     "LEVELS",
     "ROLES",
+    "REPLY_FORMATS",
+    "DEFAULT_REPLY_FORMAT",
+    "KNOWN_TOOLS",
+    "DEFAULT_CONTEXT_SHARE",
     "ConfigError",
     "RubricEntry",
     "Reviewer",
@@ -628,6 +823,7 @@ __all__ = [
     "validate_reviewers",
     "load_reviewers_file",
     "load_prompt",
+    "load_definition",
     "describe_config",
     "advisories",
 ]

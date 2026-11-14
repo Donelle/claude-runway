@@ -3,16 +3,18 @@
 MCP server exposing `remember`/`recall`/`forget` -- durable, cross-session
 knowledge storage independent of the code index -- plus
 `transfer_memories`, which copies a legacy collection's
-in-scope memories into the shared collection, and `copy_memories`, which
+in-scope memories into the shared collection, `copy_memories`, which
 copies another project's memories into the calling project inside that
-shared collection. Where
+shared collection, and `list_memory_banks`, a read-only per-repo breakdown of
+that collection that goes with the follow list
+(`MEMORY_BANK_FOLLOW_REPOS`, below). Where
 `codebase-indexer` remembers what a repo's CODE looks like, this server
 remembers what a project (or, via `general=True`, every project) has
 LEARNED: a cited incident's root cause, a design decision and its rationale,
 a correction a reviewer made -- the kind of thing worth surviving a
 `/compact` or a fresh session, not just a single conversation.
 
-Project minimum: Python 3.12 (policy floor; the dependency chain supports >=3.10).
+Project minimum: Python 3.12.
 
 Setup:
     pip install "mcp[cli]" qdrant-client fastembed pydantic_settings --break-system-packages
@@ -76,6 +78,17 @@ DEFAULT_MEMORY_BANK_COLLECTION = os.environ.get("MEMORY_BANK_COLLECTION", "memor
 # they're independent settings -- nothing enforces they stay identical.
 DEFAULT_MEMORY_BANK_ID = os.environ.get("MEMORY_BANK_ID")
 
+# A comma-separated list of OTHER repos' MEMORY_BANK_IDs this
+# project follows, so its default recall also returns the memories those repos
+# marked `shared`. Read access only: a follower still cannot write under an
+# owner's tag, and forget/wipe_all are unchanged (wipe_all clears only the
+# caller's own memories; forgetting another repo's memory by id still needs
+# confirm=True, followed or not). Read from the environment when the server
+# starts, so a change to .mcp.json applies on the next session or reconnect.
+# Parsed per call (see _follow_config), not here, so a test or a reload sees
+# whatever this constant holds.
+DEFAULT_MEMORY_BANK_FOLLOW_REPOS = os.environ.get("MEMORY_BANK_FOLLOW_REPOS", "")
+
 # This server has no access to Claude Code's own session_id --
 # only hooks get one, via their stdin payload (see
 # mcpservers/compress_mcp_server.py's _attach_savings_metrics docstring for the
@@ -116,6 +129,23 @@ def _next_turn() -> int:
     return next(_turn_counter)
 
 
+def _follow_config() -> tuple:
+    """
+    `(followed, notes)` for this project's `MEMORY_BANK_FOLLOW_REPOS`: the repo
+    IDs to follow, and a note for each entry that was ignored (this project's
+    own ID or `general`, both already in recall's default scope) so the entry is
+    reported, not silently dropped. See `memory_bank_lib.parse_follow_repos`.
+    """
+    followed, ignored = mb.parse_follow_repos(DEFAULT_MEMORY_BANK_FOLLOW_REPOS, DEFAULT_MEMORY_BANK_ID)
+    notes = [
+        f"MEMORY_BANK_FOLLOW_REPOS entry '{entry}' is ignored: "
+        + ("it is the reserved general tag" if entry == mb.GENERAL_REPO else "it is this project's own MEMORY_BANK_ID")
+        + ", which recall already includes."
+        for entry in ignored
+    ]
+    return followed, notes
+
+
 mcp = MCPServer("memory-bank")
 
 
@@ -136,6 +166,7 @@ async def remember(
     kind: str,
     general: bool = False,
     weight: float = mb.DEFAULT_WEIGHT,
+    shared: bool = False,
     ctx: Context = None,  # type: ignore[assignment]
 ) -> str:
     """
@@ -170,6 +201,18 @@ async def remember(
     default-weight one, and an irrelevant memory scores 0 at any weight.
     There is no separate "update weight" tool -- to change it later, `forget` the
     point and `remember` it again.
+    shared: set True ONLY when the user says this memory is relevant to other
+    repos -- e.g. "share this with the related repos," "the repos that follow
+    this one should see it." Default False; don't infer it from the content
+    alone, the same rule as general. It marks the memory as offered to every
+    repo that FOLLOWS this one (their MEMORY_BANK_FOLLOW_REPOS lists this
+    project's MEMORY_BANK_ID); the owner stays this project. It is a relevance
+    filter, NOT access control or privacy: recall(repo=<this project>) and
+    recall(all_repos=True) still return any memory, shared or not, and
+    shared=False does not hide one from other projects. Not valid with
+    general=True (a general memory is already visible to every project). Like
+    weight, it cannot be changed later: `forget` the point and `remember` it
+    again.
     """
     # turn is captured HERE, unconditionally, before any of the fallible
     # steps below (repo resolution, the actual write) -- a
@@ -211,6 +254,12 @@ async def remember(
     # depends on sort implementation detail, not a real ranking).
     if not math.isfinite(weight) or weight < 0:
         return f"Error: weight must be a finite number 0 or greater (got {weight})."
+    # Same boundary, same reason: shared only means something for a memory
+    # owned by one project. A general memory has no owner for anyone to follow
+    # and every project already recalls it, so refuse rather than store a flag
+    # that does nothing.
+    if shared and general:
+        return "Error: shared=True has no effect with general=True (every project already recalls general memories)."
 
     collection = DEFAULT_MEMORY_BANK_COLLECTION
     repo, error = mb.resolve_repo(DEFAULT_MEMORY_BANK_ID, general)
@@ -227,7 +276,7 @@ async def remember(
     point_id, created_at, mismatch = await mb.remember_point(
         client, embedding_provider, collection,
         summary=summary, description=description, kind=kind,
-        repo=repo, embedding_model=DEFAULT_EMBEDDING_MODEL, weight=weight,
+        repo=repo, embedding_model=DEFAULT_EMBEDDING_MODEL, weight=weight, shared=shared,
     )
     if mismatch:
         return mismatch
@@ -250,7 +299,8 @@ async def remember(
             project=DEFAULT_MEMORY_BANK_ID,
             turn=turn,
         )
-    return f"Remembered (id={point_id}, repo='{repo}', kind='{kind}', weight={weight})."
+    shared_note = ", shared=True" if shared else ""
+    return f"Remembered (id={point_id}, repo='{repo}', kind='{kind}', weight={weight}{shared_note})."
 
 
 @mcp.tool()
@@ -272,9 +322,16 @@ async def recall(
     SPECIFIC other project's memories instead (e.g. the user names it
     directly), or all_repos=True to search across every project at once.
     Don't guess a repo name -- only pass one the user actually named, or
-    call list_collections-equivalent context if unsure (there is no
-    discovery tool for repo names here by design: automatic
-    cross-repo discovery was rejected).
+    call list_memory_banks if unsure (it only shows which repo IDs exist in
+    the collection, with counts and no memory text; automatic cross-repo
+    discovery of memories was rejected).
+
+    The default scope also includes memories that the repos this project
+    FOLLOWS (MEMORY_BANK_FOLLOW_REPOS in this project's .mcp.json) marked
+    shared; each hit's `repo` is its owner and `shared` says whether it was
+    offered that way. A `notes` entry in the result reports a followed ID that
+    has no memories at all (likely a typo) or an ignored entry in that list.
+    An explicit repo=/all_repos=True does not use the follow list.
 
     kind narrows further if given. limit caps how many hits come back.
 
@@ -313,6 +370,15 @@ async def recall(
     if limit < 1:
         return f"Error: limit must be 1 or greater (got {limit})."
 
+    # The follow list only widens the DEFAULT scope: an explicit repo= or
+    # all_repos=True already names which repos to read. With no list set,
+    # `followed` is empty and `notes` stays empty, so nothing below changes
+    # from what recall did before the follow list existed.
+    followed: list = []
+    notes: list = []
+    if not (repo or all_repos):
+        followed, notes = _follow_config()
+
     client = QdrantClient(url=DEFAULT_QDRANT_URL, api_key=DEFAULT_QDRANT_API_KEY)
 
     if not call_with_retry(client.collection_exists, collection):
@@ -343,8 +409,21 @@ async def recall(
     results = await mb.recall_points(
         client, embedding_provider, collection, query,
         caller_repo=caller_repo or "", repo=repo, all_repos=all_repos, kind=kind, limit=limit,
+        followed=followed,
     )
+    if followed:
+        # A followed ID with no memories at all is almost certainly a typo (a
+        # repo that exists but shares nothing is fine and not reported).
+        # Checked after the search, and only for a non-empty follow list, so a
+        # project that follows nobody pays nothing.
+        for missing in mb.repos_without_memories(client, collection, followed):
+            notes.append(
+                f"Followed repo '{missing}' (MEMORY_BANK_FOLLOW_REPOS) has no memories in this "
+                f"collection; check the spelling. list_memory_banks shows which repo IDs exist."
+            )
     if not results:
+        if notes:
+            return f"No memories found for '{query}'.\n" + "\n".join(notes)
         return f"No memories found for '{query}'."
 
     if tracking:
@@ -375,7 +454,10 @@ async def recall(
     # given, so this isn't a per-field patch job -- the whole class of
     # "what if this text contains a delimiter" bugs doesn't apply to a
     # properly-serialized format.
-    return json.dumps({"query": query, "results": results}, indent=2)
+    payload: dict = {"query": query, "results": results}
+    if notes:
+        payload["notes"] = notes
+    return json.dumps(payload, indent=2)
 
 
 @mcp.tool()
@@ -598,6 +680,39 @@ async def copy_memories(
     # fine, but this keeps any other odd id type from failing the whole report
     # at serialization time.
     return json.dumps(report, indent=2, default=str)
+
+
+@mcp.tool()
+def list_memory_banks() -> str:
+    """
+    Read-only breakdown of the shared memory-bank collection THIS server is
+    configured for (MEMORY_BANK_COLLECTION): which repos have written memories,
+    how many each, and whether following one would add anything. Returns the
+    collection name, then one row per repo:
+
+        <collection name>
+          * <repo id>, <number of entries>, sharable: yes (<n> shared) | no
+
+    "sharable: yes" means the repo has at least one memory marked shared, which
+    is exactly what a repo that follows it would receive in its default recall.
+    The reserved general tag is not a repo row (every project already receives
+    it); it appears on its own last line when there are general memories.
+    Memories still being written (pending) are not counted, as in recall.
+
+    Returns ids and counts only: no memory text, summaries or descriptions. To
+    look inside a repo before following it, call recall(repo=<id>, query=...).
+    Following is set in this project's .mcp.json (MEMORY_BANK_FOLLOW_REPOS, or
+    `setup_project.py init --memory-bank-follow`), not by a tool, and takes
+    effect when the memory-bank server next starts.
+
+    Only this one collection is listed: a follow list can only work within the
+    collection recall reads, so other memory-bank collections would show repos
+    that can never be followed here (codebase-indexer's list_collections shows
+    what other collections exist).
+    """
+    collection = DEFAULT_MEMORY_BANK_COLLECTION
+    client = QdrantClient(url=DEFAULT_QDRANT_URL, api_key=DEFAULT_QDRANT_API_KEY)
+    return mb.format_memory_banks(collection, mb.summarize_repos(client, collection))
 
 
 if __name__ == "__main__":

@@ -68,7 +68,7 @@ class SanitizeProjectCollectionName(unittest.TestCase):
     def test_deterministic_across_calls(self):
         # compact_store and compact_find each call _sanitize_project
         # independently and must agree on the same collection name for the
-        # same project, or /my-resume would never find what /my-compact
+        # same project, or /cr-resume would never find what /cr-compact
         # just stored.
         mod = _load_qdrant_mcp_server()
         first = mod._sanitize_project("Acme.Support.TicketsApi")
@@ -89,7 +89,7 @@ class SanitizeProjectCollectionName(unittest.TestCase):
     def test_casing_variants_collapse_to_the_same_collection(self):
         # Regression coverage: casing variants of the exact
         # same project string must sanitize IDENTICALLY, or a casing drift
-        # between /my-compact and /my-resume points at a nonexistent
+        # between /cr-compact and /cr-resume points at a nonexistent
         # collection.
         mod = _load_qdrant_mcp_server()
         variants = ["MyProject", "myproject", "MYPROJECT", "mYpRoJeCt"]
@@ -270,7 +270,7 @@ class CompactStoreIsIdempotent(unittest.TestCase):
             date="2026-08-27",
         ))
         # Same three identity fields, simulating an external retry --
-        # /my-compact's own SKILL.md only calls this once per run, so this
+        # /cr-compact's own SKILL.md only calls this once per run, so this
         # models a transport-level retry from outside it, not a code bug in
         # the skill itself.
         _run(mod.compact_store(
@@ -382,7 +382,7 @@ class CompactStoreServerSideLabelDerivation(unittest.TestCase):
 
     def test_unstructured_info_with_blank_label_uses_unlabeled_fallback(self):
         """When derive_compact_label returns '' (no parseable content), the
-        server falls back to '(unlabeled)' so the /my-resume picker always
+        server falls back to '(unlabeled)' so the /cr-resume picker always
         shows something."""
         mod, client_cls = self._patched_module()
         _run(mod.compact_store(
@@ -407,7 +407,7 @@ class CompactStoreServerSideLabelDerivation(unittest.TestCase):
 
 class CompactFindSurfacesPointId(unittest.TestCase):
     """Regression coverage for the second gap: compact_find's
-    output must include enough of each point's own id for /my-resume's
+    output must include enough of each point's own id for /cr-resume's
     selection UI to disambiguate entries that otherwise render identically
     (same date and label)."""
 
@@ -444,7 +444,7 @@ class CompactFindIsCaseInsensitiveToProject(unittest.TestCase):
     """Regression coverage: compact_find must find a compact
     stored under a differently-cased project string -- casing is the one
     kind of project-name drift the fix closes directly (rather than via
-    the sibling-candidate fallback), since /my-compact and /my-resume can
+    the sibling-candidate fallback), since /cr-compact and /cr-resume can
     legitimately see the working directory name with different casing
     (different shell, different mount, etc.)."""
 
@@ -604,7 +604,7 @@ class CollectionsForProjectFindsEveryCasingVariant(unittest.TestCase):
         )
         client_cls().upsert(collection_name=legacy_name, points=[point])
 
-        # A NEW /my-compact call, in a different casing, must land in the
+        # A NEW /cr-compact call, in a different casing, must land in the
         # EXISTING legacy-named collection rather than creating a fresh
         # canonical one alongside it.
         _run(mod.compact_store(information="new content", project="myproject", label="l2", date="2026-08-27"))
@@ -650,8 +650,8 @@ class CollectionsForProjectFindsEveryCasingVariant(unittest.TestCase):
         _run(mod.compact_store(information="first", project="MyProject", label="l1", date="2026-08-20"))
         _run(mod.compact_store(information="second", project="myproject", label="l2", date="2026-08-27"))
 
-        # Both /my-compact calls' entries must be visible regardless of
-        # which casing /my-resume happens to query with.
+        # Both /cr-compact calls' entries must be visible regardless of
+        # which casing /cr-resume happens to query with.
         result_upper = _run(mod.compact_find(project="MyProject"))
         self.assertIn("first", result_upper)
         self.assertIn("second", result_upper)
@@ -1667,7 +1667,7 @@ COMPRESSED = "[compressed 3000 -> 1200 chars across 1 chunk(s), ~60% smaller]\n\
 
 
 class CompactStoreCompressesBeforeStoring(unittest.TestCase):
-    """compact_store now compresses the summary itself (the /my-compact skill
+    """compact_store now compresses the summary itself (the /cr-compact skill
     used to do that in a separate compress_text call), falling back to storing
     it as given when compression cannot happen."""
 

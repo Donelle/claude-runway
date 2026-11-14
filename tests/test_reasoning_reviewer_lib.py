@@ -28,6 +28,8 @@ from fake_lmstudio import FakeLmStudio  # noqa: E402
 from lmstudio_model_loader_lib import ModelLoader, ModelNotLoadedError  # noqa: E402
 from reasoning_reviewer_lib import (  # noqa: E402
     GAP_MARKER,
+    OUTPUT_FORMAT,
+    OUTPUT_FORMAT_LINES,
     MAX_CHUNKS,
     MAX_READ_BYTES,
     MIN_CHUNK_CHARS,
@@ -45,8 +47,7 @@ from reasoning_reviewer_lib import (  # noqa: E402
     collect_findings,
     format_review,
     instruction_files_for,
-    parse_findings,
-    review_skills,
+    parse_findings as _parse_findings,
     run_reasoning_review,
     split_diff,
 )
@@ -54,8 +55,14 @@ from reasoning_reviewer_lib import (  # noqa: E402
 BASE = "http://localhost:1234/v1"
 
 
+def parse_findings(text, reviewer, default_file="", reply_format="json"):
+    """`parse_findings` read as JSON unless a test says otherwise: the library's default is `lines`, and the
+    tests written for the JSON reader keep testing it."""
+    return _parse_findings(text, reviewer, default_file, reply_format)
+
+
 def rv(name="quoting", model="model-a", roles=("reasoning",), *, prompt="look at quoting", prompt_file="",
-       active=True, on_demand=False, context=None) -> Reviewer:
+       active=True, on_demand=False, context=None, reply_format="json", translator="") -> Reviewer:
     return Reviewer(
         name=name,
         model=model,
@@ -65,6 +72,8 @@ def rv(name="quoting", model="model-a", roles=("reasoning",), *, prompt="look at
         load_on_demand=on_demand,
         context_length=context,
         prompt_file=prompt_file,
+        reply_format=reply_format,
+        translator=translator,
     )
 
 
@@ -334,30 +343,14 @@ class InstructionFiles(unittest.TestCase):
         self.assertLess(len(text), 21_000)
         self.assertTrue(text.endswith("[truncated]"))
 
-    def test_review_skills_are_found_by_directory_or_front_matter_name(self):
-        for base in (".claude/skills", "skills"):
-            (self.root / base).mkdir(parents=True)
-        (self.root / ".claude/skills/code-review").mkdir()
-        (self.root / ".claude/skills/code-review/SKILL.md").write_text("---\nname: x\n---\nReview steps", encoding="utf-8")
-        (self.root / "skills/audit").mkdir()
-        (self.root / "skills/audit/SKILL.md").write_text("---\nname: PR Review helper\n---\nAudit steps", encoding="utf-8")
-        (self.root / "skills/deploy").mkdir()
-        (self.root / "skills/deploy/SKILL.md").write_text("---\nname: deploy\n---\nDeploy steps", encoding="utf-8")
-        found = review_skills(self.root)
-        self.assertEqual(
-            sorted(found),
-            [(".claude/skills/code-review/SKILL.md", "Review steps"), ("skills/audit/SKILL.md", "Audit steps")],
-        )
-
 
 class PromptAssembly(unittest.TestCase):
     def test_the_prompt_has_the_lens_then_the_rules_then_the_output_format(self):
         prompt = build_system_prompt(
             rv(prompt="Look at quoting"),
             instructions=[(".github/instructions/py.instructions.md", "Only flag disasters")],
-            skills=[("skills/review/SKILL.md", "Review steps")],
         )
-        order = [prompt.index(x) for x in ("Look at quoting", "Only flag disasters", "Review steps", '"findings"')]
+        order = [prompt.index(x) for x in ("Look at quoting", "Only flag disasters", '"findings"')]
         self.assertEqual(order, sorted(order))
         self.assertIn(".github/instructions/py.instructions.md", prompt)
 
@@ -365,6 +358,12 @@ class PromptAssembly(unittest.TestCase):
         prompt = build_system_prompt(rv())
         self.assertLess(prompt.index("NEW version"), prompt.index('"findings"'))
         self.assertIn("never report on them", prompt)
+
+    def test_the_output_format_asks_for_a_quote_copied_from_the_file(self):
+        prompt = build_system_prompt(rv())
+        self.assertIn('"quote"', prompt)
+        self.assertIn("copied character for character", prompt)
+        self.assertIn("is thrown away", prompt)
 
     def test_prompt_and_prompt_file_are_merged_with_the_text_first(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -446,6 +445,17 @@ class ParseFindings(unittest.TestCase):
 
     def test_an_empty_findings_list_is_no_findings_and_no_problem(self):
         self.assertEqual(parse_findings('{"findings": []}', "q"), ([], []))
+
+    def test_the_quote_is_read_and_stripped(self):
+        found, problems = parse_findings(reply({**finding(), "quote": "  except:  \n"}), "q")
+        self.assertEqual((found[0].quote, problems), ("except:", []))
+
+    def test_a_missing_or_non_text_quote_is_empty_and_not_a_problem_here(self):
+        # The verifier stage's grounding step is what treats a missing quote as ungrounded; parsing stays tolerant.
+        for item in (finding(), {**finding(), "quote": None}, {**finding(), "quote": 7}, {**finding(), "quote": ["x"]}):
+            with self.subTest(item=item):
+                found, problems = parse_findings(reply(item), "q")
+                self.assertEqual((found[0].quote, problems), ("", []))
 
 
 def f(reviewer, file="a.py", start=3, end=3, cls="quoting", claim="a claim", failing="x"):
@@ -529,6 +539,58 @@ class CollectFindings(unittest.TestCase):
         self.assertIn("also, at 11 [two]: lost update", text)
         self.assertIn("failing input: b", text)
 
+    def test_the_opening_line_says_what_the_later_stages_did_to_the_findings(self):
+        review = ReasoningReview(groups=collect_findings([f("one")]), reviewers_run=["one"])
+        plain = format_review(review)
+        self.assertIn("NOT verified and NOT classified: no verifier or classifier stage ran", plain)
+        self.assertEqual(format_review(review, followed_by=()), plain)
+        both = format_review(review, followed_by=("verifier", "classifier"))
+        self.assertIn("before verification and classification", both)
+        self.assertNotIn("NOT", both.splitlines()[1])
+        self.assertNotIn("no verifier or classifier stage ran", both)
+        only_verifier = format_review(review, followed_by=("verifier",)).splitlines()[1]
+        self.assertIn("before verification", only_verifier)
+        self.assertIn("NOT classified: no classifier stage ran", only_verifier)
+        only_classifier = format_review(review, followed_by=("classifier",)).splitlines()[1]
+        self.assertIn("before classification", only_classifier)
+        self.assertIn("NOT verified: no verifier stage ran", only_classifier)
+
+    def test_a_merged_finding_takes_a_quote_the_first_lacked_and_the_shorter_of_two_that_hold_each_other(self):
+        def quoted(reviewer, quote, claim="same"):
+            return Finding("a.py", 3, 3, "quoting", claim, "x", (reviewer,), quote=quote)
+
+        self.assertEqual(collect_findings([quoted("one", ""), quoted("two", "run(cmd)")])[0].findings[0].quote, "run(cmd)")
+        self.assertEqual(collect_findings([quoted("one", "run(cmd)"), quoted("two", "")])[0].findings[0].quote, "run(cmd)")
+        for first, second in (("return  total / n", "total / n"), ("total / n", "return total / n")):
+            with self.subTest(first=first, second=second):
+                merged = collect_findings([quoted("one", first), quoted("two", second)])[0].findings[0]
+                self.assertEqual((merged.quote, merged.alternates, merged.reviewers), ("total / n", (), ("one", "two")))
+        # A quote too short for grounding to place (`[]`) never wins over one that is long enough.
+        for first, second in (("def clean(items=[]):", "[]"), ("[]", "def clean(items=[]):")):
+            with self.subTest(first=first, second=second):
+                merged = collect_findings([quoted("one", first), quoted("two", second)])[0].findings[0]
+                self.assertEqual((merged.quote, merged.alternates), ("def clean(items=[]):", ()))
+        self.assertEqual(collect_findings([quoted("one", "[]"), quoted("two", "{}")])[0].findings[0].alternates[0].quote, "{}")
+
+    def test_the_same_claim_quoting_different_code_keeps_each_quote_as_an_alternate(self):
+        # Merging to the first quote would lose the second whenever the first is not in the file, and the
+        # grounding step would then drop a finding whose second quote was perfectly good.
+        merged = collect_findings([
+            Finding("a.py", 3, 3, "math", "divides by zero", "[]", ("one",), quote="total / len(xs)  # a comment"),
+            Finding("a.py", 3, 3, "math", "Divides by zero.", "[]", ("two",), quote="return total / len(xs)"),
+        ])[0].findings[0]
+        self.assertEqual((merged.claim, merged.quote, merged.reviewers), ("divides by zero", "total / len(xs)  # a comment", ("one",)))
+        self.assertEqual([(a.claim, a.quote, a.reviewers) for a in merged.alternates],
+                         [("Divides by zero.", "return total / len(xs)", ("two",))])
+
+    def test_an_alternate_keeps_its_own_quote(self):
+        merged = collect_findings([
+            Finding("a.py", 3, 5, "state", "A", "x", ("one",), quote="line a"),
+            Finding("a.py", 4, 6, "state", "B", "y", ("two",), quote="line b"),
+        ])[0].findings[0]
+        self.assertEqual((merged.claim, merged.quote), ("A", "line a"))
+        self.assertEqual([(a.claim, a.quote) for a in merged.alternates], [("B", "line b")])
+
     def test_the_same_reviewer_is_listed_once(self):
         merged = collect_findings([f("one"), f("one")])[0].findings[0]
         self.assertEqual(merged.reviewers, ("one",))
@@ -551,7 +613,7 @@ class CollectFindings(unittest.TestCase):
 
 
 class RulesFilesAreNotAWayOutOfTheRepository(unittest.TestCase):
-    """Instruction files and review skills are found automatically in a repository someone else controls."""
+    """Instruction files are found automatically in a repository someone else controls."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -560,16 +622,12 @@ class RulesFilesAreNotAWayOutOfTheRepository(unittest.TestCase):
         self.root = self.base / "repo"
         (self.root / ".github" / "instructions").mkdir(parents=True)
         self.outside = self.base / "private.txt"
-        self.outside.write_text("SECRET-TOKEN-12345\n", encoding="utf-8")
+        # newline="\n": _read_text returns the bytes as they are, and write_text would store CRLF on Windows.
+        self.outside.write_text("SECRET-TOKEN-12345\n", encoding="utf-8", newline="\n")
 
     def test_an_instruction_file_that_links_outside_the_repository_is_refused(self):
         (self.root / ".github" / "instructions" / "leak.instructions.md").symlink_to(self.outside)
         self.assertEqual(instruction_files_for(self.root, ["a.py"]), [])
-
-    def test_a_review_skill_that_links_outside_the_repository_is_refused(self):
-        (self.root / "skills" / "code-review").mkdir(parents=True)
-        (self.root / "skills" / "code-review" / "SKILL.md").symlink_to(self.outside)
-        self.assertEqual(review_skills(self.root), [])
 
     def test_a_symlinked_directory_that_leads_outside_is_refused(self):
         elsewhere = self.base / "elsewhere"
@@ -582,11 +640,7 @@ class RulesFilesAreNotAWayOutOfTheRepository(unittest.TestCase):
     def test_a_self_linked_file_or_directory_is_skipped_not_fatal(self):
         # Before Python 3.13, Path.resolve() raises RuntimeError (not OSError) for a symlink loop.
         (self.root / ".github" / "instructions" / "loop.instructions.md").symlink_to("loop.instructions.md")
-        (self.root / "skills" / "code-review").mkdir(parents=True)
-        (self.root / "skills" / "code-review" / "SKILL.md").symlink_to("SKILL.md")
-        (self.root / "skills" / "loopdir-review").symlink_to("loopdir-review")
         self.assertEqual(instruction_files_for(self.root, ["a.py"]), [])
-        self.assertEqual(review_skills(self.root), [])
 
     def test_a_loop_alongside_a_good_file_does_not_hide_the_good_file(self):
         (self.root / ".github" / "instructions" / "a-loop.instructions.md").symlink_to("a-loop.instructions.md")
@@ -631,9 +685,6 @@ class RulesFilesAreNotAWayOutOfTheRepository(unittest.TestCase):
         self._git("init", "-q", "-b", "main")
         (self.root / ".github" / "instructions" / "cfg.instructions.md").symlink_to("../../.git/config")
         self.assertEqual(instruction_files_for(self.root, ["a.py"]), [])
-        (self.root / "skills" / "code-review").mkdir(parents=True)
-        (self.root / "skills" / "code-review" / "SKILL.md").symlink_to("../../.git/HEAD")
-        self.assertEqual(review_skills(self.root), [])
 
     def test_an_untracked_link_target_is_refused_even_when_it_is_ordinary_text(self):
         self._git("init", "-q", "-b", "main")
@@ -732,12 +783,16 @@ class GitPathQuoting(unittest.TestCase):
             git("add", ".")
             git("commit", "-q", "-m", "base")
             git("checkout", "-q", "-b", "feature")
-            for name in ("café.py", 'we"ird.py', "plain.py"):
+            # A double quote is the name git quotes by escaping it, but Windows cannot hold it in a file
+            # name (every other character git quotes is invalid there too), so there the check is
+            # the non-ASCII name alone.
+            names = ["café.py", "plain.py"] if sys.platform == "win32" else ["café.py", 'we"ird.py', "plain.py"]
+            for name in names:
                 (repo / name).write_text("print(1)\n", encoding="utf-8")
             git("add", "-A")
             git("commit", "-q", "-m", "change")
             paths = [section.path for section in split_diff(git("diff", "main...feature"))]
-        self.assertEqual(paths, ["café.py", "plain.py", 'we"ird.py'])
+        self.assertEqual(paths, sorted(names))
         self.assertTrue(applies_to("**/*.py", paths))
 
 
@@ -790,6 +845,17 @@ class RunReasoningReview(unittest.TestCase):
         text = format_review(result)
         self.assertIn("seen by one", text)
         self.assertIn("NOT verified", text)
+
+    def test_a_review_named_skill_in_the_repository_never_reaches_a_prompt(self):
+        # Skills are written for an agent, not as review rules, so nothing reads them into a reviewer's prompt.
+        for base in (".claude/skills/code-review", "skills/pr-review-helper"):
+            (self.root / base).mkdir(parents=True)
+            (self.root / base / "SKILL.md").write_text("---\nname: a review skill\n---\nSKILL-BODY-MARKER", encoding="utf-8")
+        _, stub, _ = self._run(cfg(rv("one", "model-a")), lambda *a: reply())
+        self.assertTrue(stub.calls)
+        for _model, system, _content in stub.calls:
+            self.assertNotIn("SKILL-BODY-MARKER", system)
+            self.assertIn("Only flag disasters", system)  # the path-scoped instruction file still applies
 
     def test_only_active_reasoning_reviewers_run(self):
         config = cfg(
@@ -993,6 +1059,278 @@ class ReasoningModelReplies(unittest.TestCase):
 
     def test_a_reply_without_thinking_is_unchanged(self):
         self.assertEqual(len(parse_findings(self.ANSWER, "q")[0]), 1)
+
+
+def block(file="a.py", lines="3-3", cls="quoting", claim="a claim", quote="x = 1", failing="x y") -> str:
+    return (f"FINDING\nfile: {file}\nlines: {lines}\nclass: {cls}\nclaim: {claim}\nquote: {quote}\n"
+            f"failing_input: {failing}\nEND")
+
+
+def lines_of(text):
+    return _parse_findings(text, "q", "", "lines")
+
+
+class LinesReplyFormat(unittest.TestCase):
+    """The plain-lines reply: `key: value` lines in FINDING ... END blocks, or the word NONE."""
+
+    def test_one_block_is_one_finding_with_every_field(self):
+        found, problems = lines_of(block(file="app.py", lines="4-6", cls="Shell Quoting", claim="runs it in a shell"))
+        self.assertEqual(problems, [])
+        self.assertEqual(len(found), 1)
+        f = found[0]
+        self.assertEqual((f.file, f.line_start, f.line_end, f.cls), ("app.py", 4, 6, "shell-quoting"))
+        self.assertEqual((f.claim, f.quote, f.failing_input, f.reviewers), ("runs it in a shell", "x = 1", "x y", ("q",)))
+
+    def test_the_quote_that_broke_json_is_read_back_unchanged(self):
+        # Double quotes, a backslash and a string join: what small models failed to escape inside a JSON string.
+        for quote in (
+            'subprocess.run("tar czf " + name + ".tgz data", shell=True)',
+            'pattern = re.compile("\\d+\\.\\d")',
+            'if "/" in name or name.startswith("-"):',
+            "msg = 'it\\'s ' + \"a \\\"mix\\\"\"",
+        ):
+            with self.subTest(quote=quote):
+                found, problems = lines_of(block(quote=quote))
+                self.assertEqual(problems, [])
+                self.assertEqual(found[0].quote, quote)
+
+    def test_a_value_that_starts_with_punctuation_and_holds_a_colon_is_kept_whole(self):
+        # `\\W*` after the key used to be greedy and backtrack to the LAST colon, so `"/": 0,` became `0,`.
+        for value in ('"/": 0,', "':'", '"a": "b"', "{'k': 1}", '*ptr = 1', '**kwargs: int', "-1: x"):
+            with self.subTest(value=value):
+                found, problems = lines_of(block(quote=value, failing=value))
+                self.assertEqual(problems, [])
+                self.assertEqual((found[0].quote, found[0].failing_input), (value, value))
+
+    def test_markdown_bold_around_the_key_still_reads_after_the_lazy_match(self):
+        found, _ = lines_of("FINDING\n**file:** a.py\n**lines**: 3\n**claim:** c\n**quote:** `x = 1`\nEND")
+        self.assertEqual((found[0].file, found[0].line_start, found[0].claim, found[0].quote), ("a.py", 3, "c", "`x = 1`"))
+
+    def test_a_value_side_marker_is_stripped_only_when_the_keys_bold_is_still_open(self):
+        for line, quote in (
+            ("**quote**: **kwargs, d", "**kwargs, d"),  # bold closed before the colon: `**` is the code's
+            ("**quote:** **kwargs, d", "**kwargs, d"),  # bold closed after the colon: only that marker goes
+            ("**quote:** x = 1", "x = 1"),
+            ("**quote**: x = 1", "x = 1"),
+            ("__quote__: __init__(self)", "__init__(self)"),
+            ("__quote:__ __init__(self)", "__init__(self)"),
+            ("quote: **kwargs", "**kwargs"),
+        ):
+            with self.subTest(line=line):
+                found, problems = lines_of(f"FINDING\nfile: a.py\nlines: 1\nclaim: c\n{line}\nEND")
+                self.assertEqual(problems, [])
+                self.assertEqual(found[0].quote, quote)
+
+    def test_a_value_with_a_colon_in_it_keeps_the_colon(self):
+        found, _ = lines_of(block(quote="if x:", failing="key: value"))
+        self.assertEqual((found[0].quote, found[0].failing_input), ("if x:", "key: value"))
+
+    def test_several_blocks_are_several_findings(self):
+        found, problems = lines_of(block(claim="first") + "\n\n" + block(claim="second", lines="9"))
+        self.assertEqual([f.claim for f in found], ["first", "second"])
+        self.assertEqual((found[1].line_start, found[1].line_end), (9, 9))
+        self.assertEqual(problems, [])
+
+    def test_none_is_no_findings_and_no_problem(self):
+        for text in ("NONE", "none", "  None.\n", "```\nNONE\n```"):
+            with self.subTest(text=text):
+                self.assertEqual(lines_of(text), ([], []))
+
+    def test_prose_with_no_block_is_one_problem(self):
+        found, problems = lines_of("I could not find anything wrong.")
+        self.assertEqual(found, [])
+        self.assertEqual(len(problems), 1)
+        self.assertIn("no FINDING blocks", problems[0])
+        self.assertNotIn("JSON", problems[0])
+
+    def test_a_code_fence_and_a_leading_think_envelope_are_tolerated(self):
+        for text in ("```\n" + block() + "\n```", "```text\n" + block() + "\n```",
+                     "<think>FINDING\nclaim: not this\n</think>\n" + block(claim="this one")):
+            with self.subTest(text=text[:30]):
+                found, _ = lines_of(text)
+                self.assertEqual(len(found), 1)
+        self.assertEqual(lines_of("<think>FINDING\nclaim: not this\n</think>\n" + block(claim="this one"))[0][0].claim, "this one")
+
+    def test_an_envelope_that_never_closes_is_no_answer(self):
+        self.assertEqual(len(lines_of("<think>FINDING\nclaim: half way")[1]), 1)
+
+    def test_keys_are_case_insensitive_and_ignore_leading_punctuation(self):
+        text = "FINDING\n**File:** a.py\n- Lines: 7\n* CLASS: quoting\n**claim**: bold claim\n> quote: x = 1\nFailing_Input: z\nEND"
+        found, problems = lines_of(text)
+        self.assertEqual(problems, [])
+        self.assertEqual((found[0].file, found[0].line_start, found[0].cls, found[0].claim, found[0].quote, found[0].failing_input),
+                         ("a.py", 7, "quoting", "bold claim", "x = 1", "z"))
+
+    def test_a_value_continues_on_the_following_lines(self):
+        found, _ = lines_of("FINDING\nfile: a.py\nlines: 2\nclaim: it breaks\n  when the list is empty\nquote: x = 1\nEND")
+        self.assertEqual(found[0].claim, "it breaks when the list is empty")
+
+    def test_a_field_with_no_finding_line_starts_a_block_and_a_repeated_one_starts_the_next(self):
+        text = "file: a.py\nlines: 2\nclaim: one\nfile: b.py\nlines: 5\nclaim: two"
+        found, _ = lines_of(text)
+        self.assertEqual([(f.file, f.line_start, f.claim) for f in found], [("a.py", 2, "one"), ("b.py", 5, "two")])
+
+    def test_lines_takes_the_first_and_last_integers_and_tolerates_prose(self):
+        for span, expected in (("6-8", (6, 8)), ("6", (6, 6)), ("lines 6 to 8", (6, 8)), ("12-12", (12, 12)), ("", (0, 0)), ("n/a", (0, 0))):
+            with self.subTest(span=span):
+                found, _ = lines_of(block(lines=span))
+                self.assertEqual((found[0].line_start, found[0].line_end), expected)
+
+    def test_a_line_key_is_read_like_lines(self):
+        found, _ = lines_of("FINDING\nfile: a.py\nline: 4\nclaim: c\nEND")
+        self.assertEqual((found[0].line_start, found[0].line_end), (4, 4))
+
+    def test_a_block_with_no_claim_is_skipped_with_a_problem_and_the_rest_kept(self):
+        found, problems = lines_of("FINDING\nfile: a.py\nlines: 1\nEND\n" + block(claim="kept"))
+        self.assertEqual([f.claim for f in found], ["kept"])
+        self.assertEqual(len(problems), 1)
+        self.assertIn("finding 0 skipped (no 'claim')", problems[0])
+
+    def test_a_missing_file_falls_back_to_the_chunks_file(self):
+        found, _ = _parse_findings("FINDING\nlines: 2\nclaim: c\nEND", "q", "from-chunk.py", "lines")
+        self.assertEqual(found[0].file, "from-chunk.py")
+
+    def test_the_default_format_is_lines_and_json_is_a_choice(self):
+        self.assertEqual(len(_parse_findings(block(), "q")[0]), 1)
+        self.assertEqual(_parse_findings(reply(finding()), "q")[0], [])  # JSON read as lines: no blocks
+        self.assertEqual(len(_parse_findings(reply(finding()), "q", "", "json")[0]), 1)
+
+    def test_the_worked_example_in_the_prompt_file_is_a_reply_the_reader_takes(self):
+        text = (REPO_ROOT / "harness" / "prompts" / "reasoning-lines-example.md").read_text(encoding="utf-8")
+        example = text[text.index("FINDING", text.index("Example of a complete reply")):]
+        found, problems = lines_of(example)
+        self.assertEqual(problems, [])
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].quote, 'f = open(path, "w")')
+
+
+class ReplyInstructionsInThePrompt(unittest.TestCase):
+    def test_a_reviewer_with_no_format_set_is_asked_for_lines(self):
+        reviewer = Reviewer("r", "m", "p", True, ("reasoning",), False)
+        self.assertEqual(reviewer.reply_format, "lines")
+        prompt = build_system_prompt(reviewer)
+        self.assertTrue(prompt.endswith(OUTPUT_FORMAT_LINES))
+        self.assertNotIn(OUTPUT_FORMAT, prompt)
+
+    def test_json_is_asked_for_only_when_chosen(self):
+        prompt = build_system_prompt(rv(reply_format="json"))
+        self.assertTrue(prompt.endswith(OUTPUT_FORMAT))
+        self.assertNotIn(OUTPUT_FORMAT_LINES, prompt)
+
+    def test_the_lines_instructions_name_the_fields_the_reader_looks_for(self):
+        for word in ("FINDING", "END", "NONE", "file:", "lines:", "class:", "claim:", "quote:", "failing_input:", "no escaping"):
+            self.assertIn(word, OUTPUT_FORMAT_LINES)
+
+    def test_a_prompt_file_replaces_the_built_in_reply_instructions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "lens.md"
+            path.write_text("The lens, and reply in my own way.\n", encoding="utf-8")
+            for fmt in ("lines", "json"):
+                with self.subTest(fmt=fmt):
+                    prompt = build_system_prompt(rv(prompt="Inline", prompt_file=str(path), reply_format=fmt),
+                                                 instructions=[("r.md", "A repo rule")])
+                    self.assertNotIn(OUTPUT_FORMAT_LINES, prompt)
+                    self.assertNotIn(OUTPUT_FORMAT, prompt)
+                    # The inline text still merges with the file, and the rules and the input description stay.
+                    self.assertIn("Inline\n\nThe lens, and reply in my own way.", prompt)
+                    self.assertIn("A repo rule", prompt)
+                    self.assertIn("NEW version", prompt)
+
+    def test_the_shipped_prompt_files_load_and_the_lines_one_matches_the_built_in_text(self):
+        folder = REPO_ROOT / "harness" / "prompts"
+        files = sorted(p for p in folder.glob("*.md") if p.name != "README.md")
+        self.assertTrue(files)
+        for path in files:
+            with self.subTest(path=path.name):
+                prompt = build_system_prompt(rv(prompt="", prompt_file=str(path)))
+                self.assertIn(OUTPUT_FORMAT_LINES, prompt)
+                self.assertIn("NEW version", prompt)
+
+
+class LinesAndTranslatorEndToEnd(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.diff = file_diff("a.py", [["+one"]])
+
+    def _run(self, config, replies, **kw):
+        stub = StubComplete(replies)
+        result = run_reasoning_review(
+            config, ModelLoader(BASE, http=FakeLmStudio(loaded=("model-a", "model-b"))), object(), self.diff, self.root, 3,
+            complete=stub, **kw
+        )
+        return result, stub
+
+    def test_a_lines_reviewer_and_a_json_reviewer_merge_into_one_grouped_review(self):
+        config = cfg(rv("lines", "model-a", reply_format="lines"), rv("json", "model-b", reply_format="json"))
+
+        def replies(model, system, content):
+            if model == "model-a":
+                return block(file="a.py", lines="1", claim="seen by lines", quote='run("a" + b)')
+            return reply(finding(file="a.py", start=1, end=1, claim="seen by json"))
+
+        result, stub = self._run(config, replies)
+        self.assertEqual(result.errors, [])
+        self.assertEqual(result.finding_count, 1)  # same file, class and line: one finding with two claims
+        merged = result.groups[0].findings[0]
+        seen_by = set(merged.reviewers) | {r for alt in merged.alternates for r in alt.reviewers}
+        self.assertEqual(seen_by, {"lines", "json"})
+        by_model = {model: system for model, system, _ in stub.calls}
+        self.assertTrue(by_model["model-a"].endswith(OUTPUT_FORMAT_LINES))
+        self.assertTrue(by_model["model-b"].endswith(OUTPUT_FORMAT))
+
+    def test_a_json_reply_to_a_lines_reviewer_is_a_problem_naming_the_blocks(self):
+        result, _ = self._run(cfg(rv(reply_format="lines")), lambda *a: reply(finding()))
+        self.assertEqual(result.finding_count, 0)
+        self.assertTrue(any("no FINDING blocks" in e for e in result.errors), result.errors)
+
+    def _translator(self, body):
+        path = self.root / "tr.py"
+        path.write_text(body, encoding="utf-8")
+        return str(path)
+
+    def test_a_translator_turns_the_models_own_format_into_the_one_the_reader_takes(self):
+        # The model answers "path:line:claim" lines; the translator makes them FINDING blocks.
+        translator = self._translator(
+            "import sys\n"
+            "for raw in sys.stdin.read().splitlines():\n"
+            "    path, line, claim = raw.split(':', 2)\n"
+            "    print(f'FINDING\\nfile: {path}\\nlines: {line}\\nclaim: {claim}\\nEND')\n"
+        )
+        config = cfg(rv(translator=translator, reply_format="lines"))
+        result, _ = self._run(config, lambda *a: "a.py:1:it breaks\na.py:4:it breaks again")
+        self.assertEqual(result.errors, [])
+        self.assertEqual(sorted(f.claim for g in result.groups for f in g.findings), ["it breaks", "it breaks again"])
+
+    def test_a_translator_can_produce_json_for_a_json_reviewer(self):
+        translator = self._translator(
+            "import json, sys\n"
+            "sys.stdin.read()\n"
+            "print(json.dumps({'findings': [{'file': 'a.py', 'line_start': 1, 'claim': 'from json'}]}))\n"
+        )
+        result, _ = self._run(cfg(rv(translator=translator, reply_format="json")), lambda *a: "whatever")
+        self.assertEqual([f.claim for g in result.groups for f in g.findings], ["from json"])
+
+    def test_a_failing_translator_is_a_problem_and_loses_nothing_else(self):
+        bad = self._translator("import sys\nsys.stderr.write('cannot cope')\nsys.exit(2)\n")
+        config = cfg(rv("tr", "model-a", translator=bad, reply_format="lines"), rv("plain", "model-b", reply_format="lines"))
+
+        def replies(model, system, content):
+            return "garbage" if model == "model-a" else block(file="a.py", lines="1", claim="kept")
+
+        result, _ = self._run(config, replies)
+        self.assertEqual([f.claim for g in result.groups for f in g.findings], ["kept"])
+        problems = [e for e in result.errors if "'tr'" in e]
+        self.assertEqual(len(problems), 1)
+        self.assertIn("the translator exited with status 2: cannot cope", problems[0])
+        self.assertIn("chunk 1/1", problems[0])
+
+    def test_there_is_no_fallback_to_the_raw_reply(self):
+        bad = self._translator("import sys\nsys.exit(1)\n")
+        result, _ = self._run(cfg(rv(translator=bad, reply_format="lines")), lambda *a: block(file="a.py", lines="1", claim="would parse"))
+        self.assertEqual(result.finding_count, 0)
+        self.assertTrue(any("the translator" in e for e in result.errors))
 
 
 if __name__ == "__main__":

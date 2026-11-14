@@ -410,19 +410,19 @@ class WordingForTheMovedToolsStaysInSync(unittest.TestCase):
         self.assertIn("Five tools from the `local-compress` server", compression)
         self.assertNotIn("Four tools", compression)
 
-    def test_my_savings_names_the_three_savings_tools_and_the_analytics_server(self):
-        text = self._read("skills", "my-savings", "SKILL.md")
+    def test_cr_savings_names_the_three_savings_tools_and_the_analytics_server(self):
+        text = self._read("skills", "cr-savings", "SKILL.md")
         for name in ("savings_summary", "savings_detail", "savings_trend"):
             self.assertIn(name, text)
         self.assertIn("`analytics`", text)
         self.assertNotIn("from the `local-compress` server", text)
 
-    def test_my_metrics_lists_writers_points_at_savings_and_the_clis(self):
-        text = self._read("skills", "my-metrics", "SKILL.md")
+    def test_cr_metrics_lists_writers_points_at_savings_and_the_clis(self):
+        text = self._read("skills", "cr-metrics", "SKILL.md")
         self.assertIn("`autowork`", text)
         self.assertIn("ticket_cost", text)
         self.assertIn("`memory-bank`", text)
-        self.assertIn("/my-savings", text)
+        self.assertIn("/cr-savings", text)
         self.assertIn("`analytics`", text)
         self.assertNotIn("from the `local-compress` server", text)
         for cli in ("tools/autowork_cost.py report", "tools/memory_bank_report.py",
@@ -430,12 +430,12 @@ class WordingForTheMovedToolsStaysInSync(unittest.TestCase):
             self.assertIn(cli, text)
 
     def test_autowork_skill_says_record_metric_needs_the_analytics_server(self):
-        text = self._read(".claude", "skills", "my-gh-autowork", "SKILL.md")
+        text = self._read(".claude", "skills", "cr-gh-autowork", "SKILL.md")
         self.assertIn("`analytics` MCP server", text)
         self.assertNotIn("mcp__local-compress__record_metric", text)
 
     def test_setup_skill_reads_the_metrics_override_from_every_block_that_can_hold_it(self):
-        text = self._read("skills", "my-setup-clauderunway", "SKILL.md")
+        text = self._read("skills", "cr-setup", "SKILL.md")
         line = next(l for l in text.splitlines() if l.startswith("- `CLAUDE_RUNWAY_METRICS_DB` from"))
         for block in ("analytics.env", "memory-bank.env", "local-compress.env"):
             self.assertIn(block, line)

@@ -9,8 +9,9 @@ is also free of any model-client SDK import: this
 module is stdlib-only, so it imports in an environment without `openai`
 installed (a Qdrant-only install, or a caller that only needs
 `estimate_tokens`/`fetch_loaded_models`). The caller builds the model client
-(libs/lmstudio_client.py) and passes it to compress() as `client`; this module
-only calls `client.chat.completions.create(...)` and treats
+(libs/lmstudio_client.py, by way of libs/openai_lib.py) and passes it to compress() as
+`client`; this module only calls `client.chat.completions.create(...)` (through
+libs/openai_lib.py's `complete`, which the codebase-reviewer uses too) and treats
 CompletionTimeout, which that client raises for a timed-out request, as the
 "timed out" failure. ctx is accepted as a loosely-typed optional object
 with an async report_progress(progress, total, message) method; pass None
@@ -20,26 +21,19 @@ when there's no MCP Context available (e.g. from the hook).
 import asyncio
 import hashlib
 import json
-import math
 import os
 import re
-import threading
 import urllib.request
 from typing import Optional, Tuple
 
+# The request path and the LM Studio configuration live outside this module so
+# the codebase-reviewer can send a model request without importing compression.
+# Compression imports what it uses, and calls it by module-global
+# name, so its tests can still stub `complete` here.
+from credential_redaction_lib import credential_spans, display_safe, redact_credentials
+from lmstudio_client import DEFAULT_BASE_URL, resolve_request_timeout
+from openai_lib import complete, take_failure
 
-class CompletionTimeout(Exception):
-    """A model request did not finish within its time budget.
-
-    The neutral, library-owned stand-in for a client SDK's own timeout
-    exception: whichever client the caller passes in must raise this (and
-    only this) for a timeout, so this module can tell "timed out" from "could
-    not connect" without importing the SDK. libs/lmstudio_client.py does that
-    translation for the `openai` client.
-    """
-
-
-DEFAULT_BASE_URL = os.environ.get("CLAUDE_RUNWAY_LMSTUDIO_URL", "http://localhost:1234/v1")
 DEFAULT_MODEL = os.environ.get("CLAUDE_RUNWAY_LMSTUDIO_MODEL")  # intentionally no fallback -- resolve_model() auto-detects when unset
 DEFAULT_CHUNK_CHARS = 12_000  # conservative per-call size -- local models vary widely in context window
 
@@ -383,7 +377,7 @@ _REDUCE_ANTI_CHAT_INSTRUCTION = (
 
 # Section handling for structured input (see compress(preserve_sections=True)).
 #
-# /my-compact fills in a fixed six-heading template, so the section boundaries
+# /cr-compact fills in a fixed six-heading template, so the section boundaries
 # here are AUTHORED, not inferred -- which is what makes this a guarantee rather
 # than another heuristic. The identifier guard had to guess what an identifier
 # looks like; there is nothing to guess about a heading we wrote ourselves.
@@ -511,55 +505,6 @@ def section_has_mixed_runs(body: str) -> bool:
     return has_prose and has_bullets
 
 
-# Per-request budget for every LM Studio completion call, in seconds. The
-# OpenAI SDK's own defaults are a 600s read timeout plus 2 automatic retries,
-# i.e. a reachable-but-hung LM Studio (model loaded but stuck) could block one
-# call for ~30 minutes. That matters most for the PostToolUse hook, which runs
-# synchronously in Claude Code's own tool-result path, so a hang there stalls
-# the whole session, not just one tool call.
-#
-# The invariant, stated once: every client built for this module (by
-# libs/lmstudio_client.py, which reads the constants below) is BOUNDED -- a
-# finite timeout and max_retries=0. A non-streaming completion only returns
-# once generation finishes, so `timeout` here is effectively the total budget
-# for one request. Retries are off because a local server that timed out or
-# refused will not be fixed by immediately asking again (it would only
-# multiply the stall), and every caller already fails open on an error.
-DEFAULT_REQUEST_TIMEOUT_SECONDS = 60.0
-REQUEST_TIMEOUT_ENV_VAR = "CLAUDE_RUNWAY_LMSTUDIO_TIMEOUT_SECONDS"
-CLIENT_MAX_RETRIES = 0
-
-
-def resolve_request_timeout() -> float:
-    """
-    Returns the per-request timeout in seconds: CLAUDE_RUNWAY_LMSTUDIO_TIMEOUT_SECONDS
-    if it parses as a finite number > 0, else DEFAULT_REQUEST_TIMEOUT_SECONDS.
-    Read at call time (not import time) so a test or long-lived MCP server
-    process sees the current environment. An unset, blank, non-numeric,
-    non-finite or non-positive value silently falls back to the default
-    rather than raising: this runs inside the hook, where a bad env value
-    must never crash it (and 0/negative/inf/nan would otherwise mean
-    "no real bound" to the SDK, defeating the point of this setting).
-    """
-    raw = os.environ.get(REQUEST_TIMEOUT_ENV_VAR, "")
-    try:
-        value = float(raw.strip())
-    except ValueError:
-        return DEFAULT_REQUEST_TIMEOUT_SECONDS
-    return value if is_bounded_timeout(value) else DEFAULT_REQUEST_TIMEOUT_SECONDS
-
-
-def is_bounded_timeout(value: float) -> bool:
-    """
-    The single definition of a usable timeout, applied to BOTH the env var
-    and an explicit `build_client(timeout=...)` argument
-    (libs/lmstudio_client.py) so neither path can smuggle in an unbounded client: finite and > 0. The
-    SDK would treat inf as no bound, and 0/negative/nan as broken or
-    immediate-fail.
-    """
-    return math.isfinite(value) and value > 0
-
-
 def split_sections(text: str):
     """
     Split `text` into (preamble, [(heading_line, body), ...]) on '## ' headings.
@@ -656,7 +601,7 @@ def derive_compact_label(information: str) -> str:
     Derive a short, deterministic label from a structured compact summary.
 
     Looks for the "## What we were working on" section produced by the
-    /my-compact skill template (split_sections parses the same '## ' heading
+    /cr-compact skill template (split_sections parses the same '## ' heading
     convention the template uses) and extracts the first sentence from its
     body -- split on '.', '!', or '?', hard-capped at _COMPACT_LABEL_MAX_CHARS
     characters.  Falls back to the first non-blank line of that section if no
@@ -665,7 +610,7 @@ def derive_compact_label(information: str) -> str:
 
     Returns "" when nothing meaningful can be extracted, so callers can
     substitute a fallback (e.g. "(unlabeled)") rather than storing a blank
-    label that renders unreadably in the /my-resume picker.
+    label that renders unreadably in the /cr-resume picker.
 
     Pure string logic -- no model call, no I/O, always the same output for
     the same input.
@@ -714,7 +659,7 @@ def derive_compact_label(information: str) -> str:
 
 # What the qdrant server's `compact_store` asks the local model for when it
 # compresses a conversation summary before storing it. This is the text the
-# /my-compact skill used to pass as `compress_text`'s `focus`; it lives here
+# /cr-compact skill used to pass as `compress_text`'s `focus`; it lives here
 # now so the compression happens in one call inside `compact_store` instead of
 # a second tool call that sent the whole summary through Claude's output twice.
 # `compact_store` also sets preserve_identifiers and preserve_sections, which
@@ -1010,151 +955,6 @@ _IDENTIFIER_STOPLIST = frozenset({
     "e.g.", "i.e.", "etc.", "--help", "--version",
 })
 
-# Credential shapes, which must NEVER be collected. This is a security filter,
-# not a noise filter, and it is the one place where over-collection is unsafe.
-#
-# The failure it prevents, reproduced before this existed: several of the
-# patterns above match real secrets -- the snake_case one accepts
-# "ghp_<...>" and "sk_live_<...>", the dotted one accepts a three-part JWT.
-# When the summarizer omitted a secret (which it did -- dropping it was
-# accidentally protective), append_missing_identifiers put it BACK, verbatim,
-# and /my-compact enables this feature unconditionally and then persists the
-# result to Qdrant. So the repair step converted a transient secret in a
-# session into a durable one in a vector store, and made a leak out of the
-# summarizer's accidental good behavior.
-#
-# Prefix matching rather than entropy scoring on purpose: an entropy heuristic
-# would also flag commit SHAs, build ids, and hashes -- exactly the
-# identifiers worth restoring. A missed exotic credential shape is a gap; a
-# dropped commit SHA is a regression in the feature's whole point.
-_CREDENTIAL_PREFIXES = (
-    # GitHub
-    "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_",
-    # OpenAI / Anthropic style
-    "sk-", "sk-ant-", "sk-proj-",
-    # Stripe
-    "sk_live_", "sk_test_", "rk_live_", "rk_test_", "pk_live_",
-    # Slack
-    "xoxb-", "xoxp-", "xoxa-", "xoxr-", "xoxs-", "xapp-",
-    # GitLab / npm / Docker / HuggingFace / Shopify
-    "glpat-", "npm_", "dckr_pat_", "hf_", "shpat_", "shpss_",
-    # AWS access key ids / Google API keys
-    "AKIA", "ASIA", "AIza",
-    # GCP — OAuth2 refresh tokens use the "1//" prefix (documented in Google's
-    # OAuth2 reference; the body is base64url after the slashes):
-    # 1//<base64url-body>
-    "1//",
-)
-
-# Credential VALUES, matched wherever they appear -- not anchored to the start
-# of a word.
-#
-# Anchoring to word-start was the second wrong answer here (the first was
-# checking only the collected token, which missed fragments of hyphenated
-# secrets). A secret is very often not a standalone word, and 6 of 8 realistic
-# forms leaked the full value in testing:
-#
-#     GITHUB_TOKEN=ghp_<...>            leaked
-#     export GITHUB_TOKEN=ghp_<...>     leaked
-#     {"token":"ghp_<...>"}             leaked
-#     --with-token=ghp_<...>            leaked
-#     https://x:ghp_<...>@github.com/   leaked
-#     TOKEN="ghp_<...>"                 leaked
-#
-# Worse, credential_token_count() returned 0 for those, so the "withheld"
-# disclosure did not fire either -- silently wrong rather than visibly
-# incomplete. Matching the value itself covers every wrapper without needing to
-# enumerate assignment, JSON, YAML, flag, and URL syntaxes separately.
-#
-# The (?<![A-Za-z0-9_]) lookbehind is load-bearing: without it the short "sk-"
-# prefix matches inside ordinary words ("task-oriented" -> "sk-oriented"),
-# which would mark innocent text as a credential span and suppress the real
-# identifiers sitting in it.
-_CREDENTIAL_VALUE_RE = re.compile(
-    r"(?<![A-Za-z0-9_])(?:"
-    # A known prefix followed by enough body to be a real token. Short
-    # prefixes like "sk-" still capture the whole of "sk-ant-api03-<...>",
-    # because the body class includes the hyphen.
-    + "|".join(re.escape(p) for p in _CREDENTIAL_PREFIXES) + r")[A-Za-z0-9_\-]{6,}"
-    # base64url-encoded JSON: a JWT header and up to two following segments.
-    r"|(?<![A-Za-z0-9_])eyJ[A-Za-z0-9_\-]+(?:\.[A-Za-z0-9_\-]+){0,2}"
-    # PEM private keys: the WHOLE block, header through footer.
-    #
-    # Matching only the header left the key body outside the credential span,
-    # where it could be collected as an identifier and restored verbatim. The
-    # CamelCase pattern is \b-anchored and base64 is one long word with no
-    # internal boundaries, so a match can only begin at a line's first
-    # character -- which makes this probabilistic rather than certain, and is
-    # why a typical sample looks clean. Measured: ~1.5% of random 64-char
-    # base64 lines begin with a CamelCase-shaped run, so for a 25-line 2048-bit
-    # key the chance that at least one line leaks is ~31%, and ~53% for a
-    # 50-line 4096-bit key. A leaked line is 64 characters of key material.
-    #
-    # The \Z fallback covers an unterminated block (a truncated summary), where
-    # everything after the header is treated as key material. That
-    # over-suppresses -- identifiers past the header go unverified -- which is
-    # the correct direction: an unverified identifier is a gap, leaked key
-    # material is a breach.
-    r"|-----BEGIN[A-Z ]*PRIVATE KEY-----[\s\S]*?"
-    r"(?:-----END[A-Z ]*PRIVATE KEY-----|\Z)"
-    # Azure Databricks PATs: "dapi" followed by EXACTLY 32 hex characters.
-    # Excluded from _CREDENTIAL_PREFIXES (which appends a generic
-    # [A-Za-z0-9_\-]{6,} body) because "dapi" alone would then match
-    # ordinary identifiers like dapi_request, dapi_handler, etc. -- names
-    # common in API code. The documented format is strict hex only, so the
-    # dedicated pattern is both more accurate and false-positive-free.
-    # The right-side boundary (?![A-Za-z0-9_]) is load-bearing: without it a
-    # 40-char git-style hash beginning with "dapi" would match its first 32
-    # characters and be silently redacted even though it's not a real token.
-    r"|(?<![A-Za-z0-9_])dapi[0-9a-fA-F]{32}(?![A-Za-z0-9_])"
-)
-
-
-def looks_like_credential(token: str) -> bool:
-    """True if `token` contains something shaped like a secret.
-
-    Deliberately errs toward withholding: a legitimate identifier wrongly
-    withheld is one unverified token, while a credential wrongly restored is a
-    secret written into a durable store.
-    """
-    return bool(_CREDENTIAL_VALUE_RE.search(token))
-
-
-def _credential_spans(text: str) -> list:
-    """Character spans of credential values anywhere in `text`."""
-    return [m.span() for m in _CREDENTIAL_VALUE_RE.finditer(text)]
-
-
-_REDACTION_PLACEHOLDER = "[REDACTED-CREDENTIAL]"
-
-
-def redact_credentials(text: str):
-    """
-    Replace every credential value in `text` with a placeholder.
-    Returns (redacted_text, number_of_replacements).
-
-    Excluding credentials from identifier collection is not sufficient on its
-    own, because that only governs what gets RE-APPENDED. Content can reach the
-    output by being copied rather than regenerated -- the preamble, a verbatim
-    section, a failed-call fallback -- and a model can also echo a secret out of
-    its own input. Redacting the finished artifact is the only step that covers
-    all of those routes at once.
-
-    Applied only in the artifact-producing modes (preserve_identifiers /
-    preserve_sections), which are the ones whose output gets persisted. A
-    throwaway gist of a web page is not worth rewriting.
-    """
-    spans = _credential_spans(text)
-    if not spans:
-        return text, 0
-    pieces, last = [], 0
-    for start, end in spans:  # finditer spans are ordered and non-overlapping
-        pieces.append(text[last:start])
-        pieces.append(_REDACTION_PLACEHOLDER)
-        last = end
-    pieces.append(text[last:])
-    return "".join(pieces), len(spans)
-
 
 def redact_and_disclose(text: str) -> str:
     """
@@ -1192,7 +992,7 @@ def identifier_tokens(text: str) -> list:
     artifact. Those are excluded here via looks_like_credential(), so they are
     never collected and therefore never restored.
     """
-    credential_spans = _credential_spans(text)
+    spans_to_skip = credential_spans(text)
     seen: dict[str, None] = {}  # emulates an ordered set -- keys are what matters, list(seen) preserves insertion order
     for match in _IDENTIFIER_RE.finditer(text):
         token = match.group(0).strip(".,;:)(»«\"'`")
@@ -1206,7 +1006,7 @@ def identifier_tokens(text: str) -> list:
         # Skip anything overlapping a credential word, which covers both a
         # whole secret and a fragment of one.
         start, end = match.span()
-        if any(start < c_end and c_start < end for c_start, c_end in credential_spans):
+        if any(start < c_end and c_start < end for c_start, c_end in spans_to_skip):
             continue
         seen.setdefault(token, None)
     return list(seen)
@@ -1220,7 +1020,7 @@ def credential_token_count(text: str) -> int:
     restored, without printing it. A silent omission would leave a reader
     believing the restored set is complete.
     """
-    return len({text[start:end] for start, end in _credential_spans(text)})
+    return len({text[start:end] for start, end in credential_spans(text)})
 
 
 def missing_identifiers(original: str, summary: str) -> list:
@@ -1391,142 +1191,6 @@ def append_trailing_summary_if_missing(original: str, summary: str) -> str:
     return f"{summary}\n\n[RESULT] {line}"
 
 
-# Why the most recent complete() call on THIS thread failed ("timeout" or
-# "other"), or None. complete() deliberately keeps its Optional[str] contract
-# (many callers and tests rely on None meaning "the request failed"), so the
-# reason travels on this side channel instead of widening the return type.
-# Thread-local because the relevance classifier runs complete()
-# in executor threads concurrently; read it with take_failure_kind() on the
-# same thread that made the call.
-_failure_state = threading.local()
-
-
-def take_failure() -> Tuple[Optional[str], Optional[str]]:
-    """Return and clear (kind, detail) for this thread's last complete() failure.
-
-    kind:
-    "timeout" -- the request exceeded the per-request timeout (LM Studio may
-    be busy, e.g. its parallel-request slots are all taken and the request sat
-    in its queue, or unreachable: the SDK's timeout error also covers a
-    connection that never got established); "bad_request" -- LM Studio was
-    reached and answered HTTP 400 (most often the chunk does not
-    fit the loaded model's context window, so the server IS running and
-    "check it's still running" is the wrong advice); "other" -- anything else
-    (connection refused, model not found, ...); None -- no reason was
-    recorded, e.g. complete() was replaced by a test stub, or nothing failed.
-    Callers must treat None as "unknown" and fall back to the generic failure
-    wording.
-
-    detail: the server's own message for a "bad_request" (already
-    credential-redacted, whitespace-collapsed and truncated by
-    _server_error_detail), otherwise None.
-
-    Clearing on read means a stale reason can never leak into a later,
-    unrelated failure.
-    """
-    kind = getattr(_failure_state, "kind", None)
-    detail = getattr(_failure_state, "detail", None)
-    _failure_state.kind = None
-    _failure_state.detail = None
-    return kind, detail
-
-
-def take_failure_kind() -> Optional[str]:
-    """Return and clear why this thread's last complete() call failed (the
-    kind half of take_failure(); see there for the values). Reading clears the
-    detail too, so a caller that wants the detail uses take_failure()."""
-    return take_failure()[0]
-
-
-# How much of a server's error text goes into a user-facing message.
-# The text can echo the model's own input, so it is capped.
-_SERVER_DETAIL_MAX_CHARS = 200
-
-
-def _server_error_detail(exc: BaseException) -> Optional[str]:
-    """The server's message for an HTTP error, made safe to show.
-
-    Source order: `exc.body` first (the OpenAI SDK parses the response JSON
-    into it: LM Studio sends `{"error": "<text>"}`, which arrives as the bare
-    string, while an OpenAI-shaped `{"error": {"message": ...}}` arrives as a
-    dict), then `exc.message`/`str(exc)`. `.body` goes first because for
-    LM Studio's string-shaped error the SDK's `.message` is the noisy
-    "Error code: 400 - {'error': ...}" repr rather than the text itself.
-
-    Redaction runs BEFORE truncation and whitespace-collapsing: cutting a
-    credential in half first would leave a fragment the pattern no longer
-    matches. Collapsing whitespace keeps the text on one line, which the
-    outage-notice parsing (it splits on a blank line) and a one-line error
-    message both rely on.
-    """
-    body = getattr(exc, "body", None)
-    text: Optional[str] = None
-    if isinstance(body, str):
-        text = body
-    elif isinstance(body, dict):
-        for candidate in (body.get("message"), body.get("error")):
-            if isinstance(candidate, str):
-                text = candidate
-                break
-            if isinstance(candidate, dict) and isinstance(candidate.get("message"), str):
-                text = candidate["message"]
-                break
-    if not text:
-        message = getattr(exc, "message", None)
-        text = message if isinstance(message, str) and message else str(exc)
-    text, _ = redact_credentials(text)
-    text = " ".join(text.split())
-    if not text:
-        return None
-    if len(text) > _SERVER_DETAIL_MAX_CHARS:
-        text = text[:_SERVER_DETAIL_MAX_CHARS].rstrip() + "..."
-    return text
-
-
-def complete(oai_client, model: str, system: str, content: str) -> Optional[str]:
-    """Returns the completion text, or None if the request failed for any reason
-    (connection error, model not found, etc.) -- callers must check for None
-    rather than assume this always succeeds just because resolve_model did.
-    resolve_model only validates connectivity when it has to auto-detect; an
-    explicit model= or CLAUDE_RUNWAY_LMSTUDIO_MODEL skips that check entirely, so
-    a dead LM Studio server is only caught here, at the actual request.
-
-    On failure the reason is also recorded for take_failure_kind():
-    the client signals a timeout by raising CompletionTimeout (a
-    timeout may subclass a connection error in the client's own SDK, so the
-    client translates it explicitly rather than this function inferring it
-    from "not a connection error"). `oai_client` is any object with an
-    OpenAI-shaped `chat.completions.create(...)`; the caller builds it."""
-    _failure_state.kind = None
-    _failure_state.detail = None
-    try:
-        response = oai_client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": content},
-            ],
-            temperature=0,
-        )
-    except CompletionTimeout:
-        _failure_state.kind = "timeout"
-        return None
-    except Exception as e:
-        # An HTTP 400 means LM Studio was reached and refused THIS request
-        # -- typically a chunk whose token count overflows the
-        # loaded model's context window. Detected by duck-typing the
-        # `status_code` the OpenAI SDK's status errors carry, because this
-        # module never imports a client SDK. Everything else (connection
-        # refused, a missing model's 404, ...) stays "other".
-        if getattr(e, "status_code", None) == 400:
-            _failure_state.kind = "bad_request"
-            _failure_state.detail = _server_error_detail(e)
-        else:
-            _failure_state.kind = "other"
-        return None
-    return response.choices[0].message.content or ""
-
-
 _ALL_TIMED_OUT_PREFIX = "[LM Studio timed out on every request"
 # Every request in a preserve_sections run got an HTTP 400.
 _ALL_REJECTED_PREFIX = "[LM Studio rejected every request"
@@ -1550,11 +1214,14 @@ def _request_failed_message(
     refused the request, so telling the reader to check the server sends them
     to the wrong place. The wording says "most often" rather than "is" a
     context overflow, because a 400 is not proof of one; `detail` is the
-    server's own (already redacted and truncated) text, shown so the reader
+    server's own text exactly as sent (libs/openai_lib.py does not redact it),
+    so it is passed through display_safe here, which redacts credentials, then
+    collapses it to one line and truncates it, before it is shown so the reader
     can judge for themselves.
     """
     if kind == "bad_request":
-        shown = f" (LM Studio said: {detail})" if detail else ""
+        safe = display_safe(detail)  # the server's text, as sent: redacted here, where it is shown
+        shown = f" (LM Studio said: {safe})" if safe else ""
         return (
             f"Error: LM Studio rejected the request {where}{shown} -- most often the "
             f"chunk is too large for the loaded model's context window: retry with a "
@@ -1709,8 +1376,8 @@ def _http_get_json(url: str, timeout: float):
     Minimal stdlib-only GET-and-parse-JSON helper for fetch_loaded_models'
     /api/v0/models probe below -- deliberately NOT `requests`:
     this module is deliberately standard-library-only
-    (it imports no client SDK; libs/lmstudio_client.py is the only module that
-    imports `openai`), and both hooks/compress_output.py and
+    (it imports no client SDK; `openai` is imported only when libs/openai_lib.py's
+    build_openai_client builds a client), and both hooks/compress_output.py and
     hooks/redirect_webfetch_to_fetch_url.py import it directly (not through
     compress_mcp_server.py's own requirements.txt, which does include
     `requests` for fetch_url). Each hook fails OPEN on any ImportError, so a
@@ -2130,10 +1797,12 @@ async def _compress_each_section(text, focus, oai_client, model, base_url, prese
         if failures and all(k == "bad_request" for k, _d in failures):
             # Every failed request was a 400: LM Studio answered each one and
             # refused it, typically because a section does not fit the loaded
-            # model's context window. The first server message is shown (it is
-            # already one line, so the notice's blank-line parsing still holds).
+            # model's context window. The first server message is shown, after
+            # display_safe redacts it and collapses it to one line (so the
+            # notice's blank-line parsing still holds) and truncates it.
             first_detail = next((d for _k, d in failures if d), None)
-            shown = f" (LM Studio said: {first_detail})" if first_detail else ""
+            safe_detail = display_safe(first_detail)
+            shown = f" (LM Studio said: {safe_detail})" if safe_detail else ""
             result = (
                 f"{_ALL_REJECTED_PREFIX} -- LM Studio is running but refused them{shown}; "
                 "most often a section is too large for the loaded model's context window, so "
@@ -2174,7 +1843,7 @@ async def compress(
 ) -> str:
     """
     Shared map-reduce compression logic. `client` is required and is built by
-    the caller (libs/lmstudio_client.py's build_client): any object with an
+    the caller (libs/lmstudio_client.py's build_client, which wraps libs/openai_lib.py): any object with an
     OpenAI-shaped `chat.completions.create(...)` that raises CompletionTimeout
     for a timed-out request. This module never imports a client SDK.
  Returns the ORIGINAL text unchanged
@@ -2260,9 +1929,9 @@ async def compress(
     any that didn't (see append_missing_identifiers). Off by default because
     it's wrong for gist-style asks -- summarizing a web page shouldn't drag a
     list of its URLs along. Turn it on when the output is an artifact someone
-    will later grep, which is what /my-compact produces.
+    will later grep, which is what /cr-compact produces.
 
-    Why a deterministic check rather than a stronger prompt: the /my-compact
+    Why a deterministic check rather than a stronger prompt: the /cr-compact
     focus already demands "Retain exact file paths, class/function/variable
     names ... without modification" and asks for a "context-lossless" summary,
     and a real 9,876-char handoff still came back with the Options segment
@@ -2283,7 +1952,7 @@ async def compress(
     pressure. Falls back to whole-text compression when there are no headings,
     so it is safe to leave on for input that turns out to be unstructured.
 
-    The two flags compose, and /my-compact sets both: preserve_sections keeps
+    The two flags compose, and /cr-compact sets both: preserve_sections keeps
     the structure, preserve_identifiers keeps the exact strings inside it.
     Neither makes the result literally lossless -- prose inside a compressed
     section is still rewritten -- they bound the loss to within a section

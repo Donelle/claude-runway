@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Bounded wait for GitHub Copilot's review of one specific commit on a PR, used by
-/my-gh-autowork's subagent prompt (its Step 19 and the follow-up pattern that reuses it).
+/cr-gh-autowork's subagent prompt (its Step 19 and the follow-up pattern that reuses it).
 
 WHY A HELPER, AND WHY BOUNDED: the subagent's prompt cache lapses after roughly five
 minutes idle. One Bash call that sleeps for nine minutes therefore makes the next

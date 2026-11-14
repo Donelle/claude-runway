@@ -24,7 +24,7 @@ sys.path.insert(0, str(REPO_ROOT / "libs"))
 sys.path.insert(0, str(REPO_ROOT / "mcpservers"))
 sys.path.insert(0, str(REPO_ROOT / "tests"))
 
-import local_compress_lib  # noqa: E402
+import openai_lib  # noqa: E402
 from fake_lmstudio import FakeLmStudio  # noqa: E402
 from lmstudio_model_loader_lib import ModelLoader  # noqa: E402
 from reasoning_reviewer_lib import split_diff  # noqa: E402
@@ -42,7 +42,7 @@ def _load_server():
 
 def _reviewers(**over) -> dict:
     data = {
-        "rubric": [{"name": "r1", "level": "low", "definition": "d", "score": 2}],
+        "rubric": [{"name": "r1", "level": "low", "definition": "d", "score": 0.4}],
         "reviewers": [
             {"name": "quoting", "model": "model-a", "prompt": "p", "active": True, "type": ["reasoning"], "loadOnDemand": False},
             {
@@ -66,7 +66,7 @@ class Shape(unittest.TestCase):
 
     def test_the_registered_tool_set_is_the_documented_one(self):
         mod = _load_server()
-        self.assertEqual({t.name for t in mod.mcp._tool_manager.list_tools()}, {"list_reviewers", "review"})
+        self.assertEqual({t.name for t in mod.mcp._tool_manager.list_tools()}, {"list_reviewers", "review", "review_report"})
 
     def test_it_imports_no_other_server(self):
         # Standalone: installable or left out on its own.
@@ -103,7 +103,8 @@ class Client(unittest.TestCase):
         with mock.patch.dict(os.environ, {"CLAUDE_RUNWAY_LMSTUDIO_URL": "http://lm:9999/v1"}):
             client = mod.new_client()
         self.assertEqual(client.max_retries, 0)  # no retries, like every other server's client
-        self.assertEqual(str(client.base_url).rstrip("/"), "http://lm:9999/v1")
+        # LM Studio's native API, not the OpenAI-compatible /v1: only the native one returns each response's timing.
+        self.assertEqual(str(client.base_url).rstrip("/"), "http://lm:9999/api/v0")
         self.assertLess(client.timeout, 600)
 
     def test_the_base_url_comes_from_the_environment_per_call(self):
@@ -143,7 +144,9 @@ class ListReviewers(unittest.TestCase):
         with self._env(REVIEWERS_FILE=missing):
             out = self.mod.list_reviewers()
         self.assertTrue(out.startswith("Error:"))
-        self.assertIn(missing, out)
+        # The message quotes the path with repr(), which doubles every backslash in a
+        # Windows path; compare against the same quoted form so the check holds on both.
+        self.assertIn(repr(missing), out)
 
     def test_an_invalid_file_lists_every_problem(self):
         data = _reviewers()
@@ -216,7 +219,7 @@ class ListReviewers(unittest.TestCase):
             out = self.mod.list_reviewers()
         self.assertFalse(out.startswith("Error:"))
         self.assertIn("MAX_REVIEWERS=2, MAX_REVIEW_ROUNDS=4", out)
-        self.assertIn("r1 [low, min confidence 2]", out)
+        self.assertIn("r1 [low, min average probability 0.4]", out)
         self.assertIn("Stage plan", out)
         self.assertIn("1. reasoning", out)
         self.assertIn("2. classifier", out)
@@ -230,7 +233,7 @@ class ListReviewers(unittest.TestCase):
             self.mod.list_reviewers()
 
     def _with_fake(self, fake):
-        return mock.patch.object(self.mod, "ModelLoader", lambda url: ModelLoader(url, http=fake))
+        return mock.patch.object(self.mod, "ModelLoader", lambda url, **kw: ModelLoader(url, http=fake, **kw))
 
     def test_check_models_reports_when_every_resident_model_is_loaded(self):
         fake = FakeLmStudio(loaded=["model-a"])
@@ -262,6 +265,15 @@ class ReviewTool(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.dir = Path(self._tmp.name)
         self.mod = _load_server()
+        # Every review writes its run record, a metrics event and maybe a savings record: point them at the temp dir.
+        isolate = mock.patch.dict(os.environ, {
+            "CLAUDE_RUNWAY_CODEBASE_REVIEWER_DB": str(self.dir / "reviewer.db"),
+            "CLAUDE_RUNWAY_METRICS_DB": str(self.dir / "metrics.db"),
+            "CLAUDE_RUNWAY_SAVINGS_DB": str(self.dir / "savings.db"),
+            "CLAUDE_RUNWAY_TRACK_SAVINGS": "",
+        })
+        isolate.start()
+        self.addCleanup(isolate.stop)
 
     def _env(self, **env):
         base = {k: v for k, v in os.environ.items() if k not in ("REVIEWERS_FILE", "MAX_REVIEWERS", "MAX_REVIEW_ROUNDS")}
@@ -273,7 +285,7 @@ class ReviewTool(unittest.TestCase):
             "rubric": [],
             "reviewers": [
                 {"name": "quoting", "model": "model-a", "prompt": "look at quoting", "active": True,
-                 "type": ["reasoning"], "loadOnDemand": False},
+                 "type": ["reasoning"], "loadOnDemand": False, "replyFormat": "json"},
             ],
         }
         path = self.dir / "reviewers.json"
@@ -286,10 +298,26 @@ class ReviewTool(unittest.TestCase):
         self.assertEqual(tool.parameters["required"], ["type"])
 
     def test_an_unknown_type_lists_the_known_ones(self):
-        out = self.mod.review("verifier", {"repo_path": "."})
+        out = self.mod.review("summarizer", {"repo_path": "."})
         self.assertTrue(out.startswith("Error:"))
-        self.assertIn("unknown review type 'verifier'", out)
-        self.assertIn("known types: reasoning", out)
+        self.assertIn("unknown review type 'summarizer'", out)
+        self.assertIn("known types: reasoning, verifier, classifier", out)
+
+    def test_the_classifier_type_takes_the_same_keys_as_the_other_two_and_shows_its_help_without_params(self):
+        self.assertEqual(self.mod.REVIEW_TYPES["classifier"].params, self.mod.REVIEW_TYPES["reasoning"].params)
+        out = self.mod.review("classifier", {})
+        self.assertFalse(out.startswith("Error:"))
+        self.assertIn("review type 'classifier'", out)
+        for key in ("repo_path", "base_ref", "head_ref", "context_lines", "chunk_chars"):
+            self.assertIn(key, out)
+
+    def test_the_verifier_type_takes_the_same_keys_as_reasoning_and_shows_its_help_without_params(self):
+        self.assertEqual(self.mod.REVIEW_TYPES["verifier"].params, self.mod.REVIEW_TYPES["reasoning"].params)
+        out = self.mod.review("verifier", {})
+        self.assertFalse(out.startswith("Error:"))
+        self.assertIn("review type 'verifier'", out)
+        for key in ("repo_path", "base_ref", "head_ref", "context_lines", "chunk_chars"):
+            self.assertIn(key, out)
 
     def test_empty_params_returns_the_types_help_instead_of_an_error(self):
         for params in ({}, None):
@@ -327,7 +355,7 @@ class ReviewTool(unittest.TestCase):
         self.assertIn("REVIEWERS_FILE is not set", out)
 
     def test_a_bad_repo_path_or_ref_is_an_error_naming_it(self):
-        with self._env(REVIEWERS_FILE=self._reviewers_file()):
+        with self._env(REVIEWERS_FILE=self._reviewers_file()), mock.patch.object(self.mod, "_resolve_commit", return_value="0" * 40):
             gone = self.mod.review("reasoning", {"repo_path": str(self.dir / "nope"), "base_ref": "main"})
             option = self.mod.review("reasoning", {"repo_path": str(self.dir), "base_ref": "--output=/tmp/x"})
         self.assertIn("is not a directory", gone)
@@ -336,8 +364,9 @@ class ReviewTool(unittest.TestCase):
     def test_a_model_that_must_be_loaded_but_is_not_is_an_error(self):
         fake = FakeLmStudio(loaded=[])
         with self._env(REVIEWERS_FILE=self._reviewers_file()), mock.patch.object(
-            self.mod, "ModelLoader", lambda url: ModelLoader(url, http=fake)
-        ), mock.patch.object(self.mod, "_git_diff", return_value="diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n+x\n"):
+            self.mod, "ModelLoader", lambda url, **kw: ModelLoader(url, http=fake, **kw)
+        ), mock.patch.object(self.mod, "_git_diff", return_value="diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n+x\n"), \
+                mock.patch.object(self.mod, "_resolve_commit", return_value="0" * 40):
             out = self.mod.review("reasoning", {"repo_path": str(self.dir), "base_ref": "main"})
         self.assertTrue(out.startswith("Error:"))
         self.assertIn("not loaded in LM Studio", out)
@@ -367,9 +396,9 @@ class ReviewTool(unittest.TestCase):
 
         fake = FakeLmStudio(loaded=["model-a"])
         with self._env(REVIEWERS_FILE=self._reviewers_file()), mock.patch.object(
-            self.mod, "ModelLoader", lambda url: ModelLoader(url, http=fake)
+            self.mod, "ModelLoader", lambda url, **kw: ModelLoader(url, http=fake, **kw)
         ), mock.patch.object(self.mod, "new_client", return_value=object()), mock.patch.object(
-            local_compress_lib, "complete", complete
+            openai_lib, "complete", complete
         ):
             out = self.mod.review("reasoning", {"repo_path": str(repo), "base_ref": "main", "head_ref": "feature", "context_lines": 1})
         self.assertFalse(out.startswith("Error:"), out)
@@ -382,6 +411,204 @@ class ReviewTool(unittest.TestCase):
         self.assertIn("    3   print('three')", seen[0])  # unchanged context: numbered, no "+" mark
         # The diff the model read is not in what comes back to the caller.
         self.assertNotIn("print('CHANGED')", out)
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_the_verifier_type_grounds_and_verifies_a_real_git_range(self):
+        repo = self.dir / "repo"
+        repo.mkdir()
+
+        def git(*args):
+            env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull,
+                   "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+            subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, env=env)
+
+        git("init", "-q", "-b", "main")
+        (repo / "app.py").write_text("print('one')\nprint('two')\n", encoding="utf-8")
+        git("add", "."); git("commit", "-q", "-m", "base")
+        git("checkout", "-q", "-b", "feature")
+        (repo / "app.py").write_text("print('one')\nos.system(cmd)\n", encoding="utf-8")
+        git("commit", "-q", "-am", "change")
+        # Work in progress on disk that is NOT in the reviewed range: the verifier must read the committed file.
+        (repo / "app.py").write_text("uncommitted = True\n", encoding="utf-8")
+        shown = []
+
+        def complete(client, model, system, content):
+            if "checking ONE reported defect" in system:
+                shown.append(content)
+                return json.dumps({"verdict": "confirmed", "failing_input": "cmd='a; b'", "wrong_result": "runs b", "reasoning": "traced"})
+            return json.dumps({"findings": [
+                {"file": "app.py", "line_start": 1, "line_end": 1, "class": "injection", "claim": "shell injection",
+                 "failing_input": "cmd='a; b'", "quote": "os.system(cmd)"},
+                {"file": "app.py", "line_start": 1, "line_end": 1, "class": "style", "claim": "made up", "failing_input": "x",
+                 "quote": "this line does not exist"},
+            ]})
+
+        data = {"rubric": [], "reviewers": [
+            {"name": "finder", "model": "model-a", "prompt": "look", "active": True, "type": ["reasoning"], "loadOnDemand": False,
+             "replyFormat": "json"},
+            {"name": "checker", "model": "model-b", "prompt": "check", "active": True, "type": ["verifier"], "loadOnDemand": False},
+        ]}
+        fake = FakeLmStudio(loaded=["model-a", "model-b"])
+        with self._env(REVIEWERS_FILE=self._reviewers_file(data)), mock.patch.object(
+            self.mod, "ModelLoader", lambda url, **kw: ModelLoader(url, http=fake, **kw)
+        ), mock.patch.object(self.mod, "new_client", return_value=object()), mock.patch.object(
+            openai_lib, "complete", complete
+        ):
+            out = self.mod.review("verifier", {"repo_path": str(repo), "base_ref": "main", "head_ref": "feature"})
+        self.assertFalse(out.startswith("Error:"), out)
+        self.assertIn("1 confirmed, 0 disputed, 0 unchecked; dropped 0 rejected and 1 ungrounded", out)
+        self.assertIn("app.py:2 [injection] [finder] shell injection", out)  # the model said line 1; the quote is on line 2
+        self.assertIn("checker: failing input: cmd='a; b' -> runs b", out)
+        self.assertIn("ungrounded: its quote is not in app.py", out)
+        self.assertEqual(len(shown), 1)
+        self.assertIn("    2 > os.system(cmd)", shown[0])
+        self.assertNotIn("uncommitted", shown[0])
+
+    def test_a_verifier_model_that_is_not_loaded_is_an_error_not_a_traceback(self):
+        data = {"rubric": [], "reviewers": [
+            {"name": "finder", "model": "model-a", "prompt": "look", "active": True, "type": ["reasoning"], "loadOnDemand": False,
+             "replyFormat": "json"},
+            {"name": "checker", "model": "model-b", "prompt": "check", "active": True, "type": ["verifier"], "loadOnDemand": False},
+        ]}
+        fake = FakeLmStudio(loaded=["model-a"])
+        with self._env(REVIEWERS_FILE=self._reviewers_file(data)), mock.patch.object(
+            self.mod, "ModelLoader", lambda url, **kw: ModelLoader(url, http=fake, **kw)
+        ), mock.patch.object(self.mod, "new_client", return_value=object()), mock.patch.object(
+            self.mod, "_git_diff", return_value="diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n+x\n"
+        ), mock.patch.object(self.mod, "_resolve_commit", return_value="0" * 40):
+            out = self.mod.review("verifier", {"repo_path": str(self.dir), "base_ref": "main"})
+        self.assertTrue(out.startswith("Error:"))
+        self.assertIn("'model-b'", out)
+
+    def test_the_classifiers_requests_go_through_the_openai_compatible_url_because_the_native_one_returns_no_token_probabilities(self):
+        urls = []
+        with self._env(CLAUDE_RUNWAY_LMSTUDIO_URL="http://host:1234/v1"), mock.patch.object(
+            self.mod, "build_client", side_effect=lambda url, *a, **k: urls.append(url) or object()
+        ):
+            self.mod.new_client()
+            self.mod.new_probability_client()
+        self.assertEqual(urls, ["http://host:1234/api/v0", "http://host:1234/v1"])
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_the_classifier_type_classifies_what_the_verifiers_left_standing_in_a_real_git_range(self):
+        repo = self.dir / "repo"
+        repo.mkdir()
+
+        def git(*args):
+            env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull,
+                   "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+            subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, env=env)
+
+        git("init", "-q", "-b", "main")
+        (repo / "app.py").write_text("print('one')\nprint('two')\n", encoding="utf-8")
+        git("add", "."); git("commit", "-q", "-m", "base")
+        git("checkout", "-q", "-b", "feature")
+        (repo / "app.py").write_text("print('one')\nos.system(cmd)\n", encoding="utf-8")
+        git("commit", "-q", "-am", "change")
+        sorted_ = []
+
+        def probability(client, model, system, content):
+            sorted_.append((system, content))
+            return {"injection": 0.8, "crash": 0.9}[content.split("Category: ")[1].split(" (")[0]]
+
+        def complete(client, model, system, content, **options):
+            if "checking ONE reported defect" in system:
+                return json.dumps({"verdict": "confirmed", "failing_input": "cmd='a; b'", "wrong_result": "runs b", "reasoning": "traced"})
+            return json.dumps({"findings": [
+                {"file": "app.py", "line_start": 2, "line_end": 2, "class": "injection", "claim": "shell injection",
+                 "failing_input": "cmd='a; b'", "quote": "os.system(cmd)"},
+                {"file": "app.py", "line_start": 1, "line_end": 1, "class": "style", "claim": "made up", "failing_input": "x",
+                 "quote": "this line does not exist"},
+            ]})
+
+        data = {"rubric": [
+            {"name": "injection", "level": "high", "score": 0.6, "definition": "input reaches a shell"},
+            {"name": "crash", "level": "moderate", "score": 0.6, "definition": "valid input raises"},
+        ], "reviewers": [
+            {"name": "finder", "model": "model-a", "prompt": "look", "active": True, "type": ["reasoning"], "loadOnDemand": False,
+             "replyFormat": "json"},
+            {"name": "checker", "model": "model-b", "prompt": "check", "active": True, "type": ["verifier"], "loadOnDemand": False},
+            {"name": "sorter", "model": "model-c", "prompt": "sort", "active": True, "type": ["classifier"], "loadOnDemand": False},
+        ]}
+        fake = FakeLmStudio(loaded=["model-a", "model-b", "model-c"])
+        with self._env(REVIEWERS_FILE=self._reviewers_file(data)), mock.patch.object(
+            self.mod, "ModelLoader", lambda url, **kw: ModelLoader(url, http=fake, **kw)
+        ), mock.patch.object(self.mod, "new_client", return_value=object()), mock.patch.object(
+            openai_lib, "complete", complete
+        ), mock.patch.object(openai_lib, "yes_probability", probability):
+            out = self.mod.review("classifier", {"repo_path": str(repo), "base_ref": "main", "head_ref": "feature"})
+        self.assertFalse(out.startswith("Error:"), out)
+        self.assertIn("1 classified, 0 without a rubric level; dropped 0 unclassified, 0 rejected and 1 ungrounded", out)
+        self.assertIn("app.py:2 [injection] [finder] shell injection (verifier: confirmed)", out)
+        self.assertIn("injection [high], average probability 0.80 over 1 classifier(s); also fits crash (took the higher level)", out)
+        self.assertEqual(len(sorted_), 2)  # the ungrounded finding never reached the classifier: one finding, once per rubric entry
+        self.assertIn("Category: injection (level: high)\nDefinition: input reaches a shell", sorted_[0][1])
+
+    def test_a_classifier_model_that_is_not_loaded_is_an_error_not_a_traceback(self):
+        data = {"rubric": [{"name": "injection", "level": "high", "score": 0.6, "definition": "input reaches a shell"}], "reviewers": [
+            {"name": "finder", "model": "model-a", "prompt": "look", "active": True, "type": ["reasoning"], "loadOnDemand": False,
+             "replyFormat": "json"},
+            {"name": "sorter", "model": "model-c", "prompt": "sort", "active": True, "type": ["classifier"], "loadOnDemand": False},
+        ]}
+        fake = FakeLmStudio(loaded=["model-a"])
+        with self._env(REVIEWERS_FILE=self._reviewers_file(data)), mock.patch.object(
+            self.mod, "ModelLoader", lambda url, **kw: ModelLoader(url, http=fake, **kw)
+        ), mock.patch.object(self.mod, "new_client", return_value=object()), mock.patch.object(
+            self.mod, "_git_diff", return_value="diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n+x\n"
+        ), mock.patch.object(self.mod, "_resolve_commit", return_value="0" * 40):
+            out = self.mod.review("classifier", {"repo_path": str(self.dir), "base_ref": "main"})
+        self.assertTrue(out.startswith("Error:"))
+        self.assertIn("'model-c'", out)
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_the_verifier_reads_the_commit_the_diff_was_cut_from_even_if_head_moves_mid_run(self):
+        # A run takes minutes on local models; another session can check out a branch meanwhile.
+        repo = self.dir / "repo"
+        repo.mkdir()
+
+        def git(*args):
+            env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull,
+                   "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+            subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, env=env)
+
+        git("init", "-q", "-b", "main")
+        (repo / "app.py").write_text("print('one')\n", encoding="utf-8")
+        git("add", "."); git("commit", "-q", "-m", "base")
+        git("checkout", "-q", "-b", "feature")
+        (repo / "app.py").write_text("print('one')\nos.system(cmd)\n", encoding="utf-8")
+        git("commit", "-q", "-am", "change")
+        shown = []
+
+        def complete(client, model, system, content):
+            if "checking ONE reported defect" in system:
+                shown.append(content)
+                return json.dumps({"verdict": "confirmed", "failing_input": "cmd='a; b'", "wrong_result": "runs b", "reasoning": "traced"})
+            git("checkout", "-q", "main")  # HEAD leaves the reviewed commit while the reasoning stage is running
+            return json.dumps({"findings": [{"file": "app.py", "line_start": 2, "line_end": 2, "class": "injection",
+                                             "claim": "shell injection", "failing_input": "cmd='a; b'", "quote": "os.system(cmd)"}]})
+
+        data = {"rubric": [], "reviewers": [
+            {"name": "finder", "model": "model-a", "prompt": "look", "active": True, "type": ["reasoning"], "loadOnDemand": False,
+             "replyFormat": "json"},
+            {"name": "checker", "model": "model-b", "prompt": "check", "active": True, "type": ["verifier"], "loadOnDemand": False},
+        ]}
+        fake = FakeLmStudio(loaded=["model-a", "model-b"])
+        with self._env(REVIEWERS_FILE=self._reviewers_file(data)), mock.patch.object(
+            self.mod, "ModelLoader", lambda url, **kw: ModelLoader(url, http=fake, **kw)
+        ), mock.patch.object(self.mod, "new_client", return_value=object()), mock.patch.object(
+            openai_lib, "complete", complete
+        ):
+            out = self.mod.review("verifier", {"repo_path": str(repo), "base_ref": "main", "head_ref": "HEAD"})
+        self.assertFalse(out.startswith("Error:"), out)
+        self.assertIn("1 confirmed, 0 disputed, 0 unchecked; dropped 0 rejected and 0 ungrounded", out)
+        self.assertEqual(len(shown), 1)
+        self.assertIn("os.system(cmd)", shown[0])
+
+    def test_a_head_ref_that_is_not_a_commit_or_looks_like_an_option_is_refused_before_any_model_runs(self):
+        for ref in ("--output=x", "no-such-ref", "a b"):
+            with self.subTest(ref=ref):
+                with self.assertRaises(self.mod.ReviewError):
+                    self.mod._resolve_commit(str(self.dir), ref)
 
     def test_the_diff_uses_standard_prefixes_whatever_the_repositorys_git_config_says(self):
         # With diff.noprefix a change to `b/auth.py` is printed as `+++ b/auth.py` and read back as `auth.py`.
@@ -446,9 +673,12 @@ class ReviewTool(unittest.TestCase):
             captured.update(base=base_ref, head=head_ref, context=context_lines)
             raise self.mod.ReviewError("stop here")
 
-        with self._env(REVIEWERS_FILE=self._reviewers_file()), mock.patch.object(self.mod, "_git_diff", fake_diff):
+        # The head is pinned for every type: the diff is cut from the commit `HEAD` named, not from the moving name.
+        with self._env(REVIEWERS_FILE=self._reviewers_file()), mock.patch.object(self.mod, "_git_diff", fake_diff), \
+                mock.patch.object(self.mod, "_resolve_commit", return_value="0" * 40) as resolve:
             out = self.mod.review("reasoning", {"repo_path": str(self.dir), "base_ref": "origin/main"})
-        self.assertEqual(captured, {"base": "origin/main", "head": "HEAD", "context": 20})
+        resolve.assert_called_once_with(str(self.dir), "HEAD")
+        self.assertEqual(captured, {"base": "origin/main", "head": "0" * 40, "context": 20})
         self.assertEqual(out, "Error: stop here")
 
 

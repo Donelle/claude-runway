@@ -1,0 +1,2 @@
+{"stages": ["verifier"], "reviewers": [
+ {"name": "verifier", "model": "deepseek-r1-distill-qwen-7b@8bit", "prompt": "You confirm a reported defect with a concrete failing input, or reject it.", "active": true, "type": ["verifier"], "loadOnDemand": true, "contextLength": 8192}]}

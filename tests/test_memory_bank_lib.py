@@ -194,15 +194,39 @@ class EnsureMemoryBankIndexesTest(_PatchRetryMixin, unittest.TestCase):
         client.get_collection.return_value = info
         mb.ensure_memory_bank_indexes(client, "col")
         created_fields = {kw["field_name"] for _, kw in client.create_payload_index.call_args_list}
-        self.assertEqual(created_fields, {mb.SOURCE_FIELD, mb.REPO_FIELD})
+        self.assertEqual(created_fields, {mb.SOURCE_FIELD, mb.REPO_FIELD, mb.SHARED_FIELD})
+
+    def test_shared_is_a_bool_index_and_the_others_stay_keyword(self):
+        # Checked against a real Qdrant: a KEYWORD index on a
+        # boolean field stores no values, so a facet over it returns nothing;
+        # a BOOL index is the one that works.
+        client = MagicMock()
+        info = MagicMock()
+        info.payload_schema = {}
+        client.get_collection.return_value = info
+        mb.ensure_memory_bank_indexes(client, "col")
+        schemas = {kw["field_name"]: kw["field_schema"] for _, kw in client.create_payload_index.call_args_list}
+        self.assertEqual(schemas[mb.SHARED_FIELD], models.PayloadSchemaType.BOOL)
+        self.assertEqual(schemas[mb.SOURCE_FIELD], models.PayloadSchemaType.KEYWORD)
+        self.assertEqual(schemas[mb.REPO_FIELD], models.PayloadSchemaType.KEYWORD)
 
     def test_skips_existing_indexes(self):
+        client = MagicMock()
+        info = MagicMock()
+        info.payload_schema = {mb.SOURCE_FIELD: MagicMock(), mb.REPO_FIELD: MagicMock(), mb.SHARED_FIELD: MagicMock()}
+        client.get_collection.return_value = info
+        mb.ensure_memory_bank_indexes(client, "col")
+        client.create_payload_index.assert_not_called()
+
+    def test_backfills_only_the_shared_index_on_a_collection_that_predates_it(self):
+        # A collection written before `shared` existed has the other two.
         client = MagicMock()
         info = MagicMock()
         info.payload_schema = {mb.SOURCE_FIELD: MagicMock(), mb.REPO_FIELD: MagicMock()}
         client.get_collection.return_value = info
         mb.ensure_memory_bank_indexes(client, "col")
-        client.create_payload_index.assert_not_called()
+        created_fields = [kw["field_name"] for _, kw in client.create_payload_index.call_args_list]
+        self.assertEqual(created_fields, [mb.SHARED_FIELD])
 
 
 class RememberPointTest(_PatchRetryMixin, unittest.TestCase):
@@ -247,6 +271,10 @@ class RememberPointTest(_PatchRetryMixin, unittest.TestCase):
         # point -- there is no window where the
         # point exists without it, unlike created_at below.
         self.assertIs(meta["pending"], True)
+
+        # Not asked to share -> stored as an explicit False, in
+        # the same initial upsert.
+        self.assertIs(meta["shared"], False)
 
         # created_at is stamped -- and pending cleared -- in a SEPARATE call
         # made AFTER the upsert above returns
@@ -305,6 +333,16 @@ class RememberPointTest(_PatchRetryMixin, unittest.TestCase):
             )
         )
         return client, result
+
+    def test_shared_true_is_stored_and_does_not_change_the_owner(self):
+        # Shared marks the memory as offered to followers; the
+        # owner (`repo`) stays the writer.
+        client, (_, _, error) = self._remember(shared=True)
+        self.assertIsNone(error)
+        _, kwargs = client.upsert.call_args
+        meta = kwargs["points"][0].payload["metadata"]
+        self.assertIs(meta["shared"], True)
+        self.assertEqual(meta["repo"], "my-project")
 
     def test_explicit_point_id_is_used_for_upsert_and_returned(self):
         # a caller-supplied ID must be used verbatim for both the
@@ -1587,6 +1625,234 @@ class FinishedPointIdsTest(_PatchRetryMixin, unittest.TestCase):
         self.assertEqual(client.retrieve.call_count, 2)
         self.assertNotIn("id0", found)
         self.assertEqual(len(found), len(ids) - 1)
+
+
+class ParseFollowReposTest(unittest.TestCase):
+    """MEMORY_BANK_FOLLOW_REPOS parsing."""
+
+    def test_unset_and_empty_follow_nothing(self):
+        for raw in (None, "", "   ", ",", " , ,"):
+            self.assertEqual(mb.parse_follow_repos(raw, "me"), ([], []), repr(raw))
+
+    def test_trims_drops_empty_entries_and_keeps_order(self):
+        self.assertEqual(mb.parse_follow_repos(" a , b,,c ,", "me"), (["a", "b", "c"], []))
+
+    def test_a_repeated_entry_counts_once(self):
+        self.assertEqual(mb.parse_follow_repos("a,b,a", "me"), (["a", "b"], []))
+
+    def test_own_id_and_general_are_ignored_and_reported(self):
+        followed, ignored = mb.parse_follow_repos("me, a, general, me", "me")
+        self.assertEqual(followed, ["a"])
+        self.assertEqual(ignored, ["me", "general"])
+
+    def test_a_missing_own_id_matches_nothing(self):
+        self.assertEqual(mb.parse_follow_repos("a,b", None), (["a", "b"], []))
+        self.assertEqual(mb.parse_follow_repos("a,general", ""), (["a"], ["general"]))
+
+    def test_own_id_is_compared_trimmed(self):
+        self.assertEqual(mb.parse_follow_repos("me", " me "), ([], ["me"]))
+
+
+class ScopeFilterFollowTest(unittest.TestCase):
+    """The follow branch of the default scope. The branch was also
+    run against a real Qdrant instance (a nested `should` Filter is OR'd with
+    the two flat conditions: own, general and a followed repo's shared points
+    come back, a followed repo's non-shared ones do not)."""
+
+    def test_no_follow_list_is_exactly_todays_filter(self):
+        base = mb._scope_filter("me", None, False)
+        for followed in (None, []):
+            self.assertEqual(mb._scope_filter("me", None, False, followed=followed), base)
+        self.assertEqual({c.match.value for c in base.should}, {"me", mb.GENERAL_REPO})
+
+    def test_follow_list_adds_one_nested_branch_to_should(self):
+        flt = mb._scope_filter("me", None, False, followed=["a", "b"])
+        self.assertEqual(len(flt.should), 3)
+        flat = [c for c in flt.should if isinstance(c, models.FieldCondition)]
+        self.assertEqual({c.match.value for c in flat}, {"me", mb.GENERAL_REPO})
+        nested = [c for c in flt.should if isinstance(c, models.Filter)]
+        self.assertEqual(len(nested), 1)
+        by_key = {c.key: c.match for c in nested[0].must}
+        self.assertEqual(set(by_key), {mb.REPO_FIELD, mb.SHARED_FIELD})
+        self.assertEqual(by_key[mb.REPO_FIELD].any, ["a", "b"])
+        self.assertIs(by_key[mb.SHARED_FIELD].value, True)
+        self.assertIsNone(nested[0].should)
+        self.assertIsNone(nested[0].must_not)
+
+    def test_the_rest_of_the_filter_is_unchanged_by_following(self):
+        plain = mb._scope_filter("me", None, False, kind="idea")
+        followed = mb._scope_filter("me", None, False, kind="idea", followed=["a"])
+        self.assertEqual(followed.must, plain.must)
+        self.assertEqual(followed.must_not, plain.must_not)
+
+    def test_explicit_repo_and_all_repos_ignore_the_follow_list(self):
+        explicit = mb._scope_filter("me", "other", False, followed=["a"])
+        self.assertIsNone(explicit.should)
+        self.assertEqual(explicit, mb._scope_filter("me", "other", False))
+        everything = mb._scope_filter("me", None, True, followed=["a"])
+        self.assertIsNone(everything.should)
+        self.assertEqual(everything, mb._scope_filter("me", None, True))
+
+    def test_kind_composes_with_the_follow_branch(self):
+        flt = mb._scope_filter("me", None, False, kind="idea", followed=["a"])
+        self.assertEqual({c.match.value for c in flt.must if c.key == mb.KIND_FIELD}, {"idea"})
+        self.assertEqual(len(flt.should), 3)
+
+    def test_the_follow_list_is_copied_not_aliased(self):
+        followed = ["a"]
+        flt = mb._scope_filter("me", None, False, followed=followed)
+        followed.append("b")
+        nested = [c for c in flt.should if isinstance(c, models.Filter)][0]
+        self.assertEqual(nested.must[0].match.any, ["a"])
+
+
+class RecallPointsFollowTest(_PatchRetryMixin, unittest.TestCase):
+    def _client(self, payload_meta):
+        client = MagicMock()
+        client.collection_exists.return_value = True
+        point = MagicMock()
+        point.id = "p"
+        point.score = 0.9
+        point.payload = {"document": "s", "metadata": payload_meta}
+        response = MagicMock()
+        response.points = [point]
+        client.query_points.return_value = response
+        return client
+
+    def test_followed_is_passed_into_the_search_filter(self):
+        client = self._client({"repo": "a", "shared": True})
+        _run(mb.recall_points(client, _make_provider(), "col", "q", caller_repo="me", followed=["a"]))
+        flt = client.query_points.call_args.kwargs["query_filter"]
+        self.assertEqual(len([c for c in flt.should if isinstance(c, models.Filter)]), 1)
+
+    def test_no_followed_argument_builds_todays_filter(self):
+        client = self._client({"repo": "me"})
+        _run(mb.recall_points(client, _make_provider(), "col", "q", caller_repo="me"))
+        flt = client.query_points.call_args.kwargs["query_filter"]
+        self.assertEqual(flt, mb._scope_filter("me", None, False))
+
+    def test_hit_reports_shared_true_only_for_a_true_flag(self):
+        for meta, expected in (
+            ({"repo": "a", "shared": True}, True),
+            ({"repo": "a", "shared": False}, False),
+            ({"repo": "a"}, False),  # written before the field existed
+            ({"repo": "a", "shared": "yes"}, False),  # not a bool: not shared
+        ):
+            client = self._client(meta)
+            hits = _run(mb.recall_points(client, _make_provider(), "col", "q", caller_repo="me"))
+            self.assertIs(hits[0]["shared"], expected, meta)
+
+
+class ReposWithoutMemoriesTest(_PatchRetryMixin, unittest.TestCase):
+    def test_reports_only_repos_with_no_finished_memory(self):
+        client = MagicMock()
+        client.collection_exists.return_value = True
+        counts = {"a": 3, "typo": 0, "b": 1}
+        client.count.side_effect = lambda collection_name, count_filter, exact: MagicMock(
+            count=counts[count_filter.must[1].match.value]
+        )
+        self.assertEqual(mb.repos_without_memories(client, "col", ["a", "typo", "b"]), ["typo"])
+
+    def test_missing_collection_reports_every_repo(self):
+        client = MagicMock()
+        client.collection_exists.return_value = False
+        self.assertEqual(mb.repos_without_memories(client, "col", ["a", "b"]), ["a", "b"])
+        client.count.assert_not_called()
+
+    def test_empty_list_asks_nothing(self):
+        client = MagicMock()
+        self.assertEqual(mb.repos_without_memories(client, "col", []), [])
+        client.count.assert_not_called()
+
+
+def _record(repo, shared=None, **extra):
+    meta = {"repo": repo, **extra}
+    if shared is not None:
+        meta["shared"] = shared
+    return MagicMock(id=f"{repo}-{shared}", payload={"metadata": meta})
+
+
+class SummarizeReposTest(_PatchRetryMixin, unittest.TestCase):
+    def _client(self, pages):
+        client = MagicMock()
+        client.collection_exists.return_value = True
+        client.scroll.side_effect = pages
+        return client
+
+    def test_missing_collection_is_none_and_nothing_is_scrolled(self):
+        client = MagicMock()
+        client.collection_exists.return_value = False
+        self.assertIsNone(mb.summarize_repos(client, "col"))
+        client.scroll.assert_not_called()
+
+    def test_counts_entries_and_shared_per_repo_across_pages(self):
+        client = self._client([
+            ([_record("a", True), _record("a", False), _record("b")], "next"),
+            ([_record("a", True), _record("c", False)], None),
+        ])
+        self.assertEqual(
+            mb.summarize_repos(client, "col"),
+            {"a": {"entries": 3, "shared": 2}, "b": {"entries": 1, "shared": 0}, "c": {"entries": 1, "shared": 0}},
+        )
+        self.assertEqual(client.scroll.call_count, 2)
+        self.assertEqual(client.scroll.call_args_list[1].kwargs["offset"], "next")
+
+    def test_a_non_bool_shared_value_does_not_count(self):
+        client = self._client([([_record("a", "true"), _record("a", 1)], None)])
+        self.assertEqual(mb.summarize_repos(client, "col"), {"a": {"entries": 2, "shared": 0}})
+
+    def test_skips_points_with_no_repo_and_odd_payloads(self):
+        odd = [MagicMock(payload=None), MagicMock(payload={}), MagicMock(payload={"metadata": "x"}),
+               MagicMock(payload={"metadata": {"repo": ""}}), MagicMock(payload={"metadata": {"repo": 5}})]
+        client = self._client([(odd + [_record("a")], None)])
+        self.assertEqual(mb.summarize_repos(client, "col"), {"a": {"entries": 1, "shared": 0}})
+
+    def test_asks_qdrant_for_only_repo_and_shared_and_excludes_pending(self):
+        client = self._client([([], None)])
+        mb.summarize_repos(client, "col")
+        kwargs = client.scroll.call_args.kwargs
+        # No memory text is ever fetched: only these two payload keys.
+        self.assertEqual(kwargs["with_payload"], [mb.REPO_FIELD, mb.SHARED_FIELD])
+        self.assertIs(kwargs["with_vectors"], False)
+        flt = kwargs["scroll_filter"]
+        self.assertEqual([(c.key, c.match.value) for c in flt.must], [(mb.SOURCE_FIELD, mb.MEMORY_BANK_SOURCE)])
+        self.assertEqual([(c.key, c.match.value) for c in flt.must_not], [(mb.PENDING_FIELD, True)])
+
+    def test_text_fields_in_the_payload_never_reach_the_result(self):
+        record = _record("a", True, description="SECRET DESCRIPTION")
+        record.payload["document"] = "SECRET SUMMARY"
+        client = self._client([([record], None)])
+        result = mb.summarize_repos(client, "col")
+        self.assertNotIn("SECRET", repr(result))
+        self.assertNotIn("SECRET", mb.format_memory_banks("col", result))
+
+
+class FormatMemoryBanksTest(unittest.TestCase):
+    def test_rows_sorted_with_sharable_counts_and_general_on_its_own_line(self):
+        text = mb.format_memory_banks("memory-bank", {
+            "zeta": {"entries": 1, "shared": 0},
+            "alpha": {"entries": 4, "shared": 2},
+            mb.GENERAL_REPO: {"entries": 3, "shared": 0},
+        })
+        self.assertEqual(
+            text.splitlines(),
+            [
+                "memory-bank",
+                "  * alpha, 4 entries, sharable: yes (2 shared)",
+                "  * zeta, 1 entry, sharable: no",
+                "  general: 3 entries (every repo already receives these)",
+            ],
+        )
+
+    def test_general_is_never_a_repo_row_and_a_shared_general_point_is_not_sharable(self):
+        text = mb.format_memory_banks("c", {mb.GENERAL_REPO: {"entries": 1, "shared": 1}})
+        self.assertNotIn("* general", text)
+        self.assertEqual(text.splitlines()[-1], "  general: 1 entry (every repo already receives these)")
+
+    def test_empty_and_missing_collections_say_so(self):
+        self.assertIn("no memories yet", mb.format_memory_banks("c", {}))
+        self.assertIn("does not exist", mb.format_memory_banks("c", None))
+        self.assertEqual(mb.format_memory_banks("c", {}).splitlines()[0], "c")
 
 
 if __name__ == "__main__":
