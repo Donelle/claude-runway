@@ -395,15 +395,6 @@ def absolute_path(raw: str, base: Optional[Path] = None) -> str:
     return str(path if path.is_absolute() else (base or Path.cwd()) / path)
 
 
-def absolutize_config(reviewers: list, rubric: list, base: Path) -> tuple:
-    """Copies of `reviewers` and `rubric` whose `promptFile` and `definitionFile` are absolute, resolved against
-    `base` (the directory of the reviewers file they came from), as `load_reviewers_file` itself would."""
-    def fix(entry: dict, key: str) -> dict:
-        return {**entry, key: absolute_path(entry[key], base)} if isinstance(entry.get(key), str) else dict(entry)
-
-    return [fix(r, "promptFile") for r in reviewers], [fix(r, "definitionFile") for r in rubric]
-
-
 def reviewer_entry(name: str, model: str, *, prompt: Optional[str], prompt_file: Optional[str], roles: tuple = ("reasoning",),
                    on_demand: bool = True, context: int = DEFAULT_CONTEXT) -> dict:
     """One `reviewers[]` entry in the reviewers-file format."""
