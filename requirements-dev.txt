@@ -1,0 +1,35 @@
+# Dev-only tooling for CONTRIBUTING to this repo -- not needed to USE the
+# toolkit (that's requirements.txt, which stays scoped to what an end user
+# installing ClaudeRunway into their own project actually needs). Install
+# after requirements.txt, in the same venv:
+#   uv pip install -r requirements-dev.txt --index-url https://pypi.org/simple
+
+# Linting -- config lives in pyproject.toml's [tool.ruff.lint]. Run with:
+#   .venv/bin/ruff check libs tools hooks tests
+ruff==0.17.4
+
+# Type checking -- replaces mypy: Pyright is also what VS
+# Code's Pylance extension runs under the hood, so the editor and this
+# repo's CI/pre-push gate now agree. Config lives in pyproject.toml's
+# [tool.pyright] -- deliberately with no venvPath/venv there (see that
+# section's own comment), so --pythonpath is required on every invocation,
+# not optional. Run with:
+#   .venv/bin/pyright --pythonpath .venv/bin/python
+pyright==1.1.414
+pytest
+
+# tests/test_pyproject.py builds a REAL wheel (via `python -m
+# build --wheel --no-isolation`) and inspects its actual contents, rather
+# than only parsing pyproject.toml's static tables -- setup.py's data_files
+# glob logic can't be pinned any other way, since it's real Python code
+# that runs at build time, not declarative TOML. `--no-isolation` reuses
+# this venv's own already-installed `setuptools`/`wheel` instead of `build`
+# creating a fresh isolated env per invocation (which would otherwise need
+# network access on every test run just to re-fetch setuptools).
+setuptools>=68
+# pyproject.toml's version is derived from the repo history by
+# setuptools-scm, so the same `--no-isolation` build needs it installed here
+# too (an isolated build would fetch it itself, but this one cannot).
+setuptools-scm>=8
+wheel
+build

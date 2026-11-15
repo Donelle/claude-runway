@@ -1,0 +1,786 @@
+#!/usr/bin/env python3
+"""Tests for mcpservers/memory_bank_mcp_server.py's tool-layer argument
+validation and tool registration.
+
+Stdlib-only (unittest, no pytest), no network -- these only cover
+validation that happens before any QdrantClient/FastEmbedProvider is ever
+constructed. Full remember/recall/forget round-trip behavior is covered by
+tests/test_memory_bank_lib.py (the underlying logic) and was additionally
+verified manually against a real Qdrant instance during development.
+
+    .venv/bin/python -m unittest discover -s tests
+"""
+
+import asyncio
+import io
+import os
+import sys
+import tempfile
+import unittest
+from contextlib import redirect_stderr
+from pathlib import Path
+from unittest import mock
+from unittest.mock import AsyncMock, MagicMock, patch
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(REPO_ROOT, "libs"))
+sys.path.insert(0, os.path.join(REPO_ROOT, "mcpservers"))
+
+# Minimal env so module-level DEFAULT_* constants don't explode on import --
+# same pattern established in test_ingest_mcp_server_tool_count.py.
+os.environ.setdefault("QDRANT_URL", "http://localhost:6333")
+os.environ.setdefault("MEMORY_BANK_ID", "test-collection")
+os.environ.setdefault("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+os.environ.setdefault("MEMORY_BANK_COLLECTION", "memory-bank")
+
+import memory_bank_mcp_server as _mbs  # noqa: E402
+import memory_bank_lib as _mb  # noqa: E402
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+# Most tests in this module call remember()/recall()/forget()
+# with tracking left at its real default (True) and don't mock
+# mev.record_memory_metric -- only MemoryMetricCounterTest below does.
+# Without a module-wide redirect, those calls fall through to the REAL
+# metrics_lib.MetricsStore(), which resolves CLAUDE_RUNWAY_METRICS_DB via
+# os.environ and, if unset, writes into the developer's own real
+# ~/.claude/claude-runway/metrics.db (a run once appended 45 real
+# "memory-bank" rows there). setUpModule/tearDownModule point the env var at
+# a throwaway temp path for the whole module, so every call in this file --
+# mocked or not -- writes into a file nothing else reads, discarded on
+# teardown. Scoped to the whole module (not per test class) because the risk
+# is any test that doesn't explicitly mock record_memory_metric.
+_metrics_db_tmpdir: tempfile.TemporaryDirectory
+_metrics_db_env_patch: "mock._patch_dict"
+
+
+def setUpModule():
+    # CLAUDE_RUNWAY_MEMORY_EVENTS_DB is redirected here too, for
+    # the same reason as metrics.db above. Tests that patch tracking_enabled
+    # to True without also mocking mev.record_memory_event (e.g.
+    # MemoryMetricCounterTest) fall through to the REAL rich-event writer,
+    # which polluted a real memory-events.db with fake rows and skewed the
+    # baseline report (tools/memory_bank_report.py) that reads that file.
+    global _metrics_db_tmpdir, _metrics_db_env_patch
+    _metrics_db_tmpdir = tempfile.TemporaryDirectory()
+    db_path = Path(_metrics_db_tmpdir.name) / "metrics.db"
+    events_db_path = Path(_metrics_db_tmpdir.name) / "memory-events.db"
+    _metrics_db_env_patch = mock.patch.dict(
+        os.environ,
+        {"CLAUDE_RUNWAY_METRICS_DB": str(db_path), "CLAUDE_RUNWAY_MEMORY_EVENTS_DB": str(events_db_path)},
+    )
+    _metrics_db_env_patch.start()
+
+
+def tearDownModule():
+    _metrics_db_env_patch.stop()
+    _metrics_db_tmpdir.cleanup()
+
+
+class ModuleDbRedirectTest(unittest.TestCase):
+    def test_memory_events_db_is_redirected_away_from_the_real_file(self):
+        # Without this redirect, unmocked tracking
+        # calls in this module wrote into the developer's real
+        # ~/.claude/claude-runway/memory-events.db.
+        resolved = _mbs.mev.resolve_db_path()
+        self.assertTrue(str(resolved).startswith(_metrics_db_tmpdir.name), resolved)
+
+
+class ForgetArgumentValidationTest(unittest.TestCase):
+    def test_neither_point_id_nor_wipe_all_is_an_error(self):
+        result = _mbs.forget()
+        self.assertIn("Error", result)
+
+    def test_both_point_id_and_wipe_all_is_an_error(self):
+        result = _mbs.forget(point_id="some-id", wipe_all=True)
+        self.assertIn("Error", result)
+
+    def test_wipe_all_false_with_no_point_id_is_an_error(self):
+        result = _mbs.forget(point_id=None, wipe_all=False)
+        self.assertIn("Error", result)
+
+
+class RecallNonexistentCollectionTest(unittest.TestCase):
+    def test_returns_immediately_without_calling_recall_points(self):
+        # Regression for a review finding (previously-suppressed finding): when
+        # the collection doesn't exist yet, recall must return directly
+        # rather than falling through to mb.recall_points, which does its
+        # OWN separate collection_exists check -- a concurrent remember()
+        # could create the collection under a different embedding model in
+        # that gap, making recall_points proceed past its own check and hit
+        # an opaque query_points failure instead of a clean result.
+        fake_client = MagicMock()
+        fake_client.collection_exists.return_value = False
+        with patch("memory_bank_mcp_server.QdrantClient", return_value=fake_client), \
+             patch.object(_mb, "recall_points") as mock_recall_points:
+            result = _run(_mbs.recall(query="anything"))
+        self.assertIn("No memories found", result)
+        mock_recall_points.assert_not_called()
+
+    def test_does_not_construct_embedding_provider_when_collection_is_missing(self):
+        # Regression for a review finding (second pass, previously-suppressed
+        # finding): FastEmbedProvider's constructor eagerly loads/downloads
+        # the ONNX model (TextEmbedding's default lazy_load=False) -- a
+        # recall against a not-yet-existing collection must never pay for
+        # that just to return "no results."
+        fake_client = MagicMock()
+        fake_client.collection_exists.return_value = False
+        with patch("memory_bank_mcp_server.QdrantClient", return_value=fake_client), \
+             patch("memory_bank_mcp_server.FastEmbedProvider") as mock_provider_cls:
+            _run(_mbs.recall(query="anything"))
+        mock_provider_cls.assert_not_called()
+
+
+class CollectionOverrideRemovedTest(unittest.TestCase):
+    """Regression: remember/recall/forget used to accept a
+    caller-controlled `collection` kwarg with no validation, letting a call
+    write/read/delete memory-bank points in a collection other than the one
+    configured via MEMORY_BANK_COLLECTION -- bypassing index_repo/sync_repo's
+    reserved-collection guard, which only ever checks the configured name.
+    The fix removes the parameter entirely rather than validating it, so a
+    caller-supplied `collection` must now be rejected at the call boundary."""
+
+    def test_remember_rejects_collection_kwarg(self):
+        with self.assertRaises(TypeError):
+            _mbs.remember(summary="s", description="d", kind="k", collection="other")
+
+    def test_recall_rejects_collection_kwarg(self):
+        with self.assertRaises(TypeError):
+            _mbs.recall(query="anything", collection="other")
+
+    def test_forget_rejects_collection_kwarg(self):
+        with self.assertRaises(TypeError):
+            _mbs.forget(point_id="some-id", collection="other")
+
+
+class MemoryEventLoggingTest(unittest.TestCase):
+    """remember()/recall() log a memory-events row via
+    memory_events_lib, guarded by its own tracking_enabled() switch --
+    entirely separate from the point_id/description content itself."""
+
+    def test_remember_logs_one_event_when_tracking_enabled(self):
+        with patch("memory_bank_mcp_server.QdrantClient"), \
+             patch("memory_bank_mcp_server.FastEmbedProvider"), \
+             patch.object(_mb, "remember_point", new=AsyncMock(return_value=("new-id", 1700000000.0, None))), \
+             patch.object(_mbs.mev, "tracking_enabled", return_value=True), \
+             patch.object(_mbs.mev, "record_memory_event") as mock_record:
+            result = _run(_mbs.remember(summary="s", description="d", kind="lesson"))
+        self.assertIn("Remembered", result)
+        mock_record.assert_called_once()
+        _, kwargs = mock_record.call_args
+        self.assertEqual(kwargs["event_type"], "remember")
+        self.assertEqual(kwargs["point_id"], "new-id")
+        self.assertEqual(kwargs["kind"], "lesson")
+        # summary_created_at must be the EXACT
+        # value remember_point stamped/returned, not a re-sampled time.time().
+        self.assertEqual(kwargs["summary_created_at"], 1700000000.0)
+
+    def test_remember_does_not_log_when_tracking_disabled(self):
+        with patch("memory_bank_mcp_server.QdrantClient"), \
+             patch("memory_bank_mcp_server.FastEmbedProvider"), \
+             patch.object(_mb, "remember_point", new=AsyncMock(return_value=("new-id", 1700000000.0, None))), \
+             patch.object(_mbs.mev, "tracking_enabled", return_value=False), \
+             patch.object(_mbs.mev, "record_memory_event") as mock_record:
+            _run(_mbs.remember(summary="s", description="d", kind="lesson"))
+        mock_record.assert_not_called()
+
+    def test_remember_does_not_log_on_embedding_mismatch(self):
+        # A mismatch means nothing was actually written -- there is no real
+        # memory event to log.
+        with patch("memory_bank_mcp_server.QdrantClient"), \
+             patch("memory_bank_mcp_server.FastEmbedProvider"), \
+             patch.object(_mb, "remember_point", new=AsyncMock(return_value=(None, None, "Error: mismatch"))), \
+             patch.object(_mbs.mev, "tracking_enabled", return_value=True), \
+             patch.object(_mbs.mev, "record_memory_event") as mock_record:
+            result = _run(_mbs.remember(summary="s", description="d", kind="lesson"))
+        self.assertIn("Error", result)
+        mock_record.assert_not_called()
+
+    def test_remember_advances_turn_even_on_embedding_mismatch(self):
+        # Regression for a review finding: turn must be consumed for every
+        # invocation, including ones that end up not logging anything --
+        # otherwise a later successful call's turn number understates how
+        # many memory-bank calls actually happened this session.
+        with patch("memory_bank_mcp_server.QdrantClient"), \
+             patch("memory_bank_mcp_server.FastEmbedProvider"), \
+             patch.object(_mb, "remember_point", new=AsyncMock(return_value=(None, None, "Error: mismatch"))), \
+             patch.object(_mbs.mev, "tracking_enabled", return_value=True):
+            turn_before = _mbs._next_turn()
+            _run(_mbs.remember(summary="s", description="d", kind="lesson"))
+            turn_after = _mbs._next_turn()
+        # Two _next_turn() calls plus one remember() call in between should
+        # advance the counter by 3 total steps from turn_before to turn_after.
+        self.assertEqual(turn_after, turn_before + 2)
+
+    def _recall_setup(self, results):
+        fake_client = MagicMock()
+        fake_client.collection_exists.return_value = True
+        return patch("memory_bank_mcp_server.QdrantClient", return_value=fake_client), \
+            patch("memory_bank_mcp_server.check_embedding_model_mismatch", return_value=None), \
+            patch("memory_bank_mcp_server.FastEmbedProvider"), \
+            patch.object(_mb, "recall_points", new=AsyncMock(return_value=results))
+
+    def test_recall_logs_one_event_per_hit_sharing_a_turn(self):
+        results = [
+            {"id": "p1", "summary": "s1", "description": "d1", "kind": "lesson", "repo": "proj-a",
+             "embedding_model": "m", "score": 0.9, "created_at": 111.0},
+            {"id": "p2", "summary": "s2", "description": "d2", "kind": "idea", "repo": "proj-a",
+             "embedding_model": "m", "score": 0.8, "created_at": 222.0},
+        ]
+        p1, p2, p3, p4 = self._recall_setup(results)
+        with p1, p2, p3, p4, \
+             patch.object(_mbs.mev, "tracking_enabled", return_value=True), \
+             patch.object(_mbs.mev, "record_memory_event") as mock_record:
+            _run(_mbs.recall(query="anything"))
+        self.assertEqual(mock_record.call_count, 2)
+        calls = mock_record.call_args_list
+        turns = {c.kwargs["turn"] for c in calls}
+        self.assertEqual(len(turns), 1)  # both hits share the same turn
+        self.assertEqual(calls[0].kwargs["event_type"], "recall")
+        self.assertEqual(calls[0].kwargs["point_id"], "p1")
+        self.assertEqual(calls[0].kwargs["summary_created_at"], 111.0)
+        self.assertEqual(calls[1].kwargs["point_id"], "p2")
+
+    def test_recall_does_not_log_when_tracking_disabled(self):
+        results = [{"id": "p1", "summary": "s1", "description": "d1", "kind": "lesson",
+                    "repo": "proj-a", "embedding_model": "m", "score": 0.9, "created_at": 111.0}]
+        p1, p2, p3, p4 = self._recall_setup(results)
+        with p1, p2, p3, p4, \
+             patch.object(_mbs.mev, "tracking_enabled", return_value=False), \
+             patch.object(_mbs.mev, "record_memory_event") as mock_record:
+            _run(_mbs.recall(query="anything"))
+        mock_record.assert_not_called()
+
+    def test_recall_does_not_log_when_no_results(self):
+        p1, p2, p3, p4 = self._recall_setup([])
+        with p1, p2, p3, p4, \
+             patch.object(_mbs.mev, "tracking_enabled", return_value=True), \
+             patch.object(_mbs.mev, "record_memory_event") as mock_record:
+            _run(_mbs.recall(query="anything"))
+        mock_record.assert_not_called()
+
+    def test_recall_advances_turn_even_when_no_results(self):
+        # Regression for a review finding: an empty recall still consumed a
+        # turn number -- it was a real memory-bank call, even though nothing
+        # gets logged for it.
+        p1, p2, p3, p4 = self._recall_setup([])
+        with p1, p2, p3, p4, \
+             patch.object(_mbs.mev, "tracking_enabled", return_value=True):
+            turn_before = _mbs._next_turn()
+            _run(_mbs.recall(query="anything"))
+            turn_after = _mbs._next_turn()
+        self.assertEqual(turn_after, turn_before + 2)
+
+
+class MemoryMetricCounterTest(unittest.TestCase):
+    """remember()/recall()/forget() all call
+    mev.record_memory_metric(...) -- a plain per-call-attempt tally into
+    metrics.db, entirely separate from mev.record_memory_event's own rich
+    per-point memory-events.db log covered by MemoryEventLoggingTest above.
+    Counts every call ATTEMPT, including a validation error / embedding
+    mismatch / empty result, not just a successful remember/recall/forget."""
+
+    def test_remember_counts_even_on_invalid_weight(self):
+        # Regression-shaped: an invalid weight returns an Error before any
+        # Qdrant/embedding-provider work, but the call still happened.
+        with patch("memory_bank_mcp_server.QdrantClient") as mock_client_cls, \
+             patch.object(_mbs.mev, "tracking_enabled", return_value=True), \
+             patch.object(_mbs.mev, "record_memory_metric") as mock_metric:
+            result = _run(_mbs.remember(summary="s", description="d", kind="lesson", weight=-1.0))
+        self.assertIn("Error", result)
+        mock_metric.assert_called_once_with("remember", session_id=_mbs._SESSION_ID)
+        mock_client_cls.assert_not_called()
+
+    def test_remember_counts_on_embedding_mismatch(self):
+        with patch("memory_bank_mcp_server.QdrantClient"), \
+             patch("memory_bank_mcp_server.FastEmbedProvider"), \
+             patch.object(_mb, "remember_point", new=AsyncMock(return_value=(None, None, "Error: mismatch"))), \
+             patch.object(_mbs.mev, "tracking_enabled", return_value=True), \
+             patch.object(_mbs.mev, "record_memory_metric") as mock_metric:
+            _run(_mbs.remember(summary="s", description="d", kind="lesson"))
+        mock_metric.assert_called_once_with("remember", session_id=_mbs._SESSION_ID)
+
+    def test_remember_does_not_count_when_tracking_disabled(self):
+        with patch("memory_bank_mcp_server.QdrantClient"), \
+             patch("memory_bank_mcp_server.FastEmbedProvider"), \
+             patch.object(_mb, "remember_point", new=AsyncMock(return_value=("new-id", 1700000000.0, None))), \
+             patch.object(_mbs.mev, "tracking_enabled", return_value=False), \
+             patch.object(_mbs.mev, "record_memory_metric") as mock_metric:
+            _run(_mbs.remember(summary="s", description="d", kind="lesson"))
+        mock_metric.assert_not_called()
+
+    def test_recall_counts_on_missing_collection(self):
+        fake_client = MagicMock()
+        fake_client.collection_exists.return_value = False
+        with patch("memory_bank_mcp_server.QdrantClient", return_value=fake_client), \
+             patch.object(_mbs.mev, "tracking_enabled", return_value=True), \
+             patch.object(_mbs.mev, "record_memory_metric") as mock_metric:
+            result = _run(_mbs.recall(query="anything"))
+        self.assertIn("No memories found", result)
+        mock_metric.assert_called_once_with("recall", session_id=_mbs._SESSION_ID)
+
+    def test_recall_counts_once_even_with_multiple_hits(self):
+        # Unlike record_memory_event (one row per hit), record_memory_metric
+        # is a per-CALL tally -- exactly one call regardless of hit count.
+        results = [
+            {"id": "p1", "summary": "s1", "description": "d1", "kind": "lesson", "repo": "proj-a",
+             "embedding_model": "m", "score": 0.9, "created_at": 111.0},
+            {"id": "p2", "summary": "s2", "description": "d2", "kind": "idea", "repo": "proj-a",
+             "embedding_model": "m", "score": 0.8, "created_at": 222.0},
+        ]
+        fake_client = MagicMock()
+        fake_client.collection_exists.return_value = True
+        with patch("memory_bank_mcp_server.QdrantClient", return_value=fake_client), \
+             patch("memory_bank_mcp_server.check_embedding_model_mismatch", return_value=None), \
+             patch("memory_bank_mcp_server.FastEmbedProvider"), \
+             patch.object(_mb, "recall_points", new=AsyncMock(return_value=results)), \
+             patch.object(_mbs.mev, "tracking_enabled", return_value=True), \
+             patch.object(_mbs.mev, "record_memory_metric") as mock_metric:
+            _run(_mbs.recall(query="anything"))
+        mock_metric.assert_called_once_with("recall", session_id=_mbs._SESSION_ID)
+
+    def test_recall_does_not_count_when_tracking_disabled(self):
+        fake_client = MagicMock()
+        fake_client.collection_exists.return_value = False
+        with patch("memory_bank_mcp_server.QdrantClient", return_value=fake_client), \
+             patch.object(_mbs.mev, "tracking_enabled", return_value=False), \
+             patch.object(_mbs.mev, "record_memory_metric") as mock_metric:
+            _run(_mbs.recall(query="anything"))
+        mock_metric.assert_not_called()
+
+    def test_forget_counts_even_on_validation_error(self):
+        # Neither point_id nor wipe_all -- a validation error, but the call
+        # still happened and must still count.
+        with patch.object(_mbs.mev, "tracking_enabled", return_value=True), \
+             patch.object(_mbs.mev, "record_memory_metric") as mock_metric:
+            result = _mbs.forget()
+        self.assertIn("Error", result)
+        mock_metric.assert_called_once_with("forget", session_id=_mbs._SESSION_ID)
+
+    def test_forget_counts_on_ordinary_call(self):
+        with patch("memory_bank_mcp_server.QdrantClient"), \
+             patch.object(_mb, "forget_point", return_value="Deleted."), \
+             patch.object(_mbs.mev, "tracking_enabled", return_value=True), \
+             patch.object(_mbs.mev, "record_memory_metric") as mock_metric:
+            _mbs.forget(point_id="some-id")
+        mock_metric.assert_called_once_with("forget", session_id=_mbs._SESSION_ID)
+
+    def test_forget_does_not_count_when_tracking_disabled(self):
+        with patch.object(_mbs.mev, "tracking_enabled", return_value=False), \
+             patch.object(_mbs.mev, "record_memory_metric") as mock_metric:
+            _mbs.forget()
+        mock_metric.assert_not_called()
+
+
+class RememberWeightValidationTest(unittest.TestCase):
+    """a negative weight actively breaks recall_points'
+    ranking invariant (weight=0 must be a true floor, weight>1 must only
+    ever boost -- both assume weight>=0), so it's rejected at the tool
+    boundary before any Qdrant/embedding-provider work happens."""
+
+    def test_negative_weight_rejected_without_constructing_client(self):
+        with patch("memory_bank_mcp_server.QdrantClient") as mock_client_cls, \
+             patch("memory_bank_mcp_server.FastEmbedProvider") as mock_provider_cls, \
+             patch.object(_mb, "remember_point") as mock_remember:
+            result = _run(_mbs.remember(summary="s", description="d", kind="lesson", weight=-1.0))
+        self.assertIn("Error", result)
+        mock_client_cls.assert_not_called()
+        mock_provider_cls.assert_not_called()
+        mock_remember.assert_not_called()
+
+    def test_positive_infinity_weight_rejected(self):
+        # Regression for a review finding (second pass): float("inf") < 0 is
+        # False in Python, so `inf` (reachable from ordinary JSON-RPC input,
+        # e.g. the JSON literal 1e999 parses to inf) silently bypassed a
+        # `weight < 0`-only check -- it must be caught by a finiteness check
+        # too, not just negativity.
+        with patch("memory_bank_mcp_server.QdrantClient") as mock_client_cls, \
+             patch.object(_mb, "remember_point") as mock_remember:
+            result = _run(_mbs.remember(summary="s", description="d", kind="lesson", weight=float("inf")))
+        self.assertIn("Error", result)
+        mock_client_cls.assert_not_called()
+        mock_remember.assert_not_called()
+
+    def test_nan_weight_rejected(self):
+        # Regression for a review finding (second pass): float("nan") < 0 is
+        # ALSO False in Python (every comparison with NaN is False), so NaN
+        # silently bypassed a `weight < 0`-only check too, and would have
+        # made sort() ordering in recall_points undefined.
+        with patch("memory_bank_mcp_server.QdrantClient") as mock_client_cls, \
+             patch.object(_mb, "remember_point") as mock_remember:
+            result = _run(_mbs.remember(summary="s", description="d", kind="lesson", weight=float("nan")))
+        self.assertIn("Error", result)
+        mock_client_cls.assert_not_called()
+        mock_remember.assert_not_called()
+
+    def test_zero_weight_is_allowed(self):
+        with patch("memory_bank_mcp_server.QdrantClient"), \
+             patch("memory_bank_mcp_server.FastEmbedProvider"), \
+             patch.object(_mb, "remember_point", new=AsyncMock(return_value=("new-id", 1700000000.0, None))):
+            result = _run(_mbs.remember(summary="s", description="d", kind="lesson", weight=0.0))
+        self.assertIn("Remembered", result)
+
+
+class RememberWeightPassthroughTest(unittest.TestCase):
+    """remember()'s weight param must reach mb.remember_point
+    unchanged, defaulting to mb.DEFAULT_WEIGHT (1.0) when not given."""
+
+    def test_default_weight_passed_through(self):
+        with patch("memory_bank_mcp_server.QdrantClient"), \
+             patch("memory_bank_mcp_server.FastEmbedProvider"), \
+             patch.object(_mb, "remember_point", new=AsyncMock(return_value=("new-id", 1700000000.0, None))) as mock_remember, \
+             patch.object(_mbs.mev, "tracking_enabled", return_value=False):
+            result = _run(_mbs.remember(summary="s", description="d", kind="lesson"))
+        _, kwargs = mock_remember.call_args
+        self.assertEqual(kwargs["weight"], _mb.DEFAULT_WEIGHT)
+        self.assertIn(f"weight={_mb.DEFAULT_WEIGHT}", result)
+
+    def test_explicit_weight_passed_through(self):
+        with patch("memory_bank_mcp_server.QdrantClient"), \
+             patch("memory_bank_mcp_server.FastEmbedProvider"), \
+             patch.object(_mb, "remember_point", new=AsyncMock(return_value=("new-id", 1700000000.0, None))) as mock_remember, \
+             patch.object(_mbs.mev, "tracking_enabled", return_value=False):
+            result = _run(_mbs.remember(summary="s", description="d", kind="lesson", weight=2.0))
+        _, kwargs = mock_remember.call_args
+        self.assertEqual(kwargs["weight"], 2.0)
+        self.assertIn("weight=2.0", result)
+
+
+class SessionIdDelegatesToSessionIdLibTest(unittest.TestCase):
+    """_SESSION_ID must come from libs/session_id_lib.py's
+    SessionIdStrategy.PROXY rather than this module minting its
+    own uuid.uuid4().hex -- pure dedup, no behavior change. Asserting on the
+    exact cached value (not just "looks like a uuid hex string") is what
+    actually proves delegation happened: session_id_lib's PROXY strategy
+    caches one uuid.uuid4().hex per process (see its own module docstring),
+    so a second call to session_id(PROXY) within this same test process must
+    return the SAME value _mbs._SESSION_ID was set to at import time -- a
+    module that still generated its own independent uuid would fail this
+    even though both values are equally uuid-hex-shaped."""
+
+    def test_session_id_matches_shared_proxy_strategy(self):
+        import session_id_lib as sid
+        self.assertEqual(_mbs._SESSION_ID, sid.session_id(sid.SessionIdStrategy.PROXY))
+
+    def test_session_id_is_a_uuid4_hex_string(self):
+        # Same shape the old uuid.uuid4().hex call produced -- confirms the
+        # switch didn't change what downstream memory_events_lib rows store.
+        self.assertRegex(_mbs._SESSION_ID, r"^[0-9a-f]{32}$")
+
+
+class TransferMemoriesToolTest(unittest.TestCase):
+    """transfer_memories' tool-layer wiring. The transfer logic
+    itself is covered by test_memory_bank_lib.py's TransferPointsTest."""
+
+    def _fake_report(self, dry_run=True):
+        bucket = "would_migrate" if dry_run else "migrated"
+        return {"source_collection": "legacy", "target_collection": "memory-bank", "dry_run": dry_run,
+                bucket: {"general": 0, "project": 0}, "skipped_foreign_repo": {},
+                "already_present": 0, "errors": []}
+
+    def test_dry_run_is_the_default_and_builds_no_embedding_provider(self):
+        with patch("memory_bank_mcp_server.QdrantClient"), \
+             patch("memory_bank_mcp_server.FastEmbedProvider") as mock_provider_cls, \
+             patch.object(_mb, "transfer_points", new=AsyncMock(return_value=self._fake_report())) as mock_transfer:
+            result = _run(_mbs.transfer_memories(source_collection="legacy"))
+        mock_provider_cls.assert_not_called()
+        kwargs = mock_transfer.call_args.kwargs
+        self.assertIs(kwargs["dry_run"], True)
+        self.assertEqual(kwargs["source"], "legacy")
+        self.assertEqual(kwargs["target"], _mbs.DEFAULT_MEMORY_BANK_COLLECTION)
+        self.assertEqual(kwargs["caller_repo"], _mbs.DEFAULT_MEMORY_BANK_ID)
+        self.assertIsNone(mock_transfer.call_args.args[1])
+        report = __import__("json").loads(result)
+        self.assertEqual(report["caller_repo"], _mbs.DEFAULT_MEMORY_BANK_ID)
+        self.assertIn("would_migrate", report)
+
+    def test_real_run_builds_embedding_provider(self):
+        with patch("memory_bank_mcp_server.QdrantClient"), \
+             patch("memory_bank_mcp_server.FastEmbedProvider") as mock_provider_cls, \
+             patch.object(_mb, "transfer_points", new=AsyncMock(return_value=self._fake_report(False))) as mock_transfer:
+            _run(_mbs.transfer_memories(source_collection="legacy", dry_run=False))
+        mock_provider_cls.assert_called_once_with(_mbs.DEFAULT_EMBEDDING_MODEL)
+        self.assertIs(mock_transfer.call_args.kwargs["dry_run"], False)
+
+    def test_connection_overrides_reach_the_client(self):
+        with patch("memory_bank_mcp_server.QdrantClient") as mock_client_cls, \
+             patch.object(_mb, "transfer_points", new=AsyncMock(return_value=self._fake_report())):
+            _run(_mbs.transfer_memories(source_collection="legacy", qdrant_url="http://other:6333", qdrant_api_key="k"))
+        mock_client_cls.assert_called_once_with(url="http://other:6333", api_key="k")
+
+    def test_default_key_not_sent_to_an_overridden_url(self):
+        # qdrant_url is tool input, so the configured key must
+        # not follow it to another host.
+        with patch.object(_mbs, "DEFAULT_QDRANT_API_KEY", "secret"), \
+             patch("memory_bank_mcp_server.QdrantClient") as mock_client_cls, \
+             patch.object(_mb, "transfer_points", new=AsyncMock(return_value=self._fake_report())):
+            _run(_mbs.transfer_memories(source_collection="legacy", qdrant_url="http://elsewhere:6333"))
+        mock_client_cls.assert_called_once_with(url="http://elsewhere:6333", api_key=None)
+
+    def test_default_key_used_for_the_default_url(self):
+        with patch.object(_mbs, "DEFAULT_QDRANT_API_KEY", "secret"), \
+             patch("memory_bank_mcp_server.QdrantClient") as mock_client_cls, \
+             patch.object(_mb, "transfer_points", new=AsyncMock(return_value=self._fake_report())):
+            _run(_mbs.transfer_memories(source_collection="legacy"))
+            _run(_mbs.transfer_memories(source_collection="legacy", qdrant_url=_mbs.DEFAULT_QDRANT_URL))
+        for c in mock_client_cls.call_args_list:
+            self.assertEqual(c.kwargs, {"url": _mbs.DEFAULT_QDRANT_URL, "api_key": "secret"})
+
+    def test_misconfigured_memory_bank_id_returns_error_before_any_client(self):
+        with patch.object(_mbs, "DEFAULT_MEMORY_BANK_ID", None), \
+             patch("memory_bank_mcp_server.QdrantClient") as mock_client_cls, \
+             patch.object(_mb, "transfer_points", new=AsyncMock()) as mock_transfer:
+            result = _run(_mbs.transfer_memories(source_collection="legacy", dry_run=False))
+        # JSON like every other outcome, not bare text.
+        report = __import__("json").loads(result)
+        self.assertIn("MEMORY_BANK_ID", report["error"])
+        self.assertEqual(report["source_collection"], "legacy")
+        mock_client_cls.assert_not_called()
+        mock_transfer.assert_not_called()
+
+    def test_source_collection_is_required(self):
+        with self.assertRaises(TypeError):
+            _mbs.transfer_memories()  # type: ignore[call-arg]
+
+
+class CopyMemoriesToolTest(unittest.TestCase):
+    """copy_memories' tool-layer wiring. The copy logic itself is
+    covered by test_memory_bank_lib.py's CopyPointsTest."""
+
+    @staticmethod
+    def _fake_report(dry_run=True):
+        return {"collection": "memory-bank", "source_repo": "proj-b", "target_repo": "x", "kind": "all",
+                "dry_run": dry_run, ("would_copy" if dry_run else "copied"): 0,
+                "already_present": 0, "memories": [], "errors": []}
+
+    def test_dry_run_is_the_default_and_builds_no_embedding_provider(self):
+        with patch("memory_bank_mcp_server.QdrantClient"), \
+             patch("memory_bank_mcp_server.FastEmbedProvider") as mock_provider_cls, \
+             patch.object(_mb, "copy_points", new=AsyncMock(return_value=self._fake_report())) as mock_copy:
+            result = _run(_mbs.copy_memories(source_repo="proj-b"))
+        mock_provider_cls.assert_not_called()
+        kwargs = mock_copy.call_args.kwargs
+        self.assertIs(kwargs["dry_run"], True)
+        self.assertEqual(kwargs["source_repo"], "proj-b")
+        self.assertIsNone(kwargs["kind"])  # "all" reaches the lib as no kind filter
+        self.assertEqual(mock_copy.call_args.args[2], _mbs.DEFAULT_MEMORY_BANK_COLLECTION)
+        self.assertIsNone(mock_copy.call_args.args[1])
+        self.assertIn("would_copy", __import__("json").loads(result))
+
+    def test_target_is_always_this_projects_own_repo(self):
+        with patch("memory_bank_mcp_server.QdrantClient"), \
+             patch.object(_mb, "copy_points", new=AsyncMock(return_value=self._fake_report())) as mock_copy:
+            _run(_mbs.copy_memories(source_repo="proj-b"))
+        self.assertEqual(mock_copy.call_args.kwargs["caller_repo"], _mbs.DEFAULT_MEMORY_BANK_ID)
+
+    def test_has_no_parameter_that_could_name_another_target(self):
+        import inspect
+        self.assertEqual(
+            list(inspect.signature(_mbs.copy_memories).parameters), ["source_repo", "kind", "dry_run"]
+        )
+
+    def test_real_run_builds_embedding_provider(self):
+        with patch("memory_bank_mcp_server.QdrantClient"), \
+             patch("memory_bank_mcp_server.FastEmbedProvider") as mock_provider_cls, \
+             patch.object(_mb, "copy_points", new=AsyncMock(return_value=self._fake_report(False))) as mock_copy:
+            _run(_mbs.copy_memories(source_repo="proj-b", dry_run=False))
+        mock_provider_cls.assert_called_once_with(_mbs.DEFAULT_EMBEDDING_MODEL)
+        self.assertIs(mock_copy.call_args.kwargs["dry_run"], False)
+
+    def test_one_kind_reaches_the_lib_stripped(self):
+        with patch("memory_bank_mcp_server.QdrantClient"), \
+             patch.object(_mb, "copy_points", new=AsyncMock(return_value=self._fake_report())) as mock_copy:
+            _run(_mbs.copy_memories(source_repo="proj-b", kind=" lesson "))
+        self.assertEqual(mock_copy.call_args.kwargs["kind"], "lesson")
+
+    def test_empty_kind_is_an_error_before_any_client(self):
+        with patch("memory_bank_mcp_server.QdrantClient") as mock_client_cls, \
+             patch.object(_mb, "copy_points", new=AsyncMock()) as mock_copy:
+            result = _run(_mbs.copy_memories(source_repo="proj-b", kind="  "))
+        self.assertIn("kind", __import__("json").loads(result)["error"])
+        mock_client_cls.assert_not_called()
+        mock_copy.assert_not_called()
+
+    def test_misconfigured_memory_bank_id_returns_error_before_any_client(self):
+        with patch.object(_mbs, "DEFAULT_MEMORY_BANK_ID", None), \
+             patch("memory_bank_mcp_server.QdrantClient") as mock_client_cls, \
+             patch.object(_mb, "copy_points", new=AsyncMock()) as mock_copy:
+            result = _run(_mbs.copy_memories(source_repo="proj-b", dry_run=False))
+        report = __import__("json").loads(result)
+        self.assertIn("MEMORY_BANK_ID", report["error"])
+        self.assertEqual(report["source_repo"], "proj-b")
+        mock_client_cls.assert_not_called()
+        mock_copy.assert_not_called()
+
+    def test_general_memory_bank_id_is_refused(self):
+        # resolve_repo refuses a project whose own id is the reserved sentinel.
+        with patch.object(_mbs, "DEFAULT_MEMORY_BANK_ID", _mb.GENERAL_REPO), \
+             patch("memory_bank_mcp_server.QdrantClient"), \
+             patch.object(_mb, "copy_points", new=AsyncMock()) as mock_copy:
+            result = _run(_mbs.copy_memories(source_repo="proj-b"))
+        self.assertIn("error", __import__("json").loads(result))
+        mock_copy.assert_not_called()
+
+    def test_source_repo_is_required(self):
+        with self.assertRaises(TypeError):
+            _mbs.copy_memories()  # type: ignore[call-arg]
+
+
+class RememberSharedToolTest(unittest.TestCase):
+    """`remember(shared=...)` at the tool layer."""
+
+    def _remember(self, **kwargs):
+        with patch("memory_bank_mcp_server.QdrantClient"), \
+             patch("memory_bank_mcp_server.FastEmbedProvider"), \
+             patch.object(_mb, "remember_point", new=AsyncMock(return_value=("new-id", 1.0, None))) as mock_rp, \
+             patch.object(_mbs.mev, "tracking_enabled", return_value=False):
+            result = _run(_mbs.remember(summary="s", description="d", kind="lesson", **kwargs))
+        return result, mock_rp
+
+    def test_shared_defaults_to_false(self):
+        result, mock_rp = self._remember()
+        self.assertIs(mock_rp.call_args.kwargs["shared"], False)
+        self.assertNotIn("shared", result)
+
+    def test_shared_true_reaches_the_lib_and_is_acknowledged(self):
+        result, mock_rp = self._remember(shared=True)
+        self.assertIs(mock_rp.call_args.kwargs["shared"], True)
+        self.assertEqual(mock_rp.call_args.kwargs["repo"], _mbs.DEFAULT_MEMORY_BANK_ID)  # the owner is unchanged
+        self.assertIn("shared=True", result)
+
+    def test_shared_with_general_is_an_error_before_any_client(self):
+        with patch("memory_bank_mcp_server.QdrantClient") as mock_client_cls, \
+             patch.object(_mb, "remember_point", new=AsyncMock()) as mock_rp:
+            result = _run(_mbs.remember(summary="s", description="d", kind="k", general=True, shared=True))
+        self.assertIn("Error", result)
+        self.assertIn("general", result)
+        mock_client_cls.assert_not_called()
+        mock_rp.assert_not_called()
+
+    def test_docstring_says_it_is_not_access_control(self):
+        doc = _mbs.remember.__doc__ or ""
+        self.assertIn("shared", doc)
+        self.assertIn("NOT access control", doc)
+
+
+class RecallFollowToolTest(unittest.TestCase):
+    """`recall`'s default scope follows MEMORY_BANK_FOLLOW_REPOS."""
+
+    def _recall(self, follow, results, *, missing=(), **kwargs):
+        fake_client = MagicMock()
+        fake_client.collection_exists.return_value = True
+        with patch.object(_mbs, "DEFAULT_MEMORY_BANK_FOLLOW_REPOS", follow), \
+             patch("memory_bank_mcp_server.QdrantClient", return_value=fake_client), \
+             patch("memory_bank_mcp_server.check_embedding_model_mismatch", return_value=None), \
+             patch("memory_bank_mcp_server.FastEmbedProvider"), \
+             patch.object(_mbs.mev, "tracking_enabled", return_value=False), \
+             patch.object(_mb, "repos_without_memories", return_value=list(missing)) as mock_missing, \
+             patch.object(_mb, "recall_points", new=AsyncMock(return_value=results)) as mock_recall:
+            out = _run(_mbs.recall(query="q", **kwargs))
+        return out, mock_recall, mock_missing
+
+    _HIT = {"id": "p1", "summary": "s", "description": "d", "kind": "lesson", "repo": "proj-a",
+            "embedding_model": "m", "score": 0.9, "created_at": 1.0, "shared": True}
+
+    def test_unset_follow_list_changes_nothing(self):
+        for follow in ("", "  ", ",,"):
+            out, mock_recall, mock_missing = self._recall(follow, [self._HIT])
+            self.assertEqual(mock_recall.call_args.kwargs["followed"], [])
+            mock_missing.assert_not_called()
+            self.assertEqual(sorted(__import__("json").loads(out)), ["query", "results"])
+
+    def test_follow_list_is_passed_parsed_to_the_search(self):
+        _, mock_recall, mock_missing = self._recall(" proj-a , proj-b,", [self._HIT])
+        self.assertEqual(mock_recall.call_args.kwargs["followed"], ["proj-a", "proj-b"])
+        self.assertEqual(mock_missing.call_args.args[2], ["proj-a", "proj-b"])
+
+    def test_hit_carries_shared_through_to_the_result(self):
+        out, _, _ = self._recall("proj-a", [self._HIT])
+        hit = __import__("json").loads(out)["results"][0]
+        self.assertIs(hit["shared"], True)
+        self.assertEqual(hit["repo"], "proj-a")
+
+    def test_explicit_repo_and_all_repos_do_not_use_the_follow_list(self):
+        for kwargs in ({"repo": "proj-b"}, {"all_repos": True}):
+            _, mock_recall, mock_missing = self._recall("proj-a", [self._HIT], **kwargs)
+            self.assertEqual(mock_recall.call_args.kwargs["followed"], [])
+            mock_missing.assert_not_called()
+
+    def test_own_id_and_general_are_ignored_with_a_note(self):
+        own = _mbs.DEFAULT_MEMORY_BANK_ID
+        out, mock_recall, _ = self._recall(f"{own},general,proj-a", [self._HIT])
+        self.assertEqual(mock_recall.call_args.kwargs["followed"], ["proj-a"])
+        notes = __import__("json").loads(out)["notes"]
+        self.assertEqual(len(notes), 2)
+        self.assertTrue(any("general" in n and "ignored" in n for n in notes))
+        self.assertTrue(any(own in n and "ignored" in n for n in notes))
+
+    def test_unknown_followed_repo_gets_a_note_even_with_results(self):
+        out, _, _ = self._recall("proj-a,typo", [self._HIT], missing=["typo"])
+        notes = __import__("json").loads(out)["notes"]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("'typo'", notes[0])
+
+    def test_a_followed_repo_with_nothing_shared_is_not_an_error_or_a_note(self):
+        out, _, _ = self._recall("proj-a", [self._HIT])
+        self.assertNotIn("notes", __import__("json").loads(out))
+
+    def test_no_results_still_shows_the_notes(self):
+        out, _, _ = self._recall("typo", [], missing=["typo"])
+        self.assertTrue(out.startswith("No memories found for 'q'."))
+        self.assertIn("'typo'", out)
+
+    def test_no_results_without_notes_is_todays_message(self):
+        out, _, _ = self._recall("", [])
+        self.assertEqual(out, "No memories found for 'q'.")
+
+
+class ListMemoryBanksToolTest(unittest.TestCase):
+    def test_lists_the_configured_collection_through_the_lib(self):
+        summary = {"a": {"entries": 2, "shared": 1}}
+        with patch("memory_bank_mcp_server.QdrantClient") as mock_client_cls, \
+             patch.object(_mb, "summarize_repos", return_value=summary) as mock_sum:
+            out = _mbs.list_memory_banks()
+        self.assertEqual(mock_sum.call_args.args[1], _mbs.DEFAULT_MEMORY_BANK_COLLECTION)
+        self.assertIs(mock_sum.call_args.args[0], mock_client_cls.return_value)
+        self.assertEqual(out.splitlines()[0], _mbs.DEFAULT_MEMORY_BANK_COLLECTION)
+        self.assertIn("* a, 2 entries, sharable: yes (1 shared)", out)
+
+    def test_takes_no_arguments_so_it_cannot_name_another_collection(self):
+        import inspect
+        self.assertEqual(list(inspect.signature(_mbs.list_memory_banks).parameters), [])
+
+    def test_missing_collection_is_reported_not_raised(self):
+        with patch("memory_bank_mcp_server.QdrantClient"), patch.object(_mb, "summarize_repos", return_value=None):
+            out = _mbs.list_memory_banks()
+        self.assertIn("does not exist", out)
+
+    def test_never_builds_an_embedding_provider(self):
+        with patch("memory_bank_mcp_server.QdrantClient"), \
+             patch("memory_bank_mcp_server.FastEmbedProvider") as mock_provider_cls, \
+             patch.object(_mb, "summarize_repos", return_value={}):
+            _mbs.list_memory_banks()
+        mock_provider_cls.assert_not_called()
+
+
+class ToolRegistrationTest(unittest.TestCase):
+    def test_registers_exactly_six_tools(self):
+        from mcp_tool_introspect import tool_count
+        self.assertEqual(tool_count(_mbs.mcp), 6)
+
+    def test_logs_tool_count_to_stderr_not_stdout(self):
+        captured_err = io.StringIO()
+        captured_out = io.StringIO()
+        import contextlib
+        with redirect_stderr(captured_err), contextlib.redirect_stdout(captured_out):
+            _mbs._log_registered_tool_count()
+        self.assertIn("memory-bank", captured_err.getvalue())
+        self.assertIn("6", captured_err.getvalue())
+        self.assertEqual(captured_out.getvalue(), "")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,332 @@
+#!/usr/bin/env python3
+"""Tests for pyproject.toml/setup.py -- pins the 3
+console-script entry points the issue actually names (ingest_to_qdrant.py,
+setup_project.py, doctor.py), confirms the `claude_runway` shim package
+they now route through is declared and present, and builds a REAL wheel to
+confirm libs/tools/mcpservers/hooks/templates/skills land under
+<wheel>.data/data/src/{libs,tools,mcpservers,hooks,templates,skills} -- the
+whole point, replacing the old top-level `[tool.setuptools] packages`
+layout that put these five directly in site-packages.
+
+setup.py's data_files() is real Python code that runs at build time (a
+glob, not a hand-typed list -- see that file's own docstring for why), so
+it can't be pinned by only parsing pyproject.toml's static TOML tables the
+way the old version of this file did; the wheel-content tests below
+actually build a wheel and inspect it, which is the only thing that can
+catch setup.py itself regressing (e.g. back to a single shared "src/skills"
+target, which silently drops every skill but one -- confirmed live during
+development, see setup.py's docstring).
+
+Stdlib-only for the TOML-parsing tests (tomllib, always present: the project
+minimum is Python 3.12). The wheel-building tests
+need `build`/`wheel`/`setuptools` (requirements-dev.txt) and are skipped
+(not failed) if those aren't importable, so a bare `requirements.txt`-only
+environment doesn't spuriously fail unittest discovery.
+
+    .venv/bin/python -m unittest discover -s tests
+"""
+
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+import zipfile
+from typing import Optional
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PYPROJECT_PATH = os.path.join(REPO_ROOT, "pyproject.toml")
+
+import tomllib
+
+try:
+    import build as _build_pkg  # noqa: F401
+    import wheel as _wheel_pkg  # noqa: F401
+
+    _BUILD_TOOLING_AVAILABLE = True
+except ImportError:
+    _BUILD_TOOLING_AVAILABLE = False
+
+
+class PyprojectTomlIsWellFormed(unittest.TestCase):
+    def setUp(self):
+        with open(PYPROJECT_PATH, "rb") as f:
+            self.data = tomllib.load(f)
+
+    def test_the_python_floor_is_the_project_minimum_that_ci_and_pyright_run_on(self):
+        # 3.12 is what CI, the bootstrap scripts and Pyright run on and what docs/prerequisites.md states;
+        # a looser `requires-python` would promise support for versions nobody tests.
+        self.assertEqual(self.data["project"]["requires-python"], ">=3.12")
+        self.assertEqual(self.data["tool"]["pyright"]["pythonVersion"], "3.12")
+
+    def test_declares_the_three_named_console_scripts_via_the_shim(self):
+        # These no longer point straight at tools.*:main --
+        # tools/ isn't an importable site-packages package anymore (it
+        # ships as wheel data under <env>/src/tools instead), so each
+        # entry point routes through the claude_runway shim, which loads the
+        # real <env>/src/tools/*.py by file path and calls its main().
+        scripts = self.data["project"]["scripts"]
+        self.assertEqual(scripts.get("claude-runway-ingest"), "claude_runway:ingest_main")
+        self.assertEqual(scripts.get("claude-runway-setup"), "claude_runway:setup_main")
+        self.assertEqual(scripts.get("claude-runway-doctor"), "claude_runway:doctor_main")
+
+    def test_version_is_derived_from_the_repo_not_hardcoded(self):
+        # a hand-edited `version = "0.1.0"` made all 200+ commits
+        # build as the identical version. Pin that it's dynamic, that
+        # setuptools-scm is what supplies it, and that a no-VCS-metadata
+        # build still gets a (clearly-labelled) fallback instead of failing.
+        project = self.data["project"]
+        self.assertNotIn("version", project)
+        self.assertIn("version", project["dynamic"])
+        self.assertTrue(any(r.startswith("setuptools-scm") for r in self.data["build-system"]["requires"]))
+        self.assertIn("fallback_version", self.data["tool"]["setuptools_scm"])
+
+    def test_claude_runway_shim_is_the_only_declared_package(self):
+        # libs/tools/templates/hooks/skills moved OUT of
+        # `[tool.setuptools] packages` (previously all five, plus this one
+        # implicitly via site-packages, were top-level packages -- the
+        # generic-namespace layout this one replaces). claude_runway is
+        # the one real, importable site-packages package left -- it exists
+        # purely to bridge [project.scripts] to the data-files layout (see
+        # claude_runway/__init__.py's own docstring).
+        packages = set(self.data["tool"]["setuptools"]["packages"])
+        self.assertEqual(packages, {"claude_runway"})
+
+    def test_no_stale_package_data_section(self):
+        # templates/*.template and skills/*/SKILL.md used to need
+        # `[tool.setuptools.package-data]` globs because they were bundled
+        # INSIDE a declared package. They now ship as data_files
+        # instead (see setup.py) -- package-data has nothing left to do and
+        # its presence would be a stale, confusing leftover of the old
+        # layout, so pin its absence rather than silently letting it
+        # reappear unnoticed.
+        self.assertNotIn("package-data", self.data.get("tool", {}).get("setuptools", {}))
+
+    def test_core_dependencies_match_requirements_txt_core_section(self):
+        # Not a byte-for-byte diff against requirements.txt (that file has
+        # its own comments/optional section this doesn't need to mirror
+        # exactly) -- just pins that the same core packages
+        # tools/ingest_to_qdrant.py actually imports are declared here too.
+        deps = " ".join(self.data["project"]["dependencies"])
+        for expected in ("mcp", "qdrant-client", "fastembed", "pydantic_settings"):
+            self.assertIn(expected, deps)
+
+    def test_third_party_qdrant_server_packages_are_not_dependencies(self):
+        # This repo serves `qdrant` from its own mcpservers/qdrant_mcp_server.py, so
+        # neither the third-party server package nor the compatibility pin that
+        # only existed for it may come back in either install file.
+        deps = [d.lower() for d in self.data["project"]["dependencies"]]
+        requirements = open(os.path.join(REPO_ROOT, "requirements.txt"), encoding="utf-8").read().lower()
+        for banned in ("mcp-server-qdrant", "fastmcp"):
+            self.assertFalse(any(d.startswith(banned) for d in deps), banned)
+            self.assertNotIn(banned, requirements)
+
+    def test_local_compress_dependencies_are_base_not_optional(self):
+        # claude-runway-setup's OWN default
+        # behavior (no --qdrant-only) generates a .mcp.json that enables
+        # mcpservers/compress_mcp_server.py and its hooks, pointed at this same
+        # install's interpreter -- confirmed live that leaving
+        # openai/requests/trafilatura as an opt-in extra meant a plain
+        # default `pipx install claude-runway` + `claude-runway-setup init`
+        # (no flags) produced a config whose local-compress MCP server
+        # crashes at import time (ModuleNotFoundError: trafilatura). These
+        # 3 must be base dependencies, not behind a "compress" extra a
+        # first-time user has no reason to know to ask for.
+        deps = " ".join(self.data["project"]["dependencies"])
+        for expected in ("openai", "requests", "trafilatura"):
+            self.assertIn(expected, deps)
+        self.assertNotIn("compress", self.data["project"].get("optional-dependencies", {}))
+
+    def test_pathspec_is_base_not_optional(self):
+        # Review (Copilot), second round: same class of finding as
+        # the compress trio above, but security-relevant rather than just a
+        # startup crash. libs/qdrant_ingest_lib.py's respect_gitignore=True
+        # default silently falls back to "don't filter at all" (no error) if
+        # pathspec isn't importable -- and --qdrant-api-key writes a real
+        # credential into a project's .mcp.json that this repo's own docs
+        # tell users to gitignore. Leaving pathspec an opt-in extra meant
+        # claude-runway-ingest would silently NOT respect that gitignore
+        # rule by default, indexing the credential into Qdrant -- and would
+        # have made this pip-installed default *worse* than the existing
+        # documented clone-based default (`uv pip install -r
+        # requirements.txt`), which already includes pathspec.
+        deps = " ".join(self.data["project"]["dependencies"])
+        self.assertIn("pathspec", deps)
+        self.assertNotIn("gitignore", self.data["project"].get("optional-dependencies", {}))
+
+
+def _build_wheel() -> Optional[str]:
+    """Builds a real wheel via `python -m build --wheel --no-isolation` into
+    a fresh temp dir, returning the .whl path. Reused across every test in
+    BuiltWheelHasExpectedDataLayout via setUpClass so the (multi-second)
+    build only runs once per test session, not once per test method."""
+    out_dir = tempfile.mkdtemp(prefix="claude_runway_wheel_test_")
+    subprocess.run(
+        [sys.executable, "-m", "build", "--wheel", "--no-isolation", "-o", out_dir],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    whls = [f for f in os.listdir(out_dir) if f.endswith(".whl")]
+    assert len(whls) == 1, f"expected exactly one wheel in {out_dir}, found {whls}"
+    return os.path.join(out_dir, whls[0])
+
+
+@unittest.skipUnless(
+    _BUILD_TOOLING_AVAILABLE,
+    "build/wheel not installed -- run `uv pip install -r requirements-dev.txt` to enable this test",
+)
+class BuiltWheelHasExpectedDataLayout(unittest.TestCase):
+    """The core acceptance criterion: a real built wheel must ship
+    libs/tools/mcpservers/hooks/templates/skills as DATA files landing under
+    <env>/src/{libs,tools,mcpservers,hooks,templates,skills} at install time (wheel
+    spec: the "data" category installs relative to sys.prefix) -- not as
+    site-packages packages. Confirmed live that
+    this "data" category's install-to-sys.prefix rule is a wheel-spec
+    guarantee, not OS-specific, so inspecting the wheel's own RECORD/namelist
+    here is a legitimate stand-in for actually installing it on each of
+    Windows/macOS/Linux (the CI matrix in .github/workflows/tests.yml's
+    packaging-smoke job covers the real per-OS install+run separately)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.whl_path = _build_wheel()
+        with zipfile.ZipFile(cls.whl_path) as z:
+            cls.names = z.namelist()
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.whl_path and os.path.exists(cls.whl_path):
+            os.remove(cls.whl_path)
+
+    def _data_src_names(self) -> list:
+        # The wheel's data category directory is named
+        # "<dist-name>-<version>.data/data/..." -- match on the
+        # "/data/src/" suffix rather than hardcoding the version, so this
+        # doesn't need updating every version bump.
+        return [n for n in self.names if ".data/data/src/" in n]
+
+    def test_wheel_version_is_derived_not_the_old_hardcoded_0_1_0(self):
+        # The wheel's own filename/metadata carries the
+        # setuptools-scm version. In a checkout it must be the git-derived
+        # one; only a build with no VCS metadata may use the fallback.
+        version = os.path.basename(self.whl_path).split("-")[1]
+        self.assertNotEqual(version, "0.1.0")
+        # Copilot review: installs previously reported 0.1.0, and
+        # PEP 440 sorts `0.0.1.devN`/`0.1.devN` BELOW that -- version-based
+        # upgrade checks would treat the first SCM builds as older. The
+        # `v0.1.0` baseline tag on main makes derived versions 0.1.1.devN.
+        try:
+            from packaging.version import Version
+        except ImportError:
+            Version = None
+        if Version is not None and os.path.exists(os.path.join(REPO_ROOT, ".git")) and version != "0.0.0+unknown":
+            self.assertGreater(Version(version), Version("0.1.0"), "derived version must sort above the old static 0.1.0 (is the v0.1.0 baseline tag fetched?)")
+        self.assertTrue(
+            os.path.exists(os.path.join(REPO_ROOT, ".git")) or version == "0.0.0+unknown",
+            f"unexpected version {version!r} for a build without a checkout",
+        )
+        if os.path.exists(os.path.join(REPO_ROOT, ".git")):
+            self.assertNotEqual(version, "0.0.0+unknown", "built in a checkout but got the no-VCS fallback")
+
+    def test_claude_runway_shim_ships_as_a_real_package_not_data(self):
+        self.assertIn("claude_runway/__init__.py", self.names)
+
+    def test_libs_tools_hooks_templates_ship_under_env_src(self):
+        data_names = self._data_src_names()
+        for directory, filename in (
+            ("libs", "setup_project_lib.py"),
+            ("tools", "setup_project.py"),
+            ("tools", "doctor.py"),
+            ("tools", "ingest_to_qdrant.py"),
+            ("hooks", "compress_output.py"),
+            ("hooks", "redirect_webfetch_to_fetch_url.py"),
+            ("hooks", "record_session_id.py"),
+            ("templates", "mcp.json.template"),
+            ("templates", "settings.json.template"),
+            ("templates", "CLAUDE.md.template"),
+        ):
+            with self.subTest(directory=directory, filename=filename):
+                self.assertTrue(
+                    any(n.endswith(f"/data/src/{directory}/{filename}") for n in data_names),
+                    f"{directory}/{filename} not found under any .data/data/src/{directory}/ in the built wheel",
+                )
+
+    def test_memory_bank_files_are_present_in_the_built_wheel(self):
+        # The guarantee (the memory-bank MCP server must ship the
+        # same way ingest_mcp_server.py/compress_mcp_server.py do) still
+        # holds under the new data_files layout -- confirm directly against
+        # the real wheel rather than just the files existing on disk, which
+        # wouldn't catch setup.py's glob failing to pick them up.
+        data_names = self._data_src_names()
+        for rel_path in (
+            "mcpservers/memory_bank_mcp_server.py",
+            "libs/memory_bank_lib.py",
+            "libs/memory_events_lib.py",
+        ):
+            with self.subTest(rel_path=rel_path):
+                self.assertTrue(
+                    any(n.endswith(f"/data/src/{rel_path}") for n in data_names),
+                    f"{rel_path} missing from the built wheel's data files",
+                )
+
+    def test_codebase_reviewer_libs_are_present_in_the_built_wheel(self):
+        # The server imports these three by bare name from <env>/src/libs, so a
+        # wheel that shipped the script without them would crash on startup.
+        data_names = self._data_src_names()
+        for rel_path in (
+            "libs/codebase_reviewer_config_lib.py",
+            "libs/lmstudio_model_loader_lib.py",
+            "libs/reviewer_scheduler_lib.py",
+        ):
+            with self.subTest(rel_path=rel_path):
+                self.assertTrue(
+                    any(n.endswith(f"/data/src/{rel_path}") for n in data_names),
+                    f"{rel_path} missing from the built wheel's data files",
+                )
+
+    def test_all_six_mcp_servers_ship_under_mcpservers(self):
+        # The servers moved from tools/ to mcpservers/. Without setup.py's
+        # `_flat_data_files("mcpservers", "*.py")` entry the wheel would
+        # silently lose all six while every other directory still shipped.
+        data_names = self._data_src_names()
+        for stem in ("compress", "analytics", "qdrant", "ingest", "memory_bank", "codebase_reviewer"):
+            rel_path = f"mcpservers/{stem}_mcp_server.py"
+            with self.subTest(rel_path=rel_path):
+                self.assertTrue(
+                    any(n.endswith(f"/data/src/{rel_path}") for n in data_names),
+                    f"{rel_path} missing from the built wheel's data files",
+                )
+        # ...and none of them is still shipped from the old location.
+        self.assertFalse(
+            [n for n in data_names if n.endswith("_mcp_server.py") and "/data/src/tools/" in n],
+            "an MCP server script is still shipped under src/tools/",
+        )
+
+    def test_every_skill_subdirectory_ships_distinctly_not_collapsed(self):
+        # Regression guard for the exact bug found during
+        # development: a single shared "src/skills" data_files target
+        # copies every matched SKILL.md into the SAME target directory by
+        # basename alone, silently collapsing every skill but the
+        # alphabetically-last one into one file. setup.py instead emits one
+        # data_files tuple per skills/<name>/ subdirectory -- confirm every
+        # real skill directory on disk actually made it into the wheel
+        # DISTINCTLY (own subdirectory, own SKILL.md), not just that "a"
+        # SKILL.md exists somewhere.
+        skills_dir = os.path.join(REPO_ROOT, "skills")
+        real_skill_names = sorted(
+            name for name in os.listdir(skills_dir) if os.path.isdir(os.path.join(skills_dir, name))
+        )
+        self.assertGreater(len(real_skill_names), 1, "expected more than one skill on disk to make this test meaningful")
+        data_names = self._data_src_names()
+        for name in real_skill_names:
+            with self.subTest(skill=name):
+                self.assertTrue(
+                    any(n.endswith(f"/data/src/skills/{name}/SKILL.md") for n in data_names),
+                    f"skills/{name}/SKILL.md missing from the built wheel (or collapsed into another skill's entry)",
+                )
+
+
+if __name__ == "__main__":
+    unittest.main()

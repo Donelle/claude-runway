@@ -1,0 +1,1361 @@
+#!/usr/bin/env python3
+"""
+PostToolUse hook that compresses ANY large tool output via a local LM Studio
+model, replacing what Claude actually sees with the compressed version.
+(Formerly compress_bash_output.py -- renamed because it started
+Bash-only but now also covers Grep, WebFetch, Glob, and WebSearch; existing
+installs are migrated by `upgrade`'s compress-hook-renamed migration.)
+It is written to extend to further tools without code changes per-tool where possible. Unlike a PreToolUse hook,
+this doesn't need to guess in advance which calls will produce large
+output -- it acts on the REAL, measured size after the tool has already
+run.
+
+When CLAUDE_RUNWAY_TRACK_SAVINGS=1, this hook is also the SOLE writer for
+the opt-in savings tracker's per-session ledger (see libs/savings_ledger.py):
+it always has session_id (hooks receive it on stdin; MCP tool calls do not),
+so it's the one place that can attribute a compression event to a session.
+For tools it compresses itself (Bash/Grep/Glob/etc. below), it logs directly.
+For the local-compress MCP server's own credited tools (compress_file,
+compress_command_output, fetch_url -- matcher extended to
+mcp__local-compress__*), the server can't write the ledger itself (no
+session_id), so it returns a small JSON envelope instead --
+{"compressed_text": <what Claude should see>, "metrics": {...}} -- and this
+hook parses it with json.loads (strictly: anything that is not exactly that
+envelope is ordinary tool output and is left alone), replaces the tool output
+with compressed_text and logs the metrics. When tracking is off, none of
+this runs and behavior is unchanged from before this feature existed.
+
+The actual dividing line for what belongs in the matcher isn't "runs
+locally" -- WebFetch/WebSearch run through Anthropic's own infrastructure,
+not local compute, yet are safe to include (see note on Read below). It's:
+does Claude ever use this tool's raw output as the literal, exact basis for
+a following Edit? Bash/Grep/Glob/WebFetch/WebSearch output is read for gist
+or lookup, never used as a byte-exact source to edit from, so lossy
+compression is safe. Read fails that test (see below) and is deliberately
+excluded.
+
+That same question gets asked a SECOND time, per-command, within Bash --
+because unlike the other matched tools, "Bash output" is not one kind of
+output. `dotnet build` is a log to skim; `git rev-parse HEAD` is a 40-char
+identifier where one wrong nibble is a silent, confident lie. So before a
+Bash call is compressed, its command string is checked by
+_is_exactness_critical() (see the exempt-list block below), and an
+exactness-critical command exits silently with the real output intact --
+the same way an under-threshold call does, since raw output is the correct
+result here, not something to announce. A size threshold cannot make this
+distinction on its own: it sees only bytes, and the dangerous cases are
+frequently the SMALL ones, where compression saves a few hundred tokens and
+risks dropping the single line that carried the answer. A trailing
+`# compress-ok` on the command opts any exempt command back in.
+
+Mechanism: Claude Code lets a PostToolUse hook return `updatedToolOutput`,
+which replaces the tool result before Claude ever reads it -- not just what
+gets displayed. That's what makes this actually save tokens rather than
+compressing something already paid for.
+
+Bash gets special-cased handling (known `{stdout, stderr}` shape, proven by
+testing). The other tools do NOT have a documented `tool_response` schema
+-- Claude Code's hooks docs explicitly type it as `Any`/`unknown`. Rather
+than guess field names and risk either missing the real content or emitting
+a malformed `updatedToolOutput` that Claude Code silently ignores, those
+(and any other tool added to the matcher below) go through a generic
+"largest string field(s)" walk: recursively find every string value in the
+tool_response, group them by which sibling RECORD they belong to (e.g.
+`results[3]` vs `results[4]` in a WebSearch-shaped payload -- see
+_record_group_key), and compress/replace within each record independently.
+A response with no sibling record structure at all (a flat shape, or one
+dominant field) falls back to the original whole-blob behavior: compress
+everything together and write the result back into the single largest
+string field, blanking the other large string fields (small ones, e.g.
+short metadata like a URL or file count, are left untouched either way).
+This preserves the original JSON shape/keys exactly -- only string VALUES
+change -- which is the safest bet against an undocumented schema silently
+rejecting the rewrite. Per-record grouping exists because concatenating
+across independent records and writing the result into just one of them
+silently destroyed every other record's content (reproduced
+live against a 10-result WebSearch payload: 9 of 10 snippets got blanked
+to "" with no error or indication). If you add a new tool to the matcher
+and this generic path picks the wrong field or discards something you need
+untouched, check the debug log (see below) to see the tool's real payload
+shape and special-case it like Bash below.
+
+Note on WebFetch/WebSearch specifically: both already run their own
+extraction/summarization server-side on Anthropic's infrastructure before
+Claude ever sees the result (confirmed empirically -- a 2MB fetched page
+came back as a ~1300 char tool_response.result). That means this hook is
+usually a no-op for them, since the pre-processed result is often already
+under the threshold. They're included anyway because it's harmless (still
+correctly skips when small) and catches the cases where the upstream
+summary is still large.
+
+Note on Glob specifically: a large result (hundreds of file paths) will
+usually stay uncompressed even though the total size is big, because each
+individual path is short (well under MIN_FIELD_LEN) and MIN_FIELD_LEN
+filters per-field, not on the aggregate. This is intentional, not a bug --
+file paths are exact identifiers Claude needs verbatim for a follow-up
+Read/Edit/Grep call, so summarizing a file listing away would risk the same
+class of problem Read's exclusion avoids. If you want large Glob results
+compressed anyway, lower MIN_FIELD_LEN for that case specifically rather
+than globally, since globally lowering it would also start summarizing
+short-but-numerous fields elsewhere that shouldn't be touched.
+
+Fails OPEN, not closed: if compression fails for any reason (LM Studio
+unreachable, ambiguous/missing model, request error, OR any other unexpected
+exception anywhere in main()'s dispatch after payload parsing -- see the
+top-level try/except wrapping _dispatch() below), the ORIGINAL
+output is left unchanged and a short note is attached via additionalContext.
+PostToolUse can't block anyway (the tool already ran), so silently losing the
+actual output on a compression failure would be strictly worse than just
+leaving it alone -- this differs from the harder-line "fail loud" stance used
+elsewhere in this project (e.g. resolve_model refusing to guess a model)
+because here "fail loud" would mean discarding real tool output, not just
+refusing to guess.
+
+Deliberately NOT matching Read: Read's output is frequently used as the
+exact basis for a subsequent Edit. A hook that silently rewrites it to a
+lossy summary risks Claude editing from compressed content -- worse than a
+compressed log, since it can corrupt an edit rather than just lose detail
+in a summary. Don't add Read to the matcher without addressing that.
+
+Setup:
+    Dependencies (openai, via libs/lmstudio_client.py and libs/openai_lib.py, which build the
+    model client this hook passes to libs/local_compress_lib.py) come from
+    requirements.txt; run this script with that environment's Python.
+
+Register in .claude/settings.json (see templates/settings.json.template; the
+`claude-runway-setup` tool writes this for you) -- point the args path at
+this script's location in the cloned tools repo, nothing needs to be copied
+into the target project. The full recommended matcher is in
+templates/settings.json.template, which extends the base set below with a vetted
+MCP tool allowlist for GitHub (individually vetted against the edit-basis
+rule -- get_file_contents and get_pull_request_files excluded, see dispatch
+comments below):
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash|Grep|WebFetch|Glob|WebSearch|mcp__local-compress__.*|mcp__qdrant__(?:compact_store|compact_find|compact_prune)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "REPLACE-WITH-VENV-PYTHON",
+            "args": ["/absolute/path/to/tools-repo/hooks/compress_output.py"]
+          }
+        ]
+      }
+    ]
+  }
+}
+
+Env vars (same names local_compress_lib.py / compress_mcp_server.py use):
+    CLAUDE_RUNWAY_LMSTUDIO_URL, CLAUDE_RUNWAY_LMSTUDIO_MODEL,
+    CLAUDE_RUNWAY_COMPRESS_THRESHOLD_CHARS (default 2000),
+    CLAUDE_RUNWAY_EXTRA_EXACT_PATTERNS (optional, default unset -- semicolon-
+    separated regex patterns a project can add ON TOP OF the built-in
+    exactness-critical list below, e.g. for an internal CLI whose output must
+    stay byte-exact; see the _EXTRA_EXACT_PATTERNS block for matching
+    semantics),
+    CLAUDE_RUNWAY_TRACK_SAVINGS (opt-in savings tracker, off by default -- see
+    libs/savings_ledger.py), CLAUDE_RUNWAY_SAVINGS_DB (optional override of
+    the savings DB's location; must match the value set in the analytics
+    server's env, whose savings tools read the database this script writes,
+    if you set it at all -- default needs no coordination)
+
+    ALL of these must be exported at the OS/shell level to reach this script --
+    a hook entry in .claude/settings.json has no `env` field, so it inherits the
+    parent environment and cannot see .mcp.json's env block. The MCP server
+    actually inherits the same full shell environment too (not a small
+    allowlist -- see docs/environment-variables.md's "Why two places" section), but
+    only for a key genuinely absent from its own env block; this toolkit's
+    shipped .mcp.json always declares CLAUDE_RUNWAY_LMSTUDIO_URL/
+    CLAUDE_RUNWAY_LMSTUDIO_MODEL/CLAUDE_RUNWAY_TRACK_SAVINGS explicitly (and
+    CLAUDE_RUNWAY_SAVINGS_DB in the analytics block when overridden), so
+    those need setting in BOTH places with matching values. CLAUDE_RUNWAY_COMPRESS_THRESHOLD_CHARS is
+    the exception -- this script is its only reader, so it's shell-only; an
+    .mcp.json copy would just be inert. Formerly
+    LMSTUDIO_BASE_URL / LMSTUDIO_MODEL / HOOK_COMPRESS_THRESHOLD_CHARS; those
+    names are no longer read at all -- see local_compress_lib.stale_env_warning,
+    which this script reports on stderr at import time.
+
+Debugging an unfamiliar tool's payload shape: set HOOK_DEBUG_LOG to a file
+path, and every payload this hook sees gets appended there as one JSON line
+-- inspect it to see exactly what tool_response looks like for a given
+tool before trusting the generic path on it, or to write a special case.
+"""
+
+import asyncio
+import json
+import os
+import re
+import shlex
+import sys
+
+# local_compress_lib.py lives in the tools repo under libs/, NOT inside
+# .claude/hooks/ -- this script is meant to be referenced by its stable path
+# in the cloned tools repo (see settings.json.template), never copied into a
+# project's .claude/hooks/ by itself. Bug history: an earlier version only
+# added this script's OWN directory to sys.path, which silently broke the
+# import whenever this file lived in a hooks/ subdirectory one level below
+# local_compress_lib.py -- which is exactly the real repo layout. The
+# ImportError handler then made the hook a permanent, silent no-op with no
+# indication anything was wrong (confirmed by testing: large input produced
+# zero output instead of a compression result or an error JSON). Resolution
+# order below is deliberately redundant so a future repo reshuffle, or a
+# user who copies just this one file somewhere, can't reintroduce that same
+# silent failure:
+#   1. TOOLS_REPO_DIR env var, if the user wants to pin it explicitly.
+#   2. libs/ under the parent directory of this script (real repo layout).
+#   3. The parent directory of this script (repo root, backward compat).
+#   4. This script's own directory (covers copying both files together
+#      into one flat folder, e.g. for a quick local test).
+_here = os.path.dirname(os.path.abspath(__file__))
+_root = os.path.dirname(_here)
+_candidates = [os.environ.get("TOOLS_REPO_DIR"), os.path.join(_root, "libs"), _root, _here]
+for _dir in _candidates:
+    if _dir:
+        sys.path.insert(0, _dir)
+
+try:
+    from lmstudio_client import build_client
+    from local_compress_lib import compress, stale_env_warning
+    from savings_envelope_lib import parse_envelope_text
+except ImportError as e:
+    # Fail open, but say why via stderr (stdout is reserved for the
+    # hookSpecificOutput JSON contract) so a broken install is visible in
+    # Claude Code's hook debug output instead of behaving identically to
+    # "nothing needed compressing."
+    print(
+        f"compress_output.py: could not import local_compress_lib or lmstudio_client ({e}). "
+        f"Checked: {[d for d in _candidates if d]}. Set TOOLS_REPO_DIR if the "
+        "tools repo isn't where this script's parent directory implies.",
+        file=sys.stderr,
+    )
+    sys.exit(0)
+
+# savings_ledger is optional -- an older checkout without libs/savings_ledger.py
+# should keep working exactly as before, just without ledger logging. The
+# explicit `savings_ledger = None` in the except branch (adopting
+# Pyright) keeps the name always bound -- every use below checks
+# _SAVINGS_LEDGER_AVAILABLE first and then asserts it's not None, which is
+# always true at runtime (that's exactly what _SAVINGS_LEDGER_AVAILABLE
+# records) but lets Pyright narrow the type instead of reporting a
+# possibly-unbound error.
+try:
+    import savings_ledger
+    _SAVINGS_LEDGER_AVAILABLE = True
+except ImportError:
+    savings_ledger = None  # type: ignore[assignment]
+    _SAVINGS_LEDGER_AVAILABLE = False
+
+
+def _record_savings_event(session_id, tool, raw_chars, out_chars, credited, source="", project=None,
+                          agent_id=None, agent_type=None, tool_use_id=None):
+    """Best-effort -- a ledger-logging bug must never break the hook's real job
+    (making sure Claude sees the right output). `project` is threaded through to
+    record_event's own `project` field -- originally what let
+    current_session_id()'s project-filtered lookup avoid picking an unrelated
+    live session from a different project; that lookup
+    delegates to session_id_lib's shadow markers instead (populated by the
+    separate hooks/record_session_id.py hook, not this one), so this field is
+    now informational only -- see savings_ledger.record_event's own docstring.
+
+    `agent_id`/`agent_type` come from the hook payload and are only
+    present for a tool call made inside a subagent (`agent_type` also when the
+    session itself was started with `claude --agent`). They're forwarded as-is
+    and default to None, so a main-session event is recorded exactly as before.
+
+    `raw_chars`/`out_chars` are the EXACT character counts
+    of the content before and after compression -- the only size the ledger
+    records now; the chars / 3.5 token estimate was dropped. Either one
+    being None (metrics from an MCP server that predates character counts carry
+    only token estimates) means there is nothing honest to record, so the event
+    is skipped. `tool_use_id` is the PostToolUse payload's id for this tool
+    call, kept so SessionEnd can join the event to its transcript turn and model
+    (libs/transcript_attribution_lib.py)."""
+    # Split out of one combined `and` expression so Pyright can
+    # narrow savings_ledger's type via the assert below -- same short-circuit
+    # order and return behavior as the original `if not (A and B and C):`.
+    if not _SAVINGS_LEDGER_AVAILABLE or not session_id:
+        return
+    if raw_chars is None or out_chars is None:
+        return
+    assert savings_ledger is not None  # _SAVINGS_LEDGER_AVAILABLE implies this
+    if not savings_ledger.tracking_enabled():
+        return
+    try:
+        savings_ledger.record_event(
+            session_id, tool, raw_chars, out_chars, credited, source, project=project,
+            agent_id=agent_id, agent_type=agent_type, tool_use_id=tool_use_id,
+        )
+    except Exception:
+        pass
+
+
+_DEFAULT_THRESHOLD = 2000
+
+
+def _parse_threshold() -> int:
+    """This runs at import time, before main()'s fail-open guards
+    exist, so a malformed env value ("4,000", "2k", ...) used to raise
+    ValueError on every matched tool call and kill compression with a bare
+    traceback. Fall back to the default and warn on stderr instead -- the same
+    stderr-not-additionalContext precedent as _STALE_ENV below, and the same
+    parse-failure fallback _failed_url_ttl() uses."""
+    raw = os.environ.get("CLAUDE_RUNWAY_COMPRESS_THRESHOLD_CHARS")
+    if raw is None:
+        return _DEFAULT_THRESHOLD
+    try:
+        return int(raw)
+    except ValueError:
+        print(
+            f"compress_output.py: invalid CLAUDE_RUNWAY_COMPRESS_THRESHOLD_CHARS={raw!r} "
+            f"(not an integer); using default {_DEFAULT_THRESHOLD}",
+            file=sys.stderr,
+        )
+        return _DEFAULT_THRESHOLD
+
+
+THRESHOLD = _parse_threshold()
+
+# Reported on stderr rather than as additionalContext, following the same
+# precedent as the ImportError handler above: stdout is reserved for the
+# hookSpecificOutput JSON contract, and this hook runs on every matched tool
+# call, so surfacing a config warning to Claude every time would be pure noise.
+# stderr shows up in Claude Code's hook debug output, which is where you'd look.
+# The user-visible path is the fail-open note in main() -- see below.
+_STALE_ENV = stale_env_warning()
+if _STALE_ENV:
+    print(f"compress_output.py: {_STALE_ENV}", file=sys.stderr)
+SUPPORTED_TOOLS = {"Bash", "Grep", "WebFetch", "Glob", "WebSearch"}
+# MCP tools whose credited compression the server itself performs -- this hook's
+# job for these is only to unwrap the savings envelope (_handle_mcp_savings_envelope
+# below) so Claude sees just the compressed text, and log the metrics it
+# carries. See compress_mcp_server.py's _attach_savings_metrics.
+MCP_SAVINGS_TOOL_PREFIX = "mcp__local-compress__"
+# Tool names (without the mcp__local-compress__ prefix) that already run
+# their OWN compression -- with the caller's own focus/preserve_identifiers/
+# preserve_sections -- regardless of whether a savings envelope ends up on the
+# result. compress_text never emits one at all (by design, since it's
+# never credited toward savings); the other three omit it whenever
+# CLAUDE_RUNWAY_TRACK_SAVINGS is off server-side even though real
+# compression still happened. The no-envelope fallback below must never
+# re-compress these generically -- doing so would discard exactly what the
+# first pass was told to preserve (this is /cr-compact's own
+# real usage, which sets preserve_identifiers=preserve_sections=True).
+_SELF_COMPRESSING_MCP_TOOLS = {"compress_file", "compress_command_output", "fetch_url", "compress_text"}
+# The qdrant server's tools. Only the three compact tools are ever compressed
+# here: `qdrant-find` and `qdrant-store` are deliberately left alone (their
+# results are code locations and stored notes Claude acts on directly, and the
+# matcher does not list them), so any other tool under this prefix exits
+# untouched.
+MCP_QDRANT_TOOL_PREFIX = "mcp__qdrant__"
+_QDRANT_COMPACT_MCP_TOOLS = {"compact_store", "compact_find", "compact_prune"}
+# The opt-in `analytics` server (savings_summary/savings_detail/savings_trend,
+# get_metrics, record_metric). Every tool there returns an exact numeric/
+# structured report meant to be read verbatim -- a savings breakdown table, a
+# metrics trend. Same failure class as the Bash `grep -c`
+# exemption: running them through the lossy local-model path once the response
+# passes THRESHOLD could silently drop or alter a specific number. So nothing
+# under this prefix is ever compressed, and the matcher does not list it; the
+# check in main() keeps that true even if a hand-edited matcher were widened
+# to `mcp__analytics__.*`. (The qdrant server's `compact_prune`, a list of
+# pruned compact ids, is the same class and is handled by its own branch.)
+MCP_ANALYTICS_TOOL_PREFIX = "mcp__analytics__"
+# Below this length, a string is assumed to be metadata (a URL, a file
+# count, a status word) rather than content worth compressing or blanking --
+# applies only to the generic (non-Bash) path.
+MIN_FIELD_LEN = 200
+
+# --- Exactness-critical Bash commands (never compressed) --------------------
+#
+# Extends the module docstring's Read-exclusion principle *within* Bash. The
+# question there is "does Claude ever use this output as the literal, exact
+# basis for what it does next?" -- answered globally for Read, but Bash is not
+# one kind of output. `dotnet build` is a log to skim; `git rev-parse HEAD` is
+# a 40-char identifier where a single wrong nibble is a silent, confident lie.
+# A size threshold cannot tell those apart: it only sees bytes, and the
+# dangerous outputs are frequently the SMALL ones, where a summary saves a few
+# hundred tokens and risks dropping the one line that carried the answer.
+#
+# Bug history: a `git show HEAD:file | grep -c pattern; git log` call was
+# compressed 1217 -> 924 chars and the grep count -- the entire point of the
+# call -- was dropped from the summary. The surrounding prose was preserved,
+# so the result read as complete. Compression that silently removes the
+# answer while looking authoritative is worse than no compression, because
+# there is nothing to notice.
+#
+# Matched at the START of a shell segment (after leading VAR=val assignments
+# and sudo), so `git ...` is caught but `--message "regit"` is not.
+_EXACT_CMDS = (
+    # Version control is the tool reached for to VERIFY state, and a lossy
+    # `git status`/`git diff` reads as authoritative while being wrong. The
+    # transports are excluded: their output is progress noise, not state.
+    r"git(?!\s+(?:clone|fetch|pull|push)\b)",
+    # The output IS a count or a digest -- there is nothing to summarize.
+    r"wc|cksum|md5|md5sum|sha1sum|sha256sum|sha512sum|shasum",
+    # Exact identifiers, typically substituted straight into a follow-up call.
+    r"pwd|realpath|readlink|basename|dirname|which|hostname|whoami|id",
+    # Bare `env` is NOT here: `env VAR=x npm test` is the standard idiom for
+    # RUNNING a command, so a start-anchored `env` exempted the whole launched
+    # command. It's handled by _ENV_RE below instead.
+    r"printenv",
+    # Requested in a machine-readable form precisely because it gets parsed.
+    r"jq|yq",
+    # Version pins, where the digits are the entire payload.
+    r"pip\s+freeze|npm\s+(?:ls|list)",  # `list` is npm ls's documented alias
+    # Encoded/parsed payloads: a summary is not decodable.
+    r"base64|openssl|xxd|od",
+)
+# The leading-assignment part accepts quoted values, since `\S*` alone stops at
+# the first space and would leave `FOO="a b" git status` unmatched -- silently
+# dropping the exemption for a genuinely exactness-critical command. Quoted
+# alternatives come first so `\S*` can't grab a bare `"a` and strand the rest.
+# One assignment WORD: composite values (`PATH="$PATH":/opt/bin`) and a fully
+# quoted word (`'FOO=a b'`) both count. Each alternative starts with a distinct
+# character class (single chars for the bare part), so the `*` is unambiguous.
+_ASSIGN_WORD = r"""(?:\w+=(?:"[^"]*"|'[^']*'|[^\s"'])*|"\w+=[^"]*"|'\w+=[^']*')"""
+# `\S*` for the bare part used to make this prefix exponential on input like
+# `0="" 0="" 0="" ...` (a bare `\S*` can also swallow a quoted value, so the
+# repetition had many ways to match); _ASSIGN_WORD has exactly one.
+_EXACT_CMD_RE = re.compile(
+    r"^(?:" + _ASSIGN_WORD + r"\s+)*(?:sudo\s+)?(?:" + "|".join(_EXACT_CMDS) + r")\b"
+)
+
+# File slices: `sed -n 'N,Mp' f`, `head`, `tail`.
+#
+# The module docstring excludes `Read` from the matcher because its output is
+# the exact basis for what happens next. A Bash `sed -n`/`head`/`tail` on a file
+# is the same read spelled through Bash, and asking for a range means the caller
+# already narrowed to the exact text they want. Found live: `/cr-resume` read a
+# stored session back with `sed -n '3,47p'`, the hook rewrote 4,372 chars to 894,
+# and the paraphrase was shown to the user as the saved text.
+#
+# Judged by the COMMAND, never by a path: the failing read was of a derived
+# scratch file, not the harness's `tool-results/` spill file, so a path rule
+# would have missed it.
+#
+# Only where the command opens the file (see _command_segments): a `tail`/`head`
+# after a `|` trims another command's output, and `npm test 2>&1 | tail -100` is
+# the standard way to skim a log, which is what this hook exists to compress.
+# `cat` is deliberately NOT here: tests/test_compress_output.py pins `cat
+# SKILL.md` as compressible ("the big historical win"); /cr-resume is protected
+# by its skill telling the model to use `Read` instead.
+#
+# `sed` is exempt with any -n/--quiet/--silent (also bundled, `-ne`), whether or
+# not the script has a range: telling `sed -n p f` from a range needs sed-script
+# parsing for no real gain. `(?=\s|$)` rather than `\b` so `tailor`/`head-tool`
+# are not read as `tail`/`head`. `# compress-ok` still opts back in.
+_FILE_SLICE_RE = re.compile(
+    r"^(?:" + _ASSIGN_WORD + r"\s+)*(?:sudo\s+)?(?:"
+    r"sed\s+(?:-\S+\s+)*?(?:-[A-Za-z]*n[A-Za-z]*|--quiet|--silent)(?=\s|$)"
+    r"|(?:head|tail)(?=\s|$)"
+    r")"
+)
+
+# Matched ANYWHERE in a segment: these flags are how a caller says "give me
+# output I intend to parse exactly," regardless of which command they're on.
+#
+# The output-format VALUE (json/tsv/yaml) is matched case-insensitively via
+# the scoped (?i:...) group, since `-o JSON` is realistic and would otherwise
+# fall through. This is deliberately narrower than a blanket re.IGNORECASE on
+# the whole regex: that would also fold `-h` into matching `-H`, which means
+# something unrelated on real tools -- curl's custom-header flag, or df's
+# human-readable-with-SI-units flag, or docker's daemon-host flag -- none of
+# them a case variant of help.
+_EXACT_FLAG_RE = re.compile(
+    r"--porcelain\b|--json\b|--version\b|--query\b|--format[= ]"
+    # `-o json`, `-o=json` and `-ojson` are all accepted spellings (kubectl,
+    # az, ...). The lookbehind keeps `--foo-ojson` from matching.
+    # The trailing `(?![\w.-])` (not `\b`) keeps `-o json.txt` -- an output
+    # FILENAME -- from reading as a format value.
+    r"|(?<![\w-])-o[= ]?\s*(?i:json|tsv|yaml)(?![\w.-])|--output[= ](?i:json|tsv|yaml)(?![\w.-])|\|\s*jq\b"
+    # `grep -c` / `grep -rc` etc. -- counting, where the number is the answer.
+    r"|\bgrep\b[^|;&]*\s-\w*c(?:\s|$)"
+    # A dry run's entire output IS the preview of exactly what would happen --
+    # the file list, the counts, the planned actions. Summarizing it defeats
+    # the reason for running it. Found by dogfooding this repo: a summarized
+    # `ingest_to_qdrant.py --dry-run` dropped the "Found 200 chunks" line and
+    # every file_path/line_range row, keeping only the incidental file previews
+    # quoted inside them -- structure discarded, payload retained.
+    r"|--dry-run\b"
+    # Help text is read to copy exact flag spellings into the next command, so
+    # a rewrite that renames or omits a flag is worse than no help at all --
+    # same reasoning as --version. Bundled forms (`ls -lh`) deliberately don't
+    # match; only a standalone -h does.
+    r"|--help\b|\s-h(?:\s|$)"
+    # `gh api` (REST or GraphQL) always returns structured JSON meant to be
+    # parsed field-by-field -- an exact ID substituted into a follow-up call,
+    # or a comment/review body read verbatim to decide what to reply to or
+    # fix -- never prose to skim. Same rationale as the `jq|yq` command
+    # exemption above, just reached through `gh` instead of a literal pipe to
+    # the `jq` binary.
+    #
+    # Matched ANYWHERE rather than as a start-of-segment command (like
+    # `jq|yq`) on purpose: the real call sites in this repo's own skills wrap
+    # it in shell command substitution, e.g.
+    #   COMMENT_IDS=$(gh api repos/.../pulls/<PR>/comments --paginate --jq "...")
+    # A start-anchored match can't see past that `VAR=$(...)` wrapper, since
+    # the leading-assignment sub-pattern only accepts a quoted string or a
+    # whitespace-free token as the assigned value -- verified directly before
+    # picking this approach, a start-anchored `gh\s+api` addition matched the
+    # bare form but returned False on this exact wrapped form.
+    #
+    # Also deliberately broader than gating on `--jq`/`graphql` specifically:
+    # the narrower fix first suggested (those two flags only) was verified
+    # incomplete before implementing -- this repo's `cr-gh-pr-feedback` skill
+    # calls `gh api .../comments --paginate` with neither flag at all, so a
+    # narrower fix would have left that skill's primary feedback-fetch step
+    # exactly as exposed as before. One `gh api` match covers all three real
+    # shapes (plain, `--jq`-filtered, and `graphql`) plus any future one.
+)
+
+# `gh api` lives in its own pattern, NOT in _EXACT_FLAG_RE above: that one runs
+# on quote-stripped text, but `bash -c 'gh api ...'` executes its
+# quoted payload and returns structured JSON, so this one must see the raw
+# segment. See the `gh api` rationale in the comment block above.
+_EXACT_ANYWHERE_RE = re.compile(r"\bgh\s+api\b")
+
+# Escape hatch: a genuinely large exempt output (a 5MB `git diff`) can opt back
+# in with a trailing `# compress-ok` comment, so this list never becomes a
+# reason to paste huge diffs into context.
+#
+# Anchored to the END of the command, because an escape hatch that fires from
+# anywhere is a way to LOSE the exemption by accident: `git commit -m "fix the
+# # compress-ok bug"` would otherwise opt a git command back into compression
+# from inside a quoted argument. That's the exact failure this whole block
+# exists to prevent, reintroduced through the opt-out. Requiring it trailing
+# also matches how it's documented and how a real shell comment behaves.
+_FORCE_COMPRESS_RE = re.compile(r"#\s*compress-ok\s*\Z")
+
+# --- Project-level extra exactness-critical patterns ----------
+#
+# hooks/compress_output.py is shared across every project that installs
+# this toolkit -- each project's .claude/settings.json points at the SAME
+# cloned copy by absolute path (see docs/installation.md). A project with its
+# own domain-specific command whose output must stay byte-exact (an internal
+# CLI, a custom script returning an exact hash/ID) had no way to exempt it
+# without editing this shared file directly, which would change behavior for
+# every OTHER project pointing at the same clone. This env var is the
+# per-project override channel -- same shell-only pattern already used for
+# CLAUDE_RUNWAY_COMPRESS_THRESHOLD_CHARS above, since hooks have no `.mcp.json`
+# env block to read from.
+#
+# Additive only, deliberately: there is no matching "disable a builtin
+# pattern" knob. A project silently un-exempting git/wc/etc. would reintroduce
+# the exact lossy-git bug class this whole file exists to prevent (see the
+# bug-history comment above _EXACT_CMDS). CLAUDE_RUNWAY_EXTRA_EXACT_PATTERNS
+# can only ADD to _is_exactness_critical()'s check, never remove from it.
+#
+# Matched ANYWHERE in a segment -- like _EXACT_FLAG_RE, not the start-anchored
+# _EXACT_CMD_RE -- because the anywhere-matched form has no blind spot for a
+# `VAR=$(...)` wrapper (see the `gh api` addition's comment above),
+# and a project adding its own pattern is far more likely to want "this
+# command anywhere in the pipeline" than the narrower start-of-segment
+# semantics the builtin command list uses.
+#
+# Patterns are semicolon-separated, not comma-separated like this repo's other
+# multi-value env vars (e.g. INDEX_EXCLUDE_DIRS) -- a regex quantifier like
+# `{2,4}` is a realistic pattern here in a way a literal semicolon in a regex
+# is not, so comma would silently mis-split a legitimate pattern.
+#
+# Fails open PER-PATTERN, not all-or-nothing: a typo in pattern 2 of 3 must
+# not silently disable patterns 1 and 3 too. Each invalid pattern is skipped
+# and reported on stderr -- the same fail-open precedent as the ImportError
+# and stale-env-var paths above -- never crashes the hook or blocks Bash.
+def _compile_extra_exact_patterns():
+    raw = os.environ.get("CLAUDE_RUNWAY_EXTRA_EXACT_PATTERNS", "")
+    compiled = []
+    for piece in raw.split(";"):
+        pattern = piece.strip()
+        if not pattern:
+            continue
+        try:
+            compiled.append(re.compile(pattern))
+        except re.error as e:
+            print(
+                f"compress_output.py: skipping invalid "
+                f"CLAUDE_RUNWAY_EXTRA_EXACT_PATTERNS entry {pattern!r}: {e}",
+                file=sys.stderr,
+            )
+    return compiled
+
+
+_EXTRA_EXACT_PATTERNS = _compile_extra_exact_patterns()
+
+
+# Segment boundaries. Beyond the shell's own separators this also splits at
+# `$(` and a backtick: `HASH=$(git rev-parse HEAD)` otherwise
+# reads as ONE segment whose leading-assignment sub-pattern swallows
+# `HASH=$(git` as a single token, stranding `rev-parse` at segment start and
+# silently losing the exemption for the most common way a hash gets captured.
+# Splitting there makes the wrapped command start its own segment, so it hits
+# the same start-anchored table as a bare one. Only these openers split -- a
+# bare `(` mid-segment does not, since `--filter "(id=1)"` would then expose a
+# fake `id=1` segment and add false positives.
+_SEGMENT_SEP = r"\|\||&&|\$\(|`|[;|\n]"
+_SEGMENT_SPLIT_RE = re.compile(_SEGMENT_SEP)
+# The same boundaries with the separator kept (a capture group makes
+# re.split return it), so _command_segments can tell whether a segment came
+# straight after a single `|`. Built from the one string above so the two can
+# never drift apart.
+_SEGMENT_SPLIT_KEEP_SEP_RE = re.compile("(" + _SEGMENT_SEP + ")")
+
+
+def _command_segments(command):
+    """(segment, follows_pipe) pairs, split exactly as _SEGMENT_SPLIT_RE splits.
+
+    `follows_pipe` is True when the segment's immediately preceding separator
+    was a single `|`: it is then a pipeline consumer reading stdin, not the
+    command that opens a file. `||` is its own separator and does not count.
+    """
+    parts = _SEGMENT_SPLIT_KEEP_SEP_RE.split(command)
+    # re.split with one capture group alternates [segment, sep, segment, ...].
+    return [(parts[i], i > 0 and parts[i - 1] == "|") for i in range(0, len(parts), 2)]
+
+
+# Heredoc bodies are data, not commands. Splitting on `\n` would
+# otherwise put each body line at segment start, so a commit message or
+# generated script with a line beginning `git`/`wc`/`env` exempted the whole
+# command. The body is dropped but the `<<WORD ...` line itself (which can
+# carry `| jq`, `> file`, ...) is kept. Only TERMINATED heredocs are removed:
+# an unterminated match is more likely `$((1<<3))` than a real heredoc.
+# `(?<!<)`/`(?!<)` skip the `<<<` here-string. The body group is lazily
+# optional (`??`) so an EMPTY heredoc ends at its first terminator instead of
+# swallowing everything up to a later heredoc's terminator.
+_HEREDOC_RE = re.compile(
+    r"(?<!<)<<(?!<)-?[ \t]*(['\"]?)(\w+)\1(?![^\s;|&<>()])([^\n]*)\n(?:(.*?)\n)??[ \t]*\2[ \t]*(?=\n|\Z)",
+    re.DOTALL,
+)
+# A heredoc fed to a shell interpreter (incl. `ssh`, whose remote shell runs
+# it) is a SCRIPT, not data -- keep its body.
+# The guards keep a FILENAME like `f.sh` (`> f.sh`) from reading as `sh`.
+_SHELL_INTERP_RE = re.compile(r"(?<![\w.-])(?:ba|z|da|k|c|s)?sh(?![\w.-])|\bsource\b|\beval\b")
+# In an UNQUOTED heredoc, `$(...)`/backticks in the body still execute, and a
+# substitution can span lines (`$(\ngit diff\n)`), so everything from the first
+# marker on is kept -- conservative: it may scan some trailing literal text.
+_SUBSTITUTION_RE = re.compile(r"\$\(|`")
+
+
+_HEREDOC_MARK_RE = re.compile(r"(?<!<)<<(?!<)")
+
+
+def _strip_heredoc_bodies(command):
+    """Apply _heredoc_replacement, but only when EVERY `<<` is accounted for.
+
+    A `<<` that is neither a parsed opener nor inside a parsed body (a
+    non-word delimiter like `<<'DOC-TEXT'`, `$((1<<3))`) means the command is
+    not understood well enough to delete anything from it safely.
+    """
+    spans = [(m.start(), m.end()) for m in _HEREDOC_RE.finditer(command)]
+    for mark in _HEREDOC_MARK_RE.finditer(command):
+        if not any(start <= mark.start() < end for start, end in spans):
+            return command
+    return _HEREDOC_RE.sub(_heredoc_replacement, command)
+
+
+def _heredoc_replacement(m):
+    delim_quote, word, rest, body = m.group(1), m.group(2), m.group(3), m.group(4) or ""
+    line_start = m.string.rfind("\n", 0, m.start()) + 1
+    prefix = m.string[line_start:m.start()]
+    # Uncertain spans stay UNCHANGED (so nothing real is deleted). Judged on
+    # EVERYTHING before the opener, not just its own line, since quote state,
+    # comments and `\`-continuations all carry across lines: an odd quote
+    # count means this `<<` may sit inside a quoted argument, a `#` may make it
+    # a comment, and a backslash may continue an earlier line that names the
+    # interpreter (`bash \\\n<<EOF`).
+    before = m.string[:m.start()]
+    if before.count('"') % 2 or before.count("'") % 2 or "#" in before or "\\" in before:
+        return m.group(0)
+    if rest.rstrip().endswith("\\"):
+        return m.group(0)
+    # Whole opener line, both sides of `<<`: `cat <<EOF | bash` pipes the body
+    # into an interpreter just as `bash <<EOF` does.
+    opener = prefix + rest
+    if _SHELL_INTERP_RE.search(opener):
+        kept = body
+    elif delim_quote:
+        kept = ""
+    else:
+        sub = _SUBSTITUTION_RE.search(body)
+        kept = body[sub.start():] if sub else ""
+    return "<<" + word + rest + ("\n" + kept if kept else "")
+
+# Quoted spans are text, not flags: `echo "try --json here"`. Stripped before
+# the ANYWHERE flag patterns run (not the start-anchored command table, whose
+# assignment sub-pattern needs the quotes, nor _EXACT_ANYWHERE_RE). A real
+# quoted `--porcelain` losing its exemption is the safe direction --
+# `# compress-ok` is the opt-in for the other way round, and a wrongly-exempt
+# command is the silent error.
+_QUOTED_RE = re.compile(r"\"(?:\\.|[^\"\\])*\"|'[^']*'")
+
+# `env` is exempt only as a bare listing, or when the command it launches is
+# itself exempt (`env FOO=1 git status`) -- mirrors the VAR=val/sudo prefix
+# stripping in _EXACT_CMD_RE, in reverse.
+#
+# Parsed with shlex (real shell word rules: escapes, adjacent quoted/unquoted
+# pieces, quoted executables) rather than regexes -- three review rounds each found
+# another quoting form a regex parser got wrong, and shlex
+# has no backtracking to attack. Anything shlex can't parse is UNCERTAIN, and
+# uncertain keeps the exemption (the benign direction for a lone `env` word).
+_ASSIGNMENT_TOKEN_RE = re.compile(r"\w+=.*", re.DOTALL)
+_ENV_OPTS_WITH_OPERAND = ("-u", "-C", "--unset", "--chdir")
+
+
+def _env_tokens_exempt(tokens, follows_pipe=False):
+    """None if `tokens` isn't an `env` invocation; else whether it's exempt.
+
+    `follows_pipe` says the segment came straight after a single `|`, so a file
+    slice it launches is only trimming another command's stdout and is not
+    exempt (see _FILE_SLICE_RE).
+    """
+    i = 0
+    while i < len(tokens) and _ASSIGNMENT_TOKEN_RE.fullmatch(tokens[i]):
+        i += 1
+    if i < len(tokens) and tokens[i] == "sudo":
+        i += 1
+    if i >= len(tokens) or tokens[i] != "env":
+        return None
+    j = i + 1
+    while j < len(tokens):
+        tok = tokens[j]
+        if tok == "--":
+            j += 1
+            break
+        if tok.startswith(("-S", "--split-string")):
+            return True  # operand is command WORDS we don't parse: keep the exemption
+        if tok in _ENV_OPTS_WITH_OPERAND:
+            j += 2
+        elif tok.startswith("-") or _ASSIGNMENT_TOKEN_RE.fullmatch(tok):
+            j += 1
+        else:
+            break
+    rest = tokens[j:]
+    if not rest:
+        return True
+    nested = _env_tokens_exempt(rest, follows_pipe)
+    if nested is not None:
+        return nested
+    # `env CI=1 /usr/bin/git diff`: judge the executable by its basename. A file
+    # slice counts the same way it does without the wrapper: `env LC_ALL=C sed -n
+    # '3,47p' f` opens the file just like `LC_ALL=C sed -n '3,47p' f` does.
+    launched = " ".join([os.path.basename(rest[0])] + rest[1:])
+    return bool(_EXACT_CMD_RE.match(launched) or (not follows_pipe and _FILE_SLICE_RE.match(launched)))
+
+
+def _env_segment_is_exempt(segment, follows_pipe=False):
+    """None if `segment` isn't an `env` invocation; else whether it's exempt."""
+    try:
+        tokens = shlex.split(segment)
+    except ValueError:
+        # Unbalanced quote: usually _SEGMENT_SPLIT_RE cut inside a value at a
+        # `$(` (`env X="$(cmd)" git diff`). Re-walk with plain whitespace
+        # tokens just to learn whether this IS an env invocation; if so the
+        # parse is uncertain, so keep the exemption.
+        return True if _env_tokens_exempt(segment.split(), follows_pipe) is not None else None
+    return _env_tokens_exempt(tokens, follows_pipe)
+
+
+def _is_exactness_critical(command: str) -> bool:
+    """True if any segment of a (possibly compound) Bash command produces
+    output whose value depends on being byte-exact.
+
+    Checks every segment, not just the first: outputs of a pipeline or a
+    `a; b` chain are interleaved into one stdout, so there is no way to
+    compress part of it. One exactness-critical segment protects the whole.
+    """
+    if not command or _FORCE_COMPRESS_RE.search(command):
+        return False
+    command = _strip_heredoc_bodies(command)
+    for segment, follows_pipe in _command_segments(command):
+        # A subshell `(git diff)` or group `{ git diff; }` leaves its opener
+        # glued to the front of the segment, which would defeat `^` anchoring.
+        segment = segment.strip().lstrip("({").strip()
+        if not segment:
+            continue
+        env_exempt = _env_segment_is_exempt(segment, follows_pipe)
+        if env_exempt:
+            return True
+        if env_exempt is None and _EXACT_CMD_RE.match(segment):
+            return True
+        # A file slice is exact only where it opens the file. After a `|` it is
+        # just trimming another command's stdout (`npm test 2>&1 | tail -100`).
+        if not follows_pipe and _FILE_SLICE_RE.match(segment):
+            return True
+        if _EXACT_ANYWHERE_RE.search(segment):
+            return True
+        if _EXACT_FLAG_RE.search(_QUOTED_RE.sub('""', segment)):
+            return True
+        # `bash -c '...'`/`eval '...'` EXECUTE their quoted payload, so it is a
+        # command, not argument text: judge each quoted span as a command too.
+        if _SHELL_INTERP_RE.search(segment) and any(
+            _is_exactness_critical(q.group(0)[1:-1]) for q in _QUOTED_RE.finditer(segment)
+        ):
+            return True
+        if any(extra.search(segment) for extra in _EXTRA_EXACT_PATTERNS):
+            return True
+    return False
+
+
+def _debug_log(payload):
+    path = os.environ.get("HOOK_DEBUG_LOG")
+    if not path:
+        return
+    try:
+        with open(path, "a") as f:
+            f.write(json.dumps(payload) + "\n")
+    except OSError:
+        pass  # debugging aid only -- never let this break the hook itself
+
+
+def _emit_unchanged(note: str):
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "additionalContext": note,
+        }
+    }))
+
+
+def _emit_updated(updated):
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "updatedToolOutput": updated,
+        }
+    }))
+
+
+def _compress_text(text):
+    """compress() with the model client this hook owns: the library never
+    builds one (it does not import `openai`), so the hook builds the bounded
+    client for the default LM Studio URL and passes it in. Built per call,
+    which is cheap (no network until the first request)."""
+    return asyncio.run(compress(text, skip_if_under_chars=THRESHOLD, client=build_client(None)))
+
+
+def _handle_bash(tool_response):
+    """Known shape: {stdout, stderr, ...}. Proven by testing.
+    Returns ("updated", updated, raw_text, compressed_text) on success so the
+    caller can log savings without redoing the compression work."""
+    stdout = tool_response.get("stdout") or ""
+    stderr = tool_response.get("stderr") or ""
+    combined = stdout + (f"\n--- stderr ---\n{stderr}" if stderr else "")
+
+    if len(combined) < THRESHOLD:
+        return None  # small enough to leave alone
+
+    result = _compress_text(combined)
+    if result.startswith("Error:"):
+        return ("error", combined, result)
+
+    updated = dict(tool_response)
+    updated["stdout"] = result
+    updated["stderr"] = ""
+    return ("updated", updated, combined, result)
+
+
+def _walk_strings(obj, path=()):
+    """Yield (path, string) for every string leaf in a nested dict/list."""
+    if isinstance(obj, str):
+        yield path, obj
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            yield from _walk_strings(v, path + (k,))
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            yield from _walk_strings(v, path + (i,))
+
+
+def _set_path(obj, path, value):
+    cur = obj
+    for key in path[:-1]:
+        cur = cur[key]
+    cur[path[-1]] = value
+
+
+def _deep_copy(obj):
+    return json.loads(json.dumps(obj))
+
+
+def _record_group_key(path):
+    """Return the path prefix identifying which sibling "record" a string
+    field belongs to: everything up to and including the NEAREST (last,
+    i.e. innermost/deepest) list index in its path -- not the first one.
+    e.g. ('results', 3, 'snippet') -> ('results', 3), so every field under
+    results[3] groups together, separately from results[4].
+
+    Must be the last index, not the first: for a nested shape like
+    ('sections', 0, 'results', 3, 'snippet'), stopping at the FIRST index
+    (the 'sections' one) would give every result under sections[0] the same
+    key ('sections', 0) regardless of its own 'results' index -- merging
+    sections[0].results[3] and sections[0].results[4] back into one group,
+    reintroducing the exact cross-record blending this grouping exists to
+    prevent, just one level deeper. Using the last index
+    instead isolates the innermost repeating record, which is always the
+    one actually holding these sibling fields.
+
+    Fields with no list index anywhere in their path (flat top-level
+    metadata, or a single nested object with no list ancestor at all) share
+    the group key () -- there's no sibling record structure to separate
+    them, so they fall back to being treated as one group.
+    """
+    last_index = None
+    for i, key in enumerate(path):
+        if isinstance(key, int):
+            last_index = i
+    if last_index is None:
+        return ()
+    return path[: last_index + 1]
+
+
+def _compress_group(fields):
+    """Compress one record's large string fields as a unit. Returns
+    (raw_text, result) where result is either the compressed text or an
+    "Error: ..." string from compress() -- both callers below unpack
+    exactly these two values. Mirrors the single-blob logic _handle_generic
+    used to apply globally -- now scoped to just this group's own fields."""
+    combined = "\n\n".join(s for _, s in fields)
+    result = _compress_text(combined)
+    return combined, result
+
+
+def _handle_generic(tool_response):
+    """
+    Undocumented shape (Grep, WebFetch, anything else added to the matcher).
+    Finds every string leaf over MIN_FIELD_LEN; if they sum past THRESHOLD,
+    compression proceeds -- but grouped by sibling record (see
+    _record_group_key) rather than concatenated across the whole response,
+    so multiple independent records (e.g. WebSearch's `results` list) never
+    get blended into one combined summary that then gets written back into
+    only ONE record while every sibling's own field is blanked to ""
+    (reproduced live: a 10-result WebSearch-shaped payload lost 9 of
+    10 snippets this way, with no error or indication it happened).
+
+    - Exactly one group (no sibling record structure, e.g. Grep's flat
+      shape, or a single dominant field) -- unchanged from the original
+      behavior: compress the concatenation, write it into the single
+      largest field, blank the other large fields.
+    - Multiple groups (sibling records) -- each group is compressed
+      independently via compress()'s own skip_if_under_chars check, applied
+      to that RECORD's own combined eligible content, same as the
+      single-group case below but scoped to one record instead of the
+      whole response -- NOT a per-field check, so two fields that are each
+      individually under THRESHOLD can still get compressed together if
+      their combined length crosses it (the previous
+      wording here read as a per-field guarantee, which it never was). A
+      record whose combined content stays under THRESHOLD is left
+      completely untouched rather than forcibly summarized just because ITS
+      SIBLINGS pushed the RESPONSE-WIDE aggregate over the line. A record
+      whose own combined content does cross THRESHOLD gets compressed and
+      its largest field replaced, exactly like the single-group case,
+      scoped to that record.
+    Small fields (short metadata) are left completely untouched either way.
+    Preserves the original JSON shape exactly, since the real schema isn't
+    documented and a malformed updatedToolOutput may be silently ignored.
+
+    Returns ("updated", updated, raw_text, compressed_text) on success,
+    None if nothing ended up changing (every group was individually under
+    threshold), or ("error", raw_text, message) if any group's compression
+    call failed -- same three-shape contract _handle_bash uses, so the
+    caller can log savings and fail open uniformly.
+    """
+    if isinstance(tool_response, str):
+        large_fields = [((), tool_response)] if len(tool_response) >= MIN_FIELD_LEN else []
+    else:
+        large_fields = [(p, s) for p, s in _walk_strings(tool_response) if len(s) >= MIN_FIELD_LEN]
+
+    total = sum(len(s) for _, s in large_fields)
+    if total < THRESHOLD or not large_fields:
+        return None  # nothing substantial enough to bother with
+
+    groups = {}
+    for path, s in large_fields:
+        groups.setdefault(_record_group_key(path), []).append((path, s))
+
+    if len(groups) <= 1:
+        # No sibling record structure -- same whole-blob behavior as before
+        # this fix: compress everything together, write the result into the
+        # single largest field, blank the rest.
+        combined, result = _compress_group(large_fields)
+        if result.startswith("Error:"):
+            return ("error", combined, result)
+
+        largest_path, _ = max(large_fields, key=lambda ps: len(ps[1]))
+        if largest_path == ():
+            return ("updated", result, combined, result)
+
+        updated = _deep_copy(tool_response)
+        for path, _ in large_fields:
+            _set_path(updated, path, result if path == largest_path else "")
+        return ("updated", updated, combined, result)
+
+    # Sibling records exist -- compress each one independently so one
+    # record's summary never displaces another record's content.
+    updated = _deep_copy(tool_response)
+    raw_parts, compressed_parts = [], []
+    for fields in groups.values():
+        combined, result = _compress_group(fields)
+        raw_parts.append(combined)
+        if result.startswith("Error:"):
+            # Fail open for the WHOLE response, same policy as every other
+            # path here -- a partial rewrite (some records compressed, one
+            # group's call failed) is worse than none, since it's not
+            # obvious to Claude which fields are still trustworthy.
+            return ("error", "\n\n".join(raw_parts), result)
+        compressed_parts.append(result)
+        if result == combined:
+            continue  # this record's own fields were under THRESHOLD -- untouched
+        largest_path, _ = max(fields, key=lambda ps: len(ps[1]))
+        for path, _ in fields:
+            _set_path(updated, path, result if path == largest_path else "")
+
+    raw_text = "\n\n".join(raw_parts)
+    compressed_text = "\n\n".join(compressed_parts)
+    if compressed_text == raw_text:
+        return None  # every group was individually under threshold -- true no-op
+    return ("updated", updated, raw_text, compressed_text)
+
+
+def _accepted(envelope, tool):
+    """The envelope, if it came from the tool that was called (or no tool was
+    named); otherwise None."""
+    if envelope is None or (tool is not None and envelope["metrics"]["tool"] != tool):
+        return None
+    return envelope
+
+
+def _handle_mcp_savings_envelope(tool_response, tool=None):
+    """
+    Unwraps compress_mcp_server.py's savings envelope (see its
+    _attach_savings_metrics and libs/savings_envelope_lib.py, which defines
+    what an envelope is) from a credited MCP tool's output, returning
+    (metrics, updated) where `updated` is what Claude should see instead: the
+    envelope's compressed_text, in the same shape the response arrived in.
+    Returns (None, None) if the output is not that envelope -- i.e. tracking
+    was off server-side, or nothing was compressed, so there is nothing to
+    unwrap or log.
+
+    `tool` is the bare name of the tool that was called. When given, the
+    envelope is accepted only if its own metrics name that same tool, so a
+    result from a tool that never emits one (compress_text, list_local_models)
+    can never be taken for one, and an envelope-shaped file read by
+    compress_file cannot claim to be another tool's.
+
+    The shapes handled are the ones a tool_response is known to take: a plain
+    string (what Claude Code sends for a `str` return: the MCP layer's
+    `{"result": ...}` JSON, captured live and pinned in the tests), the
+    already-unwrapped dict `{"result": "<text>"}`, and a single text block.
+    Nothing else is searched: a tool_response is not walked for a string that
+    merely looks like the envelope.
+    """
+    if isinstance(tool_response, str):
+        envelope = _accepted(parse_envelope_text(tool_response), tool)
+        if envelope is not None:
+            return envelope["metrics"], envelope["compressed_text"]
+        return None, None
+
+    if isinstance(tool_response, dict) and isinstance(tool_response.get("result"), str):
+        envelope = _accepted(parse_envelope_text(tool_response["result"]), tool)
+        if envelope is not None:
+            updated = dict(tool_response)
+            updated["result"] = envelope["compressed_text"]
+            return envelope["metrics"], updated
+        return None, None
+
+    if (
+        isinstance(tool_response, list) and len(tool_response) == 1
+        and isinstance(tool_response[0], dict) and tool_response[0].get("type") == "text"
+        and isinstance(tool_response[0].get("text"), str)
+    ):
+        envelope = _accepted(parse_envelope_text(tool_response[0]["text"]), tool)
+        if envelope is not None:
+            block = dict(tool_response[0])
+            block["text"] = envelope["compressed_text"]
+            return envelope["metrics"], [block]
+    return None, None
+
+
+def _metric_chars(value):
+    """A savings metric's char count, or None if absent/malformed (metrics
+    written before character counts were recorded have none, and the event is
+    then not recorded) -- bool is excluded since it's an int subclass."""
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
+
+
+def _finish_compression_outcome(outcome, tool_name, source, session_id, project, agent_id=None, agent_type=None,
+                                tool_use_id=None):
+    """
+    Shared tail for turning an _handle_bash/_handle_generic `outcome` into
+    the right hook response -- used by both the ordinary Bash/Grep/etc. path
+    and the MCP-tool no-envelope fallback below. Always calls
+    sys.exit(0) itself, matching every other terminal branch in main().
+    """
+    if outcome is None:
+        sys.exit(0)  # under threshold -- leave alone
+
+    if outcome[0] == "error":
+        _, combined, result = outcome
+        # Compression failed -- fail open. Leave output untouched, just note
+        # why, so this doesn't silently degrade forever without being noticed.
+        _emit_unchanged(
+            f"Note: this {tool_name} call's output was {len(combined)} chars but wasn't "
+            f"compressed ({result}). Original output was left unchanged."
+            # Only attached on the failure path, where it's likely to be the actual
+            # cause and the user is already being interrupted anyway.
+            + (f" {_STALE_ENV}" if _STALE_ENV else "")
+        )
+        sys.exit(0)
+
+    _, updated, raw_text, compressed_text = outcome
+    _record_savings_event(
+        session_id, f"hook:{tool_name}", len(raw_text), len(compressed_text),
+        True, source, project=project, agent_id=agent_id, agent_type=agent_type,
+        tool_use_id=tool_use_id,
+    )
+    _emit_updated(updated)
+    sys.exit(0)
+
+
+# Matches compact_find's own header verbatim (qdrant_mcp_server.py):
+# f"Found {len(entries)} compact(s) for project '{project}':\n". Anchored to
+# the START of the leaf (^, no re.MULTILINE, so this only matches the
+# absolute beginning of the string) -- not just anchored to that exact
+# phrasing -- so a STORED compact's own content can never be mistaken for
+# the real header just because it happens to quote the same phrase
+# mid-string (e.g. a past /cr-compact session about debugging this very
+# hook). The genuine header is always the first thing compact_find's own
+# "\n".join(lines) call emits, so requiring position 0 costs nothing for
+# the real case while closing that false-match window.
+_COMPACT_FIND_HEADER_RE = re.compile(r"^Found (\d+) compact\(s\) for project '")
+
+
+def _compact_find_entry_count(tool_response):
+    """Extract N from compact_find's "Found {N} compact(s) for project..."
+    header, searching every string leaf of the (possibly
+    nested) tool response via the same _walk_strings used elsewhere in this
+    file. Returns None if no such header is found anywhere -- e.g. an error
+    string ("No compacts found for project..."), some other response shape
+    entirely, or a leaf where the phrase appears but not at that leaf's own
+    start -- which the caller treats as "nothing to special-case, fall
+    through to the ordinary size-based path" rather than as N=0."""
+    for _, s in _walk_strings(tool_response):
+        m = _COMPACT_FIND_HEADER_RE.search(s)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def _dispatch(payload):
+    """Everything main() does after the payload has been parsed off stdin --
+    split out so main() can wrap this whole body in one try/except
+    without also swallowing the json.load try/except above it, which
+    has to stay narrowly scoped to the parse step itself."""
+    _debug_log(payload)
+
+    tool_name = payload.get("tool_name")
+    session_id = payload.get("session_id")
+    tool_response = payload.get("tool_response")
+    # a tool call made inside a subagent carries the PARENT's
+    # session_id plus `agent_id` (present only inside a subagent) and
+    # `agent_type` (a subagent's type, or the main thread's `claude --agent`
+    # name). Read once here and threaded to every recording call below, so a
+    # credited saving can later be attributed to the subagent that earned it.
+    agent_id = payload.get("agent_id")
+    agent_type = payload.get("agent_type")
+    # The id of THIS tool call (documented PostToolUse payload
+    # field). Recorded on the event so it can later be joined to its turn/model.
+    # Empty when absent; a non-string value is dropped rather than trusted.
+    tool_use_id = payload.get("tool_use_id")
+    if not isinstance(tool_use_id, str):
+        tool_use_id = None
+    # Same source session_end_savings.py already uses for the identical
+    # purpose -- derived once here so both _record_savings_event call sites
+    # below tag their JSONL entries with it. Originally this is
+    # what let current_session_id()'s project-filtered lookup tell this
+    # session's events apart from an unrelated project's;
+    # that lookup delegates to session_id_lib's shadow markers instead, so
+    # this tag is now informational only -- see savings_ledger.record_event's
+    # own docstring.
+    if _SAVINGS_LEDGER_AVAILABLE:
+        assert savings_ledger is not None  # _SAVINGS_LEDGER_AVAILABLE implies this
+        project = savings_ledger.project_name_from_cwd(payload.get("cwd", ""))
+    else:
+        project = None
+
+    if tool_name and tool_name.startswith(MCP_SAVINGS_TOOL_PREFIX):
+        if tool_response is None:
+            sys.exit(0)
+        bare_tool_name = tool_name[len(MCP_SAVINGS_TOOL_PREFIX):]
+        metrics, updated = _handle_mcp_savings_envelope(tool_response, bare_tool_name)
+        if metrics is not None:
+            _record_savings_event(
+                session_id, metrics["tool"],
+                _metric_chars(metrics.get("raw_chars")), _metric_chars(metrics.get("out_chars")),
+                metrics["credited"], metrics["source"],
+                project=project, agent_id=agent_id, agent_type=agent_type,
+                tool_use_id=tool_use_id,
+            )
+            _emit_updated(updated)
+            sys.exit(0)
+        # No envelope. If this is one of the tools that already ran its OWN
+        # compression (see _SELF_COMPRESSING_MCP_TOOLS's comment), leave it
+        # alone regardless of size -- re-compressing it generically here
+        # would discard exactly what that first pass was told to preserve.
+        # Otherwise, this is one of the local-compress tools that never
+        # compresses anything itself (e.g. list_local_models) -- fall back to
+        # the same size-based compression every other matched tool gets,
+        # otherwise every one of THOSE calls is a complete no-op regardless
+        # of size, the opposite of what this hook exists to do.
+        if bare_tool_name in _SELF_COMPRESSING_MCP_TOOLS:
+            sys.exit(0)
+        outcome = _handle_generic(tool_response)
+        _finish_compression_outcome(outcome, tool_name, tool_name, session_id, project, agent_id, agent_type, tool_use_id)
+
+    # The analytics server's reports are exact numbers read verbatim (see
+    # MCP_ANALYTICS_TOOL_PREFIX): never compressed, at any size.
+    if tool_name and tool_name.startswith(MCP_ANALYTICS_TOOL_PREFIX):
+        sys.exit(0)
+
+    # The compact tools live on the qdrant server (they used to be on
+    # local-compress). They never compress anything themselves and carry no
+    # savings envelope, so they take the same size-based path as any other
+    # matched tool, with the two exemptions below. Every OTHER tool on this
+    # server (`qdrant-find`, `qdrant-store`) is never compressed, and the
+    # matcher does not list them; this check keeps that true even if a
+    # hand-edited matcher were widened to `mcp__qdrant__.*`.
+    # (compact_prune, an exact list of ids, is the same verbatim-report class
+    # as the analytics tools above.)
+    if tool_name and tool_name.startswith(MCP_QDRANT_TOOL_PREFIX):
+        bare_tool_name = tool_name[len(MCP_QDRANT_TOOL_PREFIX):]
+        if bare_tool_name not in _QDRANT_COMPACT_MCP_TOOLS or tool_response is None:
+            sys.exit(0)
+        # A list of pruned compact ids is an exact report, the same class as
+        # the analytics server's reports.
+        if bare_tool_name == "compact_prune":
+            sys.exit(0)
+        # compact_find can return up to 10 full stored conversation compacts,
+        # which is why it is matched at all. Its output is
+        # structured data /cr-resume parses for
+        # control flow, not prose to skim: a "Found {N}
+        # compact(s)" header followed by N discrete dated/labeled entries.
+        # /cr-resume branches on that count (0 -> tell the user to run
+        # /cr-compact, 1 -> restore silently, 2+ -> AskUserQuestion picker
+        # with one option per entry). Generic size-based compression below
+        # collapses all N entries into a single flowing narrative before
+        # /cr-resume ever sees discrete entries to count, so the picker
+        # never fires and the merged summary can misrepresent which
+        # entries exist at all. Skip compression outright whenever the
+        # header itself reports more than one entry. A single-entry (or
+        # header-less, e.g. "No compacts found...") response has no
+        # multi-entry structure to lose, so it still gets the ordinary
+        # size-based path below -- preserving the original intent
+        # that compact_find isn't UNCONDITIONALLY exempt, just exempt when
+        # exemption actually matters.
+        if bare_tool_name == "compact_find":
+            entry_count = _compact_find_entry_count(tool_response)
+            if entry_count is not None and entry_count > 1:
+                sys.exit(0)
+        outcome = _handle_generic(tool_response)
+        _finish_compression_outcome(outcome, tool_name, tool_name, session_id, project, agent_id, agent_type, tool_use_id)
+
+    # Generic MCP tools from other servers (GitHub, etc.) --
+    # NOT mcp__local-compress__, whose path comes first above. All of these
+    # go through _handle_generic: the generic walker is schema-agnostic and
+    # the dividing line for whether a tool belongs in the matcher at all
+    # (does Claude use this output as the exact basis for a following Edit?)
+    # is enforced at the settings.json.template matcher level, not here.
+    # Each tool in the matcher has been individually vetted against that rule:
+    # - get_file_contents: excluded -- returns raw file bytes (edit-basis).
+    # - get_pull_request_files: excluded -- returns per-file patch hunks
+    #   (edit-basis; the patch IS the code being reviewed or implemented,
+    #   not a summary of statistics).
+    # - write/mutation calls (create_*/push_files/fork_repository): excluded
+    #   -- response is created-object metadata, which is never large enough
+    #   to compress, and these paths don't benefit from being in the matcher.
+    # - add_issue_comment, create_pull_request_review: included despite being
+    #   write calls -- their response is the newly created object's JSON
+    #   (id, url, body, timestamps), read for confirmation or follow-up, never
+    #   the byte-exact basis for an Edit. The "NOT write mutations" framing in
+    #   earlier drafts was an oversimplification; the real test is edit-basis,
+    #   not read-vs-write.
+    if tool_name.startswith("mcp__"):
+        outcome = _handle_generic(tool_response)
+        _finish_compression_outcome(outcome, tool_name, tool_name, session_id, project, agent_id, agent_type, tool_use_id)
+
+    if tool_name not in SUPPORTED_TOOLS:
+        sys.exit(0)  # matcher should already restrict this, but double-check
+
+    if tool_response is None:
+        sys.exit(0)
+
+    if tool_name == "Bash":
+        source = (payload.get("tool_input") or {}).get("command", "")
+        if _is_exactness_critical(source):
+            # Silent, like the under-threshold path: Claude gets the real
+            # output, which is the correct result, not something to announce.
+            sys.exit(0)
+        outcome = _handle_bash(tool_response)
+    else:
+        outcome = _handle_generic(tool_response)
+        source = tool_name
+
+    _finish_compression_outcome(outcome, tool_name, source, session_id, project, agent_id, agent_type, tool_use_id)
+
+
+def main():
+    # Claude Code writes the hook payload to stdin as UTF-8, but on Windows
+    # Python opens stdin with the locale codepage (cp1252 on a US/Western
+    # install), not UTF-8. Left unfixed that has two silent,
+    # wrong-result failure modes here: (1) multi-byte UTF-8 in tool_response
+    # (routine in build logs/fetched pages) decodes as mojibake, which this
+    # hook would then compress and splice back in via updatedToolOutput --
+    # Claude reads a summary of garbage as if it were the real output; and
+    # (2) bytes with no cp1252 mapping (0x81/0x8D/0x8F/0x90/0x9D) raise
+    # UnicodeDecodeError -- a ValueError subclass the json.load guard below
+    # swallows -- so compression silently dies for exactly the riskiest
+    # outputs. Force UTF-8 with errors="replace" before the read. Guarded
+    # because a non-reconfigurable stream (e.g. io.StringIO in the unit
+    # tests) has no reconfigure(); fail open rather than crash the hook.
+    _reconfigure = getattr(sys.stdin, "reconfigure", None)
+    if _reconfigure is not None:
+        try:
+            _reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass  # already-consumed/detached stream -- fail open
+    try:
+        payload = json.load(sys.stdin)
+    except (json.JSONDecodeError, ValueError):
+        sys.exit(0)  # can't parse input -- fail open, don't touch anything
+
+    # Top-level guard for everything AFTER the parse step above:
+    # _dispatch() calls into _handle_bash/_handle_generic, which call
+    # compress() via asyncio.run -- compress()'s own docstring promises
+    # "never raises," but that's upheld only incidentally (the one
+    # network-calling piece, complete(), is what actually catches
+    # everything; nothing else in the pipeline has its own try/except). Any
+    # other unexpected error anywhere in this path -- here, or in a future
+    # change to _dispatch() itself -- must fail open the same way every KNOWN
+    # failure mode in this file already does, rather than propagate as a raw
+    # traceback with no _STALE_ENV context and no explanation.
+    #
+    # Deliberately `except Exception`, not `BaseException`: every terminal
+    # branch inside _dispatch()/_finish_compression_outcome() already calls
+    # sys.exit(0), which raises SystemExit -- a BaseException subclass that
+    # must keep propagating past this guard unharmed, or every existing
+    # "done, exit cleanly" path below would get rerouted into the error note
+    # this except block is only meant for genuinely unexpected failures.
+    try:
+        _dispatch(payload)
+    except Exception as e:
+        _emit_unchanged(
+            f"Note: this hook failed unexpectedly ({type(e).__name__}: {e}). "
+            "Original output was left unchanged."
+            + (f" {_STALE_ENV}" if _STALE_ENV else "")
+        )
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

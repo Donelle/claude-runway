@@ -1,0 +1,1525 @@
+"""
+Shared, dependency-light logic behind `mcpservers/memory_bank_mcp_server.py`:
+`remember`/`recall`/`forget` persist durable, cross-session
+lessons into ONE shared Qdrant collection across every project (not each
+project's own code-index collection), tagged by writing project so lookups
+stay precise by default while still allowing a deliberate cross-project
+lookup.
+
+Uses a raw `QdrantClient` + embedding provider directly, not
+`QdrantConnector` (the class `find_in_collection`/`index_repo`/`sync_repo`
+build on): the embedded field (`summary`) and the field returned on a hit
+(`description`) are NOT the same field here, unlike `find_in_collection`'s
+generic `content`-in/`content`-out pattern -- see `remember_point`'s payload
+shape below.
+
+`metadata` also carries `description` (verbatim stored text), `created_at`,
+and `pending` (see `remember_point`/`wipe_memory_bank`) -- the
+CONTROL/classification fields below are the ones that gate access
+(source/repo) or describe provenance (embedding_model) or open-ended
+categorization (kind) or offer a memory to followers (shared); `kind` and
+`shared` are the ones left to the calling model's own judgment (`shared`
+only on the user's say-so, see below):
+  - `source` -- always "memory-bank", fixed by this module, never
+    model-settable. The structural "is this actually a memory-bank record"
+    signal `index_repo(reset=true)`/`sync_repo` key their guard exclusions
+    off of (see mcpservers/ingest_mcp_server.py).
+  - `repo` -- the writing project's own MEMORY_BANK_ID (a plain identifier,
+    not necessarily a real Qdrant collection name), or the reserved
+    GENERAL_REPO sentinel when the caller explicitly asked for
+    general/cross-project scope. Also tool-resolved (see resolve_repo), not
+    directly model-settable -- `general` can only ever steer this to the one
+    fixed sentinel, never to spoof a specific other project's identity.
+  - `embedding_model` -- diagnostic only. An earlier draft of this module
+    gated `recall` results on this field per-point; that check was cut after
+    review found it structurally almost unreachable (a stored point can only
+    exist if its vector already matched the collection's fixed schema at
+    write time) and, on the one path that WAS reachable, compared raw model-
+    name strings rather than resolved vector name/dimension -- a real bug
+    that made it more likely to raise a false positive than catch a genuine
+    mismatch. The collection-level schema check (qdrant_model_check.py) is
+    the actual defense against a real cross-model mismatch; this field is
+    kept purely so a human can later see what model wrote a given point.
+  - `kind` -- fully open, model-decided (no fixed enum).
+  - `shared` -- a bool the writer sets with `remember(shared=True)`: "offer
+    this memory to the repos that FOLLOW my repo" (see `_scope_filter`). A
+    relevance filter, NOT access control: it never changes `repo` (the owner
+    stays the writer), and `recall(repo=...)`/`recall(all_repos=True)` return
+    any repo's memories whether shared or not. A point with no such field
+    (written before it existed) counts as `shared=False` at read time.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import time
+import uuid
+from typing import Optional
+
+from qdrant_client import QdrantClient, models
+
+from qdrant_retry import call_with_retry
+from qdrant_model_check import check_embedding_model_mismatch
+
+# Passed as check_embedding_model_mismatch's recovery_hint by every memory-bank
+# call site -- the shared check's DEFAULT text tells a caller
+# to "use index_repo(reset=true)"/mentions "find_in_collection", both wrong
+# here: index_repo refuses to ever touch the shared memory-bank collection
+# (see is_memory_bank_collection_name's callers in mcpservers/ingest_mcp_server.py),
+# and memory-bank isn't a cross-repo lookup.
+MISMATCH_RECOVERY_HINT = (
+    "This shared memory-bank collection was created with a different embedding "
+    "model than this project's EMBEDDING_MODEL. Every project sharing it must "
+    "agree on one model -- either change this project's EMBEDDING_MODEL to match "
+    "whichever model created the collection, or (if you control every project "
+    "using it) delete the collection directly in Qdrant and let the next "
+    "remember() call recreate it under the new model."
+)
+
+SOURCE_FIELD = "metadata.source"
+KIND_FIELD = "metadata.kind"
+REPO_FIELD = "metadata.repo"
+EMBEDDING_MODEL_FIELD = "metadata.embedding_model"
+CREATED_AT_FIELD = "metadata.created_at"
+PENDING_FIELD = "metadata.pending"
+WEIGHT_FIELD = "metadata.weight"
+SHARED_FIELD = "metadata.shared"
+
+MEMORY_BANK_SOURCE = "memory-bank"
+
+# metadata.source value qdrant_mcp_server.compact_store stamps on every
+# conversation-compact point. Lives here beside
+# MEMORY_BANK_SOURCE so the writer and the indexer's delete guard
+# (memory_bank_exclusion_filter) share one constant and can't drift apart.
+COMPACT_SOURCE = "conversation-compact"
+
+# Default weight for a point with no metadata.weight at all --
+# either a point written before this field existed, or one explicitly
+# remembered with weight=1.0 (the default). Multiplicative against
+# FLOORED similarity (see _normalize_similarity below -- effective_score =
+# max(0, raw) * weight), so this value is specifically chosen to
+# be a true no-op: 1.0 preserves plain-similarity ORDERING exactly (a
+# constant scale factor across every hit, with negative-similarity ties
+# broken by raw score in recall_points).
+DEFAULT_WEIGHT = 1.0
+
+# recall_points over-fetches this many times `limit` from query_points BEFORE
+# applying the weight multiplier and truncating -- re-ranking by
+# effective_score = max(0, raw_score) * weight (see _normalize_similarity's
+# docstring for the full semantics and why) has to happen against a wider raw-similarity pool than
+# the final `limit`, or a genuinely high-weight but lower-raw-similarity
+# match could get cut by Qdrant's own similarity-only ordering before
+# re-ranking ever sees it. 3x is a fixed implementation choice (the
+# two-stage SHAPE -- fetch pool, re-rank, truncate -- is the
+# design decision, not this exact multiplier).
+_RECALL_OVERFETCH_MULTIPLIER = 3
+
+
+def _normalize_similarity(raw_score: float) -> float:
+    """
+    Floors a raw cosine similarity at 0 (`max(0.0, raw_score)`, no offset, no
+    rescale) BEFORE it's multiplied by `weight`. FINAL WEIGHT SEMANTICS
+    (the contract a future `reweight_point`, builds on):
+
+        effective_score = max(0, raw_similarity) * weight
+
+    i.e. `weight` is a PROPORTIONAL relevance multiplier. A hit's
+    effective_score is always proportional to its own relevance, so:
+      * a zero-or-negative-similarity hit scores exactly 0 at ANY weight --
+        weight can never rescue an irrelevant memory (nor, for a finite
+        weight, turn it into a top hit);
+      * `weight=1.0` (the default, and any point with no `metadata.weight`)
+        is a true no-op for ORDERING: effective_score equals max(0, raw), a
+        monotonic function of raw similarity;
+      * `weight=0` floors to exactly 0, the bottom of the ranking;
+      * `weight=w>1` lets a hit beat a default-weight competitor iff
+        `w * raw_w > raw_d`, e.g. weight=2.0 makes a hit with half the
+        similarity TIE a default-weight one and beat any equally-similar
+        one -- a boost among comparably-relevant hits, never a takeover.
+    Hits that tie at effective_score 0 (all non-positive similarities, or
+    weight=0) are ordered weight>0 hits first, then by raw similarity
+    descending (see recall_points), so default-weight ordering is exactly
+    plain-similarity ordering even in the negative range, and weight=0 hits
+    always sit at the very bottom.
+
+    History: the first version multiplied the RAW score, which inverted for
+    NEGATIVE similarities (weight=0 on score=-0.8 gave 0, ranking ABOVE a
+    weight=1 hit at -0.1; weight>1 demoted). A follow-up fixed the sign with a
+    `(raw+1)/2` rescale into [0, 1], but that put every realistic hit
+    (raw>=0) in [0.5, 1.0]: weight=2.0 on raw=0.0 scored 1.0 and beat a
+    default-weight raw=0.99 (0.995) -- an unconditional takeover.
+    Flooring at 0 with no offset keeps both sign fixes and removes the 0.5
+    floor.
+
+    This is an internal ranking mechanism only -- the `score` field in a
+    recall_points hit dict stays the RAW, un-floored similarity Qdrant
+    returned (unchanged meaning, see recall_points' own docstring for why).
+    """
+    return max(0.0, raw_score)
+
+# Reserved metadata.repo value for knowledge that isn't tied to any one
+# project -- set via remember(general=True). Collides, in principle, with a
+# real project whose own MEMORY_BANK_ID happens to resolve to this exact
+# string (e.g. setup_project.py defaults it from default_collection_name(),
+# which slugifies a directory name, so a repo literally named "general"
+# would produce this) -- resolve_repo() below refuses that case explicitly
+# rather than silently aliasing a real project's memories onto the general
+# bucket.
+GENERAL_REPO = "general"
+
+# Must match templates/mcp.json.template's literal MEMORY_BANK_ID
+# placeholder text exactly -- an unedited project would otherwise silently
+# tag every memory with this same string, indistinguishable from a real,
+# unique project identifier and shared across every un-configured project.
+_PLACEHOLDER_MEMORY_BANK_ID = "ANY-NAME-YOU-WANT"
+
+
+def resolve_repo(memory_bank_id: Optional[str], general: bool) -> tuple:
+    """
+    Resolves the `metadata.repo` value a `remember`/`recall`/`forget`
+    (`wipe_all`) call should use. Returns `(repo, None)` on success or
+    `(None, error_message)` on failure -- mirrors this repo's
+    `validate_chunk_params`-style "return an error string, let the caller
+    decide how to surface it" convention (see qdrant_ingest_lib.py) rather
+    than raising.
+
+    general=True always resolves to the fixed GENERAL_REPO sentinel
+    regardless of memory_bank_id -- the whole point of `general` is that
+    it doesn't depend on which project is calling, and it can never resolve
+    to any value other than that one fixed sentinel (so it can't be used to
+    spoof a specific OTHER project's identity).
+
+    general=False errors (rather than silently degrading) when:
+    - memory_bank_id is falsy: no MEMORY_BANK_ID configured for this
+      project's .mcp.json, mirroring index_repo/sync_repo's own "no
+      collection specified" error.
+    - memory_bank_id is still the unedited mcp.json.template placeholder:
+      every project left unconfigured this way would otherwise silently
+      share one `repo` tag, leaking memories across projects that never
+      intended to share anything.
+    - memory_bank_id == GENERAL_REPO: a real project's own identifier
+      colliding with the reserved sentinel would make its memories
+      indistinguishable from genuinely general ones.
+    """
+    if general:
+        return GENERAL_REPO, None
+    if not memory_bank_id:
+        return None, (
+            "Error: no collection specified and no MEMORY_BANK_ID env var "
+            "configured for this project's .mcp.json -- memory-bank needs this "
+            "to tag/scope entries by project. Set MEMORY_BANK_ID (any identifier "
+            "unique to this project) for this project, or pass general=True to "
+            "store this as general, cross-project knowledge instead."
+        )
+    if memory_bank_id == _PLACEHOLDER_MEMORY_BANK_ID:
+        return None, (
+            f"Error: MEMORY_BANK_ID is still the unedited template placeholder "
+            f"('{_PLACEHOLDER_MEMORY_BANK_ID}') -- every project left unconfigured "
+            f"this way would silently share the same memory-bank 'repo' tag. "
+            f"Set a real, unique MEMORY_BANK_ID for this project first."
+        )
+    if memory_bank_id == GENERAL_REPO:
+        return None, (
+            f"Error: this project's MEMORY_BANK_ID is '{GENERAL_REPO}', which "
+            f"collides with memory-bank's reserved general-knowledge tag. Rename "
+            f"this project's MEMORY_BANK_ID to something else."
+        )
+    return memory_bank_id, None
+
+
+def parse_follow_repos(raw: Optional[str], own_repo: Optional[str]) -> tuple:
+    """
+    Parses `MEMORY_BANK_FOLLOW_REPOS` (a comma-separated list of repo IDs, set
+    in this project's `.mcp.json`) into `(followed, ignored)`. Returns two
+    lists, never raises.
+
+    Entries are trimmed, empty ones dropped (so `""`, `" "` and `"a,,b,"` are
+    all fine) and repeats kept once, in first-seen order. An entry that is this
+    project's own ID or the reserved `general` sentinel is moved to `ignored`
+    instead of `followed`: both are already in `recall`'s default scope, so
+    following them adds nothing, and `ignored` lets the caller say so rather
+    than dropping it silently. `own_repo` is compared trimmed; a missing or
+    unedited-placeholder own ID simply matches nothing.
+    """
+    followed: list = []
+    ignored: list = []
+    own = (own_repo or "").strip()
+    for entry in (raw or "").split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if entry == GENERAL_REPO or (own and entry == own):
+            if entry not in ignored:
+                ignored.append(entry)
+        elif entry not in followed:
+            followed.append(entry)
+    return followed, ignored
+
+
+def is_memory_bank_collection_name(collection: str, memory_bank_collection: str) -> bool:
+    """
+    True if `collection` (an index_repo/sync_repo target) matches the
+    configured memory-bank collection name -- used by ingest_mcp_server.py
+    to refuse indexing/syncing directly into the shared memory bank,
+    regardless of reset/force, rather than only guarding the reset path.
+    """
+    return collection == memory_bank_collection
+
+
+def memory_bank_exclusion_filter() -> models.Filter:
+    """
+    The reusable `must_not` fragment index_repo/sync_repo fold into their own
+    delete filters, so a collection that ever ends up holding both code
+    chunks and protected points (it shouldn't, given
+    is_memory_bank_collection_name's guard, but this stays as
+    defense-in-depth) never has them caught by an unrelated
+    delete. Protects memory-bank points (metadata.source == "memory-bank")
+    and conversation compacts (metadata.source ==
+    "conversation-compact"). Compacts stored before that marker existed carry no
+    metadata.source and stay unprotected until backfilled.
+    """
+    return models.Filter(
+        must_not=[
+            models.FieldCondition(key=SOURCE_FIELD, match=models.MatchValue(value=MEMORY_BANK_SOURCE)),
+            models.FieldCondition(key=SOURCE_FIELD, match=models.MatchValue(value=COMPACT_SOURCE)),
+        ]
+    )
+
+
+def _scope_filter(
+    caller_repo: str,
+    repo: Optional[str],
+    all_repos: bool,
+    kind: Optional[str] = None,
+    followed: Optional[list] = None,
+) -> models.Filter:
+    """
+    Builds the `metadata.source == "memory-bank"` (+ repo/kind) filter
+    `recall_points` searches with (`count_memory_bank_points` builds its own,
+    simpler filter). Precedence: an explicit `repo` override narrows to
+    exactly that repo; `all_repos=True` (with no explicit `repo`) applies no
+    repo constraint at all; otherwise (the default) scope is this project's
+    own repo OR the general-knowledge sentinel -- `should` conditions in a
+    Qdrant Filter are OR'd together and required (min_should_match defaults
+    to 1) alongside `must`, giving `source == memory-bank AND (repo ==
+    caller_repo OR repo == "general")`.
+
+    `followed` (the parsed `MEMORY_BANK_FOLLOW_REPOS`, see `parse_follow_repos`)
+    adds a THIRD branch to that default scope only: `repo in followed AND
+    shared == True`. `Filter.should` is a flat OR of conditions, so the
+    two-part branch is a nested `Filter(must=[...])` inside `should`. Checked
+    against a real Qdrant instance (not only mock tests): the nested branch is
+    OR'd with the other two, so a followed repo's non-shared points stay out
+    and a point with no `shared` field never matches it. With `followed`
+    empty/None the branch is skipped and the filter is exactly what it was
+    before this existed. An explicit `repo`/`all_repos` ignores `followed`
+    (they already say which repos to read), and `kind` composes as before.
+
+    Also excludes `pending == True` points:
+    `remember_point`'s point is visible to a search the instant its initial
+    upsert returns, before its follow-up call clears `pending`/stamps
+    `created_at` -- without this, `recall` could surface a record whose
+    `description` (the verbatim text `remember` was given) is fully written,
+    but which `wipe_memory_bank` cannot yet remove (pending points are always
+    wipe-ineligible -- see `_own_repo_filter`). Excluding it from recall too
+    means a point that is visibly searchable is *also* always wipeable --
+    the two states move together instead of a window where one is true and
+    not the other.
+    """
+    # Bare `list` (not `list[FieldCondition]`) so the type checker (mypy
+    # originally, Pyright -- both treat this the same way)
+    # sees these as list[Any] -- Filter's must/should accept a broader
+    # Condition union, and list's invariance would otherwise reject a
+    # narrower list[FieldCondition].
+    must: list = [models.FieldCondition(key=SOURCE_FIELD, match=models.MatchValue(value=MEMORY_BANK_SOURCE))]
+    must_not: list = [models.FieldCondition(key=PENDING_FIELD, match=models.MatchValue(value=True))]
+    should: Optional[list] = None
+    if repo:
+        must.append(models.FieldCondition(key=REPO_FIELD, match=models.MatchValue(value=repo)))
+    elif not all_repos:
+        should = [
+            models.FieldCondition(key=REPO_FIELD, match=models.MatchValue(value=caller_repo)),
+            models.FieldCondition(key=REPO_FIELD, match=models.MatchValue(value=GENERAL_REPO)),
+        ]
+        if followed:
+            should.append(
+                models.Filter(
+                    must=[
+                        models.FieldCondition(key=REPO_FIELD, match=models.MatchAny(any=list(followed))),
+                        models.FieldCondition(key=SHARED_FIELD, match=models.MatchValue(value=True)),
+                    ]
+                )
+            )
+    if kind:
+        must.append(models.FieldCondition(key=KIND_FIELD, match=models.MatchValue(value=kind)))
+    return models.Filter(must=must, must_not=must_not, should=should)
+
+
+def ensure_collection(client: "QdrantClient", collection: str, embedding_provider) -> Optional[str]:
+    """
+    Creates `collection` with a named-vector schema matching
+    `embedding_provider` if it doesn't already exist. Returns an error string
+    if the collection that ends up existing (whether already there, or won by
+    a concurrent creator) doesn't actually match `embedding_provider`'s
+    schema; None on success.
+
+    Idempotent against a concurrent creator: multiple projects' sessions can
+    plausibly call `remember` against the shared memory-bank collection for
+    the first time at close to the same moment (e.g. right after a Qdrant
+    wipe), so a bare create_collection here would race. A concurrent creator
+    winning that race surfaces as an exception from Qdrant (typically a 409
+    Conflict) -- re-checking existence before re-raising treats that as
+    "the collection now exists" rather than a real failure.
+
+    Found in review: the previous version stopped there, silently
+    treating "it exists now" as full success -- but the WINNING creator could
+    be a different project configured with a DIFFERENT EMBEDDING_MODEL, in
+    which case this process's next upsert would fail with an opaque Qdrant
+    error (wrong/missing vector name) instead of the clear, actionable
+    mismatch message this repo already has a function for. Re-validating the
+    schema here -- on BOTH the immediate already-exists path and the
+    race-recovery path -- closes that gap; any other, genuine
+    create_collection error still propagates.
+    """
+    if call_with_retry(client.collection_exists, collection):
+        return check_embedding_model_mismatch(client, collection, embedding_provider, recovery_hint=MISMATCH_RECOVERY_HINT)
+    vector_name = embedding_provider.get_vector_name()
+    vector_size = embedding_provider.get_vector_size()
+    try:
+        call_with_retry(
+            client.create_collection,
+            collection_name=collection,
+            vectors_config={
+                vector_name: models.VectorParams(size=vector_size, distance=models.Distance.COSINE)
+            },
+        )
+    except Exception:
+        if not call_with_retry(client.collection_exists, collection):
+            raise
+        return check_embedding_model_mismatch(client, collection, embedding_provider, recovery_hint=MISMATCH_RECOVERY_HINT)
+    return None
+
+
+def ensure_memory_bank_indexes(client: "QdrantClient", collection: str) -> None:
+    """
+    Idempotently backfills payload indexes on `source`/`repo` (KEYWORD) and
+    `shared` (BOOL) --
+    mirrors qdrant_batch_store.ensure_file_path_index's "check current
+    payload_schema before creating" pattern so re-running this doesn't
+    reissue a full-collection-scanning create_payload_index call every time.
+    The first two cover the `source` match clause that every recall/count/wipe
+    filter has, and the `repo` match clause wherever one is applied (not
+    always: `_scope_filter` omits it for `all_repos=True`, and
+    `count_memory_bank_points` omits it when `repo` is None), so those
+    clauses no longer full-scan a collection shared across every project as
+    it grows. `shared` covers the follow branch of `_scope_filter`'s default
+    scope (only built when `MEMORY_BANK_FOLLOW_REPOS` is set).
+
+    `shared` is a BOOL index, not KEYWORD like the other two. Checked against
+    a real Qdrant instance: a KEYWORD index on a boolean field still answers a
+    `match` filter, but stores none of the values, so a facet over it returns
+    nothing; a BOOL index is what an operator's facet on the field needs.
+
+    A collection created before `shared` existed gets the index the next time
+    `remember_point` runs; until then the follow branch is evaluated per
+    point, like the clauses below, which is correct and only slower.
+
+    They do NOT cover the other clauses: `metadata.pending` (the
+    `must_not` exclusion in `_scope_filter`, `count_memory_bank_points` and
+    `_own_repo_filter`), `metadata.kind` (`_scope_filter`'s optional `kind`
+    match) and `metadata.created_at` (`_own_repo_filter`'s range /
+    is-empty `created_before` clause) have no payload index, so Qdrant
+    evaluates them per point. Those filters are therefore only partly
+    index-assisted, not fully so; adding indexes for them is a separate,
+    unmade decision.
+    """
+    info = call_with_retry(client.get_collection, collection)
+    existing = info.payload_schema or {}
+    for field, schema in (
+        (SOURCE_FIELD, models.PayloadSchemaType.KEYWORD),
+        (REPO_FIELD, models.PayloadSchemaType.KEYWORD),
+        (SHARED_FIELD, models.PayloadSchemaType.BOOL),
+    ):
+        if field not in existing:
+            call_with_retry(
+                client.create_payload_index,
+                collection_name=collection,
+                field_name=field,
+                field_schema=schema,
+            )
+
+
+async def remember_point(
+    client: "QdrantClient",
+    embedding_provider,
+    collection: str,
+    summary: str,
+    description: str,
+    kind: str,
+    repo: str,
+    embedding_model: str,
+    weight: float = DEFAULT_WEIGHT,
+    point_id: str | None = None,
+    shared: bool = False,
+) -> tuple:
+    """
+    Embeds `summary` (the only text actually searched) and stores it
+    alongside `description` (verbatim, payload-only, never embedded) and the
+    tool-set `source`/`repo`/`embedding_model` metadata.
+
+    `shared` is stored verbatim as `metadata.shared` ("offer this to repos that
+    follow `repo`", see `_scope_filter`). It never changes `repo`. Every caller
+    that copies a memory into the caller's own repo (`copy_points`,
+    `transfer_points`) leaves it at the default False, because the copy is the
+    caller's own and sharing it is the caller's decision.
+
+    `weight` is a static, caller-supplied quality multiplier --
+    `recall_points` re-ranks by `effective_score = max(0, raw_similarity) *
+    weight` (see `_normalize_similarity`'s docstring for the exact semantics
+    and why) instead of raw similarity alone, so a stale or superseded memory
+    doesn't outrank a more trustworthy one purely by having more similar
+    wording. weight is proportional: it never lifts an irrelevant memory
+    (raw similarity <= 0 scores 0 at any weight), and weight=2.0 only lets
+    a hit with half the similarity tie a default-weight one.
+    Stored verbatim in `metadata.weight`; a point with no such field at all
+    (written before this change) is treated as `weight=1.0` at read time by
+    `recall_points` -- a true no-op, not a behavior change for existing data.
+
+    `point_id` is optional. When omitted (the
+    default, and what `remember()`'s MCP tool always does) a fresh random
+    `uuid.uuid4().hex` is minted exactly as before -- behavior is unchanged
+    for every existing caller. When provided, that exact ID is used for the
+    upsert instead, so a caller that needs deterministic per-source IDs (the
+    legacy-collection transfer tool's idempotency) can get them.
+    This function itself does NO check-before-write: upserting an existing ID
+    overwrites it and re-stamps `created_at`/re-cycles `pending`, so a caller
+    that wants a re-run to leave unchanged points alone must check first.
+
+    Returns `(point_id, created_at, None)` on success, or
+    `(None, None, error_message)` if `ensure_collection` finds this
+    project's embedding model doesn't actually match the collection's schema
+    (see that function's docstring for why this can happen even when the
+    collection already existed) -- same `(value, error)` two-outcome
+    convention `resolve_repo` uses, just with an extra success-only field.
+
+    `created_at` is the EXACT `time.time()`
+    value this function itself stamped into `metadata.created_at` below --
+    returned so a caller logging a memory-events row for this write (see
+    `mcpservers/memory_bank_mcp_server.py`'s `remember()`) can record the real
+    creation timestamp instead of re-sampling `time.time()` after this
+    function returns. Re-sampling would drift from the real stamped value by
+    however long the upsert + set_payload round trips (plus any
+    `call_with_retry` backoff) took -- not always negligible, and this field
+    exists specifically to support a time-to-first-reuse metric that a
+    drifted value would corrupt.
+
+    Known residual gap, accepted as-is rather than built out further:
+    if the initial upsert below succeeds but the
+    follow-up `set_payload` call that clears `pending` fails even after
+    `call_with_retry`'s retries are exhausted, that exception propagates out
+    of this function uncaught -- the caller never receives `point_id`, so it
+    has no way to `forget_point` the record directly, and the point is stuck
+    `pending=True` forever: excluded from both `recall_points` (see
+    `_scope_filter`) and `wipe_memory_bank` (see `_own_repo_filter`) with no
+    tool-level path back. This requires the upsert to durably succeed and the
+    immediately-following set_payload to fail all 4 attempts -- rare, and no
+    worse than the alternative of NOT having a pending marker at all (a
+    silent wipe-race data loss on every write, not just this narrow failure
+    case) -- so a stale-pending reconciliation/TTL mechanism was deliberately
+    not built for this. A stuck record is inert (unsearchable) rather than
+    actively harmful; if cleanup is ever needed, it's a plain Qdrant payload
+    filter (`metadata.pending == true`) any Qdrant client can query and
+    delete directly, no different from an operator poking at any other
+    stuck row in a database.
+    """
+    mismatch = ensure_collection(client, collection, embedding_provider)
+    if mismatch:
+        return None, None, mismatch
+    ensure_memory_bank_indexes(client, collection)
+    vector_name = embedding_provider.get_vector_name()
+    embeddings = await embedding_provider.embed_documents([summary])
+    if point_id is None:
+        point_id = uuid.uuid4().hex
+    # pending=True is written in this SAME atomic upsert that creates the
+    # point -- there is no window where the point exists without it, unlike
+    # created_at (stamped in a separate follow-up call below). wipe_memory_bank
+    # unconditionally excludes any point with pending=True regardless of its
+    # created_at state, so a point can never be swept up while it's between
+    # "exists" and "fully stamped," no matter how that window's timing lines
+    # up against a concurrent wipe's cutoff/scroll. Found in review
+    # (sixth pass): a two-step write (create, THEN stamp created_at
+    # separately) closes the "timestamp read before upsert completes" race
+    # from the previous round, but during the gap between those two calls
+    # the point has no created_at at all -- and the existing IsEmptyCondition
+    # fallback (added for points written before created_at existed at all)
+    # treated that missing state as "definitely safe to wipe," which is
+    # exactly backwards for a point that's mid-write right now. pending is a
+    # POSITIVE marker for that specific in-between state, so it can be
+    # excluded without disturbing the legacy-point fallback (which stays
+    # keyed on created_at being absent -- a legacy point never has pending
+    # set at all, so it's untouched by this check either way).
+    call_with_retry(
+        client.upsert,
+        collection_name=collection,
+        points=[
+            models.PointStruct(
+                id=point_id,
+                vector={vector_name: embeddings[0]},
+                payload={
+                    "document": summary,
+                    "metadata": {
+                        "source": MEMORY_BANK_SOURCE,
+                        "kind": kind,
+                        "description": description,
+                        "repo": repo,
+                        "embedding_model": embedding_model,
+                        "weight": weight,
+                        "shared": bool(shared),
+                        "pending": True,
+                    },
+                },
+            )
+        ],
+    )
+    # created_at is stamped -- and pending cleared -- in a SEPARATE call,
+    # made only AFTER the upsert above has returned (Qdrant's default
+    # wait=True means that return already confirms durability). A value read
+    # and embedded in the SAME payload as the initial write is necessarily
+    # captured BEFORE that write's own round-trip completes, which is exactly
+    # why this is a second call rather than one -- see the pending comment
+    # above for why the gap between these two calls is still safe regardless.
+    #
+    # This does NOT fully close the created_at race, only shrink it further:
+    # time.time() here is STILL a client-side
+    # read taken before THIS call's own RPC is sent, same pattern as the
+    # original upsert-embedded version, just one level narrower -- if this
+    # specific set_payload round-trip is delayed and a concurrent wipe's
+    # cutoff lands in that exact gap, the point can still be swept up once
+    # the delayed write finally applies, since its own created_at is
+    # genuinely <= that cutoff by wall-clock time. Qdrant exposes no
+    # server-assigned write-order primitive (a monotonic revision, a
+    # server-stamped timestamp) this could tie to instead, so "the RPC's
+    # own network round-trip" is the tightest bound achievable with a
+    # client-side timestamp -- not a perfect guarantee, and not meant to be
+    # read as one. In practice this is a millisecond-scale window between
+    # two operations from the same caller (a remember() finishing at almost
+    # the exact instant that same project's own wipe_all begins), not an
+    # adversarial multi-tenant race.
+    created_at = time.time()
+    call_with_retry(
+        client.set_payload,
+        collection_name=collection,
+        payload={"created_at": created_at, "pending": False},
+        points=[point_id],
+        key="metadata",
+    )
+    return point_id, created_at, None
+
+
+async def recall_points(
+    client: "QdrantClient",
+    embedding_provider,
+    collection: str,
+    query: str,
+    caller_repo: str,
+    repo: Optional[str] = None,
+    all_repos: bool = False,
+    kind: Optional[str] = None,
+    limit: int = 5,
+    followed: Optional[list] = None,
+) -> list:
+    """
+    Searches `summary` vectors, always scoped to `metadata.source ==
+    "memory-bank"`, plus the repo/kind narrowing `_scope_filter` builds
+    (`followed` is passed straight to it: the default scope also returns
+    `shared` memories of those repos).
+    Returns a list of dicts: id/summary/description/kind/repo/
+    embedding_model/score/weight/effective_score/created_at/shared (`shared`
+    is True only for a point whose `metadata.shared` is True; a point with no
+    such field reads as False), sorted by
+    `effective_score` descending and truncated to `limit`. Returns [] (not an
+    error) when the collection doesn't exist yet -- an empty memory bank is a
+    normal, expected state, not a failure.
+
+    `created_at` is the point's own `metadata.created_at`
+    (a float `time.time()` value stamped by `remember_point`, or None for a
+    legacy point written before that field existed) -- included so a caller
+    logging a memory-events row for this hit can denormalize the memory's
+    real creation time without a second Qdrant round trip.
+
+    `weight`/`effective_score`: `score` stays the RAW cosine
+    similarity Qdrant returned (unchanged meaning, for backward compat with
+    any existing caller reading it) -- `effective_score` is what re-ranking
+    and truncation actually use, so raw similarity alone can't tell "most
+    trustworthy" from "most similar wording." A point with no `metadata.weight`
+    (written before this field existed) is treated as `weight=1.0`, a true
+    no-op for ORDERING purposes among other default-weight hits:
+    `effective_score = max(0, score) * weight` (see
+    `_normalize_similarity` for the full semantics), so at weight=1.0 it
+    equals max(0, score) -- same ordering as raw similarity, though a
+    negative `score` reports effective_score 0. `query_points` itself is
+    asked for `limit * _RECALL_OVERFETCH_MULTIPLIER` candidates, not just
+    `limit` -- re-ranking against only `limit` raw-similarity hits could
+    never let a high-weight-but-lower-raw-similarity match rise above one
+    Qdrant's own similarity-only ordering already cut before re-ranking saw
+    it.
+
+    Ties on `effective_score` (all non-positive-similarity hits score 0, as
+    do weight=0 hits) are broken by weight>0 first (weight=0 is always last),
+    then raw `score` descending, so default-weight ordering stays exactly
+    plain-similarity ordering in the negative range.
+    """
+    if not call_with_retry(client.collection_exists, collection):
+        return []
+    vector_name = embedding_provider.get_vector_name()
+    query_vector = await embedding_provider.embed_query(query)
+    query_filter = _scope_filter(caller_repo, repo, all_repos, kind, followed=followed)
+    fetch_limit = limit * _RECALL_OVERFETCH_MULTIPLIER
+    response = call_with_retry(
+        client.query_points,
+        collection_name=collection,
+        query=query_vector,
+        using=vector_name,
+        query_filter=query_filter,
+        limit=fetch_limit,
+        with_payload=True,
+    )
+    results = []
+    for point in response.points:
+        payload = point.payload or {}
+        meta = payload.get("metadata") or {}
+        weight = meta.get("weight")
+        if weight is None:
+            weight = DEFAULT_WEIGHT
+        score = point.score
+        results.append(
+            {
+                "id": point.id,
+                "summary": payload.get("document", ""),
+                "description": meta.get("description", ""),
+                "kind": meta.get("kind"),
+                "repo": meta.get("repo"),
+                "embedding_model": meta.get("embedding_model"),
+                "score": score,
+                "weight": weight,
+                "effective_score": _normalize_similarity(score) * weight,
+                "created_at": meta.get("created_at"),
+                "shared": meta.get("shared") is True,
+            }
+        )
+    # Sort key: effective_score, then weight>0, then raw score (all
+    # descending). The raw-score tie-break keeps default-weight ordering equal
+    # to plain-similarity ordering among all-negative hits (which all floor to
+    # effective 0). The `weight > 0` middle term keeps weight=0 a true bottom:
+    # without it a weight=0 hit with raw 0.95 would out-tie a default-weight
+    # hit at raw -0.1 (both effective 0) on raw score alone.
+    results.sort(key=lambda r: (r["effective_score"], r["weight"] > 0, r["score"]), reverse=True)
+    return results[:limit]
+
+
+# Page size for scroll_collection. Qdrant's own scroll default is
+# 10; 1000 matches wipe_memory_bank's page size, keeping round trips low on a
+# large legacy collection without one enormous response.
+_SCROLL_BATCH_SIZE = 1000
+
+
+def scroll_collection(
+    client: "QdrantClient",
+    source: str,
+    batch_size: int = _SCROLL_BATCH_SIZE,
+    scroll_filter: Optional[models.Filter] = None,
+) -> tuple:
+    """
+    Read-only, COMPLETE-for-an-unchanged-collection enumeration of every point
+    in `source` -- for reading a foreign/legacy
+    collection (e.g. one that predates the shared memory-bank collection) so
+    its points can be audited or migrated. Loops `client.scroll` following
+    `next_offset` until Qdrant returns None, so unlike `recall_points` it is
+    a full walk rather than semantic top-k search, never silently capped at
+    a top-k: no query text and no embedding provider are involved at all.
+    Vectors are never fetched.
+
+    Completeness caveat: `scroll()` has no cross-page
+    consistency guarantee (see wipe_memory_bank's docstring), so if points
+    are inserted or deleted WHILE this runs, the result is not a snapshot --
+    a concurrent insert can be missed or a concurrent delete still seen. The
+    full-enumeration guarantee therefore holds only for a collection nothing
+    is writing to (the normal case for a legacy/foreign source being
+    audited or migrated); callers needing more must quiesce writers first.
+
+    Returns `(points, errors)`:
+      * `points`: one dict per well-shaped point -- id, summary (the
+        `document` field), description, kind, repo, embedding_model,
+        created_at, weight (DEFAULT_WEIGHT when absent) -- the same field
+        names `recall_points` returns, minus the similarity scores.
+      * `errors`: one `{"id": ..., "error": "..."}` per point that is NOT
+        memory-bank-shaped (payload/metadata not a dict, or `metadata.repo`
+        missing). Such a point is reported and skipped rather than crashing
+        the whole scroll, since `source` may be any collection at all. A
+        missing collection yields `([], [{"id": None, "error": ...}])`.
+
+    Applies NO source/pending filter by default: the point is to see
+    everything in `source`, and callers decide what to do with each point.
+    `scroll_filter` is the one opt-in narrowing, for a caller
+    that wants a complete walk of a SUBSET (`copy_points` reads one repo's
+    points of the shared collection this way) rather than a top-k search; it
+    is passed to Qdrant unchanged and, when None, no `scroll_filter` argument
+    is sent at all, so every existing caller behaves exactly as before.
+    """
+    if not call_with_retry(client.collection_exists, source):
+        return [], [{"id": None, "error": f"collection '{source}' does not exist."}]
+    points: list = []
+    errors: list = []
+    offset = None
+    extra: dict = {} if scroll_filter is None else {"scroll_filter": scroll_filter}
+    while True:
+        records, offset = call_with_retry(
+            client.scroll,
+            collection_name=source,
+            limit=batch_size,
+            offset=offset,
+            with_payload=True,
+            with_vectors=False,
+            **extra,
+        )
+        for record in records:
+            payload = record.payload
+            if not isinstance(payload, dict):
+                errors.append({"id": record.id, "error": "payload is missing or not an object."})
+                continue
+            meta = payload.get("metadata")
+            if not isinstance(meta, dict):
+                errors.append({"id": record.id, "error": "payload has no 'metadata' object."})
+                continue
+            repo = meta.get("repo")
+            if not repo:
+                errors.append({"id": record.id, "error": "metadata.repo is missing."})
+                continue
+            weight = meta.get("weight")
+            points.append(
+                {
+                    "id": record.id,
+                    "summary": payload.get("document", ""),
+                    "description": meta.get("description", ""),
+                    "kind": meta.get("kind"),
+                    "repo": repo,
+                    "embedding_model": meta.get("embedding_model"),
+                    "weight": DEFAULT_WEIGHT if weight is None else weight,
+                    "created_at": meta.get("created_at"),
+                }
+            )
+        if offset is None:
+            break
+    return points, errors
+
+
+# Fixed namespace for transfer_point_id. Never change it: every
+# id a past transfer_points run wrote was derived from this exact value, so a
+# new namespace would make a re-run see none of them as already present and
+# write every point a second time under a fresh id.
+TRANSFER_ID_NAMESPACE = uuid.UUID("6f1c2b7e-4d3a-5e8f-9a0b-1c2d3e4f5a6b")
+
+
+def transfer_point_id(source: str, source_point_id) -> str:
+    """
+    Deterministic target id for one source point:
+    `uuid5(TRANSFER_ID_NAMESPACE, "<source>:<source_point_id>")`. The same
+    source point always maps to the same target id, so a re-run of
+    `transfer_points` can tell "already migrated" apart from "new" with a
+    plain `retrieve` instead of duplicating every point under a fresh random
+    id. Qdrant ids are either unsigned ints or UUIDs, so an int id `5` and a
+    UUID string can never format to the same `<source>:<id>` text.
+    """
+    return str(uuid.uuid5(TRANSFER_ID_NAMESPACE, f"{source}:{source_point_id}"))
+
+
+def _transfer_field_error(point: dict) -> Optional[str]:
+    """
+    Checks the fields `remember_point` will write for one scrolled point, so a
+    legacy point that is memory-bank-shaped enough to have a `repo` (which is
+    all `scroll_collection` checks) but not enough to be written lands in the
+    report's `errors` bucket, not in the shared collection. Same weight rule
+    `remember()` enforces at its own tool boundary (finite, >= 0): an `inf`/
+    `nan`/negative weight copied verbatim would break `recall_points`'
+    ranking for every project sharing the collection.
+    """
+    summary = point.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        return "summary (payload 'document') is missing or empty -- nothing to embed."
+    if not isinstance(point.get("kind"), str) or not point["kind"]:
+        return "metadata.kind is missing or not a string."
+    if not isinstance(point.get("description"), str):
+        return "metadata.description is not a string."
+    weight = point.get("weight")
+    if isinstance(weight, bool) or not isinstance(weight, (int, float)):
+        return f"metadata.weight is not a number (got {weight!r})."
+    if not math.isfinite(weight) or weight < 0:
+        return f"metadata.weight must be a finite number 0 or greater (got {weight})."
+    return None
+
+
+def _finished_point_ids(client: "QdrantClient", collection: str, ids: list) -> set:
+    """
+    Which of `ids` already exist in `collection` as a FINISHED write -- the
+    check-before-write lookup `transfer_points` and `copy_points` share
+    (pulled out of `transfer_points` unchanged).
+
+    One retrieve per batch instead of one per point. A collection that
+    doesn't exist yet holds nothing, so there is nothing to look up.
+
+    Only a FINISHED write counts as present (found in review, second pass):
+    remember_point upserts with pending=True and clears it in a second
+    call, so a run whose second call failed leaves the id in the collection
+    with pending=True -- hidden from recall and wipe (see _scope_filter /
+    _own_repo_filter). Counting that as already present would make it
+    permanent; leaving it out lets the next run rewrite the same id and
+    finish it. Hence payload is fetched (the pending flag only).
+    """
+    present: set = set()
+    if ids and call_with_retry(client.collection_exists, collection):
+        for start in range(0, len(ids), _SCROLL_BATCH_SIZE):
+            found = call_with_retry(
+                client.retrieve,
+                collection_name=collection,
+                ids=ids[start:start + _SCROLL_BATCH_SIZE],
+                with_payload=[PENDING_FIELD],
+                with_vectors=False,
+            )
+            for record in found:
+                meta = (record.payload or {}).get("metadata")
+                if isinstance(meta, dict) and meta.get("pending") is True:
+                    continue
+                present.add(str(record.id))
+    return present
+
+
+async def transfer_points(
+    client: "QdrantClient",
+    embedding_provider,
+    source: str,
+    target: str,
+    caller_repo: str,
+    embedding_model: str,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Migrates the in-scope points of a legacy/foreign collection `source` into
+    the shared memory-bank collection `target` (part 3 of the
+    memory-transfer design). Returns a report dict; never raises for a per-point problem.
+
+    Repo-tag mapping, per point -- the same boundary `resolve_repo` enforces
+    for a single `remember()` call, applied point by point, with no bypass:
+      * `metadata.repo == caller_repo` -> written project-scoped (repo=caller_repo).
+      * `metadata.repo == GENERAL_REPO` -> written as general.
+      * anything else -> NOT written, counted in `skipped_foreign_repo` by tag,
+        so the user can run this same tool from a session in that repo.
+    A point is never written under a tag other than the one it already had.
+
+    Idempotency is check-before-write, not blind re-upsert: each point's
+    target id comes from `transfer_point_id`, the target is `retrieve`d for
+    those ids first, and only ids not already there are written. Re-upserting
+    an existing id would re-stamp `created_at` and re-cycle `pending` on a
+    point that hasn't changed (see `remember_point`'s docstring), so already
+    present points are counted in `already_present` and left alone. Each new
+    point gets a fresh `created_at` (the time of migration) and is re-embedded
+    with this project's `embedding_provider`; the source's own vectors and
+    timestamps are not copied. Dedup only recognizes ids this function
+    derived: a memory copied over earlier by hand via `remember()` has a
+    random id and is NOT detected (no content matching is attempted), so a
+    real run would write a second copy of it -- the dry-run report is how a
+    caller checks for that before writing.
+
+    `dry_run=True` (the default) does everything except the write and reports
+    `would_migrate` instead of `migrated`; it never embeds, so
+    `embedding_provider` may be None there. A dry run cannot detect an
+    embedding-model mismatch on the target, which only shows up when the
+    first real write calls `ensure_collection`; that mismatch is
+    collection-wide, so it stops the run and is returned as `error` (with the
+    counts reached so far), rather than being repeated once per point.
+
+    Read-only against `source`: nothing here ever writes to or deletes from
+    it. Deleting a legacy collection stays a separate, manual action.
+
+    Report keys: source_collection, target_collection, dry_run,
+    `would_migrate` or `migrated` ({"general": n, "project": n}),
+    skipped_foreign_repo ({tag: n}), already_present (n), errors (list of
+    {"id", "error"}), and `error` (str, only when the run stopped early).
+    """
+    bucket = "would_migrate" if dry_run else "migrated"
+    report: dict = {
+        "source_collection": source,
+        "target_collection": target,
+        "dry_run": dry_run,
+        bucket: {"general": 0, "project": 0},
+        "skipped_foreign_repo": {},
+        "already_present": 0,
+        "errors": [],
+    }
+    # Compared by BACKING collection, not by name: Qdrant
+    # accepts an alias anywhere a collection name goes (collection_exists and
+    # scroll both resolve it -- confirmed live), so an alias of the memory-bank
+    # collection would pass a plain name check, scroll memory-bank itself, and
+    # write copies of its points back into it under new ids; each later run
+    # would then copy those copies again. Fails closed: if the alias list
+    # can't be read, nothing is scrolled or written.
+    #
+    # Every Qdrant call below then uses these RESOLVED backing names, never
+    # the requested ones: an alias can be
+    # repointed atomically at any moment, so checking resolved names but then
+    # scrolling/writing through the alias would leave a window where the
+    # check passes and the alias is switched to memory-bank (copying it into
+    # itself) or the target alias is switched to the source (writing into the
+    # supposedly read-only source). The requested `source` name is still
+    # what transfer_point_id hashes, so ids stay stable across runs however
+    # the source is reached.
+    try:
+        aliases = {
+            a.alias_name: a.collection_name
+            for a in call_with_retry(client.get_aliases).aliases
+        }
+    except Exception as e:
+        report["error"] = f"could not read Qdrant collection aliases to check source vs. target: {e}"
+        return report
+    source_backing = aliases.get(source, source)
+    target_backing = aliases.get(target, target)
+    if source_backing == target_backing:
+        report["error"] = (
+            f"source_collection '{source}' is the memory-bank collection itself "
+            f"(directly or through an alias) -- name the legacy collection to transfer from."
+        )
+        return report
+    if not call_with_retry(client.collection_exists, source_backing):
+        report["error"] = (
+            f"collection '{source}' does not exist. Name it exactly "
+            f"(codebase-indexer's list_collections shows what exists)."
+        )
+        return report
+
+    points, scroll_errors = scroll_collection(client, source_backing)
+    report["errors"].extend(scroll_errors)
+
+    # (target_id, scope, point) for every point that passes the repo boundary
+    # and field checks -- foreign-tagged points never get this far, so they
+    # are never even looked up in the target.
+    candidates: list = []
+    for point in points:
+        repo = point["repo"]
+        if repo == GENERAL_REPO:
+            scope = "general"
+        elif repo == caller_repo:
+            scope = "project"
+        else:
+            tag = str(repo)
+            report["skipped_foreign_repo"][tag] = report["skipped_foreign_repo"].get(tag, 0) + 1
+            continue
+        field_error = _transfer_field_error(point)
+        if field_error:
+            report["errors"].append({"id": point["id"], "error": field_error})
+            continue
+        candidates.append((transfer_point_id(source, point["id"]), scope, point))
+
+    present = _finished_point_ids(client, target_backing, [c[0] for c in candidates])
+
+    for target_id, scope, point in candidates:
+        if target_id in present:
+            report["already_present"] += 1
+            continue
+        if dry_run:
+            report[bucket][scope] += 1
+            continue
+        try:
+            _, _, mismatch = await remember_point(
+                client, embedding_provider, target_backing,
+                summary=point["summary"],
+                description=point["description"],
+                kind=point["kind"],
+                repo=GENERAL_REPO if scope == "general" else caller_repo,
+                embedding_model=embedding_model,
+                weight=point["weight"],
+                point_id=target_id,
+            )
+        except Exception as e:  # one bad point must not abort the whole run
+            report["errors"].append({"id": point["id"], "error": f"write failed: {e}"})
+            continue
+        if mismatch:
+            report["error"] = mismatch
+            return report
+        report[bucket][scope] += 1
+    return report
+
+
+# Fixed namespace for copy_point_id. Own value, never shared with
+# TRANSFER_ID_NAMESPACE, and never to be changed: every id a past copy_points
+# run wrote derives from it, so a new one would make a re-run see none of them
+# as already present and copy every memory a second time.
+COPY_ID_NAMESPACE = uuid.UUID("b3a5d2c1-8e47-5f06-a9d3-2c7e1f4b6a80")
+
+
+def copy_point_id(collection: str, source_point_id, target_repo: str) -> str:
+    """
+    Deterministic id for one memory copied into `target_repo`:
+    `uuid5(COPY_ID_NAMESPACE, <collection, source point id, target repo>)`.
+
+    Not `transfer_point_id`: that one hashes `"<source>:<source_point_id>"`,
+    and for an in-collection copy the source is always the memory-bank
+    collection, so the same source memory copied into two different projects
+    would map to ONE id and the second project's copy would be taken for the
+    first's. The target repo is therefore part of the name. The name is a JSON
+    array rather than a joined string, so a `:` inside a collection or repo
+    name cannot make two different triples produce the same text.
+    """
+    return str(uuid.uuid5(COPY_ID_NAMESPACE, json.dumps([collection, str(source_point_id), target_repo])))
+
+
+async def copy_points(
+    client: "QdrantClient",
+    embedding_provider,
+    collection: str,
+    source_repo: str,
+    caller_repo: str,
+    embedding_model: str,
+    kind: Optional[str] = None,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Copies one project's memories (all of them, or one `kind`) in the shared
+    memory-bank collection `collection` into the CALLER's own repo tag.
+    Returns a report dict; never raises for a per-point problem.
+
+    The target is always `caller_repo`, never a parameter: a session can only
+    write memories under its own `MEMORY_BANK_ID`, the same boundary `remember`
+    and `transfer_points` enforce ("no cross-repo write override").
+    "Copy to repo B" means running this from a session in repo B.
+
+    Refused with an `error` and nothing read or written:
+      * `source_repo` empty -- there is nothing to match.
+      * `source_repo == GENERAL_REPO` -- every project's `recall` already
+        includes general memories by default, so a copy would only create a
+        project-scoped duplicate, and this function never writes `general`.
+      * `source_repo == caller_repo` -- a copy into itself.
+
+    Reads by a FILTERED scroll (`metadata.source == memory-bank`, `metadata.repo
+    == source_repo`, `metadata.kind == kind` when given, not pending), so it is
+    complete rather than a top-k `recall` -- complete for a source nothing is
+    writing to, see `scroll_collection`'s caveat. A pending point is a write
+    that has not finished (invisible to `recall`) and is not copied.
+
+    Writes go through `remember_point`, so the embedding, the model-mismatch
+    check and the pending marker are exactly `remember`'s. Each copy is a NEW
+    point: fresh `created_at`, re-embedded with this project's model, `weight`
+    kept, no link back to its source (it can drift from it, and a fresh
+    `created_at` makes time-to-first-reuse look shorter than it is for that
+    memory).
+
+    Idempotency is check-before-write on a `copy_point_id` id, as in
+    `transfer_points`: a memory whose copy already exists (finished, not
+    pending) is counted in `already_present` and left alone; a half-written
+    one is rewritten. Dedup only recognizes copies this function wrote: a
+    memory copied by hand with `remember()` has a random id and would be
+    written again, so the dry-run report is how a caller checks first.
+
+    `dry_run=True` (the default) does everything except the write and reports
+    `would_copy` instead of `copied`; it never embeds, so `embedding_provider`
+    may be None there. A dry run cannot detect an embedding-model mismatch on
+    the collection, which only shows up on the first real write; that mismatch
+    is collection-wide, so it stops the run and is returned as `error`.
+
+    Read-only against the source memories: nothing here changes or deletes
+    them.
+
+    Report keys: collection, source_repo, target_repo, kind ("all" or the
+    kind), dry_run, `would_copy` or `copied` (n), already_present (n),
+    memories (one {"id" (the source memory's), "kind", "summary", "status"}
+    per memory found, sorted by kind then summary, where status is
+    would_copy/copied/already_present -- a memory that could not be copied is
+    in `errors` instead), errors (list of {"id", "error"}), and `error`
+    (str, only when the run stopped early or was refused).
+    """
+    bucket = "would_copy" if dry_run else "copied"
+    report: dict = {
+        "collection": collection,
+        "source_repo": source_repo,
+        "target_repo": caller_repo,
+        "kind": kind or "all",
+        "dry_run": dry_run,
+        bucket: 0,
+        "already_present": 0,
+        "memories": [],
+        "errors": [],
+    }
+    if not source_repo or not source_repo.strip():
+        report["error"] = "source_repo is required: the exact repo tag to copy from."
+        return report
+    if source_repo == GENERAL_REPO:
+        report["error"] = (
+            f"source_repo '{GENERAL_REPO}' cannot be copied: every project's recall already "
+            f"includes general memories by default, so a copy would only create a project-scoped "
+            f"duplicate, and this tool never writes general memories."
+        )
+        return report
+    if source_repo == caller_repo:
+        report["error"] = f"source_repo '{source_repo}' is this project's own repo tag -- nothing to copy into itself."
+        return report
+    if not call_with_retry(client.collection_exists, collection):
+        report["error"] = f"collection '{collection}' does not exist, so there are no memories to copy."
+        return report
+
+    must: list = [
+        models.FieldCondition(key=SOURCE_FIELD, match=models.MatchValue(value=MEMORY_BANK_SOURCE)),
+        models.FieldCondition(key=REPO_FIELD, match=models.MatchValue(value=source_repo)),
+    ]
+    if kind:
+        must.append(models.FieldCondition(key=KIND_FIELD, match=models.MatchValue(value=kind)))
+    scroll_filter = models.Filter(
+        must=must,
+        must_not=[models.FieldCondition(key=PENDING_FIELD, match=models.MatchValue(value=True))],
+    )
+    points, scroll_errors = scroll_collection(client, collection, scroll_filter=scroll_filter)
+    report["errors"].extend(scroll_errors)
+
+    candidates: list = []
+    for point in points:
+        field_error = _transfer_field_error(point)
+        if field_error:
+            report["errors"].append({"id": point["id"], "error": field_error})
+            continue
+        candidates.append((copy_point_id(collection, point["id"], caller_repo), point))
+    # A stable order for the report, so a dry run and the real run that follows
+    # it list the same memories in the same places.
+    candidates.sort(key=lambda c: (c[1]["kind"], c[1]["summary"]))
+
+    present = _finished_point_ids(client, collection, [c[0] for c in candidates])
+
+    for target_id, point in candidates:
+        entry = {"id": point["id"], "kind": point["kind"], "summary": point["summary"]}
+        if target_id in present:
+            report["already_present"] += 1
+            report["memories"].append({**entry, "status": "already_present"})
+            continue
+        if not dry_run:
+            try:
+                _, _, mismatch = await remember_point(
+                    client, embedding_provider, collection,
+                    summary=point["summary"],
+                    description=point["description"],
+                    kind=point["kind"],
+                    repo=caller_repo,
+                    embedding_model=embedding_model,
+                    weight=point["weight"],
+                    point_id=target_id,
+                )
+            except Exception as e:  # one bad point must not abort the whole run
+                report["errors"].append({"id": point["id"], "error": f"write failed: {e}"})
+                continue
+            if mismatch:
+                report["error"] = mismatch
+                return report
+        report[bucket] += 1
+        report["memories"].append({**entry, "status": bucket})
+    return report
+
+
+def count_memory_bank_points(client: "QdrantClient", collection: str, repo: Optional[str] = None) -> int:
+    """
+    Counts memory-bank points in `collection`, optionally scoped to `repo`.
+    Returns 0 if the collection doesn't exist. Used by `wipe_memory_bank`'s
+    pre-confirm count (repo=caller's own) -- NOT by `index_repo(reset=true)`
+    anymore: that guard used to call this with repo=None
+    first to decide between a full `delete_collection` and a filtered one,
+    but the count-then-act sequence was racy against a concurrent write, so
+    `index_repo(reset=true)` now always does the filtered delete unconditionally
+    instead of counting at all.
+
+    Excludes `pending == True` points: without
+    this, a dry-run (`confirm=False`) call could report a count that includes
+    a still-pending point, while the immediately following `confirm=True`
+    call excludes that same point via `_own_repo_filter` -- the dry-run number
+    and the confirmed delete could then disagree even with no time passing
+    and no concurrent writer at all, purely because the two paths applied
+    different eligibility rules to the exact same snapshot.
+    """
+    if not call_with_retry(client.collection_exists, collection):
+        return 0
+    must: list = [models.FieldCondition(key=SOURCE_FIELD, match=models.MatchValue(value=MEMORY_BANK_SOURCE))]
+    if repo:
+        must.append(models.FieldCondition(key=REPO_FIELD, match=models.MatchValue(value=repo)))
+    must_not: list = [models.FieldCondition(key=PENDING_FIELD, match=models.MatchValue(value=True))]
+    result = call_with_retry(
+        client.count,
+        collection_name=collection,
+        count_filter=models.Filter(must=must, must_not=must_not),
+        exact=True,
+    )
+    return result.count
+
+
+def repos_without_memories(client: "QdrantClient", collection: str, repos: list) -> list:
+    """
+    The entries of `repos` that have no finished memory in `collection` at all
+    (shared or not), in the given order -- how `recall` notices a followed repo
+    ID that is misspelled or names a repo that never wrote anything. A repo
+    that exists but has nothing SHARED is not reported: that is a normal,
+    expected state (it may share later), not a mistake. One exact count per
+    repo, so the cost is the size of the follow list.
+    """
+    return [r for r in repos if count_memory_bank_points(client, collection, repo=r) == 0]
+
+
+def summarize_repos(client: "QdrantClient", collection: str) -> Optional[dict]:
+    """
+    Per-repo breakdown of `collection`'s finished memory-bank points, for
+    `list_memory_banks`: `{repo: {"entries": n, "shared": m}}`, where `entries`
+    counts every finished memory the repo owns and `shared` those with
+    `metadata.shared == True`. Returns None when the collection does not exist.
+    Includes the `general` sentinel as an ordinary key; the caller decides how
+    to show it.
+
+    Reads with a scroll that asks Qdrant for only `metadata.repo` and
+    `metadata.shared`, so no memory text (`document`, `description`) is ever
+    fetched, let alone returned. A scroll rather than a facet on purpose: a
+    facet needs a payload index on the field, which a collection written before
+    `shared` existed lacks until its next `remember`, and the facet answers 400
+    without one. Excludes `pending` points, as `recall` and the counts do (a
+    write that has not finished). A point with no `metadata.repo` is skipped.
+    Like `scroll_collection`, complete only if nothing writes during the walk.
+    """
+    if not call_with_retry(client.collection_exists, collection):
+        return None
+    scroll_filter = models.Filter(
+        must=[models.FieldCondition(key=SOURCE_FIELD, match=models.MatchValue(value=MEMORY_BANK_SOURCE))],
+        must_not=[models.FieldCondition(key=PENDING_FIELD, match=models.MatchValue(value=True))],
+    )
+    summary: dict = {}
+    offset = None
+    while True:
+        records, offset = call_with_retry(
+            client.scroll,
+            collection_name=collection,
+            scroll_filter=scroll_filter,
+            limit=_SCROLL_BATCH_SIZE,
+            offset=offset,
+            with_payload=[REPO_FIELD, SHARED_FIELD],
+            with_vectors=False,
+        )
+        for record in records:
+            payload = record.payload
+            meta = payload.get("metadata") if isinstance(payload, dict) else None
+            repo = meta.get("repo") if isinstance(meta, dict) else None
+            if not isinstance(repo, str) or not repo:
+                continue
+            row = summary.setdefault(repo, {"entries": 0, "shared": 0})
+            row["entries"] += 1
+            if isinstance(meta, dict) and meta.get("shared") is True:
+                row["shared"] += 1
+        if offset is None:
+            break
+    return summary
+
+
+def format_memory_banks(collection: str, summary: Optional[dict]) -> str:
+    """
+    Renders `summarize_repos`' result for `list_memory_banks`:
+
+        <collection name>
+          * <repo id>, <number of entries>, sharable: yes (<n> shared) | no
+          general: <n> entries (every repo already receives these)
+
+    One row per repo, sorted by id. "Sharable" means the repo has at least one
+    `shared` memory, which is exactly what a follower would receive, so it says
+    whether following that repo adds anything. `general` is never a repo row (it
+    cannot be followed: every repo already gets it); it is its own last line,
+    present only when there are general memories. An empty or missing collection
+    says so on the line below the name. The text carries ids, counts and the
+    collection name only, never any memory text.
+    """
+    if summary is None:
+        return f"{collection}\n  (collection does not exist yet: nothing has been remembered)"
+    lines = [collection]
+    general = summary.get(GENERAL_REPO)
+    repos = sorted(r for r in summary if r != GENERAL_REPO)
+    for repo in repos:
+        row = summary[repo]
+        sharable = f"yes ({row['shared']} shared)" if row["shared"] else "no"
+        lines.append(f"  * {repo}, {row['entries']} {'entry' if row['entries'] == 1 else 'entries'}, sharable: {sharable}")
+    if general:
+        n = general["entries"]
+        lines.append(f"  general: {n} {'entry' if n == 1 else 'entries'} (every repo already receives these)")
+    if len(lines) == 1:
+        lines.append("  (no memories yet)")
+    return "\n".join(lines)
+
+
+def forget_point(client: "QdrantClient", collection: str, point_id: str, caller_repo: str, confirm: bool) -> str:
+    """
+    Deletes exactly one point by id. Refuses (error string, no delete) if the
+    point doesn't exist or isn't actually a memory-bank point -- `forget`
+    must never touch a code-index chunk even if handed its id directly.
+
+    If the point's own `repo` differs from `caller_repo` (this includes a
+    "general"-tagged point -- general knowledge is never "this project's
+    own"), deleting it requires confirm=True: a cross-repo id can only reach
+    here via an explicit recall(repo=...)/recall(all_repos=True) call, so
+    this is the one place a copy-pasted or hallucinated id from a DIFFERENT
+    project could otherwise be deleted in a single unconfirmed call. A
+    same-repo delete (the normal case -- the id came from this project's own
+    recall) needs no confirm, unchanged from the original spec.
+    """
+    if not call_with_retry(client.collection_exists, collection):
+        return f"Error: collection '{collection}' does not exist."
+    try:
+        records = call_with_retry(client.retrieve, collection_name=collection, ids=[point_id], with_payload=True)
+    except Exception:
+        # A malformed/non-UUID point_id (e.g. a hallucinated string) raises a
+        # raw Qdrant 400 from retrieve() rather than returning an empty list --
+        # treat any retrieve failure the same as "not found" instead of letting
+        # a raw exception escape this tool call.
+        records = []
+    if not records:
+        return f"Error: no point with id '{point_id}' found in '{collection}'."
+    payload = records[0].payload or {}
+    meta = payload.get("metadata") or {}
+    if meta.get("source") != MEMORY_BANK_SOURCE:
+        return f"Error: point '{point_id}' is not a memory-bank point -- refusing to delete it."
+    point_repo = meta.get("repo")
+    if point_repo != caller_repo and not confirm:
+        return (
+            f"This point belongs to repo '{point_repo}', not your own ('{caller_repo}'). "
+            f"Pass confirm=True to delete a memory belonging to a different repo."
+        )
+    call_with_retry(
+        client.delete,
+        collection_name=collection,
+        points_selector=models.PointIdsList(points=[point_id]),
+    )
+    return f"Deleted point '{point_id}' (repo='{point_repo}')."
+
+
+def _own_repo_filter(caller_repo: str, created_before: Optional[float] = None) -> models.Filter:
+    """
+    Always excludes `pending == True` points:
+    that marker covers the brief window between remember_point's initial
+    upsert (which creates the point, including pending=True, atomically)
+    and its follow-up call that clears pending while stamping `created_at`
+    -- a point can never be swept up while it's in that window, regardless
+    of how its timing lines up against a wipe's cutoff/scroll. A legacy
+    point (written before `pending` existed) never has this field set at
+    all, so it's unaffected by this exclusion either way.
+
+    `created_before`, if given, additionally requires `created_at <= created_before`
+    OR the field is missing entirely (via `should`, alongside the `must` conditions --
+    see wipe_memory_bank's docstring for why the cutoff exists, and why a missing
+    field must still match: a point written before this field existed necessarily
+    predates any cutoff computed after this fix shipped, so excluding it would be a
+    pure regression with no safety benefit).
+    """
+    must: list = [
+        models.FieldCondition(key=SOURCE_FIELD, match=models.MatchValue(value=MEMORY_BANK_SOURCE)),
+        models.FieldCondition(key=REPO_FIELD, match=models.MatchValue(value=caller_repo)),
+    ]
+    must_not: list = [models.FieldCondition(key=PENDING_FIELD, match=models.MatchValue(value=True))]
+    if created_before is None:
+        return models.Filter(must=must, must_not=must_not)
+    return models.Filter(
+        must=must,
+        must_not=must_not,
+        should=[
+            models.FieldCondition(key=CREATED_AT_FIELD, range=models.Range(lte=created_before)),
+            models.IsEmptyCondition(is_empty=models.PayloadField(key=CREATED_AT_FIELD)),
+        ],
+    )
+
+
+def wipe_memory_bank(client: "QdrantClient", collection: str, caller_repo: str, confirm: bool) -> tuple:
+    """
+    Bulk-clears this project's OWN memory-bank points -- filter is
+    `source == "memory-bank" AND repo == caller_repo`, which deliberately
+    EXCLUDES "general"-tagged points even though they're visible from this
+    project's own recall: clearing one project's own bank shouldn't take
+    shared/global knowledge down with it. A general memory can only be
+    removed individually via forget_point (which requires confirm=True for
+    it, since its repo is "general", never a caller's own).
+
+    Returns (count, deleted): `deleted` is only True when confirm=True
+    actually triggered a delete -- a call without confirm=True only counts,
+    never mutates anything.
+
+    `confirm=True` snapshots the matching point ids first (via `scroll`),
+    then deletes precisely those ids, and `count` is `len(ids)` -- not a
+    separate `count()` call taken before the delete. Found in review: the previous
+    version called `count_memory_bank_points` (one
+    Qdrant request) and then deleted by the same live FILTER (a second,
+    separate request) -- if a new same-repo point arrived in between, the
+    filter-based delete would remove it too, but the EARLIER count wouldn't
+    reflect it, so the number this function reported could understate what
+    it actually just deleted. Deleting the exact snapshotted ids instead
+    means `count` reflects the SNAPSHOT this call took, not a live filter
+    evaluated separately at delete time.
+
+    `count` is this snapshot's size, not a guaranteed-exact count of points
+    physically removed: Qdrant's
+    delete-by-id tolerates an already-missing id without error, so if some
+    OTHER concurrent actor (a `forget_point` call, another `wipe_memory_bank`
+    call) removes one of these exact snapshotted ids in the narrow gap
+    between this call's `scroll` and its `delete`, that id is silently a
+    no-op here -- `len(ids)` still reports the snapshot size, slightly
+    overstating what this specific call physically deleted. The guarantee
+    that actually matters is preserved regardless: nothing outside this
+    snapshot (in particular, nothing created after it was taken) is ever
+    touched -- see the `created_at`/`pending` discussion below for that.
+
+    This does NOT make the count shown by an EARLIER, separate dry-run call
+    (`confirm=False`) a binding contract -- a new point can still arrive
+    between that call and this one, since they're two independent tool
+    calls with no state carried between them. That gap is inherent to any
+    two-step confirm UX spanning separate calls (visible in real time via
+    each call's own honestly-reported count, never silently hidden) rather
+    than something this function alone can close -- see the review
+    thread for the full reasoning on why a heavier cross-call snapshot
+    mechanism wasn't added on top of this.
+
+    WITHIN this one call, though, the snapshot ids are additionally bounded
+    by a `created_at` cutoff captured before scrolling starts:
+    `scroll()` has no cross-page
+    consistency guarantee, and point ids are random UUIDs (not
+    insertion-ordered), so once a repo has enough memories to need more
+    than one page (>1000), a `remember()` landing mid-scroll could sort
+    into a not-yet-visited page and get swept up despite being created
+    after this wipe began. The cutoff closes that regardless of paging.
+
+    A `remember()` call whose point exists but is still `pending` (between
+    its initial upsert and the follow-up call that stamps `created_at`) is
+    excluded unconditionally, regardless of the cutoff comparison
+    -- see `remember_point`'s and `_own_repo_filter`'s
+    own docstrings for why a missing `created_at` alone isn't enough to
+    tell "legacy point, definitely safe" apart from "brand new point,
+    mid-write, definitely NOT safe."
+    """
+    if not confirm:
+        return count_memory_bank_points(client, collection, repo=caller_repo), False
+    if not call_with_retry(client.collection_exists, collection):
+        return 0, True
+    ids: list = []
+    offset = None
+    cutoff = time.time()
+    scroll_filter = _own_repo_filter(caller_repo, created_before=cutoff)
+    while True:
+        records, offset = call_with_retry(
+            client.scroll,
+            collection_name=collection,
+            scroll_filter=scroll_filter,
+            limit=1000,
+            with_payload=False,
+            with_vectors=False,
+            offset=offset,
+        )
+        ids.extend(r.id for r in records)
+        if offset is None:
+            break
+    if ids:
+        call_with_retry(
+            client.delete,
+            collection_name=collection,
+            points_selector=models.PointIdsList(points=ids),
+        )
+    return len(ids), True

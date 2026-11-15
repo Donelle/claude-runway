@@ -1,0 +1,720 @@
+#!/usr/bin/env python3
+"""
+MCP server exposing `remember`/`recall`/`forget` -- durable, cross-session
+knowledge storage independent of the code index -- plus
+`transfer_memories`, which copies a legacy collection's
+in-scope memories into the shared collection, `copy_memories`, which
+copies another project's memories into the calling project inside that
+shared collection, and `list_memory_banks`, a read-only per-repo breakdown of
+that collection that goes with the follow list
+(`MEMORY_BANK_FOLLOW_REPOS`, below). Where
+`codebase-indexer` remembers what a repo's CODE looks like, this server
+remembers what a project (or, via `general=True`, every project) has
+LEARNED: a cited incident's root cause, a design decision and its rationale,
+a correction a reviewer made -- the kind of thing worth surviving a
+`/compact` or a fresh session, not just a single conversation.
+
+Project minimum: Python 3.12.
+
+Setup:
+    pip install "mcp[cli]" qdrant-client fastembed pydantic_settings --break-system-packages
+
+Register in .mcp.json (see templates/mcp.json.template's "memory-bank"
+block). Reuses the same QDRANT_URL/QDRANT_API_KEY/EMBEDDING_MODEL env var
+names the qdrant/codebase-indexer servers read, but EMBEDDING_MODEL here is
+its OWN value, set independently of theirs because it must match
+the shared collection's model, not the project's code index -- and
+MEMORY_BANK_COLLECTION
+is its own, separate collection name: every project shares ONE memory-bank
+collection (not each project's own code-index collection), tagged by writing
+project (see libs/memory_bank_lib.py's module docstring for why).
+
+IMPORTANT: this server uses stdio transport, meaning stdout is reserved for
+MCP protocol messages. Nothing in this file should ever call print() --
+progress and results must be returned as tool output, not printed.
+"""
+
+import itertools
+import json
+import math
+import os
+import sys
+from typing import Optional
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "libs"))
+
+from mcp.server.mcpserver import MCPServer, Context
+from qdrant_embeddings import FastEmbedProvider
+from qdrant_client import QdrantClient
+
+from qdrant_ingest_lib import ensure_persistent_fastembed_cache
+from qdrant_retry import call_with_retry
+from qdrant_model_check import check_embedding_model_mismatch
+from qdrant_credentials import resolve_qdrant_credentials
+from mcp_tool_introspect import tool_count
+from session_id_lib import SessionIdStrategy, session_id as _resolve_session_id
+import memory_bank_lib as mb
+import memory_events_lib as mev
+
+# Must run before any FastEmbedProvider(...) construction below -- see
+# ingest_mcp_server.py's identical call for why.
+ensure_persistent_fastembed_cache()
+
+# Same env var names the qdrant/codebase-indexer servers already read, so a
+# single project .mcp.json keeps every Qdrant-talking server aligned.
+DEFAULT_QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
+DEFAULT_QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY")
+DEFAULT_EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+
+# The ONE shared collection every project's memory-bank tools write into --
+# deliberately NOT derived from this project's own MEMORY_BANK_ID below (see
+# libs/memory_bank_lib.py's docstring).
+DEFAULT_MEMORY_BANK_COLLECTION = os.environ.get("MEMORY_BANK_COLLECTION", "memory-bank")
+
+# A plain identifier for THIS project -- doesn't have to match any real
+# Qdrant collection name, used purely to resolve this project's `repo` tag
+# (see memory_bank_lib.resolve_repo). setup_project.py defaults it to the
+# same value as codebase-indexer's own COLLECTION_NAME for convenience, but
+# they're independent settings -- nothing enforces they stay identical.
+DEFAULT_MEMORY_BANK_ID = os.environ.get("MEMORY_BANK_ID")
+
+# A comma-separated list of OTHER repos' MEMORY_BANK_IDs this
+# project follows, so its default recall also returns the memories those repos
+# marked `shared`. Read access only: a follower still cannot write under an
+# owner's tag, and forget/wipe_all are unchanged (wipe_all clears only the
+# caller's own memories; forgetting another repo's memory by id still needs
+# confirm=True, followed or not). Read from the environment when the server
+# starts, so a change to .mcp.json applies on the next session or reconnect.
+# Parsed per call (see _follow_config), not here, so a test or a reload sees
+# whatever this constant holds.
+DEFAULT_MEMORY_BANK_FOLLOW_REPOS = os.environ.get("MEMORY_BANK_FOLLOW_REPOS", "")
+
+# This server has no access to Claude Code's own session_id --
+# only hooks get one, via their stdin payload (see
+# mcpservers/compress_mcp_server.py's _attach_savings_metrics docstring for the
+# identical constraint on the local-compress server). Delegates to
+# libs/session_id_lib.py's SessionIdStrategy.PROXY rather
+# than minting its own uuid.uuid4().hex here -- same process-lifetime,
+# cached-once, thread-safe proxy behavior, just no longer duplicated: see
+# that module's docstring for the full four-strategy rationale (this MCP
+# server has no hook payload and no need for a real session boundary here,
+# just a stable per-process grouping key).
+_raw_session_id = _resolve_session_id(SessionIdStrategy.PROXY)
+# session_id()'s return type is Optional[str] because OTHER strategies can
+# genuinely fail to resolve one -- but _proxy_session_id() (what PROXY
+# dispatches to) always returns a str unconditionally, never None. Narrowing
+# that here via an explicit annotation (rather than threading Optional[str]
+# through every record_memory_event call below, or leaving the type checker
+# (mypy originally, Pyright -- both behave the same way
+# here) widen _SESSION_ID's type back to Optional[str] at every OTHER use
+# site, which a bare assert right after the assignment does not prevent for
+# a module-level global) keeps this module's own session_id type exactly
+# what it was before this delegation (a plain str), matching
+# memory_events_lib.record_memory_event's session_id: str parameter.
+assert _raw_session_id is not None, "SessionIdStrategy.PROXY always resolves a value"
+_SESSION_ID: str = _raw_session_id
+
+# Per-session call-sequence counter for memory_events_lib's `turn` field --
+# incremented once per remember()/recall() TOOL INVOCATION (see _next_turn),
+# not once per event row logged, and regardless of whether
+# that particular call ends up actually logging anything -- a validation
+# error, a missing collection, or an empty recall still consumed a turn
+# number, matching "the Nth memory-bank call this session," not "the Nth
+# LOGGED memory-bank call." forget() never advances this, since forget
+# events aren't tracked at all.
+_turn_counter = itertools.count(1)
+
+
+def _next_turn() -> int:
+    return next(_turn_counter)
+
+
+def _follow_config() -> tuple:
+    """
+    `(followed, notes)` for this project's `MEMORY_BANK_FOLLOW_REPOS`: the repo
+    IDs to follow, and a note for each entry that was ignored (this project's
+    own ID or `general`, both already in recall's default scope) so the entry is
+    reported, not silently dropped. See `memory_bank_lib.parse_follow_repos`.
+    """
+    followed, ignored = mb.parse_follow_repos(DEFAULT_MEMORY_BANK_FOLLOW_REPOS, DEFAULT_MEMORY_BANK_ID)
+    notes = [
+        f"MEMORY_BANK_FOLLOW_REPOS entry '{entry}' is ignored: "
+        + ("it is the reserved general tag" if entry == mb.GENERAL_REPO else "it is this project's own MEMORY_BANK_ID")
+        + ", which recall already includes."
+        for entry in ignored
+    ]
+    return followed, notes
+
+
+mcp = MCPServer("memory-bank")
+
+
+def _log_registered_tool_count():
+    """Best-effort startup log (stderr only) -- see
+    ingest_mcp_server.py's identical helper for why this can't ever call print()."""
+    try:
+        n = tool_count(mcp)
+        print(f"[claude-runway] memory-bank registered {n} tools", file=sys.stderr)
+    except Exception as e:
+        print(f"[claude-runway] could not count memory-bank tools: {e}", file=sys.stderr)
+
+
+@mcp.tool()
+async def remember(
+    summary: str,
+    description: str,
+    kind: str,
+    general: bool = False,
+    weight: float = mb.DEFAULT_WEIGHT,
+    shared: bool = False,
+    ctx: Context = None,  # type: ignore[assignment]
+) -> str:
+    """
+    Persist a distilled finding for future sessions -- a bug's root cause, a
+    design decision and its rationale, a correction a reviewer made, or
+    anything else worth surviving a fresh session. Writes into ONE shared
+    collection across every project (not this project's own code index),
+    tagged by this project unless general=True.
+
+    summary: a concise summarization -- the ONLY text actually embedded and
+    searched. Keep it short and phrased the way a future query would be
+    phrased, not a verbatim dump.
+    description: the verbatim full text of what's being remembered --
+    stored as payload, returned in full on a hit, but never itself embedded.
+    Provenance (a cited ticket, a file path) belongs here, not in a separate
+    field.
+    kind: a fully open, model-decided classification (e.g. "lesson",
+    "decision", "idea", "correction") -- no fixed enum, pick whatever fits.
+    general: set True ONLY when the user explicitly signals this applies
+    across every project -- e.g. "remember this globally," "this applies to
+    every project," "remember this across all repos." Default False (scoped
+    to this project) otherwise; don't infer general=True from the content
+    alone, only from an explicit signal like that.
+    weight: a static, FINITE, NONNEGATIVE quality multiplier (default 1.0, a
+    true no-op) `recall` uses to re-rank hits instead of raw similarity
+    alone -- infinite/NaN/negative values are rejected outright. Use a value
+    >1.0 to boost a known-good memory above equally-similar competitors, or
+    0.0 to de-emphasize a stale/superseded one without deleting it. It is a
+    proportional multiplier on relevance (effective_score = max(0,
+    similarity) * weight): a boost among comparably-relevant hits, never a
+    takeover -- weight=2.0 lets a hit with half the similarity tie a
+    default-weight one, and an irrelevant memory scores 0 at any weight.
+    There is no separate "update weight" tool -- to change it later, `forget` the
+    point and `remember` it again.
+    shared: set True ONLY when the user says this memory is relevant to other
+    repos -- e.g. "share this with the related repos," "the repos that follow
+    this one should see it." Default False; don't infer it from the content
+    alone, the same rule as general. It marks the memory as offered to every
+    repo that FOLLOWS this one (their MEMORY_BANK_FOLLOW_REPOS lists this
+    project's MEMORY_BANK_ID); the owner stays this project. It is a relevance
+    filter, NOT access control or privacy: recall(repo=<this project>) and
+    recall(all_repos=True) still return any memory, shared or not, and
+    shared=False does not hide one from other projects. Not valid with
+    general=True (a general memory is already visible to every project). Like
+    weight, it cannot be changed later: `forget` the point and `remember` it
+    again.
+    """
+    # turn is captured HERE, unconditionally, before any of the fallible
+    # steps below (repo resolution, the actual write) -- a
+    # previous version only called _next_turn() deep inside the
+    # tracking-enabled branch, AFTER a successful write, so a validation
+    # error or a schema mismatch silently skipped a turn number instead of
+    # consuming one. `turn` is meant to mean "the Nth memory-bank call this
+    # session" (see _next_turn's docstring), which has to count every call
+    # attempt, not just the ones that end up logged.
+    tracking = mev.tracking_enabled()
+    turn = _next_turn() if tracking else None
+    if tracking:
+        # a plain per-call-attempt tally into metrics.db,
+        # separate from the rich mev.record_memory_event(...) call below --
+        # fired here, before ANY of the fallible steps that follow (weight
+        # validation, repo resolution, the actual write), so an invalid
+        # weight or a repo-resolution error still counts as a call, matching
+        # `turn`'s own "count every invocation" philosophy just above.
+        mev.record_memory_metric("remember", session_id=_SESSION_ID)
+
+    # Rejected here, at the tool boundary, same as recall()'s `limit < 1`
+    # check below -- before resolve_repo/QdrantClient/embedding provider, so
+    # an invalid weight never pays for any of that: a
+    # negative weight isn't just "unusual," it actively BREAKS the ranking
+    # invariant recall_points' effective_score depends on (weight=0 must be
+    # a true floor, weight>1 must only ever boost -- both assume weight>=0).
+    #
+    # `math.isfinite(weight)` is checked FIRST, not just `weight < 0`:
+    # `float("inf") < 0` and `float("nan") < 0`
+    # are both False in Python, so `inf`/`nan` (both reachable from ordinary
+    # JSON-RPC numeric input -- e.g. the JSON literal `1e999` parses to
+    # `inf`) silently passed the negativity check alone. `inf` would then
+    # make every future recall's effective_score infinite (and
+    # `json.dumps(..., allow_nan=True)`'s default emits the non-standard
+    # `Infinity`/`NaN` tokens for it -- not valid per the JSON spec, and not
+    # every consumer's parser accepts them), and `nan` makes `sort()`
+    # comparisons undefined (confirmed: `nan < x` and `nan > x` are both
+    # always False, so a `nan`-weighted hit's position among other hits
+    # depends on sort implementation detail, not a real ranking).
+    if not math.isfinite(weight) or weight < 0:
+        return f"Error: weight must be a finite number 0 or greater (got {weight})."
+    # Same boundary, same reason: shared only means something for a memory
+    # owned by one project. A general memory has no owner for anyone to follow
+    # and every project already recalls it, so refuse rather than store a flag
+    # that does nothing.
+    if shared and general:
+        return "Error: shared=True has no effect with general=True (every project already recalls general memories)."
+
+    collection = DEFAULT_MEMORY_BANK_COLLECTION
+    repo, error = mb.resolve_repo(DEFAULT_MEMORY_BANK_ID, general)
+    if error:
+        return error
+
+    client = QdrantClient(url=DEFAULT_QDRANT_URL, api_key=DEFAULT_QDRANT_API_KEY)
+    embedding_provider = FastEmbedProvider(DEFAULT_EMBEDDING_MODEL)
+
+    # No separate top-level mismatch check here: ensure_collection
+    # (called by remember_point below) now does an equivalent check itself, positioned
+    # right before the actual write rather than earlier -- checking here too would just
+    # be a redundant round-trip with a WIDER race window, not extra safety.
+    point_id, created_at, mismatch = await mb.remember_point(
+        client, embedding_provider, collection,
+        summary=summary, description=description, kind=kind,
+        repo=repo, embedding_model=DEFAULT_EMBEDDING_MODEL, weight=weight, shared=shared,
+    )
+    if mismatch:
+        return mismatch
+    if tracking:
+        # summary_created_at is the EXACT value remember_point itself
+        # stamped into metadata.created_at -- a previous
+        # version re-sampled time.time() here instead, which under
+        # call_with_retry's retries (up to 4 attempts, each with a backoff)
+        # could diverge from the real stamped value by much more than a
+        # negligible amount, corrupting the time-to-first-reuse metric this
+        # field exists to support.
+        assert turn is not None  # tracking is True here, so _next_turn() already ran above
+        mev.record_memory_event(
+            event_type="remember",
+            point_id=point_id,
+            repo=repo,
+            kind=kind,
+            summary_created_at=created_at,
+            session_id=_SESSION_ID,
+            project=DEFAULT_MEMORY_BANK_ID,
+            turn=turn,
+        )
+    shared_note = ", shared=True" if shared else ""
+    return f"Remembered (id={point_id}, repo='{repo}', kind='{kind}', weight={weight}{shared_note})."
+
+
+@mcp.tool()
+async def recall(
+    query: str,
+    kind: Optional[str] = None,
+    repo: Optional[str] = None,
+    all_repos: bool = False,
+    limit: int = 5,
+    ctx: Context = None,  # type: ignore[assignment]
+) -> str:
+    """
+    Semantically search stored memories. Defaults to THIS project's own
+    memories plus general (cross-project) ones -- the same precision a
+    per-project store would give, without missing anything explicitly
+    tagged as applying everywhere.
+
+    Pass repo=<some other project's MEMORY_BANK_ID> to look at a
+    SPECIFIC other project's memories instead (e.g. the user names it
+    directly), or all_repos=True to search across every project at once.
+    Don't guess a repo name -- only pass one the user actually named, or
+    call list_memory_banks if unsure (it only shows which repo IDs exist in
+    the collection, with counts and no memory text; automatic cross-repo
+    discovery of memories was rejected).
+
+    The default scope also includes memories that the repos this project
+    FOLLOWS (MEMORY_BANK_FOLLOW_REPOS in this project's .mcp.json) marked
+    shared; each hit's `repo` is its owner and `shared` says whether it was
+    offered that way. A `notes` entry in the result reports a followed ID that
+    has no memories at all (likely a typo) or an ignored entry in that list.
+    An explicit repo=/all_repos=True does not use the follow list.
+
+    kind narrows further if given. limit caps how many hits come back.
+
+    Results are ranked by `effective_score` (`max(0, raw similarity) *
+    weight`; ties broken by weight>0 then raw similarity, so weight=0 is last), not raw similarity alone
+    -- a memory `remember`ed with a higher `weight` can outrank
+    a more similarly-worded but lower-weight (or stale/superseded) one, but
+    only proportionally (weight=2.0 lets a hit with half the similarity tie),
+    and never when its similarity is non-positive. Each result includes both `score` (raw
+    similarity) and `effective_score` (what ranking actually used) so this
+    is inspectable, not hidden.
+    """
+    # Captured HERE, unconditionally, for the same reason remember() above
+    # does: turn must count every recall() INVOCATION --
+    # a validation error, a missing collection, an embedding mismatch, or a
+    # genuinely empty result set are all still "a call this session," even
+    # though none of them reach the logging branch below.
+    tracking = mev.tracking_enabled()
+    turn = _next_turn() if tracking else None
+    if tracking:
+        # a plain per-call-attempt tally into metrics.db, fired
+        # unconditionally for every recall() invocation (unlike the per-hit
+        # mev.record_memory_event(...) logging further down, which only
+        # fires when there are actual results) -- a validation error, an
+        # embedding mismatch, or a genuinely empty result set are all still
+        # "a recall call," same as `turn` above already counts them.
+        mev.record_memory_metric("recall", session_id=_SESSION_ID)
+
+    collection = DEFAULT_MEMORY_BANK_COLLECTION
+    caller_repo, error = mb.resolve_repo(DEFAULT_MEMORY_BANK_ID, general=False)
+    if error and not (repo or all_repos):
+        # A caller with no valid own repo can still explicitly search a
+        # NAMED other repo or all_repos -- only the (repo=None,
+        # all_repos=False) default scope actually needs caller_repo resolved.
+        return error
+    if limit < 1:
+        return f"Error: limit must be 1 or greater (got {limit})."
+
+    # The follow list only widens the DEFAULT scope: an explicit repo= or
+    # all_repos=True already names which repos to read. With no list set,
+    # `followed` is empty and `notes` stays empty, so nothing below changes
+    # from what recall did before the follow list existed.
+    followed: list = []
+    notes: list = []
+    if not (repo or all_repos):
+        followed, notes = _follow_config()
+
+    client = QdrantClient(url=DEFAULT_QDRANT_URL, api_key=DEFAULT_QDRANT_API_KEY)
+
+    if not call_with_retry(client.collection_exists, collection):
+        # Return immediately rather than falling through to recall_points,
+        # which does its OWN separate collection_exists check right before
+        # querying: a concurrent remember() could create the
+        # collection under a DIFFERENT embedding model in the gap between
+        # this check and that one, making recall_points proceed past ITS
+        # check and call query_points with the wrong vector name -- an
+        # opaque Qdrant error instead of this function's own clean mismatch
+        # message. A collection that doesn't exist yet has no memories for
+        # this caller regardless, so returning here is exactly what
+        # recall_points would have reported anyway, without reopening that
+        # window. Checked BEFORE constructing FastEmbedProvider below:
+        # that constructor eagerly loads/downloads
+        # the ONNX model (TextEmbedding's default lazy_load=False), so
+        # recalling against a not-yet-existing collection would otherwise pay
+        # for a model load it never needed just to return "no results."
+        return f"No memories found for '{query}'."
+
+    embedding_provider = FastEmbedProvider(DEFAULT_EMBEDDING_MODEL)
+    mismatch = check_embedding_model_mismatch(
+        client, collection, embedding_provider, recovery_hint=mb.MISMATCH_RECOVERY_HINT
+    )
+    if mismatch:
+        return mismatch
+
+    results = await mb.recall_points(
+        client, embedding_provider, collection, query,
+        caller_repo=caller_repo or "", repo=repo, all_repos=all_repos, kind=kind, limit=limit,
+        followed=followed,
+    )
+    if followed:
+        # A followed ID with no memories at all is almost certainly a typo (a
+        # repo that exists but shares nothing is fine and not reported).
+        # Checked after the search, and only for a non-empty follow list, so a
+        # project that follows nobody pays nothing.
+        for missing in mb.repos_without_memories(client, collection, followed):
+            notes.append(
+                f"Followed repo '{missing}' (MEMORY_BANK_FOLLOW_REPOS) has no memories in this "
+                f"collection; check the spelling. list_memory_banks shows which repo IDs exist."
+            )
+    if not results:
+        if notes:
+            return f"No memories found for '{query}'.\n" + "\n".join(notes)
+        return f"No memories found for '{query}'."
+
+    if tracking:
+        # One turn value for this whole call: "3rd memory-bank
+        # call this session" describes the CALL, not each individual hit --
+        # a recall() returning 5 hits logs 5 rows that all share this same
+        # turn number, not 5 separate turns. turn was already captured at
+        # the top of this function (see comment there).
+        assert turn is not None  # tracking is True here, so _next_turn() already ran above
+        for hit in results:
+            mev.record_memory_event(
+                event_type="recall",
+                point_id=hit.get("id"),
+                repo=hit.get("repo"),
+                kind=hit.get("kind"),
+                summary_created_at=hit.get("created_at"),
+                session_id=_SESSION_ID,
+                project=DEFAULT_MEMORY_BANK_ID,
+                turn=turn,
+            )
+
+    # JSON, not hand-rolled XML-ish text:
+    # summary/description/kind are arbitrary stored text (see
+    # memory_bank_lib.py's module docstring -- kind is fully model-decided,
+    # summary/description are never sanitized), so interpolating them into
+    # unescaped tags let one memory's content break record boundaries or
+    # spoof a fake <memory> block. json.dumps escapes every string it's
+    # given, so this isn't a per-field patch job -- the whole class of
+    # "what if this text contains a delimiter" bugs doesn't apply to a
+    # properly-serialized format.
+    payload: dict = {"query": query, "results": results}
+    if notes:
+        payload["notes"] = notes
+    return json.dumps(payload, indent=2)
+
+
+@mcp.tool()
+def forget(
+    point_id: Optional[str] = None,
+    wipe_all: bool = False,
+    confirm: bool = False,
+) -> str:
+    """
+    Delete memories. Two mutually exclusive modes -- passing both or
+    neither of point_id/wipe_all is an error:
+
+    point_id: delete exactly one memory by exact id (e.g. one returned by a
+    prior recall call). Deleting a memory that belongs to a DIFFERENT repo
+    than this project's own (this includes a general/cross-project memory)
+    requires confirm=True -- always confirm with the user before passing
+    confirm=True here, don't set it automatically.
+
+    wipe_all: bulk-clear ALL of THIS project's own memories (never general/
+    cross-project ones -- those can only be removed individually via
+    point_id). A call without confirm=True only returns a count of what
+    would be deleted; pass confirm=True to actually delete. Always show the
+    count to the user and get explicit confirmation before re-calling with
+    confirm=True.
+    """
+    if mev.tracking_enabled():
+        # forget() has no existing memory_events_lib tracking at
+        # all (its rich record_memory_event log deliberately excludes
+        # "forget" -- see that module's docstring), so this is the first use
+        # of mev here. Fired before the point_id/wipe_all validation below,
+        # so even that error still counts as a call attempt, matching
+        # remember()/recall()'s own "count every invocation" placement.
+        mev.record_memory_metric("forget", session_id=_SESSION_ID)
+
+    if bool(point_id) == bool(wipe_all):
+        return "Error: pass exactly one of point_id or wipe_all, not both or neither."
+
+    collection = DEFAULT_MEMORY_BANK_COLLECTION
+    caller_repo, error = mb.resolve_repo(DEFAULT_MEMORY_BANK_ID, general=False)
+    if error:
+        return error
+
+    client = QdrantClient(url=DEFAULT_QDRANT_URL, api_key=DEFAULT_QDRANT_API_KEY)
+
+    if point_id:
+        return mb.forget_point(client, collection, point_id, caller_repo=caller_repo, confirm=confirm)
+
+    count, deleted = mb.wipe_memory_bank(client, collection, caller_repo=caller_repo, confirm=confirm)
+    if not deleted:
+        return (
+            f"{count} memor{'y' if count == 1 else 'ies'} belonging to repo '{caller_repo}' would be deleted. "
+            f"Pass confirm=True to actually delete them."
+        )
+    return (
+        f"Deleted {count} memor{'y' if count == 1 else 'ies'} belonging to repo '{caller_repo}' "
+        f"(count reflects what this call found and targeted, not a separately-verified post-delete total)."
+    )
+
+
+@mcp.tool()
+async def transfer_memories(
+    source_collection: str,
+    dry_run: bool = True,
+    qdrant_url: Optional[str] = None,
+    qdrant_api_key: Optional[str] = None,
+) -> str:
+    """
+    Copy memories from a legacy/foreign Qdrant collection (one shaped like a
+    memory-bank export: payload `document` plus a `metadata` object with
+    `repo`/`kind`/`description`/`weight`) into the shared memory-bank
+    collection. Reads every point with a full scroll, not a top-k search.
+
+    source_collection: REQUIRED, the exact collection name -- no guessing
+    (call codebase-indexer's list_collections first if unsure).
+    dry_run: defaults to True -- reports what WOULD happen without writing
+    anything. Show the user that report, then pass dry_run=False only once
+    they want the write to happen.
+
+    Only points tagged with THIS project's own MEMORY_BANK_ID (written
+    project-scoped) or the reserved "general" tag (written as general) are
+    migrated. Points tagged with any other project are skipped and reported
+    under skipped_foreign_repo by tag -- run this tool from a session in that
+    project to migrate them. Re-running is safe: each source point maps to a
+    fixed target id, and points already migrated are counted under
+    already_present and left untouched -- but only points THIS tool wrote; a
+    memory copied over earlier by hand with remember() is not recognized and
+    would be written again, so compare the dry-run counts with what was
+    already migrated. The source collection is never modified or deleted by
+    this tool.
+
+    qdrant_url/qdrant_api_key override this project's QDRANT_URL/
+    QDRANT_API_KEY for this call (both collections are on that one instance).
+    The configured QDRANT_API_KEY is only sent to the configured QDRANT_URL;
+    a different qdrant_url needs its own qdrant_api_key if it requires one.
+
+    Returns a JSON report: would_migrate/migrated ({general, project}),
+    skipped_foreign_repo ({tag: count}), already_present, errors (per point),
+    and error (only when the run stopped early, including before it started
+    because this project's MEMORY_BANK_ID is missing or invalid).
+    """
+    # Same boundary remember() enforces: no write is ever possible without a
+    # valid, non-placeholder, non-"general" MEMORY_BANK_ID for this project.
+    # Checked before any client/provider is built, so a misconfigured project
+    # pays for nothing.
+    caller_repo, error = mb.resolve_repo(DEFAULT_MEMORY_BANK_ID, general=False)
+    if error:
+        # JSON like every other outcome of this tool, so a
+        # caller can parse every result the same way.
+        return json.dumps({"source_collection": source_collection, "dry_run": dry_run, "error": error}, indent=2)
+    assert caller_repo is not None  # resolve_repo returns a repo whenever error is None
+
+    # The configured key is only sent to the configured URL:
+    # qdrant_url is tool input, so falling back to DEFAULT_QDRANT_API_KEY for
+    # ANY url would hand this project's Qdrant credential to whatever host a
+    # call names. A different endpoint gets only the key passed with it.
+    # The rule itself lives in libs/qdrant_credentials.py, shared with the
+    # codebase-indexer server so the two cannot drift apart.
+    url, api_key = resolve_qdrant_credentials(
+        qdrant_url,
+        qdrant_api_key,
+        default_url=DEFAULT_QDRANT_URL,
+        default_api_key=DEFAULT_QDRANT_API_KEY,
+    )
+    client = QdrantClient(url=url, api_key=api_key)
+    # A dry run never embeds anything, and FastEmbedProvider's constructor
+    # eagerly loads the ONNX model (see recall()'s comment above), so only
+    # a real write pays for it.
+    embedding_provider = None if dry_run else FastEmbedProvider(DEFAULT_EMBEDDING_MODEL)
+
+    report = await mb.transfer_points(
+        client, embedding_provider,
+        source=source_collection,
+        target=DEFAULT_MEMORY_BANK_COLLECTION,
+        caller_repo=caller_repo,
+        embedding_model=DEFAULT_EMBEDDING_MODEL,
+        dry_run=dry_run,
+    )
+    report["caller_repo"] = caller_repo
+    # default=str: a Qdrant point id in `errors` can be an int or a UUID
+    # string, both fine, but this keeps any other odd id type from failing
+    # the whole report at serialization time.
+    return json.dumps(report, indent=2, default=str)
+
+
+@mcp.tool()
+async def copy_memories(
+    source_repo: str,
+    kind: str = "all",
+    dry_run: bool = True,
+) -> str:
+    """
+    Copy another project's memories (all of them, or one kind) into THIS
+    project, inside the shared memory-bank collection. A pull: run it from the
+    project that should receive the memories. There is no way to write under
+    another project's name, so "copy to project B" means running this from a
+    session in project B.
+
+    source_repo: REQUIRED, the exact repo tag to copy from -- the other
+    project's MEMORY_BANK_ID, as the user named it. Don't guess one. "general"
+    is refused: every project's recall already includes general memories.
+    kind: "all" (the default), or one kind to copy -- e.g. "lesson",
+    "decision", "reference", "instruction", "project", "correction".
+    dry_run: defaults to True -- reports every memory that WOULD be copied
+    (its kind and summary) without writing or embedding anything. Show the
+    user that report so they can say which memories only make sense in the
+    source project (re-run with a single `kind` to narrow it, since there is no
+    per-memory selection), then pass dry_run=False only once they agree.
+
+    Reads by a filtered scan of the source project's memories, not a top-k
+    search, so none is missed (as long as nothing writes to the source during
+    the run). Each copy is a NEW memory under this project's tag: re-embedded
+    with this project's EMBEDDING_MODEL, a fresh created_at, weight kept, no
+    link back to the original, so it can drift from it. The source memories
+    are never changed. Re-running is safe: a memory this tool already copied
+    here is counted under already_present and left alone -- but a memory
+    copied earlier by hand with remember() is not recognized and would be
+    written again, so check the dry-run report against what is already here.
+
+    Returns a JSON report: would_copy/copied, already_present, memories (each
+    {id, kind, summary, status}), errors (per memory), and error (only when
+    the run stopped early or was refused, including when this project's
+    MEMORY_BANK_ID is missing or invalid).
+    """
+    # Same boundary remember() enforces: no write is ever possible without a
+    # valid, non-placeholder, non-"general" MEMORY_BANK_ID for this project --
+    # and that ID is the ONLY target this tool can write under. Checked before
+    # any client/provider is built, so a misconfigured project pays for nothing.
+    caller_repo, error = mb.resolve_repo(DEFAULT_MEMORY_BANK_ID, general=False)
+    if error:
+        # JSON like every other outcome of this tool, so a caller can parse
+        # every result the same way.
+        return json.dumps({"source_repo": source_repo, "kind": kind, "dry_run": dry_run, "error": error}, indent=2)
+    assert caller_repo is not None  # resolve_repo returns a repo whenever error is None
+
+    kind = kind.strip()
+    if not kind:
+        return json.dumps(
+            {"source_repo": source_repo, "kind": kind, "dry_run": dry_run,
+             "error": 'kind must be "all" or the name of one kind (got an empty string).'},
+            indent=2,
+        )
+    kind_filter = None if kind == "all" else kind
+
+    client = QdrantClient(url=DEFAULT_QDRANT_URL, api_key=DEFAULT_QDRANT_API_KEY)
+    # A dry run never embeds anything, and FastEmbedProvider's constructor
+    # eagerly loads the ONNX model (see recall()'s comment above), so only a
+    # real write pays for it.
+    embedding_provider = None if dry_run else FastEmbedProvider(DEFAULT_EMBEDDING_MODEL)
+
+    report = await mb.copy_points(
+        client, embedding_provider,
+        DEFAULT_MEMORY_BANK_COLLECTION,
+        source_repo=source_repo,
+        caller_repo=caller_repo,
+        embedding_model=DEFAULT_EMBEDDING_MODEL,
+        kind=kind_filter,
+        dry_run=dry_run,
+    )
+    # default=str: a Qdrant point id can be an int or a UUID string, both
+    # fine, but this keeps any other odd id type from failing the whole report
+    # at serialization time.
+    return json.dumps(report, indent=2, default=str)
+
+
+@mcp.tool()
+def list_memory_banks() -> str:
+    """
+    Read-only breakdown of the shared memory-bank collection THIS server is
+    configured for (MEMORY_BANK_COLLECTION): which repos have written memories,
+    how many each, and whether following one would add anything. Returns the
+    collection name, then one row per repo:
+
+        <collection name>
+          * <repo id>, <number of entries>, sharable: yes (<n> shared) | no
+
+    "sharable: yes" means the repo has at least one memory marked shared, which
+    is exactly what a repo that follows it would receive in its default recall.
+    The reserved general tag is not a repo row (every project already receives
+    it); it appears on its own last line when there are general memories.
+    Memories still being written (pending) are not counted, as in recall.
+
+    Returns ids and counts only: no memory text, summaries or descriptions. To
+    look inside a repo before following it, call recall(repo=<id>, query=...).
+    Following is set in this project's .mcp.json (MEMORY_BANK_FOLLOW_REPOS, or
+    `setup_project.py init --memory-bank-follow`), not by a tool, and takes
+    effect when the memory-bank server next starts.
+
+    Only this one collection is listed: a follow list can only work within the
+    collection recall reads, so other memory-bank collections would show repos
+    that can never be followed here (codebase-indexer's list_collections shows
+    what other collections exist).
+    """
+    collection = DEFAULT_MEMORY_BANK_COLLECTION
+    client = QdrantClient(url=DEFAULT_QDRANT_URL, api_key=DEFAULT_QDRANT_API_KEY)
+    return mb.format_memory_banks(collection, mb.summarize_repos(client, collection))
+
+
+if __name__ == "__main__":
+    _log_registered_tool_count()
+    mcp.run()

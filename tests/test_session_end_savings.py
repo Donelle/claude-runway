@@ -1,0 +1,354 @@
+#!/usr/bin/env python3
+"""Tests for hooks/session_end_savings.py.
+
+Stdlib-only (unittest, no pytest) and no disk/DB/network — all savings_ledger
+calls are stubbed at the hook's module-level reference, following the same
+mock.patch.object pattern as test_redirect_webfetch_to_fetch_url.py.
+
+The hook wrapped systemMessage inside hookSpecificOutput, which is
+not a valid key for SessionEnd — Claude Code rejects the entire payload with a
+schema validation error. The fix emits {"systemMessage": summary} at the JSON
+root. These tests pin that output shape and verify the silent-exit paths
+produce no stdout.
+
+    .venv/bin/python -m unittest discover -s tests
+"""
+
+import io
+import json
+import os
+import sys
+import unittest
+from contextlib import redirect_stdout
+from unittest import mock
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hooks"))
+
+import session_end_savings as hook  # noqa: E402
+
+
+_RECOVER_PATCH = None
+
+
+def setUpModule():
+    # main() now calls savings_ledger.recover_orphaned_sessions(),
+    # which is NOT stubbed by the per-test patches below and would otherwise
+    # scan (and roll up/delete from) the REAL ~/.claude/claude-runway/sessions
+    # directory whenever a test patches tracking_enabled to True. Stub it for
+    # the whole module; RecoveryWiring below re-patches it to assert on it.
+    global _RECOVER_PATCH
+    _RECOVER_PATCH = mock.patch.object(hook.savings_ledger, "recover_orphaned_sessions", return_value=0)
+    _RECOVER_PATCH.start()
+
+
+def tearDownModule():
+    if _RECOVER_PATCH is not None:
+        _RECOVER_PATCH.stop()
+
+
+_PAYLOAD = json.dumps({"session_id": "abc123", "cwd": "/some/project"})
+_SUMMARY = "ClaudeRunway · Compression Savings\n\nThis session · my-project\n  Characters before  12,000"
+
+
+def _run_main(stdin_text=_PAYLOAD):
+    buf = io.StringIO()
+    with mock.patch("sys.stdin", io.StringIO(stdin_text)):
+        with redirect_stdout(buf):
+            try:
+                hook.main()
+            except SystemExit:
+                pass
+    return buf.getvalue()
+
+
+class OutputShape(unittest.TestCase):
+    """systemMessage must appear at the JSON root — not inside hookSpecificOutput."""
+
+    def setUp(self):
+        patchers = [
+            mock.patch.object(hook.savings_ledger, "tracking_enabled", return_value=True),
+            mock.patch.object(hook.savings_ledger, "has_session_artifacts", return_value=True),
+            mock.patch.object(hook.savings_ledger, "project_name_from_cwd", return_value="my-project"),
+            mock.patch.object(hook.savings_ledger, "finalize_owned_session", return_value={"event_count": 1}),
+            mock.patch.object(hook.savings_ledger, "query_project_summary", return_value={}),
+            mock.patch.object(hook.savings_ledger, "format_simple_view", return_value=_SUMMARY),
+        ]
+        for p in patchers:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_systemmessage_at_root(self):
+        data = json.loads(_run_main())
+        self.assertIn("systemMessage", data)
+        self.assertEqual(data["systemMessage"], _SUMMARY)
+
+    def test_no_hookspecificoutput(self):
+        # Regression: hookSpecificOutput is not valid for SessionEnd;
+        # Claude Code rejects any payload that contains it.
+        data = json.loads(_run_main())
+        self.assertNotIn("hookSpecificOutput", data)
+
+    def test_only_systemmessage_key(self):
+        # The root object must contain exactly one key — no extras smuggled in.
+        data = json.loads(_run_main())
+        self.assertEqual(list(data.keys()), ["systemMessage"])
+
+
+class SilentExitPaths(unittest.TestCase):
+    """Hook must produce no stdout when it has nothing to report."""
+
+    def test_tracking_disabled_no_output(self):
+        with mock.patch.object(hook.savings_ledger, "tracking_enabled", return_value=False):
+            self.assertEqual(_run_main(), "")
+
+    def test_missing_session_id_no_output(self):
+        payload = json.dumps({"cwd": "/some/project"})  # no session_id key
+        with mock.patch.object(hook.savings_ledger, "tracking_enabled", return_value=True):
+            self.assertEqual(_run_main(payload), "")
+
+    def test_empty_events_no_output(self):
+        with (
+            mock.patch.object(hook.savings_ledger, "tracking_enabled", return_value=True),
+            mock.patch.object(hook.savings_ledger, "has_session_artifacts", return_value=False),
+        ):
+            self.assertEqual(_run_main(), "")
+
+    def test_uncredited_only_session_no_output_but_still_finalized(self):
+        # Events exist (e.g. fetch_url, never credited) but none credited
+        # -> finalize_owned_session reports event_count 0. The session must still be
+        # rolled up into the perpetual store, yet nothing may be printed.
+        with (
+            mock.patch.object(hook.savings_ledger, "tracking_enabled", return_value=True),
+            mock.patch.object(hook.savings_ledger, "has_session_artifacts", return_value=True),
+            mock.patch.object(hook.savings_ledger, "project_name_from_cwd", return_value="p"),
+            mock.patch.object(
+                hook.savings_ledger, "finalize_owned_session", return_value={"event_count": 0, "fetch_url_count": 2}
+            ) as fin,
+            mock.patch.object(hook.savings_ledger, "query_project_summary", return_value={}),
+            mock.patch.object(hook.savings_ledger, "format_simple_view", return_value=_SUMMARY) as fmt,
+        ):
+            self.assertEqual(_run_main(), "")
+        fin.assert_called_once()
+        fmt.assert_not_called()
+
+    def test_invalid_json_stdin_no_output(self):
+        # Malformed stdin must not crash the hook — it exits silently.
+        self.assertEqual(_run_main("not valid json {{"), "")
+
+
+class RecoveryWiring(unittest.TestCase):
+    """Every SessionEnd (tracking on) rolls up OTHER sessions'
+    orphaned ledgers, excluding the session that is ending, regardless of
+    whether the ending session logged anything, and never at the cost of
+    the ending session's own roll-up/summary."""
+
+    def test_recovery_runs_excluding_the_ending_session_even_with_no_events(self):
+        with (
+            mock.patch.object(hook.savings_ledger, "tracking_enabled", return_value=True),
+            mock.patch.object(hook.savings_ledger, "has_session_artifacts", return_value=False),
+            mock.patch.object(hook.savings_ledger, "recover_orphaned_sessions", return_value=1) as rec,
+        ):
+            self.assertEqual(_run_main(), "")
+        rec.assert_called_once_with(exclude_session_id="abc123")
+
+    def test_recovery_not_run_when_tracking_disabled(self):
+        with (
+            mock.patch.object(hook.savings_ledger, "tracking_enabled", return_value=False),
+            mock.patch.object(hook.savings_ledger, "recover_orphaned_sessions") as rec,
+        ):
+            self.assertEqual(_run_main(), "")
+        rec.assert_not_called()
+
+    def test_recovery_failure_does_not_block_own_summary(self):
+        with (
+            mock.patch.object(hook.savings_ledger, "tracking_enabled", return_value=True),
+            mock.patch.object(hook.savings_ledger, "recover_orphaned_sessions", side_effect=OSError("boom")),
+            mock.patch.object(hook.savings_ledger, "has_session_artifacts", return_value=True),
+            mock.patch.object(hook.savings_ledger, "project_name_from_cwd", return_value="my-project"),
+            mock.patch.object(hook.savings_ledger, "finalize_owned_session", return_value={"event_count": 1}) as fin,
+            mock.patch.object(hook.savings_ledger, "query_project_summary", return_value={}),
+            mock.patch.object(hook.savings_ledger, "format_simple_view", return_value=_SUMMARY),
+        ):
+            data = json.loads(_run_main())
+        fin.assert_called_once()
+        self.assertEqual(data["systemMessage"], _SUMMARY)
+
+    def test_own_roll_up_goes_through_the_owned_protocol(self):
+        # The hook must use the same ownership protocol as
+        # recovery (finalize_owned_session -- serialized, and combining this
+        # session's ledger with any leftover claim of it), not the plain
+        # finalize_session, or the two can overwrite each other's rows.
+        with (
+            mock.patch.object(hook.savings_ledger, "tracking_enabled", return_value=True),
+            mock.patch.object(hook.savings_ledger, "has_session_artifacts", return_value=True),
+            mock.patch.object(hook.savings_ledger, "project_name_from_cwd", return_value="my-project"),
+            mock.patch.object(hook.savings_ledger, "finalize_session") as plain,
+            mock.patch.object(hook.savings_ledger, "finalize_owned_session", return_value={"event_count": 0}) as fin,
+        ):
+            _run_main()
+        plain.assert_not_called()
+        fin.assert_called_once_with("abc123", "my-project", actual_tokens=None, attribution=None)
+
+    def test_artifact_check_error_fails_open(self):
+        # has_session_artifacts() ran outside the
+        # hook's guard, so an error there escaped as a traceback at session
+        # shutdown instead of failing open like every other step.
+        with (
+            mock.patch.object(hook.savings_ledger, "tracking_enabled", return_value=True),
+            mock.patch.object(hook.savings_ledger, "has_session_artifacts", side_effect=PermissionError("denied")),
+            mock.patch.object(hook.savings_ledger, "finalize_owned_session") as fin,
+        ):
+            self.assertEqual(_run_main(), "")  # _run_main only swallows SystemExit
+        fin.assert_not_called()
+
+    def test_already_consumed_by_another_process_prints_nothing(self):
+        # None: a concurrent recovery owned and rolled up this session first.
+        with (
+            mock.patch.object(hook.savings_ledger, "tracking_enabled", return_value=True),
+            mock.patch.object(hook.savings_ledger, "has_session_artifacts", return_value=True),
+            mock.patch.object(hook.savings_ledger, "project_name_from_cwd", return_value="my-project"),
+            mock.patch.object(hook.savings_ledger, "finalize_owned_session", return_value=None),
+            mock.patch.object(hook.savings_ledger, "format_simple_view", return_value=_SUMMARY) as fmt,
+        ):
+            self.assertEqual(_run_main(), "")
+        fmt.assert_not_called()
+
+
+_PAYLOAD_WITH_TRANSCRIPT = json.dumps({
+    "session_id": "abc123",
+    "cwd": "/some/project",
+    "transcript_path": "/fake/transcript.jsonl",
+})
+
+
+class TranscriptParsing(unittest.TestCase):
+    """Hook calls parse_session_token_counts and passes result to
+    finalize_owned_session when CLAUDE_RUNWAY_PARSE_TRANSCRIPT_TOKENS is enabled."""
+
+    def _run_with_patched_ledger(self, env, finalize_kwargs_capture, transcript_result):
+        """Run main() with all ledger calls stubbed; capture finalize_owned_session kwargs."""
+        captured = {}
+
+        def _fake_finalize(session_id, project=None, actual_tokens=None, stale_before=None, attribution=None):
+            captured["actual_tokens"] = actual_tokens
+            captured["attribution"] = attribution
+            return {"event_count": 1}
+
+        # Start from the real environment minus the one var under test, so a
+        # developer who exports CLAUDE_RUNWAY_PARSE_TRANSCRIPT_TOKENS in their
+        # shell (the documented way to enable the feature) doesn't leak it
+        # into the "env var not set" case. Each test then supplies exactly the
+        # value it means to via `env`.
+        patched_env = {k: v for k, v in os.environ.items() if k != "CLAUDE_RUNWAY_PARSE_TRANSCRIPT_TOKENS"}
+        patched_env.update(env)
+
+        patchers = [
+            mock.patch.dict(os.environ, patched_env, clear=True),
+            mock.patch.object(hook.savings_ledger, "tracking_enabled", return_value=True),
+            mock.patch.object(hook.savings_ledger, "has_session_artifacts", return_value=True),
+            mock.patch.object(hook.savings_ledger, "project_name_from_cwd", return_value="proj"),
+            mock.patch.object(hook.savings_ledger, "finalize_owned_session", side_effect=_fake_finalize),
+            mock.patch.object(hook.savings_ledger, "query_project_summary", return_value={}),
+            mock.patch.object(hook.savings_ledger, "format_simple_view", return_value=_SUMMARY),
+            # The hook calls the session-level parser (main + subagent
+            # transcripts), not the single-file one.
+            mock.patch.object(
+                hook.savings_ledger, "parse_session_token_counts",
+                return_value=transcript_result
+            ),
+            # The same opt-in also reads the transcript for the per-model join.
+            mock.patch.object(
+                hook.savings_ledger, "read_transcript_attribution",
+                return_value={"calls": {}, "marker_ids": set(), "samples": {}}
+            ),
+        ]
+        for p in patchers:
+            p.start()
+        try:
+            _run_main(_PAYLOAD_WITH_TRANSCRIPT)
+        finally:
+            for p in patchers:
+                p.stop()
+        finalize_kwargs_capture.update(captured)
+
+    def test_actual_tokens_passed_when_env_var_set(self):
+        fake_counts = {"input": 10, "output": 5, "cache_read": 200, "cache_write": 30}
+        captured = {}
+        self._run_with_patched_ledger(
+            {"CLAUDE_RUNWAY_PARSE_TRANSCRIPT_TOKENS": "1"},
+            captured,
+            fake_counts,
+        )
+        self.assertEqual(captured["actual_tokens"], fake_counts)
+
+    def test_actual_tokens_none_when_env_var_not_set(self):
+        captured = {}
+        self._run_with_patched_ledger(
+            {},  # env var absent
+            captured,
+            {"input": 10, "output": 5, "cache_read": 200, "cache_write": 30},
+        )
+        self.assertIsNone(captured["actual_tokens"])
+
+    def test_actual_tokens_none_when_transcript_parse_returns_none(self):
+        # parse_session_token_counts returned None (e.g. file unreadable) --
+        # finalize_owned_session must still receive None, not an exception.
+        captured = {}
+        self._run_with_patched_ledger(
+            {"CLAUDE_RUNWAY_PARSE_TRANSCRIPT_TOKENS": "1"},
+            captured,
+            None,  # transcript parse failed
+        )
+        self.assertIsNone(captured["actual_tokens"])
+
+    def test_attribution_index_is_passed_only_under_the_same_opt_in(self):
+        captured = {}
+        self._run_with_patched_ledger({"CLAUDE_RUNWAY_PARSE_TRANSCRIPT_TOKENS": "1"}, captured, None)
+        self.assertEqual(captured["attribution"], {"calls": {}, "marker_ids": set(), "samples": {}})
+        captured = {}
+        self._run_with_patched_ledger({}, captured, None)
+        self.assertIsNone(captured["attribution"])
+
+    def test_hook_reads_the_attribution_index_from_the_payload_transcript_path(self):
+        with (
+            mock.patch.dict(os.environ, {"CLAUDE_RUNWAY_PARSE_TRANSCRIPT_TOKENS": "1"}),
+            mock.patch.object(hook.savings_ledger, "tracking_enabled", return_value=True),
+            mock.patch.object(hook.savings_ledger, "has_session_artifacts", return_value=True),
+            mock.patch.object(hook.savings_ledger, "project_name_from_cwd", return_value="proj"),
+            mock.patch.object(hook.savings_ledger, "finalize_owned_session", return_value={}),
+            mock.patch.object(hook.savings_ledger, "parse_session_token_counts", return_value=None),
+            mock.patch.object(hook.savings_ledger, "read_transcript_attribution", return_value=None) as read,
+        ):
+            _run_main(_PAYLOAD_WITH_TRANSCRIPT)
+        read.assert_called_once_with("/fake/transcript.jsonl")
+
+    def test_hook_passes_transcript_path_to_session_level_parser(self):
+        # The payload's transcript_path is only the MAIN transcript; the
+        # session-level parser derives the subagent transcripts from it, so the
+        # hook must hand it that exact path.
+        with (
+            mock.patch.dict(os.environ, {"CLAUDE_RUNWAY_PARSE_TRANSCRIPT_TOKENS": "1"}),
+            mock.patch.object(hook.savings_ledger, "tracking_enabled", return_value=True),
+            mock.patch.object(hook.savings_ledger, "has_session_artifacts", return_value=True),
+            mock.patch.object(hook.savings_ledger, "project_name_from_cwd", return_value="proj"),
+            mock.patch.object(hook.savings_ledger, "finalize_owned_session", return_value={}),
+            mock.patch.object(hook.savings_ledger, "query_project_summary", return_value={}),
+            mock.patch.object(hook.savings_ledger, "format_simple_view", return_value=_SUMMARY),
+            mock.patch.object(hook.savings_ledger, "parse_session_token_counts", return_value=None) as parse,
+        ):
+            _run_main(_PAYLOAD_WITH_TRANSCRIPT)
+        parse.assert_called_once_with("/fake/transcript.jsonl")
+
+    def test_parse_transcript_enabled_accepts_true_yes(self):
+        for val in ("1", "true", "True", "TRUE", "yes", "YES"):
+            with mock.patch.dict(os.environ, {"CLAUDE_RUNWAY_PARSE_TRANSCRIPT_TOKENS": val}):
+                self.assertTrue(hook._parse_transcript_enabled(), f"Failed for value {val!r}")
+
+    def test_parse_transcript_disabled_for_other_values(self):
+        for val in ("0", "false", "no", "", "off"):
+            with mock.patch.dict(os.environ, {"CLAUDE_RUNWAY_PARSE_TRANSCRIPT_TOKENS": val}):
+                self.assertFalse(hook._parse_transcript_enabled(), f"Should be disabled for {val!r}")
+
+
+if __name__ == "__main__":
+    unittest.main()

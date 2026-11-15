@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""
+Shared, dependency-free introspection over an MCPServer's registered
+`@mcp.tool()` functions -- so any caller that needs "how many tools does
+this server expose right now, and roughly how big are their schemas" gets
+a LIVE answer instead of a hardcoded number that quietly goes stale as
+tools are added over time.
+
+This exists because that exact drift already happened twice on this repo:
+
+- `compress_mcp_server.py`'s `_log_fixed_overhead()`
+  hardcoded a 5-tool tuple. `compact_store`/`compact_find`/
+  `savings_summary`/`savings_detail` shipped later and were never added to
+  it -- the /cr-savings "tool overhead" annotation (since removed)
+  silently undercounted for months, with no error to notice.
+- EVALUATION.md's Track A/B prose separately hardcoded
+  "6 total" and "5 total" tool counts that drifted the same way.
+
+The fix replaced compress_mcp_server.py's own hardcoded tuple with
+an inline enumeration of `mcp._tool_manager.list_tools()`. This module
+extracts that same logic into one shared place (GROW-05) so
+every caller that needs a live tool count -- `ingest_mcp_server.py`,
+`memory_bank_mcp_server.py`, `tools/report_tool_counts.py`, and
+EVALUATION.md's own "how to check this" prose -- goes through the identical
+code path and can't drift relative to each other. (`compress_mcp_server.py`
+was a caller until its `_log_fixed_overhead()` schema-size
+estimate was removed.)
+
+Deliberately STDLIB-ONLY (no third-party imports, not even
+`local_compress_lib.py`) so importing this from
+`ingest_mcp_server.py`'s side doesn't drag in the compression stack for a
+project that only wants the Qdrant memory piece -- same reasoning
+`libs/doctor_lib.py`'s own docstring already gives for not importing
+`local_compress_lib.py` directly.
+"""
+
+import inspect
+from typing import Any, Callable, List
+
+
+def list_registered_tools(mcp: Any) -> List[Callable]:
+    """
+    Returns every function currently registered as an `@mcp.tool()` on an
+    MCPServer instance, in registration order.
+
+    Reaches into MCPServer's private `_tool_manager` attribute rather than
+    the public `list_tools()` coroutine -- the public method is async, and
+    this needs to run at plain module/startup scope (before `mcp.run()`
+    starts an event loop), the same synchronous-context constraint
+    `compress_mcp_server.py`'s original fix already worked around this
+    way. Same private-attribute tradeoff already accepted in
+    `qdrant_batch_store.py` for the identical reason: no public
+    synchronous alternative exists.
+    """
+    return [info.fn for info in mcp._tool_manager.list_tools()]
+
+
+def describe_tools(mcp: Any) -> str:
+    """
+    Name + signature + docstring for every registered tool, concatenated
+    into one blob -- a proxy for the real JSON tool schema Claude Code
+    actually sends (MCPServer doesn't expose the real schema synchronously
+    either). `tools/report_tool_counts.py` reports its length in characters,
+    labeled as a schema proxy; it is not the serialized schema and is not
+    converted to tokens.
+    """
+    return "\n".join(
+        f"{fn.__name__}{inspect.signature(fn)}\n{fn.__doc__ or ''}"
+        for fn in list_registered_tools(mcp)
+    )
+
+
+def tool_count(mcp: Any) -> int:
+    """Convenience for callers that only need the count, not the blob."""
+    return len(list_registered_tools(mcp))
