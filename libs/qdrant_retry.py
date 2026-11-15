@@ -79,11 +79,11 @@ from qdrant_client.http.exceptions import ResponseHandlingException
 # case some call path ever raises them unwrapped.
 TRANSIENT_HTTP_ERRORS = (httpx.RemoteProtocolError, httpx.ConnectError)
 
-# Total attempts (the original call plus retries), not just "retries" --
-# bumped from 2 (a single retry) after real-world testing showed that's
-# still not enough over a large enough sequential loop (see module
-# docstring). A short backoff between attempts gives vpnkit's connection
-# state a moment to settle rather than hammering it with an instant retry.
+# Total attempts (the original call plus the retries), not only the retries.
+# It was 2 (a single retry) until real-world testing showed that is still not
+# enough over a long enough sequential loop (see the module docstring). The
+# short backoff between attempts lets vpnkit's connection state settle
+# instead of retrying instantly.
 MAX_ATTEMPTS = 4
 RETRY_BACKOFF_SECONDS = 0.2
 
@@ -105,8 +105,8 @@ def call_with_retry(fn, *args, **kwargs):
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
             return fn(*args, **kwargs)
-        except Exception as e:
-            if not _is_transient(e) or attempt == MAX_ATTEMPTS:
+        except Exception as exc:
+            if not _is_transient(exc) or attempt == MAX_ATTEMPTS:
                 raise
             time.sleep(RETRY_BACKOFF_SECONDS)
     # Unreachable: MAX_ATTEMPTS (a fixed positive constant, see above) means
@@ -126,8 +126,8 @@ async def async_call_with_retry(fn, *args, **kwargs):
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
             return await fn(*args, **kwargs)
-        except Exception as e:
-            if not _is_transient(e) or attempt == MAX_ATTEMPTS:
+        except Exception as exc:
+            if not _is_transient(exc) or attempt == MAX_ATTEMPTS:
                 raise
             await asyncio.sleep(RETRY_BACKOFF_SECONDS)
     # See call_with_retry's identical comment above.

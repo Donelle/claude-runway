@@ -14,8 +14,8 @@ them back together even though both are small SQLite files in the same
 directory.
 
 Callers own their own tables (their own CREATE TABLE IF NOT EXISTS against
-the connection this module hands back) -- this module itself defines no
-tables, just where the shared file lives and how to open it. See
+the connection this module hands back). This module defines no tables: it
+only says where the shared file lives and how to open it. See
 libs/qdrant_collection_hints.py (collection_hints) and
 hooks/redirect_webfetch_to_fetch_url.py (webfetch_denied_urls) for the tables
 living here (qdrant_collection_hints also creates a small schema_versions
