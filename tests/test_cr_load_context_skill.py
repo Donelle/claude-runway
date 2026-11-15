@@ -95,24 +95,24 @@ class CrLoadContextSkillTest(unittest.TestCase):
     def test_round_one_is_one_message_with_all_five_calls(self):
         round1 = _section(self.text, "### 1.", "### 2.")
         self.assertIn("ONE message", round1)
-        for call in ("sync_repo", "facts.sh", "get_collection_info", "list_local_models", "recall"):
+        for call in ("cb_indexer_sync_repo", "facts.sh", "cb_indexer_get_collection_info", "list_local_models", "recall"):
             self.assertIn(call, round1)
-        # sync_repo runs in the background and nothing waits on it.
+        # cb_indexer_sync_repo runs in the background and nothing waits on it.
         self.assertIn("background", round1)
         self.assertIn("Nothing waits on it", round1)
 
     def test_sync_repo_is_not_started_for_a_project_with_no_index(self):
-        # Option A: with no manifest, sync_repo would be a full rebuild, which the
+        # Option A: with no manifest, cb_indexer_sync_repo would be a full rebuild, which the
         # epic says is the user's to ask for. The background subagent checks first and does not call it.
         round1 = _section(self.text, "### 1.", "### 2.")
         self.assertIn("only when the project already has an index", round1)
         self.assertIn("Bash `test -f`", round1)
-        self.assertIn("do NOT call `sync_repo`", round1)
+        self.assertIn("do NOT call `cb_indexer_sync_repo`", round1)
         self.assertIn("`no manifest: sync not started`", round1)
         # Without the Agent tool the skill calls it itself, and only after the facts say present.
         self.assertIn("`sync manifest: present`", round1)
         report = _section(self.text, "### 4. Report")
-        self.assertIn("suggest `index_repo`", report)
+        self.assertIn("suggest `cb_indexer_index_repo`", report)
 
     def test_the_script_is_run_with_a_bare_porcelain_flag(self):
         self.assertIn('bash "<skill folder>/facts.sh" --porcelain', self.text)
@@ -130,12 +130,12 @@ class CrLoadContextSkillTest(unittest.TestCase):
             self.assertIn(f"**`{server}`**", guide)
         # The rules that change what the model does, one or two per server.
         for rule in (
-            "use Grep for exact identifiers",                      # qdrant-find vs Grep
+            "use Grep for exact identifiers",                      # cb_indexer_find_repo vs Grep
             "Read only that span",                                 # results are leads
-            "never a raw file dump",                               # qdrant-store
-            "run it at the start of a session",                    # sync_repo
-            "different** already-indexed repo",                    # find_in_collection
-            "call `list_collections` first, never guess",
+            "never a raw file dump",                               # cb_indexer_store_repo
+            "run it at the start of a session",                    # cb_indexer_sync_repo
+            "different** already-indexed repo",                    # cb_indexer_find_in_collection
+            "call `cb_indexer_list_collections` first, never guess",
             "`recall` before finalizing any non-trivial change",
             "Ask first",                                           # remember
             "`general=True` only when the user explicitly says",
@@ -227,7 +227,7 @@ class CrLoadContextSkillTest(unittest.TestCase):
         self.assertIn("do not run it", self.text)
 
     def test_warns_before_a_first_index_and_discloses_the_one_side_effect(self):
-        self.assertIn("suggest `index_repo`", self.text)
+        self.assertIn("suggest `cb_indexer_index_repo`", self.text)
         self.assertIn("do not start it silently", self.text)
         self.assertIn(".qdrant_index_manifest.json", self.text)
 
@@ -516,7 +516,7 @@ class FactsCoreTest(_Env):
         out, _ = self.run_facts()
         self.assertIn("sync manifest: ABSENT", out)
         self.assertIn("first embed is long", out)
-        self.assertIn("sync_repo was not started", out)
+        self.assertIn("cb_indexer_sync_repo was not started", out)
         (self.repo / ".qdrant_index_manifest.json").write_text("{}", encoding="utf-8")
         out, _ = self.run_facts()
         self.assertIn("sync manifest: present", out)

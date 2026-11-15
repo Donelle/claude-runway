@@ -2,16 +2,16 @@
 """Tests for the memory-bank guards added to mcpservers/codebase_indexer_mcp_server.py:
 
 
-- index_repo/sync_repo refuse outright when their target collection matches
+- cb_indexer_index_repo/cb_indexer_sync_repo refuse outright when their target collection matches
   the configured shared memory-bank collection name.
-- index_repo(reset=True) ALWAYS preserves memory-bank points via a filtered
+- cb_indexer_index_repo(reset=True) ALWAYS preserves memory-bank points via a filtered
   delete, and never calls delete_collection or counts anything first (PR
   An earlier version branched on a memory-bank point count, but
   that count and the delete were separate Qdrant requests with no
   transaction between them -- a concurrent remember() landing in the gap
   could still be destroyed by a "zero-count" full delete. Always using the
   filtered delete removes the race instead of narrowing it).
-- sync_repo's per-batch delete filter carries a must_not exclusion for
+- cb_indexer_sync_repo's per-batch delete filter carries a must_not exclusion for
   memory-bank points.
 
 Stdlib-only (unittest, no pytest), no network -- mirrors
@@ -92,7 +92,7 @@ class IndexRepoResetGuardTest(unittest.TestCase):
         self._index_patcher.start()
         self.addCleanup(self._index_patcher.stop)
 
-        # These tests index REPO_ROOT, the real checkout: index_repo writes (and
+        # These tests index REPO_ROOT, the real checkout: cb_indexer_index_repo writes (and
         # on reset removes) the repo's sync manifest, which must not touch it.
         for name in ("_save_manifest", "_discard_manifest"):
             patcher = patch.object(_ims, name)
@@ -261,7 +261,7 @@ class SyncRepoDeleteFilterTest(unittest.TestCase):
 
     def test_schema_mismatch_blocks_the_delete_loop(self):
         # Regression for a review finding (fifth pass): without this check,
-        # sync_repo would delete each changed/removed file's old chunks
+        # cb_indexer_sync_repo would delete each changed/removed file's old chunks
         # FIRST and only discover an incompatible EMBEDDING_MODEL later,
         # once the embed/store loop's upsert failed -- leaving those files
         # with no searchable content at all, unlike every other skip path
@@ -294,7 +294,7 @@ class SyncRepoDeleteFilterTest(unittest.TestCase):
 
 
 class SyncRepoMissingCollectionTest(unittest.TestCase):
-    """sync_repo's manifest-diff "no changes" early return
+    """cb_indexer_sync_repo's manifest-diff "no changes" early return
     used to run before any collection_exists check, so a manifest claiming
     every file was indexed masked a dropped/empty collection -- which is
     exactly the state the documented EMBEDDING_MODEL-change remediation
@@ -338,7 +338,7 @@ class SyncRepoMissingCollectionTest(unittest.TestCase):
         self.assertNotIn("No changes since last sync", result)
         self.assertIn("Error", result)
         self.assertIn("test-collection", result)
-        self.assertIn("index_repo", result)
+        self.assertIn("cb_indexer_index_repo", result)
 
     def test_up_to_date_manifest_against_empty_collection_is_reported(self):
         result = self._sync(self._client(exists=True, points=0), {"a.py": "h1", "b.py": "h2"})
@@ -357,7 +357,7 @@ class SyncRepoMissingCollectionTest(unittest.TestCase):
         _ims.store_batch.assert_not_called()
 
     def test_count_ignores_points_without_a_file_path(self):
-        # Preserved memory-bank / qdrant-store points must not
+        # Preserved memory-bank / cb_indexer_store_repo points must not
         # make an otherwise chunk-less collection look populated. The fake
         # count honors the filter the way Qdrant would.
         client = MagicMock()

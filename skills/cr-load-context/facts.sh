@@ -163,13 +163,13 @@ fi
 # --- the index -------------------------------------------------------------
 
 section "index"
-# The skill starts sync_repo only when this manifest exists (a project with no
-# manifest would get a full rebuild, a long embed that is index_repo's to start
+# The skill starts cb_indexer_sync_repo only when this manifest exists (a project with no
+# manifest would get a full rebuild, a long embed that is cb_indexer_index_repo's to start
 # and the user's to ask for), so ABSENT stays true while this script runs.
 if [ -f .qdrant_index_manifest.json ]; then
   echo "sync manifest: present (.qdrant_index_manifest.json)"
 else
-  echo "sync manifest: ABSENT (this project has not been indexed here; the first embed is long, so sync_repo was not started)"
+  echo "sync manifest: ABSENT (this project has not been indexed here; the first embed is long, so cb_indexer_sync_repo was not started)"
 fi
 
 # --- the forge: pull requests only -----------------------------------------

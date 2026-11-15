@@ -1,30 +1,27 @@
 #!/usr/bin/env python3
 """
-The `qdrant` MCP server: this project's own semantic memory plus the
-conversation-compact store, in one process.
+The `qdrant` MCP server: the conversation-compact store.
 
-Five tools:
+Three tools:
 
-  - `qdrant-find` / `qdrant-store`: search and save notes in THIS project's own
-    collection (`COLLECTION_NAME`). These keep the names the third-party
-    Qdrant MCP server this one replaced served, so `mcp__qdrant__qdrant-find` and every permission rule written against it
-    keep working. Their descriptions live in the docstrings below instead of
-    in `TOOL_FIND_DESCRIPTION`/`TOOL_STORE_DESCRIPTION` env entries.
   - `compact_store` / `compact_find` / `compact_prune`: the conversation-compact
     store `/cr-compact` and `/cr-resume` use, moved here from the
     `local-compress` server. They share this server's Qdrant connection and
     embedding code. `compact_store` also compresses the summary it is given
     through `libs/local_compress_lib.py` before storing it (see below).
 
-On-disk format is unchanged. Code-index points are written by
-`libs/qdrant_connector.py` (one named cosine vector, payload
-`{document, metadata}`), and compacts keep their own payload fields and the
+Searching and saving notes in the project's own collection is NOT here: the
+`codebase-indexer` server serves it as `cb_indexer_find_repo` /
+`cb_indexer_store_repo` (it owns that collection). This server used to serve
+them as `qdrant-find` / `qdrant-store`, and no longer does.
+
+On-disk format is unchanged. Compacts keep their own payload fields and the
 model-named vector `fast-<model basename>` they were always stored under, so
 collections written before this server existed stay readable.
 
-Two embedding models, on purpose. `EMBEDDING_MODEL` is the code-index model and
-must agree with the `codebase-indexer` block. `COMPACT_EMBEDDING_MODEL` is the
-conversation-compact model: compacts are stored under a model-named vector, so
+`COMPACT_EMBEDDING_MODEL` is the conversation-compact model (the code-index
+model is the `codebase-indexer` block's `EMBEDDING_MODEL`, which this server
+no longer reads): compacts are stored under a model-named vector, so
 changing it for an install that already has compacts orphans them. When it is
 unset it falls back to `BAAI/bge-small-en`, which every compact stored before
 this variable existed was embedded with.
@@ -39,11 +36,10 @@ Embedding models are loaded on first use, not at startup, so the server
 answers `initialize` immediately whatever the network or model cache looks like.
 """
 
-import json
 import os
 import sys
 import uuid
-from typing import Any, Optional
+from typing import Optional
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "libs"))
 
@@ -58,7 +54,6 @@ from local_compress_lib import (
 )
 from memory_bank_lib import COMPACT_SOURCE
 from qdrant_compact_marker import mark_compact_collection
-from qdrant_connector import Entry, QdrantConnector
 from qdrant_credentials import resolve_qdrant_credentials
 from qdrant_embeddings import FastEmbedProvider
 from qdrant_ingest_lib import ensure_persistent_fastembed_cache
@@ -73,15 +68,6 @@ ensure_persistent_fastembed_cache()
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
 # An empty string in .mcp.json means "no key"; normalize it so no auth header is sent.
 QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY") or None
-COLLECTION_NAME = os.environ.get("COLLECTION_NAME") or None
-DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL") or DEFAULT_EMBEDDING_MODEL
-# How many hits qdrant-find returns when the caller passes no limit. The
-# package this replaces defaulted to 10 and took no limit at all; the tool now
-# takes an optional one, because repetitive content (generated
-# clients, JSON fixtures, lock files) can fill a fixed top 10 with near-
-# duplicates and push the chunk that was asked for past it.
-SEARCH_LIMIT = 10
 
 # The names the compact tools and their helpers below are written against; the
 # compact code was moved here unchanged, so these keep its original spelling.
@@ -130,7 +116,7 @@ LEGACY_COMPACT_EMBEDDING_MODEL = "BAAI/bge-small-en"
 # creating a second vector or missing existing points.
 COMPACT_EMBEDDING_MODEL = os.environ.get("COMPACT_EMBEDDING_MODEL") or LEGACY_COMPACT_EMBEDDING_MODEL
 
-# Replaces the shared check's default find_in_collection-oriented advice
+# Replaces the shared check's default cb_indexer_find_in_collection-oriented advice
 # ("check the other repo's .mcp.json"), which is wrong for compacts.
 COMPACT_MODEL_MISMATCH_HINT = (
     "Compacts are stored under the embedding model that created their collection, so this "
@@ -141,81 +127,6 @@ COMPACT_MODEL_MISMATCH_HINT = (
 )
 
 mcp = MCPServer("qdrant")
-
-# The connector (and with it the embedding model) is built on the first
-# qdrant-find/qdrant-store call, not at import: loading the ONNX model takes
-# seconds and, on a cold cache, a download, and none of that should delay the
-# server answering `initialize`.
-_connector: Optional[QdrantConnector] = None
-
-
-def _get_connector() -> QdrantConnector:
-    global _connector
-    if _connector is None:
-        _connector = QdrantConnector(
-            QDRANT_URL,
-            QDRANT_API_KEY,
-            COLLECTION_NAME,
-            FastEmbedProvider(EMBEDDING_MODEL),
-        )
-    return _connector
-
-
-def _format_entry(entry: Entry) -> str:
-    """One search hit, in the shape the package this server replaces returned,
-    so a caller or prompt that learned to read it keeps working."""
-    entry_metadata = json.dumps(entry.metadata) if entry.metadata else ""
-    return f"<entry><content>{entry.content}</content><metadata>{entry_metadata}</metadata></entry>"
-
-
-_NO_COLLECTION_ERROR = (
-    "Error: COLLECTION_NAME is not set in this server's env block (.mcp.json), so there is no "
-    "project collection to use. Run `claude-runway-setup init` or set it by hand."
-)
-
-
-@mcp.tool(name="qdrant-find")
-async def qdrant_find(query: str, limit: int = SEARCH_LIMIT) -> list[str]:
-    """
-    Semantic search over everything in THIS project's collection (indexed code
-    and docs, plus any text stored with qdrant-store). Use this
-    BEFORE grepping or reading files for conceptual questions like 'where is X
-    handled' or 'how does Y work'. Do NOT use for exact string, symbol, or
-    error-message matches -- use Grep for those. Returns matching entries as
-    text, including any metadata (e.g. file_path, line_number, char_range)
-    attached to them -- use line_number to read only the relevant lines
-    instead of the whole file (points indexed before token-window chunking
-    carry line_range, "start-end", instead). Input: query (a natural-language
-    question, not a code snippet), limit (how many hits to return, default 10;
-    raise it when the thing you want is not in the first 10, which repetitive
-    content can cause). Hits with line_range come from an index that predates
-    token-window chunking, where a miss is not proof the code is absent.
-    """
-    if not COLLECTION_NAME:
-        return [_NO_COLLECTION_ERROR]
-    if limit < 1:
-        return [f"Error: limit must be 1 or greater (got {limit})."]
-    entries = await _get_connector().search(query, collection_name=COLLECTION_NAME, limit=limit)
-    if not entries:
-        return [f"No information found for the query '{query}'"]
-    return [f"Results for the query '{query}'"] + [_format_entry(e) for e in entries]
-
-
-@mcp.tool(name="qdrant-store")
-async def qdrant_store(information: str, metadata: Optional[dict[str, Any]] = None) -> str:
-    """
-    Store a piece of text, with optional metadata, in this project's
-    collection so qdrant-find can return it by meaning. Keep it short; do not
-    store raw file dumps or speculative, in-progress reasoning. Metadata is optional: add file_path and line_number
-    when the text is about a file, source or url when it comes from somewhere
-    else, or nothing. Input: information (the text to store), metadata
-    (optional JSON).
-    """
-    if not COLLECTION_NAME:
-        return _NO_COLLECTION_ERROR
-    await _get_connector().store(Entry(content=information, metadata=metadata), collection_name=COLLECTION_NAME)
-    return f"Remembered: {information} in collection {COLLECTION_NAME}"
-
 
 def _normalize_project(project: str) -> str:
     """
@@ -602,7 +513,7 @@ async def compact_store(
     into a new one -- see _collections_for_project. Pass collection
     explicitly to override.
 
-    Called by /cr-compact instead of qdrant-store. project, label, and date
+    Called by /cr-compact instead of cb_indexer_store_repo. project, label, and date
     are stored as payload fields and used by compact_find for native filtering
     and sorting. The collection is created automatically on first use.
 
@@ -710,14 +621,14 @@ async def compact_store(
         # An existing collection created under a different model
         # would otherwise get a SECOND vector name added by the upsert below
         # (or fail opaquely), leaving the old points unsearchable by this
-        # model. Fails open on an inconclusive check, like find_in_collection.
+        # model. Fails open on an inconclusive check, like cb_indexer_find_in_collection.
         mismatch = check_embedding_model_mismatch(
             client, col, embedding_provider, recovery_hint=COMPACT_MODEL_MISMATCH_HINT
         )
         if mismatch:
             return mismatch
     # Mark the collection internal on EVERY write (idempotent), so
-    # find_in_collection/list_collections can tell it isn't a search target.
+    # cb_indexer_find_in_collection/cb_indexer_list_collections can tell it isn't a search target.
     # Done on every write rather than only at creation so a legacy collection
     # gets marked on its next /cr-compact. Fails open: a failed mark must not
     # lose the user's compact.
@@ -751,7 +662,7 @@ async def compact_store(
                 # case-insensitive PER-ENTRY filter against it. The exact
                 # literal value is also a human-readable record of what this
                 # specific call actually passed.
-                # metadata.source is what index_repo/sync_repo's
+                # metadata.source is what cb_indexer_index_repo/cb_indexer_sync_repo's
                 # delete filters exclude on (mb.memory_bank_exclusion_filter),
                 # so a reset pointed at a compact collection can't wipe these.
                 payload={
@@ -941,7 +852,7 @@ async def compact_find(
     isolates one project's entries from another's, including when a shared
     collection is passed explicitly via the collection param.
 
-    Called by /cr-resume instead of qdrant-find. Returns compacts sorted by
+    Called by /cr-resume instead of cb_indexer_find_repo. Returns compacts sorted by
     date descending (most recent first; compacts sharing a date are ordered
     by the time they were stored, newest first -- compacts stored before that
     timestamp existed count as oldest on their date), each with its date,

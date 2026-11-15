@@ -2056,7 +2056,7 @@ def run_setup(
             f"WARNING: EMBEDDING_MODEL changed from '{previous_embedding_model}' to "
             f"'{resolved_embedding_model}'. Vectors already indexed under the old model are "
             f"incompatible: drop the project's collection (directly in Qdrant) and re-run "
-            f"index_repo. The memory-bank server's model is separate and is not changed by "
+            f"cb_indexer_index_repo. The memory-bank server's model is separate and is not changed by "
             f"--embedding-model."
         )
     elif previous_embedding_model and previous_embedding_model != template_embedding_model:
@@ -2125,7 +2125,7 @@ def run_setup(
     # Found in review: a target repo directory named e.g. "memory-bank"
     # with both COLLECTION_NAME and MEMORY_BANK_COLLECTION left at their
     # defaults resolves them to the SAME string -- mcpservers/codebase_indexer_mcp_server.py's
-    # reserved-collection-name guard then refuses EVERY index_repo/sync_repo
+    # reserved-collection-name guard then refuses EVERY cb_indexer_index_repo/cb_indexer_sync_repo
     # call for this project, since its own code-index collection IS the
     # reserved memory-bank name. Warn at setup time rather than leaving this
     # to surface later as a confusing "Error: ... is configured as the shared
@@ -2133,7 +2133,7 @@ def run_setup(
     if resolved_collection_name == resolved_memory_bank_collection:
         changes.append(
             f"WARNING: this project's COLLECTION_NAME ('{resolved_collection_name}') is the same "
-            f"as MEMORY_BANK_COLLECTION -- index_repo/sync_repo will refuse to run at all for this "
+            f"as MEMORY_BANK_COLLECTION -- cb_indexer_index_repo/cb_indexer_sync_repo will refuse to run at all for this "
             f"project (they never touch the shared memory-bank collection). Pass --collection-name "
             f"or --memory-bank-collection so the two differ."
         )

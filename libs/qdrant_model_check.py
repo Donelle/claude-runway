@@ -1,8 +1,8 @@
 """
 Embedding-model mismatch check shared by `mcpservers/codebase_indexer_mcp_server.py`
-(`find_in_collection`, `index_repo`, `sync_repo`) and `libs/memory_bank_lib.py`.
+(`cb_indexer_find_in_collection`, `cb_indexer_index_repo`, `cb_indexer_sync_repo`) and `libs/memory_bank_lib.py`.
 Relocated here from `codebase_indexer_mcp_server.py` (where it was a private,
-single-file function used only by `find_in_collection`) rather than
+single-file function used only by `cb_indexer_find_in_collection`) rather than
 duplicated, so callers can't drift apart on this logic. The default
 behavior is unchanged from that original home (fails open on an
 inconclusive check), but two things were added since relocation that
@@ -42,12 +42,12 @@ def check_embedding_model_mismatch(
     Fails open on any exception BY DEFAULT (`fail_closed=False`) -- a network
     error or unexpected config shape must never block a valid read-only query;
     the caller already verified the collection exists, and every other caller
-    of this function (`find_in_collection`, `memory_bank_lib.py`'s remember/
+    of this function (`cb_indexer_find_in_collection`, `memory_bank_lib.py`'s remember/
     recall/ensure_collection) is fine proceeding on an inconclusive result.
 
     `fail_closed=True` inverts that
-    for the three callers where it's wrong: `index_repo(reset=True)`'s,
-    `sync_repo`'s, and `tools/ingest_to_qdrant.py --reset`'s
+    for the three callers where it's wrong: `cb_indexer_index_repo(reset=True)`'s,
+    `cb_indexer_sync_repo`'s, and `tools/ingest_to_qdrant.py --reset`'s
     pre-delete checks. Each exists specifically to stop a
     destructive delete before it runs -- fail-open there meant an
     inconclusive check (a transient network error,
@@ -70,15 +70,15 @@ def check_embedding_model_mismatch(
       QdrantConnector.search always passes using=get_vector_name(), which Qdrant
       cannot resolve for an unnamed/default-vector collection.
 
-    `recovery_hint`, if given, REPLACES the default `find_in_collection`/
-    `index_repo`-oriented remediation text in the two error messages that carry
+    `recovery_hint`, if given, REPLACES the default `cb_indexer_find_in_collection`/
+    `cb_indexer_index_repo`-oriented remediation text in the two error messages that carry
     one (the name-mismatch and unnamed-vector-format cases). Added for issue
     `memory_bank_lib.py` also calls this shared check,
-    where "use index_repo(reset=true)" is actively wrong advice -- `index_repo`
+    where "use cb_indexer_index_repo(reset=true)" is actively wrong advice -- `cb_indexer_index_repo`
     refuses to ever touch the shared memory-bank collection -- and "check the
-    other repo's .mcp.json"/"that find_in_collection expects" don't apply
+    other repo's .mcp.json"/"that cb_indexer_find_in_collection expects" don't apply
     either, since memory-bank isn't a cross-repo lookup. Defaults to None,
-    which preserves the original `find_in_collection`-oriented text exactly,
+    which preserves the original `cb_indexer_find_in_collection`-oriented text exactly,
     so this is a purely additive change for that caller.
     """
     try:
@@ -124,8 +124,8 @@ def check_embedding_model_mismatch(
             # using=get_vector_name(), which Qdrant cannot resolve for an unnamed/
             # default-vector collection. Return an error immediately rather than
             # letting it fail downstream with an opaque Qdrant error.
-            # Recovery (find_in_collection's default text): previously
-            # recommended index_repo(reset=true) to wipe and recreate with a
+            # Recovery (cb_indexer_find_in_collection's default text): previously
+            # recommended cb_indexer_index_repo(reset=true) to wipe and recreate with a
             # named-vector schema -- no longer effective advice:
             # reset=true was changed to always preserve
             # the collection's existing schema (never delete_collection), so
@@ -139,7 +139,7 @@ def check_embedding_model_mismatch(
                     recovery_hint
                     or f"Drop this collection directly in Qdrant and re-index it from scratch "
                     f"so it stores vectors under the '{expected_name}' name that "
-                    f"find_in_collection expects -- index_repo(reset=true) no longer "
+                    f"cb_indexer_find_in_collection expects -- cb_indexer_index_repo(reset=true) no longer "
                     f"recreates an existing collection's schema."
                 )
             )

@@ -4,19 +4,19 @@ Collection-metadata marker for conversation-compact collections.
 `compact_store` (mcpservers/qdrant_mcp_server.py) writes saved conversation
 summaries for /cr-compact and /cr-resume into their own collections, which
 are only ever read back by project through `compact_find` -- never by
-semantic search. Nothing used to say so: `find_in_collection` would search
-them and `list_collections` listed them next to real codebase collections as
+semantic search. Nothing used to say so: `cb_indexer_find_in_collection` would search
+them and `cb_indexer_list_collections` listed them next to real codebase collections as
 if they were search targets. This module is the ONE place that defines how
 such a collection is marked internal, so the writer (qdrant_mcp_server.py)
-and the two readers (codebase_indexer_mcp_server.py's `find_in_collection` /
-`list_collections`) cannot drift apart on the key, the value, or the
+and the two readers (codebase_indexer_mcp_server.py's `cb_indexer_find_in_collection` /
+`cb_indexer_list_collections`) cannot drift apart on the key, the value, or the
 read/write rules. (libs/qdrant_collection_hints.py is a description cache
 and not a fit for this.)
 
 The marker is Qdrant collection metadata, the same mechanism
-`set_collection_description` uses. `update_collection(metadata=...)` merges
+`cb_indexer_set_collection_description` uses. `update_collection(metadata=...)` merges
 top-level keys rather than replacing the dict (confirmed against a live
-Qdrant instance, and noted in `set_collection_description`'s
+Qdrant instance, and noted in `cb_indexer_set_collection_description`'s
 docstring), so writing the marker cannot erase
 a stored `description`/`search_limit` hint, and writing those cannot erase
 the marker.

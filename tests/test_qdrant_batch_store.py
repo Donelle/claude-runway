@@ -91,7 +91,7 @@ class _FakeCollectionInfo:
 
 
 class _FakeSyncClient:
-    """Stands in for the plain (sync) QdrantClient index_repo/sync_repo
+    """Stands in for the plain (sync) QdrantClient cb_indexer_index_repo/cb_indexer_sync_repo
     already construct for their own collection_exists/delete calls --
     ensure_file_path_index only ever calls get_collection/
     create_payload_index on it."""
@@ -160,7 +160,7 @@ class StoreBatch(unittest.TestCase):
         """Payload/vector shape must exactly match what
         qdrant_connector.QdrantConnector.store()/search() write and
         read -- a mismatch wouldn't error, it would just silently write
-        payloads search()/qdrant-find can't parse metadata back out of."""
+        payloads search()/cb_indexer_find_repo can't parse metadata back out of."""
         connector = _FakeConnector()
         entry = _Entry("hello world", {"file_path": "a.py", "line_range": "1-2"})
         _run(store_batch(connector, [entry]))
@@ -235,7 +235,7 @@ class EnsureFilePathIndex(unittest.TestCase):
         """The issue's own proposal text suggested the bare "file_path" key
         -- confirmed by reading the real payload shape that the actual
         indexable field is nested under "metadata", matching what
-        sync_repo's existing delete-by-filter already queries."""
+        cb_indexer_sync_repo's existing delete-by-filter already queries."""
         self.assertEqual(FILE_PATH_INDEX_FIELD, f"{METADATA_PATH}.file_path")
 
     def test_skips_create_when_index_already_exists(self):
@@ -245,7 +245,7 @@ class EnsureFilePathIndex(unittest.TestCase):
         self.assertEqual(client.create_payload_index_calls, [])
 
     def test_second_call_after_first_creation_is_a_no_op(self):
-        """Confirms this is safe to call on every sync_repo/index_repo run
+        """Confirms this is safe to call on every cb_indexer_sync_repo/cb_indexer_index_repo run
         without re-triggering Qdrant's full-collection index-build scan
         each time -- the whole point of checking payload_schema first."""
         client = _FakeSyncClient(existing_payload_schema={})

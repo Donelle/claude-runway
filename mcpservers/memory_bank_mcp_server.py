@@ -531,7 +531,7 @@ async def transfer_memories(
     collection. Reads every point with a full scroll, not a top-k search.
 
     source_collection: REQUIRED, the exact collection name -- no guessing
-    (call codebase-indexer's list_collections first if unsure).
+    (call codebase-indexer's cb_indexer_list_collections first if unsure).
     dry_run: defaults to True -- reports what WOULD happen without writing
     anything. Show the user that report, then pass dry_run=False only once
     they want the write to happen.
@@ -707,7 +707,7 @@ def list_memory_banks() -> str:
 
     Only this one collection is listed: a follow list can only work within the
     collection recall reads, so other memory-bank collections would show repos
-    that can never be followed here (codebase-indexer's list_collections shows
+    that can never be followed here (codebase-indexer's cb_indexer_list_collections shows
     what other collections exist).
     """
     collection = DEFAULT_MEMORY_BANK_COLLECTION

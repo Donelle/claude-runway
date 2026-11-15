@@ -9,7 +9,7 @@ Each assertion fails when something is added without its docs line:
 - every environment variable the code (or a shipped skill) reads is named in
   `docs/environment-variables.md`, apart from a short allow-list of
   intentionally internal ones;
-- the `qdrant-find`/`qdrant-store` descriptions, and the template outside its
+- the `cb_indexer_find_repo`/`cb_indexer_store_repo` descriptions, and the template outside its
   memory-bank section, never assign the lessons/decisions purpose that belongs
   to memory-bank.
 
@@ -95,10 +95,10 @@ class McpToolsInTemplate(unittest.TestCase):
 
 
 class QdrantToolsStayContentAgnostic(unittest.TestCase):
-    """`qdrant-store`/`qdrant-find` take and rank whatever text they are given;
+    """`cb_indexer_store_repo`/`cb_indexer_find_repo` take and rank whatever text they are given;
     the server has no notion of what a stored point is "for". Lessons,
     corrections and design decisions belong to memory-bank, and the template's
-    memory-bank section is the one place that says so. If the qdrant tools'
+    memory-bank section is the one place that says so. If these tools'
     descriptions (or the rest of the template) also asked for them, two
     instructions would compete after every resolved root cause, and the notes
     written to the project collection would sit beside the indexer's chunks
@@ -112,8 +112,8 @@ class QdrantToolsStayContentAgnostic(unittest.TestCase):
 
     @staticmethod
     def _qdrant_tool_descriptions() -> dict[str, str]:
-        tree = ast.parse(_read("mcpservers/qdrant_mcp_server.py"))
-        wanted = {"qdrant_find": "qdrant-find", "qdrant_store": "qdrant-store"}
+        tree = ast.parse(_read("mcpservers/codebase_indexer_mcp_server.py"))
+        wanted = {"cb_indexer_find_repo": "cb_indexer_find_repo", "cb_indexer_store_repo": "cb_indexer_store_repo"}
         out = {
             wanted[node.name]: ast.get_docstring(node) or ""
             for node in ast.walk(tree)
@@ -133,7 +133,7 @@ class QdrantToolsStayContentAgnostic(unittest.TestCase):
     def test_descriptions_are_found(self):
         # Guards the AST lookup: a silent miss would make the next test vacuous.
         found = self._qdrant_tool_descriptions()
-        self.assertEqual(sorted(found), ["qdrant-find", "qdrant-store"])
+        self.assertEqual(sorted(found), ["cb_indexer_find_repo", "cb_indexer_store_repo"])
         for name, text in found.items():
             self.assertTrue(text.strip(), f"{name}: empty description")
 

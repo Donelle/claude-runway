@@ -2,7 +2,7 @@
 """
 MCP server exposing repo indexing as callable tools, so Claude (in Claude
 Code) can trigger re-indexing on demand -- e.g. right after cloning a repo,
-or when it notices qdrant-find is coming back empty -- instead of you
+or when it notices cb_indexer_find_repo is coming back empty -- instead of you
 running ingest_to_qdrant.py by hand every time.
 
 Project minimum: Python 3.12.
@@ -47,12 +47,12 @@ import os
 import sys
 import threading
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "libs"))
 
 from mcp.server.mcpserver import MCPServer, Context
-from qdrant_connector import QdrantConnector, Entry
+from qdrant_connector import QdrantConnector, Entry, NO_COLLECTION_ERROR, SEARCH_LIMIT, find_entries, store_entry
 from qdrant_embeddings import FastEmbedProvider
 from qdrant_client import QdrantClient, models
 
@@ -99,15 +99,15 @@ from qdrant_credentials import resolve_qdrant_credentials, same_endpoint
 from mcp_tool_introspect import tool_count
 import memory_bank_lib as mb
 
-# Must run before any FastEmbedProvider(...) construction below (index_repo,
-# sync_repo, find_in_collection each make their own) -- see the
+# Must run before any FastEmbedProvider(...) construction below (cb_indexer_index_repo,
+# cb_indexer_sync_repo, cb_indexer_find_in_collection each make their own) -- see the
 # function's own docstring for why this can't just be a .mcp.json env value.
 ensure_persistent_fastembed_cache()
 
 # MANIFEST_FILENAME is imported from qdrant_ingest_lib so
 # ingest_to_qdrant.py excludes the same file -- see its comment there.
 
-# sync_repo batches its per-file delete filter into chunks of this size
+# cb_indexer_sync_repo batches its per-file delete filter into chunks of this size
 # instead of one client.delete() call per changed/removed file:
 # a live repro against this repo's own 10,532-file monorepo
 # confirmed the real trigger wasn't an idle-connection gap at all, but this
@@ -125,7 +125,7 @@ DELETE_BATCH_SIZE = 500
 # The manifest helpers live in libs/sync_manifest_lib.py so the CLI's
 # --write-manifest uses the same code. They keep their underscore
 # names here: this module's own callers and tests refer to them (and patch them)
-# as _ims.<name>, and index_repo/sync_repo always call them through these module
+# as _ims.<name>, and cb_indexer_index_repo/cb_indexer_sync_repo always call them through these module
 # globals.
 _load_manifest = load_manifest
 _save_manifest = save_manifest
@@ -158,9 +158,9 @@ def _non_chunk_points_warning(client: QdrantClient, collection: str) -> str:
     indexer did not write and that the rebuild may delete. Returns "" when
     there are none.
 
-    sync_repo deletes a file's old points by metadata.file_path alone, excluding
-    only memory-bank and conversation-compact points. qdrant-store and
-    qdrant-find accept any content, so a project collection can hold a note with
+    cb_indexer_sync_repo deletes a file's old points by metadata.file_path alone, excluding
+    only memory-bank and conversation-compact points. cb_indexer_store_repo and
+    cb_indexer_find_repo accept any content, so a project collection can hold a note with
     a matching file_path, and it would go with the file's chunks. A warning, not
     a block: the rebuild still has to run, and most collections hold none.
 
@@ -223,9 +223,9 @@ def _delete_orphaned_chunks(
 
     A rebuild starts from an empty manifest, so a file deleted from the repo
     before it is in neither the manifest nor the scan, and its old chunks are
-    never removed by the per-file delete (the same gap index_repo documents).
+    never removed by the per-file delete (the same gap cb_indexer_index_repo documents).
     Existence is tested on disk, NOT by membership in this sync's scan, so a
-    sync_repo(scope=...), an extension filter or a gitignore difference can
+    cb_indexer_sync_repo(scope=...), an extension filter or a gitignore difference can
     never remove the chunks of a file that is still there. A file counts as
     gone only when os.lstat positively reports a missing path (_confirmed_absent):
     lstat does not follow symlinks, so a symlink whose target has disappeared is
@@ -327,7 +327,7 @@ async def _hash_files_with_progress(ctx, repo: Path, scope: str, **hash_kwargs) 
     compute_file_hashes off the event loop, reporting progress while it runs.
     Returns its (hashes, skipped).
 
-    Hashing is the first phase of sync_repo (and of index_repo when it writes
+    Hashing is the first phase of cb_indexer_sync_repo (and of cb_indexer_index_repo when it writes
     the manifest baseline) and reads every matching file in the repo; on a
     first sync that is thousands of files with nothing else to report yet, so
     without this the call looks frozen for the whole stretch -- the thing MCP
@@ -338,7 +338,7 @@ async def _hash_files_with_progress(ctx, repo: Path, scope: str, **hash_kwargs) 
     and waited for. That keeps at most one notification in flight, and a report
     that raises (the client went away) stops the scan at its next report
     instead of letting it read the rest of the repo, the same meaning a failing
-    report has in index_repo's chunk loop.
+    report has in cb_indexer_index_repo's chunk loop.
 
     Cancelling the call must free the worker too. Cancelling the await below
     does not stop its thread, and the report it is waiting on is a separate
@@ -444,9 +444,10 @@ def _chunk_lines_note(chunk_lines: int) -> str:
         f" Note: chunk_lines={chunk_lines} was ignored -- chunks are cut by the embedding model's token window, "
         f"not by line count."
     )
-
+# QDRANT_URL/QDRANT_API_KEY are also read by qdrant_mcp_server.py, but
+# COLLECTION_NAME/EMBEDDING_MODEL belong only to this server.
 # Same env var names mcpservers/qdrant_mcp_server.py reads, so a single project .mcp.json
-# config keeps this server and the qdrant-find/qdrant-store server aligned.
+# config keeps this server and the cb_indexer_find_repo/cb_indexer_store_repo server aligned.
 # Resolved through qdrant_ingest_lib.ingest_env_defaults -- the
 # same helper ingest_to_qdrant.py's argparse defaults come from, so the two
 # entry points can't drift apart on these again.
@@ -458,12 +459,12 @@ DEFAULT_EMBEDDING_MODEL = _ENV_DEFAULTS["embedding_model"]
 
 # Optional, this repo's own -- not read by the qdrant server. Declared once
 # alongside COLLECTION_NAME so a project's description doesn't require a
-# one-off set_collection_description call; applied by
+# one-off cb_indexer_set_collection_description call; applied by
 # _sync_static_collection_description() below.
 DEFAULT_COLLECTION_DESCRIPTION = os.environ.get("COLLECTION_DESCRIPTION")
 
 # Same env var name memory_bank_mcp_server.py reads -- used
-# here ONLY to refuse index_repo/sync_repo ever targeting the shared
+# here ONLY to refuse cb_indexer_index_repo/cb_indexer_sync_repo ever targeting the shared
 # memory-bank collection, not to write into it. Defaults to the same
 # "memory-bank" default so the guard still applies out of the box even on a
 # project that hasn't explicitly configured this var.
@@ -532,7 +533,7 @@ def _sync_static_collection_description(collection: Optional[str], qdrant_url: s
     metadata + the local hint cache from libs/qdrant_collection_hints.py,
     if it's configured and doesn't already match. This is what
     lets a description be declared once in .mcp.json instead of requiring
-    an explicit set_collection_description call every time a project is
+    an explicit cb_indexer_set_collection_description call every time a project is
     freshly wired up.
 
     Best-effort: catches everything, logs to stderr, never raises -- same
@@ -543,7 +544,7 @@ def _sync_static_collection_description(collection: Optional[str], qdrant_url: s
     exceptions unrelated to the local cache.
 
     Called from three places: server startup (against this project's own
-    DEFAULT_COLLECTION/DEFAULT_QDRANT_URL), and after index_repo/sync_repo
+    DEFAULT_COLLECTION/DEFAULT_QDRANT_URL), and after cb_indexer_index_repo/cb_indexer_sync_repo
     finish writing (guarded there to only fire when that call's resolved
     collection/qdrant_url actually match this project's own defaults --
     an explicit override to index a DIFFERENT collection or instance must
@@ -557,8 +558,8 @@ def _sync_static_collection_description(collection: Optional[str], qdrant_url: s
     guaranteed: store_batch itself returns immediately without creating the
     collection when entries is empty (libs/qdrant_batch_store.py's own
     `if not entries: return 0`, before ensure_collection_exists is ever
-    called) -- reachable from index_repo on an empty/no-matching-files repo,
-    or from sync_repo when only files were REMOVED (changed is empty, so
+    called) -- reachable from cb_indexer_index_repo on an empty/no-matching-files repo,
+    or from cb_indexer_sync_repo when only files were REMOVED (changed is empty, so
     _chunk_changed_files() produces no entries, but the "nothing to do"
     early-return only fires when BOTH changed and removed are empty). This
     function handles that fine either way -- collection_exists below is
@@ -570,13 +571,13 @@ def _sync_static_collection_description(collection: Optional[str], qdrant_url: s
     stale or missing cache row (e.g. from a prior cache write that was
     silently swallowed per libs/qdrant_collection_hints.py's fail-open
     design, or a description changed by some other means entirely outside
-    this tool) could keep list_collections showing an outdated hint
-    indefinitely, since list_collections trusts an existing cache row
+    this tool) could keep cb_indexer_list_collections showing an outdated hint
+    indefinitely, since cb_indexer_list_collections trusts an existing cache row
     without re-checking it against live Qdrant.
     """
     if not DEFAULT_COLLECTION_DESCRIPTION or not collection:
         return
-    # Same guard index_repo/sync_repo have: a project misconfigured with
+    # Same guard cb_indexer_index_repo/cb_indexer_sync_repo have: a project misconfigured with
     # COLLECTION_NAME == MEMORY_BANK_COLLECTION must never stamp its code-index
     # description onto the shared memory-bank collection.
     if mb.is_memory_bank_collection_name(collection, DEFAULT_MEMORY_BANK_COLLECTION):
@@ -615,8 +616,8 @@ def _recompute_search_limit(collection: Optional[str], qdrant_url: str, qdrant_a
     count and writes it through to BOTH Qdrant collection metadata
     (`search_limit`, the source of truth) and the local hint cache -- but
     each only if it actually differs. Shared by
-    index_repo and sync_repo: a fresh index is often the single biggest
-    point-count jump a collection sees (0 -> N), and sync_repo covers
+    cb_indexer_index_repo and cb_indexer_sync_repo: a fresh index is often the single biggest
+    point-count jump a collection sees (0 -> N), and cb_indexer_sync_repo covers
     incremental drift.
 
     Unlike _sync_static_collection_description, this is NOT guarded to this
@@ -627,7 +628,7 @@ def _recompute_search_limit(collection: Optional[str], qdrant_url: str, qdrant_a
     search_limit hiccup can never turn an otherwise-successful sync/index
     into a reported failure. The metadata write sends ONLY the search_limit
     key: Qdrant merges metadata patches (same contract as
-    set_collection_description), and resending a read-back snapshot would
+    cb_indexer_set_collection_description), and resending a read-back snapshot would
     risk overwriting a concurrent change to another key.
 
     The two stores are compared independently: Qdrant metadata is compared
@@ -655,7 +656,7 @@ def _recompute_search_limit(collection: Optional[str], qdrant_url: str, qdrant_a
         print(f"[claude-runway] could not recompute search_limit for '{collection}': {e}", file=sys.stderr)
 
 
-# Hardcoded last-resort search limit for find_in_collection when the caller
+# Hardcoded last-resort search limit for cb_indexer_find_in_collection when the caller
 # passes none and no per-collection value is stored anywhere.
 DEFAULT_SEARCH_LIMIT = 10
 
@@ -670,7 +671,7 @@ def _valid_search_limit(value: object) -> Optional[int]:
 
 def _resolve_search_limit(client: QdrantClient, collection: str, qdrant_url: str) -> int:
     """
-    Resolves find_in_collection's limit when the caller passed none:
+    Resolves cb_indexer_find_in_collection's limit when the caller passed none:
     local cache first, then live Qdrant collection
     metadata (`search_limit`, the source of truth written by
     _recompute_search_limit), then DEFAULT_SEARCH_LIMIT. A live hit
@@ -724,7 +725,7 @@ def _log_registered_tool_count():
         print(f"[claude-runway] could not count codebase-indexer tools: {e}", file=sys.stderr)
 
 
-@mcp.tool()
+@mcp.tool(name="cb_indexer_index_repo")
 async def index_repo(
     repo_path: str,
     collection: Optional[str] = None,
@@ -746,14 +747,14 @@ async def index_repo(
     # Confirmed still needed under Pyright (which replaced mypy):
     # removing the ignore surfaces Pyright's own equivalent
     # reportArgumentType error here, just phrased differently than mypy's.
-    # Same reasoning at sync_repo's ctx param below and throughout
+    # Same reasoning at cb_indexer_sync_repo's ctx param below and throughout
     # compress_mcp_server.py/memory_bank_mcp_server.py.
     ctx: Context = None,  # type: ignore[assignment]
 ) -> str:
     """
-    Bulk-index a repo's code and docs into a Qdrant collection so qdrant-find
+    Bulk-index a repo's code and docs into a Qdrant collection so cb_indexer_find_repo
     can retrieve them later. Use this when: a collection is missing or empty
-    and qdrant-find is returning nothing useful, a repo was just cloned and
+    and cb_indexer_find_repo is returning nothing useful, a repo was just cloned and
     hasn't been indexed yet, or the code has changed enough that the
     existing index is stale.
 
@@ -772,7 +773,7 @@ async def index_repo(
     excludes (silently ignored if there's no .gitignore).
 
     embedding_model MUST match the EMBEDDING_MODEL configured on the
-    qdrant-find/qdrant-store MCP server, or search relevance will silently
+    cb_indexer_find_repo/cb_indexer_store_repo MCP server, or search relevance will silently
     break (different models produce incompatible vector spaces).
 
     Set reset=true to delete all existing UNPROTECTED entries (everything
@@ -781,7 +782,7 @@ async def index_repo(
     "memory-bank") and conversation compacts stored
     (metadata.source == "conversation-compact") are always preserved
     regardless -- but do NOT set reset=true if the collection is shared with
-    OTHER non-code data (e.g. qdrant-store notes, or conversation-compacts
+    OTHER non-code data (e.g. cb_indexer_store_repo notes, or conversation-compacts
     stored before the source marker existed, which carry none) you don't want wiped;
     those still get deleted. Note this means reset=true no longer recreates the
     collection's underlying vector SCHEMA either (an
@@ -789,11 +790,11 @@ async def index_repo(
     memory-bank points existed at check-time, but that check-then-act was
     itself racy against a concurrent write): changing EMBEDDING_MODEL on an
     existing collection now requires manually dropping it first, outside
-    this tool, before re-running index_repo.
+    this tool, before re-running cb_indexer_index_repo.
 
     When reset=False and the collection already contains data, this tool
     returns a warning before starting the expensive embedding work
-    so you can cancel/reset/use sync_repo rather than discovering
+    so you can cancel/reset/use cb_indexer_sync_repo rather than discovering
     duplicate risk after the full embed-and-store loop has already run.
     Pass force=True to bypass this pre-flight check and add content to
     the existing index deliberately. force has no effect when reset=True.
@@ -804,18 +805,18 @@ async def index_repo(
     now, with no memory of what a previous call indexed. A deleted file's
     old chunks are never touched and remain in the collection indefinitely
     as stale, orphaned search results. Deliberately not fixed by having
-    this tool detect and delete them itself -- sync_repo already exists
-    specifically for that. But sync_repo's removal-detection only covers
+    this tool detect and delete them itself -- cb_indexer_sync_repo already exists
+    specifically for that. But cb_indexer_sync_repo's removal-detection only covers
     files recorded in its manifest -- a file
     already deleted before the manifest was first written is absent from
-    both the manifest and the current scan, so a sync_repo has nothing to
-    compare against and can't discover or delete it either. sync_repo only
+    both the manifest and the current scan, so a cb_indexer_sync_repo has nothing to
+    compare against and can't discover or delete it either. cb_indexer_sync_repo only
     prevents FUTURE orphans once a baseline exists; reset=true here is
     what's actually required to clean up chunks ALREADY orphaned by an
-    index_repo run that did not write one (see the last paragraph for when
+    cb_indexer_index_repo run that did not write one (see the last paragraph for when
     that is). If your repo's files can be deleted between runs, switch to
-    sync_repo for ongoing re-indexing -- just don't expect it to also
-    retroactively clean up whatever index_repo already orphaned.
+    cb_indexer_sync_repo for ongoing re-indexing -- just don't expect it to also
+    retroactively clean up whatever cb_indexer_index_repo already orphaned.
 
     Chunking is by the embedding model's own token window, not by line count:
     the model reads only the first N tokens of any text it
@@ -843,8 +844,8 @@ async def index_repo(
 
     When this run leaves the collection holding exactly what it indexed
     (reset=true, or a collection that was absent or empty before) it also
-    writes sync_repo's manifest (.qdrant_index_manifest.json, the same
-    versioned format, through the same writer), so the next sync_repo picks
+    writes cb_indexer_sync_repo's manifest (.qdrant_index_manifest.json, the same
+    versioned format, through the same writer), so the next cb_indexer_sync_repo picks
     up from here instead of re-chunking and re-embedding every file. Each
     file's content hash is taken BEFORE chunking (a first step that reports a
     running count of files hashed), so a file edited while the
@@ -854,7 +855,7 @@ async def index_repo(
     wipe, and the reset does not start if it cannot be removed), so a run that
     fails or is cancelled partway leaves no manifest claiming files are
     indexed. Use the same scope, include_extensions, exclude_dirs and
-    respect_gitignore for later sync_repo calls: the manifest records the
+    respect_gitignore for later cb_indexer_sync_repo calls: the manifest records the
     files this run's filters selected. A force=true run into a collection
     that already held points leaves the manifest untouched and says so: that
     run only adds chunks (duplicates, for files already indexed), so no
@@ -870,7 +871,7 @@ async def index_repo(
     lock (.qdrant_index_manifest.json.lock) from before it prepares and counts
     the collection to the end, whether or not it ends up writing the
     manifest: whether it may write one depends on that count, which no other
-    manifest user may change in between. If another index_repo, sync_repo or
+    manifest user may change in between. If another cb_indexer_index_repo, cb_indexer_sync_repo or
     CLI --write-manifest run on the same checkout holds it, this returns an
     error at once, before anything is deleted or stored; run it again once
     that one has finished. A run into any other collection never takes the
@@ -921,7 +922,7 @@ async def _index_repo(
     ctx: Context,
     manifest_lock: ManifestLock,
 ) -> str:
-    """index_repo's body (see its docstring), run with the manifest lock its
+    """cb_indexer_index_repo's body (see its docstring), run with the manifest lock its
     caller releases."""
     # Checked first, before even the filesystem -- cheapest possible input to
     # validate, and the whole point is catching this before any real
@@ -950,7 +951,7 @@ async def _index_repo(
         return (
             f"Error: '{collection}' is configured as the shared memory-bank "
             f"collection (MEMORY_BANK_COLLECTION). Refusing to index code into it "
-            f"or reset it via index_repo -- use a different COLLECTION_NAME for "
+            f"or reset it via cb_indexer_index_repo -- use a different COLLECTION_NAME for "
             f"this project's code index."
         )
     qdrant_url, qdrant_api_key = _resolve_credentials(qdrant_url, qdrant_api_key)
@@ -972,16 +973,16 @@ async def _index_repo(
 
     # The sync manifest is ONE file in the repo root: it records hashes and
     # nothing about which collection or Qdrant instance they were indexed into.
-    # So index_repo only ever touches it for this project's own collection (the
+    # So cb_indexer_index_repo only ever touches it for this project's own collection (the
     # same test the collection description uses further down); indexing the
     # checkout into some other collection must not replace the baseline of the
-    # one sync_repo keeps up to date from the same checkout.
+    # one cb_indexer_sync_repo keeps up to date from the same checkout.
     owns_manifest = _is_own_collection(collection, qdrant_url)
     if owns_manifest:
         # Taken BEFORE the collection is prepared and counted, not when the
         # manifest is first touched: whether this run may write a baseline
         # rests on the collection being absent or empty (points_before below),
-        # and a sync_repo finishing in between could fill it and save its own
+        # and a cb_indexer_sync_repo finishing in between could fill it and save its own
         # manifest, after which this run would append duplicates and record a
         # baseline that did not describe them. Holding the lock from here
         # means no other manifest user can change the collection between the
@@ -1003,7 +1004,7 @@ async def _index_repo(
     def _duplicate_risk_warning(existing_count: int) -> Optional[str]:
         # Checked BEFORE the expensive embedding work -- surface
         # the duplicate-risk warning up front so the user can cancel/reset/
-        # use sync_repo instead of discovering it after the full
+        # use cb_indexer_sync_repo instead of discovering it after the full
         # embed-and-store loop has already run.
         points_before["count"] = existing_count
         if existing_count == 0 and owns_manifest:
@@ -1019,13 +1020,13 @@ async def _index_repo(
             return None
         return (
             f"Warning: collection '{collection}' already contains "
-            f"{existing_count} points. Re-running index_repo without "
+            f"{existing_count} points. Re-running cb_indexer_index_repo without "
             f"reset=True may add duplicate chunks on top of those. "
-            f"Options: (1) use sync_repo instead for an incremental update "
+            f"Options: (1) use cb_indexer_sync_repo instead for an incremental update "
             f"that avoids duplicates (preferred for most cases), "
             f"(2) re-run with reset=True to wipe unprotected collection "
             f"data and re-index cleanly (caution: wipes any other non-code "
-            f"data stored there, e.g. qdrant-store notes or conversation-"
+            f"data stored there, e.g. cb_indexer_store_repo notes or conversation-"
             f"compacts stored before the source marker existed -- memory-bank points and "
             f"newer conversation compacts are always preserved), "
             f"or (3) re-run with force=True to add content "
@@ -1141,7 +1142,7 @@ async def _index_repo(
     if writes_baseline:
         # BEFORE any file is chunked, never after (see _index_baseline): a file
         # edited between the two must end up with a hash older than its chunks,
-        # so the next sync re-indexes it. Same scan parameters as sync_repo's
+        # so the next sync re-indexes it. Same scan parameters as cb_indexer_sync_repo's
         # own hashing, and off the event loop for the same reason (a large
         # repo is thousands of files read one by one).
         current_hashes, _hash_skipped = await _hash_files_with_progress(
@@ -1323,7 +1324,7 @@ async def _index_repo(
     total = chunk_count
 
     # The sync baseline: written through _save_manifest, the one
-    # writer sync_repo uses, so it is always the current versioned format. After
+    # writer cb_indexer_sync_repo uses, so it is always the current versioned format. After
     # the last chunk is stored (a run that failed earlier writes nothing, and
     # a reset run has already removed the old one) and before the fail-open
     # steps below, so nothing there can come between the index and its baseline.
@@ -1343,14 +1344,14 @@ async def _index_repo(
         baseline = _index_baseline(current_hashes, skipped, file_chunk_counts, missed)
         try:
             _save_manifest(repo, baseline)
-            manifest_note = f" Wrote the sync manifest ({len(baseline)} file(s)) so sync_repo can pick up from here."
+            manifest_note = f" Wrote the sync manifest ({len(baseline)} file(s)) so cb_indexer_sync_repo can pick up from here."
         except OSError as e:
             # The chunks are already stored and searchable, so a manifest that
             # cannot be written (read-only checkout) is reported, not raised:
             # raising would hide the summary of an index that succeeded. The
-            # next sync_repo finds no manifest and rebuilds, as before.
+            # next cb_indexer_sync_repo finds no manifest and rebuilds, as before.
             manifest_note = (
-                f" Warning: could not write the sync manifest ({e}); the next sync_repo will rebuild the index."
+                f" Warning: could not write the sync manifest ({e}); the next cb_indexer_sync_repo will rebuild the index."
             )
 
     # Only for THIS project's own default collection/instance -- an
@@ -1376,7 +1377,7 @@ async def _index_repo(
     )
 
 
-@mcp.tool()
+@mcp.tool(name="cb_indexer_sync_repo")
 async def sync_repo(
     repo_path: str,
     collection: Optional[str] = None,
@@ -1389,7 +1390,7 @@ async def sync_repo(
     respect_gitignore: bool = True,
     chunk_lines: int = 50,
     overlap: int = 10,
-    ctx: Context = None,  # type: ignore[assignment]  # see index_repo's ctx comment above
+    ctx: Context = None,  # type: ignore[assignment]  # see cb_indexer_index_repo's ctx comment above
 ) -> str:
     """
     Incrementally update a Qdrant collection to match the repo's current
@@ -1397,7 +1398,7 @@ async def sync_repo(
     entries for files that were removed, and skips unchanged files entirely.
 
     include_extensions/exclude_dirs/respect_gitignore work the same as in
-    index_repo and default to the same INDEX_INCLUDE_EXTENSIONS/
+    cb_indexer_index_repo and default to the same INDEX_INCLUDE_EXTENSIONS/
     INDEX_EXCLUDE_DIRS env vars. IMPORTANT: keep these consistent between
     calls for the same repo -- changing them changes which files "exist" as
     far as the manifest is concerned, which can make previously-indexed
@@ -1405,13 +1406,13 @@ async def sync_repo(
 
     Use this for routine re-indexing (e.g. after editing a handful of files,
     or as a habit at the start of a session) -- it's far cheaper than
-    index_repo since it doesn't touch or re-embed anything unchanged. Use
-    index_repo with reset=true instead when: this is the first time indexing
+    cb_indexer_index_repo since it doesn't touch or re-embed anything unchanged. Use
+    cb_indexer_index_repo with reset=true instead when: this is the first time indexing
     this repo, overlap changed and everything needs re-chunking
     consistently, or the index and manifest seem to have drifted (e.g. after
     manually editing points in Qdrant). If EMBEDDING_MODEL changed, reset=true
     can no longer rebuild the schema for you -- manually drop the
-    collection first, outside this tool, then run index_repo fresh.
+    collection first, outside this tool, then run cb_indexer_index_repo fresh.
 
     Tracks a small manifest file (.qdrant_index_manifest.json) in the repo
     root to know what's already indexed -- safe to gitignore, don't hand-edit it.
@@ -1429,7 +1430,7 @@ async def sync_repo(
     inside the scope. A file whose existence cannot be checked is left alone.
 
     Chunking is by the embedding model's own token window, not by line count,
-    exactly as described under index_repo: `overlap` is in tokens and
+    exactly as described under cb_indexer_index_repo: `overlap` is in tokens and
     `chunk_lines` is accepted but ignored. Every changed file is indexed with
     no per-file cap; progress names each file as it is chunked and the result
     names the files that produced the most chunks. Fails before chunking or
@@ -1450,7 +1451,7 @@ async def sync_repo(
     to gitignore too) from reading the manifest to saving it, so two
     overlapping syncs on one checkout -- two sessions each syncing at start,
     say -- cannot leave a manifest that disagrees with the collection. If
-    another sync_repo, an index_repo into this project's own collection or a
+    another cb_indexer_sync_repo, an cb_indexer_index_repo into this project's own collection or a
     CLI --write-manifest run on the same checkout holds it, this returns an
     error at once, before
     anything is read, deleted or stored; run it again once that one has
@@ -1495,9 +1496,9 @@ async def _sync_repo(
     ctx: Context,
     manifest_lock: ManifestLock,
 ) -> str:
-    """sync_repo's body (see its docstring), run with the manifest lock its
+    """cb_indexer_sync_repo's body (see its docstring), run with the manifest lock its
     caller releases."""
-    # See index_repo's identical check above.
+    # See cb_indexer_index_repo's identical check above.
     chunk_err = validate_token_overlap(overlap)
     if chunk_err:
         return f"Error: {chunk_err}"
@@ -1512,7 +1513,7 @@ async def _sync_repo(
             "Error: no collection specified and no COLLECTION_NAME env var "
             "configured for this project's .mcp.json."
         )
-    # Same reserved-collection-name refusal as index_repo -- see
+    # Same reserved-collection-name refusal as cb_indexer_index_repo -- see
     # its comment above for why.
     if mb.is_memory_bank_collection_name(collection, DEFAULT_MEMORY_BANK_COLLECTION):
         return (
@@ -1550,7 +1551,7 @@ async def _sync_repo(
         include_extensions=resolved_include_extensions,
         extra_exclude_dirs=resolved_exclude_dirs,
         respect_gitignore=respect_gitignore,
-        # Same as index_repo -- the manifest must never hash itself into the
+        # Same as cb_indexer_index_repo -- the manifest must never hash itself into the
         # change-detection baseline.
         extra_exclude_files={MANIFEST_FILENAME},
     )
@@ -1590,7 +1591,7 @@ async def _sync_repo(
         would produce chunks is either (a) present in the Qdrant collection
         or (b) proven to be (re)indexed during THIS sync". Returns
         (error_or_None, collection_present). Run at EVERY collection-existence
-        check in sync_repo (the early one and the one before the delete/store
+        check in cb_indexer_sync_repo (the early one and the one before the delete/store
         phase), and the caller must use the returned collection_present
         rather than asking Qdrant again, so there is no gap between check and
         use.
@@ -1616,7 +1617,7 @@ async def _sync_repo(
         the manifest is checked, failing closed
         on any unknown state: a missing collection, an empty one (no point
         with metadata.type in {code, doc} -- preserved memory-bank /
-        qdrant-store points, which can also carry metadata.file_path,
+        cb_indexer_store_repo points, which can also carry metadata.file_path,
         must not mask that), a not-found raised mid-check by a
         concurrent drop, or a manifest file that is unreadable (hash-skipped
         or fails to chunk). The only files ignored are ones proven to be
@@ -1674,7 +1675,7 @@ async def _sync_repo(
             return (
                 f"Error: the sync manifest says {len(manifest)} files are already indexed, but collection "
                 f"'{collection}' {state} in Qdrant, so an incremental sync would silently leave those files "
-                f"unindexed. Run index_repo(reset=True) to rebuild it from scratch (which also rewrites the manifest).",
+                f"unindexed. Run cb_indexer_index_repo(reset=True) to rebuild it from scratch (which also rewrites the manifest).",
                 collection_present,
             )
         return None, collection_present
@@ -1799,7 +1800,7 @@ async def _sync_repo(
 
     # embedding_provider was constructed before chunking (see above), so the
     # schema check below can validate BEFORE the delete loop runs --
-    # same reasoning as index_repo's own pre-delete check, and the exact
+    # same reasoning as cb_indexer_index_repo's own pre-delete check, and the exact
     # same "validate/chunk before deleting" principle the review
     # already established for this function's chunk-before-delete ordering.
 
@@ -1830,7 +1831,7 @@ async def _sync_repo(
         # (deleted, never replaced), unlike every other skip path in this
         # function, which deliberately preserves existing embeddings on
         # failure. fail_closed=True (not the default fail-open) for the same
-        # reason as index_repo's own pre-delete check: this is about to run a
+        # reason as cb_indexer_index_repo's own pre-delete check: this is about to run a
         # destructive delete, so an inconclusive result must block it, not
         # silently permit it.
         mismatch = check_embedding_model_mismatch(client, collection, embedding_provider, fail_closed=True)
@@ -1928,7 +1929,7 @@ async def _sync_repo(
         rebuild_notes += _preserved_gone_note(preserved_gone)
 
     # Only for THIS project's own default collection/instance -- see the
-    # matching guard in index_repo above for why.
+    # matching guard in cb_indexer_index_repo above for why.
     if _is_own_collection(collection, qdrant_url):
         _sync_static_collection_description(collection, qdrant_url, qdrant_api_key)
 
@@ -1974,7 +1975,7 @@ async def _sync_repo(
     )
 
 
-@mcp.tool()
+@mcp.tool(name="cb_indexer_preview_index")
 def preview_index(
     repo_path: str,
     scope: str = "both",
@@ -1988,7 +1989,7 @@ def preview_index(
 ) -> str:
     """
     Preview how a repo would be chunked WITHOUT writing anything to Qdrant.
-    Use this before index_repo on a repo you haven't indexed before, to
+    Use this before cb_indexer_index_repo on a repo you haven't indexed before, to
     sanity-check chunk boundaries and metadata (especially file_path,
     line_number and char_range) -- and to sanity-check
     include_extensions/exclude_dirs are actually filtering the way you expect
@@ -1998,10 +1999,10 @@ def preview_index(
     loads the embedding model (embedding_model, default this project's
     EMBEDDING_MODEL) to read that window, and fails with an explicit error if
     it cannot. overlap is in tokens; chunk_lines is accepted but ignored (see
-    index_repo). The result names the files that produced the most chunks, to
+    cb_indexer_index_repo). The result names the files that produced the most chunks, to
     show how large a minified or generated file would become before indexing it.
     """
-    # See index_repo's identical check above.
+    # See cb_indexer_index_repo's identical check above.
     chunk_err = validate_token_overlap(overlap)
     if chunk_err:
         return f"Error: {chunk_err}"
@@ -2023,7 +2024,7 @@ def preview_index(
         include_extensions=parse_csv_set(include_extensions) or DEFAULT_INCLUDE_EXTENSIONS,
         extra_exclude_dirs=parse_csv_set(exclude_dirs) or DEFAULT_EXTRA_EXCLUDE_DIRS,
         respect_gitignore=respect_gitignore,
-        # Same as index_repo -- the manifest must never appear in preview
+        # Same as cb_indexer_index_repo -- the manifest must never appear in preview
         # results.
         extra_exclude_files={MANIFEST_FILENAME},
     )
@@ -2041,7 +2042,7 @@ def preview_index(
     return "\n".join(lines) + _chunk_lines_note(chunk_lines) + _skipped_summary(skipped)
 
 
-@mcp.tool()
+@mcp.tool(name="cb_indexer_get_collection_info")
 def get_collection_info(
     collection: Optional[str] = None,
     qdrant_url: Optional[str] = None,
@@ -2049,8 +2050,8 @@ def get_collection_info(
 ) -> str:
     """
     Check whether a Qdrant collection exists and how many points it holds.
-    Use this to confirm a previous index_repo call actually wrote data, or
-    to check whether a collection is empty before relying on qdrant-find
+    Use this to confirm a previous cb_indexer_index_repo call actually wrote data, or
+    to check whether a collection is empty before relying on cb_indexer_find_repo
     against it.
 
     collection/qdrant_url default to this project's COLLECTION_NAME/QDRANT_URL
@@ -2072,7 +2073,7 @@ def get_collection_info(
     return f"Collection '{collection}': {info.points_count} points, status={info.status}."
 
 
-@mcp.tool()
+@mcp.tool(name="cb_indexer_find_in_collection")
 async def find_in_collection(
     query: str,
     collection: str,
@@ -2085,14 +2086,14 @@ async def find_in_collection(
     Semantically search a DIFFERENT project's Qdrant collection than this
     project's own -- e.g. from a frontend repo, search an already-indexed
     backend repo's collection to understand how an API it calls is
-    implemented on the other side. Use this instead of qdrant-find whenever
+    implemented on the other side. Use this instead of cb_indexer_find_repo whenever
     the question requires another repo's codebase, not this one's.
 
-    Unlike qdrant-find (which is locked to this project's own collection),
+    Unlike cb_indexer_find_repo (which is locked to this project's own collection),
     collection is REQUIRED here. If the user names an exact collection
     directly in their prompt, pass it through as given -- don't guess or
     substitute a different name. If you don't know the other repo's exact
-    collection name, call list_collections first rather than guessing.
+    collection name, call cb_indexer_list_collections first rather than guessing.
 
     qdrant_url/qdrant_api_key default to this project's QDRANT_URL/
     QDRANT_API_KEY env vars -- only pass these explicitly if the other
@@ -2108,7 +2109,7 @@ async def find_in_collection(
 
     limit is how many results to return. Leave it unset to use the
     collection's own stored search_limit (scaled to its size by
-    index_repo/sync_repo), falling back to 10 if none is stored;
+    cb_indexer_index_repo/cb_indexer_sync_repo), falling back to 10 if none is stored;
     an explicit limit always wins outright.
 
     Each hit's metadata locates the chunk with file_path, line_number and
@@ -2117,7 +2118,7 @@ async def find_in_collection(
     -- such a collection can miss code a re-indexed one finds.
     """
     if not collection:
-        return "Error: collection is required -- call list_collections to see what's available."
+        return "Error: collection is required -- call cb_indexer_list_collections to see what's available."
     if limit is not None and limit < 1:
         return f"Error: limit must be 1 or greater (got {limit})."
 
@@ -2130,7 +2131,7 @@ async def find_in_collection(
     if not call_with_retry(client.collection_exists, collection):
         return (
             f"Error: collection '{collection}' does not exist at {qdrant_url}. "
-            "Call list_collections to see what's available."
+            "Call cb_indexer_list_collections to see what's available."
         )
 
     # conversation-compact collections hold saved session summaries
@@ -2175,7 +2176,7 @@ async def find_in_collection(
     return "\n".join(lines)
 
 
-@mcp.tool()
+@mcp.tool(name="cb_indexer_set_collection_description")
 def set_collection_description(
     collection: str,
     description: str,
@@ -2184,13 +2185,13 @@ def set_collection_description(
 ) -> str:
     """
     Set or update a short, one-line description hint for a collection, so a
-    future list_collections call can surface it and let a model pick the
-    right collection for find_in_collection on its own -- instead of the
+    future cb_indexer_list_collections call can surface it and let a model pick the
+    right collection for cb_indexer_find_in_collection on its own -- instead of the
     user always having to name it explicitly. Works on ANY
     already-indexed collection, including this project's own -- other
     sessions benefit from this project's collection having a hint too.
 
-    collection is REQUIRED and must already exist (call list_collections
+    collection is REQUIRED and must already exist (call cb_indexer_list_collections
     first if unsure of the exact name). description should be a short
     sentence describing what the collection actually contains -- this is
     what gets shown to a model deciding which collection to search, not
@@ -2200,7 +2201,7 @@ def set_collection_description(
     metadata field), which Qdrant itself merges rather than replaces --
     confirmed directly against a live instance -- so this never clobbers
     any other metadata a collection might carry. Also written straight into
-    the local hint cache so the very next list_collections call (in this
+    the local hint cache so the very next cb_indexer_list_collections call (in this
     session or any other) sees the new value with no stale window.
 
     qdrant_url/qdrant_api_key default to this project's QDRANT_URL/
@@ -2210,7 +2211,7 @@ def set_collection_description(
     qdrant_api_key if it requires one.
     """
     if not collection:
-        return "Error: collection is required -- call list_collections to see what's available."
+        return "Error: collection is required -- call cb_indexer_list_collections to see what's available."
     qdrant_url, qdrant_api_key = _resolve_credentials(qdrant_url, qdrant_api_key)
 
     client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
@@ -2219,7 +2220,7 @@ def set_collection_description(
     if not call_with_retry(client.collection_exists, collection):
         return (
             f"Error: collection '{collection}' does not exist at {qdrant_url}. "
-            "Call list_collections to see what's available."
+            "Call cb_indexer_list_collections to see what's available."
         )
 
     call_with_retry(client.update_collection, collection_name=collection, metadata={"description": description})
@@ -2227,7 +2228,7 @@ def set_collection_description(
     return f"Description set for collection '{collection}'."
 
 
-@mcp.tool()
+@mcp.tool(name="cb_indexer_list_collections")
 def list_collections(
     include_counts: bool = True,
     include_descriptions: bool = True,
@@ -2237,7 +2238,7 @@ def list_collections(
     """
     List every collection on the connected Qdrant instance -- use this to
     discover another repo's exact collection name before calling
-    find_in_collection, or to sanity-check this project's own collection
+    cb_indexer_find_in_collection, or to sanity-check this project's own collection
     exists.
 
     include_counts (default true) additionally shows each collection's
@@ -2247,8 +2248,8 @@ def list_collections(
     listed.
 
     include_descriptions (default true) surfaces each collection's stored
-    hint (set via set_collection_description), so you can often pick the
-    right collection for find_in_collection from this listing alone instead
+    hint (set via cb_indexer_set_collection_description), so you can often pick the
+    right collection for cb_indexer_find_in_collection from this listing alone instead
     of asking the user to name it. A REAL hint is cached locally after the
     first fetch (persists across sessions/restarts) -- when include_counts
     is also true, a cache miss reuses that SAME per-collection request
@@ -2307,7 +2308,7 @@ def list_collections(
             # call's display but deliberately not written to the cache --
             # keeps the cache limited to collections someone actually
             # described (not a growing pile of "nothing here" rows), and
-            # means a description added outside set_collection_description
+            # means a description added outside cb_indexer_set_collection_description
             # (e.g. directly via the Qdrant API/UI) is picked up on the very
             # next call instead of staying invisible until this tool is
             # called explicitly. Costs an extra per-call fetch only when
@@ -2327,9 +2328,68 @@ def list_collections(
     return "\n".join(lines)
 
 
+# The connector (and with it the embedding model) is built on the first
+# cb_indexer_find_repo/cb_indexer_store_repo call, not at import: loading the
+# ONNX model takes seconds and, on a cold cache, a download, and none of that
+# should delay this server answering `initialize`.
+_find_store_connector: Optional[QdrantConnector] = None
+
+
+def _get_find_store_connector() -> QdrantConnector:
+    global _find_store_connector
+    if _find_store_connector is None:
+        _find_store_connector = QdrantConnector(
+            DEFAULT_QDRANT_URL,
+            DEFAULT_QDRANT_API_KEY,
+            DEFAULT_COLLECTION,
+            FastEmbedProvider(DEFAULT_EMBEDDING_MODEL),
+        )
+    return _find_store_connector
+
+
+@mcp.tool(name="cb_indexer_find_repo")
+async def cb_indexer_find_repo(query: str, limit: int = SEARCH_LIMIT) -> list[str]:
+    """
+    Semantic search over everything in THIS project's collection (indexed code
+    and docs, plus any text stored with cb_indexer_store_repo). Use this
+    BEFORE grepping or reading files for conceptual questions like 'where is X
+    handled' or 'how does Y work'. Do NOT use for exact string, symbol, or
+    error-message matches -- use Grep for those. Returns matching entries as
+    text, including any metadata (e.g. file_path, line_number, char_range)
+    attached to them -- use line_number to read only the relevant lines
+    instead of the whole file (points indexed before token-window chunking
+    carry line_range, "start-end", instead). Input: query (a natural-language
+    question, not a code snippet), limit (how many hits to return, default 10;
+    raise it when the thing you want is not in the first 10, which repetitive
+    content can cause). Hits with line_range come from an index that predates
+    token-window chunking, where a miss is not proof the code is absent.
+    """
+    # Check the collection BEFORE building the connector: building it loads (and on
+    # a cold cache downloads) the embedding model, which a misconfigured server
+    # must not do just to say COLLECTION_NAME is unset.
+    if not DEFAULT_COLLECTION:
+        return [NO_COLLECTION_ERROR]
+    return await find_entries(_get_find_store_connector(), DEFAULT_COLLECTION, query, limit)
+
+
+@mcp.tool(name="cb_indexer_store_repo")
+async def cb_indexer_store_repo(information: str, metadata: Optional[dict[str, Any]] = None) -> str:
+    """
+    Store a piece of text, with optional metadata, in this project's
+    collection so cb_indexer_find_repo can return it by meaning. Keep it short; do not
+    store raw file dumps or speculative, in-progress reasoning. Metadata is optional: add file_path and line_number
+    when the text is about a file, source or url when it comes from somewhere
+    else, or nothing. Input: information (the text to store), metadata
+    (optional JSON).
+    """
+    if not DEFAULT_COLLECTION:  # same order as cb_indexer_find_repo: no model load for an unset collection
+        return NO_COLLECTION_ERROR
+    return await store_entry(_get_find_store_connector(), DEFAULT_COLLECTION, information, metadata)
+
+
 if __name__ == "__main__":
     # Covers the common case: the collection already exists from a
-    # previous index. index_repo/sync_repo's own call sites (above) cover
+    # previous index. cb_indexer_index_repo/cb_indexer_sync_repo's own call sites (above) cover
     # a brand-new collection that doesn't exist yet at this point.
     _sync_static_collection_description(DEFAULT_COLLECTION, DEFAULT_QDRANT_URL, DEFAULT_QDRANT_API_KEY)
     _log_registered_tool_count()

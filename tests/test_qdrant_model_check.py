@@ -125,11 +125,11 @@ class CheckEmbeddingModelMismatchTest(unittest.TestCase):
         result = _qmc.check_embedding_model_mismatch(client, "col", provider)
         self.assertIsNotNone(result)
         self.assertIn("unnamed", result)
-        # index_repo(reset=true) no longer
+        # cb_indexer_index_repo(reset=true) no longer
         # recreates an existing collection's schema at all -- must recommend
         # dropping/recreating the collection directly, not reset=true.
         self.assertIn("Drop this collection", result)
-        self.assertNotIn("Re-index it using index_repo(reset=true)", result)
+        self.assertNotIn("Re-index it using cb_indexer_index_repo(reset=true)", result)
 
     def test_single_vector_wrong_size_also_returns_error_about_unnamed_format(self):
         # Dimension mismatch within an unnamed-vector collection is secondary:
@@ -171,7 +171,7 @@ class CheckEmbeddingModelMismatchTest(unittest.TestCase):
         result = _qmc.check_embedding_model_mismatch(client, "col", provider)
         self.assertIsNone(result)
 
-    # --- fail_closed=True: the destructive-delete callers (index_repo/CLI reset and sync_repo pre-delete checks) that must NOT fail open ---
+    # --- fail_closed=True: the destructive-delete callers (cb_indexer_index_repo/CLI reset and cb_indexer_sync_repo pre-delete checks) that must NOT fail open ---
 
     def test_fail_closed_returns_error_on_exception_instead_of_none(self):
         # Regression for a review finding (fourth pass): a destructive-delete
@@ -208,7 +208,7 @@ class CheckEmbeddingModelMismatchTest(unittest.TestCase):
 
     def test_default_still_fails_open_on_exception(self):
         # Explicit regression pin: fail_closed defaults to False, so every
-        # EXISTING caller (find_in_collection, memory_bank_lib.py) is
+        # EXISTING caller (cb_indexer_find_in_collection, memory_bank_lib.py) is
         # unaffected by this change.
         provider = _make_provider("fast-all-minilm-l6-v2", 384)
         client = MagicMock()

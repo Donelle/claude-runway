@@ -1,6 +1,6 @@
 """
-Async Qdrant connector used by `index_repo`/`sync_repo`/`find_in_collection`
-and `tools/ingest_to_qdrant.py`.
+Async Qdrant connector used by the `codebase-indexer` server's
+`cb_indexer_*` tools and `tools/ingest_to_qdrant.py`.
 
 This is the repo's own `QdrantConnector`/`Entry`, written to replace the ones
 the third-party Qdrant MCP server package provided and this repo used to
@@ -21,6 +21,7 @@ ensure-collection) are public here. `libs/qdrant_batch_store.py` builds its
 batched writes on them.
 """
 
+import json
 import uuid
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -178,3 +179,59 @@ class QdrantConnector:
                 f"schema: expected vector '{vector_name}' of size {vector_size}, found {present}. "
                 f"Every writer to one collection must use the same EMBEDDING_MODEL."
             )
+
+
+# --- find/store, served as cb_indexer_find_repo / cb_indexer_store_repo ---------
+#
+# These were the bodies of the `qdrant` server's `qdrant-find`/`qdrant-store`
+# tools; they live here so the `codebase-indexer` server (which owns the same
+# collection) can serve them without importing the `qdrant` server. Nothing
+# here imports MCP, and nothing reads the environment: the caller passes the
+# collection in. Their return values are byte-for-byte what those tools
+# returned, because a prompt or caller may already parse them.
+
+# How many hits a find returns when the caller passes no limit. The package
+# this replaced defaulted to 10 and took no limit at all; the tool takes an
+# optional one because repetitive content (generated clients, JSON fixtures,
+# lock files) can fill a fixed top 10 with near-duplicates and push the chunk
+# that was asked for past it.
+SEARCH_LIMIT = 10
+
+NO_COLLECTION_ERROR = (
+    "Error: COLLECTION_NAME is not set in this server's env block (.mcp.json), so there is no "
+    "project collection to use. Run `claude-runway-setup init` or set it by hand."
+)
+
+
+def format_entry(entry: Entry) -> str:
+    """One search hit, in the shape the package this repo replaced returned,
+    so a caller or prompt that learned to read it keeps working."""
+    entry_metadata = json.dumps(entry.metadata) if entry.metadata else ""
+    return f"<entry><content>{entry.content}</content><metadata>{entry_metadata}</metadata></entry>"
+
+
+async def find_entries(
+    connector: QdrantConnector, collection_name: Optional[str], query: str, limit: int = SEARCH_LIMIT
+) -> list[str]:
+    """Semantic search over `collection_name`, formatted for a tool reply."""
+    if not collection_name:
+        return [NO_COLLECTION_ERROR]
+    if limit < 1:
+        return [f"Error: limit must be 1 or greater (got {limit})."]
+    entries = await connector.search(query, collection_name=collection_name, limit=limit)
+    if not entries:
+        return [f"No information found for the query '{query}'"]
+    return [f"Results for the query '{query}'"] + [format_entry(e) for e in entries]
+
+
+async def store_entry(
+    connector: QdrantConnector,
+    collection_name: Optional[str],
+    information: str,
+    metadata: Optional[dict[str, Any]] = None,
+) -> str:
+    """Embeds and stores one note in `collection_name`, returning the reply text."""
+    if not collection_name:
+        return NO_COLLECTION_ERROR
+    await connector.store(Entry(content=information, metadata=metadata), collection_name=collection_name)
+    return f"Remembered: {information} in collection {collection_name}"

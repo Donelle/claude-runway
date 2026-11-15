@@ -862,12 +862,12 @@ class AutoworkAgentTypeTests(unittest.TestCase):
 
     def test_allow_list_covers_the_basics_the_procedure_uses(self):
         # Bash (git/gh/uv/tests), Read/Edit/Write (files and plans), ToolSearch (the only way
-        # to load deferred MCP tools), and sync_repo (Step 1).
-        for tool in ("Bash", "Read", "Edit", "Write", "ToolSearch", "mcp__codebase-indexer__sync_repo"):
+        # to load deferred MCP tools), and cb_indexer_sync_repo (Step 1).
+        for tool in ("Bash", "Read", "Edit", "Write", "ToolSearch", "mcp__codebase-indexer__cb_indexer_sync_repo"):
             self.assertIn(tool, self.tools)
 
     def test_every_mcp_tool_the_template_names_is_allowed(self):
-        self.assertIn("sync_repo", self.template)
+        self.assertIn("cb_indexer_sync_repo", self.template)
         for name in set(re.findall(r"mcp__[A-Za-z0-9_-]+__[A-Za-z0-9_-]+", self.template)):
             self.assertIn(name, self.tools)
 

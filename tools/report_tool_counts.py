@@ -46,7 +46,7 @@ needs only `mcp`, and `codebase_reviewer_mcp_server` needs `mcp` and `openai`; i
 and `fastembed`. All are already required for the CI job's
 `pip install -r requirements.txt` step to succeed at all, so no extra
 dependency is introduced here. Importing `qdrant_mcp_server` loads no
-embedding model (it is built on the first `qdrant-find`/`qdrant-store`
+embedding model (it is built on the first `cb_indexer_find_repo`/`cb_indexer_store_repo`
 call), so this stays network-free.
 """
 

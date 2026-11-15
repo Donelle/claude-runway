@@ -1,8 +1,8 @@
 """
 The sync manifest's read, write, discard and baseline logic, shared by
-mcpservers/codebase_indexer_mcp_server.py (sync_repo and index_repo) and tools/ingest_to_qdrant.py
+mcpservers/codebase_indexer_mcp_server.py (cb_indexer_sync_repo and cb_indexer_index_repo) and tools/ingest_to_qdrant.py
 (the CLI's opt-in --write-manifest), so the two cannot drift apart on a file
-whose format every project's next sync_repo depends on.
+whose format every project's next cb_indexer_sync_repo depends on.
 
 Moved here from the server module, which imports MCP and therefore cannot be
 imported by the CLI. The manifest format and
@@ -26,8 +26,8 @@ once. Two separate guards cover that:
   saves, and B saves last. The collection then holds the old chunks while the
   manifest records the new hash, and every later sync skips the file as
   unchanged. Every run that reads or may replace the manifest holds the lock
-  from before its first decision that depends on it (sync_repo: reading the
-  manifest; index_repo and the CLI: counting the collection, since a baseline
+  from before its first decision that depends on it (cb_indexer_sync_repo: reading the
+  manifest; cb_indexer_index_repo and the CLI: counting the collection, since a baseline
   is only written into one that was absent or empty) to its final save, and a
   second run is refused at once with a clear message instead of queueing
   behind a long embed.
@@ -81,7 +81,7 @@ def load_manifest(repo: Path, preserved_out: Optional[set] = None) -> dict:
     qdrant_ingest_lib.MANIFEST_FORMAT_VERSION). A manifest in the old flat
     {file: hash} shape is ignored on purpose: it records file content but not
     how files were chunked, so trusting it after the chunker changed would make
-    sync_repo report "No changes" and keep serving the old chunks indefinitely.
+    cb_indexer_sync_repo report "No changes" and keep serving the old chunks indefinitely.
     """
     manifest_path = repo / MANIFEST_FILENAME
     if manifest_path.exists():
@@ -108,7 +108,7 @@ def load_manifest(repo: Path, preserved_out: Optional[set] = None) -> dict:
 def save_manifest(repo: Path, manifest: dict, preserved=()) -> None:
     """
     Write the versioned manifest: the {file: hash} map plus, when there are any,
-    the preserved-but-untracked paths. index_repo's baseline (and
+    the preserved-but-untracked paths. cb_indexer_index_repo's baseline (and
     the CLI's) passes none: a run that starts from a clean slate has nothing
     preserved.
 
@@ -203,7 +203,7 @@ else:
 
     def _try_lock(fd: int) -> None:
         # flock locks belong to the open file description, so a second open()
-        # of the same file in the SAME process is refused too: two sync_repo
+        # of the same file in the SAME process is refused too: two cb_indexer_sync_repo
         # calls in one MCP server are serialized like two servers are. The
         # kernel drops the lock when the process dies, so a crashed run never
         # leaves the checkout locked.
@@ -356,12 +356,12 @@ def _open_lock_file(path: Path) -> int:
 
 def discard_manifest(repo: Path) -> None:
     """
-    Remove the repo's sync manifest, if any. index_repo (and the
+    Remove the repo's sync manifest, if any. cb_indexer_index_repo (and the
     CLI with --write-manifest) calls it before it stores anything into a
     collection it will write a baseline for (and, on reset, before the wipe):
     from the moment the collection changes the old manifest no longer describes
     it, and if the run then fails or is cancelled halfway, nothing would replace
-    it, so the next sync_repo would trust it and report "No changes" over a
+    it, so the next cb_indexer_sync_repo would trust it and report "No changes" over a
     partly filled collection. With no manifest that sync is a rebuild instead.
 
     Raises OSError when an existing manifest cannot be removed. That is NOT
@@ -378,7 +378,7 @@ def invalidation_error(
 ) -> Optional[str]:
     """
     Remove the old manifest and return None, or return the error message to
-    abort a run with when it cannot be removed. The one wording index_repo and
+    abort a run with when it cannot be removed. The one wording cb_indexer_index_repo and
     the CLI both stop on, in the shape prepare_collection_for_index's
     before_reset_delete hook expects. `discard` is injectable so each caller
     passes its own module-level name, which is the patch point its tests use.
@@ -399,7 +399,7 @@ def invalidation_error(
         return (
             f"Error: could not remove the old sync manifest {MANIFEST_FILENAME} ({e}). Nothing was deleted or "
             f"indexed: a manifest left behind would claim files are indexed that this run is about to replace, "
-            f"and sync_repo would trust it if the run failed partway."
+            f"and cb_indexer_sync_repo would trust it if the run failed partway."
         )
     return None
 
@@ -445,7 +445,7 @@ def unindexed_hashed_files(
 def index_baseline(current_hashes: dict, chunk_skipped: list, chunked_files, missed=()) -> dict:
     """
     The {file: hash} manifest a full index records when it finishes, in the
-    same shape sync_repo's own manifest has so the next sync_repo diffs
+    same shape cb_indexer_sync_repo's own manifest has so the next cb_indexer_sync_repo diffs
     against it.
 
     `current_hashes` must have been taken BEFORE the files were chunked: a file

@@ -2,7 +2,7 @@
 """
 Bulk-index a repo's code and docs into the same Qdrant collection your
 `qdrant` MCP server reads from, using the *same* embedding
-provider the server uses (so vectors are compatible with qdrant-find).
+provider the server uses (so vectors are compatible with cb_indexer_find_repo).
 
 Usage:
     pip install qdrant-client fastembed pydantic_settings
@@ -21,7 +21,7 @@ QDRANT_API_KEY is used only when --qdrant-url is QDRANT_URL (or the built-in
 default); any other --qdrant-url needs its own --qdrant-api-key.
 
 --collection is refused on every run if it is the shared memory-bank
-collection, as index_repo/sync_repo refuse it. That name comes from
+collection, as cb_indexer_index_repo/cb_indexer_sync_repo refuse it. That name comes from
 --memory-bank-collection, else $MEMORY_BANK_COLLECTION, else
 MEMORY_BANK_COLLECTION in --repo-path's .mcp.json (where setup writes it, the
 codebase-indexer block first), else "memory-bank".
@@ -35,20 +35,20 @@ thousands of chunks: the run prints each file's chunk count as it goes and names
 the largest files at the end. Even --dry-run loads the embedding model, to read
 that window.
 
---write-manifest additionally leaves sync_repo's manifest
-(.qdrant_index_manifest.json, in --repo-path) behind, so the first sync_repo
+--write-manifest additionally leaves cb_indexer_sync_repo's manifest
+(.qdrant_index_manifest.json, in --repo-path) behind, so the first cb_indexer_sync_repo
 after this index re-embeds only what changed instead of every file a second
 time. It is an explicit opt-in because the manifest is one file per checkout and
 does not record which collection it describes: pass it only when --collection
-(on --qdrant-url) is the collection sync_repo uses for this checkout, i.e. the
+(on --qdrant-url) is the collection cb_indexer_sync_repo uses for this checkout, i.e. the
 `codebase-indexer` block's COLLECTION_NAME on its QDRANT_URL in .mcp.json. It
 writes only when this run leaves the collection holding exactly what it indexed
 (--reset, or a collection that was absent or empty), never on --dry-run or after
 a failed run. Without the flag the CLI writes no manifest, and the next
-sync_repo re-chunks and re-embeds every file. With the flag, a real run holds
+cb_indexer_sync_repo re-chunks and re-embeds every file. With the flag, a real run holds
 the checkout's manifest lock (.qdrant_index_manifest.json.lock) from before it
 counts the collection to the end, and stops with an error, before deleting or
-storing anything, if a sync_repo or index_repo on the same checkout holds it.
+storing anything, if a cb_indexer_sync_repo or cb_indexer_index_repo on the same checkout holds it.
 
 Run this once to seed the collection, then re-run periodically (or on a
 schedule) to pick up changes. Re-running without --reset will add duplicate
@@ -135,14 +135,14 @@ async def ingest(args):
 
 async def _ingest(args, manifest_lock: ManifestLock):
     # --reset used to be a raw delete_collection with none of the protections
-    # index_repo(reset=True) has.
-    # Layer 1 (name refusal), ported from index_repo: the shared memory-bank
+    # cb_indexer_index_repo(reset=True) has.
+    # Layer 1 (name refusal), ported from cb_indexer_index_repo: the shared memory-bank
     # collection is reserved for every project's durable memories, so no code
     # index goes there. It is not the only protection -- --reset's filtered
     # delete keeps memory-bank points, and recall only matches points with
     # the memory-bank source marker -- but it stops the mistake at the name
     # instead of relying on those. Refused on EVERY run, as
-    # index_repo/sync_repo refuse it regardless of reset/force; this used
+    # cb_indexer_index_repo/cb_indexer_sync_repo refuse it regardless of reset/force; this used
     # to guard --reset only. Checked BEFORE the dry-run guard and before any
     # Qdrant client exists, so it needs no network and a refused command
     # fails fast even when combined with --dry-run.
@@ -150,7 +150,7 @@ async def _ingest(args, manifest_lock: ManifestLock):
     # The name is resolved per run, not at import: the MCP
     # server reads MEMORY_BANK_COLLECTION from its .mcp.json env block, but
     # this CLI runs from a shell that normally doesn't export it, so reading
-    # only the shell left a custom name unprotected here while index_repo
+    # only the shell left a custom name unprotected here while cb_indexer_index_repo
     # refused it. resolve_memory_bank_collection also reads --repo-path's
     # .mcp.json, after the flag and the shell variable.
     memory_bank = resolve_memory_bank_collection(args.memory_bank_collection, args.repo_path)
@@ -184,7 +184,7 @@ async def _ingest(args, manifest_lock: ManifestLock):
     if write_manifest:
         # Taken BEFORE the collection is prepared and counted: whether this run
         # may write a baseline rests on the collection being absent or empty
-        # (points_before below), and a sync_repo finishing in between could
+        # (points_before below), and a cb_indexer_sync_repo finishing in between could
         # fill it and save its own manifest, after which this run would append
         # duplicates and record a baseline that did not describe them. Held
         # from here, no other manifest user can change the collection between
@@ -233,7 +233,7 @@ async def _ingest(args, manifest_lock: ManifestLock):
 
     if not args.dry_run:
         client = QdrantClient(url=args.qdrant_url, api_key=args.qdrant_api_key)
-        # The same preparation index_repo runs (libs/
+        # The same preparation cb_indexer_index_repo runs (libs/
         # qdrant_index_prep.py) -- --reset's pre-delete model check (Layer 3,
         # fail_closed) and always-filtered delete (Layer 2), or
         # the file_path index backfill -- with EVERY Qdrant call
@@ -345,9 +345,9 @@ async def _ingest(args, manifest_lock: ManifestLock):
         include_extensions=include_extensions,
         extra_exclude_dirs=extra_exclude_dirs,
         respect_gitignore=not args.no_gitignore,
-        # sync_repo's manifest is a .json file at the repo root,
+        # cb_indexer_sync_repo's manifest is a .json file at the repo root,
         # so without this the CLI embeds it whenever a repo previously
-        # maintained by sync_repo doesn't gitignore it -- the exact bug
+        # maintained by cb_indexer_sync_repo doesn't gitignore it -- the exact bug
         # fixed for the server's three build_entries/compute_file_hashes
         # call sites.
         extra_exclude_files={MANIFEST_FILENAME},
@@ -418,12 +418,12 @@ async def _ingest(args, manifest_lock: ManifestLock):
     baseline = index_baseline(current_hashes, skipped, chunked_files, missed)
     try:
         save_manifest(repo_path, baseline)
-        print(f"Wrote the sync manifest ({len(baseline)} file(s)) so sync_repo can pick up from here.")
+        print(f"Wrote the sync manifest ({len(baseline)} file(s)) so cb_indexer_sync_repo can pick up from here.")
     except OSError as e:
         # The chunks are already stored and searchable, so a manifest that
         # cannot be written (read-only checkout) is reported, not raised. The
-        # next sync_repo finds no manifest and rebuilds, as without the flag.
-        print(f"Warning: could not write the sync manifest ({e}); the next sync_repo will rebuild the index.")
+        # next cb_indexer_sync_repo finds no manifest and rebuilds, as without the flag.
+        print(f"Warning: could not write the sync manifest ({e}); the next cb_indexer_sync_repo will rebuild the index.")
 
 
 def parse_args():
@@ -472,19 +472,19 @@ def parse_args():
                          "Must be smaller than the model's usable window")
     p.add_argument("--dry-run", action="store_true", help="Preview chunks without writing to Qdrant")
     p.add_argument("--write-manifest", action="store_true",
-                    help="Also write sync_repo's manifest (.qdrant_index_manifest.json in --repo-path), so the first "
-                         "sync_repo after this index re-embeds only what changed instead of every file. Pass it only "
-                         "when --collection (on --qdrant-url) is the collection sync_repo uses for this checkout "
+                    help="Also write cb_indexer_sync_repo's manifest (.qdrant_index_manifest.json in --repo-path), so the first "
+                         "cb_indexer_sync_repo after this index re-embeds only what changed instead of every file. Pass it only "
+                         "when --collection (on --qdrant-url) is the collection cb_indexer_sync_repo uses for this checkout "
                          "(the codebase-indexer block's COLLECTION_NAME on its QDRANT_URL in .mcp.json): the manifest "
                          "is one file per checkout and does not say which collection it describes. Written only with "
                          "--reset or into a collection that was absent or empty; never on --dry-run or after a failed "
                          "run. The old manifest is removed before anything is deleted or stored. Into a populated "
                          "collection without --reset, the manifest is left alone and a message says why. A run with "
                          "this flag holds the checkout's manifest lock (.qdrant_index_manifest.json.lock) for the "
-                         "whole run and stops with an error, before deleting or storing anything, if a sync_repo or "
-                         "index_repo on the same checkout already holds it")
+                         "whole run and stops with an error, before deleting or storing anything, if a cb_indexer_sync_repo or "
+                         "cb_indexer_index_repo on the same checkout already holds it")
     p.add_argument("--reset", action="store_true", help="Delete the collection's existing points before indexing (avoids duplicate chunks on re-runs). "
-                         "Like index_repo(reset=True), this is a filtered delete that keeps the "
+                         "Like cb_indexer_index_repo(reset=True), this is a filtered delete that keeps the "
                          "collection itself, any memory-bank points and marked conversation compacts, "
                          "and aborts before deleting on an embedding-model "
                          "mismatch -- so it can no longer rebuild a collection's vector schema after an "
@@ -492,7 +492,7 @@ def parse_args():
                          "collection is refused outright, with or without --reset (see --memory-bank-collection)")
     p.add_argument("--memory-bank-collection", default=None,
                     help="Name of the shared memory-bank collection, which this CLI refuses to index into on any run, "
-                         "as index_repo/sync_repo do. Default: $MEMORY_BANK_COLLECTION if set, else "
+                         "as cb_indexer_index_repo/cb_indexer_sync_repo do. Default: $MEMORY_BANK_COLLECTION if set, else "
                          "MEMORY_BANK_COLLECTION from --repo-path's .mcp.json (the codebase-indexer block, then the "
                          "memory-bank block), else 'memory-bank'")
     args = p.parse_args()

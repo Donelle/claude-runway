@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for index_repo's pre-flight duplicate-point warning.
+"""Tests for cb_indexer_index_repo's pre-flight duplicate-point warning.
 
 Stdlib-only (unittest, no pytest) and no network -- all QdrantClient,
 FastEmbedProvider, store_batch, and iter_entries calls are mocked so these
@@ -49,7 +49,7 @@ def _run(coro):
 class IndexRepoPreflightWarningTest(unittest.TestCase):
     """
     Pre-flight check: when reset=False, force=False, and the target collection
-    already contains points, index_repo must return a warning string before
+    already contains points, cb_indexer_index_repo must return a warning string before
     starting the expensive embedding loop.
     """
 
@@ -68,7 +68,7 @@ class IndexRepoPreflightWarningTest(unittest.TestCase):
 
         # iter_entries is the CPU-bound scan -- also must not run on early return.
         # Returns an empty generator (no chunks, no skipped files) to keep tests
-        # fast and network-free. index_repo scans via iter_entries().
+        # fast and network-free. cb_indexer_index_repo scans via iter_entries().
         self._iter_entries_patcher = patch.object(_ims, "iter_entries", return_value=iter([]))
         self.mock_iter_entries = self._iter_entries_patcher.start()
 
@@ -83,7 +83,7 @@ class IndexRepoPreflightWarningTest(unittest.TestCase):
         self._index_patcher = patch.object(_ims, "ensure_file_path_index")
         self.mock_ensure_index = self._index_patcher.start()
 
-        # These tests index REPO_ROOT, the real checkout: index_repo writes (and
+        # These tests index REPO_ROOT, the real checkout: cb_indexer_index_repo writes (and
         # on reset removes) the repo's sync manifest, which must not touch it.
         for name in ("_save_manifest", "_discard_manifest"):
             patcher = patch.object(_ims, name)
@@ -144,7 +144,7 @@ class IndexRepoPreflightWarningTest(unittest.TestCase):
 
     def test_warning_uses_may_not_will_for_duplicate_risk(self):
         """Warning must say 'may' (not 'will') add duplicates -- existing points may not
-        be from a prior index_repo run at all (they could be conversation-memory data)."""
+        be from a prior cb_indexer_index_repo run at all (they could be conversation-memory data)."""
         client = self._make_client(exists=True, points_count=1)
         with self._patch_client(client):
             result = _run(_ims.index_repo(
@@ -157,7 +157,7 @@ class IndexRepoPreflightWarningTest(unittest.TestCase):
         self.assertNotIn("will add", result)
 
     def test_warning_mentions_sync_repo_alternative(self):
-        """Warning must mention sync_repo as the preferred duplicate-safe alternative."""
+        """Warning must mention cb_indexer_sync_repo as the preferred duplicate-safe alternative."""
         client = self._make_client(exists=True, points_count=1)
         with self._patch_client(client):
             result = _run(_ims.index_repo(
@@ -166,7 +166,7 @@ class IndexRepoPreflightWarningTest(unittest.TestCase):
                 reset=False,
                 force=False,
             ))
-        self.assertIn("sync_repo", result)
+        self.assertIn("cb_indexer_sync_repo", result)
 
     def test_warning_mentions_force_option(self):
         """Warning must tell the user force=True bypasses the check."""

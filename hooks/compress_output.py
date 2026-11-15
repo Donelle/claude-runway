@@ -344,7 +344,7 @@ MCP_SAVINGS_TOOL_PREFIX = "mcp__local-compress__"
 # real usage, which sets preserve_identifiers=preserve_sections=True).
 _SELF_COMPRESSING_MCP_TOOLS = {"compress_file", "compress_command_output", "fetch_url", "compress_text"}
 # The qdrant server's tools. Only the three compact tools are ever compressed
-# here: `qdrant-find` and `qdrant-store` are deliberately left alone (their
+# here: `cb_indexer_find_repo` and `cb_indexer_store_repo` are deliberately left alone (their
 # results are code locations and stored notes Claude acts on directly, and the
 # matcher does not list them), so any other tool under this prefix exits
 # untouched.
@@ -1222,7 +1222,7 @@ def _dispatch(payload):
     # local-compress). They never compress anything themselves and carry no
     # savings envelope, so they take the same size-based path as any other
     # matched tool, with the two exemptions below. Every OTHER tool on this
-    # server (`qdrant-find`, `qdrant-store`) is never compressed, and the
+    # server (`cb_indexer_find_repo`, `cb_indexer_store_repo`) is never compressed, and the
     # matcher does not list them; this check keeps that true even if a
     # hand-edited matcher were widened to `mcp__qdrant__.*`.
     # (compact_prune, an exact list of ids, is the same verbatim-report class

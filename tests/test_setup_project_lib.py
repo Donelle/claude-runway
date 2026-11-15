@@ -639,7 +639,7 @@ class RunSetupEndToEnd(unittest.TestCase):
         # e.g. "memory-bank" with both COLLECTION_NAME and
         # MEMORY_BANK_COLLECTION left at their defaults resolves them to the
         # SAME string, which makes codebase_indexer_mcp_server.py's reserved-name guard
-        # refuse every index_repo/sync_repo call for this project.
+        # refuse every cb_indexer_index_repo/cb_indexer_sync_repo call for this project.
         result = run_setup(
             self.target_repo, REPO_ROOT, home_dir=Path("/home/user"), collection_name="memory-bank"
         )

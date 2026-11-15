@@ -60,7 +60,7 @@ class TranscriptFixture(unittest.TestCase):
 
 class ServerOfTests(unittest.TestCase):
     def test_extracts_the_server_between_the_mcp_prefix_and_the_tool(self):
-        self.assertEqual(T.server_of("mcp__codebase-indexer__sync_repo"), "codebase-indexer")
+        self.assertEqual(T.server_of("mcp__codebase-indexer__cb_indexer_sync_repo"), "codebase-indexer")
         self.assertEqual(T.server_of("mcp__claude_ai_Claude_Docs__read"), "claude_ai_Claude_Docs")
 
     def test_non_mcp_and_malformed_names_have_no_server(self):
@@ -133,7 +133,7 @@ class StartOfSessionTests(TranscriptFixture):
 class SummarizeTests(TranscriptFixture):
     def test_counts_toolkit_tools_among_the_deferred_names(self):
         p = self.write([
-            _delta(added=["WebFetch", "mcp__qdrant__qdrant-find", "mcp__memory-bank__recall", "mcp__github__x"]),
+            _delta(added=["WebFetch", "mcp__qdrant__compact_find", "mcp__memory-bank__recall", "mcp__github__x"]),
             _assistant(inp=1, read=100),
         ])
         s = T.summarize(p)
@@ -153,8 +153,8 @@ class SummarizeTests(TranscriptFixture):
 
     def test_a_deferred_toolkit_tool_that_was_called_is_not_flagged(self):
         p = self.write([
-            _delta(added=["mcp__qdrant__qdrant-find"]),
-            _assistant(content=_tool_use("mcp__qdrant__qdrant-find")),
+            _delta(added=["mcp__qdrant__compact_find"]),
+            _assistant(content=_tool_use("mcp__qdrant__compact_find")),
         ])
         self.assertEqual(T.summarize(p)["toolkit_used_not_deferred"], [])
 
@@ -165,27 +165,27 @@ class SummarizeTests(TranscriptFixture):
 class LoadedSchemaTests(TranscriptFixture):
     def test_sizes_only_toolkit_tools_and_keeps_the_first_record_per_tool(self):
         p = self.write([
-            _record({"mcp__qdrant__qdrant-find": "x" * 100, "mcp__github__list_issues": "y" * 100}),
-            _record({"mcp__qdrant__qdrant-find": "z" * 5000}),
+            _record({"mcp__qdrant__compact_find": "x" * 100, "mcp__github__list_issues": "y" * 100}),
+            _record({"mcp__qdrant__compact_find": "z" * 5000}),
         ])
         sizes = T.loaded_schema_chars(p)
-        self.assertEqual(set(sizes), {"mcp__qdrant__qdrant-find"})
-        self.assertGreater(sizes["mcp__qdrant__qdrant-find"], 100)
-        self.assertLess(sizes["mcp__qdrant__qdrant-find"], 1000)
+        self.assertEqual(set(sizes), {"mcp__qdrant__compact_find"})
+        self.assertGreater(sizes["mcp__qdrant__compact_find"], 100)
+        self.assertLess(sizes["mcp__qdrant__compact_find"], 1000)
 
     def test_a_malformed_entries_container_is_skipped_not_raised(self):
         # Valid JSON whose `entries` is not a list must not abort a survey.
-        for bad in ("oops", 7, {"name": "mcp__qdrant__qdrant-find"}, True):
+        for bad in ("oops", 7, {"name": "mcp__qdrant__compact_find"}, True):
             p = self.write([{"type": "attachment", "attachment": {"type": "deferred_tools_record", "entries": bad}},
-                            _record({"mcp__qdrant__qdrant-find": "d"})])
-            self.assertEqual(set(T.loaded_schema_chars(p)), {"mcp__qdrant__qdrant-find"}, bad)
+                            _record({"mcp__qdrant__compact_find": "d"})])
+            self.assertEqual(set(T.loaded_schema_chars(p)), {"mcp__qdrant__compact_find"}, bad)
 
     def test_a_session_that_loaded_nothing_has_no_sizes(self):
         self.assertEqual(T.loaded_schema_chars(self.write([_assistant()])), {})
 
 
 class OptionalServerTests(TranscriptFixture):
-    CORE = ["mcp__qdrant__qdrant-find", "mcp__codebase-indexer__sync_repo",
+    CORE = ["mcp__qdrant__compact_find", "mcp__codebase-indexer__cb_indexer_sync_repo",
             "mcp__memory-bank__recall", "mcp__local-compress__compress_file"]
 
     def test_constants_keep_core_four_and_list_analytics_as_optional(self):
@@ -222,8 +222,8 @@ class OptionalServerTests(TranscriptFixture):
 
 class CompareTests(TranscriptFixture):
     def test_difference_is_with_minus_without_per_model(self):
-        w1 = self.write([_delta(added=["mcp__qdrant__qdrant-find"]), _assistant(model="m1", read=1000)])
-        w2 = self.write([_delta(added=["mcp__qdrant__qdrant-find"]), _assistant(model="m1", read=1200)])
+        w1 = self.write([_delta(added=["mcp__qdrant__compact_find"]), _assistant(model="m1", read=1000)])
+        w2 = self.write([_delta(added=["mcp__qdrant__compact_find"]), _assistant(model="m1", read=1200)])
         wo = self.write([_delta(added=["WebFetch"]), _assistant(model="m1", read=1050)])
         res = T.compare([w1, w2], [wo])["models"]["m1"]
         # Each session's total is its 2 input tokens plus the cache read.
@@ -254,7 +254,7 @@ class CliTests(TranscriptFixture):
         return code, buf.getvalue()
 
     def test_with_without_reports_the_difference_and_the_caveat(self):
-        w = self.write([_delta(added=["mcp__qdrant__qdrant-find"]), _assistant(read=2000)])
+        w = self.write([_delta(added=["mcp__qdrant__compact_find"]), _assistant(read=2000)])
         wo = self.write([_delta(added=["WebFetch"]), _assistant(read=1500)])
         code, out = self._run(["--with", str(w), "--without", str(wo)])
         self.assertEqual(code, 0)
@@ -264,7 +264,7 @@ class CliTests(TranscriptFixture):
     def test_a_without_transcript_that_lists_toolkit_tools_is_rejected_with_no_number(self):
         # The controlled figure must not be printed from a session
         # whose own transcript shows the toolkit was connected.
-        w = self.write([_delta(added=["mcp__qdrant__qdrant-find"]), _assistant(read=2000)])
+        w = self.write([_delta(added=["mcp__qdrant__compact_find"]), _assistant(read=2000)])
         bad = self.write([_delta(added=["mcp__memory-bank__recall"]), _assistant(read=1500)])
         buf = io.StringIO()
         with redirect_stdout(buf), redirect_stderr(io.StringIO()) as err:
@@ -276,7 +276,7 @@ class CliTests(TranscriptFixture):
     def test_a_without_transcript_that_called_a_toolkit_tool_is_rejected_too(self):
         # a call proves the toolkit was connected, even with no
         # first-turn deferred listing (up front, or connected later: neither is "removed").
-        w = self.write([_delta(added=["mcp__qdrant__qdrant-find"]), _assistant(read=2000)])
+        w = self.write([_delta(added=["mcp__qdrant__compact_find"]), _assistant(read=2000)])
         bad = self.write([_delta(added=["WebFetch"]),
                           _assistant(read=1500, content=_tool_use("mcp__memory-bank__recall"))])
         buf = io.StringIO()
@@ -296,7 +296,7 @@ class CliTests(TranscriptFixture):
         proj = self.dir / "proj"
         proj.mkdir()
         (proj / "a.jsonl").write_text("\n".join(json.dumps(e) for e in [
-            _delta(added=["mcp__qdrant__qdrant-find", "WebFetch"]), _record({"mcp__qdrant__qdrant-find": "d"}),
+            _delta(added=["mcp__qdrant__compact_find", "WebFetch"]), _record({"mcp__qdrant__compact_find": "d"}),
             _assistant(read=3000)]), encoding="utf-8")
         (proj / "b.jsonl").write_text("\n".join(json.dumps(e) for e in [
             _delta(added=["WebFetch"]), _assistant(read=2000)]), encoding="utf-8")
@@ -335,7 +335,7 @@ class CliTests(TranscriptFixture):
         proj = self.dir / "proj"
         proj.mkdir()
         (proj / "late.jsonl").write_text("\n".join(json.dumps(e) for e in [
-            _delta(added=["WebFetch"]), _assistant(read=500, content=_tool_use("mcp__qdrant__qdrant-find"))]),
+            _delta(added=["WebFetch"]), _assistant(read=500, content=_tool_use("mcp__qdrant__compact_find"))]),
             encoding="utf-8")
         _, out = self._run(["--survey", str(self.dir)])
         self.assertRegex(out, r"unclassified \(called a toolkit tool, none listed\)\s*: 1 session")
@@ -349,8 +349,8 @@ class CliTests(TranscriptFixture):
         proj = self.dir / "proj"
         proj.mkdir()
         (proj / "late.jsonl").write_text("\n".join(json.dumps(e) for e in [
-            _delta(added=["WebFetch"]), _record({"mcp__qdrant__qdrant-find": "d"}),
-            _assistant(read=500, content=_tool_use("mcp__qdrant__qdrant-find"))]), encoding="utf-8")
+            _delta(added=["WebFetch"]), _record({"mcp__qdrant__compact_find": "d"}),
+            _assistant(read=500, content=_tool_use("mcp__qdrant__compact_find"))]), encoding="utf-8")
         _, out = self._run(["--survey", str(self.dir)])
         self.assertRegex(out, r"unclassified \(called a toolkit tool, none listed\)\s*: 1 session")
         self.assertIn("1 of 1 session(s) that parsed recorded", out)

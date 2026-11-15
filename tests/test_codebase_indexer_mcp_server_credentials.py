@@ -46,7 +46,7 @@ class IngestToolCredentialsTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
 
     def _tools(self):
-        # (name, factory taking the credential kwargs). index_repo/sync_repo
+        # (name, factory taking the credential kwargs). cb_indexer_index_repo/cb_indexer_sync_repo
         # need a real directory; the others need only a collection name.
         repo = self.tmp.name
         return [

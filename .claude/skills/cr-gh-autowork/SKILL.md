@@ -29,7 +29,7 @@ Project-scoped to this repo (hardcodes `Donelle/claude-runway`, `.venv`-based te
 
 ## Steps (orchestrator — runs in the main conversation, kept deliberately thin)
 
-0. **Dogfood preflight — STOP before doing anything else if this checkout isn't configured for it.** `.claude/skills/` is committed to this repo, so this skill ships to every clone — but it grants full autonomous commit/push/merge authority with zero human approval gate, which should only run somewhere deliberately, verifiably set up for it, never assumed just because the skill file is present. This check has TWO parts, and the first one is not optional even though it seems obvious: **claude-runway is itself a toolkit meant to be installed into OTHER repos** ("one copy serves all projects," per its own README) — any OTHER project that installed it would have a `.mcp.json` with the exact same `qdrant`/`codebase-indexer` server names and a `.claude/settings.json` with the exact same `PostToolUse` hook shape, since those come from THIS project's own `templates/`. A file-shape check alone can't tell "a genuine claude-runway dogfood checkout" apart from "some unrelated repo that happens to have installed claude-runway's tools" — or a fork. Confirming the repo identity FIRST, before spawning anything, is what actually gates this — checking it only inside the subagent (too late: it would have already read files and run `sync_repo` against whatever repo it's actually in by the time it notices) doesn't count:
+0. **Dogfood preflight — STOP before doing anything else if this checkout isn't configured for it.** `.claude/skills/` is committed to this repo, so this skill ships to every clone — but it grants full autonomous commit/push/merge authority with zero human approval gate, which should only run somewhere deliberately, verifiably set up for it, never assumed just because the skill file is present. This check has TWO parts, and the first one is not optional even though it seems obvious: **claude-runway is itself a toolkit meant to be installed into OTHER repos** ("one copy serves all projects," per its own README) — any OTHER project that installed it would have a `.mcp.json` with the exact same `qdrant`/`codebase-indexer` server names and a `.claude/settings.json` with the exact same `PostToolUse` hook shape, since those come from THIS project's own `templates/`. A file-shape check alone can't tell "a genuine claude-runway dogfood checkout" apart from "some unrelated repo that happens to have installed claude-runway's tools" — or a fork. Confirming the repo identity FIRST, before spawning anything, is what actually gates this — checking it only inside the subagent (too late: it would have already read files and run `cb_indexer_sync_repo` against whatever repo it's actually in by the time it notices) doesn't count:
    ```bash
    ORIGIN=$(git remote get-url origin 2>/dev/null)
    case "$ORIGIN" in
@@ -217,7 +217,7 @@ If the follow-up reports `MERGED` and the user's authorization covered keeping t
 
 ## The `autowork-ticket` agent type
 
-Every subagent this skill starts uses the agent definition in `.claude/agents/autowork-ticket.md`. Its `tools` allow-list holds only what the template below uses: `Bash`, `Read`, `Edit`, `Write` (the procedure's commands, files and plans), `Glob` and `Grep` (cheap and harmless), `ToolSearch` (the only way to load deferred tools such as MCP tools), and the MCP tools the template or the project's CLAUDE.md names (`sync_repo` in Step 1, plus the other index, search, compression and recall tools). It omits the Agent tool and the Artifact tools, which cost a `general-purpose` subagent about 13,300 to 15,300 tokens of tool definitions at request 0 and about 19,000 tokens per request from request 1 on (the agent list joins at request 1). If an edit to the template starts using a tool, add it to that file's allow-list in the same commit; `tests/test_cr_gh_autowork_skill.py` fails when a tool the template names is missing from it.
+Every subagent this skill starts uses the agent definition in `.claude/agents/autowork-ticket.md`. Its `tools` allow-list holds only what the template below uses: `Bash`, `Read`, `Edit`, `Write` (the procedure's commands, files and plans), `Glob` and `Grep` (cheap and harmless), `ToolSearch` (the only way to load deferred tools such as MCP tools), and the MCP tools the template or the project's CLAUDE.md names (`cb_indexer_sync_repo` in Step 1, plus the other index, search, compression and recall tools). It omits the Agent tool and the Artifact tools, which cost a `general-purpose` subagent about 13,300 to 15,300 tokens of tool definitions at request 0 and about 19,000 tokens per request from request 1 on (the agent list joins at request 1). If an edit to the template starts using a tool, add it to that file's allow-list in the same commit; `tests/test_cr_gh_autowork_skill.py` fails when a tool the template names is missing from it.
 
 **Fallback.** Claude Code finds agent definitions when a session starts, so a session begun before that file existed (or before an upgrade copied it in) does not know the type, and the `Agent` call fails with an unknown-agent-type error before any work starts. In that case, and only that case, repeat the same call with `subagent_type: "general-purpose"` for this run and tell the user the allow-list was not applied; restarting the session fixes it. Never fall back on any other error.
 
@@ -269,7 +269,7 @@ call out separately).
 **Do NOT skip any numbered step below because the change looks small, and do not skip a
 step because it is "just a git command."** Confirmed live across the 2026-10-05/06 run
 (five tickets): one subagent skipped Step 1's full README read and its
-`sync_repo` call ("the change was small and self-contained"), and another skipped Step 29's
+`cb_indexer_sync_repo` call ("the change was small and self-contained"), and another skipped Step 29's
 final `git fetch origin main && git log origin/main -1` confirmation because it was a git
 command. Both steps exist for reasons stated where they appear (a stale index, an
 unconfirmed merge); a small diff doesn't make either reason go away. If the sandbox refuses
@@ -346,7 +346,7 @@ under `~/.claude/skills/`, not guaranteed to exist on whichever machine is runni
    confirmed necessary live: a freshly created worktree's initial files reflect whatever
    commit the orchestrator's OWN primary checkout happened to be on at the moment this
    worktree was created, not necessarily current `main` (e.g. if the orchestrator is
-   itself mid-edit on some other branch). Without this, the `sync_repo` call in the next
+   itself mid-edit on some other branch). Without this, the `cb_indexer_sync_repo` call in the next
    item could index stale or wrong-branch content while believing it reflects current
    `main`. This does NOT hit the "main already checked out elsewhere" conflict Step 2
    describes below — it resets whatever branch this worktree already has checked out to
@@ -363,10 +363,10 @@ under `~/.claude/skills/`, not guaranteed to exist on whichever machine is runni
    reading all of it.
 3. Note the top-level solution structure (`libs/`, `tools/`, `hooks/`, `tests/`, `skills/`,
    `templates/`) and this repo's entry points if the ticket's Location field touches them.
-4. Call the `codebase-indexer` MCP server's `sync_repo` tool once, now, so the Qdrant index
+4. Call the `codebase-indexer` MCP server's `cb_indexer_sync_repo` tool once, now, so the Qdrant index
    reflects the current `main` before you investigate anything (normally cheap — it only
    re-embeds changed files, using a manifest file to know what's already indexed):
-   `sync_repo(repo_path="<absolute path to YOUR OWN current working directory — run pwd to
+   `cb_indexer_sync_repo(repo_path="<absolute path to YOUR OWN current working directory — run pwd to
    get it, since you're in your own isolated git worktree, not the primary checkout>")`.
    Note: since your worktree is fresh, the gitignored sync manifest won't be present here
    even though it exists in the primary checkout, so this one call may re-embed more than
