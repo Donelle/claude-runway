@@ -1740,7 +1740,15 @@ def plan_skill_renames(tools_repo_dir: Path, skills_dir: Path) -> list:
         source = skills_root / new_name / "SKILL.md"
         old_dir = skills_dir / old_name
         old_file = old_dir / "SKILL.md"
-        if old_dir.is_symlink() or not old_dir.is_dir() or not old_file.is_file() or not source.is_file():
+        # A symlinked SKILL.md inside a real old directory is skipped too: is_file() follows the
+        # link, and its target's front matter would otherwise be copied into the new skill.
+        if (
+            old_dir.is_symlink()
+            or not old_dir.is_dir()
+            or old_file.is_symlink()
+            or not old_file.is_file()
+            or not source.is_file()
+        ):
             continue
         new_dir = skills_dir / new_name
         new_dest = new_dir / "SKILL.md"

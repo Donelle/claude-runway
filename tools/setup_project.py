@@ -956,6 +956,9 @@ def migrate_renamed_skills(
         if plan.old_dir.is_symlink() or not plan.old_dir.is_dir():
             print("      Not removed: it is no longer a plain directory.")
             continue
+        if (plan.old_dir / "SKILL.md").is_symlink():
+            print("      Not removed: the old SKILL.md is now a symlink.")
+            continue
         shutil.rmtree(plan.old_dir)
         print("      Renamed.")
         migrated.append(plan.old_name)

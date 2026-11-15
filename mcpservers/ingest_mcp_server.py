@@ -2284,8 +2284,9 @@ def list_collections(
     for name in names:
         # "Own" means this project's collection on this project's own Qdrant
         # instance: the same name on an explicit qdrant_url override pointing at a
-        # different instance is someone else's collection.
-        is_own = name == DEFAULT_COLLECTION and qdrant_url == DEFAULT_QDRANT_URL
+        # different instance is someone else's collection. The URL is compared the
+        # way the key rule compares it, so a trailing slash does not drop the label.
+        is_own = _is_own_collection(name, qdrant_url)
         marker = " (this project's own)" if is_own else ""
         needs_description_fetch = include_descriptions and name not in descriptions
         # Every collection's metadata is read so conversation-

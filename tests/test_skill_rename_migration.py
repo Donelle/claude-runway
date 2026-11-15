@@ -214,6 +214,21 @@ class Migration(SkillRenameBase):
         self.assertTrue((real / "SKILL.md").is_file())
         self.assertFalse((self.skills / "cr-compact").exists())
 
+    def test_symlinked_old_skill_file_is_never_followed_or_removed(self):
+        outside = self.skills.parent / "outside.md"
+        outside.write_text("---\nname: secret\napi_key: LEAKED\n---\nbody\n")
+        (self.skills / "my-compact").mkdir(parents=True)
+        try:
+            os.symlink(outside, self.skills / "my-compact" / "SKILL.md")
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks unavailable")
+        self.assertEqual(plan_skill_renames(self.tools, self.skills), [])
+        done, _ = self._migrate()
+        self.assertEqual(done, [])
+        self.assertTrue((self.skills / "my-compact" / "SKILL.md").is_symlink())
+        self.assertTrue(outside.is_file())
+        self.assertFalse((self.skills / "cr-compact").exists())
+
 
 class InertWithoutShippedNewNames(SkillRenameBase):
     SHIPPED = ()

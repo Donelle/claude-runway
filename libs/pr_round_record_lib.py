@@ -68,7 +68,11 @@ IDEMPOTENT
   A PR's rounds can span sessions: each session contributes the rounds and calls its own
   transcript holds. A review that two sessions both fetched is therefore two `pr_round` rows
   (each with its own session's tokens and its own call time), joined by `review_id` and
-  `copilot_review_number`; it is never one row with the other session's spend dropped.
+  `copilot_review_number`. A Copilot round's key holds no session id, on purpose (see
+  docs/metrics.md): a resumed session whose transcript copies another's history must not count
+  that round twice. The cost is that two sessions whose marker calls for the same review carry
+  the same call-time text (to the millisecond) are one row, and the second session's spend for
+  it is not recorded.
 
 FAILS OPEN
   `record_pr_rounds` never raises and always returns a summary dict. A `gh` call that fails

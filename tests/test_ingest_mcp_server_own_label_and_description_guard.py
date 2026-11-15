@@ -47,6 +47,9 @@ class OwnLabelRequiresSameInstance(unittest.TestCase):
     def test_same_name_on_a_different_instance_is_not_own(self):
         self.assertNotIn("(this project's own)", self._list(OTHER_URL))
 
+    def test_trailing_slash_on_the_same_instance_is_still_own(self):
+        self.assertIn("(this project's own)", self._list(OWN_URL + "/"))
+
 
 class DescriptionSyncSkipsMemoryBank(unittest.TestCase):
     def _sync(self, collection, memory_bank):
