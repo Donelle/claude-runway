@@ -1864,7 +1864,7 @@ class McpServerScriptsMoved(unittest.TestCase):
         self.assertEqual(self._apply(mcp_json), mcp_json)
 
     def test_a_block_without_args_or_with_odd_shapes_does_not_break_detect_or_apply(self):
-        mcp_json = {"mcpServers": {"a": {"command": "x"}, "b": {"args": None}, "c": "not-a-dict", "d": {"args": [1, None]}}}
+        mcp_json = {"mcpServers": {"a": {"command": "x"}, "b": {"args": None}, "c": "not-a-dict", "d": {"args": [1, None]}, "e": {"args": 1}, "f": {"args": True}, "g": {"args": "/home/u/claude-runway/tools/qdrant_mcp_server.py"}}}
         migration = _migration(self._ID)
         self.assertFalse(migration.detect(mcp_json, {}))
         self.assertEqual(self._apply(mcp_json), mcp_json)
@@ -2283,7 +2283,7 @@ class CodebaseIndexerScriptRenamed(unittest.TestCase):
         self.assertLess(ids.index("mcp-server-scripts-moved"), ids.index(self._ID))
 
     def test_odd_shapes_do_not_break_detect_or_apply(self):
-        mcp_json = {"mcpServers": {"a": {"command": "x"}, "b": {"args": None}, "c": "not-a-dict", "d": {"args": [1, None]}}}
+        mcp_json = {"mcpServers": {"a": {"command": "x"}, "b": {"args": None}, "c": "not-a-dict", "d": {"args": [1, None]}, "e": {"args": 1}, "f": {"args": True}, "g": {"args": "/home/u/claude-runway/mcpservers/ingest_mcp_server.py"}}}
         migration = _migration(self._ID)
         self.assertFalse(migration.detect(mcp_json, {}))
         self.assertEqual(self._apply(mcp_json), mcp_json)

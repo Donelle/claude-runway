@@ -974,7 +974,13 @@ def _detect_mcp_server_scripts_moved(mcp_json: dict, settings_json: dict) -> boo
     for block in servers.values():
         if not isinstance(block, dict):
             continue
-        for arg in block.get("args") or []:
+        # Only a list is walked: a scalar `args` (1, true) would raise here, and a
+        # bare string would be walked one character at a time. `apply` already
+        # skips non-lists, so detect now agrees with it.
+        args = block.get("args")
+        if not isinstance(args, list):
+            continue
+        for arg in args:
             if _rewrite_moved_server_path(arg) is not None:
                 return True
     return False
@@ -1051,7 +1057,12 @@ def _detect_codebase_indexer_script_renamed(mcp_json: dict, settings_json: dict)
     for block in servers.values():
         if not isinstance(block, dict):
             continue
-        for arg in block.get("args") or []:
+        # A list only, same as mcp-server-scripts-moved and this migration's own
+        # apply: a scalar `args` would raise, a bare string would be walked by character.
+        args = block.get("args")
+        if not isinstance(args, list):
+            continue
+        for arg in args:
             if not isinstance(arg, str):
                 continue
             if _OLD_INDEXER_PATH.search(arg) or _OLD_INDEXER_TOOLS_PATH.search(arg):
