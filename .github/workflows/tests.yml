@@ -171,7 +171,7 @@ jobs:
           # The six MCP servers Claude Code launches must all ship: a wheel
           # built without the mcpservers/ data-files entry would silently lose
           # them while every directory check above still passed.
-          for server in ('compress', 'analytics', 'qdrant', 'codebase_indexer', 'memory_bank', 'codebase_reviewer'):
+          for server in ('compress', 'analytics', 'compact', 'codebase_indexer', 'memory_bank', 'codebase_reviewer'):
               p = os.path.join(sys.prefix, 'src', 'mcpservers', server + '_mcp_server.py')
               assert os.path.isfile(p), 'missing ' + p
           print('OK: libs/tools/mcpservers/hooks/templates/skills all present under <env>/src/')"
@@ -185,16 +185,16 @@ jobs:
           mkdir -p pkgtest-target
           "$VENV_BIN/claude-runway-setup" init "$(pwd)/pkgtest-target" --dry-run
 
-          # The `qdrant` block is this repo's own server now. A generated
+          # The `compact` block is this repo's own server now. A generated
           # config must never launch the third-party package's console
-          # script, and every script the qdrant and analytics blocks launch
+          # script, and every script the compact and analytics blocks launch
           # must exist in this fresh env (the paths come from <env>/src/).
           "$VENV_BIN/claude-runway-setup" init "$(pwd)/pkgtest-target" --dry-run --track-savings > init-dry-run.txt
           "$VENV_PY" -c "import json, os
           text = open('init-dry-run.txt', encoding='utf-8').read()
           assert 'mcp-server-qdrant' not in text and 'fastmcp' not in text, 'stale third-party reference in generated config'
           servers, _ = json.JSONDecoder().raw_decode(text[text.index('\n{\n') + 1:])
-          for name in ('qdrant', 'analytics'):
+          for name in ('compact', 'analytics'):
               script = servers[name]['args'][0]
               assert os.path.isfile(script), name + ' server script missing: ' + script
-          print('OK: qdrant and analytics blocks launch scripts that exist; no third-party qdrant server reference')"
+          print('OK: compact and analytics blocks launch scripts that exist; no third-party qdrant server reference')"

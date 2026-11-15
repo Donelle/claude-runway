@@ -7,7 +7,7 @@ It replaces the prose in a project's `CLAUDE.md` that asks Claude to run `cb_ind
 ## Prerequisites
 
 - `git`.
-- claude-runway's own MCP tools, configured in the project: `qdrant`, `codebase-indexer`, `local-compress` and `memory-bank`. Run `/cr-setup` if they are not.
+- claude-runway's own MCP tools, configured in the project: `compact`, `codebase-indexer`, `local-compress` and `memory-bank`. Run `/cr-setup` if they are not.
 
 Nothing else is required. `gh` (GitHub) and `az` (Azure DevOps, with the `azure-devops` extension) are optional extras: when one is missing, not signed in, slow or failing, only its own section of the report says `skipped: <reason>`, and every other section is unaffected. No step below may stop because of them.
 
@@ -51,7 +51,7 @@ Then run one or two `cb_indexer_find_repo` queries instead of opening many files
 
 A project may not have claude-runway's own `CLAUDE.md` guidance, so this step puts it in your head for the rest of the session. Take the entry below for each tool group that is **live**: a group is live when one of its tools exists and answered. Round 1 called `codebase-indexer`, `local-compress` and `memory-bank`; the other groups are not called here, so they are live when one of their tools is among yours (a tool shows up as `mcp__<group>__<tool>`). Skip the entry of a group that is missing or errored, and say nothing about it here (the report's status line covers it). This guide is for you: do not recite it in the report, and do not teach the user tool names, since users ask in natural language.
 
-- **`qdrant`** (this project's saved conversation compacts)
+- **`compact`** (this project's saved conversation compacts)
   - `compact_store`, `compact_find` and `compact_prune` keep conversation compacts in a separate collection per project (they back `/cr-compact` and `/cr-resume`). `cb_indexer_find_repo` does not search them: use `compact_find`, by project and an optional query. `compact_prune` deletes compacts (keep the last N, or drop those older than N days) and defaults to a dry run: run it only when the user asks, and show what it would remove before a real run. Never put notes about the code in compacts: that is what `cb_indexer_store_repo` is for, and a compact stored as a note is buried under code chunks.
 - **`codebase-indexer`** (code and docs indexed into Qdrant)
   - `cb_indexer_find_repo` is semantic search. Use it before Grep or Read for conceptual questions ("where is X handled", "how does Y work", "which files deal with Z"); use Grep for exact identifiers, error strings and known symbols. Its results are leads, not facts: when a hit's metadata has a `file_path` and a line number or `line_range`, Read only that span, not the whole file. It returns 10 hits unless you pass `limit`. If the same question comes up again, reuse the earlier result instead of searching again.

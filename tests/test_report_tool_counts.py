@@ -57,21 +57,21 @@ class ReportRepoServerReturnsLiveCountsAndSchemaSizes(unittest.TestCase):
 class ReportQdrantServerCoversTheServerThatReplacedTheThirdPartyOne(unittest.TestCase):
     """The `qdrant` server used to be the unpinned third-party package's, whose
     tool count this repo could not control, so the report had to construct it
-    specially. It is this repo's own `qdrant_mcp_server.py` now and goes through
+    specially. It is this repo's own `compact_mcp_server.py` now and goes through
     the same live enumeration as the others."""
 
     def test_reports_three_tools_without_a_live_connection(self):
-        count, chars = _rtc._report_repo_server("qdrant_mcp_server")
+        count, chars = _rtc._report_repo_server("compact_mcp_server")
         self.assertEqual(count, 3)
         self.assertGreater(chars, 0)
 
     def test_pinned_to_the_actual_tool_names_not_just_the_count(self):
         # A count-only assertion would still pass if a tool were renamed while
         # the count stayed at 3 -- the silent drift this report exists to catch.
-        import qdrant_mcp_server
+        import compact_mcp_server
         from mcp_tool_introspect import list_registered_tools
 
-        names = {fn.__name__ for fn in list_registered_tools(qdrant_mcp_server.mcp)}
+        names = {fn.__name__ for fn in list_registered_tools(compact_mcp_server.mcp)}
         self.assertEqual(
             names, {"compact_store", "compact_find", "compact_prune"}
         )
@@ -137,7 +137,7 @@ class MainReportsAllServersAndExitsCleanly(unittest.TestCase):
         self.assertIn("analytics", output)
         self.assertIn("codebase-indexer", output)
         self.assertIn("memory-bank", output)
-        self.assertIn("qdrant (qdrant_mcp_server.py): 3 tools", output)
+        self.assertIn("compact (compact_mcp_server.py): 3 tools", output)
         self.assertNotIn("standalone", output)
         self.assertIn("tools", output)
         self.assertIn("tool-description characters (schema proxy)", output)

@@ -112,7 +112,7 @@ class PyprojectTomlIsWellFormed(unittest.TestCase):
             self.assertIn(expected, deps)
 
     def test_third_party_qdrant_server_packages_are_not_dependencies(self):
-        # This repo serves `qdrant` from its own mcpservers/qdrant_mcp_server.py, so
+        # This repo serves `qdrant` from its own mcpservers/compact_mcp_server.py, so
         # neither the third-party server package nor the compatibility pin that
         # only existed for it may come back in either install file.
         deps = [d.lower() for d in self.data["project"]["dependencies"]]
@@ -291,7 +291,7 @@ class BuiltWheelHasExpectedDataLayout(unittest.TestCase):
         # `_flat_data_files("mcpservers", "*.py")` entry the wheel would
         # silently lose all six while every other directory still shipped.
         data_names = self._data_src_names()
-        for stem in ("compress", "analytics", "qdrant", "codebase_indexer", "memory_bank", "codebase_reviewer"):
+        for stem in ("compress", "analytics", "compact", "codebase_indexer", "memory_bank", "codebase_reviewer"):
             rel_path = f"mcpservers/{stem}_mcp_server.py"
             with self.subTest(rel_path=rel_path):
                 self.assertTrue(

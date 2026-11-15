@@ -134,7 +134,7 @@ comments below):
   "hooks": {
     "PostToolUse": [
       {
-        "matcher": "Bash|Grep|WebFetch|Glob|WebSearch|mcp__local-compress__.*|mcp__qdrant__(?:compact_store|compact_find|compact_prune)$",
+        "matcher": "Bash|Grep|WebFetch|Glob|WebSearch|mcp__local-compress__.*|mcp__compact__(?:compact_store|compact_find|compact_prune)$",
         "hooks": [
           {
             "type": "command",
@@ -348,7 +348,7 @@ _SELF_COMPRESSING_MCP_TOOLS = {"compress_file", "compress_command_output", "fetc
 # results are code locations and stored notes Claude acts on directly, and the
 # matcher does not list them), so any other tool under this prefix exits
 # untouched.
-MCP_QDRANT_TOOL_PREFIX = "mcp__qdrant__"
+MCP_COMPACT_TOOL_PREFIX = "mcp__compact__"
 _QDRANT_COMPACT_MCP_TOOLS = {"compact_store", "compact_find", "compact_prune"}
 # The opt-in `analytics` server (savings_summary/savings_detail/savings_trend,
 # get_metrics, record_metric). Every tool there returns an exact numeric/
@@ -1118,7 +1118,7 @@ def _finish_compression_outcome(outcome, tool_name, source, session_id, project,
     sys.exit(0)
 
 
-# Matches compact_find's own header verbatim (qdrant_mcp_server.py):
+# Matches compact_find's own header verbatim (compact_mcp_server.py):
 # f"Found {len(entries)} compact(s) for project '{project}':\n". Anchored to
 # the START of the leaf (^, no re.MULTILINE, so this only matches the
 # absolute beginning of the string) -- not just anchored to that exact
@@ -1224,11 +1224,11 @@ def _dispatch(payload):
     # matched tool, with the two exemptions below. Every OTHER tool on this
     # server (`cb_indexer_find_repo`, `cb_indexer_store_repo`) is never compressed, and the
     # matcher does not list them; this check keeps that true even if a
-    # hand-edited matcher were widened to `mcp__qdrant__.*`.
+    # hand-edited matcher were widened to `mcp__compact__.*`.
     # (compact_prune, an exact list of ids, is the same verbatim-report class
     # as the analytics tools above.)
-    if tool_name and tool_name.startswith(MCP_QDRANT_TOOL_PREFIX):
-        bare_tool_name = tool_name[len(MCP_QDRANT_TOOL_PREFIX):]
+    if tool_name and tool_name.startswith(MCP_COMPACT_TOOL_PREFIX):
+        bare_tool_name = tool_name[len(MCP_COMPACT_TOOL_PREFIX):]
         if bare_tool_name not in _QDRANT_COMPACT_MCP_TOOLS or tool_response is None:
             sys.exit(0)
         # A list of pruned compact ids is an exact report, the same class as

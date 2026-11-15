@@ -87,7 +87,7 @@ class ExtractSections(unittest.TestCase):
 
 class WantedHeadings(unittest.TestCase):
     def test_each_section_follows_its_server(self):
-        servers = {"qdrant": {}, "codebase-indexer": {}, "memory-bank": {}}
+        servers = {"compact": {}, "codebase-indexer": {}, "memory-bank": {}}
         self.assertEqual(wanted_claude_md_headings(servers), QDRANT_ONLY)
         servers.update({"local-compress": {}, "analytics": {}, "codebase-reviewer": {}})
         self.assertEqual(
@@ -317,7 +317,7 @@ class InitCliClaudeMd(unittest.TestCase):
         self.assertEqual(self.claude_md.read_text(encoding="utf-8"), "Mine.\n")
         self.assertNotIn("CLAUDE.md", out)
         # The config is still written.
-        self.assertIn("qdrant", json.loads((self.target / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"])
+        self.assertIn("compact", json.loads((self.target / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"])
 
     def test_skip_claude_md_creates_nothing(self):
         self._init(skip_claude_md=True)

@@ -83,6 +83,12 @@ class MigrationContext:
 
     tools_repo_dir: Path
     venv_python: Path
+    # The key of the block that launched `qdrant_mcp_server.py` BEFORE any
+    # migration in this run was applied (None when there was none, or more than
+    # one). `run_upgrade` fills it in from the pre-apply `.mcp.json`, because by
+    # the time a repo migration applies, `compact-server-renamed` has already
+    # renamed that block and its old key can no longer be read from disk.
+    compact_old_key: Optional[str] = None
 
 
 @dataclass
@@ -121,7 +127,7 @@ class RepoMigration:
 
     Same shape as `Migration` for everything a prompt or a printout reads (`id`,
     `title`, `kind`, `description`, `note`), but `detect(target_repo) -> bool`
-    and `apply(target_repo) -> None` take the repo path and touch disk. Kept
+    and `apply(target_repo, ctx) -> None` take the repo path and touch disk. Kept
     config-only in spirit: an apply may delete or rewrite a bookkeeping file,
     never run indexing or embedding code.
     """
@@ -132,7 +138,7 @@ class RepoMigration:
     description: str
     note: str
     detect: Callable[[Path], bool]
-    apply: Callable[[Path], None]
+    apply: Callable[[Path, MigrationContext], None]
 
 
 # ---------------------------------------------------------------------------
@@ -160,7 +166,7 @@ def _detect_old_format_manifest(target_repo: Path) -> bool:
     return is_old_format_manifest(data)
 
 
-def _apply_old_format_manifest(target_repo: Path) -> None:
+def _apply_old_format_manifest(target_repo: Path, ctx: Optional[MigrationContext] = None) -> None:
     (Path(target_repo) / MANIFEST_FILENAME).unlink(missing_ok=True)
 
 
@@ -201,7 +207,7 @@ def _apply_memory_bank_server_missing(
     matching what a fresh `init` run does when `--memory-bank-id` isn't
     passed.
 
-    `EMBEDDING_MODEL` is deliberately NOT copied from the `qdrant`/
+    `EMBEDDING_MODEL` is deliberately NOT copied from the `compact`/
     `codebase-indexer` blocks. Memory-bank's model is its own value,
     independent of the code-index model, and the shared `memory-bank`
     collection locks in whichever model created it first
@@ -218,7 +224,7 @@ def _apply_memory_bank_server_missing(
     """
     mcp_json = copy.deepcopy(mcp_json)
     servers = mcp_json.setdefault("mcpServers", {})
-    qdrant_env = servers.get("qdrant", {}).get("env", {})
+    qdrant_env = _compact_server_env(mcp_json)
     indexer_env = servers.get("codebase-indexer", {}).get("env", {})
 
     qdrant_url = qdrant_env.get("QDRANT_URL") or "http://localhost:6333"
@@ -464,7 +470,12 @@ def _apply_pr_round_capture_hook_missing(
 # legacy model exactly as that one did).
 
 _THIRD_PARTY_QDRANT_SCRIPT = "mcp-server-qdrant"
+# The script the server ran as before it became `compact_mcp_server.py`. Spelled
+# out here on purpose: this and compact-server-renamed below are the only places
+# that still need the old name.
 _OWN_QDRANT_SCRIPT = "qdrant_mcp_server.py"
+_NEW_COMPACT_SCRIPT = "compact_mcp_server.py"
+COMPACT_SERVER_KEY = "compact"
 
 
 def _launches_third_party_qdrant_server(block: object) -> bool:
@@ -489,11 +500,20 @@ def _launches_third_party_qdrant_server(block: object) -> bool:
     return False
 
 
+def _third_party_qdrant_keys(mcp_json: dict) -> "list[str]":
+    """Keys of the blocks that still start the third-party console script,
+    whatever the user named them (found by what they launch, not by key)."""
+    servers = mcp_json.get("mcpServers")
+    if not isinstance(servers, dict):
+        return []
+    return [key for key, block in servers.items() if _launches_third_party_qdrant_server(block)]
+
+
 def _detect_qdrant_server_replaced(mcp_json: dict, settings_json: dict) -> bool:
-    """False for a project with no `qdrant` block (nothing to rewrite) and for
+    """False for a project with no such block (nothing to rewrite) and for
     one that already runs this repo's own server (nothing left to do), which is
     what makes re-running `upgrade` a no-op."""
-    return _launches_third_party_qdrant_server(mcp_json.get("mcpServers", {}).get("qdrant"))
+    return bool(_third_party_qdrant_keys(mcp_json))
 
 
 def _env_str(env: object, key: str) -> str:
@@ -505,13 +525,14 @@ def _env_str(env: object, key: str) -> str:
 # for. `init` wrote the same URL and key into all of them, but a hand-edited or
 # older config can have them in only one (the setup skill checks every one of
 # these blocks for the key for exactly that reason), and the compact tools now
-# reach Qdrant through the qdrant block alone.
-_QDRANT_USING_SERVERS = ("qdrant", "local-compress", "codebase-indexer", "memory-bank")
+# reach Qdrant through the compact block alone.
+_QDRANT_USING_SERVERS = ("local-compress", "codebase-indexer", "memory-bank")
 
 
-def _first_qdrant_env_str(servers: dict, key: str) -> str:
-    """The first non-blank `key` found across the Qdrant-using pre-move blocks."""
-    for name in _QDRANT_USING_SERVERS:
+def _first_qdrant_env_str(servers: dict, key: str, first: str) -> str:
+    """The first non-blank `key` found across the Qdrant-using pre-move blocks,
+    starting with `first`, the third-party block's own key."""
+    for name in (first, *_QDRANT_USING_SERVERS):
         block = servers.get(name)
         value = _env_str(block.get("env") if isinstance(block, dict) else None, key)
         if value.strip():
@@ -519,15 +540,29 @@ def _first_qdrant_env_str(servers: dict, key: str) -> str:
     return ""
 
 
+def _with_server_key(mcp_json: dict, old_key: str, new_key: str) -> dict:
+    """A copy of `mcp_json` whose `old_key` server block is keyed `new_key`
+    (same position). A no-op rename when the keys are equal."""
+    view = dict(mcp_json)
+    view["mcpServers"] = {(new_key if key == old_key else key): block for key, block in mcp_json["mcpServers"].items()}
+    return view
+
+
 def _apply_qdrant_server_replaced(
     mcp_json: dict, settings_json: dict, ctx: MigrationContext
 ) -> "tuple[dict, dict]":
     """
-    Rewrites the `qdrant` block to start `mcpservers/qdrant_mcp_server.py` under the
-    venv interpreter, with the env that server reads, reusing `build_mcp_servers`
-    (the SAME function `init` uses) so it cannot drift from a fresh `init`.
-    Only the `qdrant` KEY is taken from the result; every other server, and the
-    whole of `settings.json`, is left as it was.
+    Replaces the block that launches the third-party server with the `compact`
+    block (`mcpservers/compact_mcp_server.py` under the venv interpreter, with
+    the env that server reads), reusing `build_mcp_servers` (the SAME function
+    `init` uses) so it cannot drift from a fresh `init`. The old block is
+    removed under whatever key it had, so this lands directly on the final key
+    and `compact-server-renamed` has nothing left to do for it. When more than
+    one block launches the third-party script, or an unrelated block is already
+    keyed `compact`, it says so and changes nothing. Only that one block is
+    touched; every other server, and the whole of `settings.json`, is left as
+    it was. Permission rules written against the third-party era's key are NOT
+    carried over: update them by hand.
 
     What is carried over from the old config, so nothing a user set is reset:
       - `QDRANT_URL`, `QDRANT_API_KEY`, `COLLECTION_NAME` and `EMBEDDING_MODEL`
@@ -548,23 +583,34 @@ def _apply_qdrant_server_replaced(
     `FASTEMBED_CACHE_PATH` (set in code now) and the `TOOL_FIND_DESCRIPTION`/
     `TOOL_STORE_DESCRIPTION` texts (the descriptions live in the server).
     """
+    third_party_keys = _third_party_qdrant_keys(mcp_json)
+    if len(third_party_keys) != 1:
+        print(
+            "      Not applied: more than one .mcp.json block launches the third-party qdrant server "
+            f"({', '.join(third_party_keys)}). Leave one, then run upgrade again."
+        )
+        return mcp_json, settings_json
+    old_key = third_party_keys[0]
+    if old_key != COMPACT_SERVER_KEY and COMPACT_SERVER_KEY in mcp_json.get("mcpServers", {}):
+        print(f"      Not applied: .mcp.json already has a different '{COMPACT_SERVER_KEY}' block next to '{old_key}'.")
+        return mcp_json, settings_json
     mcp_json = copy.deepcopy(mcp_json)
     servers = mcp_json.setdefault("mcpServers", {})
-    old_env = servers.get("qdrant", {}).get("env", {})
+    old_env = servers.get(old_key, {}).get("env", {})
     indexer_env = servers.get("codebase-indexer", {}).get("env", {})
     compress_env = servers.get("local-compress", {}).get("env", {})
-    # The old qdrant block's own values win. A value missing from it is looked
+    # The old third-party block's own values win. A value missing from it is looked
     # for in the other Qdrant-using blocks, so an authenticated install whose
     # key lives only in local-compress (or the indexer) keeps it instead of
     # having the moved compact tools write an empty one.
-    qdrant_url = _first_qdrant_env_str(servers, "QDRANT_URL") or "http://localhost:6333"
-    qdrant_api_key = _first_qdrant_env_str(servers, "QDRANT_API_KEY")
+    qdrant_url = _first_qdrant_env_str(servers, "QDRANT_URL", old_key) or "http://localhost:6333"
+    qdrant_api_key = _first_qdrant_env_str(servers, "QDRANT_API_KEY", old_key)
 
     collection_name = _env_str(old_env, "COLLECTION_NAME") or _env_str(indexer_env, "COLLECTION_NAME") or "project"
     embedding_model = _env_str(old_env, "EMBEDDING_MODEL") or _env_str(indexer_env, "EMBEDDING_MODEL")
 
     template = load_json(Path(ctx.tools_repo_dir) / "templates" / "mcp.json.template")
-    template_model = template["mcpServers"]["qdrant"]["env"]["EMBEDDING_MODEL"]
+    template_model = template["mcpServers"][COMPACT_SERVER_KEY]["env"]["EMBEDDING_MODEL"]
     generated = build_mcp_servers(
         template,
         collection_name=collection_name,
@@ -577,10 +623,19 @@ def _apply_qdrant_server_replaced(
         lmstudio_model=_env_str(compress_env, "CLAUDE_RUNWAY_LMSTUDIO_MODEL"),
         compact_collection=_env_str(compress_env, "COMPACT_COLLECTION"),
         embedding_model=embedding_model,
-        compact_embedding_model=resolve_compact_embedding_model(mcp_json, embedding_model or template_model),
+        compact_embedding_model=resolve_compact_embedding_model(
+            # The old block under the key the resolver reads, so an install whose compacts were
+            # stored before COMPACT_EMBEDDING_MODEL existed is still pinned to the legacy model.
+            _with_server_key(mcp_json, old_key, COMPACT_SERVER_KEY),
+            embedding_model or template_model,
+        ),
         include_compress=False,
     )
-    servers["qdrant"] = generated["qdrant"]
+    # Same position the old block had, under the final key.
+    mcp_json["mcpServers"] = {
+        (COMPACT_SERVER_KEY if key == old_key else key): (generated[COMPACT_SERVER_KEY] if key == old_key else block)
+        for key, block in servers.items()
+    }
     return mcp_json, settings_json
 
 
@@ -742,9 +797,9 @@ def _apply_compress_hook_renamed(mcp_json: dict, settings_json: dict, ctx: Migra
 # ---------------------------------------------------------------------------
 
 # The alternative `templates/settings.json.template`'s compress-hook matcher
-# carries for the conversation-compact tools, now served by the `qdrant`
+# carries for the conversation-compact tools, served by the `compact`
 # server. tests/test_upgrade_lib.py pins that the template contains exactly it.
-COMPACT_TOOLS_MATCHER = "mcp__qdrant__(?:compact_store|compact_find|compact_prune)$"
+COMPACT_TOOLS_MATCHER = "mcp__compact__(?:compact_store|compact_find|compact_prune)$"
 _LOCAL_COMPRESS_MATCHER = "mcp__local-compress__.*"
 
 
@@ -752,7 +807,7 @@ def _compress_hook_blocks_missing_compact_matcher(settings_json: dict) -> "list[
     """
     Blocks that run the compress hook (under its current or its legacy name)
     with a matcher that lists the `local-compress` tools by the exact text
-    `init` writes but not the compact tools' new `mcp__qdrant__` alternative.
+    `init` writes but not the compact tools' `mcp__compact__` alternative.
     A matcher this toolkit did not write (no `mcp__local-compress__.*` in it)
     is deliberately not matched: it is the user's own, and guessing where to
     splice into it could break it.
@@ -780,7 +835,7 @@ def _apply_compress_hook_matcher_missing_compact_tools(
     mcp_json: dict, settings_json: dict, ctx: MigrationContext
 ) -> "tuple[dict, dict]":
     """
-    Adds the compact tools' `mcp__qdrant__` alternative right after
+    Adds the compact tools' `mcp__compact__` alternative right after
     `mcp__local-compress__.*` in each compress-hook matcher that lacks it. The
     compact tools used to be `mcp__local-compress__` tools, so a matcher `init`
     wrote before they moved stops reaching the hook for them after
@@ -1281,7 +1336,258 @@ def _apply_cb_indexer_tools_renamed(
     return mcp_json, settings_json
 
 
-# The CLAUDE.md section the template writes for the `qdrant` server. It names
+# ---------------------------------------------------------------------------
+# compact-server-renamed / compact-server-settings-renamed
+# ---------------------------------------------------------------------------
+#
+# The `qdrant` MCP server was renamed to `compact`: its script to
+# `compact_mcp_server.py`, its `.mcp.json` key to `compact`, its tool prefix to
+# `mcp__compact__`. Nothing keeps answering to the old names, so the block and
+# every settings entry that names it have to move together.
+#
+# The old block is found BY SHAPE (what it launches), never by the key `qdrant`:
+# a user may have named it anything. Two migrations carry it, because the
+# settings files are not part of what a config migration is handed:
+#   - compact-server-renamed (a Migration) renames the `.mcp.json` block;
+#   - compact-server-settings-renamed (a RepoMigration) rewrites
+#     .claude/settings.json and .claude/settings.local.json.
+# The second runs after the first has already renamed the block, so the old key
+# is read BEFORE anything is applied (`MigrationContext.compact_old_key`).
+
+_COMPACT_TOOL_NAMES = ("compact_store", "compact_find", "compact_prune")
+# Only the `mcpservers/` form is rewritten: a path still under `tools/` (from
+# before mcp-server-scripts-moved) is left for that migration, since renaming
+# the file there would point at a script that has never existed.
+_OLD_COMPACT_SCRIPT_PATH = re.compile(r"(^|[\\/])mcpservers([\\/])" + re.escape(_OWN_QDRANT_SCRIPT) + r"$")
+# What every `init` wrote as the key. Used ONLY when the block has already been
+# renamed (so there is no shape left to read) and nothing else holds that key.
+_PRE_RENAME_KEY = "qdrant"
+_LOCAL_SETTINGS_LISTS = ("enabledMcpjsonServers", "disabledMcpjsonServers")
+
+
+def find_old_compact_server_keys(mcp_json: dict) -> "list[str]":
+    """
+    Keys of every `.mcp.json` block that launches the pre-rename compact server
+    (`qdrant_mcp_server.py`, or the third-party `mcp-server-qdrant` it replaced),
+    whatever the user named the block. `/cr-setup` uses this to tell an install
+    that still needs `upgrade` from a current one.
+    """
+    return _launcher_keys(mcp_json, _QDRANT_SCRIPTS)
+
+
+def _compact_server_env(mcp_json: dict) -> dict:
+    """The `env` of this project's compact server block: the `compact` block, or
+    else the one old block found by shape. `{}` when there is none or it is
+    ambiguous."""
+    servers = mcp_json.get("mcpServers")
+    if not isinstance(servers, dict):
+        return {}
+    block = servers.get(COMPACT_SERVER_KEY)
+    if not isinstance(block, dict):
+        keys = find_old_compact_server_keys(mcp_json)
+        block = servers.get(keys[0]) if len(keys) == 1 else None
+    env = block.get("env") if isinstance(block, dict) else None
+    return env if isinstance(env, dict) else {}
+
+
+def _rewrite_old_compact_script(value: object) -> "Optional[str]":
+    """`value` with the old script's file name replaced (directory and separator
+    kept), or None when it is not a path to that script."""
+    if not isinstance(value, str):
+        return None
+    new, count = _OLD_COMPACT_SCRIPT_PATH.subn(
+        lambda m: m.group(1) + "mcpservers" + m.group(2) + _NEW_COMPACT_SCRIPT, value
+    )
+    return new if count else None
+
+
+def _detect_compact_server_renamed(mcp_json: dict, settings_json: dict) -> bool:
+    return bool(_launcher_keys(mcp_json, (_OWN_QDRANT_SCRIPT,)))
+
+
+def _apply_compact_server_renamed(
+    mcp_json: dict, settings_json: dict, ctx: MigrationContext
+) -> "tuple[dict, dict]":
+    """
+    Renames the block that launches `qdrant_mcp_server.py` to `compact` (keeping
+    its position and every env value) and rewrites that script's file name in
+    its `command`/`args` to `compact_mcp_server.py`. Touches nothing else: not
+    another server, not `settings.json`. When more than one block launches the
+    script, or a different block is already keyed `compact`, it says why and
+    changes nothing, so `run_upgrade` reports the migration as still pending.
+    """
+    keys = _launcher_keys(mcp_json, (_OWN_QDRANT_SCRIPT,))
+    if not keys:
+        return mcp_json, settings_json
+    if len(keys) > 1:
+        print(
+            f"      Not applied: more than one .mcp.json block launches {_OWN_QDRANT_SCRIPT} "
+            f"({', '.join(keys)}). Leave one, then run upgrade again."
+        )
+        return mcp_json, settings_json
+    old_key = keys[0]
+    if old_key != COMPACT_SERVER_KEY and COMPACT_SERVER_KEY in mcp_json["mcpServers"]:
+        print(
+            f"      Not applied: .mcp.json already has a different '{COMPACT_SERVER_KEY}' block next to "
+            f"'{old_key}'. Rename or remove one, then run upgrade again."
+        )
+        return mcp_json, settings_json
+    original = mcp_json
+    mcp_json = copy.deepcopy(mcp_json)
+    block = mcp_json["mcpServers"][old_key]
+    command = _rewrite_old_compact_script(block.get("command"))
+    if command is not None:
+        block["command"] = command
+    if isinstance(block.get("args"), list):
+        block["args"] = [_rewrite_old_compact_script(arg) or arg for arg in block["args"]]
+    if _launcher_keys(mcp_json, (_OWN_QDRANT_SCRIPT,)):
+        # The script is still launched from somewhere this does not rewrite (the
+        # old tools/ folder): renaming only the key would leave a block that
+        # cannot start, so wait for mcp-server-scripts-moved.
+        print(
+            f"      Not applied: '{old_key}' still launches {_OWN_QDRANT_SCRIPT} from outside mcpservers/. "
+            "Apply mcp-server-scripts-moved first."
+        )
+        return original, settings_json
+    mcp_json["mcpServers"] = {
+        (COMPACT_SERVER_KEY if key == old_key else key): value for key, value in mcp_json["mcpServers"].items()
+    }
+    return mcp_json, settings_json
+
+
+def _read_json_object(path: Path) -> "Optional[dict]":
+    """A JSON object read from `path`, or None when the file is missing,
+    unreadable or not an object -- a file this migration cannot safely edit."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _old_compact_key_for_settings(target_repo: Path, ctx: "Optional[MigrationContext]") -> "Optional[str]":
+    """
+    The key the settings files may still name, or None when there is nothing to
+    rename. Order: the key `run_upgrade` read before applying anything; else the
+    one block still launching the old script; else `qdrant`, but only for an
+    install that has since been renamed (a `compact` block, and no other block
+    holding that key), so a real server of the user's own called `qdrant` is
+    never mistaken for it.
+    """
+    if ctx is not None and ctx.compact_old_key:
+        return ctx.compact_old_key
+    mcp_json = _read_json_object(Path(target_repo) / ".mcp.json")
+    servers = mcp_json.get("mcpServers") if mcp_json is not None else None
+    if mcp_json is None or not isinstance(servers, dict):
+        return None
+    keys = _launcher_keys(mcp_json, (_OWN_QDRANT_SCRIPT,))
+    if len(keys) > 1:
+        return None
+    if keys:
+        return None if keys[0] == COMPACT_SERVER_KEY else keys[0]
+    if isinstance(servers.get(COMPACT_SERVER_KEY), dict) and _PRE_RENAME_KEY not in servers:
+        return _PRE_RENAME_KEY
+    return None
+
+
+def _drop_repeated_compact_matcher(matcher: str) -> str:
+    """Removes every copy of the compact alternative after the first, so a
+    matcher that already had the new one (added by
+    compress-hook-matcher-covers-compact-tools) does not end up with two."""
+    alt = COMPACT_TOOLS_MATCHER
+    while matcher.count(alt) > 1:
+        i = matcher.rfind(alt)
+        if i > 0 and matcher[i - 1] == "|":
+            matcher = matcher[: i - 1] + matcher[i + len(alt):]
+        else:
+            matcher = matcher[:i] + matcher[i + len(alt) + 1:]
+    return matcher
+
+
+def _settings_with_compact_renamed(settings_json: dict, old_key: str) -> dict:
+    """A copy of `.claude/settings.json` with the compact server's tool names
+    moved from `old_key` to `compact`: the toolkit's compress-hook matcher
+    alternative and the `mcp__<old>`, `mcp__<old>__*` and `mcp__<old>__compact_*`
+    permission rules. Every other alternative and rule is left exactly as it is."""
+    new = copy.deepcopy(settings_json)
+    names = {f"mcp__{old_key}__{tool}": f"mcp__{COMPACT_SERVER_KEY}__{tool}" for tool in _COMPACT_TOOL_NAMES}
+    rule_names = {
+        **names,
+        f"mcp__{old_key}": f"mcp__{COMPACT_SERVER_KEY}",
+        f"mcp__{old_key}__*": f"mcp__{COMPACT_SERVER_KEY}__*",
+    }
+    for list_name in _PERMISSION_LISTS:
+        rules = _permission_rules(new, list_name)
+        rewritten = [rule_names.get(r, r) if isinstance(r, str) else r for r in rules]
+        rules[:] = [r for i, r in enumerate(rewritten) if not (isinstance(r, str) and r in rewritten[:i])]
+    old_alternative = f"mcp__{old_key}__(?:{'|'.join(_COMPACT_TOOL_NAMES)})$"
+    for block in _compress_hook_matcher_blocks(new):
+        matcher = block["matcher"].replace(old_alternative, COMPACT_TOOLS_MATCHER)
+        block["matcher"] = _drop_repeated_compact_matcher(_rename_matcher(matcher, names))
+    return new
+
+
+def _local_settings_with_compact_renamed(local_json: dict, old_key: str) -> dict:
+    """A copy of `.claude/settings.local.json` with `old_key` replaced by
+    `compact` in `enabledMcpjsonServers`/`disabledMcpjsonServers`, in place, so
+    Claude Code does not ask to approve the renamed server again."""
+    new = copy.deepcopy(local_json)
+    for list_name in _LOCAL_SETTINGS_LISTS:
+        entries = new.get(list_name)
+        if not isinstance(entries, list):
+            continue
+        renamed = [COMPACT_SERVER_KEY if e == old_key else e for e in entries]
+        entries[:] = [e for i, e in enumerate(renamed) if not (e == COMPACT_SERVER_KEY and e in renamed[:i])]
+    return new
+
+
+def _settings_files(target_repo: Path) -> "list[tuple[Path, Callable[[dict, str], dict]]]":
+    claude_dir = Path(target_repo) / ".claude"
+    return [
+        (claude_dir / "settings.json", _settings_with_compact_renamed),
+        (claude_dir / "settings.local.json", _local_settings_with_compact_renamed),
+    ]
+
+
+def _detect_compact_server_settings_renamed(target_repo: Path) -> bool:
+    old_key = _old_compact_key_for_settings(target_repo, None)
+    if old_key is None:
+        return False
+    for path, rewrite in _settings_files(target_repo):
+        data = _read_json_object(path)
+        if data is not None and rewrite(data, old_key) != data:
+            return True
+    return False
+
+
+def _apply_compact_server_settings_renamed(target_repo: Path, ctx: "Optional[MigrationContext]" = None) -> None:
+    """
+    Rewrites the two settings files (see `_settings_with_compact_renamed` and
+    `_local_settings_with_compact_renamed`), each only when something in it
+    changes and never creating either one. It does nothing until `.mcp.json`
+    actually has the `compact` block and no block left launching the old
+    script, so declining `compact-server-renamed` cannot leave the settings
+    naming a server that does not exist yet.
+    """
+    old_key = _old_compact_key_for_settings(target_repo, ctx)
+    if old_key is None:
+        return
+    mcp_json = _read_json_object(Path(target_repo) / ".mcp.json")
+    servers = mcp_json.get("mcpServers") if mcp_json is not None else None
+    if mcp_json is None or not isinstance(servers, dict) or not isinstance(servers.get(COMPACT_SERVER_KEY), dict):
+        return
+    if _launcher_keys(mcp_json, (_OWN_QDRANT_SCRIPT,)):
+        return
+    for path, rewrite in _settings_files(target_repo):
+        data = _read_json_object(path)
+        if data is None:
+            continue
+        new = rewrite(data, old_key)
+        if new != data:
+            _atomic_write_json(path, new)
+
+
+# The CLAUDE.md section the template writes for the code-index tools. It names
 # these tools, so it is the one section this migration may rewrite.
 _OLD_TOOL_NAME_IN_TEXT = re.compile(
     r"(?<![\w-])(?:index_repo|sync_repo|preview_index|get_collection_info|find_in_collection|"
@@ -1308,7 +1614,7 @@ def _detect_cb_indexer_claude_md_renamed(target_repo: Path) -> bool:
     return bool(_stale_claude_md_spans(text.removeprefix(_BOM).splitlines(keepends=True)))
 
 
-def _apply_cb_indexer_claude_md_renamed(target_repo: Path) -> None:
+def _apply_cb_indexer_claude_md_renamed(target_repo: Path, ctx: Optional[MigrationContext] = None) -> None:
     """
     Replaces each stale `## Vector memory (Qdrant MCP)` section with the
     current template's, so the tool names AND the sentence about which server
@@ -1356,7 +1662,7 @@ MIGRATIONS: "list[Migration]" = [
         description=(
             "This project's .mcp.json has no 'memory-bank' server configured -- durable, cross-session "
             "remember/recall/forget storage isn't available here yet. Adds the memory-bank "
-            "server block, reusing this project's existing qdrant server's QDRANT_URL/QDRANT_API_KEY."
+            "server block, reusing this project's existing compact server's QDRANT_URL/QDRANT_API_KEY."
         ),
         note=(
             "MEMORY_BANK_ID defaults to your collection name -- customize it in .mcp.json if you want a "
@@ -1419,16 +1725,16 @@ MIGRATIONS: "list[Migration]" = [
     ),
     Migration(
         id="qdrant-server-replaced",
-        title="Run this repo's own qdrant MCP server instead of mcp-server-qdrant",
+        title="Run this repo's own compact MCP server instead of mcp-server-qdrant",
         kind="update",
         description=(
-            "The 'qdrant' server in .mcp.json still launches the third-party mcp-server-qdrant console "
-            "script. This repo now ships its own (mcpservers/qdrant_mcp_server.py): the conversation-compact tools "
+            "The server in .mcp.json still launches the third-party mcp-server-qdrant console "
+            "script. This repo now ships its own (mcpservers/compact_mcp_server.py): the conversation-compact tools "
             "(compact_store, compact_find, compact_prune) that /cr-compact and /cr-resume use, which "
             "have moved there from local-compress. (The note search and save tools the third-party "
             "server provided as qdrant-find/qdrant-store are served by the codebase-indexer server as "
             "cb_indexer_find_repo/cb_indexer_store_repo; the cb-indexer-tools-renamed migration updates "
-            "references to them.) Rewrites the qdrant block to the new command and env, "
+            "references to them.) Replaces that block with the compact block (new command and env), "
             "keeping your Qdrant URL/key, collection and embedding model, and carrying over the compact "
             "collection, LM Studio URL/model and compact embedding model from the local-compress block; "
             "drops HF_HUB_OFFLINE, FASTEMBED_CACHE_PATH and the TOOL_*_DESCRIPTION entries, which the "
@@ -1482,7 +1788,7 @@ MIGRATIONS: "list[Migration]" = [
     ),
     Migration(
         id="compress-hook-matcher-covers-compact-tools",
-        title="Make the compress hook matcher cover the compact tools on the qdrant server",
+        title="Make the compress hook matcher cover the compact tools",
         kind="update",
         description=(
             "This project's .claude/settings.json compress hook matches the local-compress tools but not "
@@ -1602,6 +1908,27 @@ MIGRATIONS: "list[Migration]" = [
         detect=_detect_cb_indexer_tools_renamed,
         apply=_apply_cb_indexer_tools_renamed,
     ),
+    Migration(
+        id="compact-server-renamed",
+        title="Rename the qdrant MCP server block in .mcp.json to compact",
+        kind="update",
+        description=(
+            "The server that holds the conversation-compact tools (compact_store, compact_find, compact_prune) "
+            "was renamed from qdrant to compact: its script is now mcpservers/compact_mcp_server.py, its "
+            ".mcp.json key is compact and its tools are mcp__compact__*. Every old name stops working at "
+            "once, with no transition. Renames the block that launches the old script (found by that script, "
+            "not by its key) to compact, keeps its env as it is, and points it at the new script. The "
+            "settings files are handled by the next step. Changes nothing, and says why, if more than one "
+            "block launches the old script or a different block is already called compact."
+        ),
+        note=(
+            "Restart Claude Code to load the renamed server. Not touched, so update them by hand if they name "
+            "the old server: rules in your user-level ~/.claude/settings.json (mcp__qdrant__*), and rules "
+            "written for a pre-qdrant-server install."
+        ),
+        detect=_detect_compact_server_renamed,
+        apply=_apply_compact_server_renamed,
+    ),
 ]
 
 
@@ -1647,6 +1974,26 @@ REPO_MIGRATIONS: "list[RepoMigration]" = [
         detect=_detect_cb_indexer_claude_md_renamed,
         apply=_apply_cb_indexer_claude_md_renamed,
     ),
+    RepoMigration(
+        id="compact-server-settings-renamed",
+        title="Point .claude/settings.json and settings.local.json at the compact server",
+        kind="update",
+        description=(
+            "The qdrant MCP server is now called compact. In .claude/settings.json this rewrites the "
+            "compress-hook matcher's mcp__<old>__(compact_store|compact_find|compact_prune) alternative and any "
+            "permissions.allow/deny/ask rule on those tools, so compact results are still compressed and "
+            "permission prompts do not come back. In .claude/settings.local.json it renames the server in "
+            "enabledMcpjsonServers/disabledMcpjsonServers, so Claude Code does not ask you to approve it again. "
+            "Every other matcher alternative (including ones you added), rule and entry is left as it is, and "
+            "neither file is created."
+        ),
+        note=(
+            "Runs only once .mcp.json has the compact block. Restart Claude Code afterwards. Your user-level "
+            "~/.claude/settings.json is not touched."
+        ),
+        detect=_detect_compact_server_settings_renamed,
+        apply=_apply_compact_server_settings_renamed,
+    ),
 ]
 
 
@@ -1664,17 +2011,18 @@ def pending_migrations(mcp_json: dict, settings_json: dict) -> "list[Migration]"
     return [m for m in MIGRATIONS if m.detect(mcp_json, settings_json)]
 
 
-def _has_qdrant_server(mcp_json: dict) -> bool:
+def _has_compact_server(mcp_json: dict) -> bool:
     """True if `mcp_json` already has this toolkit's OWN base-install
-    marker -- a `qdrant` server block, present in EVERY real `init` run
-    regardless of `--qdrant-only`/`--skip-hooks` (it's the one server key
-    every configured project is guaranteed to have)."""
-    return "qdrant" in mcp_json.get("mcpServers", {})
+    marker -- the `compact` server block, present in EVERY real `init` run
+    regardless of `--qdrant-only`/`--skip-hooks` -- or a block that launches the
+    server's old script (found by shape, whatever its key), which is an
+    install `upgrade` renames to `compact`."""
+    return COMPACT_SERVER_KEY in mcp_json.get("mcpServers", {}) or bool(find_old_compact_server_keys(mcp_json))
 
 
 def is_project_configured(target_repo: "Path | str") -> bool:
     """
-    Path-based convenience wrapper around `_has_qdrant_server`, for a caller
+    Path-based convenience wrapper around `_has_compact_server`, for a caller
     (`cmd_upgrade`) that wants to check this BEFORE calling `run_upgrade` at
     all -- mirroring `cmd_init`'s own `target_repo.is_dir()` pre-check, so a
     typo'd/genuinely-unconfigured target gets a clean CLI-level error and
@@ -1688,14 +2036,14 @@ def is_project_configured(target_repo: "Path | str") -> bool:
     missing `.mcp.json` is treated the same as one with no keys at all) and
     happily writes a BROKEN partial config: found in Copilot review and confirmed live,
     `upgrade <empty-dir> --auto-yes` wrote a
-    `qdrant` server block with an `env` but no `command`/`type` at all --
+    server block with an `env` but no `command`/`type` at all --
     plus a default `memory-bank` block, for a directory that had never been
     `init`'d.
     """
     mcp_json_path = Path(target_repo) / ".mcp.json"
     if not mcp_json_path.exists():
         return False
-    return _has_qdrant_server(load_existing_mcp_json(mcp_json_path))
+    return _has_compact_server(load_existing_mcp_json(mcp_json_path))
 
 
 def _atomic_write_json(path: Path, data: dict) -> None:
@@ -1791,11 +2139,11 @@ def _add_codebase_reviewer_block(mcp_json: dict, ctx: MigrationContext) -> dict:
     so the two cannot drift). `REVIEWERS_FILE` is left BLANK: the server
     requires it and has no default, and no default path or reviewers file is
     ever written. The block's Qdrant URL and key follow the project's own
-    `qdrant` block; every other server and `settings.json` are untouched.
+    `compact` block; every other server and `settings.json` are untouched.
     """
     mcp_json = copy.deepcopy(mcp_json)
     servers = mcp_json.setdefault("mcpServers", {})
-    qdrant_env = servers.get("qdrant", {}).get("env") if isinstance(servers.get("qdrant"), dict) else None
+    qdrant_env = _compact_server_env(mcp_json)
     template = load_json(Path(ctx.tools_repo_dir) / "templates" / "mcp.json.template")
     generated = build_mcp_servers(
         template,
@@ -1886,12 +2234,17 @@ def run_upgrade(
     settings_path = target_repo / ".claude" / "settings.json"
     mcp_json = load_existing_mcp_json(mcp_json_path)
     settings_json = load_existing_settings_json(settings_path)
+    # Read before anything is applied: compact-server-renamed renames this block,
+    # and the settings migration that runs after it still needs the old key.
+    old_compact_keys = _launcher_keys(mcp_json, (_OWN_QDRANT_SCRIPT,))
+    if len(old_compact_keys) == 1 and old_compact_keys[0] != COMPACT_SERVER_KEY:
+        ctx.compact_old_key = old_compact_keys[0]
 
     print(f"Checking {target_repo} for pending upgrades...")
 
-    if not _has_qdrant_server(mcp_json):
+    if not _has_compact_server(mcp_json):
         print(
-            f"\nerror: no existing toolkit configuration found at {mcp_json_path} (no 'qdrant' MCP "
+            f"\nerror: no existing toolkit configuration found at {mcp_json_path} (no 'compact' MCP "
             "server block) -- `upgrade` only applies migrations to an ALREADY-configured project. "
             "Run `init` first, then `upgrade` to pick up anything released since."
         )
@@ -2022,7 +2375,7 @@ def run_upgrade(
         if not accept:
             skipped += 1
             continue
-        repo_migration.apply(target_repo)
+        repo_migration.apply(target_repo, ctx)
         applied.append(repo_migration.id)
 
     if dry_run:

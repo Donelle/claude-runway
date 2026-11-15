@@ -61,9 +61,19 @@ def _migration(migration_id: str):
     return next(m for m in MIGRATIONS if m.id == migration_id)
 
 
+def _repo_migration(migration_id: str):
+    return next(m for m in REPO_MIGRATIONS if m.id == migration_id)
+
+
 # The compress hook's matcher as `init` wrote it before the compact tools moved
-# to the qdrant server: it lists the local-compress tools, not the compact tools.
+# to the compact server: it lists the local-compress tools, not the compact tools.
 _OLD_MATCHER = "Bash|Grep|WebFetch|Glob|WebSearch|mcp__local-compress__.*"
+
+# A project that still launches the third-party qdrant server gets its block
+# replaced straight into `compact` by qdrant-server-replaced, so
+# compact-server-renamed (which matches the own script by shape) has nothing
+# to do and is not reported.
+_THIRD_PARTY_ERA_IDS = {m.id for m in MIGRATIONS} - {"compact-server-renamed"}
 
 
 class MemoryBankServerMissing(unittest.TestCase):
@@ -414,7 +424,7 @@ class ObsoleteMigrationsAreGone(unittest.TestCase):
         self.assertNotIn("local-compress-embedding-model-missing", ids)
 
     def test_a_block_without_hf_hub_offline_is_not_pending_on_its_own(self):
-        mcp_json = {"mcpServers": {"qdrant": {"command": "/venv/bin/python", "args": ["/t/mcpservers/qdrant_mcp_server.py"],
+        mcp_json = {"mcpServers": {"compact": {"command": "/venv/bin/python", "args": ["/t/mcpservers/compact_mcp_server.py"],
                                               "env": {"COLLECTION_NAME": "p"}},
                                    "memory-bank": {"env": {}}, "codebase-indexer": {"env": {"MEMORY_BANK_COLLECTION": "m"}}}}
         settings = {"hooks": {"SessionStart": [{"hooks": [{"args": ["/x/hooks/record_session_id.py"]}]}],
@@ -608,7 +618,7 @@ class QdrantServerReplaced(unittest.TestCase):
     a model-named vector, so the compact embedding model has to carry over."""
 
     _ID = "qdrant-server-replaced"
-    _SERVER = f"{REPO_ROOT.as_posix()}/mcpservers/qdrant_mcp_server.py"
+    _SERVER = f"{REPO_ROOT.as_posix()}/mcpservers/compact_mcp_server.py"
 
     def _migration(self):
         return _migration(self._ID)
@@ -679,7 +689,7 @@ class QdrantServerReplaced(unittest.TestCase):
 
     def test_apply_rewrites_command_args_and_env_exactly(self):
         after, after_settings = self._migration().apply(self._pre_split(), {}, _ctx())
-        block = after["mcpServers"]["qdrant"]
+        block = after["mcpServers"]["compact"]
         self.assertEqual(block["command"], "/fake/venv/bin/python")
         self.assertEqual(block["type"], "stdio")
         self.assertEqual(block["args"], [self._SERVER])
@@ -699,7 +709,7 @@ class QdrantServerReplaced(unittest.TestCase):
         self.assertEqual(after_settings, {})
 
     def test_apply_drops_what_the_new_server_does_not_read(self):
-        env = self._migration().apply(self._pre_split(), {}, _ctx())[0]["mcpServers"]["qdrant"]["env"]
+        env = self._migration().apply(self._pre_split(), {}, _ctx())[0]["mcpServers"]["compact"]["env"]
         for gone in ("HF_HUB_OFFLINE", "FASTEMBED_CACHE_PATH", "TOOL_FIND_DESCRIPTION", "TOOL_STORE_DESCRIPTION"):
             self.assertNotIn(gone, env)
 
@@ -724,20 +734,20 @@ class QdrantServerReplaced(unittest.TestCase):
         # BAAI/bge-small-en whatever the code-index model is.
         before = self._pre_split()
         del before["mcpServers"]["local-compress"]["env"]["EMBEDDING_MODEL"]
-        env = self._migration().apply(before, {}, _ctx())[0]["mcpServers"]["qdrant"]["env"]
+        env = self._migration().apply(before, {}, _ctx())[0]["mcpServers"]["compact"]["env"]
         self.assertEqual(env["COMPACT_EMBEDDING_MODEL"], "BAAI/bge-small-en")
         self.assertEqual(env["EMBEDDING_MODEL"], "sentence-transformers/all-mpnet-base-v2")
 
     def test_a_blank_local_compress_model_counts_as_never_set(self):
         before = self._pre_split()
         before["mcpServers"]["local-compress"]["env"]["EMBEDDING_MODEL"] = "  "
-        env = self._migration().apply(before, {}, _ctx())[0]["mcpServers"]["qdrant"]["env"]
+        env = self._migration().apply(before, {}, _ctx())[0]["mcpServers"]["compact"]["env"]
         self.assertEqual(env["COMPACT_EMBEDDING_MODEL"], "BAAI/bge-small-en")
 
     def test_a_model_the_user_set_in_local_compress_is_carried_over(self):
         before = self._pre_split()
         before["mcpServers"]["local-compress"]["env"]["EMBEDDING_MODEL"] = "x/custom-compact-model"
-        env = self._migration().apply(before, {}, _ctx())[0]["mcpServers"]["qdrant"]["env"]
+        env = self._migration().apply(before, {}, _ctx())[0]["mcpServers"]["compact"]["env"]
         self.assertEqual(env["COMPACT_EMBEDDING_MODEL"], "x/custom-compact-model")
 
     def test_a_missing_local_compress_block_does_not_prove_no_compact_was_ever_stored(self):
@@ -747,7 +757,7 @@ class QdrantServerReplaced(unittest.TestCase):
         # legacy for a project that never stored one costs nothing.
         before = self._pre_split()
         del before["mcpServers"]["local-compress"]
-        env = self._migration().apply(before, {}, _ctx())[0]["mcpServers"]["qdrant"]["env"]
+        env = self._migration().apply(before, {}, _ctx())[0]["mcpServers"]["compact"]["env"]
         self.assertEqual(env["COMPACT_EMBEDDING_MODEL"], "BAAI/bge-small-en")
         self.assertEqual(env["EMBEDDING_MODEL"], "sentence-transformers/all-mpnet-base-v2")
         self.assertEqual(env["COMPACT_COLLECTION"], "conversation-compacts")
@@ -766,7 +776,7 @@ class QdrantServerReplaced(unittest.TestCase):
 
     def test_a_key_kept_only_in_local_compress_survives(self):
         before = self._without_qdrant_connection("qdrant")
-        env = self._migration().apply(before, {}, _ctx())[0]["mcpServers"]["qdrant"]["env"]
+        env = self._migration().apply(before, {}, _ctx())[0]["mcpServers"]["compact"]["env"]
         self.assertEqual(env["QDRANT_API_KEY"], "real-key")
         self.assertEqual(env["QDRANT_URL"], "http://remote-qdrant:6333")
 
@@ -777,25 +787,25 @@ class QdrantServerReplaced(unittest.TestCase):
                 before["mcpServers"][holder]["env"].update(
                     {"QDRANT_URL": "http://other:6333", "QDRANT_API_KEY": f"key-from-{holder}"}
                 )
-                env = self._migration().apply(before, {}, _ctx())[0]["mcpServers"]["qdrant"]["env"]
+                env = self._migration().apply(before, {}, _ctx())[0]["mcpServers"]["compact"]["env"]
                 self.assertEqual(env["QDRANT_API_KEY"], f"key-from-{holder}")
                 self.assertEqual(env["QDRANT_URL"], "http://other:6333")
 
     def test_the_old_qdrant_blocks_own_values_win_over_the_other_blocks(self):
         before = self._pre_split()
         before["mcpServers"]["local-compress"]["env"].update({"QDRANT_URL": "http://stale:6333", "QDRANT_API_KEY": "stale"})
-        env = self._migration().apply(before, {}, _ctx())[0]["mcpServers"]["qdrant"]["env"]
+        env = self._migration().apply(before, {}, _ctx())[0]["mcpServers"]["compact"]["env"]
         self.assertEqual((env["QDRANT_URL"], env["QDRANT_API_KEY"]), ("http://remote-qdrant:6333", "real-key"))
 
     def test_a_blank_key_in_the_qdrant_block_falls_through_to_one_that_is_set(self):
         before = self._pre_split()
         before["mcpServers"]["qdrant"]["env"]["QDRANT_API_KEY"] = ""
-        env = self._migration().apply(before, {}, _ctx())[0]["mcpServers"]["qdrant"]["env"]
+        env = self._migration().apply(before, {}, _ctx())[0]["mcpServers"]["compact"]["env"]
         self.assertEqual(env["QDRANT_API_KEY"], "real-key")
 
     def test_an_unauthenticated_install_stays_unauthenticated(self):
         before = self._without_qdrant_connection("qdrant", "local-compress")
-        env = self._migration().apply(before, {}, _ctx())[0]["mcpServers"]["qdrant"]["env"]
+        env = self._migration().apply(before, {}, _ctx())[0]["mcpServers"]["compact"]["env"]
         self.assertEqual(env["QDRANT_API_KEY"], "")
         self.assertEqual(env["QDRANT_URL"], "http://localhost:6333")
 
@@ -808,7 +818,7 @@ class QdrantServerReplaced(unittest.TestCase):
                 "codebase-indexer": {"env": {"COLLECTION_NAME": "from-indexer", "EMBEDDING_MODEL": "x/indexer-model"}},
             }
         }
-        env = self._migration().apply(before, {}, _ctx())[0]["mcpServers"]["qdrant"]["env"]
+        env = self._migration().apply(before, {}, _ctx())[0]["mcpServers"]["compact"]["env"]
         self.assertEqual(env["COLLECTION_NAME"], "from-indexer")
         self.assertEqual(env["EMBEDDING_MODEL"], "x/indexer-model")
         self.assertEqual(env["QDRANT_URL"], "http://localhost:6333")
@@ -816,7 +826,7 @@ class QdrantServerReplaced(unittest.TestCase):
 
     def test_a_block_with_no_env_at_all_still_gets_a_complete_one(self):
         before = {"mcpServers": {"qdrant": {"command": "/old/bin/mcp-server-qdrant"}}}
-        block = self._migration().apply(before, {}, _ctx())[0]["mcpServers"]["qdrant"]
+        block = self._migration().apply(before, {}, _ctx())[0]["mcpServers"]["compact"]
         self.assertEqual(block["args"], [self._SERVER])
         self.assertEqual(
             set(block["env"]),
@@ -827,7 +837,7 @@ class QdrantServerReplaced(unittest.TestCase):
     def test_no_placeholder_survives_in_the_rewritten_block(self):
         from setup_project_lib import find_unresolved_placeholders
 
-        block = self._migration().apply(self._pre_split(), {}, _ctx())[0]["mcpServers"]["qdrant"]
+        block = self._migration().apply(self._pre_split(), {}, _ctx())[0]["mcpServers"]["compact"]
         self.assertEqual(find_unresolved_placeholders(block), [])
 
 
@@ -857,12 +867,12 @@ class PendingMigrations(unittest.TestCase):
             }
         }
         pending = pending_migrations(mcp_json, settings_json)
-        self.assertEqual({m.id for m in pending}, {m.id for m in MIGRATIONS})
+        self.assertEqual({m.id for m in pending}, _THIRD_PARTY_ERA_IDS)
 
     def test_none_pending_on_a_fully_up_to_date_project(self):
         mcp_json = {
             "mcpServers": {
-                "qdrant": {"command": "/venv/bin/python", "args": ["/t/mcpservers/qdrant_mcp_server.py"], "env": {}},
+                "compact": {"command": "/venv/bin/python", "args": ["/t/mcpservers/compact_mcp_server.py"], "env": {}},
                 "codebase-indexer": {"env": {"MEMORY_BANK_COLLECTION": "memory-bank"}},
                 "memory-bank": {"env": {}},
             }
@@ -897,17 +907,35 @@ class IsProjectConfigured(unittest.TestCase):
         (target / ".mcp.json").write_text(json.dumps({"mcpServers": {"some-other-server": {}}}), encoding="utf-8")
         self.assertFalse(is_project_configured(target))
 
-    def test_true_when_qdrant_server_present(self):
+    def test_true_when_compact_server_present(self):
         target = Path(self._tmpdir.name) / "real-project"
         target.mkdir()
-        (target / ".mcp.json").write_text(json.dumps({"mcpServers": {"qdrant": {}}}), encoding="utf-8")
+        (target / ".mcp.json").write_text(json.dumps({"mcpServers": {"compact": {}}}), encoding="utf-8")
         self.assertTrue(is_project_configured(target))
+
+    def test_true_for_an_old_block_found_by_the_script_it_launches_whatever_its_key(self):
+        for key, block in (
+            ("qdrant", {"command": "py", "args": ["/r/mcpservers/qdrant_mcp_server.py"]}),
+            ("my-compacts", {"command": "py", "args": ["C:\r\mcpservers\qdrant_mcp_server.py"]}),
+            ("qdrant", {"command": "/v/bin/mcp-server-qdrant"}),
+        ):
+            with self.subTest(key=key, block=block):
+                target = Path(self._tmpdir.name) / f"old-{key}-{abs(hash(str(block)))}"
+                target.mkdir()
+                (target / ".mcp.json").write_text(json.dumps({"mcpServers": {key: block}}), encoding="utf-8")
+                self.assertTrue(is_project_configured(target))
+
+    def test_false_for_a_block_keyed_qdrant_that_launches_nothing_of_ours(self):
+        target = Path(self._tmpdir.name) / "someone-elses-qdrant"
+        target.mkdir()
+        (target / ".mcp.json").write_text(json.dumps({"mcpServers": {"qdrant": {}}}), encoding="utf-8")
+        self.assertFalse(is_project_configured(target))
 
     def test_true_for_a_qdrant_only_project_with_no_memory_bank_or_compress(self):
         target = Path(self._tmpdir.name) / "qdrant-only-project"
         target.mkdir()
         (target / ".mcp.json").write_text(
-            json.dumps({"mcpServers": {"qdrant": {}, "codebase-indexer": {}}}), encoding="utf-8"
+            json.dumps({"mcpServers": {"compact": {}, "codebase-indexer": {}}}), encoding="utf-8"
         )
         self.assertTrue(is_project_configured(target))
 
@@ -1010,13 +1038,13 @@ class RunUpgradeEndToEnd(unittest.TestCase):
 
     def test_auto_yes_applies_every_pending_migration(self):
         applied = run_upgrade(self.target_repo, REPO_ROOT, _VENV_PYTHON, auto_yes=True)
-        self.assertEqual(set(applied), {m.id for m in MIGRATIONS})
+        self.assertEqual(set(applied), _THIRD_PARTY_ERA_IDS)
 
         mcp_json, settings_json = self._read_configs()
         self.assertIn("memory-bank", mcp_json["mcpServers"])
-        qdrant = mcp_json["mcpServers"]["qdrant"]
+        qdrant = mcp_json["mcpServers"]["compact"]
         self.assertEqual(qdrant["command"], "/fake/venv/bin/python")
-        self.assertTrue(qdrant["args"][0].endswith("mcpservers/qdrant_mcp_server.py"))
+        self.assertTrue(qdrant["args"][0].endswith("mcpservers/compact_mcp_server.py"))
         self.assertEqual(qdrant["env"]["COMPACT_EMBEDDING_MODEL"], "BAAI/bge-small-en")
         self.assertEqual(qdrant["env"]["COMPACT_COLLECTION"], "conversation-compacts")
         # The server that was still on the old tools/ path moved
@@ -1082,7 +1110,7 @@ class RunUpgradeEndToEnd(unittest.TestCase):
 
         applied = run_upgrade(self.target_repo, REPO_ROOT, _VENV_PYTHON, dry_run=True)
 
-        self.assertEqual(set(applied), {m.id for m in MIGRATIONS})
+        self.assertEqual(set(applied), _THIRD_PARTY_ERA_IDS)
         self.assertEqual((self.target_repo / ".mcp.json").read_text(encoding="utf-8"), original_mcp)
         self.assertEqual(
             (self.target_repo / ".claude" / "settings.json").read_text(encoding="utf-8"), original_settings
@@ -1095,7 +1123,7 @@ class RunUpgradeEndToEnd(unittest.TestCase):
             raise AssertionError("dry_run must never prompt")
 
         applied = run_upgrade(self.target_repo, REPO_ROOT, _VENV_PYTHON, dry_run=True, prompt_fn=_explode)
-        self.assertEqual(set(applied), {m.id for m in MIGRATIONS})
+        self.assertEqual(set(applied), _THIRD_PARTY_ERA_IDS)
 
     def test_declining_a_migration_leaves_it_pending_next_run(self):
         declined_id = "qdrant-server-replaced"
@@ -1138,10 +1166,10 @@ class RunUpgradeEndToEnd(unittest.TestCase):
             return True
 
         run_upgrade(self.target_repo, REPO_ROOT, _VENV_PYTHON, prompt_fn=_accept_all)
-        self.assertEqual(len(seen), len(MIGRATIONS))
+        self.assertEqual(len(seen), len(_THIRD_PARTY_ERA_IDS))
         totals = {t for _, t in seen}
-        self.assertEqual(totals, {len(MIGRATIONS)})
-        self.assertEqual([i for i, _ in seen], list(range(1, len(MIGRATIONS) + 1)))
+        self.assertEqual(totals, {len(_THIRD_PARTY_ERA_IDS)})
+        self.assertEqual([i for i, _ in seen], list(range(1, len(_THIRD_PARTY_ERA_IDS) + 1)))
 
     def test_refuses_a_brand_new_never_configured_project(self):
         # Regression for the finding from Copilot review: an
@@ -1213,7 +1241,7 @@ class RunUpgradeWritesOnlyChangedFiles(unittest.TestCase):
         self.assertEqual(applied, ["qdrant-server-replaced"])
         self.assertFalse(self.settings_path.exists(), "settings.json must not be materialized")
         written = json.loads(self.mcp_path.read_text(encoding="utf-8"))
-        self.assertEqual(written["mcpServers"]["qdrant"]["command"], "/fake/venv/bin/python")
+        self.assertEqual(written["mcpServers"]["compact"]["command"], "/fake/venv/bin/python")
 
     def test_settings_only_migration_leaves_mcp_json_bytes_untouched(self):
         self.settings_path.parent.mkdir()
@@ -1285,7 +1313,8 @@ class IndexManifestOldFormat(unittest.TestCase):
 
     def test_registered_with_a_stable_id(self):
         self.assertEqual(
-            [m.id for m in REPO_MIGRATIONS], ["index-manifest-old-format", "cb-indexer-claude-md-renamed"]
+            [m.id for m in REPO_MIGRATIONS],
+            ["index-manifest-old-format", "cb-indexer-claude-md-renamed", "compact-server-settings-renamed"],
         )
 
     def test_not_pending_without_a_manifest(self):
@@ -1453,7 +1482,7 @@ class AnalyticsServerMissing(unittest.TestCase):
 
     def _mcp(self, **compress_env):
         return {"mcpServers": {
-            "qdrant": {"command": "/venv/bin/python", "args": ["/t/mcpservers/qdrant_mcp_server.py"], "env": {}},
+            "compact": {"command": "/venv/bin/python", "args": ["/t/mcpservers/compact_mcp_server.py"], "env": {}},
             "local-compress": {"command": "/venv/bin/python", "env": dict(compress_env)},
         }}
 
@@ -1581,7 +1610,7 @@ class LocalCompressSavingsDbInert(unittest.TestCase):
 
     def _mcp(self, analytics=False, **compress_env):
         servers = {
-            "qdrant": {"command": "/venv/bin/python", "args": ["/t/mcpservers/qdrant_mcp_server.py"], "env": {}},
+            "compact": {"command": "/venv/bin/python", "args": ["/t/mcpservers/compact_mcp_server.py"], "env": {}},
             "local-compress": {"command": "/venv/bin/python", "env": dict(compress_env)},
         }
         if analytics:
@@ -1894,7 +1923,8 @@ class McpServerScriptsMoved(unittest.TestCase):
             self.assertIn(self._ID, applied)
             written = json.loads((target / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"]
             for name, _ in self._SCRIPTS:
-                script = Path(written[name]["args"][0])
+                # --auto-yes also renames the qdrant block (compact-server-renamed).
+                script = Path(written["compact" if name == "qdrant" else name]["args"][0])
                 self.assertEqual(script.parent.name, "mcpservers", name)
                 # The rewritten path is where the script really lives. Checked
                 # by the file name actually written, since --auto-yes also
@@ -1972,9 +2002,9 @@ class UpgradeChainFromPreSplitProject(unittest.TestCase):
         self.assertEqual(upgraded["local-compress"]["args"], ["/old/mcpservers/compress_mcp_server.py"])
         # Compacts that predate the setting stay pinned to the model they were
         # stored with; that is the one deliberate difference from a new install.
-        fresh_qdrant = copy.deepcopy(fresh["qdrant"])
-        fresh_qdrant["env"]["COMPACT_EMBEDDING_MODEL"] = "BAAI/bge-small-en"
-        self.assertEqual(upgraded["qdrant"], fresh_qdrant)
+        fresh_compact = copy.deepcopy(fresh["compact"])
+        fresh_compact["env"]["COMPACT_EMBEDDING_MODEL"] = "BAAI/bge-small-en"
+        self.assertEqual(upgraded["compact"], fresh_compact)
 
     def test_a_second_upgrade_changes_nothing(self):
         run_upgrade(self.target_repo, REPO_ROOT, _VENV_PYTHON, auto_yes=True)
@@ -2324,8 +2354,10 @@ class CbIndexerToolsRenamed(unittest.TestCase):
     def _apply(self, mcp_json, settings):
         return _migration(self._ID).apply(mcp_json, settings, _ctx())[1]
 
-    def test_registered_last_so_it_runs_after_the_server_script_migrations(self):
-        self.assertEqual(MIGRATIONS[-1].id, self._ID)
+    def test_registered_after_the_server_script_migrations(self):
+        # compact-server-renamed comes after it and is the last one.
+        self.assertEqual(MIGRATIONS[-2].id, self._ID)
+        self.assertEqual(MIGRATIONS[-1].id, "compact-server-renamed")
 
     def test_not_pending_without_permissions_or_matchers(self):
         self.assertFalse(_migration(self._ID).detect(self._mcp(), {}))
@@ -2598,7 +2630,232 @@ class CbIndexerClaudeMdRenamed(unittest.TestCase):
         self.assertIn("`codebase-indexer` server", template)
 
     def test_the_migration_is_registered_after_the_manifest_one(self):
-        self.assertEqual([m.id for m in REPO_MIGRATIONS][-1], self._ID)
+        self.assertEqual([m.id for m in REPO_MIGRATIONS][1], self._ID)
+
+
+class CompactServerRenamed(unittest.TestCase):
+    """compact-server-renamed: the `.mcp.json` block that launches the old
+    qdrant_mcp_server.py becomes `compact`, found by shape, never by its key."""
+
+    _ID = "compact-server-renamed"
+
+    def _block(self, script="/r/mcpservers/qdrant_mcp_server.py", **extra):
+        return {"command": "/v/bin/python", "type": "stdio", "args": [script],
+                "env": {"COLLECTION_NAME": "p", "COMPACT_COLLECTION": "c", "QDRANT_API_KEY": "k"}, **extra}
+
+    def _apply(self, mcp_json):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            result = _migration(self._ID).apply(mcp_json, {"a": 1}, _ctx())
+        return result[0], result[1], out.getvalue()
+
+    def test_detect_by_shape_under_any_key(self):
+        m = _migration(self._ID)
+        for key in ("qdrant", "my-compacts", "compact"):
+            with self.subTest(key=key):
+                self.assertTrue(m.detect({"mcpServers": {key: self._block()}}, {}))
+
+    def test_detect_false_once_renamed_or_for_unrelated_blocks(self):
+        m = _migration(self._ID)
+        self.assertFalse(m.detect({"mcpServers": {"compact": self._block("/r/mcpservers/compact_mcp_server.py")}}, {}))
+        # A block keyed `qdrant` that launches something else is the user's own server.
+        self.assertFalse(m.detect({"mcpServers": {"qdrant": {"command": "node", "args": ["server.js"]}}}, {}))
+        self.assertFalse(m.detect({"mcpServers": {"qdrant": {"command": "/v/bin/mcp-server-qdrant"}}}, {}))
+        self.assertFalse(m.detect({}, {}))
+
+    def test_apply_renames_in_place_keeping_env_and_every_other_server(self):
+        before = {"mcpServers": {"a": {"x": 1}, "qdrant": self._block(), "z": {"y": 2}}, "other": True}
+        snapshot = copy.deepcopy(before)
+        after, settings, _ = self._apply(before)
+        self.assertEqual(before, snapshot, "must not mutate its input")
+        self.assertEqual(list(after["mcpServers"]), ["a", "compact", "z"])
+        self.assertEqual(after["mcpServers"]["compact"], self._block("/r/mcpservers/compact_mcp_server.py"))
+        self.assertEqual(after["mcpServers"]["a"], {"x": 1})
+        self.assertEqual(after["other"], True)
+        self.assertEqual(settings, {"a": 1})
+
+    def test_apply_finds_a_block_the_user_keyed_something_else_and_keeps_a_windows_path(self):
+        before = {"mcpServers": {"my-compacts": self._block("C:\\r\\mcpservers\\qdrant_mcp_server.py")}}
+        after, _, _ = self._apply(before)
+        self.assertEqual(list(after["mcpServers"]), ["compact"])
+        self.assertEqual(after["mcpServers"]["compact"]["args"], ["C:\\r\\mcpservers\\compact_mcp_server.py"])
+
+    def test_apply_on_a_block_already_keyed_compact_only_fixes_the_script(self):
+        after, _, _ = self._apply({"mcpServers": {"compact": self._block()}})
+        self.assertEqual(after["mcpServers"]["compact"]["args"], ["/r/mcpservers/compact_mcp_server.py"])
+
+    def test_two_matching_blocks_stop_and_report_instead_of_picking_one(self):
+        before = {"mcpServers": {"one": self._block(), "two": self._block()}}
+        after, _, printed = self._apply(before)
+        self.assertEqual(after, before)
+        self.assertIn("one, two", printed)
+        self.assertTrue(_migration(self._ID).detect(after, {}), "stays pending")
+
+    def test_a_different_block_already_called_compact_stops(self):
+        before = {"mcpServers": {"qdrant": self._block(), "compact": {"command": "node"}}}
+        after, _, printed = self._apply(before)
+        self.assertEqual(after, before)
+        self.assertIn("already has a different 'compact' block", printed)
+
+    def test_a_script_still_under_the_old_tools_folder_waits_for_the_move(self):
+        before = {"mcpServers": {"qdrant": self._block("/r/tools/qdrant_mcp_server.py")}}
+        after, _, printed = self._apply(before)
+        self.assertEqual(after, before)
+        self.assertIn("mcp-server-scripts-moved", printed)
+
+    def test_idempotent(self):
+        once, _, _ = self._apply({"mcpServers": {"qdrant": self._block()}})
+        self.assertFalse(_migration(self._ID).detect(once, {}))
+
+
+class CompactServerSettingsRenamed(unittest.TestCase):
+    """compact-server-settings-renamed: `.claude/settings.json` (matcher and
+    permissions) and `.claude/settings.local.json` follow the renamed server."""
+
+    _ID = "compact-server-settings-renamed"
+    _OLD_ALT = "mcp__qdrant__(?:compact_store|compact_find|compact_prune)$"
+    _SPLUNK = "mcp__claude_ai_Splunk__.*"
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.repo = Path(self._tmpdir.name) / "proj"
+        (self.repo / ".claude").mkdir(parents=True)
+
+    def _write_mcp(self, key="qdrant", script="qdrant_mcp_server.py"):
+        block = {"command": "/v/bin/python", "args": [f"/r/mcpservers/{script}"], "env": {"COLLECTION_NAME": "p"}}
+        (self.repo / ".mcp.json").write_text(json.dumps({"mcpServers": {key: block}}), encoding="utf-8")
+
+    def _write_settings(self, matcher=None, allow=None):
+        matcher = matcher or f"{_OLD_MATCHER}|{self._OLD_ALT}|{self._SPLUNK}"
+        data = {
+            "permissions": {
+                "allow": allow or ["mcp__qdrant__compact_find", "Bash(git:*)"],
+                "deny": ["mcp__qdrant__compact_prune"],
+            },
+            "hooks": {"PostToolUse": [{"matcher": matcher, "hooks": [{"args": ["/x/hooks/compress_output.py"]}]}]},
+        }
+        (self.repo / ".claude" / "settings.json").write_text(json.dumps(data), encoding="utf-8")
+
+    def _write_local(self, enabled=("qdrant", "memory-bank"), disabled=None):
+        data = {"enabledMcpjsonServers": list(enabled), "other": 1}
+        if disabled is not None:
+            data["disabledMcpjsonServers"] = list(disabled)
+        (self.repo / ".claude" / "settings.local.json").write_text(json.dumps(data), encoding="utf-8")
+
+    def _read(self, name):
+        return json.loads((self.repo / ".claude" / name).read_text(encoding="utf-8"))
+
+    def _snapshot(self):
+        files = {p.name: p.read_bytes() for p in (self.repo / ".claude").iterdir()}
+        files[".mcp.json"] = (self.repo / ".mcp.json").read_bytes()
+        return files
+
+    def _upgrade(self, **kw):
+        with redirect_stdout(io.StringIO()):
+            return run_upgrade(self.repo, REPO_ROOT, _VENV_PYTHON, **kw)
+
+    def test_a_full_upgrade_moves_the_block_the_matcher_the_rules_and_the_approval(self):
+        self._write_mcp()
+        self._write_settings()
+        self._write_local(disabled=["qdrant"])
+        applied = self._upgrade(auto_yes=True)
+        self.assertIn("compact-server-renamed", applied)
+        self.assertIn(self._ID, applied)
+        mcp = json.loads((self.repo / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"]
+        self.assertIn("compact", mcp)
+        self.assertNotIn("qdrant", mcp)
+        settings = self._read("settings.json")
+        self.assertEqual(
+            settings["hooks"]["PostToolUse"][0]["matcher"], f"{_OLD_MATCHER}|{COMPACT_TOOLS_MATCHER}|{self._SPLUNK}"
+        )
+        self.assertEqual(settings["permissions"]["allow"], ["mcp__compact__compact_find", "Bash(git:*)"])
+        self.assertEqual(settings["permissions"]["deny"], ["mcp__compact__compact_prune"])
+        local = self._read("settings.local.json")
+        self.assertEqual(local["enabledMcpjsonServers"], ["compact", "memory-bank"])
+        self.assertEqual(local["disabledMcpjsonServers"], ["compact"])
+        self.assertEqual(local["other"], 1)
+
+    def test_a_second_run_changes_nothing(self):
+        self._write_mcp()
+        self._write_settings()
+        self._write_local()
+        self._upgrade(auto_yes=True)
+        snapshot = self._snapshot()
+        self.assertEqual(self._upgrade(auto_yes=True), [])
+        self.assertEqual(self._snapshot(), snapshot)
+
+    def test_a_block_with_any_other_key_is_found_by_shape_and_its_entries_follow(self):
+        self._write_mcp(key="my-compacts")
+        matcher = f"Bash|{self._OLD_ALT.replace('qdrant', 'my-compacts')}"
+        self._write_settings(matcher=matcher, allow=["mcp__my-compacts__compact_store"])
+        self._write_local(enabled=("my-compacts", "qdrant"))
+        self._upgrade(auto_yes=True)
+        self.assertEqual(self._read("settings.json")["hooks"]["PostToolUse"][0]["matcher"], f"Bash|{COMPACT_TOOLS_MATCHER}")
+        self.assertEqual(self._read("settings.json")["permissions"]["allow"], ["mcp__compact__compact_store"])
+        # The user's own `qdrant` entry is not the renamed server, so it stays.
+        self.assertEqual(self._read("settings.local.json")["enabledMcpjsonServers"], ["compact", "qdrant"])
+
+    def test_the_local_settings_file_is_not_created_when_absent(self):
+        # (settings.json can appear for other reasons: other migrations add hooks to it.)
+        self._write_mcp()
+        self._upgrade(auto_yes=True)
+        self.assertFalse((self.repo / ".claude" / "settings.local.json").exists())
+        self.assertFalse(_repo_migration(self._ID).detect(self.repo))
+
+    def test_local_settings_without_the_lists_are_left_alone(self):
+        self._write_mcp()
+        (self.repo / ".claude" / "settings.local.json").write_text('{"permissions": {}}', encoding="utf-8")
+        before = (self.repo / ".claude" / "settings.local.json").read_bytes()
+        self._upgrade(auto_yes=True)
+        self.assertEqual((self.repo / ".claude" / "settings.local.json").read_bytes(), before)
+
+    def test_declining_the_block_rename_leaves_the_settings_alone(self):
+        self._write_mcp()
+        self._write_settings()
+        self._write_local()
+        before_local = (self.repo / ".claude" / "settings.local.json").read_bytes()
+        self._upgrade(prompt_fn=lambda m, i, t: m.id != "compact-server-renamed")
+        self.assertEqual((self.repo / ".claude" / "settings.local.json").read_bytes(), before_local)
+        settings = self._read("settings.json")
+        self.assertIn("mcp__qdrant__compact_find", settings["permissions"]["allow"])
+        self.assertIn(self._OLD_ALT, settings["hooks"]["PostToolUse"][0]["matcher"])
+        # ...and it is still pending, so the next run finishes the job.
+        self.assertTrue(_repo_migration(self._ID).detect(self.repo))
+
+    def test_a_matcher_that_already_has_the_new_alternative_does_not_get_it_twice(self):
+        self._write_mcp()
+        self._write_settings(matcher=f"{_OLD_MATCHER}|{self._OLD_ALT}|{COMPACT_TOOLS_MATCHER}")
+        self._upgrade(auto_yes=True)
+        matcher = self._read("settings.json")["hooks"]["PostToolUse"][0]["matcher"]
+        self.assertEqual(matcher.count(COMPACT_TOOLS_MATCHER), 1)
+        self.assertNotIn("qdrant", matcher)
+
+    def test_a_matcher_the_toolkit_did_not_write_is_not_touched(self):
+        self._write_mcp()
+        block = {"matcher": "mcp__qdrant__.*", "hooks": [{"args": ["/x/other_hook.py"]}]}
+        data = {"hooks": {"PostToolUse": [block]}}
+        (self.repo / ".claude" / "settings.json").write_text(json.dumps(data), encoding="utf-8")
+        self._upgrade(auto_yes=True)
+        self.assertIn(block, self._read("settings.json")["hooks"]["PostToolUse"])
+
+    def test_ambiguous_old_blocks_leave_the_settings_alone(self):
+        block = {"command": "py", "args": ["/r/mcpservers/qdrant_mcp_server.py"]}
+        (self.repo / ".mcp.json").write_text(json.dumps({"mcpServers": {"one": block, "two": block}}), encoding="utf-8")
+        self._write_settings()
+        self._upgrade(auto_yes=True)
+        settings = self._read("settings.json")
+        self.assertIn("mcp__qdrant__compact_find", settings["permissions"]["allow"])
+        self.assertIn(self._OLD_ALT, settings["hooks"]["PostToolUse"][0]["matcher"])
+
+    def test_a_real_server_of_the_users_own_called_qdrant_is_never_renamed(self):
+        (self.repo / ".mcp.json").write_text(
+            json.dumps({"mcpServers": {"compact": {"command": "py", "args": ["/r/mcpservers/compact_mcp_server.py"]},
+                                       "qdrant": {"command": "node", "args": ["theirs.js"]}}}),
+            encoding="utf-8",
+        )
+        self._write_local()
+        self.assertFalse(_repo_migration(self._ID).detect(self.repo))
 
 
 if __name__ == "__main__":

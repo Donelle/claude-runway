@@ -33,7 +33,7 @@ from typing import Iterable, Optional
 # (templates/mcp.json.template). A tool name in a transcript is
 # `mcp__<server>__<tool>`. "Every always-on server" statistics (the survey's
 # per-server counts and its "all N servers" line) use this tuple alone.
-TOOLKIT_SERVERS = ("qdrant", "codebase-indexer", "memory-bank", "local-compress")
+TOOLKIT_SERVERS = ("compact", "codebase-indexer", "memory-bank", "local-compress")
 
 # Servers that exist only when the user opted in, so most projects and every older
 # transcript lack them. `analytics` is written by `init --track-savings` (and offered

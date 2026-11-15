@@ -639,7 +639,7 @@ class MainThreadsAgentFieldsToRecordEvent(unittest.TestCase):
         self._run_main({
             "session_id": "s", "cwd": "/repos/p",
             "agent_id": "agent-9", "agent_type": "Explore",
-            "tool_name": "mcp__qdrant__compact_find",
+            "tool_name": "mcp__compact__compact_find",
             "tool_response": "STORED COMPACT CONTENT. " * 200,
         })
         kwargs = self._single_call_kwargs()
@@ -757,7 +757,7 @@ class MainThreadsCharsAndToolUseId(MainThreadsAgentFieldsToRecordEvent):
     def test_generic_mcp_path_forwards_tool_use_id(self):
         self._run_main({
             "session_id": "s", "cwd": "/repos/p", "tool_use_id": "toolu_gen",
-            "tool_name": "mcp__qdrant__compact_find",
+            "tool_name": "mcp__compact__compact_find",
             "tool_response": "STORED COMPACT CONTENT. " * 200,
         })
         self.assertEqual(self._single_call_kwargs().get("tool_use_id"), "toolu_gen")
@@ -789,7 +789,7 @@ async def _fake_compress(text, skip_if_under_chars=2000, **kwargs):
 
 class MainFallsBackToGenericForNonEnvelopeMcpTools(unittest.TestCase):
     """An MCP tool call that carries NO savings envelope
-    (mcp__qdrant__compact_find / compact_store, mcp__local-compress__list_local_models
+    (mcp__compact__compact_find / compact_store, mcp__local-compress__list_local_models
     -- none of these ever call _attach_savings_metrics) must still get the same
     size-based compression every other matched tool gets, not a silent no-op
     regardless of size. Exception: every tool on the analytics
@@ -834,7 +834,7 @@ class MainFallsBackToGenericForNonEnvelopeMcpTools(unittest.TestCase):
         payload = {
             "session_id": "sess-1",
             "cwd": "/repos/my-project",
-            "tool_name": "mcp__qdrant__compact_find",
+            "tool_name": "mcp__compact__compact_find",
             "tool_response": big_response,
         }
         printed = self._run_main(payload)
@@ -843,7 +843,7 @@ class MainFallsBackToGenericForNonEnvelopeMcpTools(unittest.TestCase):
         self.assertIn("GIST", printed)
         self.assertEqual(len(self.stub.calls), 1)
         args, kwargs = self.stub.calls[0]
-        self.assertEqual(args[1], "hook:mcp__qdrant__compact_find")
+        self.assertEqual(args[1], "hook:mcp__compact__compact_find")
         self.assertEqual(kwargs.get("project"), "my-project")
 
     def test_small_no_envelope_response_is_left_untouched(self):
@@ -854,7 +854,7 @@ class MainFallsBackToGenericForNonEnvelopeMcpTools(unittest.TestCase):
         payload = {
             "session_id": "sess-1",
             "cwd": "/repos/my-project",
-            "tool_name": "mcp__qdrant__compact_find",
+            "tool_name": "mcp__compact__compact_find",
             "tool_response": small_response,
         }
         printed = self._run_main(payload)
@@ -914,7 +914,7 @@ class MainFallsBackToGenericForNonEnvelopeMcpTools(unittest.TestCase):
         self.assertGreater(len(big), hook.THRESHOLD)
         printed = self._run_main({
             "session_id": "sess-1", "cwd": "/repos/my-project",
-            "tool_name": "mcp__qdrant__compact_prune", "tool_response": big,
+            "tool_name": "mcp__compact__compact_prune", "tool_response": big,
         })
         self.assertEqual(printed, "")
         self.assertEqual(len(self.stub.calls), 0)
@@ -924,10 +924,10 @@ class MainFallsBackToGenericForNonEnvelopeMcpTools(unittest.TestCase):
         self.assertGreater(len(big), hook.THRESHOLD)
         printed = self._run_main({
             "session_id": "sess-1", "cwd": "/repos/my-project",
-            "tool_name": "mcp__qdrant__compact_store", "tool_response": big,
+            "tool_name": "mcp__compact__compact_store", "tool_response": big,
         })
         self.assertIn("updatedToolOutput", printed)
-        self.assertEqual(self.stub.calls[0][0][1], "hook:mcp__qdrant__compact_store")
+        self.assertEqual(self.stub.calls[0][0][1], "hook:mcp__compact__compact_store")
 
     def test_qdrant_find_and_store_are_never_compressed_however_large(self):
         # Their results are code locations and stored notes Claude acts on
@@ -940,7 +940,7 @@ class MainFallsBackToGenericForNonEnvelopeMcpTools(unittest.TestCase):
                 self.stub.calls.clear()
                 printed = self._run_main({
                     "session_id": "sess-1", "cwd": "/repos/my-project",
-                    "tool_name": f"mcp__qdrant__{bare_name}", "tool_response": [big],
+                    "tool_name": f"mcp__compact__{bare_name}", "tool_response": [big],
                 })
                 self.assertEqual(printed, "", f"{bare_name} must be a true no-op here")
                 self.assertEqual(len(self.stub.calls), 0)
@@ -1058,7 +1058,7 @@ class CompactFindMultiEntryIsNeverGenericallyCompressed(unittest.TestCase):
         payload = {
             "session_id": "sess-1",
             "cwd": "/repos/claude-runway",
-            "tool_name": "mcp__qdrant__compact_find",
+            "tool_name": "mcp__compact__compact_find",
             "tool_response": response,
         }
         printed = self._run_main(payload)
@@ -1073,7 +1073,7 @@ class CompactFindMultiEntryIsNeverGenericallyCompressed(unittest.TestCase):
         payload = {
             "session_id": "sess-1",
             "cwd": "/repos/claude-runway",
-            "tool_name": "mcp__qdrant__compact_find",
+            "tool_name": "mcp__compact__compact_find",
             "tool_response": response,
         }
         printed = self._run_main(payload)
@@ -1091,7 +1091,7 @@ class CompactFindMultiEntryIsNeverGenericallyCompressed(unittest.TestCase):
         payload = {
             "session_id": "sess-1",
             "cwd": "/repos/claude-runway",
-            "tool_name": "mcp__qdrant__compact_find",
+            "tool_name": "mcp__compact__compact_find",
             "tool_response": response,
         }
         printed = self._run_main(payload)
@@ -1106,7 +1106,7 @@ class CompactFindMultiEntryIsNeverGenericallyCompressed(unittest.TestCase):
         payload = {
             "session_id": "sess-1",
             "cwd": "/repos/claude-runway",
-            "tool_name": "mcp__qdrant__compact_find",
+            "tool_name": "mcp__compact__compact_find",
             "tool_response": response,
         }
         printed = self._run_main(payload)
@@ -1133,18 +1133,18 @@ class SettingsTemplateMatcherCoversTheCompactTools(unittest.TestCase):
     def test_compact_tools_on_the_qdrant_server_are_matched(self):
         matcher = self._template_matcher()
         for name in ("compact_store", "compact_find", "compact_prune"):
-            self.assertTrue(self._matches(matcher, f"mcp__qdrant__{name}"), name)
+            self.assertTrue(self._matches(matcher, f"mcp__compact__{name}"), name)
 
     def test_qdrant_find_and_store_are_not_matched(self):
         matcher = self._template_matcher()
         for name in ("cb_indexer_find_repo", "cb_indexer_store_repo"):
-            self.assertFalse(self._matches(matcher, f"mcp__qdrant__{name}"), name)
+            self.assertFalse(self._matches(matcher, f"mcp__compact__{name}"), name)
 
     def test_the_local_compress_server_is_still_matched(self):
         self.assertTrue(self._matches(self._template_matcher(), "mcp__local-compress__compress_file"))
 
     def test_the_hook_docstring_shows_the_same_qdrant_alternative_as_the_template(self):
-        alternative = "mcp__qdrant__(?:compact_store|compact_find|compact_prune)$"
+        alternative = "mcp__compact__(?:compact_store|compact_find|compact_prune)$"
         self.assertIn(alternative, self._template_matcher())
         self.assertIn(alternative, hook.__doc__ or "")
 

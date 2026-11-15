@@ -1,6 +1,6 @@
 # Skill: cr-compact
 
-Locally summarize and persist the current conversation to Qdrant so it can be restored in a fresh session with `/cr-resume`. Everything stays local — `compact_store` (on the `qdrant` MCP server) compresses the summary on LM Studio and stores it in Qdrant, in one call. No Anthropic tokens are spent on the compression step, and the summary passes through your output only once.
+Locally summarize and persist the current conversation to Qdrant so it can be restored in a fresh session with `/cr-resume`. Everything stays local — `compact_store` (on the `compact` MCP server) compresses the summary on LM Studio and stores it in Qdrant, in one call. No Anthropic tokens are spent on the compression step, and the summary passes through your output only once.
 
 Optional argument: a short label to identify this compact (e.g., `/cr-compact "auth middleware refactor"`). If omitted, `compact_store` derives the label server-side from the first sentence of "## What we were working on" in the structured summary — you do not need to extract it yourself.
 
@@ -42,7 +42,7 @@ LABEL: <label from step 2, or omit/leave blank if using server-side derivation>
 <anything left open, unclear, or deferred>
 ```
 
-4. **Store it by calling `compact_store`** (on the `qdrant` MCP server) with:
+4. **Store it by calling `compact_store`** (on the `compact` MCP server) with:
    - `information`: the full structured summary from step 3, exactly as you filled in the template. Do NOT compress it yourself first: `compact_store` compresses it on the local model before storing it, and it asks for what a handoff needs (every file path, identifier and command kept verbatim, every `##` section kept). A second compression pass here would only throw away what that one preserves.
    - `project`: the working directory name from step 1
    - `label`: the label from step 2 — omit this parameter (or pass `""`) if no argument was given; the server derives it automatically from the summary

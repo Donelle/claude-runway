@@ -100,9 +100,9 @@ class BuildMcpServers(unittest.TestCase):
 
     def test_qdrant_runs_this_repos_own_server_under_the_venv_interpreter(self):
         servers = self._build()
-        self.assertEqual(servers["qdrant"]["command"], "/home/user/tools/claude-runway/.venv/bin/python")
+        self.assertEqual(servers["compact"]["command"], "/home/user/tools/claude-runway/.venv/bin/python")
         self.assertEqual(
-            servers["qdrant"]["args"], ["/home/user/tools/claude-runway/mcpservers/qdrant_mcp_server.py"]
+            servers["compact"]["args"], ["/home/user/tools/claude-runway/mcpservers/compact_mcp_server.py"]
         )
 
     def test_codebase_indexer_runs_the_renamed_script(self):
@@ -114,7 +114,7 @@ class BuildMcpServers(unittest.TestCase):
         )
 
     def test_qdrant_block_no_longer_carries_the_third_party_servers_settings(self):
-        env = self._build()["qdrant"]["env"]
+        env = self._build()["compact"]["env"]
         for gone in ("HF_HUB_OFFLINE", "FASTEMBED_CACHE_PATH", "TOOL_FIND_DESCRIPTION", "TOOL_STORE_DESCRIPTION"):
             self.assertNotIn(gone, env)
 
@@ -124,7 +124,7 @@ class BuildMcpServers(unittest.TestCase):
             self.assertTrue(block["args"][0].endswith("_mcp_server.py"), name)
 
     def test_qdrant_block_carries_the_compact_and_lm_studio_settings(self):
-        env = self._build(lmstudio_url="http://lm:1234/v1", lmstudio_model="my-model")["qdrant"]["env"]
+        env = self._build(lmstudio_url="http://lm:1234/v1", lmstudio_model="my-model")["compact"]["env"]
         self.assertEqual(env["COMPACT_COLLECTION"], "conversation-compacts")
         self.assertEqual(env["CLAUDE_RUNWAY_LMSTUDIO_URL"], "http://lm:1234/v1")
         self.assertEqual(env["CLAUDE_RUNWAY_LMSTUDIO_MODEL"], "my-model")
@@ -135,7 +135,7 @@ class BuildMcpServers(unittest.TestCase):
         # block carries the values even with no local-compress server.
         servers = self._build(include_compress=False, lmstudio_model="my-model")
         self.assertNotIn("local-compress", servers)
-        self.assertEqual(servers["qdrant"]["env"]["CLAUDE_RUNWAY_LMSTUDIO_MODEL"], "my-model")
+        self.assertEqual(servers["compact"]["env"]["CLAUDE_RUNWAY_LMSTUDIO_MODEL"], "my-model")
 
     def test_local_compress_block_no_longer_carries_qdrant_or_compact_settings(self):
         env = self._build()["local-compress"]["env"]
@@ -204,26 +204,32 @@ class BuildMcpServers(unittest.TestCase):
         self.assertIn("my-own", merged["mcpServers"])
 
     def test_compact_embedding_model_blank_leaves_the_template_default(self):
-        env = self._build(compact_embedding_model="")["qdrant"]["env"]
-        self.assertEqual(env["COMPACT_EMBEDDING_MODEL"], MCP_TEMPLATE["mcpServers"]["qdrant"]["env"]["COMPACT_EMBEDDING_MODEL"])
+        env = self._build(compact_embedding_model="")["compact"]["env"]
+        self.assertEqual(env["COMPACT_EMBEDDING_MODEL"], MCP_TEMPLATE["mcpServers"]["compact"]["env"]["COMPACT_EMBEDDING_MODEL"])
 
     def test_compact_embedding_model_explicit_value_used_verbatim(self):
-        env = self._build(compact_embedding_model="BAAI/bge-small-en")["qdrant"]["env"]
+        env = self._build(compact_embedding_model="BAAI/bge-small-en")["compact"]["env"]
         self.assertEqual(env["COMPACT_EMBEDDING_MODEL"], "BAAI/bge-small-en")
         # ... and never leaks into the code-index model.
         self.assertNotEqual(env["EMBEDDING_MODEL"], "BAAI/bge-small-en")
 
     def test_collection_name_applied_to_both_qdrant_and_indexer(self):
         servers = self._build()
-        self.assertEqual(servers["qdrant"]["env"]["COLLECTION_NAME"], "my-project")
+        self.assertEqual(servers["compact"]["env"]["COLLECTION_NAME"], "my-project")
         self.assertEqual(servers["codebase-indexer"]["env"]["COLLECTION_NAME"], "my-project")
 
     def test_include_compress_false_omits_the_server(self):
         servers = self._build(include_compress=False)
         self.assertNotIn("local-compress", servers)
         # Omitting it shouldn't disturb the other two.
-        self.assertIn("qdrant", servers)
+        self.assertIn("compact", servers)
         self.assertIn("codebase-indexer", servers)
+
+    def test_a_fresh_init_writes_a_compact_block_and_no_qdrant_block(self):
+        servers = self._build()
+        self.assertIn("compact", servers)
+        self.assertNotIn("qdrant", servers)
+        self.assertTrue(servers["compact"]["args"][0].endswith("mcpservers/compact_mcp_server.py"))
 
     def test_original_template_dict_is_not_mutated(self):
         before = json.dumps(MCP_TEMPLATE, sort_keys=True)
@@ -237,13 +243,13 @@ class BuildMcpServers(unittest.TestCase):
         # talks to Qdrant -- qdrant, codebase-indexer and memory-bank (the
         # local-compress server no longer talks to Qdrant at all).
         servers = self._build(qdrant_api_key="my-secret-key")
-        self.assertEqual(servers["qdrant"]["env"]["QDRANT_API_KEY"], "my-secret-key")
+        self.assertEqual(servers["compact"]["env"]["QDRANT_API_KEY"], "my-secret-key")
         self.assertEqual(servers["codebase-indexer"]["env"]["QDRANT_API_KEY"], "my-secret-key")
         self.assertEqual(servers["memory-bank"]["env"]["QDRANT_API_KEY"], "my-secret-key")
 
     def test_qdrant_api_key_defaults_to_blank_for_unauthenticated_local_qdrant(self):
         servers = self._build()
-        self.assertEqual(servers["qdrant"]["env"]["QDRANT_API_KEY"], "")
+        self.assertEqual(servers["compact"]["env"]["QDRANT_API_KEY"], "")
         self.assertEqual(servers["codebase-indexer"]["env"]["QDRANT_API_KEY"], "")
 
     def test_compact_collection_defaults_to_the_shared_historical_name(self):
@@ -254,7 +260,7 @@ class BuildMcpServers(unittest.TestCase):
         # project's COMPACT_COLLECTION has only ever
         # held this one constant so far (this function never touched the
         # key at all originally) -- orphaning that project's entire
-        # conversation-compact history, since qdrant_mcp_server.py's
+        # conversation-compact history, since compact_mcp_server.py's
         # sibling-scan/canonical-name computation both key off this exact
         # string. A per-project default is still worth having for NEW
         # setups -- that's what /cr-setup's own Q5 computes
@@ -262,19 +268,19 @@ class BuildMcpServers(unittest.TestCase):
         # passes --collection-name rather than relying on this function's
         # own bare fallback.
         servers = self._build()
-        self.assertEqual(servers["qdrant"]["env"]["COMPACT_COLLECTION"], "conversation-compacts")
+        self.assertEqual(servers["compact"]["env"]["COMPACT_COLLECTION"], "conversation-compacts")
 
     def test_compact_collection_explicit_value_used_verbatim(self):
         servers = self._build(compact_collection="my-custom-compacts")
-        self.assertEqual(servers["qdrant"]["env"]["COMPACT_COLLECTION"], "my-custom-compacts")
+        self.assertEqual(servers["compact"]["env"]["COMPACT_COLLECTION"], "my-custom-compacts")
 
     def test_compact_collection_never_left_blank(self):
         # Regression guard: os.environ.get("COMPACT_COLLECTION", "conversation-compacts")
-        # in qdrant_mcp_server.py only falls back when the key is ABSENT,
+        # in compact_mcp_server.py only falls back when the key is ABSENT,
         # not when it's present-but-empty -- an explicit "" here would build
         # a collection name with a leading stray hyphen at runtime.
         servers = self._build(compact_collection="")
-        self.assertNotEqual(servers["qdrant"]["env"]["COMPACT_COLLECTION"], "")
+        self.assertNotEqual(servers["compact"]["env"]["COMPACT_COLLECTION"], "")
 
     def test_memory_bank_server_generated_with_this_projects_repo_tag(self):
         servers = self._build()
@@ -407,18 +413,18 @@ class BuildSettingsHooks(unittest.TestCase):
 class MergeMcpJson(unittest.TestCase):
     def test_preserves_unrelated_existing_server(self):
         existing = {"mcpServers": {"github": {"command": "some-other-mcp-server"}}}
-        merged = merge_mcp_json(existing, {"qdrant": {"command": "x"}})
+        merged = merge_mcp_json(existing, {"compact": {"command": "x"}})
         self.assertIn("github", merged["mcpServers"])
-        self.assertIn("qdrant", merged["mcpServers"])
+        self.assertIn("compact", merged["mcpServers"])
 
     def test_overwrites_a_stale_previously_generated_server(self):
-        existing = {"mcpServers": {"qdrant": {"command": "stale-path"}}}
-        merged = merge_mcp_json(existing, {"qdrant": {"command": "fresh-path"}})
-        self.assertEqual(merged["mcpServers"]["qdrant"]["command"], "fresh-path")
+        existing = {"mcpServers": {"compact": {"command": "stale-path"}}}
+        merged = merge_mcp_json(existing, {"compact": {"command": "fresh-path"}})
+        self.assertEqual(merged["mcpServers"]["compact"]["command"], "fresh-path")
 
     def test_empty_existing_produces_just_the_generated_servers(self):
-        merged = merge_mcp_json({}, {"qdrant": {"command": "x"}})
-        self.assertEqual(merged, {"mcpServers": {"qdrant": {"command": "x"}}})
+        merged = merge_mcp_json({}, {"compact": {"command": "x"}})
+        self.assertEqual(merged, {"mcpServers": {"compact": {"command": "x"}}})
 
     def test_omitting_an_owned_server_this_run_removes_it_from_existing(self):
         # Regression for a review finding: re-running with
@@ -428,16 +434,16 @@ class MergeMcpJson(unittest.TestCase):
         # and never removes anything absent from generated_servers.
         existing = {
             "mcpServers": {
-                "qdrant": {"command": "old"},
+                "compact": {"command": "old"},
                 "local-compress": {"command": "old-compress"},
                 "github": {"command": "unrelated"},
             }
         }
-        generated_servers_qdrant_only = {"qdrant": {"command": "new"}, "codebase-indexer": {"command": "new-indexer"}}
+        generated_servers_qdrant_only = {"compact": {"command": "new"}, "codebase-indexer": {"command": "new-indexer"}}
         merged = merge_mcp_json(existing, generated_servers_qdrant_only)
         self.assertNotIn("local-compress", merged["mcpServers"])
         self.assertIn("github", merged["mcpServers"])  # untouched -- not a toolkit-owned key
-        self.assertEqual(merged["mcpServers"]["qdrant"]["command"], "new")
+        self.assertEqual(merged["mcpServers"]["compact"]["command"], "new")
 
 
 class MergeSettingsHooks(unittest.TestCase):
@@ -590,7 +596,7 @@ class RunSetupEndToEnd(unittest.TestCase):
     def test_collection_name_defaults_from_target_dir_name(self):
         result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
         self.assertEqual(
-            result.mcp_json["mcpServers"]["qdrant"]["env"]["COLLECTION_NAME"], "my-target-project"
+            result.mcp_json["mcpServers"]["compact"]["env"]["COLLECTION_NAME"], "my-target-project"
         )
 
     def test_compact_collection_defaults_to_the_shared_historical_name(self):
@@ -601,7 +607,7 @@ class RunSetupEndToEnd(unittest.TestCase):
         # already-configured project, not silently orphan its history.
         result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
         self.assertEqual(
-            result.mcp_json["mcpServers"]["qdrant"]["env"]["COMPACT_COLLECTION"],
+            result.mcp_json["mcpServers"]["compact"]["env"]["COMPACT_COLLECTION"],
             "conversation-compacts",
         )
 
@@ -660,7 +666,7 @@ class RunSetupEndToEnd(unittest.TestCase):
         # tools/setup_project.py's own docstring advertises) of an already-configured
         # project that has only ever used the shared default must produce
         # the SAME value both times, or its stored conversation-compact
-        # history becomes unreachable (see qdrant_mcp_server.py's
+        # history becomes unreachable (see compact_mcp_server.py's
         # _collections_for_project, which scans for siblings by this exact
         # prefix). Deriving the default from collection_name would have
         # failed this the moment build_mcp_servers() started resolving
@@ -671,8 +677,8 @@ class RunSetupEndToEnd(unittest.TestCase):
 
         second = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
         self.assertEqual(
-            first.mcp_json["mcpServers"]["qdrant"]["env"]["COMPACT_COLLECTION"],
-            second.mcp_json["mcpServers"]["qdrant"]["env"]["COMPACT_COLLECTION"],
+            first.mcp_json["mcpServers"]["compact"]["env"]["COMPACT_COLLECTION"],
+            second.mcp_json["mcpServers"]["compact"]["env"]["COMPACT_COLLECTION"],
         )
 
     def test_qdrant_only_omits_compress_server_and_settings_json(self):
@@ -745,7 +751,7 @@ class RunSetupEndToEnd(unittest.TestCase):
         )
         result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
         self.assertIn("github", result.mcp_json["mcpServers"])
-        self.assertIn("qdrant", result.mcp_json["mcpServers"])
+        self.assertIn("compact", result.mcp_json["mcpServers"])
 
     def test_rerun_does_not_duplicate_hook_blocks(self):
         first = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
@@ -795,7 +801,7 @@ class RunSetupEndToEnd(unittest.TestCase):
             self.target_repo, REPO_ROOT, home_dir=Path("/home/user"), include_compress=False, include_hooks=False
         )
         self.assertNotIn("local-compress", second.mcp_json["mcpServers"])
-        self.assertIn("qdrant", second.mcp_json["mcpServers"])
+        self.assertIn("compact", second.mcp_json["mcpServers"])
 
     def test_rerun_with_qdrant_only_also_removes_stale_hooks_from_a_prior_full_setup(self):
         # Regression for a review finding: --qdrant-only
@@ -874,7 +880,7 @@ class RunSetupEndToEnd(unittest.TestCase):
 
     # --- Init re-run must not reset a customized EMBEDDING_MODEL ---
 
-    _EMBED_SERVERS = ("qdrant", "codebase-indexer", "memory-bank")
+    _EMBED_SERVERS = ("compact", "codebase-indexer", "memory-bank")
     _CUSTOM_MODEL = "BAAI/bge-small-en"
 
     def _models(self, result):
@@ -888,7 +894,7 @@ class RunSetupEndToEnd(unittest.TestCase):
         (self.target_repo / ".mcp.json").write_text(json.dumps(cfg))
 
     def test_fresh_target_uses_template_default_embedding_model(self):
-        default = MCP_TEMPLATE["mcpServers"]["qdrant"]["env"]["EMBEDDING_MODEL"]
+        default = MCP_TEMPLATE["mcpServers"]["compact"]["env"]["EMBEDDING_MODEL"]
         result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
         self.assertEqual(set(self._models(result).values()), {default})
 
@@ -906,7 +912,7 @@ class RunSetupEndToEnd(unittest.TestCase):
         models = self._models(result)
         # Per-project code collections move to the new model; memory-bank's model is
         # its own value and is untouched.
-        self.assertEqual(models["qdrant"], new_model)
+        self.assertEqual(models["compact"], new_model)
         self.assertEqual(models["codebase-indexer"], new_model)
         self.assertEqual(models["memory-bank"], self._CUSTOM_MODEL)
         self.assertTrue(any("EMBEDDING_MODEL changed" in c and "WARNING" in c for c in result.changes))
@@ -931,7 +937,7 @@ class RunSetupEndToEnd(unittest.TestCase):
         self._drop_memory_bank_block()
         result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"), embedding_model=self._OTHER_MODEL)
         models = self._models(result)
-        self.assertEqual(models["qdrant"], self._OTHER_MODEL)
+        self.assertEqual(models["compact"], self._OTHER_MODEL)
         self.assertEqual(models["memory-bank"], MCP_TEMPLATE["mcpServers"]["memory-bank"]["env"]["EMBEDDING_MODEL"])
 
     def test_no_memory_bank_block_does_not_inherit_custom_code_model(self):
@@ -940,7 +946,7 @@ class RunSetupEndToEnd(unittest.TestCase):
         self._write_customized_existing_config(self._CUSTOM_MODEL)
         self._drop_memory_bank_block()
         models = self._models(run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user")))
-        self.assertEqual(models["qdrant"], self._CUSTOM_MODEL)
+        self.assertEqual(models["compact"], self._CUSTOM_MODEL)
         self.assertEqual(models["memory-bank"], MCP_TEMPLATE["mcpServers"]["memory-bank"]["env"]["EMBEDDING_MODEL"])
 
     def test_code_side_model_is_never_read_from_memory_bank_block(self):
@@ -949,12 +955,12 @@ class RunSetupEndToEnd(unittest.TestCase):
         first = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
         cfg = first.mcp_json
         cfg["mcpServers"]["memory-bank"]["env"]["EMBEDDING_MODEL"] = self._CUSTOM_MODEL
-        for s in ("qdrant", "codebase-indexer"):
+        for s in ("compact", "codebase-indexer"):
             del cfg["mcpServers"][s]["env"]["EMBEDDING_MODEL"]
         (self.target_repo / ".mcp.json").write_text(json.dumps(cfg))
         models = self._models(run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user")))
-        default = MCP_TEMPLATE["mcpServers"]["qdrant"]["env"]["EMBEDDING_MODEL"]
-        self.assertEqual(models["qdrant"], default)
+        default = MCP_TEMPLATE["mcpServers"]["compact"]["env"]["EMBEDDING_MODEL"]
+        self.assertEqual(models["compact"], default)
         self.assertEqual(models["codebase-indexer"], default)
         self.assertEqual(models["memory-bank"], self._CUSTOM_MODEL)
 
@@ -965,7 +971,7 @@ class RunSetupEndToEnd(unittest.TestCase):
         )
         models = self._models(result)
         self.assertEqual(models["memory-bank"], self._OTHER_MODEL)
-        self.assertEqual(models["qdrant"], self._CUSTOM_MODEL)
+        self.assertEqual(models["compact"], self._CUSTOM_MODEL)
         self.assertEqual(models["codebase-indexer"], self._CUSTOM_MODEL)
         self.assertTrue(
             any("memory-bank EMBEDDING_MODEL changed" in c and "WARNING" in c and "EVERY project" in c
@@ -992,7 +998,7 @@ class RunSetupEndToEnd(unittest.TestCase):
         self._set_memory_bank_model(self._OTHER_MODEL)
         models = self._models(run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user")))
         self.assertEqual(models["memory-bank"], self._OTHER_MODEL)
-        self.assertEqual(models["qdrant"], self._CUSTOM_MODEL)
+        self.assertEqual(models["compact"], self._CUSTOM_MODEL)
 
     def test_explicit_embedding_model_same_as_existing_does_not_warn(self):
         self._write_customized_existing_config(self._CUSTOM_MODEL)
@@ -1007,13 +1013,13 @@ class RunSetupEndToEnd(unittest.TestCase):
             self.target_repo, REPO_ROOT, home_dir=Path("/home/user"), embedding_model=self._CUSTOM_MODEL
         )
         models = self._models(result)
-        self.assertEqual({models["qdrant"], models["codebase-indexer"]}, {self._CUSTOM_MODEL})
+        self.assertEqual({models["compact"], models["codebase-indexer"]}, {self._CUSTOM_MODEL})
         self.assertEqual(models["memory-bank"], MCP_TEMPLATE["mcpServers"]["memory-bank"]["env"]["EMBEDDING_MODEL"])
         self.assertFalse(any("WARNING" in c for c in result.changes))
 
     def test_existing_config_without_embedding_model_falls_back_to_template(self):
-        default = MCP_TEMPLATE["mcpServers"]["qdrant"]["env"]["EMBEDDING_MODEL"]
-        (self.target_repo / ".mcp.json").write_text(json.dumps({"mcpServers": {"qdrant": {"env": {}}}}))
+        default = MCP_TEMPLATE["mcpServers"]["compact"]["env"]["EMBEDDING_MODEL"]
+        (self.target_repo / ".mcp.json").write_text(json.dumps({"mcpServers": {"compact": {"env": {}}}}))
         result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
         self.assertEqual(set(self._models(result).values()), {default})
 
@@ -1023,15 +1029,15 @@ class RunSetupEndToEnd(unittest.TestCase):
         # next toolkit block rather than to the template default.
         first = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
         cfg = first.mcp_json
-        del cfg["mcpServers"]["qdrant"]["env"]["EMBEDDING_MODEL"]
+        del cfg["mcpServers"]["compact"]["env"]["EMBEDDING_MODEL"]
         cfg["mcpServers"]["codebase-indexer"]["env"]["EMBEDDING_MODEL"] = self._CUSTOM_MODEL
         (self.target_repo / ".mcp.json").write_text(json.dumps(cfg))
         result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
         models = self._models(result)
-        self.assertEqual({models["qdrant"], models["codebase-indexer"]}, {self._CUSTOM_MODEL})
+        self.assertEqual({models["compact"], models["codebase-indexer"]}, {self._CUSTOM_MODEL})
 
     def test_build_mcp_servers_embedding_model_blank_keeps_template_default(self):
-        default = MCP_TEMPLATE["mcpServers"]["qdrant"]["env"]["EMBEDDING_MODEL"]
+        default = MCP_TEMPLATE["mcpServers"]["compact"]["env"]["EMBEDDING_MODEL"]
         servers = build_mcp_servers(
             MCP_TEMPLATE, collection_name="c", venv_python=Path("/v/bin/python"),
             tools_repo_dir=REPO_ROOT, home_dir=Path("/home/user"),
@@ -1437,7 +1443,7 @@ class CompactEmbeddingModelOnInit(unittest.TestCase):
         self.target_repo.mkdir()
 
     def _model(self, result):
-        return result.mcp_json["mcpServers"]["qdrant"]["env"]["COMPACT_EMBEDDING_MODEL"]
+        return result.mcp_json["mcpServers"]["compact"]["env"]["COMPACT_EMBEDDING_MODEL"]
 
     def _write(self, servers):
         (self.target_repo / ".mcp.json").write_text(json.dumps({"mcpServers": servers}), encoding="utf-8")
@@ -1454,29 +1460,29 @@ class CompactEmbeddingModelOnInit(unittest.TestCase):
         self.assertEqual(self._model(result), "c/d")
 
     def test_pre_move_install_without_the_key_is_pinned_to_the_legacy_model(self):
-        self._write({"qdrant": {"env": {}}, "local-compress": {"env": {"COMPACT_COLLECTION": "conversation-compacts"}}})
+        self._write({"compact": {"env": {}}, "local-compress": {"env": {"COMPACT_COLLECTION": "conversation-compacts"}}})
         self.assertEqual(self._model(self._run()), self.LEGACY)
 
     def test_pre_move_value_in_the_local_compress_block_is_carried_over(self):
-        self._write({"qdrant": {"env": {"EMBEDDING_MODEL": "a/b"}},
+        self._write({"compact": {"env": {"EMBEDDING_MODEL": "a/b"}},
                      "local-compress": {"env": {"EMBEDDING_MODEL": "x/custom"}}})
         result = self._run(embedding_model="c/d")
         self.assertEqual(self._model(result), "x/custom")
-        self.assertEqual(result.mcp_json["mcpServers"]["qdrant"]["env"]["EMBEDDING_MODEL"], "c/d")
+        self.assertEqual(result.mcp_json["mcpServers"]["compact"]["env"]["EMBEDDING_MODEL"], "c/d")
 
     def test_the_qdrant_blocks_own_value_wins_over_a_stale_local_compress_one(self):
-        self._write({"qdrant": {"env": {"COMPACT_EMBEDDING_MODEL": "x/current"}},
+        self._write({"compact": {"env": {"COMPACT_EMBEDDING_MODEL": "x/current"}},
                      "local-compress": {"env": {"EMBEDDING_MODEL": "x/stale"}}})
         self.assertEqual(self._model(self._run()), "x/current")
 
     def test_a_rerun_keeps_the_value_even_when_the_project_model_changes(self):
-        self._write({"qdrant": {"env": {"EMBEDDING_MODEL": "a/b", "COMPACT_EMBEDDING_MODEL": self.LEGACY}}})
+        self._write({"compact": {"env": {"EMBEDDING_MODEL": "a/b", "COMPACT_EMBEDDING_MODEL": self.LEGACY}}})
         result = self._run(embedding_model="c/d")
         self.assertEqual(self._model(result), self.LEGACY)
-        self.assertEqual(result.mcp_json["mcpServers"]["qdrant"]["env"]["EMBEDDING_MODEL"], "c/d")
+        self.assertEqual(result.mcp_json["mcpServers"]["compact"]["env"]["EMBEDDING_MODEL"], "c/d")
 
     def test_qdrant_only_rerun_keeps_the_value_after_local_compress_is_removed(self):
-        self._write({"qdrant": {"env": {"COMPACT_EMBEDDING_MODEL": self.LEGACY}}, "local-compress": {"env": {}}})
+        self._write({"compact": {"env": {"COMPACT_EMBEDDING_MODEL": self.LEGACY}}, "local-compress": {"env": {}}})
         result = self._run(include_compress=False)
         self.assertNotIn("local-compress", result.mcp_json["mcpServers"])
         self.assertEqual(self._model(result), self.LEGACY)
@@ -1487,11 +1493,11 @@ class CompactEmbeddingModelOnInit(unittest.TestCase):
         # so a missing block does not prove none was stored. Pinning legacy for a
         # project that never stored one costs nothing; the project model would
         # orphan one that did.
-        self._write({"qdrant": {"env": {"EMBEDDING_MODEL": "a/b"}}})
+        self._write({"compact": {"env": {"EMBEDDING_MODEL": "a/b"}}})
         self.assertEqual(self._model(self._run()), self.LEGACY)
 
     def test_a_previous_full_then_qdrant_only_config_keeps_the_legacy_model(self):
-        self._write({"qdrant": {"command": "/v/bin/mcp-server-qdrant", "env": {"COLLECTION_NAME": "p"}}})
+        self._write({"compact": {"command": "/v/bin/mcp-server-qdrant", "env": {"COLLECTION_NAME": "p"}}})
         result = self._run(include_compress=False, embedding_model="c/d")
         self.assertEqual(self._model(result), self.LEGACY)
         self.assertNotIn("local-compress", result.mcp_json["mcpServers"])
@@ -1512,10 +1518,10 @@ _BAD_MCP_JSON = [
     ("top level null", "null", "top level is a NoneType"),
     ("mcpServers null", '{"mcpServers": null}', '"mcpServers" is a NoneType'),
     ("mcpServers list", '{"mcpServers": []}', '"mcpServers" is a list'),
-    ("server null", '{"mcpServers": {"qdrant": null}}', '"qdrant" server is a NoneType'),
-    ("server env list", '{"mcpServers": {"qdrant": {"env": []}}}', '"qdrant"."env" is a list'),
-    ("server args not list", '{"mcpServers": {"qdrant": {"args": 1}}}', '"qdrant" server has "args"'),
-    ("server args non-string", '{"mcpServers": {"qdrant": {"args": [1]}}}', '"qdrant" server has "args"'),
+    ("server null", '{"mcpServers": {"compact": null}}', '"compact" server is a NoneType'),
+    ("server env list", '{"mcpServers": {"compact": {"env": []}}}', '"compact"."env" is a list'),
+    ("server args not list", '{"mcpServers": {"compact": {"args": 1}}}', '"compact" server has "args"'),
+    ("server args non-string", '{"mcpServers": {"compact": {"args": [1]}}}', '"compact" server has "args"'),
 ]
 
 _BAD_SETTINGS_JSON = [

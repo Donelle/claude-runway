@@ -265,7 +265,7 @@ class QdrantApiKeyNeverLeaksInOwnOutput(unittest.TestCase):
         args = _init_args(self.target_repo, qdrant_api_key="my-real-secret", dry_run=False)
         self.mod.cmd_init(args)
         written = json.loads((self.target_repo / ".mcp.json").read_text(encoding="utf-8"))
-        self.assertEqual(written["mcpServers"]["qdrant"]["env"]["QDRANT_API_KEY"], "my-real-secret")
+        self.assertEqual(written["mcpServers"]["compact"]["env"]["QDRANT_API_KEY"], "my-real-secret")
 
     def test_commit_warning_replaces_the_normal_commit_instruction(self):
         args = _init_args(self.target_repo, qdrant_api_key="my-real-secret", dry_run=False)
@@ -476,14 +476,14 @@ class CompactCollectionFlag(unittest.TestCase):
         self.mod.cmd_init(args)
         written = json.loads((self.target_repo / ".mcp.json").read_text(encoding="utf-8"))
         self.assertEqual(
-            written["mcpServers"]["qdrant"]["env"]["COMPACT_COLLECTION"], "conversation-compacts"
+            written["mcpServers"]["compact"]["env"]["COMPACT_COLLECTION"], "conversation-compacts"
         )
 
     def test_rerun_with_no_flag_does_not_drift_between_runs(self):
         # Regression for a review finding: a plain re-run
         # with no new flags must produce the SAME COMPACT_COLLECTION both
         # times on an already-configured project, or its conversation-compact
-        # history becomes unreachable (see qdrant_mcp_server.py's
+        # history becomes unreachable (see compact_mcp_server.py's
         # _collections_for_project, which scans for siblings by this exact
         # prefix).
         first_args = _init_args(self.target_repo, dry_run=False)
@@ -495,8 +495,8 @@ class CompactCollectionFlag(unittest.TestCase):
         second_written = json.loads((self.target_repo / ".mcp.json").read_text(encoding="utf-8"))
 
         self.assertEqual(
-            first_written["mcpServers"]["qdrant"]["env"]["COMPACT_COLLECTION"],
-            second_written["mcpServers"]["qdrant"]["env"]["COMPACT_COLLECTION"],
+            first_written["mcpServers"]["compact"]["env"]["COMPACT_COLLECTION"],
+            second_written["mcpServers"]["compact"]["env"]["COMPACT_COLLECTION"],
         )
 
     def test_explicit_value_is_used_verbatim(self):
@@ -504,7 +504,7 @@ class CompactCollectionFlag(unittest.TestCase):
         self.mod.cmd_init(args)
         written = json.loads((self.target_repo / ".mcp.json").read_text(encoding="utf-8"))
         self.assertEqual(
-            written["mcpServers"]["qdrant"]["env"]["COMPACT_COLLECTION"], "my-custom-compacts"
+            written["mcpServers"]["compact"]["env"]["COMPACT_COLLECTION"], "my-custom-compacts"
         )
 
 
@@ -525,26 +525,26 @@ class EmbeddingModelFlag(unittest.TestCase):
         written = json.loads((self.target_repo / ".mcp.json").read_text(encoding="utf-8"))
         return {
             s: written["mcpServers"][s]["env"]["EMBEDDING_MODEL"]
-            for s in ("qdrant", "codebase-indexer", "memory-bank")
+            for s in ("compact", "codebase-indexer", "memory-bank")
         }
 
     def test_flag_is_written_into_code_blocks_only_and_survives_a_plain_rerun(self):
         self.mod.cmd_init(_init_args(self.target_repo, embedding_model=self.CUSTOM, dry_run=False))
         models = self._written_models()
-        self.assertEqual({models["qdrant"], models["codebase-indexer"]}, {self.CUSTOM})
+        self.assertEqual({models["compact"], models["codebase-indexer"]}, {self.CUSTOM})
         # memory-bank's model is its own value, never taken from --embedding-model.
         self.assertNotEqual(models["memory-bank"], self.CUSTOM)
         # A plain re-run (no flag) must not reset it to the template default.
         self.mod.cmd_init(_init_args(self.target_repo, dry_run=False))
         again = self._written_models()
-        self.assertEqual({again["qdrant"], again["codebase-indexer"]}, {self.CUSTOM})
+        self.assertEqual({again["compact"], again["codebase-indexer"]}, {self.CUSTOM})
         self.assertEqual(again["memory-bank"], models["memory-bank"])
 
     def test_memory_bank_flag_is_written_into_memory_bank_block_only(self):
         self.mod.cmd_init(_init_args(self.target_repo, memory_bank_embedding_model=self.CUSTOM, dry_run=False))
         models = self._written_models()
         self.assertEqual(models["memory-bank"], self.CUSTOM)
-        self.assertNotEqual(models["qdrant"], self.CUSTOM)
+        self.assertNotEqual(models["compact"], self.CUSTOM)
         # Sticky across a plain re-run.
         self.mod.cmd_init(_init_args(self.target_repo, dry_run=False))
         self.assertEqual(self._written_models()["memory-bank"], self.CUSTOM)
@@ -768,8 +768,8 @@ class PipInstalledLayoutReminder(unittest.TestCase):
         with mock.patch.object(self.mod, "_pip_installed_venv_python", return_value=fake_python):
             self.mod.cmd_init(_init_args(self.target_repo, dry_run=False))
         mcp_json = json.loads(mcp_json_path.read_text(encoding="utf-8"))
-        self.assertEqual(mcp_json["mcpServers"]["qdrant"]["command"], "/opt/pipx/venvs/claude-runway/bin/python")
-        self.assertTrue(mcp_json["mcpServers"]["qdrant"]["args"][0].endswith("qdrant_mcp_server.py"))
+        self.assertEqual(mcp_json["mcpServers"]["compact"]["command"], "/opt/pipx/venvs/claude-runway/bin/python")
+        self.assertTrue(mcp_json["mcpServers"]["compact"]["args"][0].endswith("compact_mcp_server.py"))
 
     def test_clone_based_layout_keeps_the_original_reminder(self):
         # Mocked to None, the value _pip_installed_venv_python returns when
@@ -991,13 +991,13 @@ class UpgradeSubcommand(unittest.TestCase):
         self.addCleanup(home_patch.stop)
         # is_project_configured now gates
         # cmd_upgrade before it ever calls run_upgrade -- give this fixture
-        # a minimal, already-configured .mcp.json (a 'qdrant' server block
+        # a minimal, already-configured .mcp.json (a 'compact' server block
         # is the only thing that check looks for) so tests that mock
         # run_upgrade directly still reach it. test_nonexistent_target_repo_
         # errors_out and test_unconfigured_target_repo_errors_out below
         # cover the two refusal paths themselves.
         (self.target_repo / ".mcp.json").write_text(
-            json.dumps({"mcpServers": {"qdrant": {}}}), encoding="utf-8"
+            json.dumps({"mcpServers": {"compact": {}}}), encoding="utf-8"
         )
 
     def test_parse_args_target_repo_is_optional(self):
@@ -1073,7 +1073,7 @@ class UpgradeSubcommand(unittest.TestCase):
     def test_unconfigured_target_repo_errors_out(self):
         # Regression for the finding from Copilot review: a real,
         # existing directory that was simply never `init`'d (no .mcp.json,
-        # or one with no 'qdrant' server) must be refused with a clear error
+        # or one with no 'compact' server) must be refused with a clear error
         # and exit code, not silently write a broken partial config.
         unconfigured = Path(self._tmpdir.name) / "never-init-run"
         unconfigured.mkdir()
@@ -1274,7 +1274,7 @@ class UpgradeOffersSavingsTracker(unittest.TestCase):
         self.addCleanup(self._tmpdir.cleanup)
         self.target_repo = Path(self._tmpdir.name) / "my-project"
         self.target_repo.mkdir()
-        (self.target_repo / ".mcp.json").write_text(json.dumps({"mcpServers": {"qdrant": {}}}), encoding="utf-8")
+        (self.target_repo / ".mcp.json").write_text(json.dumps({"mcpServers": {"compact": {}}}), encoding="utf-8")
         home_patch = mock.patch.object(Path, "home", return_value=Path(self._tmpdir.name) / "fake-home")
         home_patch.start()
         self.addCleanup(home_patch.stop)
@@ -1418,7 +1418,7 @@ class UpgradeSkillRefresh(unittest.TestCase):
     def _cmd_upgrade(self, **kw):
         target = Path(self._tmpdir.name) / "proj"
         target.mkdir(exist_ok=True)
-        (target / ".mcp.json").write_text(json.dumps({"mcpServers": {"qdrant": {}}}), encoding="utf-8")
+        (target / ".mcp.json").write_text(json.dumps({"mcpServers": {"compact": {}}}), encoding="utf-8")
         args = argparse.Namespace(target_repo=str(target), skills_dir=str(self.skills), **kw)
         buf = io.StringIO()
         with mock.patch.object(self.mod, "TOOLS_REPO_DIR", self.tools), \
@@ -1628,7 +1628,7 @@ class MalformedExistingConfigExitsCleanly(unittest.TestCase):
         self.assertNotIn("no existing toolkit configuration", message)
 
     def test_upgrade_with_a_null_hooks_exits_one_without_writing(self):
-        mcp_text = json.dumps({"mcpServers": {"qdrant": {}}})
+        mcp_text = json.dumps({"mcpServers": {"compact": {}}})
         (self.target_repo / ".mcp.json").write_text(mcp_text, encoding="utf-8")
         settings = self.target_repo / ".claude" / "settings.json"
         settings.write_text('{"hooks": null}', encoding="utf-8")

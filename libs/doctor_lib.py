@@ -106,7 +106,7 @@ SERVER_DUAL_ENV_VARS = {
         "CLAUDE_RUNWAY_LMSTUDIO_MODEL",
         "CLAUDE_RUNWAY_TRACK_SAVINGS",
     ),
-    "qdrant": ("CLAUDE_RUNWAY_LMSTUDIO_URL", "CLAUDE_RUNWAY_LMSTUDIO_MODEL"),
+    "compact": ("CLAUDE_RUNWAY_LMSTUDIO_URL", "CLAUDE_RUNWAY_LMSTUDIO_MODEL"),
     "analytics": ("CLAUDE_RUNWAY_SAVINGS_DB",),
 }
 
@@ -427,7 +427,7 @@ def run_doctor(target_repo: Path, *, shell_env: Mapping[str, str], home_dir: Opt
     mcp_json_path = Path(target_repo) / ".mcp.json"
     try:
         compress_env = load_server_env(mcp_json_path, "local-compress")
-        qdrant_env = load_server_env(mcp_json_path, "qdrant")
+        compact_env = load_server_env(mcp_json_path, "compact")
         analytics_env = load_server_env(mcp_json_path, "analytics")
         reviewer_env = load_server_env(mcp_json_path, "codebase-reviewer")
     except MalformedMcpJsonError as exc:
@@ -439,9 +439,9 @@ def run_doctor(target_repo: Path, *, shell_env: Mapping[str, str], home_dir: Opt
     # The qdrant block holds the LM Studio URL/model compact_store compresses
     # with, which the shell (and the hooks) must agree with just like the
     # local-compress block's copy. Its other vars are not dual-config ones.
-    qdrant_checked = _carries_any(qdrant_env, "qdrant")
-    if qdrant_env is not None:
-        mismatches += check_dual_env_vars(qdrant_env, shell_env, home_dir=resolved_home, server="qdrant")
+    qdrant_checked = _carries_any(compact_env, "compact")
+    if compact_env is not None:
+        mismatches += check_dual_env_vars(compact_env, shell_env, home_dir=resolved_home, server="compact")
     # The analytics block holds the savings DB override its tools read; the
     # hooks write that database from the shell's value.
     analytics_checked = _carries_any(analytics_env, "analytics")
