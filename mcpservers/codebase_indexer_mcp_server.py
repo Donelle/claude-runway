@@ -444,7 +444,8 @@ def _chunk_lines_note(chunk_lines: int) -> str:
         f" Note: chunk_lines={chunk_lines} was ignored -- chunks are cut by the embedding model's token window, "
         f"not by line count."
     )
-
+# QDRANT_URL/QDRANT_API_KEY are also read by qdrant_mcp_server.py, but
+# COLLECTION_NAME/EMBEDDING_MODEL belong only to this server.
 # Same env var names mcpservers/qdrant_mcp_server.py reads, so a single project .mcp.json
 # config keeps this server and the cb_indexer_find_repo/cb_indexer_store_repo server aligned.
 # Resolved through qdrant_ingest_lib.ingest_env_defaults -- the
