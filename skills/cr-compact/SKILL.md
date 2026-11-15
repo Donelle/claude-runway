@@ -48,7 +48,7 @@ LABEL: <label from step 2, or omit/leave blank if using server-side derivation>
    - `label`: the label from step 2 — omit this parameter (or pass `""`) if no argument was given; the server derives it automatically from the summary
    - `date`: today's date
 
-   If LM Studio is not available, `compact_store` stores the summary uncompressed instead of failing, and its reply says so; nothing for you to do. Note: `compact_store` uses a dedicated per-project Qdrant collection (e.g. `conversation-compacts-my-project`), isolated from the codebase index. Do NOT use `qdrant-store` here — that writes to the shared codebase collection where compacts get buried under code chunks.
+   If LM Studio is not available, `compact_store` stores the summary uncompressed instead of failing, and its reply says so; nothing for you to do. Note: `compact_store` uses a dedicated per-project Qdrant collection (e.g. `conversation-compacts-my-project`), isolated from the codebase index. Do NOT use `cb_indexer_store_repo` here — that writes to the shared codebase collection where compacts get buried under code chunks.
 
 5. **Check the result before confirming anything.** `compact_store` returns exactly one of
    two shapes: a success string starting with `Stored compact in '...'` (ending with a

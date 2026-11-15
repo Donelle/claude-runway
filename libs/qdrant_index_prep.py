@@ -1,6 +1,6 @@
 """
 Shared "prepare a collection for a full index" step, used by
-both mcpservers/codebase_indexer_mcp_server.py's index_repo and tools/ingest_to_qdrant.py's
+both mcpservers/codebase_indexer_mcp_server.py's cb_indexer_index_repo and tools/ingest_to_qdrant.py's
 ingest().
 
 Before this module, each of those hand-rolled the same sequence -- on reset,
@@ -13,11 +13,11 @@ first-big-index path (the one docs/installation.md recommends). One shared
 code path means a future fix to this sequence lands in both callers at once.
 
 What deliberately stays with each caller, because the two differ on purpose:
-  - the memory-bank NAME refusal (index_repo refuses that collection
+  - the memory-bank NAME refusal (cb_indexer_index_repo refuses that collection
     regardless of reset; the CLI only refuses it with --reset),
   - --dry-run (the CLI never calls this at all on a dry run, so a preview
     touches neither Qdrant nor the embedding model),
-  - how an error is surfaced (index_repo returns the string; the CLI prints
+  - how an error is surfaced (cb_indexer_index_repo returns the string; the CLI prints
     it and exits 1) and what gets printed on success.
 
 Deliberately a separate module from qdrant_ingest_lib.py, which documents
@@ -83,16 +83,16 @@ def prepare_collection_for_index(
     inconclusive result must block a destructive delete),
     then ALWAYS a filtered delete that preserves memory-bank and marked
     conversation-compact points -- never delete_collection, and no
-    count-then-act, to avoid the race documented in index_repo.
+    count-then-act, to avoid the race documented in cb_indexer_index_repo.
     `before_reset_delete`, if given, runs after the model check and immediately
     before that delete; a non-None return aborts with that message, with nothing
-    deleted (index_repo uses it to invalidate its sync manifest first, so no
+    deleted (cb_indexer_index_repo uses it to invalidate its sync manifest first, so no
     failure after the wipe can leave a manifest describing an index that is
     gone). Not called when the collection does not exist: nothing is deleted.
 
     reset=False and the collection exists: if existing_points_guard is
     given, call it with the collection's current point count; a non-None
-    return aborts (index_repo's duplicate-risk warning). Then
+    return aborts (cb_indexer_index_repo's duplicate-risk warning). Then
     backfill the metadata.file_path payload index, since FIELD_INDEXES only
     applies when QdrantConnector creates a brand-new collection.
 

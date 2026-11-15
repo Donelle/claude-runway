@@ -10,7 +10,7 @@ functions over text, so this needs neither Qdrant nor an embedding model:
 Why the chunking tests exist: the four bugs pinned first here were SILENT. Nothing errors
 when a chunker splits in the wrong place, skips lines, or explodes chunk
 count -- the index just quietly contains worse content (or costs far more to
-build), and a later qdrant-find returns a comment line instead of an answer.
+build), and a later cb_indexer_find_repo returns a comment line instead of an answer.
 The first three were found by indexing this repo with its own indexer:
 
   1. '.txt' routed to the markdown chunker, whose heading test was a bare
@@ -997,7 +997,7 @@ class IterFilesExcludeDirs(unittest.TestCase):
 
 
 class Batched(unittest.TestCase):
-    """batched() groups sync_repo's per-file deletes into fixed-size chunks
+    """batched() groups cb_indexer_sync_repo's per-file deletes into fixed-size chunks
     -- confirmed empirically that neither extreme works:
     one client.delete() call per file exhausts connections on a large repo,
     and one call covering every file can time out server-side.
@@ -1069,7 +1069,7 @@ class BuildEntriesSkipsUnreadableFiles(unittest.TestCase):
 
 class ComputeFileHashesSkipsUnreadableFiles(unittest.TestCase):
     """Same guarantee as BuildEntriesSkipsUnreadableFiles, for the hashing
-    path sync_repo relies on to detect changed files."""
+    path cb_indexer_sync_repo relies on to detect changed files."""
 
     def _patched_read_bytes(self, bad_name):
         real_read_bytes = Path.read_bytes
@@ -1161,7 +1161,7 @@ class ComputeFileHashesSkipsUnreadableFiles(unittest.TestCase):
 
 class FilesRemovedSinceLastSync(unittest.TestCase):
     """a file that failed to hash must not be reported as
-    'removed' -- sync_repo would otherwise delete its still-good existing
+    'removed' -- cb_indexer_sync_repo would otherwise delete its still-good existing
     embeddings over what may just be a transient read error. Only a file
     genuinely absent from BOTH current_hashes and skipped_paths (i.e.
     iter_files didn't yield it at all -- deleted, renamed, or filtered out)
@@ -1320,12 +1320,12 @@ class McpToolsValidateChunkParamsBeforeAnyWork(unittest.TestCase):
 
 
 class IndexRepoDocumentsTheOrphanedChunkLimitation(unittest.TestCase):
-    """index_repo(reset=False) never detects/removes chunks for
-    files deleted from the repo, unlike sync_repo. Decided to document this
+    """cb_indexer_index_repo(reset=False) never detects/removes chunks for
+    files deleted from the repo, unlike cb_indexer_sync_repo. Decided to document this
     loudly rather than change the behavior --
-    sync_repo already exists specifically for ongoing/incremental
+    cb_indexer_sync_repo already exists specifically for ongoing/incremental
     re-indexing and already tracks a manifest to handle deletions
-    correctly; index_repo is the bulk/first-time/full-rebuild tool. This
+    correctly; cb_indexer_index_repo is the bulk/first-time/full-rebuild tool. This
     test is a regression guard for the warning itself: a future docstring
     edit can't silently drop it without failing a test, even though
     nothing here checks runtime behavior (there isn't any behavior change
@@ -1345,14 +1345,14 @@ class IndexRepoDocumentsTheOrphanedChunkLimitation(unittest.TestCase):
         doc = self.ims.index_repo.__doc__
         self.assertIsNotNone(doc)
         self.assertIn("DELETED", doc)
-        self.assertIn("sync_repo", doc)
+        self.assertIn("cb_indexer_sync_repo", doc)
 
 
 class SyncRepoPreservesEmbeddingsOnChunkAndHashFailures(unittest.TestCase):
     """Review (Copilot) follow-up. Two real bugs the
     original try/except-and-skip fix introduced, both now fixed:
 
-    1. sync_repo deleted a changed file's OLD embeddings BEFORE attempting to
+    1. cb_indexer_sync_repo deleted a changed file's OLD embeddings BEFORE attempting to
        chunk its new content. A file that hashed fine but then failed to
        chunk (the same hash/chunk race compute_file_hashes is exposed to)
        ended up with its embeddings deleted and nothing to replace them --
@@ -1366,7 +1366,7 @@ class SyncRepoPreservesEmbeddingsOnChunkAndHashFailures(unittest.TestCase):
        so its now-actually-stale embeddings would never get cleaned up.
 
     Mocks the Qdrant/FastEmbed layer (no live services needed) so this
-    exercises sync_repo's actual chunk/delete/manifest ordering end to end,
+    exercises cb_indexer_sync_repo's actual chunk/delete/manifest ordering end to end,
     not just the pure helpers in isolation."""
 
     @classmethod
@@ -1419,7 +1419,7 @@ class SyncRepoPreservesEmbeddingsOnChunkAndHashFailures(unittest.TestCase):
 
             fake_client = MagicMock()
             fake_client.collection_exists.return_value = True
-            # sync_repo's index-consistency check counts file
+            # cb_indexer_sync_repo's index-consistency check counts file
             # chunks; this fixture models a populated collection.
             fake_client.count.return_value = mock.MagicMock(count=10)
             # Chunking needs a token budget; a word-count one
@@ -1441,7 +1441,7 @@ class SyncRepoPreservesEmbeddingsOnChunkAndHashFailures(unittest.TestCase):
                 # unconfigured get_collection() returns a vectors_config the
                 # real check can't recognize, which now correctly fails
                 # closed instead of silently
-                # passing, which would otherwise block sync_repo's delete
+                # passing, which would otherwise block cb_indexer_sync_repo's delete
                 # loop for reasons unrelated to what's being tested here.
                 result = asyncio.run(self.ims.sync_repo(
                     repo_path=str(repo),
@@ -1493,7 +1493,7 @@ class ManifestSelfIndex(unittest.TestCase):
     matches CODE_EXTENSIONS, so iter_files yields it when the repo's
     .gitignore doesn't list it. The manifest content (a flat map of
     file->sha256) gets embedded as source and perpetually looks "changed"
-    to sync_repo (its own hash changes on every _save_manifest write).
+    to cb_indexer_sync_repo (its own hash changes on every _save_manifest write).
 
     Fix: extra_exclude_files parameter on iter_files/build_entries/
     compute_file_hashes; codebase_indexer_mcp_server passes {MANIFEST_FILENAME}.
@@ -1992,7 +1992,7 @@ class SharedIngestDefaults(unittest.TestCase):
 class ResolveMemoryBankCollection(unittest.TestCase):
     """The CLI resolves the shared memory-bank collection name
     from the flag, then the shell, then the repo's .mcp.json, then the
-    default, so a name set only in .mcp.json is protected as index_repo
+    default, so a name set only in .mcp.json is protected as cb_indexer_index_repo
     protects it. A malformed .mcp.json must never crash the guard."""
 
     def setUp(self):

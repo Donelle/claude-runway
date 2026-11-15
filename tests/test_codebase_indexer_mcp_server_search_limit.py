@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for the search_limit recompute wired into sync_repo/index_repo.
+"""Tests for the search_limit recompute wired into cb_indexer_sync_repo/cb_indexer_index_repo.
 Stdlib-only, no network: QdrantClient, the cache
 and the embed/store pipeline are all mocked.
 
@@ -103,13 +103,13 @@ class RecomputeSearchLimitTest(unittest.TestCase):
 
 
 class WiringTest(unittest.TestCase):
-    """Both tools call the shared helper; sync_repo's no-change path doesn't."""
+    """Both tools call the shared helper; cb_indexer_sync_repo's no-change path doesn't."""
 
     def setUp(self):
         for target, kwargs in (
             ("call_with_retry", {"side_effect": lambda fn, *a, **kw: fn(*a, **kw)}),
             ("_save_manifest", {}),
-            # index_repo also removes the manifest of the checkout it indexes
+            # cb_indexer_index_repo also removes the manifest of the checkout it indexes
             # (REPO_ROOT here, indexed into the configured default collection).
             ("_discard_manifest", {}),
             ("chunk_file", {"side_effect": lambda *a, **kw: iter([("content", {"file_path": "x"})])}),

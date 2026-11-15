@@ -10,12 +10,11 @@ in for both):
 Most of this file is the conversation-compact tests (compact_store /
 compact_find / compact_prune and their project/collection resolution helpers),
 moved here unchanged apart from the module they load when those tools moved
-from the local-compress server to this one. The qdrant-find / qdrant-store
-tests and the new compact_store compression step are at the bottom.
+from the local-compress server to this one. The new compact_store
+compression step tests are at the bottom.
 """
 
 import importlib.util
-import json
 import os
 import sys
 import unittest
@@ -1364,63 +1363,26 @@ class CompactPruneTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# The server's own tool set, qdrant-find / qdrant-store, and compact_store's
+# The server's own tool set and compact_store's
 # compression step (everything above was moved from the compress server's tests)
 # ---------------------------------------------------------------------------
 
 
 class RegisteredToolSet(unittest.TestCase):
-    """Pins the tool names. `qdrant-find` and `qdrant-store` must stay exactly
-    as the third-party server served them so `mcp__qdrant__qdrant-find` and every
-    permission rule written against it keep working; the compact tools come
-    with the server the compact skills now call."""
+    """Pins the tool names. This server serves only the conversation-compact
+    tools; `cb_indexer_find_repo`/`cb_indexer_store_repo` moved to the codebase-indexer server as
+    `cb_indexer_find_repo`/`cb_indexer_store_repo` and are deliberately not
+    registered here under any name."""
 
     def test_the_registered_tool_set_is_the_documented_one(self):
         mod = _load_qdrant_mcp_server()
         names = {info.name for info in mod.mcp._tool_manager.list_tools()}
-        self.assertEqual(
-            names,
-            {"qdrant-find", "qdrant-store", "compact_store", "compact_find", "compact_prune"},
-        )
+        self.assertEqual(names, {"compact_store", "compact_find", "compact_prune"})
 
     def test_the_server_is_registered_under_the_name_qdrant(self):
         # The tool prefix Claude Code shows is mcp__<this name>__, and existing
         # permission rules and the compress hook match on `mcp__qdrant__`.
         self.assertEqual(_load_qdrant_mcp_server().mcp.name, "qdrant")
-
-    def test_find_and_store_expose_the_same_arguments_as_the_replaced_server(self):
-        import asyncio
-
-        mod = _load_qdrant_mcp_server()
-        tools = {t.name: t for t in asyncio.run(mod.mcp.list_tools())}
-        # `limit` is optional: the package this replaced took only
-        # `query`, and a call that passes just that must keep working.
-        self.assertEqual(set(tools["qdrant-find"].input_schema["properties"]), {"query", "limit"})
-        self.assertEqual(tools["qdrant-find"].input_schema["required"], ["query"])
-        self.assertEqual(set(tools["qdrant-store"].input_schema["properties"]), {"information", "metadata"})
-        self.assertEqual(tools["qdrant-store"].input_schema["required"], ["information"])
-
-    def test_descriptions_carry_the_guidance_that_used_to_live_in_the_env_block(self):
-        import asyncio
-
-        mod = _load_qdrant_mcp_server()
-        tools = {t.name: t for t in asyncio.run(mod.mcp.list_tools())}
-        find = tools["qdrant-find"].description or ""
-        store = tools["qdrant-store"].description or ""
-        self.assertIn("BEFORE grepping", find)
-        self.assertIn("Do NOT use for exact string", find)
-        self.assertIn("file_path and line_number", store)
-        self.assertNotIn("line_range", store)
-        # Hits from before token-window chunking still carry line_range, so
-        # find's description tells the reader about both shapes.
-        self.assertIn("line_number", find)
-        self.assertIn("char_range", find)
-        self.assertIn("line_range", find)
-        self.assertIn("speculative", store)
-        # The locator metadata is advice, not a requirement: a file_path tag on
-        # text that is not about a file only exposes it to the indexer's per-file delete.
-        self.assertNotIn("ALWAYS", store)
-        self.assertIn("optional", store)
 
     def test_this_server_does_not_register_the_compression_tools(self):
         names = {info.name for info in _load_qdrant_mcp_server().mcp._tool_manager.list_tools()}
@@ -1452,7 +1414,7 @@ class ServerStartsOverStdio(unittest.TestCase):
                     return sorted(t.name for t in (await session.list_tools()).tools)
 
         names = asyncio.run(asyncio.wait_for(go(), timeout=60))
-        self.assertEqual(names, ["compact_find", "compact_prune", "compact_store", "qdrant-find", "qdrant-store"])
+        self.assertEqual(names, ["compact_find", "compact_prune", "compact_store"])
 
 
 class FastembedCachePersistenceTests(unittest.TestCase):
@@ -1490,17 +1452,14 @@ class EmbeddingModelsAreConfiguredIndependently(unittest.TestCase):
     def test_compact_model_falls_back_to_the_legacy_model_when_unset(self):
         mod = self._load_with_env(EMBEDDING_MODEL="sentence-transformers/all-MiniLM-L6-v2")
         self.assertEqual(mod.COMPACT_EMBEDDING_MODEL, "BAAI/bge-small-en")
-        self.assertEqual(mod.EMBEDDING_MODEL, "sentence-transformers/all-MiniLM-L6-v2")
 
     def test_compact_model_comes_from_its_own_variable(self):
         mod = self._load_with_env(EMBEDDING_MODEL="a/code-model", COMPACT_EMBEDDING_MODEL="b/compact-model")
         self.assertEqual(mod.COMPACT_EMBEDDING_MODEL, "b/compact-model")
-        self.assertEqual(mod.EMBEDDING_MODEL, "a/code-model")
 
     def test_blank_values_count_as_unset(self):
         mod = self._load_with_env(EMBEDDING_MODEL="", COMPACT_EMBEDDING_MODEL="")
         self.assertEqual(mod.COMPACT_EMBEDDING_MODEL, "BAAI/bge-small-en")
-        self.assertEqual(mod.EMBEDDING_MODEL, "sentence-transformers/all-MiniLM-L6-v2")
 
     def test_compact_tools_embed_with_the_compact_model_not_the_code_model(self):
         mod = self._load_with_env(EMBEDDING_MODEL="a/code-model", COMPACT_EMBEDDING_MODEL="b/compact-model")
@@ -1517,114 +1476,7 @@ class EmbeddingModelsAreConfiguredIndependently(unittest.TestCase):
         self.assertEqual(built, ["b/compact-model", "b/compact-model"])
 
 
-class _VectorProvider:
-    """A deterministic embedding provider for the real QdrantConnector: one
-    unit vector per text, so a query for the same text is the nearest hit."""
-
-    def get_vector_name(self):
-        return "fast-test-model"
-
-    def get_vector_size(self):
-        return 4
-
-    def _vec(self, text):
-        v = [0.0] * 4
-        v[sum(map(ord, text)) % 4] = 1.0
-        return v
-
-    async def embed_documents(self, documents):
-        return [self._vec(d) for d in documents]
-
-    async def embed_query(self, query):
-        return self._vec(query)
-
-
-class QdrantFindAndStoreTools(unittest.TestCase):
-    """qdrant-find / qdrant-store against a real QdrantConnector on qdrant-client's
-    in-process `:memory:` mode, so the tool bodies and the connector are
-    exercised together without a server or a model."""
-
-    def _server(self, collection="proj"):
-        from qdrant_connector import QdrantConnector
-
-        mod = _load_qdrant_mcp_server()
-        mod.COLLECTION_NAME = collection
-        mod._connector = QdrantConnector(":memory:", None, collection, _VectorProvider())
-        return mod
-
-    def test_store_then_find_round_trips_content_and_metadata(self):
-        mod = self._server()
-        reply = _run(mod.qdrant_store("auth is handled in middleware", {"file_path": "src/auth.py", "line_range": "10-40"}))
-        self.assertEqual(reply, "Remembered: auth is handled in middleware in collection proj")
-        results = _run(mod.qdrant_find("auth is handled in middleware"))
-        self.assertEqual(results[0], "Results for the query 'auth is handled in middleware'")
-        self.assertEqual(len(results), 2)
-        self.assertEqual(
-            results[1],
-            "<entry><content>auth is handled in middleware</content><metadata>"
-            + json.dumps({"file_path": "src/auth.py", "line_range": "10-40"})
-            + "</metadata></entry>",
-        )
-
-    def test_an_entry_stored_without_metadata_has_an_empty_metadata_element(self):
-        mod = self._server()
-        _run(mod.qdrant_store("note", None))
-        results = _run(mod.qdrant_find("note"))
-        self.assertEqual(results[1], "<entry><content>note</content><metadata></metadata></entry>")
-
-    def test_find_with_nothing_stored_says_so(self):
-        mod = self._server()
-        self.assertEqual(_run(mod.qdrant_find("anything")), ["No information found for the query 'anything'"])
-
-    def test_find_returns_at_most_the_search_limit(self):
-        mod = self._server()
-        for i in range(mod.SEARCH_LIMIT + 5):
-            _run(mod.qdrant_store(f"note {i}", None))
-        results = _run(mod.qdrant_find("note 0"))
-        self.assertEqual(len(results) - 1, mod.SEARCH_LIMIT)
-
-    def test_find_limit_defaults_to_ten_and_an_explicit_one_wins(self):
-        """Repetitive content can fill a fixed top 10 and push the
-        wanted chunk past it, so the caller can ask for more (or fewer)."""
-        mod = self._server()
-        self.assertEqual(mod.SEARCH_LIMIT, 10)
-        for i in range(mod.SEARCH_LIMIT + 5):
-            _run(mod.qdrant_store(f"note {i}", None))
-        self.assertEqual(len(_run(mod.qdrant_find("note 0", limit=3))) - 1, 3)
-        self.assertEqual(len(_run(mod.qdrant_find("note 0", limit=mod.SEARCH_LIMIT + 5))) - 1, mod.SEARCH_LIMIT + 5)
-
-    def test_find_rejects_a_limit_below_one(self):
-        mod = self._server()
-        for bad in (0, -1):
-            with self.subTest(limit=bad):
-                results = _run(mod.qdrant_find("note", limit=bad))
-                self.assertEqual(len(results), 1)
-                self.assertTrue(results[0].startswith("Error: limit must be 1 or greater"))
-
-    def test_store_then_find_round_trips_the_new_position_metadata(self):
-        mod = self._server()
-        metadata = {"file_path": "src/auth.py", "line_number": 12, "char_range": "340-910"}
-        _run(mod.qdrant_store("auth is handled in middleware", metadata))
-        results = _run(mod.qdrant_find("auth is handled in middleware"))
-        self.assertIn(json.dumps(metadata), results[1])
-
-    def test_both_tools_report_a_missing_collection_name_instead_of_crashing(self):
-        mod = self._server()
-        mod.COLLECTION_NAME = None
-        self.assertTrue(_run(mod.qdrant_find("q"))[0].startswith("Error: COLLECTION_NAME is not set"))
-        self.assertTrue(_run(mod.qdrant_store("x", None)).startswith("Error: COLLECTION_NAME is not set"))
-
-    def test_tools_use_the_default_collection_of_this_project_only(self):
-        mod = self._server("project-a")
-        _run(mod.qdrant_store("only in a", None))
-        # A second server for another project sharing the same in-memory client
-        # must not see it: each tool is scoped to its own COLLECTION_NAME.
-        other = self._server("project-b")
-        other._connector.client = mod._connector.client
-        self.assertEqual(_run(other.qdrant_find("only in a")), ["No information found for the query 'only in a'"])
-
-
-class QdrantToolsDoNotLoadTheModelAtStartup(unittest.TestCase):
+class QdrantServerDoesNotLoadTheModelAtStartup(unittest.TestCase):
     def test_importing_the_module_constructs_no_embedding_model(self):
         # Loading the ONNX model takes seconds (and a download on a cold cache);
         # the server must answer `initialize` first. Any construction at import
@@ -1633,26 +1485,6 @@ class QdrantToolsDoNotLoadTheModelAtStartup(unittest.TestCase):
 
         with mock.patch.object(qdrant_embeddings, "TextEmbedding", side_effect=AssertionError("model loaded at import")):
             _load_qdrant_mcp_server()
-
-    def test_the_connector_is_built_on_first_use_and_then_reused(self):
-        mod = _load_qdrant_mcp_server()
-        mod.COLLECTION_NAME = "proj"
-        mod.EMBEDDING_MODEL = "some/model"
-        built = []
-
-        class _Connector:
-            def __init__(self, url, key, collection, provider):
-                built.append((url, key, collection, provider.model_name))
-
-            async def search(self, query, *, collection_name, limit):
-                return []
-
-        mod.FastEmbedProvider = _FakeEmbeddingProvider
-        mod.QdrantConnector = _Connector
-        self.assertEqual(built, [])
-        _run(mod.qdrant_find("a"))
-        _run(mod.qdrant_find("b"))
-        self.assertEqual(built, [(mod.QDRANT_URL, mod.QDRANT_API_KEY, "proj", "some/model")])
 
 
 class _FakeLmStudioClientModule:

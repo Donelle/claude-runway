@@ -27,7 +27,7 @@ set, else ~/.claude/claude-runway/cache.db. Same convention as
 savings_ledger.resolve_db_path() (including the relative-path-anchored-to-
 home safety net for a relative override), but a DIFFERENT env var pointing
 at a DIFFERENT file -- do not conflate this with CLAUDE_RUNWAY_SAVINGS_DB.
-Read by the codebase-indexer MCP server (list_collections/set_collection_description
+Read by the codebase-indexer MCP server (cb_indexer_list_collections/cb_indexer_set_collection_description
 hint cache) and by the redirect_webfetch_to_fetch_url.py hook (denied-URL TTL
 cache). Since a hook can only inherit its environment from the shell
 (hook entries in .claude/settings.json have no `env` field), overriding this

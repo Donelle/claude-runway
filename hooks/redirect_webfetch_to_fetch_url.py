@@ -7,12 +7,12 @@ Anthropic's own WebFetch extraction step.
 
 Why a hook and not just CLAUDE.md guidance: CLAUDE.md.template already tells
 Claude to prefer fetch_url, but that's prose Claude can deprioritize --
-exactly the same qdrant-find-vs-Grep problem this project's README already
+exactly the same cb_indexer_find_repo-vs-Grep problem this project's README already
 flags as unsolvable by hooks in general. The difference here is that "should
 this call have gone to fetch_url instead" DOES have a measurable, checkable
 signal before the call: the tool name itself (WebFetch) plus whether the
 local model is actually reachable right now. That's enough to enforce
-deterministically, unlike "should this have been qdrant-find" which has no
+deterministically, unlike "should this have been cb_indexer_find_repo" which has no
 equivalent signal.
 
 Mechanism: unlike the compress_output.py PostToolUse hook (which can

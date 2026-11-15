@@ -138,7 +138,7 @@ class CollectionOverrideRemovedTest(unittest.TestCase):
     """Regression: remember/recall/forget used to accept a
     caller-controlled `collection` kwarg with no validation, letting a call
     write/read/delete memory-bank points in a collection other than the one
-    configured via MEMORY_BANK_COLLECTION -- bypassing index_repo/sync_repo's
+    configured via MEMORY_BANK_COLLECTION -- bypassing cb_indexer_index_repo/cb_indexer_sync_repo's
     reserved-collection guard, which only ever checks the configured name.
     The fix removes the parameter entirely rather than validating it, so a
     caller-supplied `collection` must now be rejected at the call boundary."""

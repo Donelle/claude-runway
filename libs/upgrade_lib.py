@@ -48,10 +48,14 @@ from typing import Callable, Optional
 # sys.path directly by callers, not treated as a real Python package).
 from qdrant_ingest_lib import MANIFEST_FILENAME, is_old_format_manifest
 from setup_project_lib import (
+    CLAUDE_MD_FILENAME,
+    CLAUDE_MD_QDRANT_HEADING,
+    CLAUDE_MD_TEMPLATE_NAME,
     COMPRESS_HOOK_SCRIPT,
     LEGACY_COMPRESS_HOOK_SCRIPT,
     PR_ROUND_CAPTURE_HOOK_SCRIPT,
     REVIEWERS_FILE_REQUIRED_WARNING,
+    SKILL_TEXT_ERRORS,
     SAVINGS_TRACKER_SHELL_EXPORT_REMINDER,
     TRACK_SAVINGS_TRUTHY,
     build_mcp_servers,
@@ -63,7 +67,10 @@ from setup_project_lib import (
     load_json,
     local_compress_tracks_savings,
     resolve_compact_embedding_model,
+    extract_claude_md_sections,
+    read_claude_md,
 )
+from setup_project_lib import _section_spans
 
 
 @dataclass
@@ -139,7 +146,7 @@ def _detect_old_format_manifest(target_repo: Path) -> bool:
     `{file: hash}` format and holds at least one entry.
 
     The manifest is versioned now (see `qdrant_ingest_lib.MANIFEST_FORMAT_VERSION`),
-    so `sync_repo` already ignores an old-format one and rebuilds by itself; this
+    so `cb_indexer_sync_repo` already ignores an old-format one and rebuilds by itself; this
     migration exists to say so out loud and to remove the stale file, not for
     correctness. Idempotent by construction: once the file is deleted (or
     rewritten by the next sync in the new format) this returns False. An absent,
@@ -260,7 +267,7 @@ def _apply_indexer_memory_bank_collection_missing(
 ) -> "tuple[dict, dict]":
     """
     Adds `MEMORY_BANK_COLLECTION` to the existing `codebase-indexer` env.
-    `index_repo`/`sync_repo`'s refusal to touch the shared memory-bank
+    `cb_indexer_index_repo`/`cb_indexer_sync_repo`'s refusal to touch the shared memory-bank
     collection compares against THIS block's own copy (falling back to the
     default name when unset), so a project whose memories live under a
     custom collection name is unprotected until this key matches it.
@@ -1100,6 +1107,240 @@ def _apply_codebase_indexer_script_renamed(
     return mcp_json, settings_json
 
 
+# ---------------------------------------------------------------------------
+# cb-indexer-tools-renamed (codebase-indexer's tools renamed to cb_indexer_*,
+# and qdrant-find/qdrant-store served by it as cb_indexer_find_repo/_store_repo)
+# ---------------------------------------------------------------------------
+#
+# Every old name stops working at once (no aliases), so a permission rule or a
+# hook matcher that still names one silently stops matching. This rewrites the
+# ones that name the toolkit's own servers, found BY SHAPE: the server key is
+# whatever the user named the block that launches the script, never assumed.
+
+# Old indexer tool -> new, as the bare tool name an `mcp__<key>__<tool>` rule ends in.
+_RENAMED_INDEXER_TOOLS = {
+    name: f"cb_indexer_{name}"
+    for name in (
+        "index_repo",
+        "sync_repo",
+        "preview_index",
+        "get_collection_info",
+        "find_in_collection",
+        "set_collection_description",
+        "list_collections",
+    )
+}
+# The two tools that moved off the `qdrant` server.
+_MOVED_QDRANT_TOOLS = {"qdrant-find": "cb_indexer_find_repo", "qdrant-store": "cb_indexer_store_repo"}
+_INDEXER_SCRIPTS = ("ingest_mcp_server.py", "codebase_indexer_mcp_server.py")
+# The third-party console script counts too: `qdrant-server-replaced` swaps it for
+# qdrant_mcp_server.py, and rules written against it name the same tools.
+_QDRANT_SCRIPTS = ("qdrant_mcp_server.py", "mcp-server-qdrant", "mcp-server-qdrant.exe")
+
+
+def _launcher_keys(mcp_json: dict, script_names: "tuple[str, ...]") -> "list[str]":
+    """Keys of every server block whose `command` or `args` has a basename in
+    `script_names` -- matched by file name, as `_launches_third_party_qdrant_server`
+    does, so the key the user chose does not matter."""
+    servers = mcp_json.get("mcpServers")
+    if not isinstance(servers, dict):
+        return []
+    found = []
+    for key, block in servers.items():
+        if not isinstance(block, dict):
+            continue
+        candidates = [block.get("command")]
+        args = block.get("args")
+        if isinstance(args, list):
+            candidates.extend(args)
+        if any(isinstance(v, str) and re.split(r"[\\/]", v)[-1] in script_names for v in candidates):
+            found.append(key)
+    return found
+
+
+def _tool_renames(mcp_json: dict) -> "tuple[dict, list[str]]":
+    """
+    `({old full name: new full name}, problems)`. `problems` is non-empty when
+    either launcher matches more than one block: which block owns a rule is then
+    a guess, so nothing is renamed and the caller reports it instead. A missing
+    indexer block means there is nothing to rename to, so the map is empty.
+    """
+    indexer_keys = _launcher_keys(mcp_json, _INDEXER_SCRIPTS)
+    qdrant_keys = _launcher_keys(mcp_json, _QDRANT_SCRIPTS)
+    problems = []
+    if len(indexer_keys) > 1:
+        problems.append(
+            f"more than one .mcp.json block launches the codebase-indexer script ({', '.join(indexer_keys)})"
+        )
+    if len(qdrant_keys) > 1:
+        problems.append(f"more than one .mcp.json block launches the qdrant script ({', '.join(qdrant_keys)})")
+    if problems or len(indexer_keys) != 1:
+        return {}, problems
+    indexer = indexer_keys[0]
+    renames = {f"mcp__{indexer}__{old}": f"mcp__{indexer}__{new}" for old, new in _RENAMED_INDEXER_TOOLS.items()}
+    if qdrant_keys:
+        renames.update(
+            {f"mcp__{qdrant_keys[0]}__{old}": f"mcp__{indexer}__{new}" for old, new in _MOVED_QDRANT_TOOLS.items()}
+        )
+    return renames, []
+
+
+def _old_names_under_every_candidate_key(mcp_json: dict) -> "set[str]":
+    """Every old full name under EVERY candidate key, for the stop-and-report
+    case: detect still has to say whether anything is waiting on the user."""
+    names = set()
+    for key in _launcher_keys(mcp_json, _INDEXER_SCRIPTS):
+        names.update(f"mcp__{key}__{old}" for old in _RENAMED_INDEXER_TOOLS)
+    for key in _launcher_keys(mcp_json, _QDRANT_SCRIPTS):
+        names.update(f"mcp__{key}__{old}" for old in _MOVED_QDRANT_TOOLS)
+    return names
+
+
+_PERMISSION_LISTS = ("allow", "deny", "ask")
+
+
+def _rename_matcher(matcher: str, renames: dict) -> str:
+    """Rewrites each old full name in a hook matcher, only where it is a whole
+    name (not followed by a name character), so one tool is never mistaken for
+    a longer name that starts with it."""
+    for old, new in renames.items():
+        matcher = re.sub(re.escape(old) + r"(?![\w-])", lambda _m, n=new: n, matcher)
+    return matcher
+
+
+def _compress_hook_matcher_blocks(settings_json: dict) -> "list[dict]":
+    """Blocks that run the toolkit's compress hook (current or legacy name) --
+    the only hook blocks this toolkit writes a tool-name matcher into."""
+    found = []
+    hooks = settings_json.get("hooks")
+    if not isinstance(hooks, dict):
+        return found
+    for blocks in hooks.values():
+        if not isinstance(blocks, list):
+            continue
+        for block in blocks:
+            if not isinstance(block, dict) or not isinstance(block.get("matcher"), str):
+                continue
+            inner = block.get("hooks")
+            if isinstance(inner, list) and any(
+                isinstance(h, dict)
+                and (_is_script_hook(h, COMPRESS_HOOK_SCRIPT) or _is_script_hook(h, LEGACY_COMPRESS_HOOK_SCRIPT))
+                for h in inner
+            ):
+                found.append(block)
+    return found
+
+
+def _permission_rules(settings_json: dict, name: str) -> list:
+    permissions = settings_json.get("permissions")
+    rules = permissions.get(name) if isinstance(permissions, dict) else None
+    return rules if isinstance(rules, list) else []
+
+
+def _detect_cb_indexer_tools_renamed(mcp_json: dict, settings_json: dict) -> bool:
+    renames, problems = _tool_renames(mcp_json)
+    old_names = _old_names_under_every_candidate_key(mcp_json) if problems else set(renames)
+    if not old_names:
+        return False
+    if any(rule in old_names for name in _PERMISSION_LISTS for rule in _permission_rules(settings_json, name)):
+        return True
+    placeholder = {old: "x" for old in old_names}
+    return any(
+        _rename_matcher(block["matcher"], placeholder) != block["matcher"]
+        for block in _compress_hook_matcher_blocks(settings_json)
+    )
+
+
+def _apply_cb_indexer_tools_renamed(
+    mcp_json: dict, settings_json: dict, ctx: MigrationContext
+) -> "tuple[dict, dict]":
+    """
+    Rewrites `permissions.allow`/`deny`/`ask` entries and compress-hook matcher
+    names that use an old tool's full `mcp__<key>__<tool>` name. Touches nothing
+    else: not the server blocks, not a rule on a server this toolkit does not
+    launch (the user's own rules), not `settings.local.json`, and not a hook
+    block that is not the toolkit's compress hook. When either launcher matches
+    more than one block it says why and changes nothing, so `run_upgrade`
+    reports the migration as still pending.
+    """
+    renames, problems = _tool_renames(mcp_json)
+    if problems:
+        print(
+            "      Not applied: " + "; ".join(problems) + ". Rename the old tool names in "
+            ".claude/settings.json by hand, or leave one block per script."
+        )
+        return mcp_json, settings_json
+    settings_json = copy.deepcopy(settings_json)
+    for name in _PERMISSION_LISTS:
+        rules = _permission_rules(settings_json, name)
+        rewritten = [renames.get(r, r) if isinstance(r, str) else r for r in rules]
+        # A rule that is already there under the new name must not be doubled.
+        rules[:] = [r for i, r in enumerate(rewritten) if not (isinstance(r, str) and r in rewritten[:i])]
+    for block in _compress_hook_matcher_blocks(settings_json):
+        block["matcher"] = _rename_matcher(block["matcher"], renames)
+    return mcp_json, settings_json
+
+
+# The CLAUDE.md section the template writes for the `qdrant` server. It names
+# these tools, so it is the one section this migration may rewrite.
+_OLD_TOOL_NAME_IN_TEXT = re.compile(
+    r"(?<![\w-])(?:index_repo|sync_repo|preview_index|get_collection_info|find_in_collection|"
+    r"set_collection_description|list_collections|qdrant-find|qdrant-store)(?![\w-])"
+)
+_CLAUDE_MD_TEMPLATE = Path(__file__).resolve().parent.parent / "templates" / CLAUDE_MD_TEMPLATE_NAME
+_BOM = "\ufeff"
+
+
+def _stale_claude_md_spans(lines: list) -> "list[tuple[int, int]]":
+    """Spans of the `## Vector memory (Qdrant MCP)` section(s) that still name an
+    old tool. A section already on the new names is not touched."""
+    return [
+        (start, end)
+        for start, end in _section_spans(lines, CLAUDE_MD_QDRANT_HEADING)
+        if _OLD_TOOL_NAME_IN_TEXT.search("".join(lines[start:end]))
+    ]
+
+
+def _detect_cb_indexer_claude_md_renamed(target_repo: Path) -> bool:
+    text = read_claude_md(Path(target_repo) / CLAUDE_MD_FILENAME)
+    if text is None:
+        return False
+    return bool(_stale_claude_md_spans(text.removeprefix(_BOM).splitlines(keepends=True)))
+
+
+def _apply_cb_indexer_claude_md_renamed(target_repo: Path) -> None:
+    """
+    Replaces each stale `## Vector memory (Qdrant MCP)` section with the
+    current template's, so the tool names AND the sentence about which server
+    they come from are right. Everything outside that section -- the user's own
+    text, every other section -- is left byte for byte as it was, and so are the
+    file's line ending and byte-order mark. Edits made inside that one section
+    are replaced; it named tools that no longer exist.
+    """
+    path = Path(target_repo) / CLAUDE_MD_FILENAME
+    text = read_claude_md(path)
+    if text is None:
+        return
+    bom = _BOM if text.startswith(_BOM) else ""
+    body = text[len(bom):]
+    newline = "\r\n" if "\r\n" in body else "\n"
+    lines = body.splitlines(keepends=True)
+    spans = _stale_claude_md_spans(lines)
+    if not spans:
+        return
+    section = extract_claude_md_sections(_CLAUDE_MD_TEMPLATE.read_text(encoding="utf-8"))[CLAUDE_MD_QDRANT_HEADING]
+    for start, end in reversed(spans):
+        trailing = 0
+        while end - trailing - 1 > start and not lines[end - trailing - 1].strip():
+            trailing += 1
+        had_final_newline = lines[end - 1].endswith(("\n", "\r"))
+        replacement = [part + newline for part in section.split("\n")] + [newline] * trailing
+        if end == len(lines) and not had_final_newline:
+            replacement[-1] = replacement[-1].rstrip("\r\n")
+        lines[start:end] = replacement
+    path.write_bytes((bom + "".join(lines)).encode("utf-8", errors=SKILL_TEXT_ERRORS))
+
+
 # List order is both display and apply order when more than one migration is
 # pending; `detect` alone decides whether each one is shown at all. Order only
 # matters where one migration's guard depends on another:
@@ -1134,7 +1375,7 @@ MIGRATIONS: "list[Migration]" = [
         kind="add",
         description=(
             "This project's codebase-indexer server has no MEMORY_BANK_COLLECTION in its env, so "
-            "index_repo/sync_repo's guard against touching the shared memory-bank collection only "
+            "cb_indexer_index_repo/cb_indexer_sync_repo's guard against touching the shared memory-bank collection only "
             "protects the default name -- unprotected if your memory-bank server uses a custom one. "
             "Adds the key, copied from the memory-bank server's own value if present, "
             'else "memory-bank".'
@@ -1182,10 +1423,12 @@ MIGRATIONS: "list[Migration]" = [
         kind="update",
         description=(
             "The 'qdrant' server in .mcp.json still launches the third-party mcp-server-qdrant console "
-            "script. This repo now ships its own (mcpservers/qdrant_mcp_server.py): same qdrant-find and "
-            "qdrant-store tools under the same names, plus the conversation-compact tools "
+            "script. This repo now ships its own (mcpservers/qdrant_mcp_server.py): the conversation-compact tools "
             "(compact_store, compact_find, compact_prune) that /cr-compact and /cr-resume use, which "
-            "have moved there from local-compress. Rewrites the qdrant block to the new command and env, "
+            "have moved there from local-compress. (The note search and save tools the third-party "
+            "server provided as qdrant-find/qdrant-store are served by the codebase-indexer server as "
+            "cb_indexer_find_repo/cb_indexer_store_repo; the cb-indexer-tools-renamed migration updates "
+            "references to them.) Rewrites the qdrant block to the new command and env, "
             "keeping your Qdrant URL/key, collection and embedding model, and carrying over the compact "
             "collection, LM Studio URL/model and compact embedding model from the local-compress block; "
             "drops HF_HUB_OFFLINE, FASTEMBED_CACHE_PATH and the TOOL_*_DESCRIPTION entries, which the "
@@ -1336,6 +1579,29 @@ MIGRATIONS: "list[Migration]" = [
         detect=_detect_codebase_indexer_script_renamed,
         apply=_apply_codebase_indexer_script_renamed,
     ),
+    Migration(
+        id="cb-indexer-tools-renamed",
+        title="Rename codebase-indexer's tools in .claude/settings.json to cb_indexer_*",
+        kind="update",
+        description=(
+            "The codebase-indexer server's tools were renamed to cb_indexer_* (index_repo is now "
+            "cb_indexer_index_repo, and so on), and qdrant-find/qdrant-store moved from the qdrant server "
+            "to it as cb_indexer_find_repo/cb_indexer_store_repo. Every old name stops working at once, "
+            "so a permission rule or a compress-hook matcher name that still uses one silently "
+            "stops matching. Rewrites each such entry in .claude/settings.json's permissions.allow/deny/ask "
+            "and in the toolkit's compress-hook matcher to the new full name; the server keys, every other "
+            "rule and every other hook are left untouched. Finds the two servers by the script each "
+            "launches, not by key, and changes nothing if either script is launched by more than one block."
+        ),
+        note=(
+            "Restart Claude Code to load the renamed tools. Not touched, so update them by hand if they "
+            "name an old tool: rules in your user-level ~/.claude/settings.json, rules in "
+            ".claude/settings.local.json, and any rule of your own on a server this toolkit does not launch. "
+            "The new tools are deliberately not added to the compress hook, as qdrant-find/qdrant-store were not."
+        ),
+        detect=_detect_cb_indexer_tools_renamed,
+        apply=_apply_cb_indexer_tools_renamed,
+    ),
 ]
 
 
@@ -1344,18 +1610,18 @@ MIGRATIONS: "list[Migration]" = [
 REPO_MIGRATIONS: "list[RepoMigration]" = [
     RepoMigration(
         id="index-manifest-old-format",
-        title="Remove the old-format sync manifest so the next sync_repo rebuilds the index",
+        title="Remove the old-format sync manifest so the next cb_indexer_sync_repo rebuilds the index",
         kind="remove",
         description=(
             "This repo has a .qdrant_index_manifest.json in the old format. Chunks are now cut by the "
             "embedding model's token window instead of by line count, and their position metadata is "
             "line_number + char_range instead of line_range, so every file has to be re-chunked and "
             "re-embedded. The manifest only records file content, not how files were chunked, so it cannot "
-            "tell. Deletes it: the next sync_repo finds no manifest, rebuilds the whole index, and writes a "
+            "tell. Deletes it: the next cb_indexer_sync_repo finds no manifest, rebuilds the whole index, and writes a "
             "new versioned one. Nothing is embedded or sent to Qdrant by this command."
         ),
         note=(
-            "Cost: the first sync_repo afterwards re-embeds the WHOLE repo in one long call, and the "
+            "Cost: the first cb_indexer_sync_repo afterwards re-embeds the WHOLE repo in one long call, and the "
             "collection ends up with several times as many chunks as before -- more for minified or "
             "generated files, which are indexed in full with no per-file cap. It reports per-file "
             "progress and names the files that produced the most chunks. Run it when you are ready. "
@@ -1365,6 +1631,21 @@ REPO_MIGRATIONS: "list[RepoMigration]" = [
         ),
         detect=_detect_old_format_manifest,
         apply=_apply_old_format_manifest,
+    ),
+    RepoMigration(
+        id="cb-indexer-claude-md-renamed",
+        title="Update CLAUDE.md's Vector memory section to the cb_indexer_* tool names",
+        kind="update",
+        description=(
+            "This repo's CLAUDE.md has the toolkit's '## Vector memory (Qdrant MCP)' section, and it still "
+            "names the old tools (qdrant-find, sync_repo, ...), so Claude is told to call tools that no longer "
+            "exist. Replaces that one section with the current template's, which names the cb_indexer_* tools "
+            "and says they come from the codebase-indexer server. Everything else in CLAUDE.md, including your "
+            "own text and every other section, is left exactly as it is."
+        ),
+        note="Any edit you made inside that one section is replaced; re-apply it after upgrading.",
+        detect=_detect_cb_indexer_claude_md_renamed,
+        apply=_apply_cb_indexer_claude_md_renamed,
     ),
 ]
 

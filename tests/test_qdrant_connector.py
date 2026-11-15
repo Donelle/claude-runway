@@ -18,6 +18,7 @@ download.
 """
 
 import asyncio
+import json
 import os
 import sys
 import unittest
@@ -32,9 +33,14 @@ import qdrant_embeddings  # noqa: E402
 from qdrant_connector import (  # noqa: E402
     DOCUMENT_KEY,
     METADATA_PATH,
+    NO_COLLECTION_ERROR,
+    SEARCH_LIMIT,
     Entry,
     QdrantConnector,
+    find_entries,
+    format_entry,
     make_point,
+    store_entry,
 )
 from qdrant_embeddings import FastEmbedProvider, vector_name_for_model  # noqa: E402
 
@@ -315,6 +321,81 @@ class ReadsPointsInThePreExistingFormat(unittest.TestCase):
 
         [hit] = _run(go())
         self.assertEqual(hit, Entry("legacy text", {"file_path": "x.py"}))
+
+
+class FindAndStoreHelpers(unittest.TestCase):
+    """`find_entries` / `store_entry` are what `cb_indexer_find_repo` /
+    `cb_indexer_store_repo` return, moved here from the `qdrant` server's
+    `qdrant-find` / `qdrant-store`. They pin the exact reply text, because a
+    prompt or caller may already parse it."""
+
+    def _conn(self):
+        return QdrantConnector(":memory:", None, "proj", _FakeProvider())
+
+    def test_store_reply_and_find_round_trip(self):
+        async def go():
+            c = self._conn()
+            reply = await store_entry(c, "proj", "auth is in middleware", {"file_path": "a.py"})
+            hits = await find_entries(c, "proj", "auth is in middleware")
+            return reply, hits
+
+        reply, hits = _run(go())
+        self.assertEqual(reply, "Remembered: auth is in middleware in collection proj")
+        self.assertEqual(hits[0], "Results for the query 'auth is in middleware'")
+        self.assertEqual(
+            hits[1],
+            "<entry><content>auth is in middleware</content><metadata>"
+            + json.dumps({"file_path": "a.py"})
+            + "</metadata></entry>",
+        )
+
+    def test_the_stored_point_is_in_the_on_disk_format(self):
+        async def go():
+            c = self._conn()
+            await store_entry(c, "proj", "a note", {"source": "design"})
+            points, _ = await c.client.scroll("proj", limit=10, with_payload=True)
+            return points
+
+        [point] = _run(go())
+        self.assertEqual(point.payload, {DOCUMENT_KEY: "a note", METADATA_PATH: {"source": "design"}})
+
+    def test_no_metadata_gives_an_empty_metadata_element(self):
+        self.assertEqual(
+            format_entry(Entry("x", None)), "<entry><content>x</content><metadata></metadata></entry>"
+        )
+
+    def test_nothing_found_and_a_missing_collection_say_so(self):
+        c = self._conn()
+        self.assertEqual(_run(find_entries(c, "nope", "q")), ["No information found for the query 'q'"])
+
+    def test_limit_defaults_to_ten_and_below_one_is_an_error(self):
+        async def go():
+            c = self._conn()
+            for i in range(SEARCH_LIMIT + 3):
+                await store_entry(c, "proj", f"note {i}", None)
+            return (
+                len(await find_entries(c, "proj", "note 0")) - 1,
+                len(await find_entries(c, "proj", "note 0", limit=2)) - 1,
+                await find_entries(c, "proj", "note 0", limit=0),
+            )
+
+        default, explicit, bad = _run(go())
+        self.assertEqual((SEARCH_LIMIT, default, explicit), (10, 10, 2))
+        self.assertTrue(bad[0].startswith("Error: limit must be 1 or greater (got 0)"))
+
+    def test_an_unset_collection_is_reported_not_raised(self):
+        c = self._conn()
+        self.assertEqual(_run(find_entries(c, None, "q")), [NO_COLLECTION_ERROR])
+        self.assertEqual(_run(store_entry(c, None, "x")), NO_COLLECTION_ERROR)
+        self.assertTrue(NO_COLLECTION_ERROR.startswith("Error: COLLECTION_NAME is not set"))
+
+    def test_a_note_stays_in_its_own_collection(self):
+        async def go():
+            c = self._conn()
+            await store_entry(c, "a", "only in a")
+            return await find_entries(c, "b", "only in a")
+
+        self.assertEqual(_run(go()), ["No information found for the query 'only in a'"])
 
 
 class OldClientTypeStillUsable(unittest.TestCase):

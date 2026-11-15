@@ -5,7 +5,7 @@ _log_fixed_overhead() (since removed). Before this, EVALUATION.md's Track A sect
 no live self-reporting mechanism at all for the codebase-indexer server's
 tool count, which is exactly why it drifted stale twice (the
 "6 total" correction, then a further drift to 7 once
-set_collection_description shipped after that fix landed).
+cb_indexer_set_collection_description shipped after that fix landed).
 
 Stdlib-only (unittest, no pytest) and no network -- _log_registered_tool_count()
 never touches Qdrant/FastEmbed; it only enumerates already-registered tool

@@ -188,7 +188,7 @@ def _transient_drop():
 
 
 class SharedPreparationWithIndexRepo(unittest.TestCase):
-    """The CLI now runs index_repo's shared preparation
+    """The CLI now runs cb_indexer_index_repo's shared preparation
     (libs/qdrant_index_prep.py). These failed on main before the fix: a
     --dry-run loaded the embedding model, and the non-reset path's
     collection_exists/ensure_file_path_index weren't retry-wrapped, so one
@@ -260,10 +260,10 @@ class SharedPreparationWithIndexRepo(unittest.TestCase):
 class ResetRefusesMemoryBankCollection(unittest.TestCase):
     """The configured memory-bank collection is refused outright, before any
     Qdrant client is even constructed. It is refused on every run, not only
-    --reset (as index_repo/sync_repo refuse it), and with the name also read
+    --reset (as cb_indexer_index_repo/cb_indexer_sync_repo refuse it), and with the name also read
     from --repo-path's .mcp.json, where setup writes it -- the shell normally
     doesn't export MEMORY_BANK_COLLECTION, so a custom name there used to go
-    unprotected by the CLI while index_repo refused it."""
+    unprotected by the CLI while cb_indexer_index_repo refused it."""
 
     def setUp(self):
         # The developer's own shell may export MEMORY_BANK_COLLECTION, which
@@ -307,7 +307,7 @@ class ResetRefusesMemoryBankCollection(unittest.TestCase):
 
     def test_plain_ingest_into_memory_bank_collection_is_refused_too(self):
         """This used to be pinned as NOT refused (only --reset was guarded);
-        index_repo/sync_repo refuse it regardless of reset/force."""
+        cb_indexer_index_repo/cb_indexer_sync_repo refuse it regardless of reset/force."""
         self._assert_refused(reset=False, memory_bank_collection="my-shared-bank")
 
     def test_name_from_the_shell_environment_is_refused(self):
@@ -440,7 +440,7 @@ class CliParityWithMcpServer(unittest.TestCase):
 
     def test_cli_never_indexes_the_sync_manifest(self):
         """Mirrors test_qdrant_ingest_lib.ManifestSelfIndex for the CLI path:
-        a repo previously maintained by sync_repo has the manifest at its
+        a repo previously maintained by cb_indexer_sync_repo has the manifest at its
         root, and .json is in CODE_EXTENSIONS."""
         with tempfile.TemporaryDirectory() as d:
             repo = Path(d)
@@ -696,8 +696,8 @@ def _sha(path: Path) -> str:
 
 
 class WriteManifestInTheCli(unittest.TestCase):
-    """The opt-in --write-manifest flag leaves sync_repo's manifest
-    baseline behind, like index_repo does when it starts from a clean slate.
+    """The opt-in --write-manifest flag leaves cb_indexer_sync_repo's manifest
+    baseline behind, like cb_indexer_index_repo does when it starts from a clean slate.
 
     Every test indexes a throwaway repo in a temp directory, never REPO_ROOT, so
     the real checkout's manifest is not touched whichever way a test goes. Where
@@ -1013,7 +1013,7 @@ class WriteManifestInTheCli(unittest.TestCase):
             out, _ = self._index()
         self.assertIn("Done.", out)
         self.assertIn("could not write the sync manifest (read-only file system)", out)
-        self.assertIn("the next sync_repo will rebuild", out)
+        self.assertIn("the next cb_indexer_sync_repo will rebuild", out)
 
     # -- the baseline's contents ---------------------------------------------------
 
@@ -1171,7 +1171,7 @@ class WriteManifestInTheCli(unittest.TestCase):
         self.assertIn("--write-manifest", doc)
         self.assertIn("does not record which collection it describes", doc)
         self.assertIn("never on --dry-run or after a failed run", doc)
-        self.assertIn("the next sync_repo re-chunks and re-embeds every file", doc)
+        self.assertIn("the next cb_indexer_sync_repo re-chunks and re-embeds every file", doc)
 
 
 class MainIsTheConsoleScriptEntryPoint(unittest.TestCase):

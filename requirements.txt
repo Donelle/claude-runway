@@ -23,7 +23,7 @@ openai
 requests
 trafilatura
 
-# Optional -- lets ingest_to_qdrant.py / index_repo / sync_repo respect a
+# Optional -- lets ingest_to_qdrant.py / cb_indexer_index_repo / cb_indexer_sync_repo respect a
 # project's .gitignore when deciding what to index. Safe to omit; falls back
 # to just the built-in include/exclude lists without it.
 pathspec

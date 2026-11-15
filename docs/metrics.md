@@ -69,6 +69,8 @@ Both live in the opt-in `analytics` server (`mcpservers/analytics_mcp_server.py`
 
 **Which `metric_id`s have a writer today:** `autowork` (the per-ticket outcome rows, including the `ticket_cost` rows `tools/autowork_cost.py record` writes), `memory-bank` (the call tally above) and `codebase-reviewer` (one `review` event per review run, below) and `pr-review-rounds` (Claude's cost per pull-request review round, below). The savings tracker is a separate store (`savings.db`), read with `/cr-savings`; asking `get_metrics` about it reports nothing.
 
+**Tool names in recorded data.** The `codebase-indexer` tools were renamed to `cb_indexer_*` (and `qdrant-find`/`qdrant-store` became `cb_indexer_find_repo`/`cb_indexer_store_repo`). Metrics and savings events recorded under an old tool name stay under it: nothing rewrites stored rows, and a query that groups by tool name shows the old and the new name as two separate tools.
+
 ### The `codebase-reviewer` events
 
 Every review run of the opt-in `codebase-reviewer` server (and every run of its test harness) writes ONE summary event here: `metric_id="codebase-reviewer"`, `event_type="review"`, `value` the wall time in seconds, `session_id` the server process's session id. Its `metadata` holds the run id, the review type, the outcome (`finished`, `refused` or `errored`), the per-stage times (`stage_s`, by stage name), the model-loading time (`load_s`), the model combination, the chunk, finding and confirmed counts, the number of requests, a timeouts count and a failures count, and the repository, branch and pull request number when known. It lets `/cr-metrics codebase-reviewer detail` show review time and frequency beside the other domains, and join on the pull request or session with autowork's rows.

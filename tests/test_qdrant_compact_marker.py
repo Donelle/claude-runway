@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Conversation-compact collections are marked internal
 (libs/qdrant_compact_marker.py), written by compact_store and honored by
-find_in_collection/list_collections; and the qdrant server reads
+cb_indexer_find_in_collection/cb_indexer_list_collections; and the qdrant server reads
 COMPACT_EMBEDDING_MODEL and checks for a model mismatch.
 
 Stdlib-only (unittest), no network: QdrantClient and the embedding provider

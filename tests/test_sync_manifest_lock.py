@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Tests for serializing the sync manifest's users per checkout
 (libs/sync_manifest_lib.py's ManifestLock and atomic save_manifest) and for
-how sync_repo, index_repo and the ingest CLI hold that lock.
+how cb_indexer_sync_repo, cb_indexer_index_repo and the ingest CLI hold that lock.
 
 Two overlapping runs on one checkout could leave the collection holding one
 version of a file's chunks while the manifest records another version's hash,
-and every later sync_repo would then skip the file as unchanged. The lock makes
+and every later cb_indexer_sync_repo would then skip the file as unchanged. The lock makes
 the second run fail fast instead; the atomic write keeps a reader from ever
 seeing a half-written manifest.
 
@@ -273,7 +273,7 @@ class InvalidationTakesTheLock(RepoTestCase):
         self.assertIsNone(lib.invalidation_error(self.repo, lock=mine))
         self.assertTrue(mine.held)
         self.assertFalse(self.manifest_path.exists())
-        # Called again in the same run (index_repo's reset hook, then its
+        # Called again in the same run (cb_indexer_index_repo's reset hook, then its
         # baseline step): still this run's lock, no refusal.
         self.assertIsNone(lib.invalidation_error(self.repo, lock=mine))
 
@@ -413,7 +413,7 @@ class ScannerSkipsSideFiles(RepoTestCase):
 
 
 # ---------------------------------------------------------------------------
-# sync_repo
+# cb_indexer_sync_repo
 # ---------------------------------------------------------------------------
 
 
@@ -539,7 +539,7 @@ class SyncRepoHoldsTheLock(RepoTestCase):
 
 
 # ---------------------------------------------------------------------------
-# index_repo
+# cb_indexer_index_repo
 # ---------------------------------------------------------------------------
 
 
@@ -631,7 +631,7 @@ class IndexRepoHoldsTheLockOnlyWhenItWritesTheManifest(RepoTestCase):
     def test_the_lock_is_already_held_while_the_collection_is_prepared_and_counted(self):
         # Whether this run may write a baseline rests on the collection being
         # absent or empty when prepared. Taking the lock only afterwards let a
-        # sync_repo fill the collection and save its manifest in between, and
+        # cb_indexer_sync_repo fill the collection and save its manifest in between, and
         # this run then appended duplicates and wrote a baseline that did not
         # describe them.
         seen = []
@@ -742,7 +742,7 @@ class CliHoldsTheLockOnlyWithWriteManifest(RepoTestCase):
         self.store.assert_not_called()
 
     def test_the_lock_is_already_held_while_the_collection_is_prepared_and_counted(self):
-        # Same race as index_repo's: the clean-slate decision must be made
+        # Same race as cb_indexer_index_repo's: the clean-slate decision must be made
         # under the lock, not before it.
         seen = []
         real_prep = _cli.prepare_collection_for_index

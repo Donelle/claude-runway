@@ -42,7 +42,7 @@ from qdrant_retry import async_call_with_retry
 # codebase_indexer_mcp_server.py for the delete side of the same problem.
 UPSERT_BATCH_SIZE = 250
 
-# Must match the nested key sync_repo's own delete-by-filter already uses
+# Must match the nested key cb_indexer_sync_repo's own delete-by-filter already uses
 # (mcpservers/codebase_indexer_mcp_server.py's models.FieldCondition(key="metadata.file_path",
 # ...)): store()/store_batch() write {"document": ..., METADATA_PATH:
 # entry.metadata}, and entry.metadata itself has a "file_path" key (see
@@ -117,7 +117,7 @@ def ensure_file_path_index(client, collection_name: str) -> bool:
     Idempotently backfills the KEYWORD payload index on
     FILE_PATH_INDEX_FIELD for an ALREADY-EXISTING collection.
 
-    Without this, sync_repo's per-file delete-by-filter -- and any other
+    Without this, cb_indexer_sync_repo's per-file delete-by-filter -- and any other
     metadata.file_path-scoped query -- full-scans every point in the
     collection on every changed/removed file. FIELD_INDEXES (passed to
     QdrantConnector's constructor) only creates this index automatically
@@ -126,13 +126,13 @@ def ensure_file_path_index(client, collection_name: str) -> bool:
     indexed before this fix shipped. This function covers that gap.
 
     Takes a plain sync `QdrantClient` (not QdrantConnector) since that's
-    what index_repo/sync_repo already construct for their own
+    what cb_indexer_index_repo/cb_indexer_sync_repo already construct for their own
     collection_exists/delete calls -- no separate client needed.
 
     Checks the collection's current payload_schema first rather than
     unconditionally calling create_payload_index every time: Qdrant builds
     a payload index by scanning every existing point once, so blindly
-    reissuing this call on every sync_repo run would just move the exact
+    reissuing this call on every cb_indexer_sync_repo run would just move the exact
     full-scan cost the index exists to eliminate from the delete path to
     here instead.
 

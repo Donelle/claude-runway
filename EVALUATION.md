@@ -19,7 +19,7 @@ Read "Measuring cleanly" first when you run A, B, C or E — it covers real mist
 ## Table of contents
 
 - [Measuring cleanly (read this first)](#measuring-cleanly-read-this-first)
-- [Track A: Qdrant codebase memory (`qdrant-find`/`qdrant-store` + `index_repo`/`sync_repo`)](#track-a-qdrant-codebase-memory-qdrant-findqdrant-store--index_reposync_repo)
+- [Track A: Qdrant codebase memory (`cb_indexer_find_repo`/`cb_indexer_store_repo` + `cb_indexer_index_repo`/`cb_indexer_sync_repo`)](#track-a-qdrant-codebase-memory-cb_indexer_find_repocb_indexer_store_repo--cb_indexer_index_repocb_indexer_sync_repo)
   - [Step A1: Build a benchmark task set](#step-a1-build-a-benchmark-task-set)
   - [Step A2: Baseline run (setup disabled)](#step-a2-baseline-run-setup-disabled)
   - [Step A3: Treatment run (setup enabled)](#step-a3-treatment-run-setup-enabled)
@@ -68,13 +68,13 @@ Lessons from actually trying to run `/usage`-based comparisons, not theoretical 
 - **Some costs may not be visible to `/usage` at all.** Claude Code's built-in tools (e.g. `WebFetch`) may run internal processing on Anthropic's own infrastructure using a different model. Check the "Usage by model" breakdown in `/usage` — if only one model ever appears there across your testing, that's evidence (not proof) that whatever a built-in tool does internally isn't being billed against your visible account usage, and no `/usage`-based test will be able to detect it either way. Don't chase this indefinitely if the breakdown never shows a second model — measure the outcome (does the session cost more or less) instead of the internal mechanism (why).
 - **Repeat every measurement 2-3x.** Prompt caching, background token usage, and non-deterministic exploration paths all add noise to a single run.
 
-## Track A: Qdrant codebase memory (`qdrant-find`/`qdrant-store` + `index_repo`/`sync_repo`)
+## Track A: Qdrant codebase memory (`cb_indexer_find_repo`/`cb_indexer_store_repo` + `cb_indexer_index_repo`/`cb_indexer_sync_repo`)
 
 ### Step A1: Build a benchmark task set
 
 Pick 8-12 real questions/tasks against the actual project repo, covering:
 
-- **Conceptual questions** (best case for `qdrant-find`) — "where is retry logic handled," "why is the auth module structured this way"
+- **Conceptual questions** (best case for `cb_indexer_find_repo`) — "where is retry logic handled," "why is the auth module structured this way"
 - **Exact-match lookups** (Grep should still win) — "find all callers of `functionName`," "where does this exact error string come from"
 - **A multi-step task** requiring real exploration — "fix bug X" or "add feature Y" — to see the effect on a realistic task, not just a single lookup
 
@@ -89,7 +89,7 @@ Keep the same list for every run so comparisons are apples-to-apples.
 
 ### Step A3: Treatment run (setup enabled)
 
-1. Restore `.mcp.json`. Run `sync_repo` first so the collection reflects the current repo state.
+1. Restore `.mcp.json`. Run `cb_indexer_sync_repo` first so the collection reflects the current repo state.
 2. Run the exact same tasks, one per freshly-relaunched process, same repo state (ideally same day, so the codebase hasn't drifted between baseline and treatment).
 3. Record `/usage` per task, and note which tools got called and in what order (visible inline, or in the saved transcript — see Step A5).
 4. Same correctness check as Step A2.
@@ -113,14 +113,14 @@ One session gives one number for the whole prefix, so it cannot attribute a shar
 **What the transcripts on the author's machine showed (survey run 2026-10-12, 115 transcripts under `~/.claude/projects`; 7 had no assistant turn and were left out):**
 
 - **The toolkit's tools were listed as deferred.** In 99 of the 115 transcripts at least one of the toolkit's tools was named in the first-turn deferred-tools list (not sent in the starting context). Per server: `qdrant` 98, `codebase-indexer` 97, `local-compress` 97, `memory-bank` 82, and all four core servers in 81 of those 99; what explains the sessions missing a server was not investigated. So "paid every turn" is not what these transcripts show for the servers that were listed. Two sessions called a toolkit tool that was not in the first-turn deferred list: either that schema was sent up front, or its server connected after the first turn; the transcript does not say which, so those are reported as unclassified, not as evidence either way.
-- **On-demand loads are the part of the cost that is visible.** In 72 of the 108 sessions that parsed (whatever their first-turn classification) the transcript recorded at least one toolkit tool's schema as loaded on demand. Across all sessions that is 24 distinct tools, 53,051 characters of recorded schema in total, the largest (`index_repo`) 3,483 characters. Characters, not tokens: a token count depends on the model's vocabulary, which is not public. This is only the observed on-demand subset, not the complete cost: a schema sent up front leaves no such record, and its cost sits inside the first turn's usage, where one transcript cannot size it separately.
+- **On-demand loads are the part of the cost that is visible.** In 72 of the 108 sessions that parsed (whatever their first-turn classification) the transcript recorded at least one toolkit tool's schema as loaded on demand. Across all sessions that is 24 distinct tools, 53,051 characters of recorded schema in total, the largest (`cb_indexer_index_repo`) 3,483 characters. Characters, not tokens: a token count depends on the model's vocabulary, which is not public. This is only the observed on-demand subset, not the complete cost: a schema sent up front leaves no such record, and its cost sits inside the first turn's usage, where one transcript cannot size it separately.
 - **The controlled with/without measurement was NOT made.** No pair of otherwise-identical sessions with the toolkit connected vs. removed exists in the local transcripts, so there is no measured number for "what the toolkit adds to the starting context" beyond the deferral and loaded-schema facts above. The observational comparison is not a substitute, and its "none listed" group (8 sessions) is not verified to be toolkit-free: a connected toolkit whose schemas were sent up front and never called leaves no trace. It showed *lower* starting context for sessions that listed the toolkit's tools (about 61k vs. 67k tokens on `claude-sonnet-5-5`, 63k vs. 77k on `claude-sonnet-5`, with only 4 sessions in the other group on each model), which reflects the sessions differing, not the toolkit saving anything. This also covers only the Claude Code builds that wrote those transcripts; re-run the survey after an upgrade rather than assuming it still holds.
 
-Keep the live tool count separate from this, because it is still useful and still drifts if hand-typed (a hardcoded count has gone stale before): run `python tools/report_tool_counts.py` for the current live count AND the size in characters of the tool descriptions (name + signature + docstring, a proxy for the JSON schema, not the schema itself) of `qdrant` (`qdrant-find`, `qdrant-store` and the three compact tools), `codebase-indexer`, `local-compress`, the opt-in `analytics` (the savings and metrics tools) and `memory-bank`, or read `codebase_indexer_mcp_server.py`'s stderr startup log (`[claude-runway] codebase-indexer registered N tools`). All five servers are this repo's own scripts, imported without a live Qdrant or embedding model (the `qdrant` server builds its model on first use). All of these go through `libs/mcp_tool_introspect.py`, so they can't drift relative to each other. Those are sizes of the schemas as written, not a per-turn cost. Where A4's measurement shows the toolkit adds a starting-context cost at all, that cost is what the savings on conceptual tasks have to beat.
+Keep the live tool count separate from this, because it is still useful and still drifts if hand-typed (a hardcoded count has gone stale before): run `python tools/report_tool_counts.py` for the current live count AND the size in characters of the tool descriptions (name + signature + docstring, a proxy for the JSON schema, not the schema itself) of `qdrant` (the three compact tools), `codebase-indexer` (the nine `cb_indexer_*` tools), `local-compress`, the opt-in `analytics` (the savings and metrics tools) and `memory-bank`, or read `codebase_indexer_mcp_server.py`'s stderr startup log (`[claude-runway] codebase-indexer registered N tools`). All five servers are this repo's own scripts, imported without a live Qdrant or embedding model (the `qdrant` server builds its model on first use). All of these go through `libs/mcp_tool_introspect.py`, so they can't drift relative to each other. Those are sizes of the schemas as written, not a per-turn cost. Where A4's measurement shows the toolkit adds a starting-context cost at all, that cost is what the savings on conceptual tasks have to beat.
 
 ### Step A5: Extract transcript data (optional but recommended)
 
-Claude Code session transcripts live at `~/.claude/projects/<project-hash>/<session-id>.jsonl`. Each line includes per-turn token usage and tool calls, so instead of manually reading `/usage` output you can parse these to get exact per-task totals and confirm `qdrant-find` was actually chosen over `Grep` for the conceptual tasks. Ask if you want a script that does this.
+Claude Code session transcripts live at `~/.claude/projects/<project-hash>/<session-id>.jsonl`. Each line includes per-turn token usage and tool calls, so instead of manually reading `/usage` output you can parse these to get exact per-task totals and confirm `cb_indexer_find_repo` was actually chosen over `Grep` for the conceptual tasks. Ask if you want a script that does this.
 
 ## Track B: Local compression (`compress_file`, `compress_command_output`, `fetch_url`)
 
@@ -137,7 +137,7 @@ Pick 3 tasks, one per local-compress tool, each with a real large source:
 ### Step B2: Baseline run (built-in tool)
 
 1. Fully quit/relaunch `claude` per task.
-2. Send a prompt that forces the built-in tool specifically (e.g. "Use Bash to run X," "Use Read to open Y," "Use WebFetch to fetch Z") — don't leave it to Claude's own judgment, since CLAUDE.md guidance may or may not be followed (see this repo's own README for that exact problem with `qdrant-find` vs. `Grep`).
+2. Send a prompt that forces the built-in tool specifically (e.g. "Use Bash to run X," "Use Read to open Y," "Use WebFetch to fetch Z") — don't leave it to Claude's own judgment, since CLAUDE.md guidance may or may not be followed (see this repo's own README for that exact problem with `cb_indexer_find_repo` vs. `Grep`).
 3. Record `/usage` immediately after.
 
 ### Step B3: Treatment run (local-compress tool)
@@ -220,7 +220,7 @@ Tracks A–C all follow the same rigorous shape: run a task, run it again under 
 
 > `characters before (the raw content that was compressed)` vs. `characters after (the compressed result actually used)`, plus the percent reduction between them
 
-This is directly observable for local-compression events only (`compress_file`/`compress_command_output`/`fetch_url`'s server-side compression, plus the `compress_output.py` hook), because the tool holds both sides of the comparison in hand — it read the raw content and produced the compressed result itself, so nothing about that specific delta is guessed. That's exactly why Track A's Qdrant piece is NOT part of this tracker: the counterfactual for `qdrant-find` (what Grep+Read would have cost instead) isn't observable the same way, so the tracker deliberately never labels Qdrant activity as "savings" — see "Measuring cleanly" above and the README's own qdrant-find-vs-Grep discussion for why that gap can't be closed by a heuristic.
+This is directly observable for local-compression events only (`compress_file`/`compress_command_output`/`fetch_url`'s server-side compression, plus the `compress_output.py` hook), because the tool holds both sides of the comparison in hand — it read the raw content and produced the compressed result itself, so nothing about that specific delta is guessed. That's exactly why Track A's Qdrant piece is NOT part of this tracker: the counterfactual for `cb_indexer_find_repo` (what Grep+Read would have cost instead) isn't observable the same way, so the tracker deliberately never labels Qdrant activity as "savings" — see "Measuring cleanly" above and the README's own cb_indexer_find_repo-vs-Grep discussion for why that gap can't be closed by a heuristic.
 
 Other differences from Tracks A–C worth being explicit about:
 

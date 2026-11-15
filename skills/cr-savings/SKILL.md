@@ -31,6 +31,6 @@ Run this any time you want to check how much local compression has saved this se
 ## Notes
 
 - This is read-only — it never writes, modifies, or deletes anything. (The perpetual SQLite rollup happens automatically at session end via a separate hook, not through this skill.)
-- Only local-compression events are credited toward the headline figures. Qdrant/`qdrant-find` activity is intentionally never counted here — its counterfactual (what Grep+Read would have cost) isn't observable, so crediting it would be a guess dressed up as a measurement.
+- Only local-compression events are credited toward the headline figures. Qdrant/`cb_indexer_find_repo` activity is intentionally never counted here — its counterfactual (what Grep+Read would have cost) isn't observable, so crediting it would be a guess dressed up as a measurement.
 - The per-model block (`detail` view, and the session-end summary) needs a transcript, so the detail view shows the most recent finished session's split, not the one in progress. An `unattributed` row holds events that could not be matched to a transcript turn.
 - `fetch_url` calls are logged but never credited — its honest counterfactual is WebFetch's own already-compressed summary, which isn't observed. The tool's output will show fetch_url call counts separately from the credited savings figure.

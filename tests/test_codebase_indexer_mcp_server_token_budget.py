@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Tests for the token-budget chunking wiring in mcpservers/codebase_indexer_mcp_server.py:
-index_repo, sync_repo and preview_index chunk by the embedding
+cb_indexer_index_repo, cb_indexer_sync_repo and cb_indexer_preview_index chunk by the embedding
 model's window, fail before touching anything when it cannot be read, report
 per-file progress and the largest files, read both metadata shapes, and
 rebuild safely from a missing or old-format manifest.
@@ -96,14 +96,14 @@ class NonChunkPointsWarning(unittest.TestCase):
         client = _local_collection(
             {
                 1: {"file_path": "a.py", "type": "code"},
-                2: {"file_path": "a.py", "note": "stored with qdrant-store"},
+                2: {"file_path": "a.py", "note": "stored with cb_indexer_store_repo"},
                 3: {"source": "https://example.com/page"},
                 4: {"file_path": "b.md", "type": "doc"},
             }
         )
         warning = _ims._non_chunk_points_warning(client, "col")
         self.assertIn("holds 2 point(s) that are not indexer chunks", warning)
-        self.assertIn("stored with qdrant-store", warning)
+        self.assertIn("stored with cb_indexer_store_repo", warning)
         self.assertIn("deleted with that file's old chunks", warning)
 
     def test_no_non_chunk_points_means_no_warning(self):
@@ -152,7 +152,7 @@ class DeleteOrphanedChunks(unittest.TestCase):
 
     def test_existence_is_tested_on_disk_not_against_a_scan(self):
         """A file that is still there but outside this sync's scope or extension
-        filter must keep its chunks: a sync_repo(scope="code") must not remove
+        filter must keep its chunks: a cb_indexer_sync_repo(scope="code") must not remove
         the doc chunks of files that exist."""
         (self.repo / "README.md").write_text("# hi")
         (self.repo / "dir").mkdir()
@@ -271,7 +271,7 @@ class ManifestOnDisk(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# sync_repo
+# cb_indexer_sync_repo
 # ---------------------------------------------------------------------------
 
 
@@ -669,12 +669,12 @@ def _sha(path: Path) -> str:
 
 
 # ---------------------------------------------------------------------------
-# index_repo
+# cb_indexer_index_repo
 # ---------------------------------------------------------------------------
 
 
 class IndexBaseline(unittest.TestCase):
-    """_index_baseline: which {file: hash} entries index_repo records."""
+    """_index_baseline: which {file: hash} entries cb_indexer_index_repo records."""
 
     def test_every_hashed_file_keeps_its_hash(self):
         self.assertEqual(_ims._index_baseline({"a": "h1", "b": "h2"}, [], {"a": 1, "b": 2}), {"a": "h1", "b": "h2"})
@@ -923,12 +923,12 @@ class IndexRepoTokenBudget(unittest.TestCase):
 
     def test_docstring_says_when_the_sync_manifest_is_written(self):
         doc = " ".join((_ims.index_repo.__doc__ or "").split())
-        self.assertIn("writes sync_repo's manifest", doc)
+        self.assertIn("writes cb_indexer_sync_repo's manifest", doc)
         self.assertIn("BEFORE chunking", doc)
         self.assertIn("force=true run into a collection that already held points leaves the manifest untouched", doc)
         self.assertIn("only written (or removed) when this run targets this project's own collection", doc)
         self.assertIn("the reset does not start if it cannot be removed", doc)
-        self.assertNotIn("does not write sync_repo's manifest", doc)
+        self.assertNotIn("does not write cb_indexer_sync_repo's manifest", doc)
         self.assertNotIn("a second time", doc)
 
     # -- the sync manifest baseline -----------------------------------------------
@@ -987,8 +987,8 @@ class IndexRepoTokenBudget(unittest.TestCase):
         self.assertIn("1 file(s) unchanged", result)
 
     def test_a_later_deletion_is_noticed_by_the_next_sync(self):
-        """The point of the baseline: files recorded by index_repo are the ones
-        sync_repo can later see removed."""
+        """The point of the baseline: files recorded by cb_indexer_index_repo are the ones
+        cb_indexer_sync_repo can later see removed."""
         self._index()
         (self.repo / "small.txt").unlink()
         self.client.collection_exists.return_value = True
@@ -1010,8 +1010,8 @@ class IndexRepoTokenBudget(unittest.TestCase):
         """A file edited while the run is going must end up with a hash OLDER
         than its indexed chunks (so the next sync re-indexes it), never newer."""
         original_hash = _sha(self.repo / "small.txt")
-        # index_repo chunks through iter_entries, which calls the library's
-        # chunk_file, so that is the one to intercept (sync_repo calls its own
+        # cb_indexer_index_repo chunks through iter_entries, which calls the library's
+        # chunk_file, so that is the one to intercept (cb_indexer_sync_repo calls its own
         # imported name instead).
         real_chunk_file = _lib.chunk_file
 
@@ -1215,7 +1215,7 @@ class IndexRepoTokenBudget(unittest.TestCase):
 
     def test_a_failed_run_into_an_empty_collection_leaves_no_stale_manifest(self):
         """Nothing to wipe, but the old manifest is no longer true once chunks
-        land: a run that dies partway must not leave it for sync_repo to trust."""
+        land: a run that dies partway must not leave it for cb_indexer_sync_repo to trust."""
         _ims._save_manifest(self.repo, {
             "big.txt": _sha(self.repo / "big.txt"), "small.txt": _sha(self.repo / "small.txt"),
         })
@@ -1244,7 +1244,7 @@ class IndexRepoTokenBudget(unittest.TestCase):
     def test_indexing_another_collection_never_replaces_this_projects_baseline(self):
         """The manifest is one file per checkout and records no collection:
         indexing the checkout into collection B must not overwrite what
-        sync_repo keeps for collection A, or A's next sync reports no changes
+        cb_indexer_sync_repo keeps for collection A, or A's next sync reports no changes
         for files edited since."""
         self._index()
         before = self._saved_files()
@@ -1276,7 +1276,7 @@ class IndexRepoTokenBudget(unittest.TestCase):
         self.assertFalse((self.repo / MANIFEST_FILENAME).exists())
 
     def _without_chunks_for(self, name):
-        """Run index_repo as if the second tree walk never reached `name`, which
+        """Run cb_indexer_index_repo as if the second tree walk never reached `name`, which
         is how a file deleted at that moment and restored afterwards looks."""
         real_iter_entries = _ims.iter_entries
 
@@ -1397,7 +1397,7 @@ class IndexRepoTokenBudget(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# preview_index
+# cb_indexer_preview_index
 # ---------------------------------------------------------------------------
 
 

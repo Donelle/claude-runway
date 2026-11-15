@@ -6,7 +6,7 @@ scope. Those paths are recorded in the manifest under an additive key, apart
 from the {file: hash} map, so a later sync can notice when one is deleted and
 remove its chunks.
 
-The sync_repo tests run against qdrant-client's in-process `:memory:` mode, so
+The cb_indexer_sync_repo tests run against qdrant-client's in-process `:memory:` mode, so
 the real filters (including the memory-bank/compact exclusion) are exercised
 rather than asserted against a mock. The embedding model is replaced by a
 stand-in (tests/fake_token_budget.py). No test depends on the order the repo
@@ -236,7 +236,7 @@ class SweepReportsPreservedPaths(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# sync_repo, end to end against an in-memory collection
+# cb_indexer_sync_repo, end to end against an in-memory collection
 # ---------------------------------------------------------------------------
 
 
@@ -386,7 +386,7 @@ class SyncRepoTracksPreservedPaths(unittest.TestCase):
         must not promise more than that."""
         self.client.upsert("col", [models.PointStruct(
             id=8, vector={"v": [1.0, 0.0]},
-            payload={"document": "a note", "metadata": {"file_path": "README.md", "note": "stored with qdrant-store"}},
+            payload={"document": "a note", "metadata": {"file_path": "README.md", "note": "stored with cb_indexer_store_repo"}},
         )])
         self._rebuild()
         (self.repo / "README.md").unlink()
@@ -557,7 +557,7 @@ def _sha(path: Path) -> str:
 
 
 # ---------------------------------------------------------------------------
-# index_repo's baseline
+# cb_indexer_index_repo's baseline
 # ---------------------------------------------------------------------------
 
 
@@ -633,7 +633,7 @@ class WorkaroundNoteIsReplacedConsistently(unittest.TestCase):
     """The advice to run the first rebuild with the scope you normally index
     with existed because nothing tracked the files a narrower rebuild kept.
     The Known limitations page (it was in the README before that section moved),
-    docs/installation.md, the upgrade migration's note and sync_repo's
+    docs/installation.md, the upgrade migration's note and cb_indexer_sync_repo's
     docstring all carried it; they must now agree that those files are tracked."""
 
     def _texts(self):
@@ -647,7 +647,7 @@ class WorkaroundNoteIsReplacedConsistently(unittest.TestCase):
             "docs/known-limitations.md": read("docs", "known-limitations.md"),
             "docs/installation.md": read("docs", "installation.md"),
             "the upgrade migration note": " ".join(migration.note.split()),
-            "sync_repo's docstring": " ".join((_ims.sync_repo.__doc__ or "").split()),
+            "cb_indexer_sync_repo's docstring": " ".join((_ims.sync_repo.__doc__ or "").split()),
         }
 
     def test_none_of_them_still_asks_for_the_same_scope_or_says_removal_goes_unnoticed(self):
@@ -657,7 +657,7 @@ class WorkaroundNoteIsReplacedConsistently(unittest.TestCase):
                 self.assertNotIn("same scope you normally index with", low)
                 self.assertNotIn("until the collection is reset or rebuilt again", low)
                 self.assertNotIn("no sync removes", low)
-                self.assertNotIn("no `sync_repo` removes", low)
+                self.assertNotIn("no `cb_indexer_sync_repo` removes", low)
                 self.assertNotIn("is not recorded in the new manifest", low)
                 self.assertNotIn("is not tracked in the new manifest", low)
 
