@@ -18,7 +18,7 @@ servers and they can't drift apart:
   "mcpServers": {
     "codebase-indexer": {
       "command": "python",
-      "args": ["/absolute/path/to/mcpservers/ingest_mcp_server.py"],
+      "args": ["/absolute/path/to/mcpservers/codebase_indexer_mcp_server.py"],
       "env": {
         "QDRANT_URL": "http://localhost:6333",
         "COLLECTION_NAME": "<this-project's-collection-name>",

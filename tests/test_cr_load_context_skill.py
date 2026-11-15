@@ -150,7 +150,7 @@ class CrLoadContextSkillTest(unittest.TestCase):
     # Each MCP server's file and the group heading the skill's guide uses for it.
     SERVERS = {
         "qdrant_mcp_server.py": "qdrant",
-        "ingest_mcp_server.py": "codebase-indexer",
+        "codebase_indexer_mcp_server.py": "codebase-indexer",
         "memory_bank_mcp_server.py": "memory-bank",
         "compress_mcp_server.py": "local-compress",
         "analytics_mcp_server.py": "analytics",

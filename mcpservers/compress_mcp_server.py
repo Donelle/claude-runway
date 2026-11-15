@@ -349,7 +349,7 @@ async def compress_file(
     # removing the ignore surfaces Pyright's own equivalent
     # reportArgumentType error here, just phrased differently than mypy's.
     # Same reasoning at every other `ctx` parameter below and in
-    # ingest_mcp_server.py/memory_bank_mcp_server.py.
+    # codebase_indexer_mcp_server.py/memory_bank_mcp_server.py.
     ctx: Context = None,  # type: ignore[assignment]
 ) -> str:
     """

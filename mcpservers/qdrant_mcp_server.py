@@ -681,7 +681,7 @@ async def compact_store(
     # Docker Desktop's vpnkit can reap an idle pooled connection, so the
     # very next Qdrant call can raise a ResponseHandlingException on a
     # connection the client believes is still healthy. See
-    # libs/qdrant_retry.py, and ingest_mcp_server.py's identical pattern.
+    # libs/qdrant_retry.py, and codebase_indexer_mcp_server.py's identical pattern.
     created_here = False
     if not call_with_retry(client.collection_exists, col):
         try:

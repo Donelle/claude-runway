@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Tests for check_embedding_model_mismatch in libs/qdrant_model_check.py
-(relocated here from mcpservers/ingest_mcp_server.py
+(relocated here from mcpservers/codebase_indexer_mcp_server.py
 so mcpservers/memory_bank_mcp_server.py can reuse the identical check).
 
 Stdlib-only (unittest, no pytest) and no network -- all QdrantClient and

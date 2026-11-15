@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.join(REPO_ROOT, "libs"))
 sys.path.insert(0, os.path.join(REPO_ROOT, "mcpservers"))
 
 # Minimal env so module-level DEFAULT_* constants don't explode on import --
-# same pattern established in test_ingest_mcp_server_tool_count.py.
+# same pattern established in test_codebase_indexer_mcp_server_tool_count.py.
 os.environ.setdefault("QDRANT_URL", "http://localhost:6333")
 os.environ.setdefault("MEMORY_BANK_ID", "test-collection")
 os.environ.setdefault("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Tests for libs/mcp_tool_introspect.py -- the shared utility extracted
-(GROW-05) so ingest_mcp_server.py, memory_bank_mcp_server.py, and
+(GROW-05) so codebase_indexer_mcp_server.py, memory_bank_mcp_server.py, and
 tools/report_tool_counts.py all enumerate an MCPServer's registered tools
 through one identical code path instead of duplicating (and independently
 drifting on) the same "mcp._tool_manager.list_tools()" logic in several

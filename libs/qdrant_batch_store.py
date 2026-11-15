@@ -39,11 +39,11 @@ from qdrant_retry import async_call_with_retry
 # exists to avoid (the failure this replaces happened at ~5,249 individual
 # calls) while keeping each single upsert request's payload (points +
 # embeddings) a reasonable size. Matches DELETE_BATCH_SIZE's role in
-# ingest_mcp_server.py for the delete side of the same problem.
+# codebase_indexer_mcp_server.py for the delete side of the same problem.
 UPSERT_BATCH_SIZE = 250
 
 # Must match the nested key sync_repo's own delete-by-filter already uses
-# (mcpservers/ingest_mcp_server.py's models.FieldCondition(key="metadata.file_path",
+# (mcpservers/codebase_indexer_mcp_server.py's models.FieldCondition(key="metadata.file_path",
 # ...)): store()/store_batch() write {"document": ..., METADATA_PATH:
 # entry.metadata}, and entry.metadata itself has a "file_path" key (see
 # qdrant_ingest_lib.py's chunk_file), so the indexable field is the NESTED

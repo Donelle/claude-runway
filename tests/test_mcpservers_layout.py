@@ -22,7 +22,7 @@ EXPECTED_SERVERS = {
     "analytics_mcp_server.py",
     "codebase_reviewer_mcp_server.py",
     "compress_mcp_server.py",
-    "ingest_mcp_server.py",
+    "codebase_indexer_mcp_server.py",
     "memory_bank_mcp_server.py",
     "qdrant_mcp_server.py",
 }

@@ -31,7 +31,7 @@ from typing import Optional
 
 def same_endpoint(a: str, b: str) -> bool:
     """Whether two Qdrant URLs name the same endpoint. Also how
-    ingest_mcp_server decides that a call targets this project's own
+    codebase_indexer_mcp_server decides that a call targets this project's own
     collection (which owns the checkout's sync manifest and its lock), so the
     key rule and that decision agree on what "the configured URL" is."""
     # A trailing slash names the same endpoint, so it must not make the

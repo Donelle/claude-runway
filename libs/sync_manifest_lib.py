@@ -1,6 +1,6 @@
 """
 The sync manifest's read, write, discard and baseline logic, shared by
-mcpservers/ingest_mcp_server.py (sync_repo and index_repo) and tools/ingest_to_qdrant.py
+mcpservers/codebase_indexer_mcp_server.py (sync_repo and index_repo) and tools/ingest_to_qdrant.py
 (the CLI's opt-in --write-manifest), so the two cannot drift apart on a file
 whose format every project's next sync_repo depends on.
 

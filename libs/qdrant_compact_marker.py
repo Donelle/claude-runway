@@ -8,7 +8,7 @@ semantic search. Nothing used to say so: `find_in_collection` would search
 them and `list_collections` listed them next to real codebase collections as
 if they were search targets. This module is the ONE place that defines how
 such a collection is marked internal, so the writer (qdrant_mcp_server.py)
-and the two readers (ingest_mcp_server.py's `find_in_collection` /
+and the two readers (codebase_indexer_mcp_server.py's `find_in_collection` /
 `list_collections`) cannot drift apart on the key, the value, or the
 read/write rules. (libs/qdrant_collection_hints.py is a description cache
 and not a fit for this.)
