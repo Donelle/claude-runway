@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for the token-budget chunking wiring in mcpservers/ingest_mcp_server.py:
+"""Tests for the token-budget chunking wiring in mcpservers/codebase_indexer_mcp_server.py:
 index_repo, sync_repo and preview_index chunk by the embedding
 model's window, fail before touching anything when it cannot be read, report
 per-file progress and the largest files, read both metadata shapes, and
@@ -32,7 +32,7 @@ os.environ.setdefault("QDRANT_URL", "http://localhost:6333")
 os.environ.setdefault("COLLECTION_NAME", "test-collection")
 os.environ.setdefault("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 
-import ingest_mcp_server as _ims  # noqa: E402
+import codebase_indexer_mcp_server as _ims  # noqa: E402
 import qdrant_ingest_lib as _lib  # noqa: E402
 from fake_token_budget import word_budget  # noqa: E402
 from qdrant_client import QdrantClient, models  # noqa: E402

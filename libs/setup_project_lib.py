@@ -462,7 +462,7 @@ def build_mcp_servers(
 
     indexer = servers["codebase-indexer"]
     indexer["command"] = venv_python_str
-    indexer["args"] = [f"{tools_repo_str}/mcpservers/ingest_mcp_server.py"]
+    indexer["args"] = [f"{tools_repo_str}/mcpservers/codebase_indexer_mcp_server.py"]
     indexer["env"]["QDRANT_URL"] = qdrant_url
     indexer["env"]["QDRANT_API_KEY"] = qdrant_api_key
     indexer["env"]["COLLECTION_NAME"] = collection_name
@@ -2124,7 +2124,7 @@ def run_setup(
 
     # Found in review: a target repo directory named e.g. "memory-bank"
     # with both COLLECTION_NAME and MEMORY_BANK_COLLECTION left at their
-    # defaults resolves them to the SAME string -- mcpservers/ingest_mcp_server.py's
+    # defaults resolves them to the SAME string -- mcpservers/codebase_indexer_mcp_server.py's
     # reserved-collection-name guard then refuses EVERY index_repo/sync_repo
     # call for this project, since its own code-index collection IS the
     # reserved memory-bank name. Warn at setup time rather than leaving this

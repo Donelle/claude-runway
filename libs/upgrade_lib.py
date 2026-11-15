@@ -1003,12 +1003,99 @@ def _apply_mcp_server_scripts_moved(
     return mcp_json, settings_json
 
 
+# ---------------------------------------------------------------------------
+# codebase-indexer-script-renamed
+# ---------------------------------------------------------------------------
+#
+# The codebase-indexer server's script was renamed from `ingest_mcp_server.py`
+# to `codebase_indexer_mcp_server.py`, so its file name matches the server it
+# runs like every other `<server>_mcp_server.py`. Every `.mcp.json` written
+# before that names the old file, and the server fails to start until the path
+# is rewritten. Matched by file name in any server block, not only the one
+# keyed `codebase-indexer`, so a user who renamed that key is still migrated
+# (same as mcp-server-scripts-moved above).
+#
+# The old name is spelled out here on purpose: this migration and
+# `_MOVED_MCP_SERVER_SCRIPTS` above are the only places that still need it.
+
+_OLD_INDEXER_SCRIPT = "ingest_mcp_server.py"
+_NEW_INDEXER_SCRIPT = "codebase_indexer_mcp_server.py"
+
+# The old script directly under a `mcpservers` path segment (either
+# separator). This is the form `apply` rewrites.
+_OLD_INDEXER_PATH = re.compile(r"(^|[\\/])mcpservers([\\/])" + re.escape(_OLD_INDEXER_SCRIPT) + r"$")
+
+# The same file still under `tools/`, from before mcp-server-scripts-moved.
+# `detect` counts it so one `upgrade` run on a very old install offers both
+# migrations: `run_upgrade` computes the pending list once, before anything is
+# applied, so detecting only the `mcpservers/` form would leave this one for a
+# second run. `apply` never rewrites this form itself (see its docstring).
+_OLD_INDEXER_TOOLS_PATH = re.compile(r"(^|[\\/])tools[\\/]" + re.escape(_OLD_INDEXER_SCRIPT) + r"$")
+
+
+def _rewrite_renamed_indexer_path(value: object) -> "Optional[str]":
+    """The renamed form of an old `.../mcpservers/ingest_mcp_server.py` path,
+    keeping the directory and separator, or None when `value` is not one."""
+    if not isinstance(value, str):
+        return None
+    new, count = _OLD_INDEXER_PATH.subn(r"\1mcpservers\2" + _NEW_INDEXER_SCRIPT, value)
+    return new if count else None
+
+
+def _detect_codebase_indexer_script_renamed(mcp_json: dict, settings_json: dict) -> bool:
+    """True when any server block still launches the old indexer script, from
+    `mcpservers/` or from the even older `tools/`."""
+    servers = mcp_json.get("mcpServers", {})
+    if not isinstance(servers, dict):
+        return False
+    for block in servers.values():
+        if not isinstance(block, dict):
+            continue
+        for arg in block.get("args") or []:
+            if not isinstance(arg, str):
+                continue
+            if _OLD_INDEXER_PATH.search(arg) or _OLD_INDEXER_TOOLS_PATH.search(arg):
+                return True
+    return False
+
+
+def _apply_codebase_indexer_script_renamed(
+    mcp_json: dict, settings_json: dict, ctx: MigrationContext
+) -> "tuple[dict, dict]":
+    """
+    Rewrites each `.../mcpservers/ingest_mcp_server.py` entry in `args` to
+    `.../mcpservers/codebase_indexer_mcp_server.py`, and nothing else: the
+    venv `command`, every `env` value, every other server and the whole of
+    `settings.json` are left as they were.
+
+    A `.../tools/ingest_mcp_server.py` entry is left alone. When
+    mcp-server-scripts-moved is accepted in the same run, it has already moved
+    that path to `mcpservers/` (it is earlier in `MIGRATIONS`), so it is
+    rewritten here. When that one was declined, rewriting the file name alone
+    would point at a `tools/codebase_indexer_mcp_server.py` that has never
+    existed, so this changes nothing and `run_upgrade` reports it as still
+    pending (same pattern as `local-compress-savings-db-inert`).
+    """
+    mcp_json = copy.deepcopy(mcp_json)
+    servers = mcp_json.get("mcpServers", {})
+    if not isinstance(servers, dict):
+        return mcp_json, settings_json
+    for block in servers.values():
+        if not isinstance(block, dict) or not isinstance(block.get("args"), list):
+            continue
+        block["args"] = [
+            _rewrite_renamed_indexer_path(arg) or arg for arg in block["args"]
+        ]
+    return mcp_json, settings_json
+
+
 # List order is both display and apply order when more than one migration is
 # pending; `detect` alone decides whether each one is shown at all. Order only
 # matters where one migration's guard depends on another:
 # record-session-id-sessionstart needs record-session-id-hooks-missing to
-# appear (and be applied) earlier in this list, and
-# local-compress-savings-db-inert needs analytics-server-missing earlier.
+# appear (and be applied) earlier in this list,
+# local-compress-savings-db-inert needs analytics-server-missing earlier, and
+# codebase-indexer-script-renamed needs mcp-server-scripts-moved earlier.
 MIGRATIONS: "list[Migration]" = [
     Migration(
         id="memory-bank-server-missing",
@@ -1204,7 +1291,8 @@ MIGRATIONS: "list[Migration]" = [
         description=(
             "This project's .mcp.json launches one or more of the five MCP server scripts "
             "(qdrant, ingest, memory_bank, compress, analytics) from tools/, where they no longer "
-            "are: they moved to mcpservers/ (same file names), so those servers fail to start until "
+            "are: they moved to mcpservers/ (same file names; codebase-indexer's ingest_mcp_server.py "
+            "is then renamed by codebase-indexer-script-renamed), so those servers fail to start until "
             "the path is rewritten. Rewrites just the script path in each such server's args from "
             ".../tools/<server>.py to .../mcpservers/<server>.py; the venv command, env values, "
             "every other server and .claude/settings.json are left untouched."
@@ -1216,6 +1304,26 @@ MIGRATIONS: "list[Migration]" = [
         ),
         detect=_detect_mcp_server_scripts_moved,
         apply=_apply_mcp_server_scripts_moved,
+    ),
+    Migration(
+        id="codebase-indexer-script-renamed",
+        title="Point codebase-indexer at codebase_indexer_mcp_server.py",
+        kind="update",
+        description=(
+            "This project's .mcp.json launches the codebase-indexer server from "
+            "mcpservers/ingest_mcp_server.py, which was renamed to "
+            "mcpservers/codebase_indexer_mcp_server.py, so that server fails to start until the path "
+            "is rewritten. Rewrites just that file name in args, keeping the directory; the venv "
+            "command, env values, every other server and .claude/settings.json are left untouched."
+        ),
+        note=(
+            "Restart Claude Code to load the server from its new file. A pipx or `uv tool` install "
+            "needs upgrading first (`pipx upgrade claude-runway` / `uv tool upgrade claude-runway`). "
+            "If mcp-server-scripts-moved is also pending, this changes nothing until that one has "
+            "moved the path to mcpservers/."
+        ),
+        detect=_detect_codebase_indexer_script_renamed,
+        apply=_apply_codebase_indexer_script_renamed,
     ),
 ]
 

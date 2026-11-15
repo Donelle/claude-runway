@@ -1,6 +1,6 @@
 """
 Shared "prepare a collection for a full index" step, used by
-both mcpservers/ingest_mcp_server.py's index_repo and tools/ingest_to_qdrant.py's
+both mcpservers/codebase_indexer_mcp_server.py's index_repo and tools/ingest_to_qdrant.py's
 ingest().
 
 Before this module, each of those hand-rolled the same sequence -- on reset,
@@ -101,7 +101,7 @@ def prepare_collection_for_index(
 
     provider_factory/retry/model_check/backfill are injectable so each
     caller passes its OWN module-level names, keeping those the patch point
-    its existing tests already use (e.g. ingest_mcp_server.FastEmbedProvider).
+    its existing tests already use (e.g. codebase_indexer_mcp_server.FastEmbedProvider).
     """
     result = IndexPreparation()
     if reset:

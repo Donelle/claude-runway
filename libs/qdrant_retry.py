@@ -44,7 +44,7 @@ in case some future/other call path raises them unwrapped.
 FOUND BY REAL-WORLD TESTING ON A LARGE REPO (10,532+ files): a single retry
 (2 total attempts) still isn't enough on a big enough sequential loop.
 sync_repo's delete loop batching (see DELETE_BATCH_SIZE in
-ingest_mcp_server.py) fixed the failure there, but the SAME class of drop
+codebase_indexer_mcp_server.py) fixed the failure there, but the SAME class of drop
 then reliably resurfaced deep in the per-chunk upsert loop instead --
 observed failing near call ~5,249 in one run, after thousands of prior
 calls all returned 200 OK. The mechanism is statistical, not a stuck

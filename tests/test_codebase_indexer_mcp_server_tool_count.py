@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for ingest_mcp_server.py's _log_registered_tool_count() --
+"""Tests for codebase_indexer_mcp_server.py's _log_registered_tool_count() --
 GROW-05's Track A counterpart to compress_mcp_server.py's
 _log_fixed_overhead() (since removed). Before this, EVALUATION.md's Track A section had
 no live self-reporting mechanism at all for the codebase-indexer server's
@@ -32,7 +32,7 @@ os.environ.setdefault("QDRANT_URL", "http://localhost:6333")
 os.environ.setdefault("COLLECTION_NAME", "test-collection")
 os.environ.setdefault("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 
-import ingest_mcp_server as _ims  # noqa: E402
+import codebase_indexer_mcp_server as _ims  # noqa: E402
 
 
 class LogRegisteredToolCountReportsTheLiveCount(unittest.TestCase):

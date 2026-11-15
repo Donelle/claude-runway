@@ -1,11 +1,11 @@
 """
 Shared, side-effect-free chunking helpers used by both:
   - ingest_to_qdrant.py   (standalone CLI script)
-  - ingest_mcp_server.py  (MCP server exposing the same logic as tools)
+  - codebase_indexer_mcp_server.py  (MCP server exposing the same logic as tools)
 
 Kept dependency-free (no qdrant-client / fastembed imports here) so
 it's easy to unit test and reuse. No print() calls in this file on purpose --
-ingest_mcp_server.py runs over stdio, where stray prints corrupt the protocol.
+codebase_indexer_mcp_server.py runs over stdio, where stray prints corrupt the protocol.
 """
 
 import bisect
@@ -67,7 +67,7 @@ EXCLUDE_DIRS = {
 
 
 # sync_repo's bookkeeping file at the repo root. Lives here rather than in
-# ingest_mcp_server.py so the CLI can exclude it too: .json is in
+# codebase_indexer_mcp_server.py so the CLI can exclude it too: .json is in
 # CODE_EXTENSIONS, so every build_entries/compute_file_hashes caller has to
 # pass extra_exclude_files={MANIFEST_FILENAME} or it embeds the manifest
 # itself -- the CLI was the one caller that didn't.
@@ -145,7 +145,7 @@ def parse_csv_set(value: Optional[str]) -> Optional[set]:
     a None/empty value or one with no non-blank entries, so callers can
     write `parse_csv_set(x) or default`.
 
-    Shared by ingest_mcp_server.py and ingest_to_qdrant.py:
+    Shared by codebase_indexer_mcp_server.py and ingest_to_qdrant.py:
     the CLI used to do a bare split(","), so ".py, .md" became
     {".py", " .md"} -> normalize_extensions -> {".py", ". .md"} and every
     .md file was silently skipped.

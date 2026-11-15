@@ -26,12 +26,12 @@ sys.path.insert(0, os.path.join(REPO_ROOT, "mcpservers"))
 
 # Minimal env so module-level DEFAULT_* constants don't explode on import --
 # same pattern established in test_qdrant_ingest_lib.py and
-# test_ingest_mcp_server_tool_count.py.
+# test_codebase_indexer_mcp_server_tool_count.py.
 os.environ.setdefault("QDRANT_URL", "http://localhost:6333")
 os.environ.setdefault("COLLECTION_NAME", "test-collection")
 os.environ.setdefault("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 
-import ingest_mcp_server as _ims  # noqa: E402
+import codebase_indexer_mcp_server as _ims  # noqa: E402
 
 
 def _make_collection_info(points_count: int) -> MagicMock:
@@ -73,10 +73,10 @@ class IndexRepoPreflightWarningTest(unittest.TestCase):
         self.mock_iter_entries = self._iter_entries_patcher.start()
 
         # FastEmbedProvider and QdrantConnector: never need to do anything real.
-        self._embed_patcher = patch("ingest_mcp_server.FastEmbedProvider")
+        self._embed_patcher = patch("codebase_indexer_mcp_server.FastEmbedProvider")
         self.mock_embed_cls = self._embed_patcher.start()
 
-        self._connector_patcher = patch("ingest_mcp_server.QdrantConnector")
+        self._connector_patcher = patch("codebase_indexer_mcp_server.QdrantConnector")
         self.mock_connector_cls = self._connector_patcher.start()
 
         # ensure_file_path_index: no-op for all tests.
@@ -106,7 +106,7 @@ class IndexRepoPreflightWarningTest(unittest.TestCase):
         return client
 
     def _patch_client(self, client: MagicMock):
-        return patch("ingest_mcp_server.QdrantClient", return_value=client)
+        return patch("codebase_indexer_mcp_server.QdrantClient", return_value=client)
 
     # ------------------------------------------------------------------ #
     #  Cases that SHOULD return a warning (no embedding performed)        #
@@ -233,7 +233,7 @@ class IndexRepoPreflightWarningTest(unittest.TestCase):
         client = self._make_client(exists=True, points_count=9999)
         client.delete_collection.return_value = True
         # reset=True's pre-delete schema check is a different, dedicated
-        # concern (test_ingest_mcp_server_memory_bank_guards.py /
+        # concern (test_codebase_indexer_mcp_server_memory_bank_guards.py /
         # test_qdrant_model_check.py) -- not what this test is pinning.
         # _make_collection_info only sets points_count, so the real check's
         # unconfigured vectors_config now correctly fails closed

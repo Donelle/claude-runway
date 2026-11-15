@@ -23,7 +23,7 @@ only on the user's say-so, see below):
   - `source` -- always "memory-bank", fixed by this module, never
     model-settable. The structural "is this actually a memory-bank record"
     signal `index_repo(reset=true)`/`sync_repo` key their guard exclusions
-    off of (see mcpservers/ingest_mcp_server.py).
+    off of (see mcpservers/codebase_indexer_mcp_server.py).
   - `repo` -- the writing project's own MEMORY_BANK_ID (a plain identifier,
     not necessarily a real Qdrant collection name), or the reserved
     GENERAL_REPO sentinel when the caller explicitly asked for
@@ -66,7 +66,7 @@ from qdrant_model_check import check_embedding_model_mismatch
 # call site -- the shared check's DEFAULT text tells a caller
 # to "use index_repo(reset=true)"/mentions "find_in_collection", both wrong
 # here: index_repo refuses to ever touch the shared memory-bank collection
-# (see is_memory_bank_collection_name's callers in mcpservers/ingest_mcp_server.py),
+# (see is_memory_bank_collection_name's callers in mcpservers/codebase_indexer_mcp_server.py),
 # and memory-bank isn't a cross-repo lookup.
 MISMATCH_RECOVERY_HINT = (
     "This shared memory-bank collection was created with a different embedding "
@@ -260,7 +260,7 @@ def parse_follow_repos(raw: Optional[str], own_repo: Optional[str]) -> tuple:
 def is_memory_bank_collection_name(collection: str, memory_bank_collection: str) -> bool:
     """
     True if `collection` (an index_repo/sync_repo target) matches the
-    configured memory-bank collection name -- used by ingest_mcp_server.py
+    configured memory-bank collection name -- used by codebase_indexer_mcp_server.py
     to refuse indexing/syncing directly into the shared memory bank,
     regardless of reset/force, rather than only guarding the reset path.
     """

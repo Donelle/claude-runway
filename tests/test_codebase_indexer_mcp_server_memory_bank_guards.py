@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for the memory-bank guards added to mcpservers/ingest_mcp_server.py:
+"""Tests for the memory-bank guards added to mcpservers/codebase_indexer_mcp_server.py:
 
 
 - index_repo/sync_repo refuse outright when their target collection matches
@@ -15,7 +15,7 @@
   memory-bank points.
 
 Stdlib-only (unittest, no pytest), no network -- mirrors
-test_ingest_mcp_server_preflight.py's mocking style.
+test_codebase_indexer_mcp_server_preflight.py's mocking style.
 
     .venv/bin/python -m unittest discover -s tests
 """
@@ -34,7 +34,7 @@ os.environ.setdefault("QDRANT_URL", "http://localhost:6333")
 os.environ.setdefault("COLLECTION_NAME", "test-collection")
 os.environ.setdefault("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 
-import ingest_mcp_server as _ims  # noqa: E402
+import codebase_indexer_mcp_server as _ims  # noqa: E402
 import memory_bank_lib as mb  # noqa: E402
 from qdrant_client.http.models import models as _m  # noqa: E402
 
@@ -80,11 +80,11 @@ class IndexRepoResetGuardTest(unittest.TestCase):
         self._iter_entries_patcher.start()
         self.addCleanup(self._iter_entries_patcher.stop)
 
-        self._embed_patcher = patch("ingest_mcp_server.FastEmbedProvider")
+        self._embed_patcher = patch("codebase_indexer_mcp_server.FastEmbedProvider")
         self._embed_patcher.start()
         self.addCleanup(self._embed_patcher.stop)
 
-        self._connector_patcher = patch("ingest_mcp_server.QdrantConnector")
+        self._connector_patcher = patch("codebase_indexer_mcp_server.QdrantConnector")
         self._connector_patcher.start()
         self.addCleanup(self._connector_patcher.stop)
 
@@ -123,8 +123,8 @@ class IndexRepoResetGuardTest(unittest.TestCase):
         provider_instance = MagicMock()
         provider_instance.get_vector_name.return_value = "fast-some-model"
         provider_instance.get_vector_size.return_value = 384
-        with patch("ingest_mcp_server.QdrantClient", return_value=client), \
-             patch("ingest_mcp_server.FastEmbedProvider", return_value=provider_instance), \
+        with patch("codebase_indexer_mcp_server.QdrantClient", return_value=client), \
+             patch("codebase_indexer_mcp_server.FastEmbedProvider", return_value=provider_instance), \
              patch.object(mb, "count_memory_bank_points") as mock_count:
             _run(_ims.index_repo(repo_path=REPO_ROOT, collection="test-collection", reset=True))
         mock_count.assert_not_called()
@@ -138,7 +138,7 @@ class IndexRepoResetGuardTest(unittest.TestCase):
 
     def test_collection_not_existing_skips_both_delete_paths(self):
         client = self._make_client(exists=False)
-        with patch("ingest_mcp_server.QdrantClient", return_value=client):
+        with patch("codebase_indexer_mcp_server.QdrantClient", return_value=client):
             _run(_ims.index_repo(repo_path=REPO_ROOT, collection="test-collection", reset=True))
         client.delete_collection.assert_not_called()
         client.delete.assert_not_called()
@@ -161,8 +161,8 @@ class IndexRepoResetGuardTest(unittest.TestCase):
         # shadows it for the duration of the `with` block only, and restores
         # setUp's bare MagicMock class automatically on exit (no manual
         # stop/restart of setUp's own patcher needed).
-        with patch("ingest_mcp_server.QdrantClient", return_value=client), \
-             patch("ingest_mcp_server.FastEmbedProvider", return_value=provider_instance):
+        with patch("codebase_indexer_mcp_server.QdrantClient", return_value=client), \
+             patch("codebase_indexer_mcp_server.FastEmbedProvider", return_value=provider_instance):
             result = _run(_ims.index_repo(repo_path=REPO_ROOT, collection="test-collection", reset=True))
         self.assertIn("Error", result)
         client.delete.assert_not_called()
@@ -176,7 +176,7 @@ class IndexRepoResetGuardTest(unittest.TestCase):
         # "compatible" just because no definitive mismatch was ever found.
         client = self._make_client()
         client.get_collection.side_effect = RuntimeError("connection refused")
-        with patch("ingest_mcp_server.QdrantClient", return_value=client):
+        with patch("codebase_indexer_mcp_server.QdrantClient", return_value=client):
             result = _run(_ims.index_repo(repo_path=REPO_ROOT, collection="test-collection", reset=True))
         self.assertIn("Error", result)
         client.delete.assert_not_called()
@@ -211,7 +211,7 @@ class SyncRepoDeleteFilterTest(unittest.TestCase):
         # An empty manifest against an existing collection is a rebuild,
         # which adds a non-chunk-points count before the per-file delete
         # and an orphan sweep after the store. Both are tested on their own in
-        # test_ingest_mcp_server_rebuild.py; here they are stubbed so
+        # test_codebase_indexer_mcp_server_rebuild.py; here they are stubbed so
         # `client.delete` still sees only the per-file delete these tests pin.
         for helper, value in (("_non_chunk_points_warning", ""), ("_delete_orphaned_chunks", [])):
             patcher = patch.object(_ims, helper, return_value=value)
@@ -222,11 +222,11 @@ class SyncRepoDeleteFilterTest(unittest.TestCase):
         self._store_batch_patcher.start()
         self.addCleanup(self._store_batch_patcher.stop)
 
-        self._embed_patcher = patch("ingest_mcp_server.FastEmbedProvider")
+        self._embed_patcher = patch("codebase_indexer_mcp_server.FastEmbedProvider")
         self._embed_patcher.start()
         self.addCleanup(self._embed_patcher.stop)
 
-        self._connector_patcher = patch("ingest_mcp_server.QdrantConnector")
+        self._connector_patcher = patch("codebase_indexer_mcp_server.QdrantConnector")
         self._connector_patcher.start()
         self.addCleanup(self._connector_patcher.stop)
 
@@ -247,8 +247,8 @@ class SyncRepoDeleteFilterTest(unittest.TestCase):
         provider_instance = MagicMock()
         provider_instance.get_vector_name.return_value = "fast-some-model"
         provider_instance.get_vector_size.return_value = 384
-        with patch("ingest_mcp_server.QdrantClient", return_value=client), \
-             patch("ingest_mcp_server.FastEmbedProvider", return_value=provider_instance):
+        with patch("codebase_indexer_mcp_server.QdrantClient", return_value=client), \
+             patch("codebase_indexer_mcp_server.FastEmbedProvider", return_value=provider_instance):
             _run(_ims.sync_repo(repo_path=REPO_ROOT, collection="test-collection"))
         client.delete.assert_called_once()
         _, kwargs = client.delete.call_args
@@ -275,8 +275,8 @@ class SyncRepoDeleteFilterTest(unittest.TestCase):
         provider_instance = MagicMock()
         provider_instance.get_vector_name.return_value = "fast-some-model"
         provider_instance.get_vector_size.return_value = 384
-        with patch("ingest_mcp_server.QdrantClient", return_value=client), \
-             patch("ingest_mcp_server.FastEmbedProvider", return_value=provider_instance):
+        with patch("codebase_indexer_mcp_server.QdrantClient", return_value=client), \
+             patch("codebase_indexer_mcp_server.FastEmbedProvider", return_value=provider_instance):
             result = _run(_ims.sync_repo(repo_path=REPO_ROOT, collection="test-collection"))
         self.assertIn("Error", result)
         client.delete.assert_not_called()
@@ -287,7 +287,7 @@ class SyncRepoDeleteFilterTest(unittest.TestCase):
         client = MagicMock()
         client.collection_exists.return_value = True
         client.get_collection.side_effect = RuntimeError("connection refused")
-        with patch("ingest_mcp_server.QdrantClient", return_value=client):
+        with patch("codebase_indexer_mcp_server.QdrantClient", return_value=client):
             result = _run(_ims.sync_repo(repo_path=REPO_ROOT, collection="test-collection"))
         self.assertIn("Error", result)
         client.delete.assert_not_called()
@@ -313,9 +313,9 @@ class SyncRepoMissingCollectionTest(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
         for target, kwargs in (
-            ("ingest_mcp_server.FastEmbedProvider", {}),
-            ("ingest_mcp_server.QdrantConnector", {}),
-            ("ingest_mcp_server.store_batch", {"new_callable": AsyncMock}),
+            ("codebase_indexer_mcp_server.FastEmbedProvider", {}),
+            ("codebase_indexer_mcp_server.QdrantConnector", {}),
+            ("codebase_indexer_mcp_server.store_batch", {"new_callable": AsyncMock}),
         ):
             patcher = patch(target, **kwargs)
             patcher.start()
@@ -323,7 +323,7 @@ class SyncRepoMissingCollectionTest(unittest.TestCase):
 
     def _sync(self, client, manifest):
         with patch.object(_ims, "_load_manifest", return_value=manifest), \
-             patch("ingest_mcp_server.QdrantClient", return_value=client):
+             patch("codebase_indexer_mcp_server.QdrantClient", return_value=client):
             return _run(_ims.sync_repo(repo_path=REPO_ROOT, collection="test-collection"))
 
     def _client(self, exists: bool, points: int = 5) -> MagicMock:

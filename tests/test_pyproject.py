@@ -255,7 +255,7 @@ class BuiltWheelHasExpectedDataLayout(unittest.TestCase):
 
     def test_memory_bank_files_are_present_in_the_built_wheel(self):
         # The guarantee (the memory-bank MCP server must ship the
-        # same way ingest_mcp_server.py/compress_mcp_server.py do) still
+        # same way codebase_indexer_mcp_server.py/compress_mcp_server.py do) still
         # holds under the new data_files layout -- confirm directly against
         # the real wheel rather than just the files existing on disk, which
         # wouldn't catch setup.py's glob failing to pick them up.
@@ -291,7 +291,7 @@ class BuiltWheelHasExpectedDataLayout(unittest.TestCase):
         # `_flat_data_files("mcpservers", "*.py")` entry the wheel would
         # silently lose all six while every other directory still shipped.
         data_names = self._data_src_names()
-        for stem in ("compress", "analytics", "qdrant", "ingest", "memory_bank", "codebase_reviewer"):
+        for stem in ("compress", "analytics", "qdrant", "codebase_indexer", "memory_bank", "codebase_reviewer"):
             rel_path = f"mcpservers/{stem}_mcp_server.py"
             with self.subTest(rel_path=rel_path):
                 self.assertTrue(

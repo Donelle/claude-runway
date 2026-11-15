@@ -57,7 +57,7 @@ import memory_bank_lib as mb
 import memory_events_lib as mev
 
 # Must run before any FastEmbedProvider(...) construction below -- see
-# ingest_mcp_server.py's identical call for why.
+# codebase_indexer_mcp_server.py's identical call for why.
 ensure_persistent_fastembed_cache()
 
 # Same env var names the qdrant/codebase-indexer servers already read, so a
@@ -151,7 +151,7 @@ mcp = MCPServer("memory-bank")
 
 def _log_registered_tool_count():
     """Best-effort startup log (stderr only) -- see
-    ingest_mcp_server.py's identical helper for why this can't ever call print()."""
+    codebase_indexer_mcp_server.py's identical helper for why this can't ever call print()."""
     try:
         n = tool_count(mcp)
         print(f"[claude-runway] memory-bank registered {n} tools", file=sys.stderr)

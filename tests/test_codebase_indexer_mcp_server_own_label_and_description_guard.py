@@ -16,7 +16,7 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from mcpservers import ingest_mcp_server as _ims  # noqa: E402
+from mcpservers import codebase_indexer_mcp_server as _ims  # noqa: E402
 
 OWN_URL = "http://own-qdrant:6333"
 OTHER_URL = "http://other-qdrant:6333"

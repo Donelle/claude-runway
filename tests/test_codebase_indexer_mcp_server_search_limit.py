@@ -20,7 +20,7 @@ os.environ.setdefault("QDRANT_URL", "http://localhost:6333")
 os.environ.setdefault("COLLECTION_NAME", "test-collection")
 os.environ.setdefault("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 
-import ingest_mcp_server as _ims  # noqa: E402
+import codebase_indexer_mcp_server as _ims  # noqa: E402
 from qdrant_client import models as _m  # noqa: E402
 
 
@@ -50,7 +50,7 @@ class RecomputeSearchLimitTest(unittest.TestCase):
             self.addCleanup(patcher.stop)
 
     def _call(self, client):
-        with patch("ingest_mcp_server.QdrantClient", return_value=client):
+        with patch("codebase_indexer_mcp_server.QdrantClient", return_value=client):
             _ims._recompute_search_limit("c", "http://q", None)
 
     def test_writes_metadata_and_cache_when_changed(self):
@@ -93,11 +93,11 @@ class RecomputeSearchLimitTest(unittest.TestCase):
         self.m_set_cached_search_limit.assert_not_called()
 
     def test_fails_open_when_client_construction_fails(self):
-        with patch("ingest_mcp_server.QdrantClient", side_effect=RuntimeError("no qdrant")):
+        with patch("codebase_indexer_mcp_server.QdrantClient", side_effect=RuntimeError("no qdrant")):
             _ims._recompute_search_limit("c", "http://q", None)  # must not raise
 
     def test_no_collection_is_a_noop(self):
-        with patch("ingest_mcp_server.QdrantClient") as cls:
+        with patch("codebase_indexer_mcp_server.QdrantClient") as cls:
             _ims._recompute_search_limit(None, "http://q", None)
         cls.assert_not_called()
 
@@ -118,7 +118,7 @@ class WiringTest(unittest.TestCase):
             ("_recompute_search_limit", {}),
             # An empty manifest against an existing collection is a rebuild;
             # its extra Qdrant calls are covered in
-            # test_ingest_mcp_server_rebuild.py, not wiring.
+            # test_codebase_indexer_mcp_server_rebuild.py, not wiring.
             ("_non_chunk_points_warning", {"return_value": ""}),
             ("_delete_orphaned_chunks", {"return_value": []}),
         ):
@@ -126,9 +126,9 @@ class WiringTest(unittest.TestCase):
             setattr(self, "m_" + target, patcher.start())
             self.addCleanup(patcher.stop)
         for target, kwargs in (
-            ("ingest_mcp_server.FastEmbedProvider", {}),
-            ("ingest_mcp_server.QdrantConnector", {}),
-            ("ingest_mcp_server.store_batch", {"new_callable": AsyncMock}),
+            ("codebase_indexer_mcp_server.FastEmbedProvider", {}),
+            ("codebase_indexer_mcp_server.QdrantConnector", {}),
+            ("codebase_indexer_mcp_server.store_batch", {"new_callable": AsyncMock}),
         ):
             patcher = patch(target, **kwargs)
             patcher.start()
@@ -148,8 +148,8 @@ class WiringTest(unittest.TestCase):
         provider.get_vector_size.return_value = 384
         with patch.object(_ims, "compute_file_hashes", return_value=(hashes, [])), \
              patch.object(_ims, "_load_manifest", return_value=manifest), \
-             patch("ingest_mcp_server.QdrantClient", return_value=self._sync_client()), \
-             patch("ingest_mcp_server.FastEmbedProvider", return_value=provider):
+             patch("codebase_indexer_mcp_server.QdrantClient", return_value=self._sync_client()), \
+             patch("codebase_indexer_mcp_server.FastEmbedProvider", return_value=provider):
             return _run(_ims.sync_repo(repo_path=REPO_ROOT, collection="test-collection"))
 
     def test_sync_repo_recomputes_after_a_real_sync(self):
@@ -165,7 +165,7 @@ class WiringTest(unittest.TestCase):
 
     def test_index_repo_recomputes(self):
         client = _client(points=0, exists=False)
-        with patch("ingest_mcp_server.QdrantClient", return_value=client):
+        with patch("codebase_indexer_mcp_server.QdrantClient", return_value=client):
             result = _run(_ims.index_repo(repo_path=REPO_ROOT, collection="test-collection"))
         self.assertIn("Indexed", result)
         self.m__recompute_search_limit.assert_called_once()

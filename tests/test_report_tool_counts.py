@@ -38,7 +38,7 @@ class ReportRepoServerReturnsLiveCountsAndSchemaSizes(unittest.TestCase):
         self.assertGreater(chars, 0)
 
     def test_codebase_indexer_reports_a_positive_count_and_schema_size(self):
-        count, chars = _rtc._report_repo_server("ingest_mcp_server")
+        count, chars = _rtc._report_repo_server("codebase_indexer_mcp_server")
         self.assertGreater(count, 0)
         self.assertGreater(chars, 0)
 

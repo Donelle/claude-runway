@@ -105,6 +105,14 @@ class BuildMcpServers(unittest.TestCase):
             servers["qdrant"]["args"], ["/home/user/tools/claude-runway/mcpservers/qdrant_mcp_server.py"]
         )
 
+    def test_codebase_indexer_runs_the_renamed_script(self):
+        # The script was renamed so its file name matches the server.
+        # `upgrade`'s codebase-indexer-script-renamed migrates older configs.
+        self.assertEqual(
+            self._build()["codebase-indexer"]["args"],
+            ["/home/user/tools/claude-runway/mcpservers/codebase_indexer_mcp_server.py"],
+        )
+
     def test_qdrant_block_no_longer_carries_the_third_party_servers_settings(self):
         env = self._build()["qdrant"]["env"]
         for gone in ("HF_HUB_OFFLINE", "FASTEMBED_CACHE_PATH", "TOOL_FIND_DESCRIPTION", "TOOL_STORE_DESCRIPTION"):
@@ -630,7 +638,7 @@ class RunSetupEndToEnd(unittest.TestCase):
         # Regression for a review finding: a target repo directory named
         # e.g. "memory-bank" with both COLLECTION_NAME and
         # MEMORY_BANK_COLLECTION left at their defaults resolves them to the
-        # SAME string, which makes ingest_mcp_server.py's reserved-name guard
+        # SAME string, which makes codebase_indexer_mcp_server.py's reserved-name guard
         # refuse every index_repo/sync_repo call for this project.
         result = run_setup(
             self.target_repo, REPO_ROOT, home_dir=Path("/home/user"), collection_name="memory-bank"
