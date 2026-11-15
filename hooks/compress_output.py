@@ -118,8 +118,8 @@ compressed log, since it can corrupt an edit rather than just lose detail
 in a summary. Don't add Read to the matcher without addressing that.
 
 Setup:
-    Dependencies (openai, via libs/lmstudio_client.py, which builds the model
-    client this hook passes to libs/local_compress_lib.py) come from
+    Dependencies (openai, via libs/lmstudio_client.py and libs/openai_lib.py, which build the
+    model client this hook passes to libs/local_compress_lib.py) come from
     requirements.txt; run this script with that environment's Python.
 
 Register in .claude/settings.json (see templates/settings.json.template; the
@@ -340,7 +340,7 @@ MCP_SAVINGS_TOOL_PREFIX = "mcp__local-compress__"
 # CLAUDE_RUNWAY_TRACK_SAVINGS is off server-side even though real
 # compression still happened. The no-envelope fallback below must never
 # re-compress these generically -- doing so would discard exactly what the
-# first pass was told to preserve (this is /my-compact's own
+# first pass was told to preserve (this is /cr-compact's own
 # real usage, which sets preserve_identifiers=preserve_sections=True).
 _SELF_COMPRESSING_MCP_TOOLS = {"compress_file", "compress_command_output", "fetch_url", "compress_text"}
 # The qdrant server's tools. Only the three compact tools are ever compressed
@@ -421,6 +421,37 @@ _EXACT_CMD_RE = re.compile(
     r"^(?:" + _ASSIGN_WORD + r"\s+)*(?:sudo\s+)?(?:" + "|".join(_EXACT_CMDS) + r")\b"
 )
 
+# File slices: `sed -n 'N,Mp' f`, `head`, `tail`.
+#
+# The module docstring excludes `Read` from the matcher because its output is
+# the exact basis for what happens next. A Bash `sed -n`/`head`/`tail` on a file
+# is the same read spelled through Bash, and asking for a range means the caller
+# already narrowed to the exact text they want. Found live: `/cr-resume` read a
+# stored session back with `sed -n '3,47p'`, the hook rewrote 4,372 chars to 894,
+# and the paraphrase was shown to the user as the saved text.
+#
+# Judged by the COMMAND, never by a path: the failing read was of a derived
+# scratch file, not the harness's `tool-results/` spill file, so a path rule
+# would have missed it.
+#
+# Only where the command opens the file (see _command_segments): a `tail`/`head`
+# after a `|` trims another command's output, and `npm test 2>&1 | tail -100` is
+# the standard way to skim a log, which is what this hook exists to compress.
+# `cat` is deliberately NOT here: tests/test_compress_output.py pins `cat
+# SKILL.md` as compressible ("the big historical win"); /cr-resume is protected
+# by its skill telling the model to use `Read` instead.
+#
+# `sed` is exempt with any -n/--quiet/--silent (also bundled, `-ne`), whether or
+# not the script has a range: telling `sed -n p f` from a range needs sed-script
+# parsing for no real gain. `(?=\s|$)` rather than `\b` so `tailor`/`head-tool`
+# are not read as `tail`/`head`. `# compress-ok` still opts back in.
+_FILE_SLICE_RE = re.compile(
+    r"^(?:" + _ASSIGN_WORD + r"\s+)*(?:sudo\s+)?(?:"
+    r"sed\s+(?:-\S+\s+)*?(?:-[A-Za-z]*n[A-Za-z]*|--quiet|--silent)(?=\s|$)"
+    r"|(?:head|tail)(?=\s|$)"
+    r")"
+)
+
 # Matched ANYWHERE in a segment: these flags are how a caller says "give me
 # output I intend to parse exactly," regardless of which command they're on.
 #
@@ -471,7 +502,7 @@ _EXACT_FLAG_RE = re.compile(
     #
     # Also deliberately broader than gating on `--jq`/`graphql` specifically:
     # the narrower fix first suggested (those two flags only) was verified
-    # incomplete before implementing -- this repo's `my-gh-pr-feedback` skill
+    # incomplete before implementing -- this repo's `cr-gh-pr-feedback` skill
     # calls `gh api .../comments --paginate` with neither flag at all, so a
     # narrower fix would have left that skill's primary feedback-fetch step
     # exactly as exposed as before. One `gh api` match covers all three real
@@ -561,7 +592,25 @@ _EXTRA_EXACT_PATTERNS = _compile_extra_exact_patterns()
 # the same start-anchored table as a bare one. Only these openers split -- a
 # bare `(` mid-segment does not, since `--filter "(id=1)"` would then expose a
 # fake `id=1` segment and add false positives.
-_SEGMENT_SPLIT_RE = re.compile(r"\|\||&&|\$\(|`|[;|\n]")
+_SEGMENT_SEP = r"\|\||&&|\$\(|`|[;|\n]"
+_SEGMENT_SPLIT_RE = re.compile(_SEGMENT_SEP)
+# The same boundaries with the separator kept (a capture group makes
+# re.split return it), so _command_segments can tell whether a segment came
+# straight after a single `|`. Built from the one string above so the two can
+# never drift apart.
+_SEGMENT_SPLIT_KEEP_SEP_RE = re.compile("(" + _SEGMENT_SEP + ")")
+
+
+def _command_segments(command):
+    """(segment, follows_pipe) pairs, split exactly as _SEGMENT_SPLIT_RE splits.
+
+    `follows_pipe` is True when the segment's immediately preceding separator
+    was a single `|`: it is then a pipeline consumer reading stdin, not the
+    command that opens a file. `||` is its own separator and does not count.
+    """
+    parts = _SEGMENT_SPLIT_KEEP_SEP_RE.split(command)
+    # re.split with one capture group alternates [segment, sep, segment, ...].
+    return [(parts[i], i > 0 and parts[i - 1] == "|") for i in range(0, len(parts), 2)]
 
 
 # Heredoc bodies are data, not commands. Splitting on `\n` would
@@ -652,8 +701,13 @@ _ASSIGNMENT_TOKEN_RE = re.compile(r"\w+=.*", re.DOTALL)
 _ENV_OPTS_WITH_OPERAND = ("-u", "-C", "--unset", "--chdir")
 
 
-def _env_tokens_exempt(tokens):
-    """None if `tokens` isn't an `env` invocation; else whether it's exempt."""
+def _env_tokens_exempt(tokens, follows_pipe=False):
+    """None if `tokens` isn't an `env` invocation; else whether it's exempt.
+
+    `follows_pipe` says the segment came straight after a single `|`, so a file
+    slice it launches is only trimming another command's stdout and is not
+    exempt (see _FILE_SLICE_RE).
+    """
     i = 0
     while i < len(tokens) and _ASSIGNMENT_TOKEN_RE.fullmatch(tokens[i]):
         i += 1
@@ -678,14 +732,17 @@ def _env_tokens_exempt(tokens):
     rest = tokens[j:]
     if not rest:
         return True
-    nested = _env_tokens_exempt(rest)
+    nested = _env_tokens_exempt(rest, follows_pipe)
     if nested is not None:
         return nested
-    # `env CI=1 /usr/bin/git diff`: judge the executable by its basename.
-    return bool(_EXACT_CMD_RE.match(" ".join([os.path.basename(rest[0])] + rest[1:])))
+    # `env CI=1 /usr/bin/git diff`: judge the executable by its basename. A file
+    # slice counts the same way it does without the wrapper: `env LC_ALL=C sed -n
+    # '3,47p' f` opens the file just like `LC_ALL=C sed -n '3,47p' f` does.
+    launched = " ".join([os.path.basename(rest[0])] + rest[1:])
+    return bool(_EXACT_CMD_RE.match(launched) or (not follows_pipe and _FILE_SLICE_RE.match(launched)))
 
 
-def _env_segment_is_exempt(segment):
+def _env_segment_is_exempt(segment, follows_pipe=False):
     """None if `segment` isn't an `env` invocation; else whether it's exempt."""
     try:
         tokens = shlex.split(segment)
@@ -694,8 +751,8 @@ def _env_segment_is_exempt(segment):
         # `$(` (`env X="$(cmd)" git diff`). Re-walk with plain whitespace
         # tokens just to learn whether this IS an env invocation; if so the
         # parse is uncertain, so keep the exemption.
-        return True if _env_tokens_exempt(segment.split()) is not None else None
-    return _env_tokens_exempt(tokens)
+        return True if _env_tokens_exempt(segment.split(), follows_pipe) is not None else None
+    return _env_tokens_exempt(tokens, follows_pipe)
 
 
 def _is_exactness_critical(command: str) -> bool:
@@ -709,16 +766,20 @@ def _is_exactness_critical(command: str) -> bool:
     if not command or _FORCE_COMPRESS_RE.search(command):
         return False
     command = _strip_heredoc_bodies(command)
-    for segment in _SEGMENT_SPLIT_RE.split(command):
+    for segment, follows_pipe in _command_segments(command):
         # A subshell `(git diff)` or group `{ git diff; }` leaves its opener
         # glued to the front of the segment, which would defeat `^` anchoring.
         segment = segment.strip().lstrip("({").strip()
         if not segment:
             continue
-        env_exempt = _env_segment_is_exempt(segment)
+        env_exempt = _env_segment_is_exempt(segment, follows_pipe)
         if env_exempt:
             return True
         if env_exempt is None and _EXACT_CMD_RE.match(segment):
+            return True
+        # A file slice is exact only where it opens the file. After a `|` it is
+        # just trimming another command's stdout (`npm test 2>&1 | tail -100`).
+        if not follows_pipe and _FILE_SLICE_RE.match(segment):
             return True
         if _EXACT_ANYWHERE_RE.search(segment):
             return True
@@ -1063,7 +1124,7 @@ def _finish_compression_outcome(outcome, tool_name, source, session_id, project,
 # absolute beginning of the string) -- not just anchored to that exact
 # phrasing -- so a STORED compact's own content can never be mistaken for
 # the real header just because it happens to quote the same phrase
-# mid-string (e.g. a past /my-compact session about debugging this very
+# mid-string (e.g. a past /cr-compact session about debugging this very
 # hook). The genuine header is always the first thing compact_find's own
 # "\n".join(lines) call emits, so requiring position 0 costs nothing for
 # the real case while closing that false-match window.
@@ -1176,14 +1237,14 @@ def _dispatch(payload):
             sys.exit(0)
         # compact_find can return up to 10 full stored conversation compacts,
         # which is why it is matched at all. Its output is
-        # structured data /my-resume parses for
+        # structured data /cr-resume parses for
         # control flow, not prose to skim: a "Found {N}
         # compact(s)" header followed by N discrete dated/labeled entries.
-        # /my-resume branches on that count (0 -> tell the user to run
-        # /my-compact, 1 -> restore silently, 2+ -> AskUserQuestion picker
+        # /cr-resume branches on that count (0 -> tell the user to run
+        # /cr-compact, 1 -> restore silently, 2+ -> AskUserQuestion picker
         # with one option per entry). Generic size-based compression below
         # collapses all N entries into a single flowing narrative before
-        # /my-resume ever sees discrete entries to count, so the picker
+        # /cr-resume ever sees discrete entries to count, so the picker
         # never fires and the merged summary can misrepresent which
         # entries exist at all. Skip compression outright whenever the
         # header itself reports more than one entry. A single-entry (or

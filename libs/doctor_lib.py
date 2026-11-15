@@ -56,6 +56,7 @@ from codebase_reviewer_config_lib import ConfigError, ReviewersConfig, load_revi
 from setup_project_lib import (
     LEGACY_COMPRESS_HOOK_SCRIPT,
     MalformedConfigError,
+    PR_ROUND_CAPTURE_HOOK_SCRIPT,
     check_object_member,
     read_config_object,
 )
@@ -75,7 +76,7 @@ _AUTO_DETECT_MODEL = "(auto-detect -- no model pinned)"
 #   would be misleading.
 # - CLAUDE_RUNWAY_WEBFETCH_FAILED_URL_TTL: hook-only; no .mcp.json counterpart.
 # - CLAUDE_RUNWAY_LMSTUDIO_TIMEOUT_SECONDS: read by both halves via
-#   libs/lmstudio_client.py's build_client(), but deliberately not declared in
+#   libs/lmstudio_client.py's resolve_request_timeout(), but deliberately not declared in
 #   the .mcp.json template: the MCP server inherits the shell value, and an
 #   absent .mcp.json key vs. a shell export is not a real divergence. Same
 #   shell-export-only channel as CLAUDE_RUNWAY_CACHE_DB above.
@@ -340,6 +341,11 @@ class DoctorResult:
     # Hook events in .claude/settings.json still invoking the pre-rename
     # compress_bash_output.py (see find_legacy_compress_hook_events).
     legacy_compress_hook_events: list = field(default_factory=list)
+    # The SessionEnd PR-round capture hook: whether .claude/settings.json
+    # registers it, and whether the shell has the opt-in on (the hook does nothing without
+    # it). "missing" covers an absent or unreadable settings file too: nothing registers it.
+    pr_round_capture_hook: str = "missing"  # "present" | "missing"
+    pr_round_capture_enabled: bool = False
 
 
 def find_legacy_compress_hook_events(target_repo: Path) -> list:
@@ -376,6 +382,39 @@ def find_legacy_compress_hook_events(target_repo: Path) -> list:
                     if event not in events:
                         events.append(event)
     return events
+
+
+# The opt-in the capture hook reads (hooks/session_end_pr_rounds.py via libs/pr_round_capture_lib.py,
+# which owns the name; a test keeps the two equal). Not imported from there: that module pulls in
+# the whole PR-round stack, and this check only needs the name.
+PR_ROUND_CAPTURE_ENV_VAR = "CLAUDE_RUNWAY_CAPTURE_PR_ROUNDS"
+
+
+def find_pr_round_capture_hook_state(target_repo: Path) -> str:
+    """
+    "present" when `target_repo`'s `.claude/settings.json` registers
+    `session_end_pr_rounds.py` under SessionEnd, else "missing" (including a
+    missing, unreadable or oddly-shaped file: nothing registers it then).
+    Best-effort and read-only; `upgrade` (migration pr-round-capture-hook-missing)
+    is the fix, this only reports.
+    """
+    settings_path = Path(target_repo) / ".claude" / "settings.json"
+    try:
+        with open(settings_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return "missing"
+    hooks = data.get("hooks") if isinstance(data, dict) else None
+    blocks = hooks.get("SessionEnd") if isinstance(hooks, dict) else None
+    for block in blocks if isinstance(blocks, list) else []:
+        inner = block.get("hooks") if isinstance(block, dict) else None
+        for hook in inner if isinstance(inner, list) else []:
+            args = hook.get("args") if isinstance(hook, dict) else None
+            if isinstance(args, list) and any(
+                isinstance(a, str) and Path(a).name == PR_ROUND_CAPTURE_HOOK_SCRIPT for a in args
+            ):
+                return "present"
+    return "missing"
 
 
 def run_doctor(target_repo: Path, *, shell_env: Mapping[str, str], home_dir: Optional[Path] = None) -> DoctorResult:
@@ -419,6 +458,9 @@ def run_doctor(target_repo: Path, *, shell_env: Mapping[str, str], home_dir: Opt
         reviewers_file_problem=reviewer_problem,
         reviewers_file_summary=reviewer_summary,
         legacy_compress_hook_events=legacy_events,
+        pr_round_capture_hook=find_pr_round_capture_hook_state(Path(target_repo)),
+        pr_round_capture_enabled=str(shell_env.get(PR_ROUND_CAPTURE_ENV_VAR, "")).strip().lower()
+        in ("1", "true", "yes"),
     )
 
 

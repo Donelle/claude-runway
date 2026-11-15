@@ -24,7 +24,7 @@ report's own output, so nobody reads more into the numbers than they hold
   call is reconstructed here as a `GROUP BY session_id, turn`. A recall that
   returned NOTHING (or failed) writes no row at all, so "average hits per
   call" here is per NON-EMPTY call. `metrics.db`'s `memory-bank` tally
-  (`/my-metrics memory-bank trend`) does count every call attempt, best-effort,
+  (`/cr-metrics memory-bank trend`) does count every call attempt, best-effort,
   but carries no project/repo detail, so it can't be broken down per repo and
   isn't mixed in here.
 - No column records a hit's `score`/`effective_score`, or the size of the
@@ -34,9 +34,13 @@ report's own output, so nobody reads more into the numbers than they hold
 - A "dead" memory may also have been `forget`-ed (not logged in this table)
   or be too new to have had a chance to be recalled -- `min_age_days` exists
   for the second case; nothing in the existing data distinguishes the first.
-- The same memory's id is logged in two spellings (undashed hex on its
-  remember row, dashed UUID on its recall rows) -- see dead_memory_ratio's
-  comment. Ids are matched in a normalized form for that reason.
+- A memory's id used to be logged in two spellings (undashed hex on its
+  remember row, dashed UUID on its recall rows). `memory_events_lib` now
+  writes one canonical dashed form and rewrites old rows once,
+  but this module opens the db read-only and so never triggers that rewrite:
+  a file not yet written to since the fix still holds both spellings. Ids are
+  therefore still matched in a normalized form -- see dead_memory_ratio's
+  comment.
 
 Never creates or writes the db: it's opened via SQLite's read-only URI mode,
 unlike `memory_events_lib._connect()`, which creates the file and schema on
@@ -158,11 +162,14 @@ def dead_memory_ratio(
     age_params: tuple = (cutoff,) if cutoff is not None else ()
     # Ids are compared in a normalized form (lowercase, dashes stripped), not
     # as stored. remember_point mints `uuid.uuid4().hex` (32 hex chars, no
-    # dashes) and that is what the remember row logs, but Qdrant returns
-    # every point id in canonical dashed UUID form, so the SAME memory's
-    # recall rows carry "6fed0f3a-a24c-..." -- confirmed live, a plain
+    # dashes) and that is what the remember row used to log, but Qdrant
+    # returns every point id in canonical dashed UUID form, so the SAME
+    # memory's recall rows carry "6fed0f3a-a24c-..." -- confirmed live, a plain
     # `r.point_id = rem.point_id` matched nothing and reported every memory
-    # as dead. Normalizing here covers rows already logged both ways.
+    # as dead. Now the writer logs one canonical form and
+    # `_connect()` rewrites old rows once, but this read-only report cannot
+    # run that rewrite, so it keeps normalizing here for a file written
+    # before the fix and not touched since.
     norm = "REPLACE(LOWER({col}), '-', '')"
     rows = conn.execute(
         f"""

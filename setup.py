@@ -73,13 +73,22 @@ def _flat_data_files(directory: str, pattern: str) -> tuple[str, list[str]]:
 def _skill_data_files() -> list[tuple[str, list[str]]]:
     """One data_files tuple PER skills/<name>/ subdirectory -- see this
     module's own docstring for why a single shared target silently drops
-    every skill but one."""
+    every skill but one. Ships the folder's files (SKILL.md and any script
+    beside it)."""
     entries = []
     for skill_dir in sorted(glob.glob(os.path.join("skills", "*"))):
         if not os.path.isdir(skill_dir):
             continue
         name = os.path.basename(skill_dir)
-        matches = sorted(_to_posix(p) for p in glob.glob(os.path.join(skill_dir, "*.md")))
+        # Every regular, non-hidden file in the folder, not only `*.md` (a skill
+        # may keep its own script beside SKILL.md). This is the
+        # same set `libs/setup_project_lib.py`'s `plan_skill_installs` copies,
+        # so a wheel install and a clone install a skill identically.
+        matches = sorted(
+            _to_posix(p)
+            for p in glob.glob(os.path.join(skill_dir, "*"))
+            if os.path.isfile(p) and not os.path.basename(p).startswith(".")
+        )
         if matches:
             entries.append((f"src/skills/{name}", matches))
     return entries

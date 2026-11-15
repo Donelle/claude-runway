@@ -1,0 +1,961 @@
+#!/usr/bin/env python3
+"""Tests for .claude/skills/cr-gh-autowork/SKILL.md -- the documentation of
+the server-side auto mode classifier that can block the orchestrator's own `Agent`
+call, independent of `.claude/settings.json`.
+
+The skill is a markdown document of prose instructions, not a Python module, so this
+mirrors tests/test_cr_resume_skill.py's content-pinning strategy: assert the key
+strings introduced for the classifier caveat remain present, so a future edit that removes or
+waters down the caveat/preflight check gets an explicit failure here instead of a
+silent regression. The Step 0 preflight check's actual `jq` regex is also exercised
+directly against representative settings.json shapes, so the check's logic is
+verified, not just its presence in the text.
+
+Stdlib-only (unittest, no pytest), no network, no LM Studio, no Qdrant, no `jq`
+subprocess needed for the logic check (re-implemented in Python for portability).
+
+    .venv/bin/python -m unittest discover -s tests
+"""
+
+import os
+import re
+import unittest
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SKILL_PATH = os.path.join(REPO_ROOT, ".claude", "skills", "cr-gh-autowork", "SKILL.md")
+README_PATH = os.path.join(REPO_ROOT, "README.md")
+KNOWN_LIMITATIONS_PATH = os.path.join(REPO_ROOT, "docs", "known-limitations.md")
+SETTINGS_TEMPLATE_PATH = os.path.join(REPO_ROOT, "templates", "settings.json.template")
+README_PATH = os.path.join(REPO_ROOT, "README.md")
+
+# Mirrors the regex embedded in SKILL.md's Step 0 preflight check:
+#   jq -e '(.permissions.allow // []) | any(test("^Bash\\((git|gh|uv)[ :)]|^Bash\\(\\.venv/(bin|Scripts)/"))'
+# The `[ :)]` delimiter right after git/gh/uv is required:
+# an earlier version with no delimiter (`^Bash\((git|gh|uv|\.venv/bin/)`)
+# false-positived on unrelated tool names sharing the same leading letters, e.g.
+# `Bash(github-cli:*)`, `Bash(ghastly:*)`, `Bash(uvicorn:*)` -- confirmed live by
+# running this exact regex against those three strings before fixing it.
+# The venv branch matches both `bin/` (Linux/macOS) and `Scripts/` (Windows) --
+# a Windows-only setup using `.venv/Scripts/python` would otherwise
+# have incorrectly reported "no" and stopped the preflight unnecessarily.
+_BASELINE_PERMISSION_RE = re.compile(r"^Bash\((git|gh|uv)[ :)]|^Bash\(\.venv/(bin|Scripts)/")
+
+
+def has_baseline_permission(allow_list):
+    """Reference implementation of the Step 0 preflight check's jq test()."""
+    return any(_BASELINE_PERMISSION_RE.match(entry) for entry in allow_list)
+
+
+class SkillFileExists(unittest.TestCase):
+    """Guard against the file being renamed or deleted accidentally."""
+
+    def test_skill_file_is_present(self):
+        self.assertTrue(
+            os.path.isfile(SKILL_PATH),
+            f".claude/skills/cr-gh-autowork/SKILL.md not found at {SKILL_PATH}",
+        )
+
+
+class SkillContentRequirements(unittest.TestCase):
+    """Pin the key content added for the auto mode classifier in SKILL.md's text."""
+
+    def setUp(self):
+        with open(SKILL_PATH, encoding="utf-8") as f:
+            self.content = f.read()
+
+    def test_documents_self_modification_workaround(self):
+        # The skill no longer cites specific ticket numbers in its prose (a later
+        # cleanup pass intentionally stripped historical issue/PR citations as
+        # scaffolding with no lasting value to a reader or to the subagent, which
+        # receives this whole file as its prompt every run) -- pin the substantive
+        # claim itself instead: a self-correction attempt via editing
+        # .claude/settings.json was separately blocked as self-modification.
+        self.assertIn("self-modification", self.content.lower())
+
+    def test_mentions_auto_mode_classifier(self):
+        self.assertIn("auto mode classifier", self.content.lower())
+
+    def test_caveat_qualifies_zero_touchpoints_claim(self):
+        # The caveat must sit near the original claim, not be buried elsewhere,
+        # so a reader of the opening claim actually sees the qualification.
+        idx_claim = self.content.find("Zero required human touchpoints")
+        idx_caveat = self.content.find("**Caveat:")
+        self.assertNotEqual(idx_claim, -1, "original claim text must still exist")
+        self.assertNotEqual(idx_caveat, -1, "caveat must exist")
+        self.assertLess(
+            idx_claim,
+            idx_caveat,
+            "caveat should immediately follow the original claim, not precede it",
+        )
+
+    def test_step_0_has_baseline_permission_preflight(self):
+        self.assertIn("Baseline Bash permission preflight", self.content)
+
+    def test_preflight_checks_both_settings_scopes(self):
+        self.assertIn(".claude/settings.json", self.content)
+        self.assertIn("~/.claude/settings.json", self.content)
+
+    def test_preflight_stops_on_missing_permissions(self):
+        # Must instruct a hard stop, matching the existing dogfood-preflight pattern.
+        # The 2500-char window leaves room for the Windows-venv note in the
+        # preflight's explanatory paragraph without pushing STOP out of sight.
+        section = self.content[self.content.find("Baseline Bash permission preflight"):]
+        self.assertIn("STOP", section[:2500])
+
+    def test_does_not_overclaim_certainty(self):
+        # The causal relationship between the permission fix and the classifier's
+        # behavior was explicitly NOT confirmed in the issue -- the skill must not
+        # overstate it as a guaranteed fix.
+        self.assertIn("not confirm", self.content.lower())
+
+    def test_does_not_recommend_wildcard_permissions(self):
+        # Copilot review (round 1): an earlier draft of this fix
+        # recommended broadening the confirmed narrow rules into a blanket
+        # 'Bash(git:*)'/'Bash(gh:*)'/'Bash(uv:*)' wildcard. Verified live that this
+        # is a real arbitrary-command-execution bypass (git alias mechanism,
+        # `uv run`), not just a broader convenience -- the skill must only ever cite
+        # these wildcard forms as an explicit warning, never as something to add.
+        self.assertIn("git -c alias", self.content)
+        self.assertIn("wildcard", self.content.lower())
+        self.assertIn("arbitrary-command-execution bypass", self.content)
+
+    def test_confirms_only_the_specific_narrow_rules(self):
+        # The actually-confirmed workaround -- these exact four
+        # rules, not a generalization of them.
+        for rule in ["git fetch *", "git push *", "gh pr *", "gh api *"]:
+            self.assertIn(rule, self.content)
+
+
+class AutoPickExclusionContentRequirements(unittest.TestCase):
+    """Pin the auto-pick label-exclusion behavior added to Step 0's picking logic
+   : a future edit could silently drop the negative label filters or the
+    explicit-issue override note, and the rest of the suite wouldn't notice, since
+    this is prose guidance for a subagent, not executable code."""
+
+    def setUp(self):
+        with open(SKILL_PATH, encoding="utf-8") as f:
+            self.content = f.read()
+
+    def test_excludes_blocked_label_from_search(self):
+        self.assertIn("-label:blocked", self.content)
+
+    def test_excludes_theme_design_label_from_search(self):
+        self.assertIn("-label:theme-design", self.content)
+
+    def test_prose_documents_both_exclusions(self):
+        self.assertIn("NOT labeled", self.content)
+        self.assertIn("`blocked` or `theme-design`", self.content)
+
+    def test_explicit_issue_number_overrides_exclusion(self):
+        # An explicitly-named ticket must still be worked regardless of its labels --
+        # the label exclusion is for auto-pick only, not a blanket ban on ever touching a
+        # blocked/theme-design issue. A later change added a second exclusion (assignee/branch/
+        # PR) that is explicitly NOT overridden the same way, so the pinned phrase narrowed
+        # from "this exclusion" to "the label-based exclusions above" to stay accurate.
+        idx = self.content.find("apply to auto-pick only")
+        self.assertNotEqual(idx, -1, "explicit-override note must exist")
+        self.assertIn("{ISSUE_NUMBER}", self.content[idx : idx + 300])
+
+    def test_assignee_branch_pr_check_not_overridden_by_explicit_issue(self):
+        # Unlike the label-based exclusions, the already-in-progress check
+        # (assignee/branch/PR) still applies even to an explicit {ISSUE_NUMBER} invocation --
+        # Step 8 is what enforces it in that case, since Step 0's own filtering is bypassed.
+        self.assertIn("NOT overridden by an", self.content)
+        self.assertIn("no:assignee", self.content)
+
+    def test_search_command_has_no_positive_label_restriction(self):
+        # Copilot review: the other tests in this class only assert the
+        # negative exclusions (-label:blocked, -label:theme-design) are present --
+        # none of them would fail if a future edit silently restored the old
+        # `label:bug,enhancement` positive restriction alongside them, since that's
+        # an *addition*, not a removal, of pinned text. Extract Step 0's actual
+        # --search command and assert it carries no positive label:X term at all.
+        match = re.search(r'--search "([^"]+)"', self.content)
+        self.assertIsNotNone(match, "Step 0's --search command must be present")
+        search_query = match.group(1)
+        # every label: qualifier in the query must be negated
+        for term in search_query.split():
+            if "label:" in term:
+                self.assertTrue(
+                    term.startswith("-label:"),
+                    f"found a positive label restriction in the search query: {term!r}",
+                )
+
+    def test_priority_sort_includes_p0_first(self):
+        # The sort rule once read "priority-p1 > p2 > p3", so a literal
+        # reading filed priority-p0 (the "fix first" label) under "unlabeled sorts last".
+        idx = self.content.find("Sort by priority label")
+        self.assertNotEqual(idx, -1, "auto-pick sort rule must exist")
+        rule = self.content[idx : idx + 400]
+        self.assertIn("priority-p0 > p1 > p2 > p3", rule)
+        self.assertIn("priority-p{N}", rule)
+
+
+class KnownLimitationsContentRequirements(unittest.TestCase):
+    """Pin the Known limitations bullet. The bullet lives in
+    docs/known-limitations.md (the README keeps only a short list and a pointer);
+    docs prose carries no ticket numbers, so these tests key on the bullet's own
+    wording."""
+
+    def setUp(self):
+        with open(KNOWN_LIMITATIONS_PATH, encoding="utf-8") as f:
+            self.content = f.read()
+
+    def test_page_documents_auto_mode_classifier_limitation(self):
+        self.assertIn("auto mode classifier", self.content.lower())
+
+    def test_bullet_is_a_list_item_on_the_page(self):
+        # A bullet, not prose in the page's opening line: the page's title and opening
+        # sentence come first, then the list.
+        classifier_idx = self.content.lower().find("auto mode classifier")
+        first_bullet_idx = self.content.find("\n- ")
+        self.assertNotEqual(classifier_idx, -1)
+        self.assertNotEqual(first_bullet_idx, -1)
+        self.assertGreater(
+            classifier_idx,
+            first_bullet_idx,
+            "the auto mode classifier must be described in a bullet, not the page's opening",
+        )
+
+    def test_readme_points_at_the_page(self):
+        # The README no longer carries this bullet, so it must still lead to it.
+        with open(README_PATH, encoding="utf-8") as f:
+            readme = f.read()
+        self.assertIn("docs/known-limitations.md", readme)
+        self.assertNotIn("auto mode classifier", readme.lower())
+
+    def test_warns_against_wildcard_permissions(self):
+        # Same requirement as the SKILL.md check above:
+        # the Known limitations page's account of the workaround must not present the broad
+        # wildcard as something that was confirmed or is safe to add.
+        self.assertIn("arbitrary-command-execution", self.content.lower())
+        self.assertIn("git -c alias", self.content)
+
+    def test_narrow_rules_not_presented_as_absolutely_safe(self):
+        # Even the confirmed narrow rules still
+        # permit code execution through legitimate flags (git fetch/push transport
+        # options, `python -c`) -- the doc must not imply per-subcommand scoping is
+        # a hard security boundary, only that it reduces exposed surface.
+        self.assertIn("upload-pack", self.content)
+        self.assertIn("not the same as safe", self.content.lower())
+
+
+class SettingsTemplateContentRequirements(unittest.TestCase):
+    """Pin the new _permissions_note documenting suggested baseline rules."""
+
+    def setUp(self):
+        with open(SETTINGS_TEMPLATE_PATH, encoding="utf-8") as f:
+            self.content = f.read()
+
+    def test_has_permissions_note(self):
+        self.assertIn("_permissions_note", self.content)
+
+    def test_permissions_note_warns_against_wildcards(self):
+        self.assertIn("arbitrary-command-execution bypass", self.content)
+        self.assertIn("git -c alias", self.content)
+
+    def test_permissions_note_no_longer_calls_project_scope_preferred(self):
+        # Project-scoped permissions.allow is irrelevant to the auto mode classifier
+        # (autoMode is read from the user-level file only), so the note must not present
+        # project scope as the PREFERRED fix for the classifier's denial.
+        self.assertNotIn("PREFERRED", self.content)
+        self.assertNotIn("project-scoped", self.content)
+
+    def test_permissions_note_does_not_present_narrow_rules_as_safe(self):
+        # Even the narrow per-subcommand rules still permit code execution through
+        # legitimate flags (git fetch --upload-pack, python -c); the note must not
+        # imply per-subcommand scoping is a security boundary.
+        self.assertIn("means SAFE in an absolute sense", self.content)
+
+    def test_permissions_note_quotes_confirmed_rules_exactly(self):
+        # An earlier review round found this note restating the confirmed rules in
+        # colon syntax ('Bash(git fetch:*)') instead of quoting them exactly as the
+        # original report did (space before the wildcard). The "confirmed-to-work"
+        # claim must use the original report's own literal quote.
+        for rule in ["git fetch *", "git push *", "gh pr *", "gh api *"]:
+            self.assertIn(rule, self.content)
+
+    def test_permissions_note_does_not_overclaim_narrow_safety(self):
+        # The template note is where the fullest account of the code-execution
+        # caveat lives, so it must carry it itself: even narrow per-subcommand
+        # rules still permit arbitrary commands (e.g. git fetch --upload-pack), and
+        # autonomous development inherently needs code-execution authority.
+        self.assertIn("upload-pack", self.content)
+        self.assertIn("code-execution authority", self.content.lower())
+
+    def test_still_valid_json(self):
+        import json
+
+        # Must remain parseable JSON after the new key was added -- a stray
+        # trailing comma or unescaped quote in the note would break every
+        # consumer of this template (setup_project_lib.py's load_json()).
+        json.loads(self.content)
+
+
+INSTALLATION_PATH = os.path.join(REPO_ROOT, "docs", "installation.md")
+
+
+class AutoModeAllowDocumentation(unittest.TestCase):
+    """The classifier's [Merge Without Review] denial is cleared by `autoMode.allow` in the
+    user-level ~/.claude/settings.json, not by a Bash permission rule. Every place that
+    used to point at the Bash rules for it must now name the real lever, and must not
+    claim a Bash rule (or project scope) is the cause or the fix."""
+
+    def _read(self, path):
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+
+    def _template_note(self):
+        import json
+
+        return json.loads(self._read(SETTINGS_TEMPLATE_PATH))["_permissions_note"]
+
+    def _documents(self):
+        return {
+            "docs/known-limitations.md": self._read(KNOWN_LIMITATIONS_PATH),
+            "docs/installation.md": self._read(INSTALLATION_PATH),
+            "SKILL.md": self._read(SKILL_PATH),
+            "settings.json.template _permissions_note": self._template_note(),
+        }
+
+    def test_every_place_names_the_real_lever(self):
+        for name, text in self._documents().items():
+            with self.subTest(document=name):
+                self.assertIn("autoMode.allow", text)
+                self.assertIn("Merge Without Review", text)
+                self.assertIn("~/.claude/settings.json", text)
+
+    def test_every_place_keeps_the_built_in_rules(self):
+        # An `allow` list without the literal "$defaults" replaces the built-in rules.
+        for name, text in self._documents().items():
+            with self.subTest(document=name):
+                self.assertIn('"$defaults"', text)
+
+    def test_every_place_says_how_to_confirm(self):
+        for name, text in self._documents().items():
+            with self.subTest(document=name):
+                self.assertIn("claude auto-mode config", text)
+
+    def test_every_place_says_claude_cannot_make_the_edit(self):
+        for name, text in self._documents().items():
+            with self.subTest(document=name):
+                self.assertIn("Self-Modification", text)
+
+    def test_every_place_says_autoMode_is_user_scope_only(self):
+        for name, text in self._documents().items():
+            with self.subTest(document=name):
+                self.assertIn(".claude/settings.local.json", text)
+
+    def test_bash_rules_are_described_as_a_separate_layer(self):
+        for name, text in self._documents().items():
+            with self.subTest(document=name):
+                self.assertIn("after the permission rules", text.lower())
+
+    def test_skill_preflight_does_not_present_a_bash_rule_as_the_classifier_cause(self):
+        content = self._read(SKILL_PATH)
+        start = content.find("Baseline Bash permission preflight")
+        self.assertNotEqual(start, -1)
+        preflight = content[start : start + 1200]
+        self.assertIn("and nothing more", preflight)
+        self.assertIn("a missing Bash rule is not its cause", preflight)
+        # the old framing called a missing rule a "precondition of the one workaround
+        # that has actually worked"
+        self.assertNotIn("workaround that has actually worked", content)
+
+    def test_documents_the_suggested_entry_in_each_place(self):
+        for name, text in self._documents().items():
+            with self.subTest(document=name):
+                self.assertIn("review_on_push", text)
+                self.assertIn("this is deliberate, not a review bypass", text)
+
+
+class BaselinePermissionRegexLogic(unittest.TestCase):
+    """Exercise the Step 0 preflight check's matching logic directly."""
+
+    def test_matches_git_rule(self):
+        self.assertTrue(has_baseline_permission(["Bash(git push:*)"]))
+
+    def test_matches_gh_rule(self):
+        self.assertTrue(has_baseline_permission(["Bash(gh pr:*)"]))
+
+    def test_matches_uv_rule(self):
+        self.assertTrue(has_baseline_permission(["Bash(uv pip install:*)"]))
+
+    def test_matches_venv_rule(self):
+        self.assertTrue(has_baseline_permission(["Bash(.venv/bin/python:*)"]))
+
+    def test_matches_venv_scripts_rule(self):
+        # Windows venv uses Scripts/ not bin/ -- the preflight must accept either
+        # form so a Windows-only setup doesn't incorrectly report "no".
+        self.assertTrue(has_baseline_permission(["Bash(.venv/Scripts/python:*)"]))
+
+    def test_no_match_on_unrelated_rules(self):
+        self.assertFalse(has_baseline_permission(["Bash(dotnet build:*)"]))
+
+    def test_no_match_on_empty_list(self):
+        self.assertFalse(has_baseline_permission([]))
+
+    def test_matches_among_multiple_unrelated_entries(self):
+        self.assertTrue(
+            has_baseline_permission(["Bash(dotnet build:*)", "Bash(git fetch:*)"])
+        )
+
+    def test_matches_bare_git_with_no_args(self):
+        # Closing paren immediately after the command name is a valid delimiter too.
+        self.assertTrue(has_baseline_permission(["Bash(git)"]))
+
+    def test_no_false_positive_on_github_cli(self):
+        # Copilot review round 2: 'github-cli' starts with the same three
+        # letters as 'git' ('g','i','t'), so a delimiter-less prefix check wrongly
+        # matched it. Confirmed live before fixing.
+        self.assertFalse(has_baseline_permission(["Bash(github-cli:*)"]))
+
+    def test_no_false_positive_on_ghastly(self):
+        # 'ghastly' starts with 'gh' -- same false-positive class as above.
+        self.assertFalse(has_baseline_permission(["Bash(ghastly:*)"]))
+
+    def test_no_false_positive_on_uvicorn(self):
+        # 'uvicorn' starts with 'uv' -- same false-positive class as above.
+        self.assertFalse(has_baseline_permission(["Bash(uvicorn:*)"]))
+
+    def test_no_false_positive_does_not_mask_real_match_in_same_list(self):
+        # A false-positive-prone entry alongside a genuine one must not change the
+        # (correct) overall result -- the real rule should still be what's detected.
+        self.assertTrue(
+            has_baseline_permission(["Bash(uvicorn:*)", "Bash(git push:*)"])
+        )
+
+
+class MetricsLoggingContentRequirements(unittest.TestCase):
+    """Pin the logging-call shape — the cut-over from
+    compact_store to record_metric. The skill is prose, not code, so a future
+    edit that silently reverts the logging call or changes its domain string
+    would otherwise produce no test failure."""
+
+    def setUp(self):
+        with open(SKILL_PATH, encoding="utf-8") as f:
+            self.content = f.read()
+
+    def test_uses_record_metric_not_compact_store_for_logging(self):
+        # compact_store may still appear in prose (e.g. historical context),
+        # but must not appear as the primary logging call in Step 2b's code
+        # block — record_metric is the replacement.
+        self.assertIn("record_metric(", self.content)
+
+    def test_logging_uses_autowork_metric_id(self):
+        # The domain string "autowork" is the metric_id every call must use
+        # so /cr-metrics can filter by it -- a typo'd domain produces a valid
+        # call that silently writes to the wrong bucket.
+        self.assertIn('metric_id="autowork"', self.content)
+
+    def test_logging_records_event_type(self):
+        # event_type is required by MetricsStore.record() -- the call must
+        # include it in the named-parameter form the skill demonstrates.
+        self.assertIn("event_type=", self.content)
+
+    def test_logging_is_described_as_best_effort(self):
+        # The best-effort discipline must survive the logging-call change --
+        # a logging failure must never block the run's actual control flow.
+        self.assertIn("best-effort and additive", self.content)
+
+    def test_logging_failure_check_mentions_error_prefix(self):
+        # record_metric returns "OK" or an "Error:..." string -- the skill
+        # must instruct the orchestrator to check for this, the same way the
+        # old compact_store prose did for that tool's own two failure shapes.
+        self.assertIn('"Error:"', self.content)
+
+    def test_cost_figures_come_from_the_transcript_cli_not_hand_copying(self):
+        # The orchestrator passes an agent id and the tool computes
+        # wall clock/tokens/tool calls, so rows can't go missing or be mistyped.
+        self.assertIn("tools/autowork_cost.py record", self.content)
+        self.assertIn("--agent-id", self.content)
+        self.assertIn("Do not copy", self.content)
+
+    def test_session_id_carries_per_attempt_timestamp(self):
+        # The per-attempt HHMMSS timestamp is now stored as session_id (not
+        # a label field, since the append-only store doesn't upsert) --
+        # verify the skill documents this so a future edit doesn't drop it.
+        self.assertIn("session_id", self.content)
+        self.assertIn("HHMMSS", self.content)
+
+
+class WorktreeVenvInstallContentRequirements(unittest.TestCase):
+    """Pin Step 15's worktree-venv invariant. Run from a git worktree,
+    `uv pip install` without `--python` resolved to the PRIMARY checkout's
+    `.venv`, so the install was a no-op there and ruff/Pyright were then missing
+    from the worktree's own venv. The fix lives entirely in the skill's prose,
+    so without this the suite would stay green if a later edit dropped the flag
+    from either install line and reintroduced the wrong-venv behavior."""
+
+    # Allows flags (e.g. --python "$PYTHON") between `install` and `-r`, so the
+    # pattern matches both the fixed lines and the older form.
+    INSTALL_LINE = re.compile(r"^\s*uv pip install\b.* -r .*$", re.MULTILINE)
+
+    def setUp(self):
+        with open(SKILL_PATH, encoding="utf-8") as f:
+            self.content = f.read()
+        self.installs = list(self.INSTALL_LINE.finditer(self.content))
+
+    def test_both_requirements_installs_present(self):
+        # Guards the other assertions against passing vacuously if the regex
+        # stops matching (e.g. the lines get reworded) -- exactly one install
+        # per requirements file is what Step 15 documents.
+        self.assertEqual(
+            [m.group(0).split("-r ")[1].split()[0] for m in self.installs],
+            ["requirements.txt", "requirements-dev.txt"],
+        )
+
+    def test_every_install_targets_the_resolved_worktree_python(self):
+        for m in self.installs:
+            self.assertIn(
+                '--python "$PYTHON"',
+                m.group(0),
+                f"uv pip install without --python \"$PYTHON\": {m.group(0).strip()}",
+            )
+
+    def test_python_is_resolved_before_the_first_install(self):
+        # The flag is only meaningful if $PYTHON already exists when the
+        # install runs -- resolving it after (the older order) would pass
+        # an empty string to --python.
+        assignment = self.content.find("PYTHON=$(")
+        self.assertNotEqual(assignment, -1, "PYTHON= assignment not found")
+        self.assertLess(assignment, self.installs[0].start())
+
+
+def dedupe_preserve_order(numbers):
+    """Reference implementation of the Step 1 remaining-queue de-dup rule:
+    build the queue from a raw invocation list, keeping only each number's
+    first occurrence, in the order it first appeared."""
+    seen = set()
+    result = []
+    for n in numbers:
+        if n not in seen:
+            seen.add(n)
+            result.append(n)
+    return result
+
+
+class ExplicitTicketListContentRequirements(unittest.TestCase):
+    """Pin the list-mode contract added for /cr-gh-autowork's third invocation
+    form (`/cr-gh-autowork 45 52 61`). Copilot review flagged both
+    the missing test coverage for this contract (this class) and a real
+    duplicate-ticket bug in the original queue-building prose, fixed alongside
+    these tests -- test_queue_deduplicates_while_preserving_order below is the
+    regression guard for that specific fix."""
+
+    def setUp(self):
+        with open(SKILL_PATH, encoding="utf-8") as f:
+            self.content = f.read()
+
+    def test_usage_documents_explicit_list_form(self):
+        self.assertIn("45 52 61", self.content)
+
+    def test_queue_is_separate_from_attempted(self):
+        self.assertIn("remaining queue", self.content)
+        self.assertIn("separate from `attempted`", self.content)
+
+    def test_queue_deduplication_is_documented(self):
+        # Regression guard for the Copilot-flagged bug: a repeated ticket
+        # number (e.g. `45 52 45`) must not be scheduled twice, since its
+        # first run already merges/closes it and a second attempt would hit
+        # Step 7's CLOSED-ticket check and abort the whole run.
+        self.assertIn("de-duplicated while preserving first-seen order", self.content)
+        self.assertIn("45 52 45", self.content)
+
+    def test_queue_deduplicates_while_preserving_order(self):
+        # Exercises the actual algorithm the prose describes, not just its
+        # presence in the text -- mirrors this file's existing dual strategy
+        # of prose-pinning plus a direct logic check (see
+        # BaselinePermissionRegexLogic above for the Step 0 precedent).
+        self.assertEqual(dedupe_preserve_order([45, 52, 45]), [45, 52])
+        self.assertEqual(dedupe_preserve_order([45, 52, 61]), [45, 52, 61])
+        self.assertEqual(dedupe_preserve_order([7, 7, 7]), [7])
+
+    def test_list_mode_never_substitutes_attempted_list(self):
+        idx = self.content.find("Which placeholder to substitute depends on invocation mode")
+        self.assertNotEqual(idx, -1, "substitution-rule paragraph must exist")
+        section = " ".join(self.content[idx : idx + 800].split())
+        self.assertIn("List mode never uses `{ATTEMPTED_LIST}`", section)
+
+    def test_all_mode_always_substitutes_attempted_list_with_no_exception(self):
+        # Regression guard for a Copilot-flagged contradiction:
+        # an earlier version of this paragraph said {ISSUE_NUMBER} covered "the
+        # current ticket of an `all` run once Step 0's auto-pick has chosen one" --
+        # but the orchestrator never knows an all-mode ticket in advance, only the
+        # subagent's own internal Step 0 discovers it. Pin that `all`/no-argument
+        # calls substitute {ATTEMPTED_LIST} unconditionally, with no ISSUE_NUMBER
+        # exception carved out for them.
+        idx = self.content.find("Which placeholder to substitute depends on invocation mode")
+        self.assertNotEqual(idx, -1, "substitution-rule paragraph must exist")
+        section = " ".join(self.content[idx : idx + 800].split())
+        self.assertIn("with no exception", section)
+        self.assertIn("no point at which `all` substitutes `{ISSUE_NUMBER}`", section)
+
+    def test_list_mode_stops_on_blocked_or_failed_rather_than_skipping(self):
+        idx = self.content.find("An explicit list of tickets")
+        self.assertNotEqual(idx, -1, "explicit-list continuation branch must exist")
+        # Normalize whitespace first -- this prose line-wraps with real
+        # newlines/indentation in the source file, so a phrase spanning a
+        # wrap point (e.g. "run\n        immediately") would otherwise fail
+        # a plain substring check despite reading as one phrase to a human.
+        section = " ".join(self.content[idx : idx + 900].split())
+        self.assertIn("stops the whole run immediately", section)
+
+    def test_list_mode_empty_queue_is_not_a_done_outcome(self):
+        idx = self.content.find("An explicit list of tickets")
+        section = " ".join(self.content[idx : idx + 1200].split())
+        self.assertIn("not a failure", section)
+        self.assertIn("no subagent call ever produces a `DONE` outcome in this mode", section)
+
+
+def _normalized(text):
+    """Collapse all whitespace runs to single spaces, so a phrase that the
+    source line-wraps (with newline + indentation) still matches a plain
+    substring check."""
+    return " ".join(text.split())
+
+
+def _template(content):
+    """The subagent prompt template: everything from its heading to the end.
+    Rules aimed at the subagent must live here, since only this block is
+    passed as the Agent prompt -- text elsewhere in the file never reaches it."""
+    idx = content.find("## Subagent Prompt Template")
+    assert idx != -1, "Subagent Prompt Template heading not found"
+    return content[idx:]
+
+
+def _template_step(content, n):
+    """The text of one numbered template item, from `n. ` at line start up to
+    the next numbered item or `## ` heading."""
+    template = _template(content)
+    match = re.search(rf"^ *{n}\. .*?(?=^ *{n + 1}\. |^## )", template, re.MULTILINE | re.DOTALL)
+    assert match is not None, f"template item {n} not found"
+    return _normalized(match.group(0))
+
+
+class RunLessonsContentRequirements(unittest.TestCase):
+    """Pin the rules carried over from the 2026-10-12/13 autowork run,
+    where the orchestrator had to patch each one into the subagent prompt by hand.
+    Each lives in the template (or, for the follow-up pattern, the orchestrator
+    half) next to the step it qualifies; a future edit that drops one would
+    otherwise pass silently, since the skill is prose, not code."""
+
+    def setUp(self):
+        with open(SKILL_PATH, encoding="utf-8") as f:
+            self.content = f.read()
+        self.template = _normalized(_template(self.content))
+
+    def test_opening_paragraph_warns_about_compressed_test_output(self):
+        idx = self.template.find("Do NOT skip any numbered step")
+        self.assertNotEqual(idx, -1)
+        paragraph = self.template[idx : self.template.find("## Step 0", idx)]
+        self.assertIn("compression hook", paragraph)
+        # Copilot review round 2: plain grep treats `|` literally and
+        # matches none of these lines, so the command must carry -E.
+        self.assertIn("grep -E '^Ran|^OK|FAILED'", paragraph)
+        self.assertIn("Redirect test output to a file", paragraph)
+
+    def test_step_3_has_pre_push_sweep(self):
+        step3 = self.template[self.template.find("## Step 3") : self.template.find("## Step 4")]
+        self.assertIn("Pre-push sweep for old wording", step3)
+        self.assertIn("before the FIRST push", step3)
+        # Copilot review round 2: without -e, a flag-shaped pattern
+        # ("--old-option") is parsed as a git grep option and the sweep errors out.
+        self.assertIn('git grep -n -i -e "<old wording>"', step3)
+        # The sweep must sit before the commit/push item, or it can't run "before
+        # the first push".
+        self.assertLess(step3.find("Pre-push sweep"), step3.find("16. Commit"))
+
+    def test_step_3_has_pre_push_self_review_against_the_review_guideline(self):
+        step3 = self.template[self.template.find("## Step 3") : self.template.find("## Step 4")]
+        review = step3.find("Pre-push self-review")
+        self.assertNotEqual(review, -1)
+        # After the old-wording sweep and the gates, before the first commit/push.
+        self.assertGreater(review, step3.find("Pre-push sweep"))
+        self.assertLess(review, step3.find("16. Commit"))
+        paragraph = step3[review : step3.find("16. Commit")]
+        # The rubric is the repo's own Copilot guideline, a tracked file.
+        self.assertIn(".github/instructions/python-code-review.instructions.md", paragraph)
+        # Findings must be actionable, verified, fixed, and the pass is capped.
+        self.assertIn("file:line", paragraph)
+        self.assertIn("concrete fix", paragraph)
+        self.assertIn("Verify each one before touching code", paragraph)
+        self.assertIn("re-run all three gates", paragraph)
+        self.assertIn("One pass only", paragraph)
+        self.assertIn("report `BLOCKED`", paragraph)
+        # Its result reaches the validate artifact posted in Step 18.
+        self.assertIn("Pre-push self-review", step3[step3.find("18. Write") :])
+
+    def test_step_19_requires_full_40_character_sha(self):
+        step19 = _template_step(self.content, 19)
+        self.assertIn("full 40-character SHA", step19)
+        self.assertIn("git rev-parse HEAD", step19)
+        self.assertIn("never an abbreviated one", step19)
+
+    def test_step_19_poll_does_not_use_a_short_sha(self):
+        # The rule above is only true if the poll itself doesn't use --short.
+        step19 = _template_step(self.content, 19)
+        self.assertIn("HEAD_SHA=$(git rev-parse HEAD)", step19)
+        self.assertNotIn("HEAD_SHA=$(git rev-parse --short", step19)
+
+    def test_step_21_headline_count_is_not_the_test(self):
+        step21 = _template_step(self.content, 21)
+        self.assertIn('"0 open findings"', step21)
+        self.assertIn("previously missed", step21)
+        self.assertIn("regardless of the headline count", step21)
+        self.assertIn("counts toward the round cap", step21)
+
+    def test_step_22_checks_whether_a_real_path_produces_the_value(self):
+        step22 = _template_step(self.content, 22)
+        doesnt = step22[step22.find("**Doesn't reproduce**") :]
+        self.assertIn("misclassified", doesnt)
+        self.assertIn("any real recording or call path", doesnt)
+        self.assertIn("deliberate, documented contract", doesnt)
+
+    def test_continuation_section_exists_outside_the_template(self):
+        # It tells the ORCHESTRATOR what to do after a BLOCKED, so it belongs in
+        # the orchestrator half, not in the subagent's own prompt.
+        heading = "## Continuing after a BLOCKED at the round cap"
+        idx = self.content.find(heading)
+        self.assertNotEqual(idx, -1)
+        self.assertLess(idx, self.content.find("## Subagent Prompt Template"))
+
+    def test_continuation_is_authorized_only_and_capped_lower(self):
+        start = self.content.find("## Continuing after a BLOCKED at the round cap")
+        section = _normalized(self.content[start : self.content.find("## Subagent Prompt Template")])
+        self.assertIn("Never automatic, never past the cap without authorization", section)
+        self.assertIn("use its own judgment and keep going", section)
+        self.assertIn("The cap is 3, not 5", section)
+        self.assertIn('replace "greater than 5" with "greater than 3"', section)
+        self.assertIn("git checkout -B <throwaway> origin/<branch>", section)
+        self.assertIn("git push origin HEAD:<branch>", section)
+        # Design/ambiguity BLOCKEDs are excluded -- only the round cap qualifies.
+        self.assertIn("does **not** apply to a `BLOCKED` for a design question", section)
+        # Model is the orchestrator's call, not hard-coded.
+        self.assertIn("Model choice is the orchestrator's call", section)
+
+    def test_continuation_overrides_the_new_pr_assumptions_of_the_review_loop(self):
+        # Copilot review round 1: Step 4 starts seen_ids empty, Step 22
+        # hard-codes the 5-round cap, and Step 19 polls before anything -- all
+        # correct for a brand-new PR, all wrong for a follow-up on an existing one
+        # (every earlier round's comment would read as new, the cap would be 5,
+        # and a declined-only first round would poll for a review no push triggers).
+        start = self.content.find("## Continuing after a BLOCKED at the round cap")
+        section = _normalized(self.content[start : self.content.find("## Subagent Prompt Template")])
+        self.assertIn("Seed `seen_ids` first", section)
+        self.assertIn("put every id it returns into `seen_ids`", section)
+        self.assertIn("are follow-up round 1", section)
+        self.assertIn("`ROUND=1`", section)
+        self.assertIn("without polling first", section)
+        self.assertIn("loop back to Step 19 only if that round pushed a fix", section)
+        # The old blanket "run Steps 19-25 exactly as written" must not come back.
+        self.assertNotIn("run Steps 19–25 and Step 5 exactly as written", section)
+
+    def test_continuation_resume_does_not_remove_from_the_queue_twice(self):
+        # Copilot review round 1: resuming "at Step 2c" after a
+        # follow-up merge re-ran 2c's "remove the just-worked ticket", though
+        # Step 1 had already removed it when its own call returned.
+        start = self.content.find("## Continuing after a BLOCKED at the round cap")
+        section = _normalized(self.content[start : self.content.find("## Subagent Prompt Template")])
+        self.assertIn("without removing or re-adding anything", section)
+        self.assertIn('must not be "removed" a second time', section)
+        self.assertNotIn("continue at Step 2c", section)
+
+    def test_step_2b_points_at_the_continuation_section(self):
+        idx = self.content.find("**stop the whole run immediately**, surface the reason verbatim")
+        self.assertNotEqual(idx, -1)
+        following = _normalized(self.content[idx : idx + 600])
+        self.assertIn("Continuing after a BLOCKED at the round cap", following)
+        self.assertIn("never start one on your own initiative", following)
+
+    def test_every_step_cross_reference_in_the_template_exists(self):
+        # The template numbers its items 1-29 (plus "Step 0"..."Step 5" section
+        # headings, all <= 29), so any "Step N" outside 0..29 is a stale
+        # reference left by an edit that renumbered or removed an item.
+        numbered = {int(m) for m in re.findall(r"^ *(\d+)\. ", _template(self.content), re.MULTILINE)}
+        self.assertEqual(numbered, set(range(1, 30)), "template items must stay numbered 1-29")
+        for ref in re.findall(r"\bSteps? (\d+)", self.template):
+            self.assertIn(int(ref), numbered | {0}, f"dangling cross-reference: Step {ref}")
+
+
+class ShortCopilotWaitContentRequirements(unittest.TestCase):
+    """Step 19's wait must stay a few short calls to the tested helper: one long sleep
+    outlasts the subagent's prompt cache (about five minutes) and forces a full
+    context re-write on the next request."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(SKILL_PATH, encoding="utf-8") as f:
+            cls.content = f.read()
+        cls.template = _normalized(_template(cls.content))
+
+    def test_no_inline_sleep_loop_comes_back(self):
+        self.assertNotIn("{1..36}", self.content)
+        self.assertNotIn("sleep 15", self.content)
+        self.assertNotIn("36 iterations", self.content)
+        self.assertNotRegex(self.content, r"for i in \{1\.\.\d+\}")
+
+    def test_template_uses_the_helper_in_short_calls(self):
+        self.assertIn("tools/poll_copilot_review.py", self.template)
+        self.assertIn("THREE short Bash calls", self.template)
+        self.assertIn("`NOT_YET`", self.template)
+        self.assertIn("the third `NOT_YET` in a row", self.template)
+        self.assertIn("same `HEAD_SHA`", self.template)
+
+    def test_timeout_is_still_failed_and_never_clean(self):
+        self.assertIn("NOT the same as \"clean\"", self.template)
+        self.assertIn("OUTCOME: FAILED (issue #<N>) — Copilot's review did not arrive within 9 minutes", self.template)
+
+    def test_head_sha_rules_survive(self):
+        self.assertIn("full 40-character SHA", self.template)
+        self.assertIn("never an abbreviated one", self.template)
+
+    def test_helper_per_call_wait_stays_under_the_cache_lifetime(self):
+        import sys
+        sys.path.insert(0, os.path.join(REPO_ROOT, "libs"))
+        import copilot_review_poll_lib as P
+        # The cache lapses after about five minutes; one call must stay well under it.
+        self.assertLess(P.MAX_CALL_SECONDS, 300)
+        self.assertLessEqual(P.DEFAULT_ITERATIONS * P.DEFAULT_INTERVAL_S, P.MAX_CALL_SECONDS)
+        # ...while the whole window stays about nine minutes.
+        self.assertEqual(P.MAX_CALLS * P.DEFAULT_ITERATIONS * P.DEFAULT_INTERVAL_S, 540)
+
+    def test_follow_up_pattern_reuses_the_short_waits(self):
+        start = self.content.find("## Continuing after a BLOCKED at the round cap")
+        section = _normalized(self.content[start : self.content.find("## Subagent Prompt Template")])
+        self.assertIn("tools/poll_copilot_review.py", section)
+        self.assertIn("rather than one long sleep", section)
+
+
+AGENT_PATH = os.path.join(REPO_ROOT, ".claude", "agents", "autowork-ticket.md")
+
+
+def _agent_frontmatter():
+    with open(AGENT_PATH, encoding="utf-8") as fh:
+        text = fh.read()
+    match = re.match(r"---\n(.*?)\n---\n", text, re.DOTALL)
+    assert match, "agent file has no frontmatter"
+    fields = {}
+    for line in match.group(1).splitlines():
+        key, _, value = line.partition(":")
+        fields[key.strip()] = value.strip()
+    return fields
+
+
+class AutoworkAgentTypeTests(unittest.TestCase):
+    """The autowork subagent type's tool allow-list must cover everything the template uses."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(SKILL_PATH, encoding="utf-8") as fh:
+            cls.content = fh.read()
+        fence = "````"
+        start = cls.content.index(fence) + len(fence)
+        cls.template = cls.content[start : cls.content.index(fence, start)]
+        fields = _agent_frontmatter()
+        cls.fields = fields
+        cls.tools = {t.strip() for t in fields["tools"].split(",") if t.strip()}
+
+    def test_name_matches_what_the_skill_launches(self):
+        self.assertEqual(self.fields["name"], "autowork-ticket")
+        self.assertIn('`subagent_type: "autowork-ticket"`, `isolation: "worktree"`', self.content)
+
+    def test_allow_list_covers_the_basics_the_procedure_uses(self):
+        # Bash (git/gh/uv/tests), Read/Edit/Write (files and plans), ToolSearch (the only way
+        # to load deferred MCP tools), and sync_repo (Step 1).
+        for tool in ("Bash", "Read", "Edit", "Write", "ToolSearch", "mcp__codebase-indexer__sync_repo"):
+            self.assertIn(tool, self.tools)
+
+    def test_every_mcp_tool_the_template_names_is_allowed(self):
+        self.assertIn("sync_repo", self.template)
+        for name in set(re.findall(r"mcp__[A-Za-z0-9_-]+__[A-Za-z0-9_-]+", self.template)):
+            self.assertIn(name, self.tools)
+
+    def test_every_builtin_tool_the_template_names_is_allowed(self):
+        builtins = ("Bash", "Read", "Edit", "Write", "Glob", "Grep", "ToolSearch", "Skill")
+        for tool in builtins:
+            if re.search(r"`%s`|\b%s tool\b" % (tool, tool), self.template):
+                self.assertIn(tool, self.tools)
+
+    def test_agent_and_artifact_tools_are_left_out(self):
+        for tool in self.tools:
+            self.assertNotIn(tool, ("Agent", "Task", "ScheduleWakeup"))
+            self.assertFalse(tool.startswith("Artifact"), tool)
+
+    def test_template_never_asks_the_subagent_to_start_agents_or_artifacts(self):
+        self.assertNotIn("subagent_type", self.template)
+        self.assertNotIn("Artifact", self.template)
+
+    def test_fallback_is_only_for_an_unknown_agent_type(self):
+        section = _normalized(self.content)
+        self.assertIn("unknown-agent-type error", section)
+        self.assertIn('`subagent_type: "general-purpose"` for this run', section)
+        self.assertIn("Never fall back on any other error", section)
+
+    def test_no_other_place_launches_general_purpose(self):
+        # Only the fallback instruction may still name general-purpose as a launch type.
+        self.assertEqual(self.content.count('subagent_type: "general-purpose"'), 1)
+
+
+CODE_IT_SKILL_PATH = os.path.join(REPO_ROOT, ".claude", "skills", "cr-gh-code-it", "SKILL.md")
+
+
+class WindowsCommandRequirements(unittest.TestCase):
+    """Pin the commands that failed on a Windows checkout, in both
+    /cr-gh-autowork and /cr-gh-code-it. Each of these was confirmed live on Windows 11
+    with gh 2.74.1 and uv 0.11, and each is easy to reintroduce by copying the old
+    wording back from an older skill or a Linux-only habit."""
+
+    def setUp(self):
+        with open(SKILL_PATH, encoding="utf-8") as f:
+            self.autowork = f.read()
+        with open(CODE_IT_SKILL_PATH, encoding="utf-8") as f:
+            self.code_it = f.read()
+
+    def test_no_bare_python3_for_the_cost_tool(self):
+        # `python3` is the Microsoft Store shim on Windows and exits 49.
+        self.assertNotIn("python3 tools/autowork_cost.py", self.autowork)
+        self.assertIn("$PYTHON tools/autowork_cost.py record", self.autowork)
+
+    def test_cost_tool_interpreter_falls_back_to_python3_last(self):
+        line = next(
+            ln for ln in self.autowork.splitlines() if ln.strip().startswith("PYTHON=$(if [ -f .venv/Scripts/python.exe ]; then echo .venv/Scripts/python.exe; elif")
+        )
+        self.assertLess(line.index(".venv/Scripts/python.exe"), line.index(".venv/bin/python"))
+        self.assertLess(line.index(".venv/bin/python"), line.index("python3"))
+
+    def test_windows_interpreter_path_has_the_exe_extension(self):
+        # uv does no extension lookup, so `uv pip install --python .venv/Scripts/python`
+        # fails on Windows even though Git Bash runs that path.
+        for content in (self.autowork, self.code_it):
+            self.assertIn("[ -f .venv/Scripts/python.exe ]", content)
+            self.assertNotIn("echo .venv/Scripts/python;", content)
+
+    def test_issue_type_is_not_set_with_a_gh_flag_that_does_not_exist(self):
+        for content in (self.autowork, self.code_it):
+            # The prose may mention the flag to say it does not exist; a command may not use it.
+            self.assertIsNone(re.search(r"gh issue edit \S+ -R \S+ --type", content))
+            self.assertIn("--method PATCH -f type=", content)
+
+    # The field list that follows `--json`, on the same line or the next one (the autowork command wraps
+    # right after the flag), up to the first character a field name cannot contain.
+    JSON_FIELDS = re.compile(r"--json\s+([\w,]+)")
+
+    def test_issue_view_does_not_request_an_issuetype_json_field(self):
+        # gh 2.74.1: "Unknown JSON field: issueType".
+        for content in (self.autowork, self.code_it):
+            lists = self.JSON_FIELDS.findall(content)
+            self.assertTrue(any("labels" in fields for fields in lists), "the issue fetch was not found")
+            for fields in lists:
+                self.assertNotIn("issueType", fields.split(","))
+
+    def test_the_issuetype_guard_catches_the_wrapped_form_it_exists_for(self):
+        # The pre-fix autowork command put the field list on the line after `--json`.
+        wrapped = "gh issue view <N> -R x/y --json\n   number,title,labels,assignees,issueType,state,url"
+        flat = "gh issue view {N} -R x/y --json number,issueType,state,url"
+        for old in (wrapped, flat):
+            self.assertIn("issueType", ",".join(self.JSON_FIELDS.findall(old)).split(","))
+
+
+if __name__ == "__main__":
+    unittest.main()

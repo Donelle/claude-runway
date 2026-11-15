@@ -1,7 +1,8 @@
-"""Tests for libs/lmstudio_client.py: the one module that imports `openai` and
-builds the bounded client that libs/local_compress_lib.py receives as an
-argument, plus the guarantee that local_compress_lib itself imports without
-`openai` installed."""
+"""Tests for libs/lmstudio_client.py: the LM Studio configuration (base URL, per-request
+timeout) and `build_client`, which builds the bounded client by way of libs/openai_lib.py.
+The request functions and the timeout translation are tested in tests/test_openai_lib.py;
+the last class here is the guarantee that this module and local_compress_lib import without
+`openai` installed, so only building a client needs it."""
 
 import os
 import subprocess
@@ -11,6 +12,8 @@ import unittest
 LIBS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "libs")
 sys.path.insert(0, LIBS)
 
+import lmstudio_client  # noqa: E402
+import openai_lib  # noqa: E402
 from lmstudio_client import build_client  # noqa: E402
 
 
@@ -53,7 +56,7 @@ class ClientIsAlwaysBounded(unittest.TestCase):
             os.environ[self.ENV] = self._saved
 
     def test_default_client_has_bounded_timeout_and_no_retries(self):
-        import local_compress_lib as L
+        L = lmstudio_client
         c = build_client("http://localhost:1234/v1")
         self.assertEqual(c.timeout, L.DEFAULT_REQUEST_TIMEOUT_SECONDS)
         self.assertEqual(c.max_retries, 0)
@@ -68,7 +71,7 @@ class ClientIsAlwaysBounded(unittest.TestCase):
     def test_invalid_explicit_timeout_falls_back_to_bounded_default(self):
         """The explicit-arg path must apply the same
         finite-and-positive rule as the env var, not bypass it."""
-        import local_compress_lib as L
+        L = lmstudio_client
         for bad in (float("inf"), float("nan"), 0, -1):
             with self.subTest(value=bad):
                 c = build_client("http://localhost:1234/v1", timeout=bad)
@@ -80,7 +83,7 @@ class ClientIsAlwaysBounded(unittest.TestCase):
         self.assertEqual(build_client("http://localhost:1234/v1").timeout, 12.5)
 
     def test_invalid_env_values_fall_back_to_default(self):
-        import local_compress_lib as L
+        L = lmstudio_client
         for bad in ("", "abc", "0", "-5", "inf", "nan"):
             with self.subTest(value=bad):
                 os.environ[self.ENV] = bad
@@ -94,8 +97,6 @@ class ClientIsAlwaysBounded(unittest.TestCase):
         import socket
         import threading
         import time
-        import local_compress_lib as L
-
         srv = socket.socket()
         srv.bind(("127.0.0.1", 0))
         srv.listen(5)
@@ -114,7 +115,7 @@ class ClientIsAlwaysBounded(unittest.TestCase):
 
         def call():
             start = time.monotonic()
-            result["out"] = L.complete(build_client(f"http://127.0.0.1:{srv.getsockname()[1]}/v1"), "m", "s", "x")
+            result["out"] = openai_lib.complete(build_client(f"http://127.0.0.1:{srv.getsockname()[1]}/v1"), "m", "s", "x")
             result["elapsed"] = time.monotonic() - start
 
         t = threading.Thread(target=call, daemon=True)
@@ -131,55 +132,23 @@ class ClientIsAlwaysBounded(unittest.TestCase):
                 c.close()
 
 
-class TimeoutTranslation(unittest.TestCase):
-    """The library tells a timeout from an outage via its own CompletionTimeout;
-    this module is what turns openai's timeout into it."""
-
-    def _client_raising(self, exc):
-        from types import SimpleNamespace
-        import lmstudio_client
-
-        def create(**kwargs):
-            raise exc
-
-        inner = SimpleNamespace(
-            chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
-            timeout=3.0,
-            max_retries=0,
-        )
-        return lmstudio_client.LMStudioClient(inner)
-
-    def _request(self):
-        import httpx
-        return httpx.Request("POST", "http://localhost:1234/v1")
-
-    def test_openai_timeout_becomes_completion_timeout(self):
-        import openai
-        from local_compress_lib import CompletionTimeout
-        c = self._client_raising(openai.APITimeoutError(request=self._request()))
-        with self.assertRaises(CompletionTimeout):
-            c.chat.completions.create(model="m", messages=[])
-
-    def test_connection_error_is_not_translated(self):
-        import openai
-        from local_compress_lib import CompletionTimeout
-        c = self._client_raising(openai.APIConnectionError(request=self._request()))
-        with self.assertRaises(openai.APIConnectionError) as ctx:
-            c.chat.completions.create(model="m", messages=[])
-        self.assertNotIsInstance(ctx.exception, CompletionTimeout)
+class BuiltClientIsTheWrappedClient(unittest.TestCase):
+    """The client build_client returns is libs/openai_lib.py's wrapper (it turns the SDK's timeout into
+    CompletionTimeout; tested in tests/test_openai_lib.py) and otherwise IS the openai client."""
 
     def test_other_attributes_are_the_wrapped_clients_own(self):
         c = build_client("http://localhost:1234/v1", timeout=2.5)
+        self.assertIsInstance(c, lmstudio_client.LMStudioClient)
         self.assertEqual(c.timeout, 2.5)
         self.assertTrue(hasattr(c, "models"))
 
 
 class LibraryImportsWithoutOpenai(unittest.TestCase):
-    """local_compress_lib must import and serve its non-model functions
-    (config checks, model discovery) without `openai`: it is standard-library
-    only, and the WebFetch redirect hook imports nothing else from the
-    compression stack. libs/lmstudio_client.py is the one module that needs
-    `openai`. Run in a fresh interpreter with `openai` made unimportable."""
+    """local_compress_lib, openai_lib and lmstudio_client must import and serve their non-model
+    functions (config checks, model discovery) without `openai`: they are standard-library only
+    at import, and the WebFetch redirect hook imports nothing else from the compression stack.
+    Only BUILDING a client imports the SDK (libs/openai_lib.py's build_openai_client). Run in a
+    fresh interpreter with `openai` made unimportable."""
 
     BLOCK = (
         "import sys\n"
@@ -207,15 +176,23 @@ class LibraryImportsWithoutOpenai(unittest.TestCase):
         )
         self.assertEqual(r.returncode, 0, r.stderr)
 
-    def test_the_shared_client_module_is_what_needs_openai(self):
-        r = self._run("import lmstudio_client\n")
+    def test_the_client_modules_import_without_openai(self):
+        r = self._run(
+            "import lmstudio_client, openai_lib\n"
+            "assert 'openai' not in sys.modules\n"
+            "assert lmstudio_client.resolve_request_timeout() > 0\n"
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_building_a_client_is_what_needs_openai(self):
+        r = self._run("import lmstudio_client\nlmstudio_client.build_client(None)\n")
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("openai is blocked", r.stderr)
 
-    def test_completion_timeout_is_defined_by_the_library(self):
+    def test_completion_timeout_is_defined_by_openai_lib(self):
         r = self._run(
-            "import local_compress_lib as L\n"
-            "assert issubclass(L.CompletionTimeout, Exception)\n"
+            "import openai_lib\n"
+            "assert issubclass(openai_lib.CompletionTimeout, Exception)\n"
         )
         self.assertEqual(r.returncode, 0, r.stderr)
 

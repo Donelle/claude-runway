@@ -1889,7 +1889,7 @@ class SessionAgentsRollup(SavingsLedgerTestCase):
 
 
 class FormatDetailViewByAgent(unittest.TestCase):
-    """The "Main session vs subagents" block in /my-savings detail."""
+    """The "Main session vs subagents" block in /cr-savings detail."""
 
     _PROJECT_SUMMARY = {"project": "proj"}
 

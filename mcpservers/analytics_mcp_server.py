@@ -4,9 +4,9 @@ MCP server `analytics`: the opt-in reporting tools over this toolkit's two
 local SQLite stores. It holds five tools and nothing else:
 
   - savings_summary, savings_detail, savings_trend: read the savings tracker
-    (libs/savings_ledger.py), the three views `/my-savings` renders.
+    (libs/savings_ledger.py), the three views `/cr-savings` renders.
   - get_metrics, record_metric: read and write the shared cross-tool metrics
-    store (libs/metrics_lib.py), which `/my-metrics` and `/my-gh-autowork` use.
+    store (libs/metrics_lib.py), which `/cr-metrics` and `/cr-gh-autowork` use.
 
 None of them uses LM Studio or Qdrant, so this server needs only the `mcp`
 package: no embedding model is loaded and no model client is built. It is
@@ -23,7 +23,7 @@ Memory-bank's counters reach metrics_lib through libs/memory_events_lib.py.
 The one writer that uses a tool here is `record_metric`, for anything
 tools/autowork_cost.py record cannot cover.
 
-Project minimum: Python 3.11.
+Project minimum: Python 3.12.
 
 Register in .mcp.json (or let `setup_project.py init --track-savings` do it):
     "analytics": {
@@ -82,7 +82,7 @@ def savings_summary(project: Optional[str] = None, format: str = "text") -> str:
     """
     SIMPLE view of the opt-in savings tracker: this session's characters
     before and after local compression and the percent reduction, plus this
-    project's all-time totals. Called by /my-savings with no argument.
+    project's all-time totals. Called by /cr-savings with no argument.
 
     Character counts recorded from now on are exact; older all-time history may
     include approximate figures (rows from before schema v6, or stale token-only
@@ -152,7 +152,7 @@ def savings_detail(project: Optional[str] = None, format: str = "text", csv_tabl
     breakdown, the per-model split of the most recent finished session (exact
     characters before and after, plus a token figure labelled as derived), a sparkline of the last 10 sessions for this project, and a
     cross-project comparison of characters before and after compression. Called by
-    `/my-savings detail`. See savings_summary's docstring for the same
+    `/cr-savings detail`. See savings_summary's docstring for the same
     counterfactual-estimate caveat.
 
     project defaults to the current working directory's folder name.
@@ -240,7 +240,7 @@ def savings_trend(project: Optional[str] = None, bucket: str = "week", n: int = 
     TREND view of the opt-in savings tracker: characters before and after
     compression, aggregated by day or week rather than individual sessions, so patterns are visible even
     once a project has accumulated enough history that per-session rows are
-    too noisy to read. Called by `/my-savings trend`.
+    too noisy to read. Called by `/cr-savings trend`.
 
     See savings_summary's docstring for the same counterfactual-estimate
     caveat that applies here.
@@ -284,7 +284,7 @@ def get_metrics(metric_id: str, view: str = "summary", bucket: str = "week", n: 
     domain writing a new `metric_id` never needs a new tool, only a new
     value passed to this one.
 
-    my-gh-autowork's per-ticket outcome logging writes
+    cr-gh-autowork's per-ticket outcome logging writes
     into this store under metric_id="autowork". Any metric_id with no
     recorded events returns an honest "no events recorded yet" result.
 
@@ -302,7 +302,7 @@ def get_metrics(metric_id: str, view: str = "summary", bucket: str = "week", n: 
                        with each row's `metadata` deserialized and rendered
                        (see `n` below for how many rows). This is the view
                        for the richer per-run detail a domain stores in
-                       `metadata` (e.g. my-gh-autowork's model/rounds/
+                       `metadata` (e.g. cr-gh-autowork's model/rounds/
                        wall_clock_s/findings) that summary/by_event_type
                        never surface, since those two only ever aggregate
                        `value`.
@@ -318,7 +318,7 @@ def get_metrics(metric_id: str, view: str = "summary", bucket: str = "week", n: 
     session_id (also honoured by "detail"), when given,
       narrows view="summary"/"by_event_type"/"detail" down to rows matching
       this exact session_id AND metric_id — e.g. one specific
-      `my-gh-autowork` attempt's own `f"issue-{n}-{HHMMSS}"` marker,
+      `cr-gh-autowork` attempt's own `f"issue-{n}-{HHMMSS}"` marker,
       instead of that metric_id's entire history. Omitting it (the
       default) keeps today's metric_id-only aggregate/listing unchanged.
       Ignored for view="trend" — per-session filtering doesn't compose with
@@ -377,7 +377,7 @@ def record_metric(
     """
     Writes one append-only event to the shared cross-tool metrics store
     (the write counterpart to get_metrics). Any domain in
-    this toolkit can call this to record an event. my-gh-autowork's
+    this toolkit can call this to record an event. cr-gh-autowork's
     per-ticket outcome logging was the first consumer (cut over from
     compact_store); it now goes through
     tools/autowork_cost.py record, which writes the same metric_id="autowork"

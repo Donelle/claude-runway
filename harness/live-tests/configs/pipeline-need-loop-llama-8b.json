@@ -1,0 +1,60 @@
+{
+  "stages": ["reasoning", "verifier", "classifier"],
+  "rubric": [
+    {
+      "name": "injection-or-traversal",
+      "level": "high",
+      "score": 0.5,
+      "definition": "Untrusted input reaches a shell, a SQL statement or a filesystem path without validation."
+    },
+    {
+      "name": "crash-on-input",
+      "level": "moderate",
+      "score": 0.5,
+      "definition": "A valid or empty input makes the code raise an unhandled exception."
+    },
+    {
+      "name": "wrong-result",
+      "level": "moderate",
+      "score": 0.5,
+      "definition": "The code returns or changes the wrong data for valid input: a bad formula, an off-by-one, state shared between calls."
+    },
+    {
+      "name": "style-only",
+      "level": "low",
+      "score": 0.75,
+      "definition": "Naming, formatting or readability, with no effect on behaviour."
+    }
+  ],
+  "reviewers": [
+    {
+      "name": "general",
+      "model": "qwen2.5-coder-7b-instruct-mlx",
+      "promptFile": "../prompts/qwen2.5-coder-7b-instruct-mlx-reviewer-loop.md",
+      "active": true,
+      "type": ["reasoning"],
+      "loadOnDemand": true,
+      "contextLength": 32768,
+      "tools": ["read_file", "grep"]
+    },
+    {
+      "name": "verifier",
+      "model": "deepseek-r1-distill-llama-8b",
+      "promptFile": "../prompts/deepseek-r1-distill-llama-8b-verifier-loop.md",
+      "active": true,
+      "type": ["verifier"],
+      "loadOnDemand": true,
+      "contextLength": 32768,
+      "tools": ["read_file", "grep"]
+    },
+    {
+      "name": "classifier",
+      "model": "qwen2.5-coder-7b-instruct-mlx",
+      "prompt": "You check whether a reported defect falls under a category's definition.",
+      "active": true,
+      "type": ["classifier"],
+      "loadOnDemand": true,
+      "contextLength": 32768
+    }
+  ]
+}

@@ -167,6 +167,7 @@ def _init_args(target_repo, **overrides) -> argparse.Namespace:
         memory_bank_id="",
         embedding_model="",
         memory_bank_embedding_model="",
+        memory_bank_follow=None,
         codebase_reviewer=False,
         reviewers_file="",
         qdrant_only=False,
@@ -557,6 +558,57 @@ class EmbeddingModelFlag(unittest.TestCase):
         with mock.patch.object(self.mod.sys, "argv", ["setup_project.py", "init", str(self.target_repo)]):
             self.assertEqual(self.mod.parse_args().memory_bank_embedding_model, "")
 
+    def _written_follow(self):
+        written = json.loads((self.target_repo / ".mcp.json").read_text(encoding="utf-8"))
+        return written["mcpServers"]["memory-bank"]["env"].get("MEMORY_BANK_FOLLOW_REPOS")
+
+    def test_memory_bank_follow_is_written_and_survives_a_plain_rerun(self):
+        # The block is regenerated wholesale on every init, so the
+        # list has to be carried over or a re-run silently drops it.
+        self.mod.cmd_init(_init_args(self.target_repo, memory_bank_follow="repo-a,repo-b", dry_run=False))
+        self.assertEqual(self._written_follow(), "repo-a,repo-b")
+        self.mod.cmd_init(_init_args(self.target_repo, dry_run=False))
+        self.assertEqual(self._written_follow(), "repo-a,repo-b")
+
+    def test_memory_bank_follow_empty_value_clears_the_list(self):
+        self.mod.cmd_init(_init_args(self.target_repo, memory_bank_follow="repo-a", dry_run=False))
+        self.mod.cmd_init(_init_args(self.target_repo, memory_bank_follow="", dry_run=False))
+        # Cleared means blank, not removed.
+        self.assertEqual(self._written_follow(), "")
+
+    def test_fresh_init_writes_the_blank_follow_key(self):
+        self.mod.cmd_init(_init_args(self.target_repo, dry_run=False))
+        self.assertEqual(self._written_follow(), "")
+
+    def test_memory_bank_follow_dry_run_writes_nothing(self):
+        self.mod.cmd_init(_init_args(self.target_repo, memory_bank_follow="repo-a", dry_run=True))
+        self.assertFalse((self.target_repo / ".mcp.json").exists())
+
+    def test_parser_distinguishes_flag_not_passed_from_empty_value(self):
+        argv = ["setup_project.py", "init", str(self.target_repo)]
+        with mock.patch.object(self.mod.sys, "argv", argv):
+            self.assertIsNone(self.mod.parse_args().memory_bank_follow)
+        with mock.patch.object(self.mod.sys, "argv", argv + ["--memory-bank-follow", "a,b"]):
+            self.assertEqual(self.mod.parse_args().memory_bank_follow, "a,b")
+        with mock.patch.object(self.mod.sys, "argv", argv + ["--memory-bank-follow", ""]):
+            self.assertEqual(self.mod.parse_args().memory_bank_follow, "")
+
+    def test_help_says_it_is_sticky_and_needs_a_restart(self):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with mock.patch.object(self.mod.sys, "argv", ["setup_project.py", "init", "--help"]), \
+             contextlib.redirect_stdout(buf), self.assertRaises(SystemExit):
+            self.mod.parse_args()
+        text = " ".join(buf.getvalue().split())
+        self.assertIn("--memory-bank-follow", text)
+        self.assertIn("PRESERVES", text)
+        self.assertIn("next starts", text)
+        # Regression: forget(point_id=..., confirm=True) can delete another
+        # repo's memory, followed or not, so the help must not say it cannot.
+        self.assertNotIn("or forget", text)
+        self.assertIn("still needs confirm=True", text)
+
     def test_parser_accepts_embedding_model_and_defaults_blank(self):
         with mock.patch.object(
             self.mod.sys, "argv", ["setup_project.py", "init", str(self.target_repo), "--embedding-model", self.CUSTOM]
@@ -815,6 +867,26 @@ class InstallSkillsFlag(unittest.TestCase):
         written = (self.skills_dir / "my-fake-skill" / "SKILL.md").read_text(encoding="utf-8")
         self.assertEqual(written, "# My Fake Skill\ncontent v2\n")
 
+    def test_a_script_beside_skill_md_is_installed_with_it_and_refreshed_alone(self):
+        # The skill's own script ships through `init --install-skills` and
+        # through `upgrade`'s refresh, which only refreshes skills that are installed.
+        script = self.fake_tools_repo / "skills" / "my-fake-skill" / "facts.sh"
+        script.write_bytes(b"#!/bin/sh\necho v1\r\n")
+        output = self._run(dry_run=True)
+        self.assertIn("+ facts.sh", output)
+        self.assertFalse((self.skills_dir / "my-fake-skill" / "facts.sh").exists())
+        self._run(dry_run=False)
+        installed = self.skills_dir / "my-fake-skill" / "facts.sh"
+        self.assertEqual(installed.read_bytes(), b"#!/bin/sh\necho v1\r\n")
+        self.assertIn("my-fake-skill: up to date", self._run(dry_run=False))
+        # Only the script changes: SKILL.md is identical, yet the skill is refreshed.
+        script.write_bytes(b"#!/bin/sh\necho v2\n")
+        done = self.mod.refresh_installed_skills(
+            self.skills_dir, tools_repo_dir=self.fake_tools_repo, auto_yes=True, dry_run=False
+        )
+        self.assertEqual(done, ["my-fake-skill"])
+        self.assertEqual(installed.read_bytes(), b"#!/bin/sh\necho v2\n")
+
     def test_combined_with_target_repo_also_writes_mcp_json(self):
         self._run(dry_run=False)
         self.assertTrue((self.target_repo / ".mcp.json").exists())
@@ -852,23 +924,23 @@ class InstallSkillsFlag(unittest.TestCase):
         output = self._run(dry_run=False)
         self.assertIn("my-fake-skill: up to date", output)
 
-    def test_my_setup_clauderunway_prints_the_clone_caveat(self):
-        (self.fake_tools_repo / "skills" / "my-setup-clauderunway").mkdir()
-        (self.fake_tools_repo / "skills" / "my-setup-clauderunway" / "SKILL.md").write_text(
-            "# my-setup-clauderunway\n", encoding="utf-8"
+    def test_cr_setup_prints_the_clone_caveat(self):
+        (self.fake_tools_repo / "skills" / "cr-setup").mkdir()
+        (self.fake_tools_repo / "skills" / "cr-setup" / "SKILL.md").write_text(
+            "# cr-setup\n", encoding="utf-8"
         )
         output = self._run(dry_run=False)
         self.assertIn("CLAUDE_RUNWAY_DIR", output)
 
-    def test_my_setup_clauderunway_caveat_is_state_neutral(self):
+    def test_cr_setup_caveat_is_state_neutral(self):
         # Regression for Copilot review finding: the caveat
         # previously asserted "was installed/updated too" unconditionally,
         # which is false during --dry-run (nothing written) and when the
         # skill is already up to date (nothing changed) -- contradicting
         # the preceding per-skill status line printed just above it.
-        (self.fake_tools_repo / "skills" / "my-setup-clauderunway").mkdir()
-        (self.fake_tools_repo / "skills" / "my-setup-clauderunway" / "SKILL.md").write_text(
-            "# my-setup-clauderunway\n", encoding="utf-8"
+        (self.fake_tools_repo / "skills" / "cr-setup").mkdir()
+        (self.fake_tools_repo / "skills" / "cr-setup" / "SKILL.md").write_text(
+            "# cr-setup\n", encoding="utf-8"
         )
         dry_run_output = self._run(dry_run=True)
         self.assertIn("CLAUDE_RUNWAY_DIR", dry_run_output)
@@ -928,11 +1000,51 @@ class UpgradeSubcommand(unittest.TestCase):
             json.dumps({"mcpServers": {"qdrant": {}}}), encoding="utf-8"
         )
 
-    def test_parse_args_requires_target_repo(self):
+    def test_parse_args_target_repo_is_optional(self):
+        # No project path means skills-only mode, not a usage error.
         with mock.patch.object(sys, "argv", ["setup_project.py", "upgrade"]):
-            with self.assertRaises(SystemExit) as ctx:
-                self.mod.parse_args()
-        self.assertEqual(ctx.exception.code, 2)
+            parsed = self.mod.parse_args()
+        self.assertIsNone(parsed.target_repo)
+        self.assertIs(parsed.func, self.mod.cmd_upgrade)
+
+    def _skills_only(self, **kw):
+        args = argparse.Namespace(
+            target_repo=None, dry_run=kw.get("dry_run", False), auto_yes=True, skills_dir=str(self.skills_dir)
+        )
+        buf = io.StringIO()
+        with mock.patch.object(self.mod, "run_upgrade", side_effect=AssertionError("project upgrade ran")), \
+             mock.patch.object(self.mod, "is_project_configured", side_effect=AssertionError("project checked")), \
+             redirect_stdout(buf):
+            self.mod.cmd_upgrade(args)
+        return buf.getvalue()
+
+    def _install_old_skill(self):
+        # Take the pair from the migration table instead of spelling the old name out here.
+        self.old_name = sorted(self.mod.RENAMED_PRODUCT_SKILLS)[0]
+        self.new_name = self.mod.RENAMED_PRODUCT_SKILLS[self.old_name]
+        d = self.skills_dir / self.old_name
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text(
+            f'---\nname: {self.old_name}\ndescription: "d"\n---\n\nold body\n', encoding="utf-8"
+        )
+
+    def test_skills_only_renames_an_old_name_and_touches_no_project(self):
+        self._install_old_skill()
+        out = self._skills_only()
+        self.assertTrue((self.skills_dir / self.new_name / "SKILL.md").is_file())
+        self.assertFalse((self.skills_dir / self.old_name).exists())
+        self.assertIn("No project configuration was touched", out)
+
+    def test_skills_only_dry_run_writes_nothing(self):
+        self._install_old_skill()
+        self._skills_only(dry_run=True)
+        self.assertTrue((self.skills_dir / self.old_name / "SKILL.md").is_file())
+        self.assertFalse((self.skills_dir / self.new_name).exists())
+
+    def test_skills_only_with_nothing_installed_is_a_no_op(self):
+        out = self._skills_only()
+        self.assertFalse(self.skills_dir.exists())
+        self.assertIn("No project configuration was touched", out)
 
     def test_parse_args_defaults(self):
         with mock.patch.object(sys, "argv", ["setup_project.py", "upgrade", str(self.target_repo)]):
@@ -1024,9 +1136,9 @@ class UpgradeSubcommand(unittest.TestCase):
 
 class InitOffersSavingsTracker(unittest.TestCase):
     """`init` never mentioned the savings tracker, so a CLI user got
-    a config with no `analytics` server and /my-savings and /my-metrics failed
+    a config with no `analytics` server and /cr-savings and /cr-metrics failed
     with an unknown-tool error. It now asks (same wording as
-    /my-setup-clauderunway's Q4) when a person can answer, and says so when
+    /cr-setup's Q4) when a person can answer, and says so when
     the tracker ends up off."""
 
     def setUp(self):
@@ -1071,7 +1183,7 @@ class InitOffersSavingsTracker(unittest.TestCase):
         disabled = "No token savings tracking"
         self.assertIn(enabled, out)
         self.assertIn(disabled, out)
-        skill = (REPO_ROOT / "skills" / "my-setup-clauderunway" / "SKILL.md").read_text(encoding="utf-8")
+        skill = (REPO_ROOT / "skills" / "cr-setup" / "SKILL.md").read_text(encoding="utf-8")
         self.assertIn(enabled, skill)
         self.assertIn(disabled, skill)
 
@@ -1084,7 +1196,7 @@ class InitOffersSavingsTracker(unittest.TestCase):
                 self.assertEqual(len(prompts), 1)
                 self.assertNotIn("analytics", self._servers())
                 self.assertIn("savings tracker is off", out)
-                self.assertIn("/my-savings and /my-metrics", out)
+                self.assertIn("/cr-savings and /cr-metrics", out)
                 self.assertIn("--track-savings", out)
                 self.assertIn("CLAUDE_RUNWAY_TRACK_SAVINGS=1", out)
 
@@ -1198,7 +1310,7 @@ class UpgradeSkillRefresh(unittest.TestCase):
     shipped ones. Everything runs against temp dirs; Path.home() is patched
     so the real ~/.claude is never read or written."""
 
-    FM = '---\nname: my-savings\ndescription: "x"\n---\n\n'
+    FM = '---\nname: cr-savings\ndescription: "x"\n---\n\n'
 
     def setUp(self):
         self.mod = _load_setup_project()
@@ -1209,9 +1321,11 @@ class UpgradeSkillRefresh(unittest.TestCase):
         home_patch.start()
         self.addCleanup(home_patch.stop)
         self.tools = root / "tools"
-        for name, body in (("my-savings", "# Skill: my-savings\nnew wording\n"), ("my-other", "# Skill: my-other\n")):
+        for name, body in (("cr-savings", "# Skill: cr-savings\nnew wording\n"), ("my-other", "# Skill: my-other\n")):
             (self.tools / "skills" / name).mkdir(parents=True)
-            (self.tools / "skills" / name / "SKILL.md").write_text(body, encoding="utf-8")
+            # Bytes, not write_text: on Windows write_text turns every newline into CRLF, and these
+            # shipped skills are compared with the text _install() writes byte for byte.
+            (self.tools / "skills" / name / "SKILL.md").write_bytes(body.encode("utf-8"))
         self.skills = root / "skills-dest"
 
     def _install(self, name, text):
@@ -1229,32 +1343,32 @@ class UpgradeSkillRefresh(unittest.TestCase):
             done = self.mod.refresh_installed_skills(self.skills, tools_repo_dir=self.tools, **kw)
         return done, buf.getvalue()
 
-    def test_stale_my_savings_is_refreshed_keeping_frontmatter_and_dropping_the_pointer(self):
-        self._install("my-savings", self.FM + "# Skill: my-savings\nold wording, see EVALUATION.md\n")
+    def test_stale_cr_savings_is_refreshed_keeping_frontmatter_and_dropping_the_pointer(self):
+        self._install("cr-savings", self.FM + "# Skill: cr-savings\nold wording, see EVALUATION.md\n")
         done, out = self._refresh()
-        self.assertEqual(done, ["my-savings"])
-        text = self._read("my-savings")
-        self.assertEqual(text, self.FM + "# Skill: my-savings\nnew wording\n")
+        self.assertEqual(done, ["cr-savings"])
+        text = self._read("cr-savings")
+        self.assertEqual(text, self.FM + "# Skill: cr-savings\nnew wording\n")
         self.assertNotIn("EVALUATION.md", text)
         self.assertIn("keeping its existing frontmatter", out)
 
     def test_up_to_date_copy_with_frontmatter_is_nothing_to_do(self):
-        self._install("my-savings", self.FM + "# Skill: my-savings\nnew wording\n")
+        self._install("cr-savings", self.FM + "# Skill: cr-savings\nnew wording\n")
         self._install("my-other", "# Skill: my-other\n")
-        before = (self.skills / "my-savings" / "SKILL.md").stat().st_mtime_ns
+        before = (self.skills / "cr-savings" / "SKILL.md").stat().st_mtime_ns
         done, out = self._refresh()
         self.assertEqual(done, [])
         self.assertIn("up to date", out)
-        self.assertEqual((self.skills / "my-savings" / "SKILL.md").stat().st_mtime_ns, before)
+        self.assertEqual((self.skills / "cr-savings" / "SKILL.md").stat().st_mtime_ns, before)
         self.assertEqual(self._refresh()[0], [])
 
     def test_dry_run_writes_nothing_and_never_prompts(self):
         stale = self.FM + "stale\n"
-        self._install("my-savings", stale)
+        self._install("cr-savings", stale)
         done, out = self._refresh(dry_run=True, auto_yes=False, prompt_fn=lambda p: self.fail("prompted"))
-        self.assertEqual(done, ["my-savings"])
-        self.assertEqual(self._read("my-savings"), stale)
-        self.assertIn("Would refresh my-savings", out)
+        self.assertEqual(done, ["cr-savings"])
+        self.assertEqual(self._read("cr-savings"), stale)
+        self.assertIn("Would refresh cr-savings", out)
 
     def test_no_installed_skills_installs_nothing(self):
         done, out = self._refresh()
@@ -1264,41 +1378,41 @@ class UpgradeSkillRefresh(unittest.TestCase):
         self.assertIn("2 shipped skill(s) are not installed", out)
 
     def test_partial_install_refreshes_only_what_is_installed(self):
-        self._install("my-savings", "stale\n")
+        self._install("cr-savings", "stale\n")
         done, _ = self._refresh()
-        self.assertEqual(done, ["my-savings"])
+        self.assertEqual(done, ["cr-savings"])
         self.assertFalse((self.skills / "my-other").exists())
 
     def test_declining_leaves_the_copy_alone(self):
-        self._install("my-savings", "stale\n")
+        self._install("cr-savings", "stale\n")
         done, out = self._refresh(auto_yes=False, prompt_fn=lambda p: False)
         self.assertEqual(done, [])
-        self.assertEqual(self._read("my-savings"), "stale\n")
+        self.assertEqual(self._read("cr-savings"), "stale\n")
         self.assertIn("Skipped", out)
 
     def test_accepting_prompt_writes(self):
-        self._install("my-savings", "stale\n")
+        self._install("cr-savings", "stale\n")
         done, _ = self._refresh(auto_yes=False, prompt_fn=lambda p: True)
-        self.assertEqual(done, ["my-savings"])
+        self.assertEqual(done, ["cr-savings"])
 
     def test_closed_stdin_counts_as_decline(self):
-        self._install("my-savings", "stale\n")
+        self._install("cr-savings", "stale\n")
         with mock.patch("builtins.input", side_effect=EOFError):
             done, _ = self._refresh(auto_yes=False)
         self.assertEqual(done, [])
-        self.assertEqual(self._read("my-savings"), "stale\n")
+        self.assertEqual(self._read("cr-savings"), "stale\n")
 
     def test_missing_skills_dir_is_fine(self):
         done, _ = self._refresh(dry_run=True)
         self.assertEqual(done, [])
 
     def test_hand_edited_copy_is_reported_and_refreshed(self):
-        self._install("my-savings", self.FM + "# Skill: my-savings\nnew wording\nmy own edit\n")
-        self.assertEqual(self._refresh(dry_run=True)[0], ["my-savings"])
+        self._install("cr-savings", self.FM + "# Skill: cr-savings\nnew wording\nmy own edit\n")
+        self.assertEqual(self._refresh(dry_run=True)[0], ["cr-savings"])
 
     def test_crlf_installed_copy_stays_up_to_date(self):
-        (self.tools / "skills" / "my-savings" / "SKILL.md").write_bytes(b"# Skill: my-savings\r\nx\r\n")
-        self._install("my-savings", "# Skill: my-savings\r\nx\r\n")
+        (self.tools / "skills" / "cr-savings" / "SKILL.md").write_bytes(b"# Skill: cr-savings\r\nx\r\n")
+        self._install("cr-savings", "# Skill: cr-savings\r\nx\r\n")
         self.assertEqual(self._refresh()[0], [])
 
     def _cmd_upgrade(self, **kw):
@@ -1315,14 +1429,14 @@ class UpgradeSkillRefresh(unittest.TestCase):
         return buf.getvalue()
 
     def test_cmd_upgrade_refreshes_with_auto_yes(self):
-        self._install("my-savings", "stale\n")
+        self._install("cr-savings", "stale\n")
         self._cmd_upgrade(dry_run=False, auto_yes=True)
-        self.assertEqual(self._read("my-savings"), "# Skill: my-savings\nnew wording\n")
+        self.assertEqual(self._read("cr-savings"), "# Skill: cr-savings\nnew wording\n")
 
     def test_cmd_upgrade_dry_run_writes_nothing(self):
-        self._install("my-savings", "stale\n")
+        self._install("cr-savings", "stale\n")
         self._cmd_upgrade(dry_run=True, auto_yes=False)
-        self.assertEqual(self._read("my-savings"), "stale\n")
+        self.assertEqual(self._read("cr-savings"), "stale\n")
 
     def test_parse_args_accepts_skills_dir(self):
         with mock.patch.object(sys, "argv", ["setup_project.py", "upgrade", "x", "--skills-dir", "/tmp/s"]):
@@ -1330,7 +1444,7 @@ class UpgradeSkillRefresh(unittest.TestCase):
         self.assertEqual(parsed.skills_dir, "/tmp/s")
 
     def test_real_shipped_skills_have_no_evaluation_pointer(self):
-        for name in ("my-savings", "my-setup-clauderunway"):
+        for name in ("cr-savings", "cr-setup"):
             shipped = (REPO_ROOT / "skills" / name / "SKILL.md").read_text(encoding="utf-8")
             self.assertNotIn("EVALUATION.md", shipped, name)
 
@@ -1349,11 +1463,11 @@ class UpgradeSkillSourceNotice(unittest.TestCase):
         self.tools = root / "snapshot"
         self.checkout = root / "checkout"
         for base, body in ((self.tools, "snapshot wording\n"), (self.checkout, "checkout wording\n")):
-            (base / "skills" / "my-savings").mkdir(parents=True)
-            (base / "skills" / "my-savings" / "SKILL.md").write_text(body, encoding="utf-8")
+            (base / "skills" / "cr-savings").mkdir(parents=True)
+            (base / "skills" / "cr-savings" / "SKILL.md").write_text(body, encoding="utf-8")
         self.skills = root / "skills-dest"
-        (self.skills / "my-savings").mkdir(parents=True)
-        self.installed = self.skills / "my-savings" / "SKILL.md"
+        (self.skills / "cr-savings").mkdir(parents=True)
+        self.installed = self.skills / "cr-savings" / "SKILL.md"
         self.installed.write_text("stale\n", encoding="utf-8")
         version_patch = mock.patch.object(self.mod, "get_version", return_value="9.9.9.test")
         version_patch.start()
@@ -1370,7 +1484,7 @@ class UpgradeSkillSourceNotice(unittest.TestCase):
 
     def test_snapshot_source_is_named_with_path_and_version(self):
         done, out = self._refresh()
-        self.assertEqual(done, ["my-savings"])
+        self.assertEqual(done, ["cr-savings"])
         self.assertIn("Comparing against the skills shipped with this install", out)
         self.assertIn(str(self.tools / "skills"), out)
         self.assertIn("9.9.9.test", out)
@@ -1386,29 +1500,56 @@ class UpgradeSkillSourceNotice(unittest.TestCase):
 
     def test_differing_checkout_copy_warns_and_still_refreshes(self):
         done, out = self._refresh(env=str(self.checkout))
-        self.assertEqual(done, ["my-savings"])
+        self.assertEqual(done, ["cr-savings"])
         self.assertEqual(self.installed.read_text(encoding="utf-8"), "snapshot wording\n")
-        self.assertIn(f"Warning: the checkout at {self.checkout} ships a different my-savings", out)
-        self.assertIn("/my-setup-clauderunway upgrade", out)
+        self.assertIn(f"Warning: the checkout at {self.checkout} ships a different cr-savings", out)
+        self.assertIn("/cr-setup upgrade", out)
         self.assertIn("uv tool install --reinstall", out)
 
     def test_warning_also_shown_in_dry_run_and_nothing_is_written(self):
         done, out = self._refresh(env=str(self.checkout), dry_run=True, auto_yes=False)
-        self.assertEqual(done, ["my-savings"])
+        self.assertEqual(done, ["cr-savings"])
         self.assertEqual(self.installed.read_text(encoding="utf-8"), "stale\n")
-        self.assertIn("Would refresh my-savings", out)
-        self.assertIn("ships a different my-savings", out)
+        self.assertIn("Would refresh cr-savings", out)
+        self.assertIn("ships a different cr-savings", out)
 
     def test_declining_still_shows_the_warning_and_skips(self):
         done, out = self._refresh(env=str(self.checkout), auto_yes=False, prompt_fn=lambda p: False)
         self.assertEqual(done, [])
-        self.assertIn("ships a different my-savings", out)
+        self.assertIn("ships a different cr-savings", out)
         self.assertIn("Skipped", out)
 
     def test_no_warning_when_checkout_copy_matches_the_snapshot(self):
-        (self.checkout / "skills" / "my-savings" / "SKILL.md").write_text("snapshot wording\n", encoding="utf-8")
+        (self.checkout / "skills" / "cr-savings" / "SKILL.md").write_text("snapshot wording\n", encoding="utf-8")
         _, out = self._refresh(env=str(self.checkout))
         self.assertNotIn("Warning", out)
+
+    def test_a_checkout_that_differs_only_in_the_skills_script_warns_too(self):
+        # A skill's script is part of the skill. Identical SKILL.md text in the
+        # checkout and the snapshot must not hide a different script.
+        for base, script in ((self.tools, b"#!/bin/sh\necho snapshot\n"), (self.checkout, b"#!/bin/sh\necho checkout\n")):
+            (base / "skills" / "cr-savings" / "SKILL.md").write_text("same wording\n", encoding="utf-8")
+            (base / "skills" / "cr-savings" / "facts.sh").write_bytes(script)
+        self.installed.write_text("same wording\n", encoding="utf-8")
+        (self.skills / "cr-savings" / "facts.sh").write_bytes(b"#!/bin/sh\necho stale\n")
+        done, out = self._refresh(env=str(self.checkout))
+        self.assertEqual(done, ["cr-savings"])
+        self.assertIn("ships a different cr-savings", out)
+        self.assertEqual((self.skills / "cr-savings" / "facts.sh").read_bytes(), b"#!/bin/sh\necho snapshot\n")
+
+    def test_a_dry_run_names_the_script_that_would_change(self):
+        for base in (self.tools, self.checkout):
+            (base / "skills" / "cr-savings" / "SKILL.md").write_text("same wording\n", encoding="utf-8")
+            (base / "skills" / "cr-savings" / "facts.sh").write_bytes(b"new script\n")
+        self.installed.write_text("same wording\n", encoding="utf-8")
+        done, out = self._refresh(dry_run=True, auto_yes=False)
+        self.assertEqual(done, ["cr-savings"])
+        self.assertIn("Would refresh cr-savings", out)
+        self.assertIn("+ facts.sh (new)", out)
+        (self.skills / "cr-savings" / "facts.sh").write_bytes(b"old script\n")
+        _, out = self._refresh(dry_run=True, auto_yes=False)
+        self.assertIn("+ facts.sh (differs)", out)
+        self.assertEqual((self.skills / "cr-savings" / "facts.sh").read_bytes(), b"old script\n")
 
     def test_no_warning_when_env_is_unset_empty_or_not_a_directory(self):
         for env in ("", "   ", str(Path(self._tmpdir.name) / "nowhere")):
@@ -1421,7 +1562,7 @@ class UpgradeSkillSourceNotice(unittest.TestCase):
         self.assertNotIn("Warning", out)
 
     def test_no_warning_when_checkout_lacks_that_skill(self):
-        (self.checkout / "skills" / "my-savings" / "SKILL.md").unlink()
+        (self.checkout / "skills" / "cr-savings" / "SKILL.md").unlink()
         _, out = self._refresh(env=str(self.checkout))
         self.assertNotIn("Warning", out)
 

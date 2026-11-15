@@ -50,6 +50,7 @@ from qdrant_ingest_lib import MANIFEST_FILENAME, is_old_format_manifest
 from setup_project_lib import (
     COMPRESS_HOOK_SCRIPT,
     LEGACY_COMPRESS_HOOK_SCRIPT,
+    PR_ROUND_CAPTURE_HOOK_SCRIPT,
     REVIEWERS_FILE_REQUIRED_WARNING,
     SAVINGS_TRACKER_SHELL_EXPORT_REMINDER,
     TRACK_SAVINGS_TRUTHY,
@@ -193,23 +194,20 @@ def _apply_memory_bank_server_missing(
     matching what a fresh `init` run does when `--memory-bank-id` isn't
     passed.
 
-    KNOWN LEGACY BEHAVIOR: `EMBEDDING_MODEL` is copied from the
-    existing `qdrant`/`codebase-indexer` block instead of being left at what
-    `build_mcp_servers` bakes in from the CURRENT `mcp.json.template`
-    (`build_mcp_servers`'s `embedding_model` parameter
-    defaults to blank, so every server it generates inherits the template's
-    own default -- and this migration doesn't pass it). That copy was added
-    after a Copilot review: a project whose `qdrant`/
-    `codebase-indexer` blocks were hand-customized to a non-default model
-    (see README's Known limitations) got a freshly-added `memory-bank` block
-    pinned to the template's default, which can mismatch the model that
-    created the shared `memory-bank` collection (`docs/memory-bank.md`: the
-    collection locks in whichever `EMBEDDING_MODEL` created it first).
-    Memory-bank's model is now its own value,
-    independent of the code-index model, so the copy is not a correct source
-    either and can produce the same mismatch the other way round;
-    `memory_bank_mcp_server.py` reports such a mismatch loudly rather than
-    returning wrong results.
+    `EMBEDDING_MODEL` is deliberately NOT copied from the `qdrant`/
+    `codebase-indexer` blocks. Memory-bank's model is its own value,
+    independent of the code-index model, and the shared `memory-bank`
+    collection locks in whichever model created it first
+    (`docs/memory-bank.md`), so a customized code-index model is not a valid
+    source: copying it would pin the new block to a model the collection may
+    not use. This migration only runs when the block is missing, so there is
+    no existing memory-bank value to preserve; the block gets the template's
+    default, the same as `init` writes for a config with no memory-bank block
+    (`resolve_memory_bank_embedding_model`). A copy was once made after a
+    review (a customized project got the template default and mismatched),
+    which memory-bank's own model made obsolete. Detecting the existing
+    collection's model would need a live Qdrant call, which `upgrade` does not
+    make.
     """
     mcp_json = copy.deepcopy(mcp_json)
     servers = mcp_json.setdefault("mcpServers", {})
@@ -220,7 +218,6 @@ def _apply_memory_bank_server_missing(
     qdrant_api_key = qdrant_env.get("QDRANT_API_KEY") or ""
     collection_name = qdrant_env.get("COLLECTION_NAME") or indexer_env.get("COLLECTION_NAME") or "project"
     memory_bank_collection = indexer_env.get("MEMORY_BANK_COLLECTION") or "memory-bank"
-    embedding_model = qdrant_env.get("EMBEDDING_MODEL") or indexer_env.get("EMBEDDING_MODEL")
 
     template = load_json(Path(ctx.tools_repo_dir) / "templates" / "mcp.json.template")
     generated = build_mcp_servers(
@@ -235,10 +232,7 @@ def _apply_memory_bank_server_missing(
         memory_bank_id=collection_name,
         include_compress=False,
     )
-    memory_bank_server = generated["memory-bank"]
-    if embedding_model:
-        memory_bank_server["env"]["EMBEDDING_MODEL"] = embedding_model
-    servers["memory-bank"] = memory_bank_server
+    servers["memory-bank"] = generated["memory-bank"]
     return mcp_json, settings_json
 
 
@@ -371,11 +365,13 @@ def _apply_record_session_id_hooks_missing(
 
     Still reuses `build_settings_hooks` itself (not `merge_settings_hooks`)
     purely to get the core blocks' `command`/`args` resolved against THIS
-    `MigrationContext`'s `tools_repo_dir`/`venv_python` -- with
-    `include_compress=False`, its `SessionStart`/`SessionEnd` results
-    contain exactly one block each (the core one; any compress-gated blocks
-    are stripped from the RETURNED dict, not from `settings_json`), so no
-    filtering is needed on this end either.
+    `MigrationContext`'s `tools_repo_dir`/`venv_python`. With
+    `include_compress=False` the compress-gated blocks are stripped from the
+    RETURNED dict (not from `settings_json`), but `SessionEnd` still holds
+    more than one CORE block (record_session_id.py and
+    session_end_pr_rounds.py), so the blocks are filtered down to this
+    migration's own script: appending all of them would duplicate the
+    other core hook whenever it is already registered.
     """
     settings_json = copy.deepcopy(settings_json)
     missing_events = _missing_record_session_id_events(settings_json)
@@ -389,7 +385,63 @@ def _apply_record_session_id_hooks_missing(
     hooks = settings_json.setdefault("hooks", {})
     for event in missing_events:
         existing_blocks = hooks.setdefault(event, [])
-        existing_blocks.extend(copy.deepcopy(b) for b in generated_hooks[event])
+        existing_blocks.extend(
+            copy.deepcopy(b) for b in _blocks_for_script(generated_hooks[event], "record_session_id.py")
+        )
+    return mcp_json, settings_json
+
+
+# ---------------------------------------------------------------------------
+# pr-round-capture-hook-missing
+# ---------------------------------------------------------------------------
+
+
+def _blocks_for_script(blocks: list, script_name: str) -> list:
+    """The blocks whose first inner hook runs `script_name` (matched by basename, like every
+    other hook lookup in this toolkit)."""
+    out = []
+    for block in blocks:
+        inner = block.get("hooks") or []
+        first_args = inner[0].get("args") if inner else None
+        if first_args and Path(first_args[-1]).name == script_name:
+            out.append(block)
+    return out
+
+
+def _has_pr_round_capture_hook(settings_json: dict) -> bool:
+    for block in settings_json.get("hooks", {}).get("SessionEnd", []):
+        for hook in block.get("hooks", []):
+            if any(Path(a).name == PR_ROUND_CAPTURE_HOOK_SCRIPT for a in hook.get("args", [])):
+                return True
+    return False
+
+
+def _detect_pr_round_capture_hook_missing(mcp_json: dict, settings_json: dict) -> bool:
+    return not _has_pr_round_capture_hook(settings_json)
+
+
+def _apply_pr_round_capture_hook_missing(
+    mcp_json: dict, settings_json: dict, ctx: MigrationContext
+) -> "tuple[dict, dict]":
+    """
+    Appends the CORE `session_end_pr_rounds.py` SessionEnd block, and only that block, to
+    whatever `settings_json` already has. A pure append for the reason
+    `_apply_record_session_id_hooks_missing` gives (the merge primitives strip and re-add
+    every toolkit-owned block of an event, which a one-gap migration must not do). The hook
+    is a silent no-op until CLAUDE_RUNWAY_CAPTURE_PR_ROUNDS is exported, so adding it changes
+    nothing a session does by itself.
+    """
+    settings_json = copy.deepcopy(settings_json)
+    if _has_pr_round_capture_hook(settings_json):
+        return mcp_json, settings_json
+    template = load_json(Path(ctx.tools_repo_dir) / "templates" / "settings.json.template")
+    generated_hooks = build_settings_hooks(
+        template, venv_python=ctx.venv_python, tools_repo_dir=ctx.tools_repo_dir, include_compress=False
+    )
+    hooks = settings_json.setdefault("hooks", {})
+    hooks.setdefault("SessionEnd", []).extend(
+        copy.deepcopy(b) for b in _blocks_for_script(generated_hooks["SessionEnd"], PR_ROUND_CAPTURE_HOOK_SCRIPT)
+    )
     return mcp_json, settings_json
 
 
@@ -759,8 +811,8 @@ def _detect_analytics_server_missing(mcp_json: dict, settings_json: dict) -> boo
     True when this project's `local-compress` block has savings tracking on
     (its `CLAUDE_RUNWAY_TRACK_SAVINGS` is a truthy string) but there is no
     `analytics` block. That block now serves `savings_summary`/`savings_detail`/
-    `savings_trend`, `get_metrics` and `record_metric`, so `/my-savings` and
-    `/my-metrics` stop working after the tools leave `local-compress` until it
+    `savings_trend`, `get_metrics` and `record_metric`, so `/cr-savings` and
+    `/cr-metrics` stop working after the tools leave `local-compress` until it
     is added. A project with tracking off is deliberately not offered THIS
     migration: the server is opt-in. An interactive `upgrade` asks about the
     tracker separately, before the migrations are listed (`run_upgrade`'s
@@ -1009,6 +1061,24 @@ MIGRATIONS: "list[Migration]" = [
         apply=_apply_record_session_id_hooks_missing,
     ),
     Migration(
+        id="pr-round-capture-hook-missing",
+        title="Add the session_end_pr_rounds.py SessionEnd hook to .claude/settings.json",
+        kind="add",
+        description=(
+            "No SessionEnd hook entry in this project's .claude/settings.json references "
+            "session_end_pr_rounds.py, the hook that records the session's pull-request "
+            "review rounds to the shared metrics store when it ends. Adds its SessionEnd block; any other "
+            "existing hooks are left completely untouched. The hook does nothing until you opt in."
+        ),
+        note=(
+            "Opt in by exporting CLAUDE_RUNWAY_CAPTURE_PR_ROUNDS=1 in your shell profile (a hook has no env "
+            "field, so it cannot be set in settings.json), then restart Claude Code. It records a PR only "
+            "once it is merged or closed, and logs to pr-round-capture.log beside metrics.db."
+        ),
+        detect=_detect_pr_round_capture_hook_missing,
+        apply=_apply_pr_round_capture_hook_missing,
+    ),
+    Migration(
         id="qdrant-server-replaced",
         title="Run this repo's own qdrant MCP server instead of mcp-server-qdrant",
         kind="update",
@@ -1016,7 +1086,7 @@ MIGRATIONS: "list[Migration]" = [
             "The 'qdrant' server in .mcp.json still launches the third-party mcp-server-qdrant console "
             "script. This repo now ships its own (mcpservers/qdrant_mcp_server.py): same qdrant-find and "
             "qdrant-store tools under the same names, plus the conversation-compact tools "
-            "(compact_store, compact_find, compact_prune) that /my-compact and /my-resume use, which "
+            "(compact_store, compact_find, compact_prune) that /cr-compact and /cr-resume use, which "
             "have moved there from local-compress. Rewrites the qdrant block to the new command and env, "
             "keeping your Qdrant URL/key, collection and embedding model, and carrying over the compact "
             "collection, LM Studio URL/model and compact embedding model from the local-compress block; "
@@ -1028,7 +1098,7 @@ MIGRATIONS: "list[Migration]" = [
             "COMPACT_EMBEDDING_MODEL is pinned to the model they were stored with (BAAI/bge-small-en for "
             "installs that never set one). Do NOT change it once you have saved compacts. Re-run "
             "`claude-runway-setup init` to also drop the compact settings the local-compress block no "
-            "longer uses; `/my-compact` and `/my-resume` copies installed under ~/.claude/skills/ are "
+            "longer uses; `/cr-compact` and `/cr-resume` copies installed under ~/.claude/skills/ are "
             "refreshed by `upgrade` itself."
         ),
         detect=_detect_qdrant_server_replaced,
@@ -1093,7 +1163,7 @@ MIGRATIONS: "list[Migration]" = [
             "This project tracks savings (CLAUDE_RUNWAY_TRACK_SAVINGS is on in its local-compress block), "
             "but its .mcp.json has no 'analytics' server. The savings and metrics tools (savings_summary, "
             "savings_detail, savings_trend, get_metrics, record_metric) have moved there from "
-            "local-compress, so /my-savings and /my-metrics stop working until it is added. Adds the "
+            "local-compress, so /cr-savings and /cr-metrics stop working until it is added. Adds the "
             "analytics block, carrying over any CLAUDE_RUNWAY_SAVINGS_DB override from the "
             "local-compress block and any CLAUDE_RUNWAY_METRICS_DB override from the memory-bank "
             "(or, in an older config, local-compress) block. Recording is unaffected either way: the "
@@ -1379,7 +1449,7 @@ def run_upgrade(
 
     `offer_savings_fn` is the interactive "enable the savings
     tracker?" question for a project that has never tracked savings and has no
-    `analytics` server, so `/my-savings` and `/my-metrics` would fail with an
+    `analytics` server, so `/cr-savings` and `/cr-metrics` would fail with an
     unknown-tool error and nothing would say why. It is asked at most once,
     before the migrations are listed, and only when the caller passes one
     AND neither `dry_run` nor `auto_yes` is set: `None` (the default), a
@@ -1389,7 +1459,10 @@ def run_upgrade(
     flow is unchanged.
 
     `offer_reviewer_fn` is the same kind of one-time interactive question for
-    the opt-in `codebase-reviewer` server, asked (after the savings one) only
+    the opt-in `codebase-reviewer` server. `tools/setup_project.py` does NOT
+    pass one while that server is unreleased, so `upgrade` never
+    asks; the parameter and its handling stay so the offer is easy to restore.
+    When one is passed it is asked (after the savings one) only
     when the project has no such block, the caller passes one, and neither
     `dry_run` nor `auto_yes` is set. A yes adds the block with `REVIEWERS_FILE`
     BLANK and prints a warning that the setting is required and has no default:

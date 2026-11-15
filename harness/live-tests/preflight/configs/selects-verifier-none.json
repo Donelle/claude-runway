@@ -1,0 +1,2 @@
+{"stages": ["verifier"], "reviewers": [
+ {"name": "a", "model": "qwen2.5-coder-7b-instruct-mlx", "prompt": "p", "active": true, "type": ["reasoning"], "loadOnDemand": true}]}

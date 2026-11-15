@@ -118,25 +118,26 @@ class MemoryBankServerMissing(unittest.TestCase):
         after_mcp, _ = migration.apply(before, {}, _ctx())
         self.assertFalse(migration.detect(after_mcp, {}))
 
-    def test_apply_preserves_a_customized_embedding_model(self):
-        # Pins the CURRENT, legacy behavior, not a desired
-        # contract: the migration copies the code-index block's
-        # EMBEDDING_MODEL into the new memory-bank block. That copy came from
-        # the Copilot review (build_mcp_servers' embedding_model
-        # parameter defaults to blank and the migration doesn't pass it, so
-        # without the copy a hand-customized project got the template
-        # default). Memory-bank's model is independent of the
-        # code-index model, so this assertion should change when that copy is
-        # removed.
+    def test_apply_does_not_copy_a_customized_code_index_embedding_model(self):
+        # Memory-bank's model is independent of the code-index model, and the
+        # shared collection locks in the model that created it, so a
+        # customized code-index model must not leak into the new memory-bank
+        # block. It gets the template default instead.
         migration = _migration("memory-bank-server-missing")
-        before = {
-            "mcpServers": {
-                "qdrant": {"env": {"COLLECTION_NAME": "my-project", "EMBEDDING_MODEL": "custom/other-model"}},
-                "codebase-indexer": {"env": {"COLLECTION_NAME": "my-project"}},
-            }
-        }
-        after_mcp, _ = migration.apply(before, {}, _ctx())
-        self.assertEqual(after_mcp["mcpServers"]["memory-bank"]["env"]["EMBEDDING_MODEL"], "custom/other-model")
+        for source in ("qdrant", "codebase-indexer"):
+            with self.subTest(source=source):
+                before = {
+                    "mcpServers": {
+                        "qdrant": {"env": {"COLLECTION_NAME": "my-project"}},
+                        "codebase-indexer": {"env": {"COLLECTION_NAME": "my-project"}},
+                    }
+                }
+                before["mcpServers"][source]["env"]["EMBEDDING_MODEL"] = "custom/other-model"
+                after_mcp, _ = migration.apply(before, {}, _ctx())
+                self.assertEqual(
+                    after_mcp["mcpServers"]["memory-bank"]["env"]["EMBEDDING_MODEL"],
+                    "sentence-transformers/all-MiniLM-L6-v2",
+                )
 
     def test_apply_falls_back_to_the_template_default_when_no_existing_model_is_recorded(self):
         migration = _migration("memory-bank-server-missing")
@@ -416,7 +417,8 @@ class ObsoleteMigrationsAreGone(unittest.TestCase):
                                               "env": {"COLLECTION_NAME": "p"}},
                                    "memory-bank": {"env": {}}, "codebase-indexer": {"env": {"MEMORY_BANK_COLLECTION": "m"}}}}
         settings = {"hooks": {"SessionStart": [{"hooks": [{"args": ["/x/hooks/record_session_id.py"]}]}],
-                              "SessionEnd": [{"hooks": [{"args": ["/x/hooks/record_session_id.py"]}]}]}}
+                              "SessionEnd": [{"hooks": [{"args": ["/x/hooks/record_session_id.py"]}]},
+                                             {"hooks": [{"args": ["/x/hooks/session_end_pr_rounds.py"]}]}]}}
         self.assertEqual(pending_migrations(mcp_json, settings), [])
 
 
@@ -865,7 +867,8 @@ class PendingMigrations(unittest.TestCase):
         settings_json = {
             "hooks": {
                 "SessionStart": [{"hooks": [{"args": ["/x/hooks/record_session_id.py"]}]}],
-                "SessionEnd": [{"hooks": [{"args": ["/x/hooks/record_session_id.py"]}]}],
+                "SessionEnd": [{"hooks": [{"args": ["/x/hooks/record_session_id.py"]}],},
+                               {"hooks": [{"args": ["/x/hooks/session_end_pr_rounds.py"]}]}],
             }
         }
         self.assertEqual(pending_migrations(mcp_json, settings_json), [])
@@ -1436,7 +1439,7 @@ class CompressHookMatcherCoversCompactTools(unittest.TestCase):
 class AnalyticsServerMissing(unittest.TestCase):
     """The savings and metrics tools moved from `local-compress` to the opt-in
     `analytics` server. A project that already tracks savings is offered the
-    block so `/my-savings` keeps working; a project that does not is not."""
+    block so `/cr-savings` keeps working; a project that does not is not."""
 
     _ID = "analytics-server-missing"
 
@@ -2048,7 +2051,7 @@ class MalformedExistingConfig(unittest.TestCase):
 
 class SavingsTrackerOffer(unittest.TestCase):
     """A project that never tracked savings has no `analytics`
-    server, so /my-savings and /my-metrics fail with an unknown-tool error and
+    server, so /cr-savings and /cr-metrics fail with an unknown-tool error and
     nothing says why. An interactive `upgrade` asks (the caller passes
     `offer_savings_fn`); a yes turns tracking on and adds the block through
     `analytics-server-missing`, without a second question."""
@@ -2107,7 +2110,7 @@ class SavingsTrackerOffer(unittest.TestCase):
     def test_yes_keeps_a_custom_metrics_db_so_memory_bank_and_analytics_share_one_file(self):
         # Project set up with `init --metrics-db` and tracking off: the override
         # lives only in the memory-bank block. The new analytics block must read
-        # the same file, or /my-metrics would show an empty default database.
+        # the same file, or /cr-metrics would show an empty default database.
         self._init_project(metrics_db="/data/metrics.db")
         self.assertEqual(self._servers()["memory-bank"]["env"]["CLAUDE_RUNWAY_METRICS_DB"], "/data/metrics.db")
         self._run(prompt_fn=lambda m, i, t: True, offer_savings_fn=lambda: True)

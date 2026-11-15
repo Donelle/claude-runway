@@ -1,0 +1,2 @@
+{"stages": ["reasoning"], "reviewers": [
+ {"name": "general", "model": "qwen2.5-coder-7b-instruct-mlx", "promptFile": "../../prompts/reasoning-lines.md", "active": true, "type": ["reasoning"], "loadOnDemand": true, "contextLength": 8192, "replyFormat": "lines"}]}
