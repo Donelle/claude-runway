@@ -62,7 +62,7 @@
           {
             "id": "B5",
             "file": "libs/sync_manifest_lib.py",
-            "line": 196,
+            "line": 477,
             "class": "logic",
             "evidence": "same-file",
             "claim": "missed files are always in baseline, so with the test inverted none is ever marked UNVERIFIED_HASH."
@@ -72,7 +72,7 @@
           {
             "id": "D2",
             "file": "libs/sync_manifest_lib.py",
-            "line": 88,
+            "line": 120,
             "evidence": "same-file",
             "claim": "The manifest write is not atomic, so a crash leaves a truncated manifest that the next sync trusts."
           }
