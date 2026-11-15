@@ -116,7 +116,8 @@ def save_manifest(repo: Path, manifest: dict, preserved=()) -> None:
     old manifest or the new one, never a truncated file. Raises OSError when the
     write fails, with the manifest left as it was and no temp file behind.
     """
-    _atomic_write_text(repo / MANIFEST_FILENAME, manifest_to_json(manifest, preserved))
+    text = manifest_to_json(manifest, preserved)
+    _atomic_write_text(repo / MANIFEST_FILENAME, text)
 
 
 # os.replace onto the manifest can fail with PermissionError on Windows while
@@ -473,6 +474,6 @@ def index_baseline(current_hashes: dict, chunk_skipped: list, chunked_files, mis
         if rel not in baseline and rel not in skipped_paths:
             baseline[rel] = UNVERIFIED_HASH
     for rel in missed:
-        if rel in baseline:
+        if rel not in baseline:
             baseline[rel] = UNVERIFIED_HASH
     return baseline
