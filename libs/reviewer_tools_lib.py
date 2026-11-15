@@ -97,7 +97,7 @@ def clip_line(line: str) -> str:
     argument list) as if it were whole."""
     if len(line) <= MAX_LINE_CHARS:
         return line
-    return f"{line[:MAX_LINE_CHARS]} ...[line cut: {len(line) - MAX_LINE_CHARS} more characters]"
+    return f"{line[:MAX_LINE_CHARS]} ...[cut {len(line) - MAX_LINE_CHARS} chars]"
 
 
 def has_line_cut(text: str) -> bool:
@@ -123,7 +123,9 @@ def _cut(text: str, limit: int) -> "tuple[str, bool]":
         return text, False
     cut = text[:limit]
     newline = cut.rfind("\n")
-    return (cut[:newline] if newline > 0 else cut), True
+    if newline > 0:
+        cut = cut[:newline]
+    return cut, True
 
 
 class ToolExecutor:
