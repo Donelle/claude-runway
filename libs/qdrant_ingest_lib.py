@@ -1062,6 +1062,27 @@ def chunk_code_by_boundaries(text: str, chunk_size: int, overlap: int, boundary_
 # of which matched the old bare startswith("#") test.
 _ATX_HEADING_RE = re.compile(r"^ {0,3}#{1,6}(?:\s|$)")
 
+# A setext underline: a run of '=' (h1) or '-' (h2), up to 3 leading spaces,
+# nothing after it but whitespace. At least TWO characters, deliberately
+# stricter than CommonMark (which allows one): a lone '-' under a line of text
+# is far more often a list marker than an underline, and a false heading
+# fragments a chunk mid-thought while a missed one only loses a preferred cut.
+_SETEXT_UNDERLINE_RE = re.compile(r"^ {0,3}(?:={2,}|-{2,})[ \t]*$")
+
+# A list item, a blockquote or a thematic break ('***', '___', '- - -'). Such a
+# line ends any open paragraph and never starts one, so a '---' after it is
+# not a heading underline.
+_BLOCK_INTERRUPT_RE = re.compile(
+    r"^(?: {0,3}(?:[-*+]|\d{1,9}[.)])(?:\s|$)"
+    r"| {0,3}>"
+    r"| {0,3}([*_-])(?:[ \t]*\1){2,}[ \t]*$)"
+)
+
+# An indented code line (4+ spaces or a tab) cannot START a paragraph, but one
+# INSIDE an open paragraph is an ordinary continuation, so the heading still
+# starts at the paragraph's top.
+_INDENTED_CODE_RE = re.compile(r"^(?: {4,}|\t)")
+
 # Fence delimiters, tracked so a '# comment' inside a ``` block is not read as
 # a heading. That's the common shape in a README full of shell and Python
 # samples, where each commented sample line would otherwise start a section.
@@ -1073,8 +1094,19 @@ _FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 
 def heading_line_indexes(lines):
     """
-    Indexes of lines that are real ATX headings, ignoring anything inside a
-    fenced code block.
+    Indexes of lines that start a real heading, ATX ('# Title') or setext
+    ('Title' over '=====' or '-----'), ignoring anything inside a fenced code
+    block. A setext heading is reported at the FIRST line of its paragraph (the
+    whole paragraph above the underline is the heading text), which is where a
+    cut belongs.
+
+    Setext detection is conservative, in the same safe direction as the fence
+    handling below: the underline needs two or more characters, a '---' after
+    a blank line, a list item, a blockquote or indented code is a thematic
+    break rather than an underline, and the '---' closing a YAML frontmatter
+    block at the top of the file is never one (it would otherwise turn the
+    frontmatter's last key into a heading). A heading that fails these tests
+    is missed, never invented.
 
     Closing a fence follows CommonMark: only a run of the SAME character, at
     least as long as the opener, with nothing but whitespace after it. A naive
@@ -1089,6 +1121,15 @@ def heading_line_indexes(lines):
     """
     indexes = []
     fence = None  # (marker char, marker length) while inside a block
+    para_start = None  # first line of the open paragraph, if one is open
+    # Index of the line closing a leading YAML frontmatter block, or -1.
+    # Setext detection is off through it; ATX detection is unchanged.
+    frontmatter_end = -1
+    if lines and lines[0].rstrip() == "---":
+        for j in range(1, len(lines)):
+            if lines[j].rstrip() in ("---", "..."):
+                frontmatter_end = j
+                break
     for i, line in enumerate(lines):
         match = _FENCE_RE.match(line)
         if match:
@@ -1096,16 +1137,37 @@ def heading_line_indexes(lines):
             if fence is None:
                 # Opening fence. A trailing info string ("```bash") is allowed.
                 fence = (marker[0], len(marker))
+                para_start = None  # a fence interrupts any open paragraph
             elif (
                 marker[0] == fence[0]
                 and len(marker) >= fence[1]
                 and not trailing.strip()
             ):
                 fence = None
+                para_start = None
             # Any other fence-looking line is content inside the open block.
             continue
-        if fence is None and _ATX_HEADING_RE.match(line):
+        if fence is not None:
+            continue
+        if _ATX_HEADING_RE.match(line):
             indexes.append(i)
+            para_start = None
+            continue
+        if i <= frontmatter_end:
+            continue
+        if not line.strip():
+            para_start = None
+        elif para_start is not None and _SETEXT_UNDERLINE_RE.match(line):
+            indexes.append(para_start)
+            para_start = None
+        elif _SETEXT_UNDERLINE_RE.match(line):
+            # '---' or '===' with no paragraph above it: a thematic break (or
+            # stray underline), never the start of a paragraph.
+            para_start = None
+        elif _BLOCK_INTERRUPT_RE.match(line):
+            para_start = None
+        elif para_start is None and not _INDENTED_CODE_RE.match(line):
+            para_start = i
     return indexes
 
 

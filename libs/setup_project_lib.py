@@ -227,6 +227,36 @@ def find_unresolved_placeholders(value: object) -> list:
     return found
 
 
+# The `codebase-reviewer` MCP server block. It is NOT in `templates/mcp.json.template`:
+# the server is not live yet, so a hand-copied template must not
+# carry it and `upgrade` no longer offers it. `init --codebase-reviewer` /
+# `--reviewers-file` still write it, from this constant, so what they write is
+# the same block the template used to hold. Restoring the offer (and deciding
+# whether the block returns to the template) is the follow-up once the server ships.
+CODEBASE_REVIEWER_BLOCK: dict = {
+    "_comment": (
+        "OPTIONAL: delete this block unless you use the local review loop. "
+        "`init --codebase-reviewer` writes it; without that it is not written. "
+        "REVIEWERS_FILE is REQUIRED and has NO default: set it to the path of your own reviewers JSON file (the models, prompts and rubric are entirely yours; this toolkit ships none and never writes a default path or a default file). "
+        "A blank, missing, unreadable or invalid file is an error at run time that names the file and what is wrong, and no review runs; `claude-runway-doctor` reports it too. "
+        "MAX_REVIEWERS is how many reviewers run at once (\"1\" runs them one at a time); size it to your machine and to LM Studio's Max Concurrent Predictions. "
+        "MAX_REVIEW_ROUNDS is the most rounds of Copilot feedback an unattended run goes through before a human is brought in. "
+        "QDRANT_URL/QDRANT_API_KEY are for the scoring database (a later piece of work); leave QDRANT_API_KEY empty for an unauthenticated local Qdrant (see the top-level _comment's warning about a real key). "
+        "The LM Studio URL is not written here: the server reads CLAUDE_RUNWAY_LMSTUDIO_URL from the shell like the other servers do."
+    ),
+    "command": "REPLACE-WITH-VENV-PYTHON",
+    "type": "stdio",
+    "args": ["/absolute/path/to/mcpservers/codebase_reviewer_mcp_server.py"],
+    "env": {
+        "REVIEWERS_FILE": "",
+        "MAX_REVIEWERS": "3",
+        "MAX_REVIEW_ROUNDS": "3",
+        "QDRANT_URL": "http://localhost:6333",
+        "QDRANT_API_KEY": "",
+    },
+}
+
+
 def build_mcp_servers(
     template: dict,
     *,
@@ -255,6 +285,7 @@ def build_mcp_servers(
     reviewers_file: str = "",
     max_reviewers: str = "",
     max_review_rounds: str = "",
+    memory_bank_follow_repos: str = "",
 ) -> dict:
     """
     Returns a fresh `mcpServers` dict (deep-copied from `template`, never
@@ -282,11 +313,11 @@ def build_mcp_servers(
     whole server block wholesale, not a per-key deep merge. Changing the *base prefix* silently
     orphans that project's entire conversation-compact history: the
     sibling-scan and canonical-name computation both key off this exact
-    string, so the moment it changes, `/my-resume` can no longer find
+    string, so the moment it changes, `/cr-resume` can no longer find
     anything stored under the old prefix -- not an error, just silently
     invisible data going forward. A genuinely per-project default
     (`<collection_name>-conversation`) is still worth having for NEW setups
-    -- that's exactly what `/my-setup-clauderunway`'s own Q5 computes and
+    -- that's exactly what `/cr-setup`'s own Q5 computes and
     passes explicitly via `--compact-collection`, the same way Q2 always
     explicitly passes `--collection-name` rather than leaving it to this
     function's own bare fallback. Direct CLI users bypassing the skill keep
@@ -333,6 +364,20 @@ def build_mcp_servers(
     here) preserves the existing identity independent of whatever
     `collection_name` resolves to on that run.
 
+    `memory_bank_follow_repos` is the `memory-bank` block's
+    `MEMORY_BANK_FOLLOW_REPOS`: the comma-separated repo IDs whose `shared`
+    memories this project's default `recall` also returns. Always written:
+    the trimmed value when there is one, `""` otherwise, so a
+    generated `.mcp.json` shows the key without the reader having to know it
+    exists. A blank value follows nothing. The server reads the variable from
+    its environment, so a block without the key would inherit a shell export,
+    but a key present here, even blank, overrides one: `.mcp.json` is the
+    place to configure it (see docs/environment-variables.md). Like `embedding_model` it is sticky across
+    re-runs, but `run_setup` decides that (see `resolve_memory_bank_follow`):
+    this function writes exactly what it is given, and since `merge_mcp_json`
+    replaces the whole block, a caller that does not pass the existing value
+    drops it.
+
     `qdrant_api_key` is applied to the Qdrant-talking servers'
     `QDRANT_API_KEY` (`qdrant`, `codebase-indexer` and `memory-bank`, plus
     `codebase-reviewer` when that opt-in block is written, which all read the
@@ -355,11 +400,14 @@ def build_mcp_servers(
     `track_savings` also decides whether the opt-in `analytics` block is
     emitted at all (it is dropped from the result otherwise); `savings_db` and
     `metrics_db` reach that block only when non-blank. A non-blank
-    `metrics_db` is also written into the `memory-bank` block, which writes
-    into the same shared store, so the two stay on one file.
+    `metrics_db` is also written into the `memory-bank` block and, when it is
+    emitted, the `codebase-reviewer` block, which both write into the same
+    shared store, so they all stay on one file.
 
     `codebase_reviewer` decides whether the opt-in `codebase-reviewer` block is
-    emitted at all (dropped from the result otherwise). `reviewers_file` is the
+    emitted at all (absent from the result otherwise). The block is built from
+    `CODEBASE_REVIEWER_BLOCK`, not read from `template`: the template no longer
+    carries it while the server is unreleased. `reviewers_file` is the
     block's `REVIEWERS_FILE`, which is REQUIRED by that server and has NO
     default: blank is written as blank (the server then refuses to run a review
     and says why), never a made-up path, and no reviewers file is ever created.
@@ -438,12 +486,13 @@ def build_mcp_servers(
     # `memory-bank` writes its call tally (metric_id="memory-bank") into the same
     # shared metrics database the `analytics` server reads, so a non-default
     # path has to reach both blocks, or a launch without the shell export
-    # (a GUI, say) leaves the two on different files and `/my-metrics
+    # (a GUI, say) leaves the two on different files and `/cr-metrics
     # memory-bank` silently reports partial data. Written only when given (a
     # blank value would mask an inherited shell value), and regardless of
     # `track_savings`, since the memory-bank server needs it either way.
     if metrics_db:
         memory_bank["env"]["CLAUDE_RUNWAY_METRICS_DB"] = metrics_db
+    memory_bank["env"]["MEMORY_BANK_FOLLOW_REPOS"] = memory_bank_follow_repos.strip()
 
     if embedding_model:
         for block in (qdrant, indexer):
@@ -490,7 +539,9 @@ def build_mcp_servers(
     # blank included: the server requires it and has no default, so inventing a
     # path here would hide the one thing the user must supply.
     if codebase_reviewer:
-        reviewer = servers["codebase-reviewer"]
+        # Built from the constant above, not read from the template: the template
+        # no longer carries the block, so `servers` has no "codebase-reviewer" key.
+        reviewer = servers["codebase-reviewer"] = copy.deepcopy(CODEBASE_REVIEWER_BLOCK)
         reviewer["command"] = venv_python_str
         reviewer["args"] = [f"{tools_repo_str}/mcpservers/codebase_reviewer_mcp_server.py"]
         reviewer["env"]["QDRANT_URL"] = qdrant_url
@@ -500,8 +551,14 @@ def build_mcp_servers(
             reviewer["env"]["MAX_REVIEWERS"] = max_reviewers
         if max_review_rounds:
             reviewer["env"]["MAX_REVIEW_ROUNDS"] = max_review_rounds
+        # It writes a summary event per review into the same shared metrics database, so a non-default path has
+        # to reach it too, for the same reason as memory-bank above.
+        if metrics_db:
+            reviewer["env"]["CLAUDE_RUNWAY_METRICS_DB"] = metrics_db
     else:
-        del servers["codebase-reviewer"]
+        # A template from before this block moved out still carries it; an absent
+        # key is the normal case now, so this must not raise.
+        servers.pop("codebase-reviewer", None)
 
     return servers
 
@@ -579,14 +636,44 @@ def resolve_memory_bank_embedding_model(explicit: str, existing_mcp: dict, templ
     return (explicit or "").strip() or existing_memory_bank_model(existing_mcp) or template_default
 
 
+def existing_memory_bank_follow(existing_mcp: dict) -> str:
+    """
+    Returns `MEMORY_BANK_FOLLOW_REPOS` from an existing `.mcp.json`'s
+    `memory-bank` block, trimmed, or "" if there is no such block
+    or no non-blank value. Tolerant of missing/odd-shaped blocks, like
+    `existing_memory_bank_model`.
+    """
+    servers = existing_mcp.get("mcpServers") if isinstance(existing_mcp, dict) else None
+    block = servers.get("memory-bank") if isinstance(servers, dict) else None
+    env = block.get("env") if isinstance(block, dict) else None
+    value = env.get("MEMORY_BANK_FOLLOW_REPOS") if isinstance(env, dict) else None
+    return value.strip() if isinstance(value, str) else ""
+
+
+def resolve_memory_bank_follow(explicit: Optional[str], existing_mcp: dict) -> str:
+    """
+    Which `MEMORY_BANK_FOLLOW_REPOS` a (re-)run of `init` writes,
+    following `resolve_memory_bank_embedding_model`'s preserve-don't-reset rule:
+      1. `None` (the flag was not passed): the existing `memory-bank` block's
+         own value, so a plain re-run keeps the follow list instead of silently
+         dropping it (the block is regenerated wholesale on every run);
+      2. a string (the flag was passed): that value, trimmed. An explicit empty
+         string clears the list, which is the one way to stop following
+         everything from the CLI.
+    """
+    if explicit is None:
+        return existing_memory_bank_follow(existing_mcp)
+    return explicit.strip()
+
+
 # ---------------------------------------------------------------------------
 # Savings tracker offer
 # ---------------------------------------------------------------------------
 # The savings tracker is opt-in, and the `analytics` MCP server that serves
-# /my-savings and /my-metrics is written only with it. Before this, a CLI user
+# /cr-savings and /cr-metrics is written only with it. Before this, a CLI user
 # ran `init`, got a config with no `analytics` block, and met an unknown-tool
 # error from those two skills with nothing saying why (only
-# /my-setup-clauderunway asked, as its Q4). `init` and `upgrade` now ask the
+# /cr-setup asked, as its Q4). `init` and `upgrade` now ask the
 # same question with the same wording, from this one place so the two cannot
 # drift apart from each other or from that skill.
 
@@ -595,7 +682,7 @@ def resolve_memory_bank_embedding_model(explicit: str, existing_mcp: dict, templ
 # `doctor_lib` does: this module must not load the savings stack.
 TRACK_SAVINGS_TRUTHY = frozenset({"1", "true", "yes"})
 
-# Same wording as the Q4 option descriptions in skills/my-setup-clauderunway.
+# Same wording as the Q4 option descriptions in skills/cr-setup.
 SAVINGS_TRACKER_ENABLED_DESCRIPTION = "Set CLAUDE_RUNWAY_TRACK_SAVINGS=1; also requires a shell export"
 SAVINGS_TRACKER_DISABLED_DESCRIPTION = "No token savings tracking"
 
@@ -639,6 +726,10 @@ def ask_codebase_reviewer(*, default_enabled: bool = False, input_fn=None, print
     Asks whether to add the opt-in `codebase-reviewer` MCP server and returns
     the answer, with the same blank-input and closed-stdin rules as
     `ask_savings_tracker`. Callers only ask on a terminal.
+
+    Nothing calls this today: the server is not live, so `tools/setup_project.py`
+    no longer passes it to `run_upgrade` as `offer_reviewer_fn`. It is kept so
+    restoring the offer is a one-line change once the server ships.
     """
     input_fn = input_fn or input
     print_fn("")
@@ -682,7 +773,7 @@ def ask_savings_tracker(*, default_enabled: bool = False, input_fn=None, print_f
     print_fn("")
     print_fn(
         "Savings tracker (opt-in): counts what local compression saves, and adds the `analytics` MCP server "
-        "that /my-savings and /my-metrics need (without it, both fail with an unknown-tool error)."
+        "that /cr-savings and /cr-metrics need (without it, both fail with an unknown-tool error)."
     )
     print_fn(f"  Enabled  - {SAVINGS_TRACKER_ENABLED_DESCRIPTION}")
     print_fn(f"  Disabled - {SAVINGS_TRACKER_DISABLED_DESCRIPTION}")
@@ -771,9 +862,15 @@ def resolve_compact_embedding_model(existing_mcp: dict, project_model: str) -> s
 # position around it) -- keeping every group derived from the same tuples is
 # what stops them from silently drifting apart if a script is ever renamed
 # or a new hook added.
+# Shared with upgrade_lib (the add-the-hook migration) and doctor_lib (the present/missing
+# check) so the three cannot disagree about the script name.
+PR_ROUND_CAPTURE_HOOK_SCRIPT = "session_end_pr_rounds.py"
 _CORE_HOOK_SCRIPTS = (
     ("SessionStart", "record_session_id.py"),
     ("SessionEnd", "record_session_id.py"),
+    # Records the session's PR review rounds to metrics.db. Installed with
+    # the base hooks, but a silent no-op until CLAUDE_RUNWAY_CAPTURE_PR_ROUNDS is on.
+    ("SessionEnd", PR_ROUND_CAPTURE_HOOK_SCRIPT),
 )
 _COMPRESS_HOOK_SCRIPTS = (
     ("PostToolUse", "compress_output.py"),
@@ -1045,7 +1142,7 @@ def default_skills_dir(home_dir: Path) -> Path:
     -- `~/.claude/skills/`, the SAME user-level location
     `docs/session-continuity.md`/`docs/savings-tracker.md` already document
     installing skills to by hand ("install globally... only once"), and
-    what `/my-resume`'s own per-project scoping (by current directory name,
+    what `/cr-resume`'s own per-project scoping (by current directory name,
     not by install location) already assumes. `--skills-dir` overrides this
     for e.g. a per-project `<repo>/.claude/skills` install instead.
     """
@@ -1116,6 +1213,55 @@ class SkillInstallPlan:
     dest: Path
     content: str
     frontmatter_preserved: bool = False
+    # Every other file that sits beside SKILL.md in the shipped skill folder
+    # (`cr-load-context` keeps its facts script in its folder).
+    # Empty for a skill that is just a SKILL.md, which is every skill before
+    # that one. `action` above already folds these in: a changed extra file
+    # makes an installed skill "update", so `upgrade`'s refresh (which only
+    # touches "update") brings the script along with the instructions.
+    extra_files: "list[SkillExtraFile]" = field(default_factory=list)
+
+
+@dataclass
+class SkillExtraFile:
+    """
+    One non-SKILL.md file shipped in a skill folder: `action` is
+    "install" (dest missing), "up_to_date" (byte-identical) or "update"
+    (differs). `data` is the exact bytes to write; unlike SKILL.md there is no
+    frontmatter rule, because a script has none and the installed copy is
+    never the user's to hand-edit the way a skill's description is.
+    """
+
+    name: str
+    action: str
+    source: Path
+    dest: Path
+    data: bytes
+
+
+def _plan_skill_extra_files(skill_dir: Path, dest_dir: Path) -> "list[SkillExtraFile]":
+    """
+    Plans the files beside SKILL.md in `skill_dir`: every regular,
+    non-hidden file directly in the folder other than SKILL.md, sorted by name.
+    Not recursive on purpose: a skill is one flat folder, and `setup.py`'s wheel
+    globs the same set (`_skill_data_files`), so a clone and a pipx/uv install
+    ship and copy the same files. Raw bytes both ways, for the same line-ending
+    reason `plan_skill_installs` gives for SKILL.md.
+    """
+    extras: list = []
+    for source in sorted(skill_dir.iterdir()):
+        if source.name == "SKILL.md" or source.name.startswith(".") or not source.is_file():
+            continue
+        data = source.read_bytes()
+        dest = dest_dir / source.name
+        if not dest.is_file():
+            action = "install"
+        elif dest.read_bytes() == data:
+            action = "up_to_date"
+        else:
+            action = "update"
+        extras.append(SkillExtraFile(name=source.name, action=action, source=source, dest=dest, data=data))
+    return extras
 
 
 # The one error handler used to decode/encode skill text, shared with
@@ -1153,7 +1299,10 @@ def plan_skill_installs(tools_repo_dir: Path, skills_dir: Path) -> list:
     is not written over it); only an installed copy with no frontmatter gets
     the shipped file whole.
 
-    Only `SKILL.md` files are considered; a skill directory without one
+    Files beside `SKILL.md` (a skill's own script) are planned and
+    installed with it, byte for byte, as `SkillInstallPlan.extra_files`.
+
+    A skill directory is recognised by its `SKILL.md`; a skill directory without one
     (shouldn't happen for anything shipped by this repo, but a defensive
     skip rather than a crash for e.g. a stray non-skill directory someone
     drops under `skills/`) is silently omitted from the plan. Returns `[]`
@@ -1223,10 +1372,17 @@ def plan_skill_installs(tools_repo_dir: Path, skills_dir: Path) -> list:
                 action = "up_to_date"
             else:
                 action = "update"
+        extras = _plan_skill_extra_files(skill_dir, dest.parent)
+        # An installed skill whose SKILL.md is current but whose script is
+        # missing or stale is still out of date: without this,
+        # `upgrade`'s refresh, which only touches "update", would never ship
+        # the script to a skill installed before it had one.
+        if action == "up_to_date" and any(e.action != "up_to_date" for e in extras):
+            action = "update"
         plans.append(
             SkillInstallPlan(
                 name=skill_dir.name, action=action, source=source, dest=dest, content=content,
-                frontmatter_preserved=preserved,
+                frontmatter_preserved=preserved, extra_files=extras,
             )
         )
     return plans
@@ -1237,7 +1393,7 @@ def plan_skill_installs(tools_repo_dir: Path, skills_dir: Path) -> list:
 #
 # `.mcp.json` gives Claude the tools; the sections of `templates/CLAUDE.md.template`
 # tell it when to reach for each one (and when not to). Until `init` wrote them,
-# only `/my-setup-clauderunway` (which needs a full clone) did, so a pipx/`uv
+# only `/cr-setup` (which needs a full clone) did, so a pipx/`uv
 # tool install` user got working servers and no guidance. The template is read
 # from `run_setup`'s `templates_dir`, the same place `mcp.json.template` comes
 # from: `<env>/src/templates/` in a tool install (setup.py ships every
@@ -1494,6 +1650,148 @@ def describe_claude_md_plan(plan: ClaudeMdPlan) -> str:
     return f"CLAUDE.md ({'; '.join(parts)}) -> {plan.path}"
 
 
+# Product skills whose directory was renamed from `my-*` to `cr-*`, old
+# name -> new name. The ONE table both `upgrade`'s migration and `init
+# --install-skills`'s warning read. Only the product skills that are installed
+# into `~/.claude/skills` belong here: the contributor skills live in this
+# repo's `.claude/skills/` and are renamed in place, so they need no install
+# migration. A `my-*` skill that is not in this table (a user's own, e.g.
+# `my-code-it`) is never touched. An entry stays inert until the shipped
+# `skills/` actually holds the new directory (see `plan_skill_renames`).
+RENAMED_PRODUCT_SKILLS: "dict[str, str]" = {
+    "my-compact": "cr-compact",
+    "my-resume": "cr-resume",
+    "my-savings": "cr-savings",
+    "my-metrics": "cr-metrics",
+    "my-setup-clauderunway": "cr-setup",
+    "my-pr-feedback": "cr-pr-feedback",
+}
+
+_UTF8_BOM = b"\xef\xbb\xbf"
+
+
+def set_skill_frontmatter_name(prefix: bytes, new_name: str) -> bytes:
+    """
+    Returns the frontmatter block `prefix` (from `split_skill_frontmatter`)
+    with its `name:` value set to `new_name`; every other line, the
+    description included, is kept byte for byte. A block with no `name:` line
+    gets one right after the opening fence, since an installed skill is listed
+    by that name. Works on bytes and keeps each line's own ending (a BOM and
+    CRLF survive); only looks inside the block, never the body.
+    """
+    lines = prefix.splitlines(keepends=True)
+    if not lines or lines[0].removeprefix(_UTF8_BOM).rstrip() != b"---":
+        return prefix
+    close_idx = next((i for i in range(1, len(lines)) if lines[i].rstrip() == b"---"), len(lines))
+    new_value = b"name: " + new_name.encode("utf-8")
+    for i in range(1, close_idx):
+        if lines[i].startswith(b"name:"):
+            ending = lines[i][len(lines[i].rstrip(b"\r\n")):]
+            lines[i] = new_value + ending
+            return b"".join(lines)
+    ending = b"\r\n" if lines[0].endswith(b"\r\n") else b"\n"
+    lines.insert(1, new_value + ending)
+    return b"".join(lines)
+
+
+@dataclass
+class SkillRenamePlan:
+    """
+    One installed product skill under an old `my-*` name that the shipped
+    `skills/` now carries under its `cr-*` name. `old_dir` is the installed
+    old directory (removed after the new copy is written), `new_dest` the new
+    `SKILL.md`, and `content` the full text to write there: the shipped body
+    behind the old copy's own frontmatter with `name:` rewritten to
+    `new_name` (an old copy with no frontmatter gets the shipped file whole).
+    `new_exists` is true when `new_dest` is already installed as a plain file;
+    its body is then kept and `content` is that copy, with the old copy's
+    frontmatter (name rewritten) put in front of it only when it has none of
+    its own, so removing the old directory never discards a customized
+    description. `needs_write` is false when `content` is what is on disk.
+    A destination that exists but is not a plain file (a symlink, a directory
+    named SKILL.md, a symlinked skill directory) is never planned at all: it
+    cannot safely stand in for the old copy.
+    """
+
+    old_name: str
+    new_name: str
+    old_dir: Path
+    new_dest: Path
+    content: str
+    new_exists: bool = False
+    needs_write: bool = True
+
+
+def plan_skill_renames(tools_repo_dir: Path, skills_dir: Path) -> list:
+    """
+    Read-only planning step for `upgrade`'s skill-rename migration. For each
+    entry of `RENAMED_PRODUCT_SKILLS` whose old directory is installed under
+    `skills_dir` (a real directory holding a `SKILL.md`; a symlink is never
+    followed or removed) AND whose new name exists in the shipped
+    `tools_repo_dir/skills/`, returns what migrating it would do. Anything else
+    is omitted, which keeps the migration inert until the renamed directories
+    ship, and idempotent: once migrated the old directory is gone. Sorted by
+    old name for deterministic output. Never writes.
+    """
+    plans: list = []
+    skills_root = Path(tools_repo_dir) / "skills"
+    skills_dir = Path(skills_dir)
+    for old_name, new_name in sorted(RENAMED_PRODUCT_SKILLS.items()):
+        source = skills_root / new_name / "SKILL.md"
+        old_dir = skills_dir / old_name
+        old_file = old_dir / "SKILL.md"
+        # A symlinked SKILL.md inside a real old directory is skipped too: is_file() follows the
+        # link, and its target's front matter would otherwise be copied into the new skill.
+        if (
+            old_dir.is_symlink()
+            or not old_dir.is_dir()
+            or old_file.is_symlink()
+            or not old_file.is_file()
+            or not source.is_file()
+        ):
+            continue
+        new_dir = skills_dir / new_name
+        new_dest = new_dir / "SKILL.md"
+        # Anything at the destination that is not a plain file in a plain
+        # directory could be (or point at) the old copy itself, and removing
+        # the old directory would then leave nothing; skip, never guess.
+        if new_dir.is_symlink() or (new_dir.exists() and not new_dir.is_dir()):
+            continue
+        if new_dest.is_symlink() or (new_dest.exists() and not new_dest.is_file()):
+            continue
+        old_prefix = split_skill_frontmatter(old_file.read_bytes())[0]
+        renamed_prefix = set_skill_frontmatter_name(old_prefix, new_name) if old_prefix else b""
+        new_exists = new_dest.is_file()
+        if new_exists:
+            existing = new_dest.read_bytes()
+            existing_prefix, existing_body = split_skill_frontmatter(existing)
+            if existing_prefix:
+                # Its own block stays, but a `name:` left over from a copied old
+                # directory would no longer match the directory it sits in.
+                content_bytes = set_skill_frontmatter_name(existing_prefix, new_name) + existing_body
+            elif renamed_prefix:
+                content_bytes = renamed_prefix + existing
+            else:
+                content_bytes = existing
+            needs_write = content_bytes != existing
+            content = content_bytes.decode("utf-8", errors=SKILL_TEXT_ERRORS)
+        else:
+            source_bytes = source.read_bytes()
+            if renamed_prefix:
+                content_bytes = renamed_prefix + split_skill_frontmatter(source_bytes)[1]
+            else:
+                content_bytes = source_bytes
+            needs_write = True
+            content = content_bytes.decode("utf-8", errors=SKILL_TEXT_ERRORS)
+        plans.append(
+            SkillRenamePlan(
+                old_name=old_name, new_name=new_name, old_dir=old_dir, new_dest=new_dest,
+                content=content, new_exists=new_exists, needs_write=needs_write,
+            )
+        )
+    return plans
+
+
 @dataclass
 class SetupResult:
     """
@@ -1567,6 +1865,7 @@ def run_setup(
     codebase_reviewer: bool = False,
     reviewers_file: str = "",
     claude_md: bool = True,
+    memory_bank_follow: Optional[str] = None,
 ) -> SetupResult:
     """
     Pure computation (no disk writes to `target_repo`) of the final
@@ -1589,6 +1888,14 @@ def run_setup(
     (template default for a block that does not exist). A non-blank value that
     differs from the existing one adds a WARNING, because the shared collection
     is locked to the model that created it.
+
+    `memory_bank_follow` (CLI `--memory-bank-follow`) is the
+    `memory-bank` block's follow list and is sticky the same way: `None` (flag
+    not passed) keeps the block's existing value, any string (even empty, which
+    clears it) replaces it; see `resolve_memory_bank_follow`. Entries equal to
+    this project's own `MEMORY_BANK_ID` or to `general` are written as given
+    but add a note to `changes` (the server ignores them: both are already in
+    recall's scope).
 
     `codebase_reviewer`/`reviewers_file` (CLI `--codebase-reviewer`/`--reviewers-file`)
     add the opt-in `codebase-reviewer` block; a `reviewers_file` alone implies
@@ -1658,6 +1965,10 @@ def run_setup(
     resolved_memory_bank_model = resolve_memory_bank_embedding_model(
         memory_bank_embedding_model, existing_mcp, template_memory_bank_model
     )
+    # The follow list is sticky for the same reason (the block is
+    # regenerated wholesale below): not passed -> keep what is there.
+    previous_memory_bank_follow = existing_memory_bank_follow(existing_mcp)
+    resolved_memory_bank_follow = resolve_memory_bank_follow(memory_bank_follow, existing_mcp)
 
     # The reviewer block is kept across re-runs (see the docstring): include it
     # when asked, or when the target already has one, and carry the user's own
@@ -1694,6 +2005,7 @@ def run_setup(
         compact_embedding_model=resolve_compact_embedding_model(existing_mcp, resolved_embedding_model),
         codebase_reviewer=include_reviewer,
         reviewers_file=reviewers_file.strip(),
+        memory_bank_follow_repos=resolved_memory_bank_follow,
     )
     reviewer_file_unset = False
     if include_reviewer:
@@ -1764,6 +2076,34 @@ def run_setup(
         changes.append(
             f"Preserved the existing memory-bank EMBEDDING_MODEL '{previous_memory_bank_model}' (pass "
             f"--memory-bank-embedding-model to change it)."
+        )
+    # Say what the follow list is and when it applies. The entries
+    # are split the way memory_bank_lib.parse_follow_repos splits them (this
+    # module must not import that one: it needs qdrant-client); an entry equal
+    # to this project's own ID or to "general" is ignored by the server, so
+    # surface it here, at setup time, rather than only in a later recall note.
+    if resolved_memory_bank_follow:
+        entries = [e.strip() for e in resolved_memory_bank_follow.split(",") if e.strip()]
+        changes.append(
+            f"memory-bank follows: {', '.join(entries) if entries else '(nothing)'}"
+            + (
+                " (kept from the existing .mcp.json; pass --memory-bank-follow to change it)"
+                if memory_bank_follow is None
+                else ""
+            )
+            + ". Takes effect when the memory-bank server next starts: restart Claude Code or reconnect it."
+        )
+        for entry in entries:
+            if entry == "general" or entry == resolved_memory_bank_id:
+                changes.append(
+                    f"WARNING: MEMORY_BANK_FOLLOW_REPOS entry '{entry}' is "
+                    + ("the reserved general tag" if entry == "general" else "this project's own MEMORY_BANK_ID")
+                    + ", which recall already includes: the server ignores it."
+                )
+    elif previous_memory_bank_follow:
+        changes.append(
+            "memory-bank follow list cleared (MEMORY_BANK_FOLLOW_REPOS is now blank). "
+            "Takes effect when the memory-bank server next starts."
         )
     # memory-bank reserves "general" as its cross-project
     # sentinel (metadata.repo) -- a project whose own MEMORY_BANK_ID

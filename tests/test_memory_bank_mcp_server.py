@@ -629,10 +629,147 @@ class CopyMemoriesToolTest(unittest.TestCase):
             _mbs.copy_memories()  # type: ignore[call-arg]
 
 
+class RememberSharedToolTest(unittest.TestCase):
+    """`remember(shared=...)` at the tool layer."""
+
+    def _remember(self, **kwargs):
+        with patch("memory_bank_mcp_server.QdrantClient"), \
+             patch("memory_bank_mcp_server.FastEmbedProvider"), \
+             patch.object(_mb, "remember_point", new=AsyncMock(return_value=("new-id", 1.0, None))) as mock_rp, \
+             patch.object(_mbs.mev, "tracking_enabled", return_value=False):
+            result = _run(_mbs.remember(summary="s", description="d", kind="lesson", **kwargs))
+        return result, mock_rp
+
+    def test_shared_defaults_to_false(self):
+        result, mock_rp = self._remember()
+        self.assertIs(mock_rp.call_args.kwargs["shared"], False)
+        self.assertNotIn("shared", result)
+
+    def test_shared_true_reaches_the_lib_and_is_acknowledged(self):
+        result, mock_rp = self._remember(shared=True)
+        self.assertIs(mock_rp.call_args.kwargs["shared"], True)
+        self.assertEqual(mock_rp.call_args.kwargs["repo"], _mbs.DEFAULT_MEMORY_BANK_ID)  # the owner is unchanged
+        self.assertIn("shared=True", result)
+
+    def test_shared_with_general_is_an_error_before_any_client(self):
+        with patch("memory_bank_mcp_server.QdrantClient") as mock_client_cls, \
+             patch.object(_mb, "remember_point", new=AsyncMock()) as mock_rp:
+            result = _run(_mbs.remember(summary="s", description="d", kind="k", general=True, shared=True))
+        self.assertIn("Error", result)
+        self.assertIn("general", result)
+        mock_client_cls.assert_not_called()
+        mock_rp.assert_not_called()
+
+    def test_docstring_says_it_is_not_access_control(self):
+        doc = _mbs.remember.__doc__ or ""
+        self.assertIn("shared", doc)
+        self.assertIn("NOT access control", doc)
+
+
+class RecallFollowToolTest(unittest.TestCase):
+    """`recall`'s default scope follows MEMORY_BANK_FOLLOW_REPOS."""
+
+    def _recall(self, follow, results, *, missing=(), **kwargs):
+        fake_client = MagicMock()
+        fake_client.collection_exists.return_value = True
+        with patch.object(_mbs, "DEFAULT_MEMORY_BANK_FOLLOW_REPOS", follow), \
+             patch("memory_bank_mcp_server.QdrantClient", return_value=fake_client), \
+             patch("memory_bank_mcp_server.check_embedding_model_mismatch", return_value=None), \
+             patch("memory_bank_mcp_server.FastEmbedProvider"), \
+             patch.object(_mbs.mev, "tracking_enabled", return_value=False), \
+             patch.object(_mb, "repos_without_memories", return_value=list(missing)) as mock_missing, \
+             patch.object(_mb, "recall_points", new=AsyncMock(return_value=results)) as mock_recall:
+            out = _run(_mbs.recall(query="q", **kwargs))
+        return out, mock_recall, mock_missing
+
+    _HIT = {"id": "p1", "summary": "s", "description": "d", "kind": "lesson", "repo": "proj-a",
+            "embedding_model": "m", "score": 0.9, "created_at": 1.0, "shared": True}
+
+    def test_unset_follow_list_changes_nothing(self):
+        for follow in ("", "  ", ",,"):
+            out, mock_recall, mock_missing = self._recall(follow, [self._HIT])
+            self.assertEqual(mock_recall.call_args.kwargs["followed"], [])
+            mock_missing.assert_not_called()
+            self.assertEqual(sorted(__import__("json").loads(out)), ["query", "results"])
+
+    def test_follow_list_is_passed_parsed_to_the_search(self):
+        _, mock_recall, mock_missing = self._recall(" proj-a , proj-b,", [self._HIT])
+        self.assertEqual(mock_recall.call_args.kwargs["followed"], ["proj-a", "proj-b"])
+        self.assertEqual(mock_missing.call_args.args[2], ["proj-a", "proj-b"])
+
+    def test_hit_carries_shared_through_to_the_result(self):
+        out, _, _ = self._recall("proj-a", [self._HIT])
+        hit = __import__("json").loads(out)["results"][0]
+        self.assertIs(hit["shared"], True)
+        self.assertEqual(hit["repo"], "proj-a")
+
+    def test_explicit_repo_and_all_repos_do_not_use_the_follow_list(self):
+        for kwargs in ({"repo": "proj-b"}, {"all_repos": True}):
+            _, mock_recall, mock_missing = self._recall("proj-a", [self._HIT], **kwargs)
+            self.assertEqual(mock_recall.call_args.kwargs["followed"], [])
+            mock_missing.assert_not_called()
+
+    def test_own_id_and_general_are_ignored_with_a_note(self):
+        own = _mbs.DEFAULT_MEMORY_BANK_ID
+        out, mock_recall, _ = self._recall(f"{own},general,proj-a", [self._HIT])
+        self.assertEqual(mock_recall.call_args.kwargs["followed"], ["proj-a"])
+        notes = __import__("json").loads(out)["notes"]
+        self.assertEqual(len(notes), 2)
+        self.assertTrue(any("general" in n and "ignored" in n for n in notes))
+        self.assertTrue(any(own in n and "ignored" in n for n in notes))
+
+    def test_unknown_followed_repo_gets_a_note_even_with_results(self):
+        out, _, _ = self._recall("proj-a,typo", [self._HIT], missing=["typo"])
+        notes = __import__("json").loads(out)["notes"]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("'typo'", notes[0])
+
+    def test_a_followed_repo_with_nothing_shared_is_not_an_error_or_a_note(self):
+        out, _, _ = self._recall("proj-a", [self._HIT])
+        self.assertNotIn("notes", __import__("json").loads(out))
+
+    def test_no_results_still_shows_the_notes(self):
+        out, _, _ = self._recall("typo", [], missing=["typo"])
+        self.assertTrue(out.startswith("No memories found for 'q'."))
+        self.assertIn("'typo'", out)
+
+    def test_no_results_without_notes_is_todays_message(self):
+        out, _, _ = self._recall("", [])
+        self.assertEqual(out, "No memories found for 'q'.")
+
+
+class ListMemoryBanksToolTest(unittest.TestCase):
+    def test_lists_the_configured_collection_through_the_lib(self):
+        summary = {"a": {"entries": 2, "shared": 1}}
+        with patch("memory_bank_mcp_server.QdrantClient") as mock_client_cls, \
+             patch.object(_mb, "summarize_repos", return_value=summary) as mock_sum:
+            out = _mbs.list_memory_banks()
+        self.assertEqual(mock_sum.call_args.args[1], _mbs.DEFAULT_MEMORY_BANK_COLLECTION)
+        self.assertIs(mock_sum.call_args.args[0], mock_client_cls.return_value)
+        self.assertEqual(out.splitlines()[0], _mbs.DEFAULT_MEMORY_BANK_COLLECTION)
+        self.assertIn("* a, 2 entries, sharable: yes (1 shared)", out)
+
+    def test_takes_no_arguments_so_it_cannot_name_another_collection(self):
+        import inspect
+        self.assertEqual(list(inspect.signature(_mbs.list_memory_banks).parameters), [])
+
+    def test_missing_collection_is_reported_not_raised(self):
+        with patch("memory_bank_mcp_server.QdrantClient"), patch.object(_mb, "summarize_repos", return_value=None):
+            out = _mbs.list_memory_banks()
+        self.assertIn("does not exist", out)
+
+    def test_never_builds_an_embedding_provider(self):
+        with patch("memory_bank_mcp_server.QdrantClient"), \
+             patch("memory_bank_mcp_server.FastEmbedProvider") as mock_provider_cls, \
+             patch.object(_mb, "summarize_repos", return_value={}):
+            _mbs.list_memory_banks()
+        mock_provider_cls.assert_not_called()
+
+
 class ToolRegistrationTest(unittest.TestCase):
-    def test_registers_exactly_five_tools(self):
+    def test_registers_exactly_six_tools(self):
         from mcp_tool_introspect import tool_count
-        self.assertEqual(tool_count(_mbs.mcp), 5)
+        self.assertEqual(tool_count(_mbs.mcp), 6)
 
     def test_logs_tool_count_to_stderr_not_stdout(self):
         captured_err = io.StringIO()
@@ -641,7 +778,7 @@ class ToolRegistrationTest(unittest.TestCase):
         with redirect_stderr(captured_err), contextlib.redirect_stdout(captured_out):
             _mbs._log_registered_tool_count()
         self.assertIn("memory-bank", captured_err.getvalue())
-        self.assertIn("5", captured_err.getvalue())
+        self.assertIn("6", captured_err.getvalue())
         self.assertEqual(captured_out.getvalue(), "")
 
 

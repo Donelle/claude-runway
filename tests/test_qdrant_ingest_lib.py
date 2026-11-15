@@ -42,6 +42,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # fake_token_bud
 
 from fake_token_budget import word_budget  # noqa: E402
 from qdrant_ingest_lib import (  # noqa: E402
+    _preferred_cuts,
     _strip_c_style_line,
     batched,
     brace_boundary_indexes,
@@ -155,6 +156,90 @@ class HeadingDetection(unittest.TestCase):
             [0, 4],
             "a closing run longer than the opener is valid",
         )
+
+
+class SetextHeadingDetection(unittest.TestCase):
+    """'Title' over '=====' / '-----' is a heading too."""
+
+    def test_equals_and_dash_underlines(self):
+        lines = ["Title", "=====", "text", "", "Section", "-------", "more"]
+        self.assertEqual(heading_line_indexes(lines), [0, 4])
+
+    def test_underline_may_carry_trailing_whitespace_and_indent(self):
+        lines = ["Title", "=====   ", "text", "", "Section", "   ----  "]
+        self.assertEqual(heading_line_indexes(lines), [0, 4])
+
+    def test_text_directly_above_a_heading_joins_its_paragraph(self):
+        # No blank line between 'text' and 'Section': CommonMark makes them
+        # one paragraph, so the heading text is both lines.
+        lines = ["text", "Section", "-------"]
+        self.assertEqual(heading_line_indexes(lines), [0])
+
+    def test_heading_is_reported_at_the_top_of_a_multi_line_paragraph(self):
+        # The whole paragraph above the underline is the heading text, and a
+        # cut belongs before its first line, not between its lines.
+        lines = ["intro", "", "A heading that", "wraps two lines", "=====", "body"]
+        self.assertEqual(heading_line_indexes(lines), [2])
+
+    def test_indented_continuation_line_keeps_the_paragraph_top(self):
+        lines = ["First line", "    indented continuation", "-----"]
+        self.assertEqual(heading_line_indexes(lines), [0])
+
+    def test_dashes_after_a_blank_line_are_a_thematic_break(self):
+        lines = ["text", "", "---", "more text"]
+        self.assertEqual(heading_line_indexes(lines), [])
+
+    def test_dashes_after_a_list_item_blockquote_or_rule_are_not_headings(self):
+        for before in ("- item", "* item", "1. item", "> quote", "***", "- - -"):
+            with self.subTest(before=before):
+                self.assertEqual(heading_line_indexes([before, "---"]), [])
+
+    def test_list_item_ends_the_paragraph_above_it(self):
+        # 'text' is not the heading of a '---' that follows a list item.
+        self.assertEqual(heading_line_indexes(["text", "- item", "---"]), [])
+
+    def test_table_row_is_not_a_heading(self):
+        lines = ["| a | b |", "|---|---|", "| 1 | 2 |"]
+        self.assertEqual(heading_line_indexes(lines), [])
+
+    def test_a_single_dash_or_equals_is_not_an_underline(self):
+        self.assertEqual(heading_line_indexes(["text", "-"]), [])
+        self.assertEqual(heading_line_indexes(["text", "="]), [])
+
+    def test_frontmatter_closing_dashes_are_not_an_underline(self):
+        lines = ["---", "applyTo: '**/*.py'", "---", "", "Title", "====="]
+        self.assertEqual(heading_line_indexes(lines), [4])
+
+    def test_dashes_that_are_not_frontmatter_still_underline(self):
+        # Line 0 is not '---', so no frontmatter block is open.
+        self.assertEqual(heading_line_indexes(["key: value", "---"]), [0])
+
+    def test_setext_lookalike_inside_a_fence_is_ignored(self):
+        lines = ["```", "Title", "=====", "```", "Real", "====="]
+        self.assertEqual(heading_line_indexes(lines), [4])
+
+    def test_fence_interrupts_an_open_paragraph(self):
+        lines = ["text", "```", "code", "```", "---"]
+        self.assertEqual(heading_line_indexes(lines), [])
+
+    def test_mixed_atx_and_setext_in_document_order(self):
+        lines = ["# One", "", "Two", "===", "body", "## Three", "", "Four", "---"]
+        self.assertEqual(heading_line_indexes(lines), [0, 2, 5, 7])
+
+    def test_atx_heading_above_dashes_is_not_made_a_second_heading(self):
+        self.assertEqual(heading_line_indexes(["# Title", "---"]), [0])
+
+    def test_chunk_markdown_splits_a_setext_only_document(self):
+        text = "\n".join(["Alpha", "=====", "a body", "", "Beta", "----", "b body"])
+        chunks = list(chunk_markdown(text, CHUNK_SIZE, OVERLAP))
+        self.assertEqual(
+            [c[0] for c in chunks],
+            ["Alpha\n=====\na body", "Beta\n----\nb body"],
+        )
+
+    def test_preferred_cut_is_the_setext_heading_start_offset(self):
+        text = "Alpha\n=====\nbody\n\nBeta\n----\nbody\n"
+        self.assertEqual(_preferred_cuts(text, ".md"), [0, text.index("Beta")])
 
 
 class MarkdownChunking(unittest.TestCase):

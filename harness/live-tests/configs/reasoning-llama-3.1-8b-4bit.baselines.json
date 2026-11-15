@@ -1,0 +1,3 @@
+{"measured": "2026-11-01", "model": "meta-llama-3.1-8b-instruct",
+ "runType": "synthetic", "metadata": {"cases": ["seeded-three", "clean", "orders", "leaks", "clean-leaks", "errors", "clean-errors", "concurrency", "clean-concurrency", "inventory", "handlers", "guards-removed", "clean-guards-removed", "paging"]},
+ "expect": {"replies_sent": 44, "replies_unanswered": 2, "replies_readable": 42, "bugs_found_of_38": 21, "false_alarms_per_run": 26}}

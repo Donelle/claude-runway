@@ -14,11 +14,12 @@ generic `content`-in/`content`-out pattern -- see `remember_point`'s payload
 shape below.
 
 `metadata` also carries `description` (verbatim stored text), `created_at`,
-and `pending` (see `remember_point`/`wipe_memory_bank`) -- the four
+and `pending` (see `remember_point`/`wipe_memory_bank`) -- the
 CONTROL/classification fields below are the ones that gate access
 (source/repo) or describe provenance (embedding_model) or open-ended
-categorization (kind), only one of which (`kind`) is ever left to the
-calling model's own judgment:
+categorization (kind) or offer a memory to followers (shared); `kind` and
+`shared` are the ones left to the calling model's own judgment (`shared`
+only on the user's say-so, see below):
   - `source` -- always "memory-bank", fixed by this module, never
     model-settable. The structural "is this actually a memory-bank record"
     signal `index_repo(reset=true)`/`sync_repo` key their guard exclusions
@@ -40,6 +41,12 @@ calling model's own judgment:
     the actual defense against a real cross-model mismatch; this field is
     kept purely so a human can later see what model wrote a given point.
   - `kind` -- fully open, model-decided (no fixed enum).
+  - `shared` -- a bool the writer sets with `remember(shared=True)`: "offer
+    this memory to the repos that FOLLOW my repo" (see `_scope_filter`). A
+    relevance filter, NOT access control: it never changes `repo` (the owner
+    stays the writer), and `recall(repo=...)`/`recall(all_repos=True)` return
+    any repo's memories whether shared or not. A point with no such field
+    (written before it existed) counts as `shared=False` at read time.
 """
 
 from __future__ import annotations
@@ -77,6 +84,7 @@ EMBEDDING_MODEL_FIELD = "metadata.embedding_model"
 CREATED_AT_FIELD = "metadata.created_at"
 PENDING_FIELD = "metadata.pending"
 WEIGHT_FIELD = "metadata.weight"
+SHARED_FIELD = "metadata.shared"
 
 MEMORY_BANK_SOURCE = "memory-bank"
 
@@ -220,6 +228,35 @@ def resolve_repo(memory_bank_id: Optional[str], general: bool) -> tuple:
     return memory_bank_id, None
 
 
+def parse_follow_repos(raw: Optional[str], own_repo: Optional[str]) -> tuple:
+    """
+    Parses `MEMORY_BANK_FOLLOW_REPOS` (a comma-separated list of repo IDs, set
+    in this project's `.mcp.json`) into `(followed, ignored)`. Returns two
+    lists, never raises.
+
+    Entries are trimmed, empty ones dropped (so `""`, `" "` and `"a,,b,"` are
+    all fine) and repeats kept once, in first-seen order. An entry that is this
+    project's own ID or the reserved `general` sentinel is moved to `ignored`
+    instead of `followed`: both are already in `recall`'s default scope, so
+    following them adds nothing, and `ignored` lets the caller say so rather
+    than dropping it silently. `own_repo` is compared trimmed; a missing or
+    unedited-placeholder own ID simply matches nothing.
+    """
+    followed: list = []
+    ignored: list = []
+    own = (own_repo or "").strip()
+    for entry in (raw or "").split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if entry == GENERAL_REPO or (own and entry == own):
+            if entry not in ignored:
+                ignored.append(entry)
+        elif entry not in followed:
+            followed.append(entry)
+    return followed, ignored
+
+
 def is_memory_bank_collection_name(collection: str, memory_bank_collection: str) -> bool:
     """
     True if `collection` (an index_repo/sync_repo target) matches the
@@ -255,6 +292,7 @@ def _scope_filter(
     repo: Optional[str],
     all_repos: bool,
     kind: Optional[str] = None,
+    followed: Optional[list] = None,
 ) -> models.Filter:
     """
     Builds the `metadata.source == "memory-bank"` (+ repo/kind) filter
@@ -266,6 +304,17 @@ def _scope_filter(
     Qdrant Filter are OR'd together and required (min_should_match defaults
     to 1) alongside `must`, giving `source == memory-bank AND (repo ==
     caller_repo OR repo == "general")`.
+
+    `followed` (the parsed `MEMORY_BANK_FOLLOW_REPOS`, see `parse_follow_repos`)
+    adds a THIRD branch to that default scope only: `repo in followed AND
+    shared == True`. `Filter.should` is a flat OR of conditions, so the
+    two-part branch is a nested `Filter(must=[...])` inside `should`. Checked
+    against a real Qdrant instance (not only mock tests): the nested branch is
+    OR'd with the other two, so a followed repo's non-shared points stay out
+    and a point with no `shared` field never matches it. With `followed`
+    empty/None the branch is skipped and the filter is exactly what it was
+    before this existed. An explicit `repo`/`all_repos` ignores `followed`
+    (they already say which repos to read), and `kind` composes as before.
 
     Also excludes `pending == True` points:
     `remember_point`'s point is visible to a search the instant its initial
@@ -293,6 +342,15 @@ def _scope_filter(
             models.FieldCondition(key=REPO_FIELD, match=models.MatchValue(value=caller_repo)),
             models.FieldCondition(key=REPO_FIELD, match=models.MatchValue(value=GENERAL_REPO)),
         ]
+        if followed:
+            should.append(
+                models.Filter(
+                    must=[
+                        models.FieldCondition(key=REPO_FIELD, match=models.MatchAny(any=list(followed))),
+                        models.FieldCondition(key=SHARED_FIELD, match=models.MatchValue(value=True)),
+                    ]
+                )
+            )
     if kind:
         must.append(models.FieldCondition(key=KIND_FIELD, match=models.MatchValue(value=kind)))
     return models.Filter(must=must, must_not=must_not, should=should)
@@ -345,16 +403,27 @@ def ensure_collection(client: "QdrantClient", collection: str, embedding_provide
 
 def ensure_memory_bank_indexes(client: "QdrantClient", collection: str) -> None:
     """
-    Idempotently backfills KEYWORD payload indexes on `source`/`repo` --
+    Idempotently backfills payload indexes on `source`/`repo` (KEYWORD) and
+    `shared` (BOOL) --
     mirrors qdrant_batch_store.ensure_file_path_index's "check current
     payload_schema before creating" pattern so re-running this doesn't
     reissue a full-collection-scanning create_payload_index call every time.
-    These two cover the `source` match clause that every recall/count/wipe
+    The first two cover the `source` match clause that every recall/count/wipe
     filter has, and the `repo` match clause wherever one is applied (not
     always: `_scope_filter` omits it for `all_repos=True`, and
     `count_memory_bank_points` omits it when `repo` is None), so those
     clauses no longer full-scan a collection shared across every project as
-    it grows.
+    it grows. `shared` covers the follow branch of `_scope_filter`'s default
+    scope (only built when `MEMORY_BANK_FOLLOW_REPOS` is set).
+
+    `shared` is a BOOL index, not KEYWORD like the other two. Checked against
+    a real Qdrant instance: a KEYWORD index on a boolean field still answers a
+    `match` filter, but stores none of the values, so a facet over it returns
+    nothing; a BOOL index is what an operator's facet on the field needs.
+
+    A collection created before `shared` existed gets the index the next time
+    `remember_point` runs; until then the follow branch is evaluated per
+    point, like the clauses below, which is correct and only slower.
 
     They do NOT cover the other clauses: `metadata.pending` (the
     `must_not` exclusion in `_scope_filter`, `count_memory_bank_points` and
@@ -367,13 +436,17 @@ def ensure_memory_bank_indexes(client: "QdrantClient", collection: str) -> None:
     """
     info = call_with_retry(client.get_collection, collection)
     existing = info.payload_schema or {}
-    for field in (SOURCE_FIELD, REPO_FIELD):
+    for field, schema in (
+        (SOURCE_FIELD, models.PayloadSchemaType.KEYWORD),
+        (REPO_FIELD, models.PayloadSchemaType.KEYWORD),
+        (SHARED_FIELD, models.PayloadSchemaType.BOOL),
+    ):
         if field not in existing:
             call_with_retry(
                 client.create_payload_index,
                 collection_name=collection,
                 field_name=field,
-                field_schema=models.PayloadSchemaType.KEYWORD,
+                field_schema=schema,
             )
 
 
@@ -388,11 +461,18 @@ async def remember_point(
     embedding_model: str,
     weight: float = DEFAULT_WEIGHT,
     point_id: str | None = None,
+    shared: bool = False,
 ) -> tuple:
     """
     Embeds `summary` (the only text actually searched) and stores it
     alongside `description` (verbatim, payload-only, never embedded) and the
     tool-set `source`/`repo`/`embedding_model` metadata.
+
+    `shared` is stored verbatim as `metadata.shared` ("offer this to repos that
+    follow `repo`", see `_scope_filter`). It never changes `repo`. Every caller
+    that copies a memory into the caller's own repo (`copy_points`,
+    `transfer_points`) leaves it at the default False, because the copy is the
+    caller's own and sharing it is the caller's decision.
 
     `weight` is a static, caller-supplied quality multiplier --
     `recall_points` re-ranks by `effective_score = max(0, raw_similarity) *
@@ -495,6 +575,7 @@ async def remember_point(
                         "repo": repo,
                         "embedding_model": embedding_model,
                         "weight": weight,
+                        "shared": bool(shared),
                         "pending": True,
                     },
                 },
@@ -546,12 +627,17 @@ async def recall_points(
     all_repos: bool = False,
     kind: Optional[str] = None,
     limit: int = 5,
+    followed: Optional[list] = None,
 ) -> list:
     """
     Searches `summary` vectors, always scoped to `metadata.source ==
-    "memory-bank"`, plus the repo/kind narrowing `_scope_filter` builds.
+    "memory-bank"`, plus the repo/kind narrowing `_scope_filter` builds
+    (`followed` is passed straight to it: the default scope also returns
+    `shared` memories of those repos).
     Returns a list of dicts: id/summary/description/kind/repo/
-    embedding_model/score/weight/effective_score/created_at, sorted by
+    embedding_model/score/weight/effective_score/created_at/shared (`shared`
+    is True only for a point whose `metadata.shared` is True; a point with no
+    such field reads as False), sorted by
     `effective_score` descending and truncated to `limit`. Returns [] (not an
     error) when the collection doesn't exist yet -- an empty memory bank is a
     normal, expected state, not a failure.
@@ -588,7 +674,7 @@ async def recall_points(
         return []
     vector_name = embedding_provider.get_vector_name()
     query_vector = await embedding_provider.embed_query(query)
-    query_filter = _scope_filter(caller_repo, repo, all_repos, kind)
+    query_filter = _scope_filter(caller_repo, repo, all_repos, kind, followed=followed)
     fetch_limit = limit * _RECALL_OVERFETCH_MULTIPLIER
     response = call_with_retry(
         client.query_points,
@@ -619,6 +705,7 @@ async def recall_points(
                 "weight": weight,
                 "effective_score": _normalize_similarity(score) * weight,
                 "created_at": meta.get("created_at"),
+                "shared": meta.get("shared") is True,
             }
         )
     # Sort key: effective_score, then weight>0, then raw score (all
@@ -1165,6 +1252,102 @@ def count_memory_bank_points(client: "QdrantClient", collection: str, repo: Opti
         exact=True,
     )
     return result.count
+
+
+def repos_without_memories(client: "QdrantClient", collection: str, repos: list) -> list:
+    """
+    The entries of `repos` that have no finished memory in `collection` at all
+    (shared or not), in the given order -- how `recall` notices a followed repo
+    ID that is misspelled or names a repo that never wrote anything. A repo
+    that exists but has nothing SHARED is not reported: that is a normal,
+    expected state (it may share later), not a mistake. One exact count per
+    repo, so the cost is the size of the follow list.
+    """
+    return [r for r in repos if count_memory_bank_points(client, collection, repo=r) == 0]
+
+
+def summarize_repos(client: "QdrantClient", collection: str) -> Optional[dict]:
+    """
+    Per-repo breakdown of `collection`'s finished memory-bank points, for
+    `list_memory_banks`: `{repo: {"entries": n, "shared": m}}`, where `entries`
+    counts every finished memory the repo owns and `shared` those with
+    `metadata.shared == True`. Returns None when the collection does not exist.
+    Includes the `general` sentinel as an ordinary key; the caller decides how
+    to show it.
+
+    Reads with a scroll that asks Qdrant for only `metadata.repo` and
+    `metadata.shared`, so no memory text (`document`, `description`) is ever
+    fetched, let alone returned. A scroll rather than a facet on purpose: a
+    facet needs a payload index on the field, which a collection written before
+    `shared` existed lacks until its next `remember`, and the facet answers 400
+    without one. Excludes `pending` points, as `recall` and the counts do (a
+    write that has not finished). A point with no `metadata.repo` is skipped.
+    Like `scroll_collection`, complete only if nothing writes during the walk.
+    """
+    if not call_with_retry(client.collection_exists, collection):
+        return None
+    scroll_filter = models.Filter(
+        must=[models.FieldCondition(key=SOURCE_FIELD, match=models.MatchValue(value=MEMORY_BANK_SOURCE))],
+        must_not=[models.FieldCondition(key=PENDING_FIELD, match=models.MatchValue(value=True))],
+    )
+    summary: dict = {}
+    offset = None
+    while True:
+        records, offset = call_with_retry(
+            client.scroll,
+            collection_name=collection,
+            scroll_filter=scroll_filter,
+            limit=_SCROLL_BATCH_SIZE,
+            offset=offset,
+            with_payload=[REPO_FIELD, SHARED_FIELD],
+            with_vectors=False,
+        )
+        for record in records:
+            payload = record.payload
+            meta = payload.get("metadata") if isinstance(payload, dict) else None
+            repo = meta.get("repo") if isinstance(meta, dict) else None
+            if not isinstance(repo, str) or not repo:
+                continue
+            row = summary.setdefault(repo, {"entries": 0, "shared": 0})
+            row["entries"] += 1
+            if isinstance(meta, dict) and meta.get("shared") is True:
+                row["shared"] += 1
+        if offset is None:
+            break
+    return summary
+
+
+def format_memory_banks(collection: str, summary: Optional[dict]) -> str:
+    """
+    Renders `summarize_repos`' result for `list_memory_banks`:
+
+        <collection name>
+          * <repo id>, <number of entries>, sharable: yes (<n> shared) | no
+          general: <n> entries (every repo already receives these)
+
+    One row per repo, sorted by id. "Sharable" means the repo has at least one
+    `shared` memory, which is exactly what a follower would receive, so it says
+    whether following that repo adds anything. `general` is never a repo row (it
+    cannot be followed: every repo already gets it); it is its own last line,
+    present only when there are general memories. An empty or missing collection
+    says so on the line below the name. The text carries ids, counts and the
+    collection name only, never any memory text.
+    """
+    if summary is None:
+        return f"{collection}\n  (collection does not exist yet: nothing has been remembered)"
+    lines = [collection]
+    general = summary.get(GENERAL_REPO)
+    repos = sorted(r for r in summary if r != GENERAL_REPO)
+    for repo in repos:
+        row = summary[repo]
+        sharable = f"yes ({row['shared']} shared)" if row["shared"] else "no"
+        lines.append(f"  * {repo}, {row['entries']} {'entry' if row['entries'] == 1 else 'entries'}, sharable: {sharable}")
+    if general:
+        n = general["entries"]
+        lines.append(f"  general: {n} {'entry' if n == 1 else 'entries'} (every repo already receives these)")
+    if len(lines) == 1:
+        lines.append("  (no memories yet)")
+    return "\n".join(lines)
 
 
 def forget_point(client: "QdrantClient", collection: str, point_id: str, caller_repo: str, confirm: bool) -> str:

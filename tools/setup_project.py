@@ -30,6 +30,7 @@ Usage:
     python tools/setup_project.py upgrade /path/to/target-repo             # apply pending config migrations + refresh installed skills
     python tools/setup_project.py upgrade /path/to/target-repo --dry-run
     python tools/setup_project.py upgrade /path/to/target-repo --auto-yes
+    python tools/setup_project.py upgrade --skills-dir ~/.claude/skills    # no project path: skills only
 
 `upgrade` is for an ALREADY-configured project: unlike `init`,
 which resets every toolkit-owned setting to whatever this run's flags/
@@ -46,20 +47,23 @@ that is not already there. Run as the `claude-runway-setup` console script,
 that refresh compares against the skills shipped with that
 install -- a snapshot taken when it was installed, not a checkout's
 `skills/` -- so it says so, and warns about each stale skill whose copy in
-the `CLAUDE_RUNWAY_DIR` checkout differs; `/my-setup-clauderunway upgrade`
-reads the checkout itself.
+the `CLAUDE_RUNWAY_DIR` checkout differs; `/cr-setup upgrade`
+reads the checkout itself. With no project path, `upgrade` runs skills-only:
+the rename and the refresh on `--skills-dir` and nothing else, so someone who
+installed skills without ever configuring a project can still pick up the
+`my-*` to `cr-*` rename.
 
 The savings tracker is opt-in (it is what writes the `analytics` MCP server behind
-/my-savings and /my-metrics). `init` and `upgrade` ask whether to enable it, with the same
-wording as /my-setup-clauderunway's Q4, but only when stdin is a terminal: a pipe or CI run,
+/cr-savings and /cr-metrics). `init` and `upgrade` ask whether to enable it, with the same
+wording as /cr-setup's Q4, but only when stdin is a terminal: a pipe or CI run,
 `--dry-run`, `--auto-yes` (upgrade) and `--qdrant-only` (init) never ask and keep it off, and an
 explicit `--track-savings` skips the question. When it ends up off, `init` says what that
 costs and how to turn it on.
 
 The `codebase-reviewer` MCP server (the local review loop) is opt-in too: `init --codebase-reviewer`
-(optionally `--reviewers-file PATH`) writes its block, and an interactive `upgrade` offers it. Its
-REVIEWERS_FILE is required and has no default, so neither command ever writes a default path or a
-reviewers file; both warn when it is not set.
+(optionally `--reviewers-file PATH`) writes its block. `upgrade` does not offer it while the server
+is unreleased, and the mcp.json template carries no block for it. Its REVIEWERS_FILE is required and
+has no default, so `init` never writes a default path or a reviewers file; it warns when it is not set.
 
 The templates stay the single source of truth: this script loads and
 patches them (see libs/setup_project_lib.py) rather than duplicating their
@@ -70,7 +74,7 @@ toolkit doesn't own (other MCP servers, other hooks) is preserved, and
 re-running with the same options doesn't duplicate hook entries -- see
 libs/setup_project_lib.py's merge_mcp_json/merge_settings_hooks.
 
-Project minimum: Python 3.12 (policy floor; the dependency chain supports >=3.10).
+Project minimum: Python 3.12.
 """
 
 import argparse
@@ -78,6 +82,7 @@ import copy
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -87,15 +92,16 @@ from typing import Optional
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "libs"))
 
 from setup_project_lib import (  # noqa: E402
+    RENAMED_PRODUCT_SKILLS,
     SKILL_TEXT_ERRORS,
     MalformedConfigError,
-    ask_codebase_reviewer,
     ask_savings_tracker,
     default_skills_dir,
     has_analytics_block,
     load_existing_mcp_json,
     local_compress_tracks_savings,
     plan_skill_installs,
+    plan_skill_renames,
     run_setup,
     venv_python_path,
 )
@@ -169,12 +175,20 @@ def _atomic_write(path: Path, content: str) -> None:
     newline translation at all, so what's encoded is exactly what lands on
     disk, matching plan_skill_installs' own byte-for-byte comparison.
     """
+    _atomic_write_bytes(path, content.encode("utf-8", errors=SKILL_TEXT_ERRORS))
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """The byte-level half of `_atomic_write` (same temp file in the same
+    directory, fsync, `os.replace`), split out so a skill's
+    non-text-edited script is written exactly as shipped, with no encode step
+    in between."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_path_str = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     tmp_path = Path(tmp_path_str)
     try:
         with os.fdopen(fd, "wb") as f:
-            f.write(content.encode("utf-8", errors=SKILL_TEXT_ERRORS))
+            f.write(data)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, path)
@@ -276,14 +290,14 @@ def _metrics_db_reminder(args: argparse.Namespace) -> str:
     the metrics database, but the reporting CLIs run from a shell
     (`tools/autowork_cost.py` and friends) read `CLAUDE_RUNWAY_METRICS_DB` from
     the shell, and the override is written into the memory-bank block (and the
-    analytics block with --track-savings) in EVERY init mode, `--qdrant-only`
+    codebase-reviewer block when it is written, and the analytics block with --track-savings) in EVERY init mode, `--qdrant-only`
     included, so the note must not depend on the hook-side suppression either.
     """
     if not args.metrics_db:
         return ""
     return (
         f"\nNote: --metrics-db wrote CLAUDE_RUNWAY_METRICS_DB={args.metrics_db} into the memory-bank "
-        "server's env block (and the analytics block, with --track-savings). The reporting CLIs run from "
+        "server's env block (and the codebase-reviewer block when written, and the analytics block, with --track-savings). The reporting CLIs run from "
         "a shell (e.g. tools/autowork_cost.py) read it from the shell environment, so export the same "
         "value there too, or they will read the default database and miss these events."
     )
@@ -313,7 +327,7 @@ def _existing_mcp_json_or_empty(target_repo: Path) -> dict:
 
 
 _SAVINGS_OFF_NOTE = (
-    "\nNote: the savings tracker is off, so no `analytics` MCP server is written. /my-savings and /my-metrics "
+    "\nNote: the savings tracker is off, so no `analytics` MCP server is written. /cr-savings and /cr-metrics "
     "will fail with an unknown-tool error until it is. To enable it, re-run init with --track-savings and "
     "`export CLAUDE_RUNWAY_TRACK_SAVINGS=1` in your shell (see docs/savings-tracker.md)."
 )
@@ -335,13 +349,13 @@ def _savings_tracker_note(args: argparse.Namespace, *, had_analytics: bool) -> s
             return ""
         return (
             f"\nNote: --qdrant-only {verb} the existing `analytics` MCP server along with local-compress, so "
-            "/my-savings and /my-metrics stop working. Re-run without --qdrant-only (and with --track-savings) "
+            "/cr-savings and /cr-metrics stop working. Re-run without --qdrant-only (and with --track-savings) "
             "to keep it."
         )
     if had_analytics:
         return (
             f"\nNote: this run {verb} the existing `analytics` MCP server because the savings tracker is off "
-            "(init resets it to this run's flags), so /my-savings and /my-metrics stop working. Pass "
+            "(init resets it to this run's flags), so /cr-savings and /cr-metrics stop working. Pass "
             "--track-savings to keep it."
         )
     return _SAVINGS_OFF_NOTE
@@ -368,8 +382,8 @@ def _quote_command(argv: list, *, windows: bool) -> str:
     return " ".join(shlex.quote(a) for a in argv)
 
 
-_MY_SETUP_CLAUDERUNWAY_CAVEAT = (
-    "Note: my-setup-clauderunway is among the skills covered above, but it still requires "
+_CR_SETUP_CAVEAT = (
+    "Note: cr-setup is among the skills covered above, but it still requires "
     "CLAUDE_RUNWAY_DIR (exported in your shell) pointing at a full clone with tools/setup_project.py "
     "on disk -- it checks this itself at its own step 1, and can't bootstrap itself purely from a "
     "pipx/`uv tool install` install. Harmless to have installed if you don't use it from this environment."
@@ -386,11 +400,24 @@ def _resolve_skills_dir(args: argparse.Namespace) -> Path:
     return default_skills_dir(Path.home())
 
 
+def _apply_skill_plan(plan) -> None:
+    """Writes one skill's SKILL.md and each of its files that is not already
+    up to date. The one place both `init --install-skills` and
+    `upgrade`'s refresh write a skill, so the two cannot drift. Each file is
+    written atomically; the script goes first so SKILL.md, the file Claude
+    Code lists the skill from, never points at a script that is not there."""
+    for extra in plan.extra_files:
+        if extra.action != "up_to_date":
+            _atomic_write_bytes(extra.dest, extra.data)
+    _atomic_write(plan.dest, plan.content)
+
+
 def _report_and_apply_skill_plan(plans: list, *, dry_run: bool) -> None:
     """
     Prints per-skill install/update/up-to-date status
-    and, unless --dry-run, actually writes each non-up-to-date SKILL.md via
-    _atomic_write. Kept as one function (not split into "plan" + "print" +
+    and, unless --dry-run, actually writes each non-up-to-date skill (its
+    SKILL.md and the files beside it) via `_apply_skill_plan`,
+    which uses the atomic writers. Kept as one function (not split into "plan" + "print" +
     "apply" separately) since every existing caller in this file always
     wants both together -- --dry-run's "print only" behavior is expressed
     via the dry_run flag rather than by the caller simply not calling the
@@ -408,10 +435,15 @@ def _report_and_apply_skill_plan(plans: list, *, dry_run: bool) -> None:
             print(f"  - {verb} {plan.name} -> {plan.dest}")
         else:
             print(f"  - {verb_update} {plan.name} -> {plan.dest}")
+        # The files beside SKILL.md, named so a dry run says what
+        # else would be written; an up-to-date one is not worth a line.
+        for extra in plan.extra_files:
+            if extra.action != "up_to_date":
+                print(f"      + {extra.name} -> {extra.dest}")
         if not dry_run and plan.action != "up_to_date":
-            _atomic_write(plan.dest, plan.content)
-    if any(p.name == "my-setup-clauderunway" for p in plans):
-        print(_MY_SETUP_CLAUDERUNWAY_CAVEAT)
+            _apply_skill_plan(plan)
+    if any(p.name == "cr-setup" for p in plans):
+        print(_CR_SETUP_CAVEAT)
 
 
 def cmd_init(args: argparse.Namespace) -> None:
@@ -427,6 +459,7 @@ def cmd_init(args: argparse.Namespace) -> None:
         plans = plan_skill_installs(TOOLS_REPO_DIR, skills_dir)
         print(("Would install/update skills under " if args.dry_run else "Installing/updating skills under ") + f"{skills_dir}:")
         _report_and_apply_skill_plan(plans, dry_run=args.dry_run)
+        warn_old_skill_names(skills_dir)
         return
 
     target_repo = Path(args.target_repo).resolve()
@@ -447,8 +480,8 @@ def cmd_init(args: argparse.Namespace) -> None:
     venv_python_override = _pip_installed_venv_python()
 
     # The savings tracker (and with it the `analytics` server that
-    # /my-savings and /my-metrics need) is opt-in, and a CLI user was never
-    # told. Ask once, with the wording /my-setup-clauderunway's Q4 uses, only
+    # /cr-savings and /cr-metrics need) is opt-in, and a CLI user was never
+    # told. Ask once, with the wording /cr-setup's Q4 uses, only
     # when nobody has answered already and a person can: an explicit
     # --track-savings skips the question, a non-terminal stdin, --dry-run (a
     # preview writes and asks nothing) and --qdrant-only (no local-compress,
@@ -483,6 +516,7 @@ def cmd_init(args: argparse.Namespace) -> None:
             memory_bank_id=args.memory_bank_id,
             embedding_model=args.embedding_model,
             memory_bank_embedding_model=args.memory_bank_embedding_model,
+            memory_bank_follow=args.memory_bank_follow,
             codebase_reviewer=args.codebase_reviewer,
             reviewers_file=args.reviewers_file,
             claude_md=not args.skip_claude_md,
@@ -636,6 +670,7 @@ def cmd_init(args: argparse.Namespace) -> None:
             skills_dir = _resolve_skills_dir(args)
             print(f"\nWould also install/update skills under {skills_dir}:")
             _report_and_apply_skill_plan(plan_skill_installs(TOOLS_REPO_DIR, skills_dir), dry_run=True)
+            warn_old_skill_names(skills_dir)
         return
 
     # Write order matters specifically for --qdrant-only: it REMOVES
@@ -682,6 +717,7 @@ def cmd_init(args: argparse.Namespace) -> None:
         skills_dir = _resolve_skills_dir(args)
         print(f"\nInstalling/updating skills under {skills_dir}:")
         _report_and_apply_skill_plan(plan_skill_installs(TOOLS_REPO_DIR, skills_dir), dry_run=False)
+        warn_old_skill_names(skills_dir)
 
 
 def _confirm_skill_refresh(plan) -> bool:
@@ -716,7 +752,10 @@ def _differing_checkout_skill(plan, tools_repo_dir: Path) -> "Path | None":
     exists, is a different checkout from `tools_repo_dir`, and differs from
     the copy `plan` would write; else None. Compares the two
     shipped files byte for byte, so the installed copy's own frontmatter
-    plays no part. Says nothing about which one is newer: no skill carries a
+    plays no part. A skill's own files beside SKILL.md (its
+    script) count too: a checkout with a different script is a different
+    skill even when the SKILL.md text is identical, and the path returned is
+    then that file. Says nothing about which one is newer: no skill carries a
     version stamp.
     """
     raw = os.environ.get("CLAUDE_RUNWAY_DIR", "").strip()
@@ -731,6 +770,10 @@ def _differing_checkout_skill(plan, tools_repo_dir: Path) -> "Path | None":
         theirs = checkout / "skills" / plan.name / "SKILL.md"
         if theirs.is_file() and theirs.read_bytes() != plan.source.read_bytes():
             return theirs
+        for extra in plan.extra_files:
+            their_extra = checkout / "skills" / plan.name / extra.name
+            if their_extra.is_file() and their_extra.read_bytes() != extra.data:
+                return their_extra
     except OSError:
         return None
     return None
@@ -762,7 +805,7 @@ def refresh_installed_skills(
 
     Run as the `claude-runway-setup` console script, the shipped
     skills are the install-time snapshot under `<env>/src/skills`, not a
-    checkout's `skills/` (which `/my-setup-clauderunway` reads), so the two
+    checkout's `skills/` (which `/cr-setup` reads), so the two
     routes can offer different refreshes. Overwriting with the snapshot's copy
     is intended; this only makes it visible. A snapshot source is named up
     front (path and version), and each stale skill whose copy in the
@@ -796,22 +839,32 @@ def refresh_installed_skills(
         warning = (
             f"      Warning: the checkout at {os.environ.get('CLAUDE_RUNWAY_DIR', '').strip()} ships a different "
             f"{plan.name}; this writes this install's copy. To match the checkout, run "
-            "`/my-setup-clauderunway upgrade`, or reinstall (`uv tool install --reinstall ...` / "
+            "`/cr-setup upgrade`, or reinstall (`uv tool install --reinstall ...` / "
             "`pipx install --force ...`)."
         )
+        # Say which of the skill's own files differ, so a refresh that
+        # changes only the script is not a bare "Would refresh <name>".
+        script_lines = [
+            f"      + {extra.name} ({'new' if extra.action == 'install' else 'differs'})"
+            for extra in plan.extra_files if extra.action != "up_to_date"
+        ]
         if dry_run:
             print(f"  - Would refresh {plan.name} -> {plan.dest}{note}")
+            for line in script_lines:
+                print(line)
             if differing:
                 print(warning)
             refreshed.append(plan.name)
             continue
         print(f"  - {plan.name} -> {plan.dest}{note}")
+        for line in script_lines:
+            print(line)
         if differing:
             print(warning)
         if not (auto_yes or ask(plan)):
             print("      Skipped.")
             continue
-        _atomic_write(plan.dest, plan.content)
+        _apply_skill_plan(plan)
         print("      Refreshed.")
         refreshed.append(plan.name)
     if not_installed:
@@ -822,6 +875,118 @@ def refresh_installed_skills(
     if dry_run and stale:
         print("  Dry run: no skills written.")
     return refreshed
+
+
+def _confirm_skill_rename(plan) -> bool:
+    """Default interactive Y/n prompt for one skill rename (blank is Yes; a
+    closed stdin is a decline, as in `_confirm_skill_refresh`)."""
+    try:
+        answer = input(f"      Rename {plan.old_name} to {plan.new_name}? [Y/n] ").strip().lower()
+    except EOFError:
+        print("      (no input available -- skipped; pass --auto-yes to apply without prompting)")
+        return False
+    return answer not in ("n", "no")
+
+
+def migrate_renamed_skills(
+    skills_dir: Path,
+    *,
+    auto_yes: bool,
+    dry_run: bool,
+    prompt_fn=None,
+    tools_repo_dir: "Path | None" = None,
+) -> "list[str]":
+    """
+    `upgrade`'s skill-rename migration: a product skill installed under an old
+    `my-*` name (`RENAMED_PRODUCT_SKILLS`) is replaced by the shipped `cr-*`
+    copy and the old directory is removed. Nothing here can rename an
+    installed skill by refreshing it, since the installed frontmatter `name:`
+    is kept; so the new directory is written (with `name:` set to the new
+    name) and only then the old one removed, never the other way round.
+
+    Approval is a Y/n per skill, every one with `auto_yes`, none written or
+    prompted with `dry_run`. Only a directory the table names is ever removed,
+    and its path is printed before it goes. Inert until the shipped `skills/`
+    holds the `cr-*` directory (`plan_skill_renames` omits the skill), and safe
+    to re-run: once migrated the old directory is gone. Returns the old names
+    migrated (or, for `dry_run`, that would be).
+    """
+    plans = plan_skill_renames(Path(tools_repo_dir or TOOLS_REPO_DIR), skills_dir)
+    if not plans:
+        return []
+    print(f"\nChecking for renamed skills under {skills_dir}...")
+    print(f"  Found {len(plans)} installed skill(s) under an old name:")
+    ask = prompt_fn or _confirm_skill_rename
+    migrated: list = []
+    for plan in plans:
+        what = (
+            f"remove {plan.old_dir} ({plan.new_name} is already installed"
+            + (", and gain your old frontmatter" if plan.needs_write else "")
+            + ")"
+            if plan.new_exists
+            else f"install {plan.new_name} -> {plan.new_dest}, then remove {plan.old_dir}"
+        )
+        if dry_run:
+            print(f"  - Would {what}")
+            migrated.append(plan.old_name)
+            continue
+        print(f"  - {plan.old_name}: {what}")
+        if not (auto_yes or ask(plan)):
+            print("      Skipped.")
+            continue
+        # A prompt can sit open while something else changes the directory, so
+        # nothing planned earlier is trusted at this point: write when the
+        # replacement is missing (or needs the old frontmatter), then check it
+        # is a plain file again, and the old directory is still a plain
+        # directory, before anything is removed.
+        new_dir = plan.new_dest.parent
+        if not plan.new_exists and (plan.new_dest.exists() or plan.new_dest.is_symlink()):
+            # Absent when planned, present now: the plan's content was built
+            # for an empty destination and would overwrite whatever arrived.
+            print("      Skipped: the new copy appeared while waiting; re-run upgrade.")
+            continue
+        if new_dir.is_symlink() or plan.new_dest.is_symlink():
+            print("      Not removed: the new copy's location is a symlink.")
+            continue
+        if plan.needs_write or not plan.new_dest.is_file():
+            _atomic_write(plan.new_dest, plan.content)
+        if not plan.new_dest.is_file() or plan.new_dest.is_symlink():
+            print("      Not removed: the new copy is not a plain file.")
+            continue
+        if plan.old_dir.is_symlink() or not plan.old_dir.is_dir():
+            print("      Not removed: it is no longer a plain directory.")
+            continue
+        if (plan.old_dir / "SKILL.md").is_symlink():
+            print("      Not removed: the old SKILL.md is now a symlink.")
+            continue
+        shutil.rmtree(plan.old_dir)
+        print("      Renamed.")
+        migrated.append(plan.old_name)
+    if dry_run:
+        print("  Dry run: nothing written or removed.")
+    return migrated
+
+
+def warn_old_skill_names(skills_dir: Path, *, tools_repo_dir: "Path | None" = None) -> None:
+    """
+    `init --install-skills` installs the `cr-*` names as usual; this adds a
+    warning for each old name from `RENAMED_PRODUCT_SKILLS` that is still
+    installed next to them, pointing at `upgrade`, which migrates it. Silent
+    until the shipped `skills/` carries the new name (same inertness as the
+    migration, so the warning never points at an `upgrade` that offers
+    nothing).
+    """
+    shipped = Path(tools_repo_dir or TOOLS_REPO_DIR) / "skills"
+    stale = [
+        old for old, new in sorted(RENAMED_PRODUCT_SKILLS.items())
+        if (shipped / new / "SKILL.md").is_file() and (Path(skills_dir) / old / "SKILL.md").is_file()
+    ]
+    if stale:
+        print(
+            f"  Warning: still installed under an old name: {', '.join(stale)}. Run "
+            "`upgrade` (with no project path, it updates just the installed skills) to move each to its "
+            "new name; until then both copies are listed."
+        )
 
 
 def cmd_upgrade(args: argparse.Namespace) -> None:
@@ -850,6 +1015,20 @@ def cmd_upgrade(args: argparse.Namespace) -> None:
     this CLI -- this earlier check exists purely so `cmd_upgrade` gets a
     clean, distinguishable exit code instead of a silent empty result.
     """
+    if args.target_repo is None:
+        # Skills-only mode: no project path means there is no project
+        # configuration to migrate, only the installed skills. The two skill
+        # steps take just `skills_dir`, so they never needed a project; a user
+        # who installed skills with `init --install-skills` and never
+        # configured a project has no other way to pick up a rename. A path
+        # that IS given but is wrong still fails below, so a typo never
+        # silently becomes skills-only.
+        skills_dir = _resolve_skills_dir(args)
+        print(f"No project path given: updating installed skills under {skills_dir} only.")
+        migrate_renamed_skills(skills_dir, auto_yes=args.auto_yes, dry_run=args.dry_run)
+        refresh_installed_skills(skills_dir, auto_yes=args.auto_yes, dry_run=args.dry_run)
+        print("No project configuration was touched.")
+        return
     target_repo = Path(args.target_repo).resolve()
     if not target_repo.is_dir():
         print(f"error: target repo path does not exist or is not a directory: {target_repo}", file=sys.stderr)
@@ -886,11 +1065,12 @@ def cmd_upgrade(args: argparse.Namespace) -> None:
             offer_savings_fn=(
                 ask_savings_tracker if not args.auto_yes and not args.dry_run and _stdin_is_interactive() else None
             ),
-            # Same rule for the opt-in codebase-reviewer server: only a person
-            # at a terminal is asked, and --auto-yes/--dry-run never add it.
-            offer_reviewer_fn=(
-                ask_codebase_reviewer if not args.auto_yes and not args.dry_run and _stdin_is_interactive() else None
-            ),
+            # The codebase-reviewer server is deliberately NOT offered: it is not
+            # live yet, so `upgrade` must not mention it. The
+            # explicit `init --codebase-reviewer` flags still write the block.
+            # To restore the offer once it ships, pass `offer_reviewer_fn`
+            # here again (`ask_codebase_reviewer` when a person is at a terminal
+            # and neither --auto-yes nor --dry-run is set, like the savings one).
         )
     except MalformedConfigError as exc:
         # .claude/settings.json is only read here (is_project_configured reads
@@ -901,7 +1081,11 @@ def cmd_upgrade(args: argparse.Namespace) -> None:
     # Config migrations never touched installed skills, so a user
     # who only ran `upgrade` kept stale skill text indefinitely. Runs after
     # the config migrations, whether or not any were pending.
-    refresh_installed_skills(_resolve_skills_dir(args), auto_yes=args.auto_yes, dry_run=args.dry_run)
+    # Renames run first so the refresh then sees the new directories as
+    # installed (and up to date) rather than leaving them for a later run.
+    skills_dir = _resolve_skills_dir(args)
+    migrate_renamed_skills(skills_dir, auto_yes=args.auto_yes, dry_run=args.dry_run)
+    refresh_installed_skills(skills_dir, auto_yes=args.auto_yes, dry_run=args.dry_run)
 
 
 def parse_args() -> argparse.Namespace:
@@ -975,7 +1159,8 @@ def parse_args() -> argparse.Namespace:
     init.add_argument(
         "--codebase-reviewer",
         action="store_true",
-        help="Add the opt-in `codebase-reviewer` MCP server (the local review loop). Its REVIEWERS_FILE setting is "
+        help="Add the opt-in `codebase-reviewer` MCP server (the local review loop; `upgrade` does not offer it "
+        "while the server is unreleased, so this flag is the way to add it). Its REVIEWERS_FILE setting is "
         "REQUIRED and has no default: init never writes a default path or a default reviewers file, so without "
         "--reviewers-file the block is written with REVIEWERS_FILE blank and init warns. An existing "
         "codebase-reviewer block is kept (with its REVIEWERS_FILE) on a re-run without this flag",
@@ -1021,17 +1206,31 @@ def parse_args() -> argparse.Namespace:
         "while stranding existing ones under the old identifier.",
     )
     init.add_argument(
+        "--memory-bank-follow",
+        default=None,
+        metavar="IDS",
+        help="Comma-separated MEMORY_BANK_IDs of OTHER repos whose `shared` memories this project's default "
+        "recall also returns (written as MEMORY_BANK_FOLLOW_REPOS in the memory-bank block). Not passing the "
+        "flag PRESERVES the list already in the target's .mcp.json (sticky, like --memory-bank-embedding-model); "
+        "passing it replaces the list, and passing an empty value (--memory-bank-follow '') clears it (the key stays, set to blank). Entries "
+        "equal to this project's own id or to 'general' are ignored by the server (already in scope) and "
+        "init warns about them. Following adds read access only: it does not let this project write under "
+        "another repo's tag, and forget/wipe_all behave as before (wipe_all clears only this project's own "
+        "memories; forgetting one memory by id that belongs to another repo still needs confirm=True). Takes effect when the memory-bank server next starts: restart Claude Code or "
+        "reconnect it",
+    )
+    init.add_argument(
         "--compact-collection",
         default="",
-        help="Base Qdrant collection name the my-compact/my-resume skills store conversation compacts under "
+        help="Base Qdrant collection name the cr-compact/cr-resume skills store conversation compacts under "
         "(qdrant_mcp_server.py's COMPACT_COLLECTION, in the qdrant block); leave blank to use the shared 'conversation-compacts' "
         "default. NOT 'sticky' to a per-project value on its own (matches every other option here): omitting "
         "this flag ALWAYS resolves to 'conversation-compacts' regardless of what a project's .mcp.json currently "
-        "has, so a re-run is only a no-op for a project that has never customized this (via /my-setup-clauderunway's "
+        "has, so a re-run is only a no-op for a project that has never customized this (via /cr-setup's "
         "own Q5, or a prior explicit --compact-collection) -- for a project that HAS, omitting this flag on a "
         "later raw-CLI re-run resets it back to 'conversation-compacts', orphaning that project's existing "
         "conversation-compact history from compact lookup. Repeat the same --compact-collection value on every "
-        "re-run for such a project, or go through /my-setup-clauderunway instead, which extracts and re-passes "
+        "re-run for such a project, or go through /cr-setup instead, which extracts and re-passes "
         "the current value automatically. qdrant_mcp_server.py still appends its own "
         "-<sanitized-project> suffix on top of whichever base this resolves to, at runtime "
         "(this base is a shared prefix; per-project isolation comes from payload filtering, not name uniqueness) "
@@ -1105,7 +1304,13 @@ def parse_args() -> argparse.Namespace:
         "upgrade",
         help="Apply pending config migrations to an already-configured project and refresh installed skills",
     )
-    upgrade.add_argument("target_repo", help="Path to the already-configured project repo to migrate")
+    upgrade.add_argument(
+        "target_repo",
+        nargs="?",
+        default=None,
+        help="Path to the already-configured project repo to migrate. Omit it to update only the installed "
+        "skills (--skills-dir, default ~/.claude/skills) and touch no project configuration",
+    )
     upgrade.add_argument(
         "--dry-run", action="store_true", help="Print pending migrations and stale skills without writing anything"
     )

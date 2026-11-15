@@ -11,7 +11,7 @@ Five tools:
     keep working. Their descriptions live in the docstrings below instead of
     in `TOOL_FIND_DESCRIPTION`/`TOOL_STORE_DESCRIPTION` env entries.
   - `compact_store` / `compact_find` / `compact_prune`: the conversation-compact
-    store `/my-compact` and `/my-resume` use, moved here from the
+    store `/cr-compact` and `/cr-resume` use, moved here from the
     `local-compress` server. They share this server's Qdrant connection and
     embedding code. `compact_store` also compresses the summary it is given
     through `libs/local_compress_lib.py` before storing it (see below).
@@ -256,8 +256,8 @@ def _sanitize_project(project: str) -> str:
 
     Case-folds `project` FIRST, before the hyphen substitution,
     so "MyProject" and "myproject" collapse onto the identical sanitized
-    string. Without this, a casing drift between /my-compact and
-    /my-resume (different terminal profile, a renamed directory recreated
+    string. Without this, a casing drift between /cr-compact and
+    /cr-resume (different terminal profile, a renamed directory recreated
     with different casing, etc.) pointed at an entirely different,
     nonexistent collection, producing a misleading "no collection found"
     message instead of just finding the right one.
@@ -265,7 +265,7 @@ def _sanitize_project(project: str) -> str:
     Deterministic (same input -> same output every call) is required here:
     compact_store and compact_find each derive the canonical name
     independently and must agree on it for the same project, so a brand-new
-    project's /my-resume finds what /my-compact just stored.
+    project's /cr-resume finds what /cr-compact just stored.
     """
     import re as _re
     return _re.sub(r"[^a-zA-Z0-9_-]", "-", _normalize_project(project))
@@ -280,7 +280,7 @@ def _collections_for_project(client: QdrantClient, project: str) -> list:
     version of this fix picked exactly ONE collection per call (a
     "legacy vs. canonical" choice), which still silently fragmented
     history across a genuine casing drift -- reproduced directly: a
-    pre-existing "MyProject" collection plus a later /my-compact call
+    pre-existing "MyProject" collection plus a later /cr-compact call
     passing "myproject" landed on the NEW case-folded canonical
     collection (since a lowercase input's legacy-style and canonical
     names coincide, so the old resolver's "does the legacy name exist"
@@ -464,9 +464,9 @@ def _compact_point_id(project: str, label: str, date: str) -> str:
     project+label+date.
 
     compact_store used to assign every stored compact a fresh uuid.uuid4(),
-    which is why a retried /my-compact call (an MCP transport hiccup, or a
-    user/model re-running /my-compact before confirming the first call
-    succeeded -- /my-compact's own SKILL.md calls compact_store exactly
+    which is why a retried /cr-compact call (an MCP transport hiccup, or a
+    user/model re-running /cr-compact before confirming the first call
+    succeeded -- /cr-compact's own SKILL.md calls compact_store exactly
     once per run, so the retry has to come from outside that skill) landed
     on a second, indistinguishable point next to the first: two random ids
     never collide, so Qdrant just inserted both. Deriving the id instead of
@@ -503,8 +503,10 @@ async def _compress_for_storage(information: str) -> tuple[str, str]:
 
     The model client is built here, from the CLAUDE_RUNWAY_LMSTUDIO_* values in
     this server's own env block (local_compress_lib reads them), and
-    libs/lmstudio_client.py is imported only now: `openai` is not installed on
-    a Qdrant-only setup, which must still be able to store compacts.
+    libs/lmstudio_client.py is imported only now. Building the client is what
+    imports `openai` (libs/openai_lib.py's build_openai_client), so it sits in the
+    same guard as the import: `openai` is not installed on a Qdrant-only setup,
+    which must still be able to store compacts, with the same note as before.
 
     compress() returns text under its own size threshold as is (apart from
     credential redaction), and that is reported as stored uncompressed rather
@@ -512,6 +514,7 @@ async def _compress_for_storage(information: str) -> tuple[str, str]:
     """
     try:
         from lmstudio_client import build_client
+        client = build_client(None)
     except Exception as e:  # ImportError, or a broken `openai` install
         return information, f"stored uncompressed: the LM Studio client is unavailable ({type(e).__name__})"
     try:
@@ -520,7 +523,7 @@ async def _compress_for_storage(information: str) -> tuple[str, str]:
             COMPACT_FOCUS,
             preserve_identifiers=True,
             preserve_sections=True,
-            client=build_client(None),
+            client=client,
         )
     except Exception as e:
         return information, f"stored uncompressed: compression failed ({type(e).__name__}: {e})"
@@ -599,7 +602,7 @@ async def compact_store(
     into a new one -- see _collections_for_project. Pass collection
     explicitly to override.
 
-    Called by /my-compact instead of qdrant-store. project, label, and date
+    Called by /cr-compact instead of qdrant-store. project, label, and date
     are stored as payload fields and used by compact_find for native filtering
     and sorting. The collection is created automatically on first use.
 
@@ -616,7 +619,7 @@ async def compact_store(
     section-splitting logic that already parses the compact template.  This
     removes label-quality variance that came from asking each calling model to
     extract the first sentence on its own.  Pass an explicit `label` to
-    override the derived value (e.g. from a /my-compact argument).
+    override the derived value (e.g. from a /cr-compact argument).
 
     Idempotent: the stored point's id is deterministically
     derived from project+label+date (see _compact_point_id), not a random
@@ -624,7 +627,7 @@ async def compact_store(
     id instead of inserting a second, indistinguishable point, so an
     external retry (an MCP transport hiccup, or a re-run before confirming
     the first call succeeded) can't silently duplicate a compact in the
-    /my-resume picker.
+    /cr-resume picker.
 
     Requires fastembed and qdrant-client (both already installed via
     requirements.txt's Core section). QDRANT_URL / QDRANT_API_KEY /
@@ -716,7 +719,7 @@ async def compact_store(
     # Mark the collection internal on EVERY write (idempotent), so
     # find_in_collection/list_collections can tell it isn't a search target.
     # Done on every write rather than only at creation so a legacy collection
-    # gets marked on its next /my-compact. Fails open: a failed mark must not
+    # gets marked on its next /cr-compact. Fails open: a failed mark must not
     # lose the user's compact.
     mark_compact_collection(client, col)
     [embedding] = await embedding_provider.embed_documents([information])
@@ -776,7 +779,7 @@ def _sibling_compact_collections(client: QdrantClient, exclude: list) -> list:
     a given project under any casing -- either this project was genuinely
     never compacted, or the project name has drifted entirely (a renamed
     directory, a different worktree checkout) from whatever it was when
-    /my-compact ran (a pure casing drift never reaches here at all -- see
+    /cr-compact ran (a pure casing drift never reaches here at all -- see
     _collections_for_project, which already finds any casing variant
     directly, so this is purely for a genuinely different name). `exclude`
     is always a list, never a bare string -- iterating a bare string would
@@ -893,7 +896,7 @@ def _candidate_hint(client: QdrantClient, exclude: list) -> str:
     the reviewer's claim -- verified via `strings` against the
     installed `claude` binary, which contains the literal schema
     description "2-4 options" and "do not exceed them even if the user
-    requests more"). my-resume/SKILL.md's "If no match is found" flow
+    requests more"). cr-resume/SKILL.md's "If no match is found" flow
     presents these candidates as AskUserQuestion options PLUS one extra
     "None of these" option, so up to 3 real candidates + 1 fallback stays
     within that hard 4-option ceiling.
@@ -938,18 +941,18 @@ async def compact_find(
     isolates one project's entries from another's, including when a shared
     collection is passed explicitly via the collection param.
 
-    Called by /my-resume instead of qdrant-find. Returns compacts sorted by
+    Called by /cr-resume instead of qdrant-find. Returns compacts sorted by
     date descending (most recent first; compacts sharing a date are ordered
     by the time they were stored, newest first -- compacts stored before that
     timestamp existed count as oldest on their date), each with its date,
-    label, and full content, ready for /my-resume to present as a selection
+    label, and full content, ready for /cr-resume to present as a selection
     list.
 
     When query is omitted, uses scroll (payload filter only, no vector
     ranking) so date-sort is reliable and recent entries are never buried by
     semantic distance. When query is provided, uses semantic search to narrow
     results to the closest match — suited for keyword-based selection like
-    '/my-resume auth refactor'. limit caps results in both cases.
+    '/cr-resume auth refactor'. limit caps results in both cases.
 
     Each entry's header also includes a short suffix of its own Qdrant
     point id. Going forward, compact_store derives that id
@@ -962,7 +965,7 @@ async def compact_find(
     identical project+label+date as unlimited separate inserts, two such
     pre-fix points can legitimately have identical date/label already
     sitting in the collection today, which would otherwise render as
-    indistinguishable entries in /my-resume's selection UI. Surfacing the
+    indistinguishable entries in /cr-resume's selection UI. Surfacing the
     id suffix here is what lets that UI (or a human reading raw output)
     tell those specific pre-existing entries apart.
 
@@ -971,8 +974,8 @@ async def compact_find(
     NEW-style collection for a brand-new project. For a project with
     EXISTING history, this AGGREGATES entries across every
     '<COMPACT_COLLECTION>-*' collection that case-insensitively matches
-    `project` -- not just one -- so a casing drift between /my-compact and
-    /my-resume, or even multiple different historical casings accumulated
+    `project` -- not just one -- so a casing drift between /cr-compact and
+    /cr-resume, or even multiple different historical casings accumulated
     over time, still surfaces everything instead of silently showing only
     whichever single collection happened to match
     (flagged in review: picking exactly one collection could
@@ -1009,7 +1012,7 @@ async def compact_find(
         if not call_with_retry(client.collection_exists, collection):
             return (
                 f"No compacts collection found ('{collection}') for project '{project}'. "
-                "Run /my-compact first to create it."
+                "Run /cr-compact first to create it."
             ) + _candidate_hint(client, [collection])
     else:
         # Every collection (under ANY casing) that already holds this
@@ -1035,7 +1038,7 @@ async def compact_find(
         if not col_list:
             return (
                 f"No compacts collection found ('{canonical_col}') for project '{project}'. "
-                "Run /my-compact first to create it."
+                "Run /cr-compact first to create it."
             ) + _candidate_hint(client, [canonical_col])
 
     # Case-insensitive per-entry isolation for the default (non-explicit-
@@ -1260,7 +1263,7 @@ async def compact_prune(
         if not call_with_retry(client.collection_exists, collection):
             return (
                 f"No compacts collection found ('{collection}') for project '{project}'. "
-                "Run /my-compact first to create it."
+                "Run /cr-compact first to create it."
             )
         case_insensitive_target: Optional[str] = None
     else:
@@ -1269,7 +1272,7 @@ async def compact_prune(
         if not col_list:
             return (
                 f"No compacts collection found ('{canonical_col}') for project '{project}'. "
-                "Run /my-compact first to create it."
+                "Run /cr-compact first to create it."
             )
         case_insensitive_target = project.casefold()
 

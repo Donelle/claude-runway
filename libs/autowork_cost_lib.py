@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Shared, dependency-free derivation of /my-gh-autowork's per-ticket cost from the
+Shared, dependency-free derivation of /cr-gh-autowork's per-ticket cost from the
 SUBAGENT TRANSCRIPTS, instead of the orchestrator copying figures out
 of the Agent call's `usage` block by hand (which nothing enforced: 22 of 91 logged
 runs had no figures at all, and the one total it did record had no cache split).

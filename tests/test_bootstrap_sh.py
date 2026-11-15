@@ -137,6 +137,12 @@ class EnvStepTestCase(_TempDirCase):
         path = self.tmp / "env.sh"
         path.write_text(text, encoding="utf-8")
         base = {"HOME": str(self.home), "PATH": os.environ.get("PATH", "")}
+        if os.name == "nt":
+            # Git Bash's sh rewrites POSIX-looking paths ("/mine.db") in the environment of every
+            # native program it starts to "C:/Program Files/Git/mine.db". Switch that off so the
+            # shell is tested for what the env file does, not for what MSYS does to the result.
+            base["MSYS_NO_PATHCONV"] = "1"
+            base["SystemRoot"] = os.environ.get("SystemRoot", "")
         base.update(env or {})
         out = subprocess.run(
             ["sh", "-euc", '. "$1"; exec "$2" -c "import json, os; print(json.dumps(dict(os.environ)))"',
@@ -252,6 +258,10 @@ class RenderEnvFileTests(EnvStepTestCase):
         }
         for raw, expected in cases.items():
             with self.subTest(raw=raw):
+                if os.name == "nt" and "${HOME}" in raw:
+                    # Git Bash's sh turns a Windows HOME into its own POSIX form (/tmp/...), so the
+                    # expansion cannot equal the Windows-style path this test builds the expectation from.
+                    self.skipTest("MSYS rewrites HOME into a POSIX path")
                 text, _ = self.render(declared={"CLAUDE_RUNWAY_SAVINGS_DB": raw})
                 self.assertEqual(self.source(text)["CLAUDE_RUNWAY_SAVINGS_DB"], expected)
         text, _ = self.render(declared={"CLAUDE_RUNWAY_SAVINGS_DB": "${RUNWAY_ROOT:-/fallback}/s.db"})
@@ -284,7 +294,9 @@ class RenderEnvFileTests(EnvStepTestCase):
         )
 
     def test_a_home_with_quotes_and_braces_reaches_the_shell_unchanged(self):
-        for name in ("O'Connor", "Work{Personal}", 'say "hi"'):
+        # A double quote cannot be in a Windows directory name (WinError 123).
+        names = ("O'Connor", "Work{Personal}") if os.name == "nt" else ("O'Connor", "Work{Personal}", 'say "hi"')
+        for name in names:
             with self.subTest(home=name):
                 self.home = self.tmp / name
                 self.home.mkdir()
@@ -376,7 +388,11 @@ class CheckParsesTests(EnvStepTestCase):
         self.assertIn("CLAUDE_RUNWAY_SAVINGS_DB would not parse", err.getvalue())
 
 
+@unittest.skipUnless(hasattr(os, "fchmod"), "write_if_changed sets the mode with os.fchmod, which Windows lacks")
 class WriteIfChangedTests(EnvStepTestCase):
+    """The env step runs on macOS and Linux only (Windows has bootstrap.ps1), and its file-mode handling
+    is POSIX: `os.fchmod`, and mode bits that Windows does not keep."""
+
     def test_writes_then_leaves_an_identical_file_alone(self):
         path = self.home / ".claude" / "claude-runway" / "env.sh"
         self.assertTrue(self.ns["write_if_changed"](path, "x\n"))
@@ -449,7 +465,8 @@ class WireProfileTests(EnvStepTestCase):
         result, out, asked = self.wire(answer="y")
         self.assertEqual(result, "wired")
         self.assertEqual((self.home / ".zshrc").read_text(encoding="utf-8"), self.block())
-        self.assertEqual(asked, ["Add the claude-runway environment to ~/.zshrc? [y/N] "])
+        # The script shows the path with the platform's own separator after the "~".
+        self.assertEqual(asked, [f"Add the claude-runway environment to ~{os.sep}.zshrc? [y/N] "])
         self.assertIn("new terminal", out)
 
     def test_yes_in_any_case_and_the_long_form(self):
@@ -545,8 +562,13 @@ class WireProfileTests(EnvStepTestCase):
 
 
 @unittest.skipIf(shutil.which("git") is None, "needs git")
+@unittest.skipUnless(hasattr(os, "fchmod"), "the script's env step uses os.fchmod; it runs on macOS and Linux only")
 class EnvOnlyScriptTests(_TempDirCase):
-    """Runs the real bash glue: `--env-only` against a temp repo, a stub doctor and a fake HOME."""
+    """Runs the real bash glue: `--env-only` against a temp repo, a stub doctor and a fake HOME.
+
+    Skipped on Windows, which has `scripts/bootstrap.ps1` instead: the script's env step writes its
+    file with `os.fchmod` (absent there), and the fake venv is a symlink to the interpreter, which a
+    Windows venv's `python.exe` cannot follow (it looks for `pyvenv.cfg` next to the link)."""
 
     def setUp(self):
         super().setUp()

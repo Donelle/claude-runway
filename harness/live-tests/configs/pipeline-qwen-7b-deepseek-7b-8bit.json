@@ -1,0 +1,3 @@
+{"stages": ["reasoning", "verifier"], "reviewers": [
+ {"name": "general", "model": "qwen2.5-coder-7b-instruct-mlx", "prompt": "You review Python changes for defects that would crash, lose data, or return a wrong result, and for security problems such as shell, SQL or path injection. Be specific and skip style remarks.", "active": true, "type": ["reasoning"], "loadOnDemand": true, "contextLength": 8192},
+ {"name": "verifier", "model": "deepseek-r1-distill-qwen-7b@8bit", "prompt": "You confirm a reported defect with a concrete failing input, or reject it.", "active": true, "type": ["verifier"], "loadOnDemand": true, "contextLength": 8192}]}

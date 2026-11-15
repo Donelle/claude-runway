@@ -184,7 +184,7 @@ class HooksAndSkillsInDocs(unittest.TestCase):
     def test_every_skill_is_in_the_template(self):
         template = _read("templates/CLAUDE.md.template")
         skills = [p.name for p in (ROOT / "skills").iterdir() if p.is_dir()]
-        # The skill directory is `my-compact`; the template spells the slash command.
+        # The skill directory is `cr-compact`; the template spells the slash command.
         self.assertEqual([s for s in skills if "/" + s not in template], [])
 
 

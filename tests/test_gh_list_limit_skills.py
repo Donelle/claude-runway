@@ -10,7 +10,7 @@ Invariant: every `gh issue list` / `gh pr list` command written in any
 (which returns a handful of results by construction).
 
 Commands are extracted whole, not line by line: a fenced-block command continues across
-`\\` line continuations (my-gh-autowork's auto-pick command puts `--limit 200` on its
+`\\` line continuations (cr-gh-autowork's auto-pick command puts `--limit 200` on its
 last line), and an inline-code command runs to its closing backtick even when the prose
 wraps the span onto the next line. A bare mention with no arguments (e.g. "`gh issue list`
 silently truncates...") is not a command.
@@ -33,7 +33,7 @@ _LIST_CMD_RE = re.compile(r"gh\s+(?:issue|pr)\s+list\b")
 # Commands deliberately shown as what NOT to do. Keyed by (skill dir name, normalized
 # command text); keep this list as short as possible.
 _NEGATIVE_EXAMPLES = {
-    ("my-gh-autowork", 'gh pr list --search "<N> in:body"'),
+    ("cr-gh-autowork", 'gh pr list --search "<N> in:body"'),
 }
 
 

@@ -1,0 +1,3 @@
+{"stages": ["reasoning"], "rubric": [{"name": "e", "level": "low", "definition": "d", "score": 0.5}], "reviewers": [
+ {"name": "a", "model": "qwen2.5-coder-7b-instruct-mlx", "prompt": "p", "active": true, "type": ["reasoning"], "loadOnDemand": true},
+ {"name": "c", "model": "qwen2.5-coder-7b-instruct-mlx", "prompt": "p", "active": true, "type": ["classifier"], "loadOnDemand": true}]}

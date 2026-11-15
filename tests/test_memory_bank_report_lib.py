@@ -37,11 +37,14 @@ class _DbTestCase(unittest.TestCase):
         self.db_path = Path(self._tmp.name) / "memory-events.db"
         self._env = mock.patch.dict(os.environ, {"CLAUDE_RUNWAY_MEMORY_EVENTS_DB": str(self.db_path)})
         self._env.start()
+        # Cleanups run last-in first-out, so registering the directory's removal FIRST makes
+        # it the LAST thing to run: after the environment is restored and after every
+        # read-only connection a test opened through ro() has been closed. A tearDown that
+        # removed the directory would run before those addCleanup(conn.close) calls, and
+        # Windows refuses to delete a SQLite file that is still open (WinError 32).
+        self.addCleanup(self._tmp.cleanup)
+        self.addCleanup(self._env.stop)
         ev._connect().close()  # create the real schema
-
-    def tearDown(self):
-        self._env.stop()
-        self._tmp.cleanup()
 
     def add(self, event_type, point_id, ts, repo="proj", project="proj", session="s1", turn=1):
         conn = sqlite3.connect(str(self.db_path))

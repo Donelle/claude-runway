@@ -2,7 +2,7 @@
 Collection-metadata marker for conversation-compact collections.
 
 `compact_store` (mcpservers/qdrant_mcp_server.py) writes saved conversation
-summaries for /my-compact and /my-resume into their own collections, which
+summaries for /cr-compact and /cr-resume into their own collections, which
 are only ever read back by project through `compact_find` -- never by
 semantic search. Nothing used to say so: `find_in_collection` would search
 them and `list_collections` listed them next to real codebase collections as
@@ -63,7 +63,7 @@ def mark_compact_collection(client, collection: str) -> bool:
     """
     Idempotently marks `collection` as an internal compact collection.
     Called by `compact_store` on EVERY write, so a legacy collection created
-    before this marker existed gets marked on its next /my-compact (no
+    before this marker existed gets marked on its next /cr-compact (no
     backfill, by decision). Skips the network write when the
     marker is already present. Sends ONLY the marker key, relying on Qdrant's
     metadata merge so a stored description/search_limit survives. Returns

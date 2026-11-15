@@ -632,7 +632,8 @@ class IndexRepoBaselineHasNoKeptPaths(unittest.TestCase):
 class WorkaroundNoteIsReplacedConsistently(unittest.TestCase):
     """The advice to run the first rebuild with the scope you normally index
     with existed because nothing tracked the files a narrower rebuild kept.
-    README, docs/installation.md, the upgrade migration's note and sync_repo's
+    The Known limitations page (it was in the README before that section moved),
+    docs/installation.md, the upgrade migration's note and sync_repo's
     docstring all carried it; they must now agree that those files are tracked."""
 
     def _texts(self):
@@ -643,7 +644,7 @@ class WorkaroundNoteIsReplacedConsistently(unittest.TestCase):
 
         migration = next(m for m in upgrade_lib.REPO_MIGRATIONS if m.id == "index-manifest-old-format")
         return {
-            "README.md": read("README.md"),
+            "docs/known-limitations.md": read("docs", "known-limitations.md"),
             "docs/installation.md": read("docs", "installation.md"),
             "the upgrade migration note": " ".join(migration.note.split()),
             "sync_repo's docstring": " ".join((_ims.sync_repo.__doc__ or "").split()),
