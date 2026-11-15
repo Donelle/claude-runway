@@ -28,7 +28,7 @@ sys.path.insert(0, str(REPO_ROOT / "mcpservers"))
 os.environ.setdefault("QDRANT_URL", "http://localhost:6333")
 os.environ.setdefault("COLLECTION_NAME", "test-collection")
 
-from qdrant_connector import SEARCH_LIMIT, QdrantConnector  # noqa: E402
+from qdrant_connector import NO_COLLECTION_ERROR, SEARCH_LIMIT, QdrantConnector  # noqa: E402
 
 EXPECTED_TOOLS = {
     "cb_indexer_index_repo",
@@ -247,6 +247,23 @@ class FindStoreDoNotLoadTheModelAtStartup(unittest.TestCase):
             qdrant_embeddings, "TextEmbedding", side_effect=AssertionError("model loaded at import")
         ):
             _load_server()
+
+    def test_an_unset_collection_is_reported_without_loading_the_model(self):
+        # The connector cache is left EMPTY on purpose: seeding it (as the
+        # round-trip tests do) would hide an order bug where the model is
+        # loaded before the collection is checked.
+        mod = _load_server()
+        mod.DEFAULT_COLLECTION = None
+        loaded = []
+
+        def _provider(model_name):
+            loaded.append(model_name)
+            raise RuntimeError("the model must not be loaded for an unset collection")
+
+        mod.FastEmbedProvider = _provider
+        self.assertEqual(_run(mod.cb_indexer_find_repo("q")), [NO_COLLECTION_ERROR])
+        self.assertEqual(_run(mod.cb_indexer_store_repo("x", None)), NO_COLLECTION_ERROR)
+        self.assertEqual(loaded, [])
 
     def test_the_connector_is_built_on_first_use_and_then_reused(self):
         mod = _load_server()

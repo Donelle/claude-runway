@@ -52,7 +52,7 @@ from typing import Any, Optional
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "libs"))
 
 from mcp.server.mcpserver import MCPServer, Context
-from qdrant_connector import QdrantConnector, Entry, SEARCH_LIMIT, find_entries, store_entry
+from qdrant_connector import QdrantConnector, Entry, NO_COLLECTION_ERROR, SEARCH_LIMIT, find_entries, store_entry
 from qdrant_embeddings import FastEmbedProvider
 from qdrant_client import QdrantClient, models
 
@@ -2364,6 +2364,11 @@ async def cb_indexer_find_repo(query: str, limit: int = SEARCH_LIMIT) -> list[st
     content can cause). Hits with line_range come from an index that predates
     token-window chunking, where a miss is not proof the code is absent.
     """
+    # Check the collection BEFORE building the connector: building it loads (and on
+    # a cold cache downloads) the embedding model, which a misconfigured server
+    # must not do just to say COLLECTION_NAME is unset.
+    if not DEFAULT_COLLECTION:
+        return [NO_COLLECTION_ERROR]
     return await find_entries(_get_find_store_connector(), DEFAULT_COLLECTION, query, limit)
 
 
@@ -2377,6 +2382,8 @@ async def cb_indexer_store_repo(information: str, metadata: Optional[dict[str, A
     else, or nothing. Input: information (the text to store), metadata
     (optional JSON).
     """
+    if not DEFAULT_COLLECTION:  # same order as cb_indexer_find_repo: no model load for an unset collection
+        return NO_COLLECTION_ERROR
     return await store_entry(_get_find_store_connector(), DEFAULT_COLLECTION, information, metadata)
 
 
