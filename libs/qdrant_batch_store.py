@@ -32,7 +32,7 @@ from typing import Awaitable, Callable, Optional
 
 from qdrant_client import models
 
-from qdrant_connector import METADATA_PATH, make_point
+from qdrant_connector import make_point
 from qdrant_retry import async_call_with_retry
 
 # Chosen to comfortably clear the connection-exhaustion ceiling this module
@@ -42,13 +42,10 @@ from qdrant_retry import async_call_with_retry
 # ingest_mcp_server.py for the delete side of the same problem.
 UPSERT_BATCH_SIZE = 250
 
-# Must match the nested key sync_repo's own delete-by-filter already uses
-# (mcpservers/ingest_mcp_server.py's models.FieldCondition(key="metadata.file_path",
-# ...)): store()/store_batch() write {"document": ..., METADATA_PATH:
-# entry.metadata}, and entry.metadata itself has a "file_path" key (see
-# qdrant_ingest_lib.py's chunk_file), so the indexable field is the NESTED
-# "metadata.file_path", not the bare "file_path".
-FILE_PATH_INDEX_FIELD = f"{METADATA_PATH}.file_path"
+# The index is on the file path every entry carries in its metadata (the
+# "file_path" key chunk_file puts there, see qdrant_ingest_lib.py), so the
+# indexable field is that key itself.
+FILE_PATH_INDEX_FIELD = "file_path"
 
 # Passed to QdrantConnector(..., field_indexes=FIELD_INDEXES) so a BRAND NEW
 # collection gets this index automatically the moment
@@ -90,16 +87,16 @@ async def store_batch(
 
     collection_name = collection_name or connector.default_collection_name
     assert collection_name is not None
+    vector_name = connector.embedding_provider.get_vector_name()
     await connector.ensure_collection_exists(collection_name)
 
-    vector_name = connector.embedding_provider.get_vector_name()
     stored = 0
     for i in range(0, len(entries), batch_size):
         batch = entries[i:i + batch_size]
         contents = [entry.content for entry in batch]
         embeddings = await connector.embedding_provider.embed_documents(contents)
         points = [
-            make_point(vector_name, embedding, entry)
+            make_point(embedding, vector_name, entry)
             # strict=False: identical to pre-ruff behavior (a bare zip()
             # already silently truncates to the shorter iterable); ruff's
             # B905 adoption must not change runtime behavior.
