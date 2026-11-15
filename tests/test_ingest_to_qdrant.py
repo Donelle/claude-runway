@@ -408,7 +408,7 @@ def _dry_run_indexed_paths(args) -> set:
 
 
 class CliParityWithMcpServer(unittest.TestCase):
-    """Three ways the CLI had drifted from ingest_mcp_server.py.
+    """Three ways the CLI had drifted from codebase_indexer_mcp_server.py.
     The csv, manifest and env-fallback tests failed on main before the fix;
     the flags-win, no-env-defaults and --help tests are guards on the new
     defaults (precedence, unchanged built-ins, no secret echoed in help)."""

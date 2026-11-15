@@ -27,7 +27,7 @@ os.environ.setdefault("QDRANT_URL", "http://localhost:6333")
 os.environ.setdefault("COLLECTION_NAME", "test-collection")
 os.environ.setdefault("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 
-import ingest_mcp_server as _ims  # noqa: E402
+import codebase_indexer_mcp_server as _ims  # noqa: E402
 import qdrant_compact_marker as marker  # noqa: E402
 from qdrant_client.http.models import models as _m  # noqa: E402
 from test_qdrant_mcp_server import (  # noqa: E402

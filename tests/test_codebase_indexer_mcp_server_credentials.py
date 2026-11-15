@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests that every mcpservers/ingest_mcp_server.py tool taking qdrant_url/
+"""Tests that every mcpservers/codebase_indexer_mcp_server.py tool taking qdrant_url/
 qdrant_api_key resolves them through the shared credential rule, so the
 configured QDRANT_API_KEY is never sent to a caller-supplied host. Asserts on
 the kwargs each tool hands to QdrantClient. Stdlib-only, no network: the client
@@ -23,7 +23,7 @@ os.environ.setdefault("QDRANT_URL", "http://localhost:6333")
 os.environ.setdefault("COLLECTION_NAME", "test-collection")
 os.environ.setdefault("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 
-import ingest_mcp_server as _ims  # noqa: E402
+import codebase_indexer_mcp_server as _ims  # noqa: E402
 
 CONFIGURED_URL = "http://configured-qdrant:6333"
 CONFIGURED_KEY = "configured-secret"

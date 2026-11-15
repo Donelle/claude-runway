@@ -10,7 +10,7 @@ the second run fail fast instead; the atomic write keeps a reader from ever
 seeing a half-written manifest.
 
 Stdlib-only and model-free: Qdrant, the embedding provider and the store are
-mocked, as in the test_ingest_mcp_server_* and test_ingest_to_qdrant files.
+mocked, as in the test_codebase_indexer_mcp_server_* and test_ingest_to_qdrant files.
 The cross-process tests start a real second Python process.
 
     .venv/bin/python -m unittest discover -s tests
@@ -42,7 +42,7 @@ os.environ.setdefault("QDRANT_URL", "http://localhost:6333")
 os.environ.setdefault("COLLECTION_NAME", "test-collection")
 os.environ.setdefault("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 
-import ingest_mcp_server as _ims  # noqa: E402
+import codebase_indexer_mcp_server as _ims  # noqa: E402
 import ingest_to_qdrant as _cli  # noqa: E402
 import sync_manifest_lib as lib  # noqa: E402
 from fake_token_budget import word_budget  # noqa: E402

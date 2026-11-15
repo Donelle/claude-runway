@@ -1,7 +1,7 @@
 """
-Embedding-model mismatch check shared by `mcpservers/ingest_mcp_server.py`
+Embedding-model mismatch check shared by `mcpservers/codebase_indexer_mcp_server.py`
 (`find_in_collection`, `index_repo`, `sync_repo`) and `libs/memory_bank_lib.py`.
-Relocated here from `ingest_mcp_server.py` (where it was a private,
+Relocated here from `codebase_indexer_mcp_server.py` (where it was a private,
 single-file function used only by `find_in_collection`) rather than
 duplicated, so callers can't drift apart on this logic. The default
 behavior is unchanged from that original home (fails open on an

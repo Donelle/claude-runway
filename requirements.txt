@@ -1,5 +1,5 @@
 # Core -- required for the Qdrant codebase-memory piece (qdrant_mcp_server.py,
-# ingest_to_qdrant.py, ingest_mcp_server.py) and the memory-bank piece
+# ingest_to_qdrant.py, codebase_indexer_mcp_server.py) and the memory-bank piece
 # (mcpservers/memory_bank_mcp_server.py) -- memory-bank reuses this same
 # Qdrant client machinery (mcp, this repo's own libs/qdrant_embeddings.py
 # FastEmbedProvider, qdrant-client), so no separate dependency section is

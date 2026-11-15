@@ -1269,7 +1269,7 @@ class ChunkLinesOverlapExplosion(unittest.TestCase):
 
 class McpToolsValidateChunkParamsBeforeAnyWork(unittest.TestCase):
     """a shared validator only closes the bug if every boundary
-    actually calls it. Imports ingest_mcp_server.py directly and calls each
+    actually calls it. Imports codebase_indexer_mcp_server.py directly and calls each
     tool with an invalid overlap -- no live Qdrant/FastEmbed needed, since the
     validation check is the very first thing each function does, before any
     network call or even a filesystem check.
@@ -1290,7 +1290,7 @@ class McpToolsValidateChunkParamsBeforeAnyWork(unittest.TestCase):
         os.environ.setdefault("QDRANT_URL", "http://localhost:6333")
         os.environ.setdefault("COLLECTION_NAME", "test-collection")
         os.environ.setdefault("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-        import ingest_mcp_server as _ims
+        import codebase_indexer_mcp_server as _ims
         cls.ims = _ims
 
     def test_index_repo_rejects_bad_overlap_before_touching_qdrant(self):
@@ -1338,7 +1338,7 @@ class IndexRepoDocumentsTheOrphanedChunkLimitation(unittest.TestCase):
         os.environ.setdefault("QDRANT_URL", "http://localhost:6333")
         os.environ.setdefault("COLLECTION_NAME", "test-collection")
         os.environ.setdefault("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-        import ingest_mcp_server as _ims
+        import codebase_indexer_mcp_server as _ims
         cls.ims = _ims
 
     def test_docstring_warns_about_deleted_files_and_points_at_sync_repo(self):
@@ -1376,7 +1376,7 @@ class SyncRepoPreservesEmbeddingsOnChunkAndHashFailures(unittest.TestCase):
         os.environ.setdefault("QDRANT_URL", "http://localhost:6333")
         os.environ.setdefault("COLLECTION_NAME", "test-collection")
         os.environ.setdefault("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-        import ingest_mcp_server as _ims
+        import codebase_indexer_mcp_server as _ims
         cls.ims = _ims
 
     @staticmethod
@@ -1437,7 +1437,7 @@ class SyncRepoPreservesEmbeddingsOnChunkAndHashFailures(unittest.TestCase):
                 # check_embedding_model_mismatch patched out -- this test is
                 # about chunk/hash-failure preservation, not the mismatch
                 # check itself (owned by test_qdrant_model_check.py /
-                # test_ingest_mcp_server_memory_bank_guards.py). fake_client's
+                # test_codebase_indexer_mcp_server_memory_bank_guards.py). fake_client's
                 # unconfigured get_collection() returns a vectors_config the
                 # real check can't recognize, which now correctly fails
                 # closed instead of silently
@@ -1496,7 +1496,7 @@ class ManifestSelfIndex(unittest.TestCase):
     to sync_repo (its own hash changes on every _save_manifest write).
 
     Fix: extra_exclude_files parameter on iter_files/build_entries/
-    compute_file_hashes; ingest_mcp_server passes {MANIFEST_FILENAME}.
+    compute_file_hashes; codebase_indexer_mcp_server passes {MANIFEST_FILENAME}.
     """
 
     MANIFEST = ".qdrant_index_manifest.json"
@@ -1579,9 +1579,9 @@ class ManifestSelfIndex(unittest.TestCase):
             names = {f.name for f in iter_files(repo, {".py"}, extra_exclude_files=None)}
             self.assertEqual(names, {"main.py"})
 
-    # --- Integration: ingest_mcp_server passes MANIFEST_FILENAME -----------
+    # --- Integration: codebase_indexer_mcp_server passes MANIFEST_FILENAME -----------
 
-    def test_ingest_mcp_server_constant_matches_expected_filename(self):
+    def test_codebase_indexer_mcp_server_constant_matches_expected_filename(self):
         """Guards the filename constant -- if MANIFEST_FILENAME ever changes,
         this fails loudly rather than silently re-exposing the bug."""
         tools_dir = os.path.join(
@@ -1592,7 +1592,7 @@ class ManifestSelfIndex(unittest.TestCase):
         os.environ.setdefault("QDRANT_URL", "http://localhost:6333")
         os.environ.setdefault("COLLECTION_NAME", "test-collection")
         os.environ.setdefault("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-        import ingest_mcp_server as _ims
+        import codebase_indexer_mcp_server as _ims
         self.assertEqual(
             _ims.MANIFEST_FILENAME,
             ".qdrant_index_manifest.json",
@@ -1923,7 +1923,7 @@ class RustLifetimeTickScanning(unittest.TestCase):
 
 class SharedIngestDefaults(unittest.TestCase):
     """parse_csv_set/ingest_env_defaults/MANIFEST_FILENAME moved
-    into the lib so ingest_mcp_server.py and ingest_to_qdrant.py resolve them
+    into the lib so codebase_indexer_mcp_server.py and ingest_to_qdrant.py resolve them
     identically. Imported lazily via the module so a missing helper fails
     the test rather than the whole file's import."""
 

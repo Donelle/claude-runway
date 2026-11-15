@@ -37,7 +37,7 @@ REPO_ROOT = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, str(REPO_ROOT / "libs"))
 
 from qdrant_ingest_lib import MANIFEST_FILENAME, manifest_to_json  # noqa: E402
-from setup_project_lib import MalformedConfigError, run_setup  # noqa: E402
+from setup_project_lib import MalformedConfigError, build_mcp_servers, run_setup  # noqa: E402
 from upgrade_lib import (  # noqa: E402
     COMPACT_TOOLS_MATCHER,
     MIGRATIONS,
@@ -1015,10 +1015,12 @@ class RunUpgradeEndToEnd(unittest.TestCase):
         self.assertTrue(qdrant["args"][0].endswith("mcpservers/qdrant_mcp_server.py"))
         self.assertEqual(qdrant["env"]["COMPACT_EMBEDDING_MODEL"], "BAAI/bge-small-en")
         self.assertEqual(qdrant["env"]["COMPACT_COLLECTION"], "conversation-compacts")
-        # The server that was still on the old tools/ path moved with its args
-        # otherwise untouched (mcp-server-scripts-moved).
+        # The server that was still on the old tools/ path moved
+        # (mcp-server-scripts-moved) and then had its script renamed
+        # (codebase-indexer-script-renamed) in the same run, with its args
+        # otherwise untouched.
         self.assertEqual(
-            mcp_json["mcpServers"]["codebase-indexer"]["args"], ["/old/tools-repo/mcpservers/ingest_mcp_server.py"]
+            mcp_json["mcpServers"]["codebase-indexer"]["args"], ["/old/tools-repo/mcpservers/codebase_indexer_mcp_server.py"]
         )
         analytics = mcp_json["mcpServers"]["analytics"]
         self.assertEqual(analytics["command"], "/fake/venv/bin/python")
@@ -1862,7 +1864,7 @@ class McpServerScriptsMoved(unittest.TestCase):
         self.assertEqual(self._apply(mcp_json), mcp_json)
 
     def test_a_block_without_args_or_with_odd_shapes_does_not_break_detect_or_apply(self):
-        mcp_json = {"mcpServers": {"a": {"command": "x"}, "b": {"args": None}, "c": "not-a-dict", "d": {"args": [1, None]}}}
+        mcp_json = {"mcpServers": {"a": {"command": "x"}, "b": {"args": None}, "c": "not-a-dict", "d": {"args": [1, None]}, "e": {"args": 1}, "f": {"args": True}, "g": {"args": "/home/u/claude-runway/tools/qdrant_mcp_server.py"}}}
         migration = _migration(self._ID)
         self.assertFalse(migration.detect(mcp_json, {}))
         self.assertEqual(self._apply(mcp_json), mcp_json)
@@ -1885,11 +1887,13 @@ class McpServerScriptsMoved(unittest.TestCase):
             applied = run_upgrade(target, REPO_ROOT, _VENV_PYTHON, auto_yes=True)
             self.assertIn(self._ID, applied)
             written = json.loads((target / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"]
-            for name, stem in self._SCRIPTS:
+            for name, _ in self._SCRIPTS:
                 script = Path(written[name]["args"][0])
                 self.assertEqual(script.parent.name, "mcpservers", name)
-                # The rewritten path is where the script really lives.
-                self.assertTrue((REPO_ROOT / "mcpservers" / f"{stem}.py").is_file(), stem)
+                # The rewritten path is where the script really lives. Checked
+                # by the file name actually written, since --auto-yes also
+                # applies codebase-indexer-script-renamed to the indexer's path.
+                self.assertTrue((REPO_ROOT / "mcpservers" / script.name).is_file(), name)
             self.assertEqual(run_upgrade(target, REPO_ROOT, _VENV_PYTHON, auto_yes=True), [])
 
 
@@ -2171,6 +2175,125 @@ class SavingsTrackerOffer(unittest.TestCase):
         applied, _ = self._run(prompt_fn=lambda m, i, t: True, offer_savings_fn=_explode)
         self.assertNotIn("analytics", self._servers())
         self.assertNotIn("analytics-server-missing", applied)
+
+
+class CodebaseIndexerScriptRenamed(unittest.TestCase):
+    """mcpservers/ingest_mcp_server.py was renamed to
+    codebase_indexer_mcp_server.py. A config naming the old file can't start
+    the server until `upgrade` rewrites just that file name."""
+
+    _ID = "codebase-indexer-script-renamed"
+    _ROOT = "/home/u/claude-runway"
+
+    def _config(self, script_path: str) -> dict:
+        return {
+            "mcpServers": {
+                "codebase-indexer": {
+                    "command": "/venv/bin/python",
+                    "type": "stdio",
+                    "args": [script_path],
+                    "env": {"COLLECTION_NAME": "proj"},
+                },
+                "qdrant": {
+                    "command": "/venv/bin/python",
+                    "args": [f"{self._ROOT}/mcpservers/qdrant_mcp_server.py"],
+                    "env": {"KEEP": "1"},
+                },
+            }
+        }
+
+    def _old(self) -> dict:
+        return self._config(f"{self._ROOT}/mcpservers/ingest_mcp_server.py")
+
+    def _apply(self, mcp_json: dict) -> dict:
+        return _migration(self._ID).apply(mcp_json, {}, _ctx())[0]
+
+    def test_detect_true_for_the_old_file_name(self):
+        self.assertTrue(_migration(self._ID).detect(self._old(), {}))
+
+    def test_apply_rewrites_only_the_file_name(self):
+        before = self._old()
+        after = self._apply(before)
+        indexer = after["mcpServers"]["codebase-indexer"]
+        self.assertEqual(indexer["args"], [f"{self._ROOT}/mcpservers/codebase_indexer_mcp_server.py"])
+        for key in ("command", "type", "env"):
+            self.assertEqual(indexer[key], before["mcpServers"]["codebase-indexer"][key], key)
+        self.assertEqual(after["mcpServers"]["qdrant"], before["mcpServers"]["qdrant"])
+        # And it never mutates its input.
+        self.assertEqual(before, self._old())
+
+    def test_apply_is_idempotent_and_a_rerun_detects_nothing(self):
+        once = self._apply(self._old())
+        self.assertFalse(_migration(self._ID).detect(once, {}))
+        self.assertEqual(self._apply(once), once)
+
+    def test_a_renamed_server_key_is_migrated_too(self):
+        mcp_json = self._old()
+        mcp_json["mcpServers"]["my-indexer"] = mcp_json["mcpServers"].pop("codebase-indexer")
+        self.assertTrue(_migration(self._ID).detect(mcp_json, {}))
+        after = self._apply(mcp_json)
+        self.assertEqual(
+            after["mcpServers"]["my-indexer"]["args"], [f"{self._ROOT}/mcpservers/codebase_indexer_mcp_server.py"]
+        )
+
+    def test_a_windows_backslash_path_keeps_its_separators(self):
+        mcp_json = self._config("C:\\repos\\claude-runway\\mcpservers\\ingest_mcp_server.py")
+        self.assertTrue(_migration(self._ID).detect(mcp_json, {}))
+        after = self._apply(mcp_json)["mcpServers"]["codebase-indexer"]["args"]
+        self.assertEqual(after, ["C:\\repos\\claude-runway\\mcpservers\\codebase_indexer_mcp_server.py"])
+
+    def test_a_pipx_env_path_is_rewritten_too(self):
+        root = "/home/u/.local/pipx/venvs/claude-runway/src"
+        after = self._apply(self._config(f"{root}/mcpservers/ingest_mcp_server.py"))
+        self.assertEqual(
+            after["mcpServers"]["codebase-indexer"]["args"], [f"{root}/mcpservers/codebase_indexer_mcp_server.py"]
+        )
+
+    def test_a_fresh_init_config_is_not_detected(self):
+        fresh = build_mcp_servers(
+            json.loads((REPO_ROOT / "templates" / "mcp.json.template").read_text(encoding="utf-8")),
+            collection_name="proj",
+            venv_python=_VENV_PYTHON,
+            tools_repo_dir=Path(self._ROOT),
+            home_dir=Path("/home/u"),
+        )
+        self.assertFalse(_migration(self._ID).detect({"mcpServers": fresh}, {}))
+
+    def test_a_lookalike_outside_mcpservers_or_tools_is_not_touched(self):
+        mcp_json = self._config("/home/u/elsewhere/ingest_mcp_server.py")
+        self.assertFalse(_migration(self._ID).detect(mcp_json, {}))
+        self.assertEqual(self._apply(mcp_json), mcp_json)
+
+    def test_a_tools_path_is_detected_but_left_for_mcp_server_scripts_moved(self):
+        # Detected, so one run on a very old install offers both migrations,
+        # but apply alone must not write a tools/codebase_indexer_mcp_server.py
+        # that never existed.
+        mcp_json = self._config(f"{self._ROOT}/tools/ingest_mcp_server.py")
+        self.assertTrue(_migration(self._ID).detect(mcp_json, {}))
+        self.assertEqual(self._apply(mcp_json), mcp_json)
+
+    def test_both_migrations_chain_in_list_order(self):
+        mcp_json = self._config(f"{self._ROOT}/tools/ingest_mcp_server.py")
+        moved = _migration("mcp-server-scripts-moved").apply(mcp_json, {}, _ctx())[0]
+        after = self._apply(moved)
+        self.assertEqual(
+            after["mcpServers"]["codebase-indexer"]["args"], [f"{self._ROOT}/mcpservers/codebase_indexer_mcp_server.py"]
+        )
+        ids = [m.id for m in MIGRATIONS]
+        self.assertLess(ids.index("mcp-server-scripts-moved"), ids.index(self._ID))
+
+    def test_odd_shapes_do_not_break_detect_or_apply(self):
+        mcp_json = {"mcpServers": {"a": {"command": "x"}, "b": {"args": None}, "c": "not-a-dict", "d": {"args": [1, None]}, "e": {"args": 1}, "f": {"args": True}, "g": {"args": "/home/u/claude-runway/mcpservers/ingest_mcp_server.py"}}}
+        migration = _migration(self._ID)
+        self.assertFalse(migration.detect(mcp_json, {}))
+        self.assertEqual(self._apply(mcp_json), mcp_json)
+        self.assertFalse(migration.detect({}, {}))
+        self.assertFalse(migration.detect({"mcpServers": []}, {}))
+
+    def test_settings_json_is_returned_untouched(self):
+        settings = {"hooks": {"SessionStart": []}}
+        _, settings_after = _migration(self._ID).apply(self._old(), settings, _ctx())
+        self.assertEqual(settings_after, settings)
 
 
 if __name__ == "__main__":

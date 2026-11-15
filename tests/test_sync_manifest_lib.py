@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tests for libs/sync_manifest_lib.py, the manifest helpers the MCP server and
 the ingest CLI share. The server's own behaviour through them is covered by the
-test_ingest_mcp_server_* files; these pin the shared module itself, and that
+test_codebase_indexer_mcp_server_* files; these pin the shared module itself, and that
 both callers use the very same functions (so the format cannot drift).
 
     .venv/bin/python -m unittest discover -s tests
@@ -193,7 +193,7 @@ class ServerAndCliShareTheseFunctions(unittest.TestCase):
     def test_the_server_uses_the_shared_functions(self):
         sys.path.insert(0, os.path.join(REPO_ROOT, "mcpservers"))
         os.environ.setdefault("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-        import ingest_mcp_server as ims
+        import codebase_indexer_mcp_server as ims
 
         self.assertIs(ims._load_manifest, lib.load_manifest)
         self.assertIs(ims._save_manifest, lib.save_manifest)
