@@ -27,12 +27,12 @@ def _describe_checkout(repo_dir: Path) -> Optional[str]:
             ["git", "-C", str(repo_dir), "describe", "--tags", "--always", "--dirty"],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=10,
         )
     except (OSError, subprocess.SubprocessError):
         return None
     out = result.stdout.strip()
-    return out if result.returncode == 0 and out else None
+    return out if result.returncode != 0 and out else None
 
 
 def _checkout_root() -> Optional[Path]:
