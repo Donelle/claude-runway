@@ -54,7 +54,7 @@ Run this once to seed the collection, then re-run periodically (or on a
 schedule) to pick up changes. Re-running without --reset will add duplicate
 chunks; pass --reset to wipe the collection's unprotected points (everything except memory-bank points and compacts carrying the source marker) before indexing.
 
-Project minimum: Python 3.12 (policy floor; the dependency chain supports >=3.10).
+Project minimum: Python 3.12.
 """
 
 import argparse
@@ -239,7 +239,7 @@ async def _ingest(args, manifest_lock: ManifestLock):
         # the file_path index backfill -- with EVERY Qdrant call
         # retry-wrapped. This copy used to skip call_with_retry on the
         # non-reset collection_exists/ensure_file_path_index, so one vpnkit
-        # dropped connection (README's Known limitations) aborted the
+        # dropped connection (docs/known-limitations.md) aborted the
         # first-big-index run docs/installation.md recommends. The CLI never
         # refuses to index into a non-empty collection (its docstring documents
         # --reset instead), so the existing_points_guard is passed only under

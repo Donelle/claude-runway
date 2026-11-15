@@ -43,10 +43,11 @@ so this module knows nothing about prompts, models' APIs or findings.
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Callable, Iterable, Optional, Sequence
+from typing import Any, Callable, Iterable, Optional, Sequence
 
 from codebase_reviewer_config_lib import ROLES, Reviewer, ReviewersConfig
 from lmstudio_model_loader_lib import ModelLoader, ModelLoadError, ModelNotLoadedError
+from reviewer_db_lib import NULL_RECORDER
 
 
 @dataclass(frozen=True)
@@ -181,6 +182,7 @@ def run_stages(
     max_reviewers: int,
     *,
     roles: Sequence[str] = ROLES,
+    recorder: Any = NULL_RECORDER,
 ) -> RunReport:
     """Runs the stage plan for `config`'s active reviewers.
 
@@ -189,34 +191,42 @@ def run_stages(
     reviewer runs if a resident model is not loaded. A `loadOnDemand` model
     that fails to load fails only the reviewers that needed it (their outcomes
     carry the error); the rest of the run continues. Everything this call
-    loaded is unloaded before it returns, even on an exception."""
+    loaded is unloaded before it returns, even on an exception.
+
+    `recorder` (see `reviewer_db_lib`) times each stage; it is never required, and nothing it does can
+    change what runs. The loader's own `observer` is what records loads and unloads."""
     stages = plan_stages(config, roles)
     report = RunReport()
     check_resident_models(stages, loader)
     try:
         for index, stage in enumerate(stages):
             upcoming = stages[index + 1].models() if index + 1 < len(stages) else set()
-            report.outcomes.extend(
-                _run_segment([r for g in stage.resident for r in g.reviewers], stage.role, run_reviewer, max_reviewers)
-            )
-            for group in order_for_carry_over(stage.on_demand, loader.owned_models, upcoming):
-                try:
-                    # Never load on top of a model this run still holds: the
-                    # point of loadOnDemand is a machine that cannot hold both.
-                    for other in [m for m in loader.owned_models if m != group.model]:
-                        loader.release(other)
-                    loader.acquire(group.model, load_on_demand=True, context_length=group.context_length)
-                except ModelLoadError as exc:
-                    report.outcomes.extend(
-                        ReviewerOutcome(role=stage.role, reviewer=r, error=str(exc)) for r in group.reviewers
-                    )
-                    continue
-                report.outcomes.extend(_run_segment(group.reviewers, stage.role, run_reviewer, max_reviewers))
-                if group.model not in upcoming:
+            with recorder.stage(stage.role, models=tuple(sorted(stage.models()))):
+                report.outcomes.extend(
+                    _run_segment([r for g in stage.resident for r in g.reviewers], stage.role, run_reviewer, max_reviewers)
+                )
+                for group in order_for_carry_over(stage.on_demand, loader.owned_models, upcoming):
                     try:
-                        loader.release(group.model)
+                        # Never load on top of a model this run still holds: the
+                        # point of loadOnDemand is a machine that cannot hold both.
+                        for other in [m for m in loader.owned_models if m != group.model]:
+                            loader.release(other)
+                        loader.acquire(group.model, load_on_demand=True, context_length=group.context_length)
                     except ModelLoadError as exc:
-                        report.warnings.append(str(exc))
+                        report.outcomes.extend(
+                            ReviewerOutcome(role=stage.role, reviewer=r, error=str(exc)) for r in group.reviewers
+                        )
+                        continue
+                    report.outcomes.extend(_run_segment(group.reviewers, stage.role, run_reviewer, max_reviewers))
+                    if group.model not in upcoming:
+                        try:
+                            loader.release(group.model)
+                        except ModelLoadError as exc:
+                            report.warnings.append(str(exc))
+                # A reviewer can fail before it sends any request (a diff too big for it, a model that never
+                # loaded); the recorder only sees requests and loads, so it is told here.
+                if any(o.role == stage.role and o.error is not None for o in report.outcomes):
+                    recorder.reviewer_failed(stage.role)
     finally:
         report.warnings.extend(loader.release_all())
     return report

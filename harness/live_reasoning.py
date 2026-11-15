@@ -7,6 +7,7 @@
     .venv/bin/python harness/live_reasoning.py --case own-diff        # this checkout's branch vs origin/main, unscored
     .venv/bin/python harness/live_reasoning.py --case own-planted     # the same, with one shell-injection planted in a real file
     .venv/bin/python harness/live_reasoning.py --config my-config.json --show-config   # what a config resolves to, no LM Studio
+    .venv/bin/python harness/live_reasoning.py --config my-config.json --run-type live  # the harness-live-tests branch, scored from my-config.baselines.json
 
 With --config, every active reviewer in the file that has the `reasoning` role runs, each with its own model and
 prompt, instead of the single reviewer --model/--prompt build; see README.md for the file.
@@ -32,6 +33,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import harness_lib as h  # noqa: E402
+import live_branch_lib as lb  # noqa: E402
 from cases import ALL_CASES  # noqa: E402
 from reasoning_reviewer_lib import format_review  # noqa: E402
 
@@ -44,6 +46,7 @@ PLANT_NEW = ('done = subprocess.run("git -C " + repo_path + " diff " + base_ref 
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     h.add_model_options(parser, config=True)
+    h.add_run_type_option(parser)
     parser.add_argument("--case", action="append", choices=[*ALL_CASES, "own-diff", "own-planted"],
                         help="case to run (repeatable); default seeded-three and clean")
     parser.add_argument("--base", default="origin/main", help="base ref for own-diff / own-planted")
@@ -108,14 +111,36 @@ def run_history(path: str, args: argparse.Namespace, recorder: h.Recorder, revie
     print(h.parity_line(case, scores))
 
 
+def run_live(args: argparse.Namespace, repo: Path, tags: tuple, recorder: h.Recorder, reviewers: list) -> None:
+    """The `live` run type: review `base...<tag>` on the harness-live-tests branch for each tag the sidecar names, and
+    score each against that tag's bugs and decoys, per evidence kind (see `live_branch_lib.py`)."""
+    scores_by_tag: dict = {}
+    for tag in tags:
+        print(f"===== live {tag.tag_id}  reviewers: {h.describe_reviewers(reviewers)}  runs={args.runs}")
+        scores = []
+        for run in range(1, args.runs + 1):
+            findings, review = h.run_reasoning(repo, lb.BASE_REF, tag.head, reviewers, args, recorder)
+            scores.append(lb.score_tag(findings, tag))
+            for error in review.errors:
+                print(f"  run {run}: reviewer error: {error}")
+        scores_by_tag[tag.tag_id] = scores
+        print(lb.format_tag(tag, scores))
+    print("===== per evidence kind")
+    print("\n".join(lb.summary_lines(tags, scores_by_tag)))
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
+    if args.run_type == "live" and (args.case or args.history):
+        raise SystemExit("--run-type live reviews the tags in the live sidecar: --case and --history belong to a synthetic run, drop them.")
     if args.show_config:
         print(h.describe_config(args))
         return 0
     if not h.stage_selected(args, "reasoning"):
         print(f"--config selects the stage(s) {list(h.selected_stages(args))}; reasoning is not one of them, so there is nothing for this script to run.")
         return 0
+    # Before any model loads: a missing sidecar or tag must stop the run here, not after a load.
+    live_repo, live_tags = lb.live_target(args) if args.run_type == "live" else (h.REPO_ROOT, ())
     reviewers = h.stage_reviewers(args, "reasoning")
     h.preflight_reviewers(reviewers, args)
     base_url = h.load_server().lmstudio_base_url()
@@ -123,6 +148,10 @@ def main(argv=None) -> int:
     recorder = h.Recorder()
     with tempfile.TemporaryDirectory(prefix="live-reasoning-") as tmp:
         scratch = Path(tmp)
+        if args.run_type == "live":
+            run_live(args, live_repo, live_tags, recorder, reviewers)
+            print(h.report_run(args, recorder, base_url, before))
+            return 0
         for path in args.history:
             print(f"===== history {path}  reviewers: {h.describe_reviewers(reviewers)}  runs={args.runs}")
             run_history(path, args, recorder, reviewers)

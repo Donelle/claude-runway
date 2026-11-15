@@ -19,9 +19,12 @@ REPO_ROOT = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, str(REPO_ROOT / "libs"))
 
 from codebase_reviewer_config_lib import (  # noqa: E402
+    DEFAULT_REPLY_FORMAT,
     LEVELS,
+    REPLY_FORMATS,
     ROLES,
     ConfigError,
+    advisories,
     describe_config,
     load_prompt,
     load_reviewers_file,
@@ -33,8 +36,8 @@ from codebase_reviewer_config_lib import (  # noqa: E402
 def _valid() -> dict:
     return {
         "rubric": [
-            {"name": "misleading-content", "level": "low", "definition": "a misleading message.", "score": 2},
-            {"name": "data-loss", "level": "high", "definition": "loses data.", "score": 4},
+            {"name": "misleading-content", "level": "low", "definition": "a misleading message.", "score": 0.4},
+            {"name": "data-loss", "level": "high", "definition": "loses data.", "score": 0.8},
         ],
         "reviewers": [
             {
@@ -77,7 +80,7 @@ class ValidFile(unittest.TestCase):
         config = validate_reviewers(_valid())
         self.assertEqual([e.name for e in config.rubric], ["misleading-content", "data-loss"])
         self.assertEqual(config.rubric[1].level, "high")
-        self.assertEqual(config.rubric[1].score, 4)
+        self.assertEqual(config.rubric[1].score, 0.8)
         quoting, classifier = config.reviewers
         self.assertEqual(quoting.roles, ("reasoning", "verifier"))
         self.assertFalse(quoting.load_on_demand)
@@ -102,7 +105,7 @@ class ValidFile(unittest.TestCase):
 
     def test_several_entries_may_share_a_level(self):
         data = _valid()
-        data["rubric"].append({"name": "other-low", "level": "low", "definition": "d", "score": 1})
+        data["rubric"].append({"name": "other-low", "level": "low", "definition": "d", "score": 0.1})
         self.assertEqual(len(validate_reviewers(data).rubric), 3)
 
     def test_empty_lists_are_allowed(self):
@@ -112,7 +115,7 @@ class ValidFile(unittest.TestCase):
 
     def test_describe_config_lists_rubric_and_reviewers(self):
         text = describe_config(validate_reviewers(_valid()))
-        self.assertIn("misleading-content [low, min confidence 2]", text)
+        self.assertIn("misleading-content [low, min average probability 0.4]", text)
         self.assertIn("classifier: active, classifier, model model-b (loaded on demand, context 32768)", text)
         self.assertIn("quoting: active, reasoning/verifier, model model-a (must already be loaded)", text)
 
@@ -152,16 +155,18 @@ class SchemaErrors(unittest.TestCase):
         problems = _problems(data)
         self.assertTrue(any("duplicate reviewer name 'quoting'" in p for p in problems))
 
-    def test_score_must_be_a_whole_number_from_1_to_5(self):
-        for bad in (0, 6, -1, 2.5, "3", True, None):
+    def test_score_must_be_a_probability_above_0_and_at_most_1(self):
+        # 2 and 3 are the old 1-5 scores: refused, not read as something else.
+        for bad in (0, 0.0, -0.1, 1.01, 2, 3, 5, "0.5", True, None):
             with self.subTest(score=bad):
                 data = _valid()
                 data["rubric"][0]["score"] = bad
-                self.assertTrue(any("'score' must be a whole number from 1 to 5" in p for p in _problems(data)))
-        for good in (1, 5):
-            data = _valid()
-            data["rubric"][0]["score"] = good
-            validate_reviewers(data)
+                self.assertTrue(any("'score' must be a probability above 0 and at most 1" in p for p in _problems(data)))
+        for good in (0.01, 0.5, 0.7, 1, 1.0):
+            with self.subTest(score=good):
+                data = _valid()
+                data["rubric"][0]["score"] = good
+                self.assertEqual(validate_reviewers(data).rubric[0].score, float(good))
 
     def test_blank_or_missing_required_strings(self):
         for key in ("name", "definition"):
@@ -228,7 +233,7 @@ class SchemaErrors(unittest.TestCase):
         data = _valid()
         data["rubric"][0]["level"] = "critical"
         data["rubric"][1]["name"] = "misleading-content"
-        data["rubric"][1]["score"] = 9
+        data["rubric"][1]["score"] = 9  # not a probability
         data["reviewers"][0]["model"] = ""
         data["reviewers"][1]["type"] = ["judge"]
         data["reviewers"][1]["loadOnDemand"] = "yes"
@@ -338,13 +343,15 @@ class LoadFile(unittest.TestCase):
         missing = self.dir / "absent.json"
         with self.assertRaises(ConfigError) as ctx:
             load_reviewers_file(str(missing))
-        self.assertIn(str(missing), str(ctx.exception))
+        # The message quotes the path with repr(), which doubles every backslash in a
+        # Windows path; compare against the same quoted form so the check holds on both.
+        self.assertIn(repr(str(missing)), str(ctx.exception))
         self.assertIn("does not exist", str(ctx.exception))
 
     def test_a_directory_is_not_a_file(self):
         with self.assertRaises(ConfigError) as ctx:
             load_reviewers_file(str(self.dir))
-        self.assertIn(str(self.dir), str(ctx.exception))
+        self.assertIn(repr(str(self.dir)), str(ctx.exception))  # repr-quoted, see above
         self.assertIn("not a file", str(ctx.exception))
 
     def test_an_unreadable_file_names_the_path_and_the_cause(self):
@@ -369,7 +376,7 @@ class LoadFile(unittest.TestCase):
         path = self._write("{not json")
         with self.assertRaises(ConfigError) as ctx:
             load_reviewers_file(str(path))
-        self.assertIn(str(path), str(ctx.exception))
+        self.assertIn(repr(str(path)), str(ctx.exception))  # repr-quoted, see above
         self.assertIn("not valid JSON", str(ctx.exception))
 
     def test_content_problems_are_all_reported_with_the_path(self):
@@ -380,7 +387,7 @@ class LoadFile(unittest.TestCase):
         with self.assertRaises(ConfigError) as ctx:
             load_reviewers_file(str(path))
         self.assertEqual(len(ctx.exception.problems), 2)
-        self.assertIn(str(path), str(ctx.exception))
+        self.assertIn(repr(str(path)), str(ctx.exception))  # repr-quoted, see above
 
     def test_a_relative_path_resolves_against_base_dir(self):
         self._write(_valid())
@@ -539,6 +546,107 @@ class PromptSources(unittest.TestCase):
         text = describe_config(self._config(promptFile="lens.md"))
         self.assertIn("prompt: inline text + " + str(self.dir / "lens.md"), text)
         self.assertIn("prompt: inline text", text)
+
+
+class ReplyFormatAndTranslator(unittest.TestCase):
+    """`replyFormat` (how the reasoning reply is read) and `translator` (a script that converts it first)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = Path(self._tmp.name)
+        (self.dir / "tr.py").write_text("print('x')\n", encoding="utf-8")
+
+    def _config(self, **change):
+        data = _valid()
+        data["reviewers"][0].update(change)
+        return validate_reviewers(data, base_dir=self.dir)
+
+    def _problems_for(self, **change):
+        data = _valid()
+        data["reviewers"][0].update(change)
+        return _problems(data, base_dir=self.dir)
+
+    def test_the_default_is_lines_and_json_stays_selectable(self):
+        self.assertEqual(DEFAULT_REPLY_FORMAT, "lines")
+        self.assertEqual(REPLY_FORMATS, ("lines", "json"))
+        self.assertEqual(self._config().reviewers[0].reply_format, "lines")
+        for value in REPLY_FORMATS:
+            self.assertEqual(self._config(replyFormat=value).reviewers[0].reply_format, value)
+
+    def test_an_unknown_or_mistyped_format_is_a_problem_naming_the_choices(self):
+        for value in ("JSON", "xml", "", None, 3, ["lines"]):
+            with self.subTest(value=value):
+                problems = self._problems_for(replyFormat=value)
+                self.assertTrue(any("'replyFormat' must be one of lines, json" in p for p in problems), problems)
+
+    def test_both_keys_are_allowed(self):
+        reviewer = self._config(replyFormat="json", translator="tr.py").reviewers[0]  # no ConfigError: both are known keys
+        self.assertEqual((reviewer.reply_format, reviewer.translator), ("json", str(self.dir / "tr.py")))
+
+    def test_no_translator_is_the_empty_string(self):
+        self.assertEqual(self._config().reviewers[0].translator, "")
+
+    def test_a_translator_resolves_against_the_reviewers_file_directory(self):
+        self.assertEqual(self._config(translator="tr.py").reviewers[0].translator, str(self.dir / "tr.py"))
+
+    def test_a_missing_file_a_directory_and_a_non_string_are_each_a_problem(self):
+        (self.dir / "adir").mkdir()
+        for value in ("nope.py", "adir"):
+            with self.subTest(value=value):
+                self.assertTrue(any("'translator'" in p and "is not a file" in p for p in self._problems_for(translator=value)))
+        for value in ("", "  ", 5, None):
+            with self.subTest(value=value):
+                self.assertTrue(any("'translator' must be a non-empty path" in p for p in self._problems_for(translator=value)))
+
+    @unittest.skipIf(os.name == "nt", "the executable bit means nothing on Windows")
+    def test_a_script_that_is_not_python_has_to_be_executable(self):
+        script = self.dir / "convert"
+        script.write_text("#!/bin/sh\ncat\n", encoding="utf-8")
+        script.chmod(0o644)
+        self.assertTrue(any("is not executable" in p for p in self._problems_for(translator="convert")))
+        script.chmod(0o755)
+        self.assertEqual(self._config(translator="convert").reviewers[0].translator, str(script))
+
+    def test_describe_config_shows_a_format_and_translator_only_when_they_matter(self):
+        plain = describe_config(self._config())
+        self.assertNotIn("reply format", plain)
+        self.assertNotIn("translator", plain)
+        text = describe_config(self._config(replyFormat="json", translator="tr.py"))
+        self.assertIn("reply format: json", text)
+        self.assertIn("translator: " + str(self.dir / "tr.py"), text)
+
+    def test_a_prompt_file_on_a_reasoning_reviewer_gets_an_advisory_naming_the_format(self):
+        (self.dir / "lens.md").write_text("A lens that says how to reply.\n", encoding="utf-8")
+        notes = advisories(self._config(promptFile="lens.md"))
+        self.assertTrue(any("'quoting'" in n and "replaces the built-in reply instructions" in n and "'lines'" in n for n in notes), notes)
+        notes = advisories(self._config(promptFile="lens.md", replyFormat="json"))
+        self.assertTrue(any("'json'" in n for n in notes), notes)
+
+    def test_no_prompt_file_no_such_advisory(self):
+        self.assertFalse(any("promptFile" in n for n in advisories(self._config())))
+
+
+class SamplingIsGone(unittest.TestCase):
+    """A classifier is asked once per rubric entry, at temperature 0, and its token probabilities are read, so there is
+    nothing to sample: `samples` and `temperature` are not settings any more."""
+
+    def test_samples_and_temperature_are_unknown_keys_on_any_reviewer(self):
+        for key, value in (("samples", 3), ("temperature", 0.7)):
+            for index in (0, 1):  # a reasoning/verifier reviewer and the classifier
+                with self.subTest(key=key, reviewer=index):
+                    data = _valid()
+                    data["reviewers"][index][key] = value
+                    problems = _problems(data)
+                    self.assertTrue(any(f"'{key}'" in p and "unknown" in p.lower() for p in problems), problems)
+
+    def test_a_reviewer_has_no_sampling_fields(self):
+        reviewer = validate_reviewers(_valid()).reviewers[1]
+        self.assertFalse(hasattr(reviewer, "samples"))
+        self.assertFalse(hasattr(reviewer, "temperature"))
+
+    def test_describe_config_says_nothing_about_samples(self):
+        self.assertNotIn("sample", describe_config(validate_reviewers(_valid())))
 
 
 _ABSENT = object()

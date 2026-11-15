@@ -1,5 +1,5 @@
 {
-  "stages": ["reasoning"],
+  "stages": ["reasoning", "verifier", "classifier"],
   "reviewers": [
     {
       "name": "injection",
@@ -21,7 +21,7 @@
     },
     {
       "name": "verifier",
-      "model": "deepseek-r1-distill-qwen-7b",
+      "model": "deepseek-r1-distill-qwen-7b@4bit",
       "prompt": "You confirm a reported defect with a concrete failing input, or reject it.",
       "active": true,
       "type": ["verifier"],
@@ -30,8 +30,8 @@
     },
     {
       "name": "classifier",
-      "model": "qwen2.5-coder-3b-instruct-8bit",
-      "prompt": "You match a verified finding to one rubric entry and say how sure you are, from 1 to 5.",
+      "model": "qwen2.5-coder-7b-instruct-mlx",
+      "prompt": "You check whether a reported defect falls under a category's definition.",
       "active": true,
       "type": ["classifier"],
       "loadOnDemand": true,
@@ -39,11 +39,13 @@
     }
   ],
   "rubric": [
-    {"name": "injection-or-traversal", "level": "high", "score": 3,
+    {"name": "injection-or-traversal", "level": "high", "score": 0.5,
      "definition": "Untrusted input reaches a shell, a SQL statement or a filesystem path without validation."},
-    {"name": "crash-on-input", "level": "moderate", "score": 3,
+    {"name": "crash-on-input", "level": "moderate", "score": 0.5,
      "definition": "A valid or empty input makes the code raise an unhandled exception."},
-    {"name": "style-only", "level": "low", "score": 4,
+    {"name": "wrong-result", "level": "moderate", "score": 0.5,
+     "definition": "The code returns or changes the wrong data for valid input: a bad formula, an off-by-one, state shared between calls."},
+    {"name": "style-only", "level": "low", "score": 0.75,
      "definition": "Naming, formatting or readability, with no effect on behaviour."}
   ]
 }

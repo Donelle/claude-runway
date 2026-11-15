@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-One bounded wait for Copilot's review of a specific commit (used by /my-gh-autowork's
+One bounded wait for Copilot's review of a specific commit (used by /cr-gh-autowork's
 subagent prompt, Step 19). Prints `review:<id>` lines for new reviews, or `NOT_YET`.
 
     python tools/poll_copilot_review.py --pr <PR> --head-sha <40-char sha> \

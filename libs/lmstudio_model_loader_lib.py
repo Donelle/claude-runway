@@ -23,11 +23,16 @@ The rules this module enforces, and why:
     `release` or `release_all`, so a caller that holds it between two stages
     loads it once.
 
+An optional `observer` (the run recorder of `reviewer_db_lib`) is told how long each load and unload
+took and what LM Studio reports about the model. It is told on a best-effort basis: whatever it does
+or raises, the load or unload goes on exactly as it would without one.
+
 Standard library only; the HTTP call is injectable (`http`) so every rule above
 is tested without a network or LM Studio.
 """
 
 import json
+import time
 import urllib.error
 import urllib.request
 from typing import Callable, Optional
@@ -71,6 +76,15 @@ def rest_root(base_url: str) -> str:
     return root
 
 
+def reviewer_api_url(base_url: str) -> str:
+    """The URL the codebase-reviewer's completion client is built on: LM Studio's native REST API
+    (`{root}/api/v0`) rather than the OpenAI-compatible `/v1`. The two answer chat completions in the same
+    shape, but only the native one fills in the response's `stats` (time to first token, tokens per second,
+    generation time, stop reason), which the run database records. The model loader above already needs this
+    API, so a reviewer already requires it."""
+    return rest_root(base_url) + "/api/v0"
+
+
 def _http_error_detail(exc: BaseException) -> str:
     """The server's own message for an HTTP error (LM Studio puts the reason in
     the body), else the exception text."""
@@ -84,9 +98,10 @@ def _http_error_detail(exc: BaseException) -> str:
 
 
 class ModelLoader:
-    def __init__(self, base_url: str, *, http: Optional[HttpFn] = None):
+    def __init__(self, base_url: str, *, http: Optional[HttpFn] = None, observer: Optional[object] = None):
         self._root = rest_root(base_url)
         self._http: HttpFn = http or _urllib_http
+        self.observer = observer
         # model id -> the instance id of the load THIS loader performed.
         self._owned: dict = {}
 
@@ -110,6 +125,30 @@ class ModelLoader:
             if isinstance(entry, dict) and entry.get("state") == "loaded" and isinstance(entry.get("id"), str)
         }
 
+    def model_details(self, model: str) -> Optional[dict]:
+        """What LM Studio reports for `model` (id, publisher, arch, compatibility_type, quantization,
+        max_context_length, loaded_context_length, state), or None when it cannot be asked or the model is
+        not listed. Never raises: it only feeds a recorder."""
+        try:
+            payload = self._http("GET", f"{self._root}/api/v0/models", None, LIST_TIMEOUT_SECONDS)
+            data = payload.get("data") if isinstance(payload, dict) else None
+            for entry in data if isinstance(data, list) else []:
+                if isinstance(entry, dict) and entry.get("id") == model:
+                    return entry
+        except Exception:
+            pass
+        return None
+
+    def _tell(self, method: str, *args) -> None:
+        """Calls `observer.<method>(*args)` if there is an observer; whatever it raises is swallowed."""
+        observer = self.observer
+        if observer is None:
+            return
+        try:
+            getattr(observer, method)(*args)
+        except Exception:
+            pass
+
     @property
     def owned_models(self) -> list:
         """Models this loader loaded and has not yet unloaded, in load order."""
@@ -132,6 +171,8 @@ class ModelLoader:
             return False
         loaded = self.loaded_model_ids()
         if model in loaded:
+            if self.observer is not None:
+                self._tell("model_seen", self.model_details(model))
             return False
         if not load_on_demand:
             raise ModelNotLoadedError(
@@ -142,14 +183,21 @@ class ModelLoader:
         if context_length:
             body["context_length"] = context_length
         url = f"{self._root}/api/v1/models/load"
+        started = time.time()
         try:
             response = self._http("POST", url, body, LOAD_TIMEOUT_SECONDS)
         except Exception as exc:
-            raise ModelLoadError(f"could not load model {model!r} ({_http_error_detail(exc)})") from exc
+            # Read once: an HTTP error's body can be read only the first time.
+            detail = _http_error_detail(exc)
+            self._tell("model_loaded", model, started, time.time(), False, detail, None)
+            raise ModelLoadError(f"could not load model {model!r} ({detail})") from exc
+        ended = time.time()
         instance = response.get("instance_id") if isinstance(response, dict) else None
         # An LM Studio that does not echo the instance id: the model id is the
         # instance id of a model loaded under its default identifier.
         self._owned[model] = instance if isinstance(instance, str) and instance else model
+        if self.observer is not None:
+            self._tell("model_loaded", model, started, ended, True, None, self.model_details(model))
         return True
 
     def release(self, model: str) -> bool:
@@ -160,11 +208,15 @@ class ModelLoader:
         if instance is None:
             return False
         url = f"{self._root}/api/v1/models/unload"
+        started = time.time()
         try:
             self._http("POST", url, {"instance_id": instance}, UNLOAD_TIMEOUT_SECONDS)
         except Exception as exc:
+            detail = _http_error_detail(exc)
+            self._tell("model_unloaded", model, started, time.time(), False, detail)
             # Still ours, so a later release_all can retry it.
-            raise ModelLoadError(f"could not unload model {model!r} ({_http_error_detail(exc)})") from exc
+            raise ModelLoadError(f"could not unload model {model!r} ({detail})") from exc
+        self._tell("model_unloaded", model, started, time.time(), True, None)
         del self._owned[model]
         return True
 

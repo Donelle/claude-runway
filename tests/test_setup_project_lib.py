@@ -174,6 +174,13 @@ class BuildMcpServers(unittest.TestCase):
         self.assertNotIn("analytics", servers)
         self.assertEqual(servers["memory-bank"]["env"]["CLAUDE_RUNWAY_METRICS_DB"], "/x/m.db")
 
+    def test_metrics_db_override_reaches_the_codebase_reviewer_too(self):
+        # The reviewer writes a summary event per review into the same store; without the override it would write
+        # those events to the default file while everything else uses the custom one.
+        servers = self._build(codebase_reviewer=True, metrics_db="/x/m.db")
+        self.assertEqual(servers["codebase-reviewer"]["env"]["CLAUDE_RUNWAY_METRICS_DB"], "/x/m.db")
+        self.assertNotIn("CLAUDE_RUNWAY_METRICS_DB", self._build(codebase_reviewer=True)["codebase-reviewer"]["env"])
+
     def test_memory_bank_has_no_metrics_key_when_not_overridden(self):
         # A blank value would mask the inherited shell value, so it is omitted.
         self.assertNotIn("CLAUDE_RUNWAY_METRICS_DB", self._build(track_savings=True)["memory-bank"]["env"])
@@ -242,7 +249,7 @@ class BuildMcpServers(unittest.TestCase):
         # conversation-compact history, since qdrant_mcp_server.py's
         # sibling-scan/canonical-name computation both key off this exact
         # string. A per-project default is still worth having for NEW
-        # setups -- that's what /my-setup-clauderunway's own Q5 computes
+        # setups -- that's what /cr-setup's own Q5 computes
         # and passes explicitly instead, the same way it always explicitly
         # passes --collection-name rather than relying on this function's
         # own bare fallback.
@@ -361,6 +368,16 @@ class BuildSettingsHooks(unittest.TestCase):
             )
             with self.assertRaises(AssertionError):
                 _find_block_args(hooks, "PostToolUse", "record_session_id.py")
+
+    def test_pr_round_capture_hook_present_regardless_of_compress(self):
+        # session_end_pr_rounds.py is a CORE SessionEnd hook, written whether or not
+        # local-compress is included (it is a silent no-op until its opt-in is exported).
+        for include_compress in (True, False):
+            hooks = self._build(include_compress=include_compress)
+            self.assertEqual(
+                _find_block_args(hooks, "SessionEnd", "session_end_pr_rounds.py"),
+                ["/home/user/tools/claude-runway/hooks/session_end_pr_rounds.py"],
+            )
 
     def test_include_compress_false_drops_compress_gated_blocks(self):
         hooks = self._build(include_compress=False)
@@ -699,11 +716,16 @@ class RunSetupEndToEnd(unittest.TestCase):
         # record_session_id.py lives under SessionStart, so
         # PostToolUse held only the compress block, now stripped → empty
         # list. SessionStart has the core record_session_id.py
-        # block. SessionEnd has record_session_id.py only (no savings hook).
+        # block. SessionEnd has the two core blocks only (record_session_id.py and
+        # session_end_pr_rounds.py; no savings hook).
         self.assertEqual(len(second.settings_json["hooks"]["SessionStart"]), 1)
         self.assertEqual(len(second.settings_json["hooks"]["PostToolUse"]), 0)
         self.assertEqual(second.settings_json["hooks"]["PreToolUse"], [])
-        self.assertEqual(len(second.settings_json["hooks"]["SessionEnd"]), 1)
+        self.assertEqual(len(second.settings_json["hooks"]["SessionEnd"]), 2)
+        self.assertEqual(
+            _find_block_args(second.settings_json["hooks"], "SessionEnd", "session_end_pr_rounds.py"),
+            [f"{REPO_ROOT.as_posix()}/hooks/session_end_pr_rounds.py"],
+        )
         self.assertEqual(
             _find_block_args(second.settings_json["hooks"], "SessionStart", "record_session_id.py"),
             [f"{REPO_ROOT.as_posix()}/hooks/record_session_id.py"],
@@ -728,11 +750,12 @@ class RunSetupEndToEnd(unittest.TestCase):
         # PostToolUse: 1 compress block (compress_output.py only; core
         #   record_session_id.py moved from PostToolUse to SessionStart).
         # PreToolUse: 1 block (redirect_webfetch_to_fetch_url.py).
-        # SessionEnd: 2 blocks (record_session_id.py + session_end_savings.py).
+        # SessionEnd: 3 blocks (record_session_id.py + session_end_savings.py +
+        #   session_end_pr_rounds.py).
         self.assertEqual(len(second.settings_json["hooks"]["SessionStart"]), 1)
         self.assertEqual(len(second.settings_json["hooks"]["PostToolUse"]), 1)
         self.assertEqual(len(second.settings_json["hooks"]["PreToolUse"]), 1)
-        self.assertEqual(len(second.settings_json["hooks"]["SessionEnd"]), 2)
+        self.assertEqual(len(second.settings_json["hooks"]["SessionEnd"]), 3)
 
     def test_generated_mcp_servers_never_includes_an_unrelated_existing_secret(self):
         # Regression for a review finding: the full merged
@@ -1008,6 +1031,111 @@ class RunSetupEndToEnd(unittest.TestCase):
         for s in self._EMBED_SERVERS:
             self.assertEqual(servers[s]["env"]["EMBEDDING_MODEL"], default)
 
+    # --- MEMORY_BANK_FOLLOW_REPOS (init --memory-bank-follow) ---
+
+    _FOLLOW_KEY = "MEMORY_BANK_FOLLOW_REPOS"
+
+    def _follow_env(self, result):
+        return result.mcp_json["mcpServers"]["memory-bank"]["env"].get(self._FOLLOW_KEY)
+
+    def _write_existing_follow(self, value):
+        first = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
+        cfg = first.mcp_json
+        cfg["mcpServers"]["memory-bank"]["env"][self._FOLLOW_KEY] = value
+        (self.target_repo / ".mcp.json").write_text(json.dumps(cfg))
+
+    def test_no_follow_flag_writes_a_blank_key_and_no_follow_note(self):
+        # The key is always present so a reader of the generated
+        # file can see it exists; blank follows nothing.
+        result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
+        self.assertEqual(self._follow_env(result), "")
+        self.assertFalse(any("follows" in c for c in result.changes))
+
+    def test_follow_is_written_into_the_memory_bank_block_only(self):
+        result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"), memory_bank_follow=" repo-a , repo-b ")
+        # Only the ends are trimmed; the server trims each entry when it parses.
+        self.assertEqual(self._follow_env(result), "repo-a , repo-b")
+        for name, block in result.mcp_json["mcpServers"].items():
+            if name != "memory-bank":
+                self.assertNotIn(self._FOLLOW_KEY, block.get("env", {}), name)
+        note = next(c for c in result.changes if c.startswith("memory-bank follows"))
+        self.assertIn("repo-a, repo-b", note)
+        self.assertIn("restart Claude Code", note)
+        self.assertNotIn("kept from", note)
+
+    def test_rerun_without_the_flag_keeps_the_existing_follow_list(self):
+        # The block is regenerated wholesale, so without this the list would be
+        # silently dropped on a plain re-run.
+        self._write_existing_follow("repo-a,repo-b")
+        result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
+        self.assertEqual(self._follow_env(result), "repo-a,repo-b")
+        self.assertTrue(any("kept from the existing .mcp.json" in c for c in result.changes))
+        self.assertFalse(any("WARNING" in c for c in result.changes))
+
+    def test_explicit_flag_replaces_the_existing_list(self):
+        self._write_existing_follow("repo-a")
+        result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"), memory_bank_follow="repo-c")
+        self.assertEqual(self._follow_env(result), "repo-c")
+
+    def test_explicit_empty_flag_clears_the_list(self):
+        self._write_existing_follow("repo-a")
+        result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"), memory_bank_follow="")
+        # Clearing blanks the key rather than removing it.
+        self.assertEqual(self._follow_env(result), "")
+        note = next(c for c in result.changes if "follow list cleared" in c)
+        self.assertNotIn("removed", note)
+
+    def test_blank_existing_value_stays_a_blank_key_with_no_note(self):
+        self._write_existing_follow("  ")
+        result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
+        self.assertEqual(self._follow_env(result), "")
+        self.assertFalse(any("follow" in c for c in result.changes))
+
+    def test_template_carries_the_blank_key(self):
+        self.assertEqual(MCP_TEMPLATE["mcpServers"]["memory-bank"]["env"][self._FOLLOW_KEY], "")
+
+    def test_own_id_and_general_entries_are_written_but_warned_about(self):
+        result = run_setup(
+            self.target_repo, REPO_ROOT, home_dir=Path("/home/user"),
+            memory_bank_id="me", memory_bank_follow="me,general,repo-a",
+        )
+        self.assertEqual(self._follow_env(result), "me,general,repo-a")
+        warnings = [c for c in result.changes if c.startswith("WARNING: MEMORY_BANK_FOLLOW_REPOS")]
+        self.assertEqual(len(warnings), 2)
+        self.assertTrue(any("'me'" in w and "own MEMORY_BANK_ID" in w for w in warnings))
+        self.assertTrue(any("'general'" in w and "reserved general tag" in w for w in warnings))
+
+    def test_follow_does_not_touch_the_models_or_ids(self):
+        self._write_customized_existing_config(self._CUSTOM_MODEL)
+        plain = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
+        followed = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"), memory_bank_follow="repo-a")
+        self.assertEqual(self._models(followed), self._models(plain))
+        env_plain = dict(plain.mcp_json["mcpServers"]["memory-bank"]["env"])
+        env_followed = dict(followed.mcp_json["mcpServers"]["memory-bank"]["env"])
+        # Both carry the key now; only its value differs.
+        self.assertEqual(env_plain.pop(self._FOLLOW_KEY), "")
+        self.assertEqual(env_followed.pop(self._FOLLOW_KEY), "repo-a")
+        self.assertEqual(env_followed, env_plain)
+
+    def test_resolve_and_existing_helpers_tolerate_odd_configs(self):
+        from setup_project_lib import existing_memory_bank_follow, resolve_memory_bank_follow
+        for odd in ({}, {"mcpServers": []}, {"mcpServers": {"memory-bank": "x"}},
+                    {"mcpServers": {"memory-bank": {"env": []}}},
+                    {"mcpServers": {"memory-bank": {"env": {self._FOLLOW_KEY: 5}}}}):
+            self.assertEqual(existing_memory_bank_follow(odd), "", odd)
+            self.assertEqual(resolve_memory_bank_follow(None, odd), "", odd)
+        self.assertEqual(resolve_memory_bank_follow(" a ", {}), "a")
+
+    def test_build_mcp_servers_always_writes_the_key(self):
+        kwargs = dict(collection_name="c", venv_python=Path("/v/bin/python"),
+                      tools_repo_dir=REPO_ROOT, home_dir=Path("/home/user"))
+        blank = build_mcp_servers(MCP_TEMPLATE, **kwargs)
+        self.assertEqual(blank["memory-bank"]["env"][self._FOLLOW_KEY], "")
+        spaces = build_mcp_servers(MCP_TEMPLATE, memory_bank_follow_repos="  ", **kwargs)
+        self.assertEqual(spaces["memory-bank"]["env"][self._FOLLOW_KEY], "")
+        value = build_mcp_servers(MCP_TEMPLATE, memory_bank_follow_repos=" a,b ", **kwargs)
+        self.assertEqual(value["memory-bank"]["env"][self._FOLLOW_KEY], "a,b")
+
 
 class DefaultSkillsDir(unittest.TestCase):
     def test_is_dot_claude_skills_under_home(self):
@@ -1096,6 +1224,82 @@ class PlanSkillInstalls(unittest.TestCase):
         by_name = {p.name: p for p in plans}
         self.assertEqual(by_name["skill-a"].action, "update")
         self.assertEqual(by_name["skill-b"].action, "install")
+
+
+class SkillExtraFiles(unittest.TestCase):
+    """A skill may keep its own script beside SKILL.md (`cr-load-context`'s
+    facts.sh). `plan_skill_installs` plans those files with the skill, byte for byte,
+    and folds them into the skill's action so `upgrade`'s refresh (which only touches
+    "update") ships them too."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.tools_repo_dir = Path(self._tmpdir.name) / "tools-repo"
+        self.skills_dir = Path(self._tmpdir.name) / "dest-skills"
+        src = self.tools_repo_dir / "skills" / "skill-a"
+        src.mkdir(parents=True)
+        (src / "SKILL.md").write_bytes(b"# Skill: a\n")
+        (src / "facts.sh").write_bytes(b"#!/bin/sh\necho v1\r\n")
+        self.dest = self.skills_dir / "skill-a"
+
+    def _plan(self):
+        return plan_skill_installs(self.tools_repo_dir, self.skills_dir)[0]
+
+    def _install(self):
+        self.dest.mkdir(parents=True, exist_ok=True)
+        (self.dest / "SKILL.md").write_bytes(b"# Skill: a\n")
+        (self.dest / "facts.sh").write_bytes(b"#!/bin/sh\necho v1\r\n")
+
+    def test_fresh_install_plans_the_script_with_its_exact_bytes(self):
+        plan = self._plan()
+        self.assertEqual(plan.action, "install")
+        self.assertEqual([(e.name, e.action) for e in plan.extra_files], [("facts.sh", "install")])
+        # Bytes, not text: the CRLF survives.
+        self.assertEqual(plan.extra_files[0].data, b"#!/bin/sh\necho v1\r\n")
+        self.assertEqual(plan.extra_files[0].dest, self.dest / "facts.sh")
+
+    def test_identical_skill_and_script_is_up_to_date(self):
+        self._install()
+        plan = self._plan()
+        self.assertEqual(plan.action, "up_to_date")
+        self.assertEqual(plan.extra_files[0].action, "up_to_date")
+
+    def test_a_changed_script_alone_makes_the_installed_skill_an_update(self):
+        self._install()
+        (self.tools_repo_dir / "skills" / "skill-a" / "facts.sh").write_bytes(b"#!/bin/sh\necho v2\n")
+        plan = self._plan()
+        self.assertEqual(plan.action, "update")
+        self.assertEqual(plan.extra_files[0].action, "update")
+
+    def test_a_skill_installed_before_it_had_a_script_gets_one_on_update(self):
+        self.dest.mkdir(parents=True)
+        (self.dest / "SKILL.md").write_bytes(b"# Skill: a\n")
+        plan = self._plan()
+        self.assertEqual(plan.action, "update")
+        self.assertEqual(plan.extra_files[0].action, "install")
+
+    def test_skill_md_is_never_an_extra_file_and_hidden_files_and_folders_are_skipped(self):
+        src = self.tools_repo_dir / "skills" / "skill-a"
+        (src / ".hidden").write_bytes(b"x")
+        (src / "sub").mkdir()
+        (src / "sub" / "nested.sh").write_bytes(b"x")
+        self.assertEqual([e.name for e in self._plan().extra_files], ["facts.sh"])
+
+    def test_a_skill_with_only_skill_md_has_no_extra_files(self):
+        (self.tools_repo_dir / "skills" / "skill-a" / "facts.sh").unlink()
+        self.assertEqual(self._plan().extra_files, [])
+
+    def test_the_installed_skill_md_frontmatter_rule_is_unchanged(self):
+        self._install()
+        (self.dest / "SKILL.md").write_bytes(b'---\nname: skill-a\ndescription: "mine"\n---\n\n# Skill: a\n')
+        plan = self._plan()
+        self.assertEqual(plan.action, "up_to_date")
+        self.assertTrue(plan.frontmatter_preserved)
+
+    def test_planning_writes_nothing(self):
+        self._plan()
+        self.assertFalse(self.skills_dir.exists())
 
 
 class SkillFrontmatterHandling(unittest.TestCase):

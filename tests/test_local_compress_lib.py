@@ -26,6 +26,8 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "libs"))
 
+import openai_lib  # noqa: E402
+from credential_redaction_lib import SERVER_DETAIL_MAX_CHARS, display_safe, looks_like_credential  # noqa: E402
 from local_compress_lib import (  # noqa: E402
     DEFAULT_FOCUS,
     DEFAULT_WEB_FOCUS,
@@ -43,7 +45,6 @@ from local_compress_lib import (  # noqa: E402
     derive_compact_label,
     find_trailing_summary_line,
     identifier_tokens,
-    looks_like_credential,
     missing_identifiers,
     missing_sections,
     redact_and_disclose,
@@ -63,7 +64,7 @@ async def compress(*args, client=None, **kwargs):
     test that does exercise the client passes its own."""
     return await _compress_lib(*args, client=client if client is not None else object(), **kwargs)
 
-# The exact template /my-compact step 3 fills in. These headings are AUTHORED by
+# The exact template /cr-compact step 3 fills in. These headings are AUTHORED by
 # the skill, which is what makes section handling a guarantee rather than a
 # heuristic -- there is nothing to infer.
 COMPACT_TEMPLATE = """PROJECT: Acme.Billing.OrdersApi
@@ -361,19 +362,19 @@ class FindFirstHeadingBoundary(unittest.TestCase):
         text = "\n".join(f"line {i} of plain unstructured text content here" for i in range(200))
         self.assertIsNone(_find_first_heading_boundary(text))
 
-    def test_finds_a_real_boundary_in_this_repos_own_readme(self):
-        # The exact scenario the issue names: this repo's own README uses
-        # standard blank-line-delimited headings throughout.
-        readme_path = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "README.md"
+    def test_finds_a_real_boundary_in_this_repos_own_markdown(self):
+        # The exact scenario the issue names: a real markdown file of this repo, with
+        # standard blank-line-delimited headings between prose paragraphs. It used to
+        # be the README; that is now mostly a list of links and short bullets, with no
+        # heading flanked by prose on both sides (the heuristic's signal), so this reads
+        # the installation guide instead, which is long-form prose under headings.
+        doc_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "docs", "installation.md"
         )
-        with open(readme_path, encoding="utf-8") as f:
+        with open(doc_path, encoding="utf-8") as f:
             text = f.read()
-        # max_offset=len(text): the first heading this heuristic accepts in the
-        # README sits after the Files table, so the default 20_000-char window
-        # would tie this test to the table's length rather than to the bug.
-        boundary = _find_first_heading_boundary(text, max_offset=len(text))
-        self.assertIsNotNone(boundary, "the real README has headings; None means the bug regressed")
+        boundary = _find_first_heading_boundary(text)
+        self.assertIsNotNone(boundary, "the real doc has headings; None means the bug regressed")
 
 
 # Tokens whose whole value is being byte-exact. Each entry is (text, token).
@@ -512,7 +513,7 @@ class CredentialsAreNeverRestored(unittest.TestCase):
     Several identifier patterns match real secrets -- snake_case accepts
     ghp_<...> and sk_live_<...>, dotted accepts a three-part JWT. The repair
     step therefore RESTORED credentials the summarizer had dropped, and
-    /my-compact enables it unconditionally then persists to Qdrant. Net effect:
+    /cr-compact enables it unconditionally then persists to Qdrant. Net effect:
     a transient secret in a session became a durable one in a vector store, and
     the summarizer's accidental good behavior (omitting it) was undone.
 
@@ -2943,7 +2944,7 @@ class TimeoutVersusConnectionFailureReporting(unittest.TestCase):
     # in tests/test_lmstudio_client.py. No `openai` import is needed here.
     @staticmethod
     def _timeout():
-        from local_compress_lib import CompletionTimeout
+        from openai_lib import CompletionTimeout
         return CompletionTimeout("request timed out")
 
     @staticmethod
@@ -2999,13 +3000,13 @@ class TimeoutVersusConnectionFailureReporting(unittest.TestCase):
         import local_compress_lib as L
         client = self._fake_client([self._timeout()])
         self.assertIsNone(L.complete(client, "m", "sys", "content"))
-        self.assertEqual(L.take_failure_kind(), "timeout")
-        self.assertIsNone(L.take_failure_kind(), "reading must clear the reason")
+        self.assertEqual(openai_lib.take_failure_kind(), "timeout")
+        self.assertIsNone(openai_lib.take_failure_kind(), "reading must clear the reason")
 
         client = self._fake_client([self._conn_error()])
         self.assertIsNone(L.complete(client, "m", "sys", "content"))
         self.assertEqual(
-            L.take_failure_kind(), "other",
+            openai_lib.take_failure_kind(), "other",
             "only CompletionTimeout is a timeout; a plain connection "
             "error must NOT be classified as one",
         )
@@ -3014,7 +3015,7 @@ class TimeoutVersusConnectionFailureReporting(unittest.TestCase):
         import local_compress_lib as L
         L.complete(self._fake_client([self._timeout()]), "m", "s", "c")
         self.assertEqual(L.complete(self._fake_client([self._ok("hi")]), "m", "s", "c"), "hi")
-        self.assertIsNone(L.take_failure_kind())
+        self.assertIsNone(openai_lib.take_failure_kind())
 
     # -- the three error messages ---------------------------------------------
 
@@ -3102,20 +3103,20 @@ class TimeoutVersusConnectionFailureReporting(unittest.TestCase):
     def test_complete_records_a_400_with_the_server_message_and_clears_on_read(self):
         import local_compress_lib as L
         self.assertIsNone(L.complete(self._fake_client([self._ctx_error()]), "m", "s", "c"))
-        self.assertEqual(L.take_failure(), ("bad_request", self._CTX_MSG))
-        self.assertEqual(L.take_failure(), (None, None), "reading must clear kind and detail")
+        self.assertEqual(openai_lib.take_failure(), ("bad_request", self._CTX_MSG))
+        self.assertEqual(openai_lib.take_failure(), (None, None), "reading must clear kind and detail")
 
     def test_take_failure_kind_also_clears_the_detail(self):
         import local_compress_lib as L
         L.complete(self._fake_client([self._ctx_error()]), "m", "s", "c")
-        self.assertEqual(L.take_failure_kind(), "bad_request")
-        self.assertEqual(L.take_failure(), (None, None))
+        self.assertEqual(openai_lib.take_failure_kind(), "bad_request")
+        self.assertEqual(openai_lib.take_failure(), (None, None))
 
     def test_a_later_failure_does_not_inherit_a_400s_detail(self):
         import local_compress_lib as L
         L.complete(self._fake_client([self._ctx_error()]), "m", "s", "c")
         L.complete(self._fake_client([self._conn_error()]), "m", "s", "c")
-        self.assertEqual(L.take_failure(), ("other", None))
+        self.assertEqual(openai_lib.take_failure(), ("other", None))
 
     def test_only_a_400_is_a_bad_request(self):
         import local_compress_lib as L
@@ -3128,46 +3129,61 @@ class TimeoutVersusConnectionFailureReporting(unittest.TestCase):
         ):
             with self.subTest(exc=repr(exc)):
                 self.assertIsNone(L.complete(self._fake_client([exc]), "m", "s", "c"))
-                self.assertEqual(L.take_failure_kind(), kind)
+                self.assertEqual(openai_lib.take_failure_kind(), kind)
 
     def test_server_message_shapes(self):
-        import local_compress_lib as L
+        # What openai_lib hands over is the server's text as sent: which field it came from is its
+        # job, what is safe to show is not.
         # LM Studio's own shape: {"error": "<text>"} reaches the SDK's .body as the bare string.
-        self.assertEqual(L._server_error_detail(self._http_error(400, "plain text")), "plain text")
+        self.assertEqual(openai_lib.server_error_text(self._http_error(400, "plain text")), "plain text")
         # OpenAI shape: {"error": {"message": ...}} arrives as {"message": ...}.
-        self.assertEqual(L._server_error_detail(self._http_error(400, {"message": "nested"})), "nested")
+        self.assertEqual(openai_lib.server_error_text(self._http_error(400, {"message": "nested"})), "nested")
         self.assertEqual(
-            L._server_error_detail(self._http_error(400, {"error": {"message": "deep"}})), "deep",
+            openai_lib.server_error_text(self._http_error(400, {"error": {"message": "deep"}})), "deep",
         )
         # No usable body: fall back to the exception's own message.
         self.assertEqual(
-            L._server_error_detail(self._http_error(400, None, message="from message")), "from message",
+            openai_lib.server_error_text(self._http_error(400, None, message="from message")), "from message",
         )
         # Nothing but whitespace is no message at all.
-        self.assertIsNone(L._server_error_detail(self._http_error(400, "   ", message="")))
+        self.assertIsNone(openai_lib.server_error_text(self._http_error(400, "   ", message="")))
+        # Whitespace, length and credentials are untouched at this layer.
+        self.assertEqual(openai_lib.server_error_text(self._http_error(400, "a\n\n b")), "a\n\n b")
 
     def test_server_message_is_one_line_truncated_and_redacted(self):
-        import local_compress_lib as L
-        multi = L._server_error_detail(self._http_error(400, "line one\n\nline   two\ttabbed"))
-        self.assertEqual(multi, "line one line two tabbed")
-        long = L._server_error_detail(self._http_error(400, "x " * 500))
+        def shown(body):
+            return display_safe(openai_lib.server_error_text(self._http_error(400, body)))
+
+        self.assertEqual(shown("line one\n\nline   two\ttabbed"), "line one line two tabbed")
+        long = shown("x " * 500)
         assert long is not None
-        self.assertLessEqual(len(long), L._SERVER_DETAIL_MAX_CHARS + 3)
+        self.assertLessEqual(len(long), SERVER_DETAIL_MAX_CHARS + 3)
         self.assertTrue(long.endswith("..."))
         secret = "sk-" + "a1B2c3D4" * 5
-        redacted = L._server_error_detail(
-            self._http_error(400, f"bad request, api_key={secret} was in the prompt")
-        )
+        redacted = shown(f"bad request, api_key={secret} was in the prompt")
         assert redacted is not None
         self.assertNotIn(secret, redacted)
         self.assertIn("[REDACTED-CREDENTIAL]", redacted)
         # Redaction runs before truncation: a credential straddling the cut must
         # not leave a recognisable fragment behind.
-        straddle = L._server_error_detail(
-            self._http_error(400, "y" * (L._SERVER_DETAIL_MAX_CHARS - 12) + f" api_key={secret}")
-        )
+        straddle = shown("y" * (SERVER_DETAIL_MAX_CHARS - 12) + f" api_key={secret}")
         assert straddle is not None
         self.assertNotIn(secret[:20], straddle)
+
+    def test_a_credential_in_the_servers_400_text_is_redacted_where_compression_shows_it(self):
+        """`openai_lib` keeps the server's text as sent, so the redaction happens at the two places
+        compression puts it in a message: the per-request failure and the all-rejected section notice."""
+        secret = "sk-" + "a1B2c3D4" * 5
+        error = self._http_error(400, f"too long; the prompt held api_key={secret}")
+        for label, out in (
+            ("plain", self._compress([error], "x" * 300, chunk_chars=1000)),
+            ("sections", self._sections([error])),
+        ):
+            with self.subTest(path=label):
+                self.assertNotIn(secret, out)
+                self.assertNotIn(secret[:20], out)
+                self.assertIn("[REDACTED-CREDENTIAL]", out)
+                self.assertIn("LM Studio said:", out)
 
     def _assert_rejected_wording(self, out, where):
         self.assertTrue(out.startswith("Error: LM Studio rejected the request"), out)
