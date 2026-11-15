@@ -27,6 +27,7 @@ import copy
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -156,7 +157,7 @@ class MemoryBankServerMissing(unittest.TestCase):
 
 class CodebaseIndexerMemoryBankCollectionMissing(unittest.TestCase):
     """`upgrade` never added MEMORY_BANK_COLLECTION to an existing
-    codebase-indexer block, leaving index_repo/sync_repo's memory-bank guard
+    codebase-indexer block, leaving cb_indexer_index_repo/cb_indexer_sync_repo's memory-bank guard
     protecting only the default name for a project with a custom one."""
 
     _ID = "codebase-indexer-memory-bank-collection-missing"
@@ -846,6 +847,8 @@ class PendingMigrations(unittest.TestCase):
             }
         }
         settings_json = {
+            # Old tool names in a permission rule: cb-indexer-tools-renamed too.
+            "permissions": {"allow": ["mcp__qdrant__qdrant-find", "mcp__codebase-indexer__sync_repo"]},
             "hooks": {
                 "PostToolUse": [
                     {"matcher": ".*", "hooks": [{"args": ["/x/hooks/record_session_id.py"]}]},
@@ -959,6 +962,7 @@ class RunUpgradeEndToEnd(unittest.TestCase):
         (self.target_repo / ".claude" / "settings.json").write_text(
             json.dumps(
                 {
+                    "permissions": {"allow": ["mcp__qdrant__qdrant-find", "mcp__codebase-indexer__sync_repo"]},
                     "hooks": {
                         "PostToolUse": [
                             {
@@ -1253,7 +1257,7 @@ class RunUpgradeWritesOnlyChangedFiles(unittest.TestCase):
 
 
 class IndexManifestOldFormat(unittest.TestCase):
-    """The sync manifest is versioned, `sync_repo` ignores an
+    """The sync manifest is versioned, `cb_indexer_sync_repo` ignores an
     old-format one by itself, and `upgrade` removes the stale file and says the
     next sync will re-index. It stays config-only: nothing here embeds anything.
 
@@ -1280,7 +1284,9 @@ class IndexManifestOldFormat(unittest.TestCase):
         return [m.id for m in pending_repo_migrations(repo or self.target_repo)]
 
     def test_registered_with_a_stable_id(self):
-        self.assertEqual([m.id for m in REPO_MIGRATIONS], ["index-manifest-old-format"])
+        self.assertEqual(
+            [m.id for m in REPO_MIGRATIONS], ["index-manifest-old-format", "cb-indexer-claude-md-renamed"]
+        )
 
     def test_not_pending_without_a_manifest(self):
         self.assertEqual(self._ids(), [])
@@ -2294,6 +2300,305 @@ class CodebaseIndexerScriptRenamed(unittest.TestCase):
         settings = {"hooks": {"SessionStart": []}}
         _, settings_after = _migration(self._ID).apply(self._old(), settings, _ctx())
         self.assertEqual(settings_after, settings)
+
+
+class CbIndexerToolsRenamed(unittest.TestCase):
+    """The settings.json half of the cb_indexer_* rename: permission rules and
+    compress-hook matcher names that use an old tool's full name. The servers
+    are found by the script they launch, never by their key."""
+
+    _ID = "cb-indexer-tools-renamed"
+    _OLD_INDEXER = (
+        "index_repo", "sync_repo", "preview_index", "get_collection_info",
+        "find_in_collection", "set_collection_description", "list_collections",
+    )
+
+    def _mcp(self, indexer_key="codebase-indexer", qdrant_key="qdrant", **extra):
+        servers = {
+            indexer_key: {"command": "py", "args": ["/r/mcpservers/codebase_indexer_mcp_server.py"]},
+            qdrant_key: {"command": "py", "args": ["/r/mcpservers/qdrant_mcp_server.py"]},
+        }
+        servers.update(extra)
+        return {"mcpServers": servers}
+
+    def _apply(self, mcp_json, settings):
+        return _migration(self._ID).apply(mcp_json, settings, _ctx())[1]
+
+    def test_registered_last_so_it_runs_after_the_server_script_migrations(self):
+        self.assertEqual(MIGRATIONS[-1].id, self._ID)
+
+    def test_not_pending_without_permissions_or_matchers(self):
+        self.assertFalse(_migration(self._ID).detect(self._mcp(), {}))
+        self.assertFalse(_migration(self._ID).detect(self._mcp(), {"permissions": {"allow": ["Bash(git:*)"]}}))
+
+    def test_every_old_full_name_is_rewritten_in_each_permission_list(self):
+        old = [f"mcp__codebase-indexer__{n}" for n in self._OLD_INDEXER] + [
+            "mcp__qdrant__qdrant-find",
+            "mcp__qdrant__qdrant-store",
+        ]
+        settings = {"permissions": {"allow": old, "deny": [old[0]], "ask": [old[-1]]}}
+        migration = _migration(self._ID)
+        self.assertTrue(migration.detect(self._mcp(), settings))
+        after = self._apply(self._mcp(), settings)["permissions"]
+        self.assertEqual(
+            after["allow"],
+            [f"mcp__codebase-indexer__cb_indexer_{n}" for n in self._OLD_INDEXER]
+            + ["mcp__codebase-indexer__cb_indexer_find_repo", "mcp__codebase-indexer__cb_indexer_store_repo"],
+        )
+        self.assertEqual(after["deny"], ["mcp__codebase-indexer__cb_indexer_index_repo"])
+        self.assertEqual(after["ask"], ["mcp__codebase-indexer__cb_indexer_store_repo"])
+
+    def test_server_keys_are_found_by_script_not_by_name(self):
+        mcp_json = self._mcp(indexer_key="indexer", qdrant_key="mem")
+        settings = {"permissions": {"allow": ["mcp__indexer__sync_repo", "mcp__mem__qdrant-find"]}}
+        after = self._apply(mcp_json, settings)
+        # The new names keep the INDEXER key as their prefix, for both moved tools.
+        self.assertEqual(
+            after["permissions"]["allow"],
+            ["mcp__indexer__cb_indexer_sync_repo", "mcp__indexer__cb_indexer_find_repo"],
+        )
+
+    def test_the_old_script_name_and_the_third_party_qdrant_command_are_recognised(self):
+        mcp_json = {
+            "mcpServers": {
+                "ci": {"command": "py", "args": ["/r/tools/ingest_mcp_server.py"]},
+                "q": {"command": "/v/bin/mcp-server-qdrant"},
+            }
+        }
+        settings = {"permissions": {"allow": ["mcp__ci__list_collections", "mcp__q__qdrant-store"]}}
+        self.assertTrue(_migration(self._ID).detect(mcp_json, settings))
+        self.assertEqual(
+            self._apply(mcp_json, settings)["permissions"]["allow"],
+            ["mcp__ci__cb_indexer_list_collections", "mcp__ci__cb_indexer_store_repo"],
+        )
+
+    def test_a_rule_on_a_server_this_toolkit_does_not_launch_is_left_alone(self):
+        rules = ["mcp__other-server__sync_repo", "mcp__other__qdrant-find", "mcp__codebase-indexer__recall"]
+        settings = {"permissions": {"allow": list(rules)}}
+        self.assertFalse(_migration(self._ID).detect(self._mcp(), settings))
+        self.assertEqual(self._apply(self._mcp(), settings), settings)
+
+    def test_a_rule_already_on_the_new_name_is_not_doubled(self):
+        settings = {
+            "permissions": {
+                "allow": ["mcp__codebase-indexer__cb_indexer_sync_repo", "mcp__codebase-indexer__sync_repo"]
+            }
+        }
+        after = self._apply(self._mcp(), settings)
+        self.assertEqual(after["permissions"]["allow"], ["mcp__codebase-indexer__cb_indexer_sync_repo"])
+
+    def test_a_new_name_is_never_rewritten_again(self):
+        settings = {"permissions": {"allow": ["mcp__codebase-indexer__cb_indexer_sync_repo"]}}
+        self.assertFalse(_migration(self._ID).detect(self._mcp(), settings))
+
+    def test_a_longer_name_that_starts_with_an_old_one_is_not_touched(self):
+        settings = {"permissions": {"allow": ["mcp__codebase-indexer__sync_repo_extra"]}}
+        self.assertFalse(_migration(self._ID).detect(self._mcp(), settings))
+
+    def _compress_block(self, matcher):
+        return {
+            "matcher": matcher,
+            "hooks": [{"type": "command", "command": "py", "args": ["/r/hooks/compress_output.py"]}],
+        }
+
+    def test_the_compress_hook_matcher_names_are_rewritten_and_nothing_is_added(self):
+        matcher = "Bash|mcp__local-compress__.*|mcp__codebase-indexer__sync_repo|mcp__qdrant__qdrant-find"
+        settings = {"hooks": {"PostToolUse": [self._compress_block(matcher)]}}
+        after = self._apply(self._mcp(), settings)
+        self.assertEqual(
+            after["hooks"]["PostToolUse"][0]["matcher"],
+            "Bash|mcp__local-compress__.*|mcp__codebase-indexer__cb_indexer_sync_repo"
+            "|mcp__codebase-indexer__cb_indexer_find_repo",
+        )
+
+    def test_the_new_tools_are_not_added_to_a_matcher_that_never_named_them(self):
+        matcher = "Bash|mcp__local-compress__.*"
+        settings = {"hooks": {"PostToolUse": [self._compress_block(matcher)], "SessionStart": []}}
+        self.assertFalse(_migration(self._ID).detect(self._mcp(), settings))
+        self.assertEqual(self._apply(self._mcp(), settings), settings)
+
+    def test_a_matcher_on_a_hook_this_toolkit_did_not_write_is_left_alone(self):
+        block = {"matcher": "mcp__codebase-indexer__sync_repo", "hooks": [{"command": "/u/own-hook.sh"}]}
+        settings = {"hooks": {"PostToolUse": [block]}}
+        self.assertFalse(_migration(self._ID).detect(self._mcp(), settings))
+        self.assertEqual(self._apply(self._mcp(), settings), settings)
+
+    def test_idempotent(self):
+        settings = {"permissions": {"allow": ["mcp__qdrant__qdrant-find", "mcp__codebase-indexer__sync_repo"]}}
+        once = self._apply(self._mcp(), settings)
+        self.assertFalse(_migration(self._ID).detect(self._mcp(), once))
+        self.assertEqual(self._apply(self._mcp(), once), once)
+
+    def test_inputs_are_not_mutated(self):
+        settings = {"permissions": {"allow": ["mcp__codebase-indexer__sync_repo"]}}
+        snapshot = copy.deepcopy(settings)
+        self._apply(self._mcp(), settings)
+        self.assertEqual(settings, snapshot)
+
+    def test_mcp_json_is_returned_untouched(self):
+        mcp_json = self._mcp()
+        settings = {"permissions": {"allow": ["mcp__codebase-indexer__sync_repo"]}}
+        self.assertEqual(_migration(self._ID).apply(mcp_json, settings, _ctx())[0], mcp_json)
+
+    def test_more_than_one_indexer_block_stops_and_reports(self):
+        mcp_json = self._mcp(second={"command": "py", "args": ["/other/codebase_indexer_mcp_server.py"]})
+        settings = {"permissions": {"allow": ["mcp__codebase-indexer__sync_repo"]}}
+        migration = _migration(self._ID)
+        # Still pending, so the user is told; nothing is written.
+        self.assertTrue(migration.detect(mcp_json, settings))
+        out = io.StringIO()
+        with redirect_stdout(out):
+            after = self._apply(mcp_json, settings)
+        self.assertEqual(after, settings)
+        self.assertIn("more than one", out.getvalue())
+        self.assertIn("codebase-indexer", out.getvalue())
+
+    def test_more_than_one_qdrant_block_stops_and_reports(self):
+        mcp_json = self._mcp(second={"command": "py", "args": ["/other/qdrant_mcp_server.py"]})
+        settings = {"permissions": {"allow": ["mcp__qdrant__qdrant-find"]}}
+        out = io.StringIO()
+        with redirect_stdout(out):
+            after = self._apply(mcp_json, settings)
+        self.assertEqual(after, settings)
+        self.assertIn("qdrant script", out.getvalue())
+
+    def test_no_indexer_block_means_nothing_to_rename_to(self):
+        mcp_json = {"mcpServers": {"qdrant": {"args": ["/r/mcpservers/qdrant_mcp_server.py"]}}}
+        settings = {"permissions": {"allow": ["mcp__qdrant__qdrant-find"]}}
+        self.assertFalse(_migration(self._ID).detect(mcp_json, settings))
+
+    def test_odd_shapes_do_not_break_detect_or_apply(self):
+        migration = _migration(self._ID)
+        odd_settings = (
+            {}, {"permissions": []}, {"permissions": {"allow": "x"}}, {"hooks": []},
+            {"hooks": {"PostToolUse": [None, {"matcher": 3}]}},
+        )
+        for mcp_json in ({}, {"mcpServers": []}, {"mcpServers": {"a": "x", "b": {"args": "no"}}}):
+            for settings in odd_settings:
+                with self.subTest(mcp=mcp_json, settings=settings):
+                    self.assertFalse(migration.detect(mcp_json, settings))
+                    self.assertEqual(self._apply(mcp_json, settings), settings)
+
+    def test_the_note_names_what_it_leaves_for_the_user(self):
+        note = _migration(self._ID).note
+        self.assertIn("settings.local.json", note)
+        self.assertIn("~/.claude/settings.json", note)
+
+    def test_run_upgrade_applies_it_and_a_second_run_changes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / ".claude").mkdir()
+            (repo / ".mcp.json").write_text(json.dumps(self._mcp()), encoding="utf-8")
+            settings_path = repo / ".claude" / "settings.json"
+            settings_path.write_text(
+                json.dumps({"permissions": {"allow": ["mcp__qdrant__qdrant-find"]}}), encoding="utf-8"
+            )
+            with redirect_stdout(io.StringIO()):
+                first = run_upgrade(repo, REPO_ROOT, _VENV_PYTHON, auto_yes=True)
+            self.assertIn(self._ID, first)
+            written = settings_path.read_text(encoding="utf-8")
+            self.assertEqual(
+                json.loads(written)["permissions"]["allow"], ["mcp__codebase-indexer__cb_indexer_find_repo"]
+            )
+            with redirect_stdout(io.StringIO()):
+                second = run_upgrade(repo, REPO_ROOT, _VENV_PYTHON, auto_yes=True)
+            self.assertNotIn(self._ID, second)
+            self.assertEqual(settings_path.read_text(encoding="utf-8"), written)
+
+
+class CbIndexerClaudeMdRenamed(unittest.TestCase):
+    """The CLAUDE.md half: the template-written Vector memory section is
+    replaced when it still names old tools, and nothing else in the file moves."""
+
+    _ID = "cb-indexer-claude-md-renamed"
+    _HEADING = "## Vector memory (Qdrant MCP)"
+    _OLD_SECTION = (
+        "## Vector memory (Qdrant MCP)\n\n"
+        "Two tools: `qdrant-find` (semantic search) and `qdrant-store`, plus `index_repo`/`sync_repo`.\n\n"
+        "Run sync_repo at the start of a session.\n"
+    )
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.repo = Path(self._tmp.name)
+        self.path = self.repo / "CLAUDE.md"
+        self.migration = next(m for m in REPO_MIGRATIONS if m.id == self._ID)
+
+    def _write(self, text, newline="\n"):
+        self.path.write_bytes(text.replace("\n", newline).encode("utf-8"))
+
+    def _read(self):
+        return self.path.read_bytes().decode("utf-8")
+
+    def _template_section(self):
+        from setup_project_lib import CLAUDE_MD_QDRANT_HEADING, extract_claude_md_sections
+
+        text = (REPO_ROOT / "templates" / "CLAUDE.md.template").read_text(encoding="utf-8")
+        return extract_claude_md_sections(text)[CLAUDE_MD_QDRANT_HEADING]
+
+    def test_no_claude_md_is_not_pending(self):
+        self.assertFalse(self.migration.detect(self.repo))
+
+    def test_a_section_already_on_the_new_names_is_not_pending(self):
+        self._write("# Mine\n\n" + self._template_section() + "\n")
+        self.assertFalse(self.migration.detect(self.repo))
+
+    def test_a_stale_section_is_pending(self):
+        self._write("# Mine\n\n" + self._OLD_SECTION)
+        self.assertTrue(self.migration.detect(self.repo))
+
+    def test_only_that_section_is_replaced_and_the_users_text_is_kept(self):
+        before = "# My project\n\nMy own rule: use tabs.\n\n"
+        after = "## Something of mine\n\nKeep `sync_repo` out of CI.\n"
+        self._write(before + self._OLD_SECTION + "\n" + after)
+        self.migration.apply(self.repo)
+        result = self._read()
+        self.assertTrue(result.startswith(before + self._template_section()))
+        self.assertTrue(result.endswith("\n\n" + after))
+        # The user's own mention in their own section is left as written.
+        self.assertIn("Keep `sync_repo` out of CI.", result)
+        self.assertNotIn("`qdrant-find`", result)
+        self.assertIn("`cb_indexer_find_repo`", result)
+
+    def test_idempotent(self):
+        self._write("# Mine\n\n" + self._OLD_SECTION)
+        self.migration.apply(self.repo)
+        once = self._read()
+        self.assertFalse(self.migration.detect(self.repo))
+        self.migration.apply(self.repo)
+        self.assertEqual(self._read(), once)
+
+    def test_crlf_and_a_byte_order_mark_are_kept(self):
+        self.path.write_bytes(("﻿# Mine\n\n" + self._OLD_SECTION).replace("\n", "\r\n").encode("utf-8"))
+        self.assertTrue(self.migration.detect(self.repo))
+        self.migration.apply(self.repo)
+        raw = self.path.read_bytes()
+        self.assertTrue(raw.startswith("﻿".encode("utf-8")))
+        text = raw.decode("utf-8")
+        self.assertNotIn("\r\r", text)
+        self.assertEqual(text.count("\n"), text.count("\r\n"))
+
+    def test_a_section_at_the_end_with_no_final_newline_stays_that_way(self):
+        self._write("# Mine\n\n" + self._OLD_SECTION.rstrip("\n"))
+        self.migration.apply(self.repo)
+        self.assertFalse(self._read().endswith("\n"))
+
+    def test_a_fenced_example_heading_is_not_mistaken_for_the_section(self):
+        self._write("# Mine\n\n```\n" + self._HEADING + "\nsync_repo\n```\n")
+        self.assertFalse(self.migration.detect(self.repo))
+
+    def test_the_fresh_template_names_no_old_tool_anywhere(self):
+        template = (REPO_ROOT / "templates" / "CLAUDE.md.template").read_text(encoding="utf-8")
+        old = re.compile(
+            r"(?<![\w-])(index_repo|sync_repo|preview_index|get_collection_info|find_in_collection|"
+            r"set_collection_description|list_collections|qdrant-find|qdrant-store)(?![\w-])"
+        )
+        self.assertIsNone(old.search(template))
+        self.assertIn("`codebase-indexer` server", template)
+
+    def test_the_migration_is_registered_after_the_manifest_one(self):
+        self.assertEqual([m.id for m in REPO_MIGRATIONS][-1], self._ID)
 
 
 if __name__ == "__main__":

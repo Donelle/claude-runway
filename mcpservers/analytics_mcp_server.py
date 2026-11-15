@@ -92,7 +92,7 @@ def savings_summary(project: Optional[str] = None, format: str = "text") -> str:
     public). The counterfactual itself -- what the raw content would have cost
     vs. the compressed result actually used -- is still observed online, not a
     controlled A/B measurement; see EVALUATION.md's Track D for that distinction.
-    Only local-compression events are credited; qdrant-find activity is
+    Only local-compression events are credited; cb_indexer_find_repo activity is
     intentionally never counted here (its counterfactual isn't observable).
 
     project defaults to the current working directory's folder name.

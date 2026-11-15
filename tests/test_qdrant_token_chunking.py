@@ -423,7 +423,7 @@ class ChunkFileWithABudget(unittest.TestCase):
 
 class ChunkPositionReader(unittest.TestCase):
     """Readers must accept the new and the old metadata shape: points keep
-    line_range until their collection is re-indexed, and find_in_collection can
+    line_range until their collection is re-indexed, and cb_indexer_find_in_collection can
     search another repo's collection that has not been."""
 
     def test_new_shape(self):

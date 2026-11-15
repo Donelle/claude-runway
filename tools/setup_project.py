@@ -1139,7 +1139,7 @@ def parse_args() -> argparse.Namespace:
         "created it, so passing a different value prints a warning: remember/recall fail for every "
         "project until that collection is rebuilt",
     )
-    init.add_argument("--collection-description", default="", help="Short one-line hint for list_collections")
+    init.add_argument("--collection-description", default="", help="Short one-line hint for cb_indexer_list_collections")
     init.add_argument("--include-extensions", default="", help="e.g. '.py,.md' -- blank uses the built-in defaults")
     init.add_argument("--exclude-dirs", default="", help="e.g. 'fixtures,generated' -- added to the built-in excludes")
     init.add_argument("--lmstudio-url", default="http://localhost:1234/v1")

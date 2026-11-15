@@ -1,9 +1,9 @@
-"""list_collections' "own" label and the startup description sync's memory-bank guard.
+"""cb_indexer_list_collections' "own" label and the startup description sync's memory-bank guard.
 
 Both are small correctness gaps: "own" was decided by collection name alone, so
 the same name on a different Qdrant instance (an explicit qdrant_url override)
 was mislabeled; and the description sync lacked the memory-bank-name guard that
-index_repo/sync_repo have, so a COLLECTION_NAME == MEMORY_BANK_COLLECTION
+cb_indexer_index_repo/cb_indexer_sync_repo have, so a COLLECTION_NAME == MEMORY_BANK_COLLECTION
 misconfiguration stamped the code-index description on the shared collection.
 """
 import io

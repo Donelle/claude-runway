@@ -250,7 +250,7 @@ class RunSetupClaudeMd(unittest.TestCase):
         for name in ("mcp.json.template", "settings.json.template"):
             (templates / name).write_bytes((REPO_ROOT / "templates" / name).read_bytes())
         (templates / "CLAUDE.md.template").write_text(
-            TEMPLATE_TEXT.replace("Prefer `qdrant-find` over Grep", "MARKER from templates_dir"), encoding="utf-8"
+            TEMPLATE_TEXT.replace("Prefer `cb_indexer_find_repo` over Grep", "MARKER from templates_dir"), encoding="utf-8"
         )
         result = run_setup(self.target, REPO_ROOT, home_dir=HOME, templates_dir=templates)
         self.assertIn("MARKER from templates_dir", result.claude_md.content)

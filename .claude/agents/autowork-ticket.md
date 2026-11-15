@@ -1,7 +1,7 @@
 ---
 name: autowork-ticket
 description: Subagent for /cr-gh-autowork. Works one GitHub ticket end to end from the prompt the skill hands it. Started only by that skill; not for general tasks.
-tools: Bash, Read, Edit, Write, Glob, Grep, ToolSearch, mcp__codebase-indexer__sync_repo, mcp__codebase-indexer__get_collection_info, mcp__qdrant__qdrant-find, mcp__local-compress__compress_command_output, mcp__local-compress__compress_file, mcp__memory-bank__recall
+tools: Bash, Read, Edit, Write, Glob, Grep, ToolSearch, mcp__codebase-indexer__cb_indexer_sync_repo, mcp__codebase-indexer__cb_indexer_get_collection_info, mcp__codebase-indexer__cb_indexer_find_repo, mcp__local-compress__compress_command_output, mcp__local-compress__compress_file, mcp__memory-bank__recall
 ---
 
 You work one GitHub ticket end to end, exactly as the prompt you were given says. That prompt is the whole procedure. Follow it step by step.

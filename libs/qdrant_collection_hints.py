@@ -1,7 +1,7 @@
 """
 Persistent, cross-session cache for per-collection description hints.
-mcpservers/codebase_indexer_mcp_server.py's list_collections tool surfaces these
-hints so a model can pick the right collection for find_in_collection on its
+mcpservers/codebase_indexer_mcp_server.py's cb_indexer_list_collections tool surfaces these
+hints so a model can pick the right collection for cb_indexer_find_in_collection on its
 own, instead of the user always having to name it explicitly.
 
 Why persistent, not just in-memory: the codebase-indexer MCP server is a
@@ -9,7 +9,7 @@ stdio subprocess spawned fresh per Claude Code session (per project's own
 .mcp.json), so an in-memory-only cache would never survive past the session
 that warmed it -- worthless for "any session, any repo," which is the whole
 point of this feature. A SQLite file surviving restarts is what actually
-makes list_collections's first call in a brand new session cheap once a
+makes cb_indexer_list_collections's first call in a brand new session cheap once a
 collection's hint has ever been fetched once, anywhere.
 
 Storage lives in the SHARED cache DB from libs/cache_db.py (a file
@@ -26,13 +26,13 @@ wrong hint across instances with no way to detect it.
 
 No TTL by design -- a cached entry is only
 ever refreshed by an explicit write. Only REAL hints get cached, though:
-set_collection_description always writes through (an explicit, intentional
+cb_indexer_set_collection_description always writes through (an explicit, intentional
 call -- even an empty string is a deliberate "clear this hint"), but
-list_collections's own cache-miss fetch deliberately does NOT cache an
+cb_indexer_list_collections's own cache-miss fetch deliberately does NOT cache an
 empty "no description set" result. That keeps this table limited to
 collections someone actually described, not a growing pile of "nothing
 here" rows, and means a description added outside this tool entirely
-(e.g. directly via the Qdrant API) is picked up on list_collections's very
+(e.g. directly via the Qdrant API) is picked up on cb_indexer_list_collections's very
 next call instead of staying invisible behind a stale cached "no hint."
 
 This is a disposable, best-effort CACHE, not the source of truth (Qdrant's
@@ -44,7 +44,7 @@ operation has already succeeded. Letting a corrupt/locked/unwritable cache
 file turn that into a reported tool failure would be strictly worse than
 just not caching this one time -- confirmed as a real gap via Copilot
 review: an unwritable cache before this fix
-could make list_collections/set_collection_description fail outright even
+could make cb_indexer_list_collections/cb_indexer_set_collection_description fail outright even
 though Qdrant itself was completely healthy.
 """
 
@@ -93,7 +93,7 @@ def _migrate_to_v1(conn) -> None:
     dropping and recreating the table. A straight drop is safe because this
     table is a disposable cache (Qdrant's own collection metadata is the
     source of truth), so no rows are copied forward -- they repopulate on
-    the next list_collections / set_collection_description call.
+    the next cb_indexer_list_collections / cb_indexer_set_collection_description call.
 
     Idempotent: if the table already has the v1 shape (e.g. a version row
     was lost) it is left alone rather than needlessly wiped.
@@ -232,7 +232,7 @@ def set_cached_description(qdrant_url: str, collection: str, description: str) -
     Upserts the cached hint for one collection. This always writes through
     unconditionally, including an empty string -- callers are expected to
     only call this when they actually want the value persisted (the
-    explicit set_collection_description tool call, or list_collections's
+    explicit cb_indexer_set_collection_description tool call, or cb_indexer_list_collections's
     own cache-miss path choosing NOT to call this at all for an empty
     result -- see this module's docstring for why). This function itself
     doesn't apply that judgment; it just stores whatever it's given.
@@ -241,7 +241,7 @@ def set_cached_description(qdrant_url: str, collection: str, description: str) -
     and logged); the one deliberate exception is _connect's RuntimeError for
     a SCHEMA_VERSION/_MIGRATIONS mismatch -- a code bug, not a cache failure.
     Qdrant collection metadata is arbitrary JSON, so a
-    description read back from it (list_collections's cache-miss path) may
+    description read back from it (cb_indexer_list_collections's cache-miss path) may
     legally be None, a dict, or a list rather than a string. The
     `description` column is nullable, so None would no longer raise -- but
     NULL there is the "never fetched" sentinel (get_cached_descriptions
@@ -279,12 +279,12 @@ def get_cached_descriptions(qdrant_url: str, collections: list) -> dict:
     description and therefore deliberately not cached" (see this module's
     docstring), and callers treat that the same way either way: check live.
     A name present with an empty string means something explicitly cleared
-    its hint via set_collection_description(collection, "") -- a real,
+    its hint via cb_indexer_set_collection_description(collection, "") -- a real,
     intentional cached value, just an empty one.
 
     Never raises: a cache READ failure (unwritable/locked/corrupt file) is
     treated as if every requested name were a miss -- callers fall through
-    to a live Qdrant fetch, which is strictly better than list_collections
+    to a live Qdrant fetch, which is strictly better than cb_indexer_list_collections
     failing outright over a disposable cache being unavailable while Qdrant
     itself is perfectly healthy.
     """

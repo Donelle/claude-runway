@@ -66,7 +66,7 @@ EXCLUDE_DIRS = {
 }
 
 
-# sync_repo's bookkeeping file at the repo root. Lives here rather than in
+# cb_indexer_sync_repo's bookkeeping file at the repo root. Lives here rather than in
 # codebase_indexer_mcp_server.py so the CLI can exclude it too: .json is in
 # CODE_EXTENSIONS, so every build_entries/compute_file_hashes caller has to
 # pass extra_exclude_files={MANIFEST_FILENAME} or it embeds the manifest
@@ -140,7 +140,7 @@ FALLBACK_MEMORY_BANK_COLLECTION = "memory-bank"
 def parse_csv_set(value: Optional[str]) -> Optional[set]:
     """
     Parses a comma-separated list (INDEX_INCLUDE_EXTENSIONS, --include-ext,
-    an index_repo include_extensions argument, ...) into a set, stripping
+    an cb_indexer_index_repo include_extensions argument, ...) into a set, stripping
     whitespace around each entry and dropping empty ones. Returns None for
     a None/empty value or one with no non-blank entries, so callers can
     write `parse_csv_set(x) or default`.
@@ -194,11 +194,11 @@ def ingest_env_defaults(environ=None) -> dict:
 # The .mcp.json server blocks that carry MEMORY_BANK_COLLECTION, in the order
 # resolve_memory_bank_collection consults them. setup_project_lib writes the
 # same value into both; codebase-indexer comes first because its copy is the
-# one index_repo/sync_repo actually guard with, and memory-bank (the server
+# one cb_indexer_index_repo/cb_indexer_sync_repo actually guard with, and memory-bank (the server
 # that owns the collection) is the fallback for a hand-edited config that only
 # set it there. When a hand edit leaves the two blocks naming different
 # collections, both names are reserved: memory-bank's is where memories are
-# stored, and codebase-indexer's is the one index_repo guards.
+# stored, and codebase-indexer's is the one cb_indexer_index_repo guards.
 MEMORY_BANK_MCP_JSON_SERVERS = ("codebase-indexer", "memory-bank")
 
 
@@ -234,7 +234,7 @@ def resolve_memory_bank_collection(
     ingest_to_qdrant.py runs from a normal shell, and this toolkit never asks
     for MEMORY_BANK_COLLECTION to be exported there -- the value lives in
     .mcp.json. Reading only the shell meant a project with a custom name had
-    its memory bank refused by index_repo but not by the CLI.
+    its memory bank refused by cb_indexer_index_repo but not by the CLI.
 
     `name` comes from the first non-blank of:
       1. `explicit` (the CLI's --memory-bank-collection)
@@ -1410,7 +1410,7 @@ def chunk_position(metadata) -> str:
     shapes: `line_number` + `char_range` on chunks indexed after
     token-budget chunking, `line_range` on points that predate it and keep it
     until their collection is re-indexed. A collection can also be another
-    repo's, found with find_in_collection, which may not be re-indexed yet.
+    repo's, found with cb_indexer_find_in_collection, which may not be re-indexed yet.
     Returns "" for a point carrying neither (a note stored with no position).
     """
     if not isinstance(metadata, dict):
@@ -1447,7 +1447,7 @@ def file_has_indexable_content(path: Path) -> bool:
     """
     True if chunking `path` would produce at least one chunk, i.e. it holds
     something other than whitespace after the same decoding chunk_file uses.
-    Independent of any token budget, so sync_repo's index-consistency probe can
+    Independent of any token budget, so cb_indexer_sync_repo's index-consistency probe can
     run before the embedding model is loaded (the "no changes" path never loads
     it). Raises OSError like chunk_file.
     """
@@ -1745,7 +1745,7 @@ def compute_file_hashes(
 
 def files_removed_since_last_sync(manifest_files, current_hashes: dict, skipped_paths) -> list:
     """
-    Which manifest-tracked files sync_repo should treat as removed.
+    Which manifest-tracked files cb_indexer_sync_repo should treat as removed.
 
     A file counts as removed only if it's genuinely gone from disk (or no
     longer matches the scope/extension/exclude filters) -- i.e. iter_files
@@ -1796,7 +1796,7 @@ def ensure_persistent_fastembed_cache() -> None:
 def batched(items: list, size: int):
     """
     Yields successive `size`-length slices of `items` (the final slice may be
-    shorter). Used by sync_repo to group per-file Qdrant delete filters into
+    shorter). Used by cb_indexer_sync_repo to group per-file Qdrant delete filters into
     chunks instead of one client.delete() call per file
     found that thousands of individual round-trips in a tight loop (not an
     idle gap) can exhaust local ephemeral ports / Docker Desktop's

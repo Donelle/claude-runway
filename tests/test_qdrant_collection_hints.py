@@ -6,7 +6,7 @@ cache layer, so testing it needs neither Qdrant nor an embedding model:
 
     .venv/bin/python -m unittest discover -s tests
 
-Why this file exists: list_collections surfaces a per-collection
+Why this file exists: cb_indexer_list_collections surfaces a per-collection
 description hint so a model can pick the right collection on its own. The
 cache exists specifically to make that cheap across sessions/restarts --
 these tests pin down the two properties that actually matter for that: a
@@ -70,7 +70,7 @@ class CollectionHintsCache(unittest.TestCase):
         self.assertEqual(result["my-repo"], "Backend API for widgets")
 
     def test_cached_empty_description_is_a_hit_not_a_miss(self):
-        # A collection genuinely has no description set -- list_collections
+        # A collection genuinely has no description set -- cb_indexer_list_collections
         # caches "" itself (see its own docstring) so it isn't re-fetched
         # every call. That must read back as present, not absent.
         set_cached_description("http://localhost:6333", "no-hint-repo", "")
@@ -105,7 +105,7 @@ class CollectionHintsCache(unittest.TestCase):
 
 class CacheFailsOpen(unittest.TestCase):
     """Copilot review caught this: a disposable cache must never
-    turn into a reported failure for list_collections/set_collection_
+    turn into a reported failure for cb_indexer_list_collections/set_collection_
     description, since by the time either cache write runs, Qdrant itself
     -- the authoritative source -- has already been read or written
     successfully. A cache read failure must fall through to "nothing
@@ -146,7 +146,7 @@ class CacheFailsOpen(unittest.TestCase):
 
     def test_non_string_description_is_normalized_to_empty_string(self):
         # Qdrant collection metadata is arbitrary JSON -- a description read
-        # back from it (list_collections's cache-miss path) could legally be
+        # back from it (cb_indexer_list_collections's cache-miss path) could legally be
         # None, a dict, or a list. Reproduced directly that binding any of
         # these into the TEXT NOT NULL column raises IntegrityError (None)
         # or ProgrammingError (dict/list) with no normalization -- this

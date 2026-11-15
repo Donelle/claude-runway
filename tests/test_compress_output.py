@@ -795,8 +795,8 @@ class MainFallsBackToGenericForNonEnvelopeMcpTools(unittest.TestCase):
     regardless of size. Exception: every tool on the analytics
     server (savings_summary/detail/trend, get_metrics, record_metric) and
     the qdrant server's compact_prune are deliberately a no-op at any size,
-    since their numbers must be read verbatim. The qdrant server's qdrant-find
-    and qdrant-store are never compressed at all."""
+    since their numbers must be read verbatim. The qdrant server's cb_indexer_find_repo
+    and cb_indexer_store_repo are never compressed at all."""
 
     def setUp(self):
         self.stub = _StubSavingsLedger()
@@ -931,11 +931,11 @@ class MainFallsBackToGenericForNonEnvelopeMcpTools(unittest.TestCase):
 
     def test_qdrant_find_and_store_are_never_compressed_however_large(self):
         # Their results are code locations and stored notes Claude acts on
-        # directly, and compressing qdrant-find results is a separate decision.
+        # directly, and compressing cb_indexer_find_repo results is a separate decision.
         # The matcher does not list them; this is the second line of defence.
         big = "<entry><content>" + "src/auth.py:10 handles the check. " * 300 + "</content></entry>"
         self.assertGreater(len(big), hook.THRESHOLD)
-        for bare_name in ("qdrant-find", "qdrant-store", "some-future-tool"):
+        for bare_name in ("cb_indexer_find_repo", "cb_indexer_store_repo", "some-future-tool"):
             with self.subTest(tool=bare_name):
                 self.stub.calls.clear()
                 printed = self._run_main({
@@ -1117,7 +1117,7 @@ class CompactFindMultiEntryIsNeverGenericallyCompressed(unittest.TestCase):
 class SettingsTemplateMatcherCoversTheCompactTools(unittest.TestCase):
     """The PostToolUse matcher in templates/settings.json.template (and the copy
     in this hook's docstring) must route the compact tools on the qdrant server
-    to the hook, and must NOT route qdrant-find / qdrant-store to it."""
+    to the hook, and must NOT route cb_indexer_find_repo / cb_indexer_store_repo to it."""
 
     @staticmethod
     def _template_matcher():
@@ -1137,7 +1137,7 @@ class SettingsTemplateMatcherCoversTheCompactTools(unittest.TestCase):
 
     def test_qdrant_find_and_store_are_not_matched(self):
         matcher = self._template_matcher()
-        for name in ("qdrant-find", "qdrant-store"):
+        for name in ("cb_indexer_find_repo", "cb_indexer_store_repo"):
             self.assertFalse(self._matches(matcher, f"mcp__qdrant__{name}"), name)
 
     def test_the_local_compress_server_is_still_matched(self):

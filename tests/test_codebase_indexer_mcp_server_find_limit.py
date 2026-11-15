@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for find_in_collection's limit resolution.
+"""Tests for cb_indexer_find_in_collection's limit resolution.
 Stdlib-only, no network: QdrantClient, the cache, the embedding
 provider and the connector are all mocked.
 

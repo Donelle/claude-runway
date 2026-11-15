@@ -7,9 +7,9 @@ stay precise by default while still allowing a deliberate cross-project
 lookup.
 
 Uses a raw `QdrantClient` + embedding provider directly, not
-`QdrantConnector` (the class `find_in_collection`/`index_repo`/`sync_repo`
+`QdrantConnector` (the class `cb_indexer_find_in_collection`/`cb_indexer_index_repo`/`cb_indexer_sync_repo`
 build on): the embedded field (`summary`) and the field returned on a hit
-(`description`) are NOT the same field here, unlike `find_in_collection`'s
+(`description`) are NOT the same field here, unlike `cb_indexer_find_in_collection`'s
 generic `content`-in/`content`-out pattern -- see `remember_point`'s payload
 shape below.
 
@@ -22,7 +22,7 @@ categorization (kind) or offer a memory to followers (shared); `kind` and
 only on the user's say-so, see below):
   - `source` -- always "memory-bank", fixed by this module, never
     model-settable. The structural "is this actually a memory-bank record"
-    signal `index_repo(reset=true)`/`sync_repo` key their guard exclusions
+    signal `cb_indexer_index_repo(reset=true)`/`cb_indexer_sync_repo` key their guard exclusions
     off of (see mcpservers/codebase_indexer_mcp_server.py).
   - `repo` -- the writing project's own MEMORY_BANK_ID (a plain identifier,
     not necessarily a real Qdrant collection name), or the reserved
@@ -64,8 +64,8 @@ from qdrant_model_check import check_embedding_model_mismatch
 
 # Passed as check_embedding_model_mismatch's recovery_hint by every memory-bank
 # call site -- the shared check's DEFAULT text tells a caller
-# to "use index_repo(reset=true)"/mentions "find_in_collection", both wrong
-# here: index_repo refuses to ever touch the shared memory-bank collection
+# to "use cb_indexer_index_repo(reset=true)"/mentions "cb_indexer_find_in_collection", both wrong
+# here: cb_indexer_index_repo refuses to ever touch the shared memory-bank collection
 # (see is_memory_bank_collection_name's callers in mcpservers/codebase_indexer_mcp_server.py),
 # and memory-bank isn't a cross-repo lookup.
 MISMATCH_RECOVERY_HINT = (
@@ -192,7 +192,7 @@ def resolve_repo(memory_bank_id: Optional[str], general: bool) -> tuple:
 
     general=False errors (rather than silently degrading) when:
     - memory_bank_id is falsy: no MEMORY_BANK_ID configured for this
-      project's .mcp.json, mirroring index_repo/sync_repo's own "no
+      project's .mcp.json, mirroring cb_indexer_index_repo/cb_indexer_sync_repo's own "no
       collection specified" error.
     - memory_bank_id is still the unedited mcp.json.template placeholder:
       every project left unconfigured this way would otherwise silently
@@ -259,7 +259,7 @@ def parse_follow_repos(raw: Optional[str], own_repo: Optional[str]) -> tuple:
 
 def is_memory_bank_collection_name(collection: str, memory_bank_collection: str) -> bool:
     """
-    True if `collection` (an index_repo/sync_repo target) matches the
+    True if `collection` (an cb_indexer_index_repo/cb_indexer_sync_repo target) matches the
     configured memory-bank collection name -- used by codebase_indexer_mcp_server.py
     to refuse indexing/syncing directly into the shared memory bank,
     regardless of reset/force, rather than only guarding the reset path.
@@ -269,7 +269,7 @@ def is_memory_bank_collection_name(collection: str, memory_bank_collection: str)
 
 def memory_bank_exclusion_filter() -> models.Filter:
     """
-    The reusable `must_not` fragment index_repo/sync_repo fold into their own
+    The reusable `must_not` fragment cb_indexer_index_repo/cb_indexer_sync_repo fold into their own
     delete filters, so a collection that ever ends up holding both code
     chunks and protected points (it shouldn't, given
     is_memory_bank_collection_name's guard, but this stays as
@@ -992,7 +992,7 @@ async def transfer_points(
     if not call_with_retry(client.collection_exists, source_backing):
         report["error"] = (
             f"collection '{source}' does not exist. Name it exactly "
-            f"(codebase-indexer's list_collections shows what exists)."
+            f"(codebase-indexer's cb_indexer_list_collections shows what exists)."
         )
         return report
 
@@ -1224,11 +1224,11 @@ def count_memory_bank_points(client: "QdrantClient", collection: str, repo: Opti
     """
     Counts memory-bank points in `collection`, optionally scoped to `repo`.
     Returns 0 if the collection doesn't exist. Used by `wipe_memory_bank`'s
-    pre-confirm count (repo=caller's own) -- NOT by `index_repo(reset=true)`
+    pre-confirm count (repo=caller's own) -- NOT by `cb_indexer_index_repo(reset=true)`
     anymore: that guard used to call this with repo=None
     first to decide between a full `delete_collection` and a filtered one,
     but the count-then-act sequence was racy against a concurrent write, so
-    `index_repo(reset=true)` now always does the filtered delete unconditionally
+    `cb_indexer_index_repo(reset=true)` now always does the filtered delete unconditionally
     instead of counting at all.
 
     Excludes `pending == True` points: without
