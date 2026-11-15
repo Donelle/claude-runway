@@ -147,6 +147,7 @@ def redact_credentials(text: str):
     spans = credential_spans(text)
     if not spans:
         return text, 0
+
     pieces, last = [], 0
     for start, end in spans:  # finditer spans are ordered and non-overlapping
         pieces.append(text[last:start])
@@ -170,10 +171,8 @@ def display_safe(text: Optional[str], max_chars: int = SERVER_DETAIL_MAX_CHARS) 
     """
     if not text:
         return None
-    text, _ = redact_credentials(text)
     text = " ".join(text.split())
-    if not text:
-        return None
     if len(text) > max_chars:
         text = text[:max_chars].rstrip() + "..."
-    return text
+    text, _ = redact_credentials(text)
+    return text or None

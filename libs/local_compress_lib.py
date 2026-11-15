@@ -1020,7 +1020,7 @@ def credential_token_count(text: str) -> int:
     restored, without printing it. A silent omission would leave a reader
     believing the restored set is complete.
     """
-    return len({text[start:end] for start, end in credential_spans(text)})
+    return len({m.group(0) for m in credential_spans(text)})
 
 
 def missing_identifiers(original: str, summary: str) -> list:
