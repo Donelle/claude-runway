@@ -23,6 +23,8 @@ REPO_ROOT = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, str(REPO_ROOT / "libs"))
 sys.path.insert(0, str(REPO_ROOT / "tools"))
 
+from doctor_lib import PR_ROUND_CAPTURE_ENV_VAR  # noqa: E402
+
 
 def _load_doctor():
     """Loads a fresh copy of tools/doctor.py by file path -- same pattern
@@ -37,6 +39,14 @@ def _load_doctor():
 class DoctorCli(unittest.TestCase):
     def setUp(self):
         self.mod = _load_doctor()
+        # main() reads the PR-round capture opt-in from os.environ, and with it on the doctor
+        # fails wherever .claude/settings.json has no SessionEnd capture hook -- true of every
+        # fixture here -- so a developer who exported it would see these tests fail. Clear it for
+        # each test (restored afterwards); test_pr_round_capture.py covers the opt-in itself.
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop(PR_ROUND_CAPTURE_ENV_VAR, None)
         self._tmpdir = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmpdir.cleanup)
         self.target_repo = Path(self._tmpdir.name) / "my-project"

@@ -292,6 +292,117 @@ class RecordFailsOpen(unittest.TestCase):
             self.assertFalse(result)
 
 
+class RecordIfAbsent(MetricsStoreTestCase):
+    """record_if_absent(): the write an idempotent recorder uses -- check and insert in one
+    write transaction, same validation and fail-open rules as record()."""
+
+    def _meta(self, **extra):
+        return {"pr": 5, "review_id": "11", "call_time": "t1", **extra}
+
+    def test_writes_once_then_reports_exists(self):
+        key = {"pr": 5, "review_id": "11", "call_time": "t1"}
+        self.assertEqual(self.store.record_if_absent("m", "e", key, 1.0, self._meta(a=1), "s1"), "written")
+        # The same key again, with different other metadata and another session: still the same event.
+        self.assertEqual(self.store.record_if_absent("m", "e", key, 1.0, self._meta(a=2), "s2"), "exists")
+        rows = self._all_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(json.loads(rows[0][3])["a"], 1)
+
+    def test_a_different_key_field_is_a_different_event(self):
+        key = {"pr": 5, "review_id": "11", "call_time": "t1"}
+        self.store.record_if_absent("m", "e", key, 1.0, self._meta())
+        other = {"pr": 5, "review_id": "11", "call_time": "t2"}
+        self.assertEqual(self.store.record_if_absent("m", "e", other, 1.0, self._meta(call_time="t2")), "written")
+        self.assertEqual(len(self._all_rows()), 2)
+
+    def test_the_check_is_per_metric_id_and_event_type(self):
+        key = {"pr": 5, "review_id": "11", "call_time": "t1"}
+        self.store.record_if_absent("m", "e", key, 1.0, self._meta())
+        self.assertEqual(self.store.record_if_absent("m", "other", key, 1.0, self._meta()), "written")
+        self.assertEqual(self.store.record_if_absent("other", "e", key, 1.0, self._meta()), "written")
+
+    def test_a_null_key_field_matches_a_null_or_absent_field(self):
+        key = {"pr": 5, "review_id": None}
+        self.assertEqual(self.store.record_if_absent("m", "e", key, 1.0, {"pr": 5, "review_id": None}), "written")
+        self.assertEqual(self.store.record_if_absent("m", "e", key, 1.0, {"pr": 5, "review_id": None}), "exists")
+
+    def test_a_row_with_unreadable_metadata_is_skipped_not_fatal(self):
+        conn = sqlite3.connect(str(self._db_path))
+        M._connect(self._db_path).close()
+        conn.execute("INSERT INTO metrics (metric_id, event_type, value, metadata, event_timestamp) "
+                     "VALUES ('m', 'e', 1.0, 'not json', '2026-01-01T00:00:00Z')")
+        conn.execute("INSERT INTO metrics (metric_id, event_type, value, metadata, event_timestamp) "
+                     "VALUES ('m', 'e', 1.0, '[1, 2]', '2026-01-01T00:00:00Z')")
+        conn.execute("INSERT INTO metrics (metric_id, event_type, value, metadata, event_timestamp) "
+                     "VALUES ('m', 'e', 1.0, NULL, '2026-01-01T00:00:00Z')")
+        conn.commit()
+        conn.close()
+        key = {"pr": 5, "review_id": "11", "call_time": "t1"}
+        self.assertEqual(self.store.record_if_absent("m", "e", key, 1.0, self._meta()), "written")
+
+    def test_a_key_field_missing_from_metadata_is_refused(self):
+        self.assertEqual(self.store.record_if_absent("m", "e", {"pr": 5, "x": 1}, 1.0, {"pr": 5}), "failed")
+        self.assertEqual(self.store.record_if_absent("m", "e", {}, 1.0, {"pr": 5}), "failed")
+        self.assertEqual(self.store.record_if_absent("m", "e", {"pr": 5}, 1.0, None), "failed")
+        self.assertEqual(self.store.record_if_absent("m", "e", {"pr": [5]}, 1.0, {"pr": [5]}), "failed")
+        self.assertEqual(self._all_rows(), [])
+
+    def test_validation_matches_record(self):
+        key = {"pr": 5}
+        self.assertEqual(self.store.record_if_absent("m", "e", key, float("nan"), {"pr": 5}), "failed")
+        self.assertEqual(self.store.record_if_absent("m", "e", key, 1.0, {"pr": 5}, event_timestamp="2026-8-5T01:02:03Z"), "failed")
+        self.assertEqual(self.store.record_if_absent("m", "e", key, 1.0, {"pr": 5}, event_timestamp="2026-08-05T01:02:03Z"), "written")
+        self.assertEqual(self._all_rows()[0][4], "2026-08-05T01:02:03Z")
+
+    def test_unwritable_store_is_failed_not_raised(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            blocking = Path(tmpdir) / "not-a-directory"
+            blocking.write_text("x")
+            store = M.MetricsStore(db_path=blocking / "sub" / "metrics.db")
+            self.assertEqual(store.record_if_absent("m", "e", {"pr": 5}, 1.0, {"pr": 5}), "failed")
+
+    def test_a_locked_store_is_failed_not_raised_and_leaves_nothing(self):
+        holder = sqlite3.connect(str(self._db_path))
+        M._connect(self._db_path).close()
+        holder.execute("BEGIN IMMEDIATE")
+        try:
+            real_connect = sqlite3.connect  # captured: patching the module attribute would recurse
+            with mock.patch.object(M.sqlite3, "connect", lambda p: real_connect(p, timeout=0.05)):
+                self.assertEqual(self.store.record_if_absent("m", "e", {"pr": 5}, 1.0, {"pr": 5}), "failed")
+        finally:
+            holder.rollback()
+            holder.close()
+        self.assertEqual(self._all_rows(), [])
+
+    def test_two_writers_of_one_key_write_one_row(self):
+        # Two stores on the same file, as a session-end hook and a backfill would be.
+        other = M.MetricsStore(db_path=self._db_path)
+        key = {"pr": 5, "review_id": "11", "call_time": "t1"}
+        results = [s.record_if_absent("m", "e", key, 1.0, self._meta()) for s in (self.store, other)]
+        self.assertEqual(sorted(results), ["exists", "written"])
+        self.assertEqual(len(self._all_rows()), 1)
+
+    def test_concurrent_writers_of_one_key_write_exactly_one_row(self):
+        import threading
+        M._connect(self._db_path).close()  # schema first, so the threads race on the write, not on CREATE
+        key = {"pr": 5, "review_id": "11", "call_time": "t1"}
+        barrier = threading.Barrier(6)
+        results: list = []
+
+        def work():
+            store = M.MetricsStore(db_path=self._db_path)
+            barrier.wait()
+            results.append(store.record_if_absent("m", "e", key, 1.0, self._meta()))
+
+        threads = [threading.Thread(target=work) for _ in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(results.count("written"), 1, results)
+        self.assertEqual(len(self._all_rows()), 1)
+
+
 class SummaryTestCase(MetricsStoreTestCase):
     def test_empty_metric_id_reports_zero_and_none_timestamps(self):
         summary = self.store.summary("no-such-metric")
@@ -338,7 +449,7 @@ class ByEventType(MetricsStoreTestCase):
 class SessionIdFilter(MetricsStoreTestCase):
     """summary()/by_event_type() gained an optional session_id
     param so a caller can narrow an aggregate down to one specific session's
-    rows (e.g. one my-gh-autowork attempt's own issue-<n>-<HHMMSS> marker)
+    rows (e.g. one cr-gh-autowork attempt's own issue-<n>-<HHMMSS> marker)
     instead of the metric_id's entire history. trend() is
     explicitly out of scope per the issue -- not covered here."""
 

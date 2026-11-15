@@ -63,6 +63,75 @@ def build_snapshot(pr_meta: dict, reviews: list, comments: list, repo: str, base
             "base_changes": base_changes, "rounds": rounds}
 
 
+# ---------------------------------------------------------------------------
+# Choosing which PRs to record
+# ---------------------------------------------------------------------------
+#
+# A pile of the PRs with the most findings would all look alike (big Python changes argued over for many rounds). A
+# balanced set covers every value of four traits: what kind of change it was, how big, how many Copilot rounds and how many
+# inline findings. `choose_balanced` picks it by a fixed rule so the same PRs give the same set.
+
+SHELL_SUFFIXES = (".sh", ".ps1", ".bat", ".cmd")
+DOC_SUFFIXES = (".md", ".txt", ".rst")
+
+
+def kind_of(paths: list) -> str:
+    """`docs` when every changed file is prose, `shell` when any is a shell or batch script, `python` when any is Python,
+    else `other`."""
+    names = [str(p).lower() for p in paths]
+    if names and all(n.endswith(DOC_SUFFIXES) for n in names):
+        return "docs"
+    if any(n.endswith(SHELL_SUFFIXES) for n in names):
+        return "shell"
+    if any(n.endswith(".py") for n in names):
+        return "python"
+    return "other"
+
+
+def size_of(lines_changed: int) -> str:
+    return "small" if lines_changed < 150 else "medium" if lines_changed < 1000 else "large"
+
+
+def rounds_of(rounds: int) -> str:
+    return "few rounds" if rounds <= 2 else "some rounds" if rounds <= 5 else "many rounds"
+
+
+def findings_of(inline: int) -> str:
+    return "few findings" if inline <= 2 else "some findings" if inline <= 5 else "many findings"
+
+
+def profile(pr: dict, rounds: int, inline: int) -> dict:
+    """What `choose_balanced` needs to know about one PR: `pr` is a `gh pr list` item (number, title, additions, deletions,
+    files), `rounds` the number of Copilot reviews it had and `inline` the inline findings across them."""
+    paths = [f.get("path", "") for f in pr.get("files") or []]
+    return {"pr": pr["number"], "title": pr.get("title", ""), "rounds": rounds, "inline": inline,
+            "traits": (kind_of(paths), size_of(int(pr.get("additions") or 0) + int(pr.get("deletions") or 0)),
+                       rounds_of(rounds), findings_of(inline))}
+
+
+def choose_balanced(profiles: list, count: int, exclude: "set | frozenset" = frozenset()) -> list:
+    """The PR numbers of a balanced set of up to `count`, in the order chosen.
+
+    Only a PR with at least one Copilot review and one inline finding can be scored. Each pick is the PR that adds the
+    most trait values not yet covered; ties go to the PR with more findings, then the lower number, so the result never
+    depends on the order the PRs arrive in. Once every value is covered the rest are the PRs whose combination of traits has
+    not been chosen yet, then the ones with the most findings."""
+    pool = [p for p in profiles if p["rounds"] >= 1 and p["inline"] >= 1 and p["pr"] not in exclude]
+    chosen: list = []
+    covered: set = set()
+    combos: set = set()
+    while pool and len(chosen) < count:
+        def rank(p):
+            new = sum(1 for dimension, value in enumerate(p["traits"]) if (dimension, value) not in covered)
+            return (new, p["traits"] not in combos, p["inline"], -p["pr"])
+        best = max(pool, key=rank)
+        chosen.append(best["pr"])
+        covered.update(enumerate(best["traits"]))
+        combos.add(best["traits"])
+        pool.remove(best)
+    return chosen
+
+
 def load_snapshot(path: "str | Path") -> dict:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     if data.get("version") != SNAPSHOT_VERSION or "rounds" not in data:

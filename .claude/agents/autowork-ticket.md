@@ -1,6 +1,6 @@
 ---
 name: autowork-ticket
-description: Subagent for /my-gh-autowork. Works one GitHub ticket end to end from the prompt the skill hands it. Started only by that skill; not for general tasks.
+description: Subagent for /cr-gh-autowork. Works one GitHub ticket end to end from the prompt the skill hands it. Started only by that skill; not for general tasks.
 tools: Bash, Read, Edit, Write, Glob, Grep, ToolSearch, mcp__codebase-indexer__sync_repo, mcp__codebase-indexer__get_collection_info, mcp__qdrant__qdrant-find, mcp__local-compress__compress_command_output, mcp__local-compress__compress_file, mcp__memory-bank__recall
 ---
 

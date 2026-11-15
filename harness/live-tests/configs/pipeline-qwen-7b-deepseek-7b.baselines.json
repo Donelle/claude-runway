@@ -1,0 +1,3 @@
+{"measured": "2026-10-27", "model": "deepseek-r1-distill-qwen-7b@4bit (verifier), qwen2.5-coder-7b-instruct-mlx (reasoning)",
+ "runType": "synthetic", "metadata": {"cases": ["orders"]},
+ "expect": {"max_decoy_alarms_after": 0, "min_bugs_after": 1}}

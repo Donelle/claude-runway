@@ -3,9 +3,11 @@
 server.
 
 What these pin, because each is a way to get it quietly wrong:
-  - `REVIEWERS_FILE` is required and has no default: neither `init` nor `upgrade`
-    ever writes a default path or a reviewers file, and both warn when it is not
-    set.
+  - `REVIEWERS_FILE` is required and has no default: `init` never writes a
+    default path or a reviewers file, and warns when it is not set.
+  - While the server is unreleased the block is NOT in `templates/mcp.json.template`
+    and `upgrade` never offers it, but `init --codebase-reviewer`/`--reviewers-file`
+    still write it (from `CODEBASE_REVIEWER_BLOCK`).
   - An existing block (and the user's own path in it) survives a re-run of `init`.
   - `doctor` reports a missing, blank or invalid reviewers file and exits 1.
 
@@ -31,8 +33,9 @@ sys.path.insert(0, str(REPO_ROOT / "tools"))
 sys.path.insert(0, str(REPO_ROOT / "tests"))
 
 import doctor as doctor_cli  # noqa: E402
-from doctor_lib import run_doctor  # noqa: E402
+from doctor_lib import PR_ROUND_CAPTURE_ENV_VAR, run_doctor  # noqa: E402
 from setup_project_lib import (  # noqa: E402
+    CODEBASE_REVIEWER_BLOCK,
     REVIEWERS_FILE_REQUIRED_WARNING,
     ask_codebase_reviewer,
     build_mcp_servers,
@@ -64,7 +67,7 @@ def _build(**overrides):
 
 def _valid_reviewers() -> dict:
     return {
-        "rubric": [{"name": "r1", "level": "low", "definition": "d", "score": 2}],
+        "rubric": [{"name": "r1", "level": "low", "definition": "d", "score": 0.4}],
         "reviewers": [
             {"name": "q", "model": "m", "prompt": "p", "active": True, "type": ["reasoning"], "loadOnDemand": False}
         ],
@@ -72,8 +75,18 @@ def _valid_reviewers() -> dict:
 
 
 class TemplateBlock(unittest.TestCase):
-    def test_the_template_has_the_block_with_the_documented_env_and_no_default_path(self):
-        env = MCP_TEMPLATE["mcpServers"][BLOCK]["env"]
+    def test_the_template_has_no_reviewer_block(self):
+        self.assertNotIn(BLOCK, MCP_TEMPLATE["mcpServers"])
+
+    def test_the_template_text_never_mentions_the_reviewer_server(self):
+        # A hand-copied template must not advertise an unreleased server, in its
+        # top-level comment or in another block's comment either.
+        text = (REPO_ROOT / "templates" / "mcp.json.template").read_text(encoding="utf-8").lower()
+        self.assertNotIn("codebase-reviewer", text)
+        self.assertNotIn("codebase_reviewer", text)
+
+    def test_the_constant_has_the_documented_env_and_no_default_path(self):
+        env = CODEBASE_REVIEWER_BLOCK["env"]
         self.assertEqual(
             set(env), {"REVIEWERS_FILE", "MAX_REVIEWERS", "MAX_REVIEW_ROUNDS", "QDRANT_URL", "QDRANT_API_KEY"}
         )
@@ -81,11 +94,49 @@ class TemplateBlock(unittest.TestCase):
         self.assertEqual(env["MAX_REVIEWERS"], "3")
         self.assertEqual(env["MAX_REVIEW_ROUNDS"], "3")
 
-    def test_the_template_block_points_at_the_new_server_script(self):
+    def test_the_constant_points_at_the_server_script(self):
         self.assertEqual(
-            MCP_TEMPLATE["mcpServers"][BLOCK]["args"], ["/absolute/path/to/mcpservers/codebase_reviewer_mcp_server.py"]
+            CODEBASE_REVIEWER_BLOCK["args"], ["/absolute/path/to/mcpservers/codebase_reviewer_mcp_server.py"]
         )
         self.assertTrue((REPO_ROOT / "mcpservers" / "codebase_reviewer_mcp_server.py").is_file())
+
+    def test_the_constants_comment_no_longer_says_upgrade_offers_it(self):
+        self.assertNotIn("upgrade", CODEBASE_REVIEWER_BLOCK["_comment"])
+
+    def test_the_flag_writes_the_whole_block_unchanged(self):
+        # Pins the exact block `init --codebase-reviewer` writes, key order included.
+        block = _build(codebase_reviewer=True, reviewers_file="/r.json")[BLOCK]
+        self.assertEqual(list(block), ["_comment", "command", "type", "args", "env"])
+        self.assertEqual(block["type"], "stdio")
+        self.assertEqual(
+            list(block["env"].items()),
+            [
+                ("REVIEWERS_FILE", "/r.json"),
+                ("MAX_REVIEWERS", "3"),
+                ("MAX_REVIEW_ROUNDS", "3"),
+                ("QDRANT_URL", "http://localhost:6333"),
+                ("QDRANT_API_KEY", ""),
+            ],
+        )
+
+    def test_building_does_not_mutate_the_constant(self):
+        before = json.dumps(CODEBASE_REVIEWER_BLOCK, sort_keys=True)
+        _build(codebase_reviewer=True, reviewers_file="/r.json", qdrant_url="http://q:1", max_reviewers="9")
+        self.assertEqual(json.dumps(CODEBASE_REVIEWER_BLOCK, sort_keys=True), before)
+
+    def test_a_template_that_still_carries_the_block_is_stripped_unless_asked_for(self):
+        # An older template copy (or a fork) may still have the block; that must not raise
+        # and must not leak it into a default init.
+        old_style = json.loads(json.dumps(MCP_TEMPLATE))
+        old_style["mcpServers"][BLOCK] = json.loads(json.dumps(CODEBASE_REVIEWER_BLOCK))
+        kwargs = dict(
+            collection_name="my-project",
+            venv_python=VENV_PYTHON,
+            tools_repo_dir=Path("/home/user/tools/claude-runway"),
+            home_dir=HOME,
+        )
+        self.assertNotIn(BLOCK, build_mcp_servers(old_style, **kwargs))
+        self.assertIn(BLOCK, build_mcp_servers(old_style, codebase_reviewer=True, **kwargs))
 
 
 class BuildMcpServers(unittest.TestCase):
@@ -393,15 +444,33 @@ class UpgradeCliWiring(unittest.TestCase):
         )
         with mock.patch.object(self.mod, "run_upgrade", side_effect=fake_run_upgrade), redirect_stdout(io.StringIO()):
             self.mod.cmd_upgrade(args)
-        return captured["offer_reviewer_fn"]
+        return captured.get("offer_reviewer_fn")
 
-    def test_an_interactive_run_passes_the_question(self):
-        self.assertIs(self._offer_passed(tty=True), self.mod.ask_codebase_reviewer)
-
-    def test_no_terminal_auto_yes_and_dry_run_pass_none(self):
+    def test_no_run_passes_the_question_while_the_server_is_unreleased(self):
+        # Interactive or not, with or without --auto-yes/--dry-run: never offered.
+        self.assertIsNone(self._offer_passed(tty=True))
         self.assertIsNone(self._offer_passed(tty=False))
         self.assertIsNone(self._offer_passed(tty=True, auto_yes=True))
         self.assertIsNone(self._offer_passed(tty=True, dry_run=True))
+
+    def test_an_interactive_upgrade_never_prompts_or_mentions_the_reviewer(self):
+        # End to end through the real run_upgrade, with stdin looking like a terminal: the
+        # reviewer question must not be asked, and nothing printed names the server.
+        self.mod._stdin_is_interactive = lambda: True
+        args = argparse.Namespace(
+            target_repo=str(self.target), dry_run=False, auto_yes=False, skills_dir=str(Path(self._tmp.name) / "skills")
+        )
+        asked: list = []
+        buf = io.StringIO()
+        with (
+            mock.patch.object(self.mod, "ask_savings_tracker", lambda *a, **k: False),
+            mock.patch("builtins.input", side_effect=lambda prompt="": asked.append(prompt) or "n"),
+            redirect_stdout(buf),
+        ):
+            self.mod.cmd_upgrade(args)
+        self.assertFalse([p for p in asked if "reviewer" in p.lower()], asked)
+        self.assertNotIn("reviewer", buf.getvalue().lower())
+        self.assertNotIn(BLOCK, json.loads((self.target / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"])
 
 
 class UpgradeOffer(unittest.TestCase):
@@ -506,6 +575,13 @@ class UpgradeOffer(unittest.TestCase):
 
 class Doctor(unittest.TestCase):
     def setUp(self):
+        # doctor_cli.main() reads the PR-round capture opt-in from os.environ, and with it on the
+        # doctor fails because these fixtures register no SessionEnd capture hook. Clear it for each
+        # test (restored afterwards) so an exported opt-in in the developer's shell can't leak in.
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop(PR_ROUND_CAPTURE_ENV_VAR, None)
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.target = Path(self._tmp.name) / "proj"
@@ -546,7 +622,9 @@ class Doctor(unittest.TestCase):
     def test_a_missing_file_names_the_path(self):
         missing = str(self.target / "nope.json")
         self._config({"REVIEWERS_FILE": missing})
-        self.assertIn(missing, self._doctor().reviewers_file_problem or "")
+        # The message quotes the path with repr(), which doubles every backslash in a
+        # Windows path; compare against the same quoted form so the check holds on both.
+        self.assertIn(repr(missing), self._doctor().reviewers_file_problem or "")
 
     def test_an_invalid_file_lists_every_problem(self):
         data = _valid_reviewers()

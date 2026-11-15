@@ -5,7 +5,7 @@ tools/setup_project.py's `cmd_init`).
 
 `init` used to write `.mcp.json` and `.claude/settings.json` only, so a project
 configured from the CLI (and every pipx/`uv tool install` user, who cannot run
-the /my-setup-clauderunway skill) got working servers with no usage guidance.
+the /cr-setup skill) got working servers with no usage guidance.
 These pin the rules the skill's step 6 followed: verbatim template sections, a
 missing section appended, the section of a server that is not configured
 removed, nothing else touched, and a re-run that changes nothing.

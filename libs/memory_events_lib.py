@@ -23,7 +23,7 @@ excluded from `record_memory_event`/`memory-events.db` above: a plain call
 count for `forget` costs nothing extra (no autonomous-removal feature is
 needed to justify it, unlike the rich per-point log this module already
 argues against for `forget`), and answering "how often is forget called"
-is exactly what that counter exists to give `/my-metrics`'s `memory-bank`
+is exactly what that counter exists to give `/cr-metrics`'s `memory-bank`
 branch real data to read.
 
 Why append-only INSERT, not an in-place counter on the Qdrant point itself:
@@ -55,16 +55,31 @@ for why it increments once per tool CALL, not once per event row.
 Follows this repo's small, function-based, dependency-light interface over
 SQLite (same shape as `libs/cache_db.py`/`libs/qdrant_collection_hints.py`)
 rather than an ORM -- swapping the backend later only touches this file.
-This is a brand-new v1 table, so (unlike `savings_ledger.py`) there's no
-migration scaffold yet; add one (SCHEMA_VERSION + a migrations map, following
-that file's `_run_migrations` pattern) the first time this schema actually
-needs to change.
+`point_id` is stored in ONE canonical form: a lowercase, dashed
+8-4-4-4-12 UUID. The same memory used to be logged two ways -- remember_point
+mints `uuid.uuid4().hex` (32 hex characters, no dashes) while Qdrant returns
+every point id dashed, which is what a recall row carries -- so a plain
+`remember.point_id = recall.point_id` join matched nothing. `record_memory_event`
+now normalizes at write time (`canonical_point_id`), in this one place so that
+every caller is covered, including `transfer_memories`/`copy_memories`, which
+mint dashed `uuid5` ids of their own. A file written before that is rewritten
+once by `_connect()` (see `_POINT_ID_FORMAT_VERSION`). A reader that opens the
+db read-only (`libs/memory_bank_report_lib.py`) never runs that rewrite, so it
+still normalizes ids in its own SQL as a safety net for a file not yet migrated.
+
+This is still a small v1 table with no general migration scaffold (unlike
+`savings_ledger.py`); the single one-time rewrite above is gated by
+`PRAGMA user_version` rather than a migrations map. Add that map (SCHEMA_VERSION
++ `_run_migrations`, following `savings_ledger.py`'s pattern) the first time a
+second change is needed.
 """
 
 import os
+import re
 import sqlite3
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -116,6 +131,40 @@ _VALID_EVENT_TYPES = ("recall", "remember")
 # for why the two lists differ).
 _VALID_METRIC_EVENT_TYPES = ("recall", "remember", "forget")
 
+# The two spellings of one UUID this log has ever carried: 32 hex
+# characters with no dashes (what remember_point mints) and the dashed 8-4-4-4-12
+# form (what Qdrant returns). Anchored with fullmatch, and deliberately NOT
+# bare `uuid.UUID(...)`, which also accepts '{...}' and 'urn:uuid:' forms no
+# path here produces -- and the one-time backfill in _connect() has to match
+# exactly the set this recognizes, no more.
+_HEX32_RE = re.compile(r"[0-9a-fA-F]{32}")
+_DASHED_UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+# SQLite GLOB spelling of _HEX32_RE, for the backfill: 32 hex-digit classes.
+_HEX32_GLOB = "[0-9a-fA-F]" * 32
+
+# `PRAGMA user_version` value that means "point_id values have been rewritten
+# to the canonical form". 0 (a file never versioned, or a brand-new one) runs
+# the rewrite once; every connection after that skips it, so the per-event
+# cost stays one integer read instead of a table scan (the point_id index
+# cannot serve a length()/GLOB predicate).
+_POINT_ID_FORMAT_VERSION = 1
+
+
+def canonical_point_id(point_id) -> Optional[str]:
+    """
+    The one stored spelling of a point id: `None` stays `None`; a
+    32-hex or dashed UUID, in either case, becomes the lowercase dashed form;
+    anything else (an integer point id, or a short id that is not a memory)
+    comes back as plain `str(point_id)`, unchanged. Never raises.
+    """
+    if point_id is None:
+        return None
+    text = str(point_id)
+    if _HEX32_RE.fullmatch(text) or _DASHED_UUID_RE.fullmatch(text):
+        return str(uuid.UUID(text))
+    return text
+
 
 def _connect() -> sqlite3.Connection:
     """
@@ -158,6 +207,25 @@ def _connect() -> sqlite3.Connection:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_events_point_id ON memory_events (point_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_events_repo ON memory_events (repo)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_events_event_type ON memory_events (event_type)")
+        # One-time rewrite of rows logged before point_id was canonicalized at
+        # write time: undashed 32-hex ids become lowercase dashed.
+        # Only values that are EXACTLY 32 hex characters are touched, so other
+        # tests'/fixtures' short non-UUID ids are left alone. The rewrite and
+        # the version bump share one transaction (`with conn:` commits both or
+        # rolls both back), and the UPDATE is idempotent, so two sessions
+        # migrating at once, or a re-run after an interrupted one, is harmless.
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        if version < _POINT_ID_FORMAT_VERSION:
+            with conn:
+                conn.execute(
+                    "UPDATE memory_events SET point_id = LOWER("
+                    "SUBSTR(point_id, 1, 8) || '-' || SUBSTR(point_id, 9, 4) || '-' || "
+                    "SUBSTR(point_id, 13, 4) || '-' || SUBSTR(point_id, 17, 4) || '-' || "
+                    "SUBSTR(point_id, 21)) "
+                    "WHERE LENGTH(point_id) = 32 AND point_id GLOB ?",
+                    (_HEX32_GLOB,),
+                )
+                conn.execute(f"PRAGMA user_version = {_POINT_ID_FORMAT_VERSION}")
     except sqlite3.Error:
         conn.close()
         raise
@@ -175,7 +243,8 @@ def record_memory_event(
     turn: int,
 ) -> None:
     """
-    Append one row. Raises ValueError for an event_type outside
+    Append one row, with `point_id` stored in its canonical spelling
+    (`canonical_point_id`). Raises ValueError for an event_type outside
     ("recall", "remember") -- that's always a caller bug (this module is
     only ever invoked by this repo's own two call sites), not a runtime
     condition worth failing open over.
@@ -206,7 +275,7 @@ def record_memory_event(
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     event_type,
-                    str(point_id) if point_id is not None else None,
+                    canonical_point_id(point_id),
                     repo,
                     kind,
                     summary_created_at,
@@ -229,7 +298,7 @@ def record_memory_metric(event_type: str, session_id: Optional[str] = None) -> N
     `libs/metrics_lib.py`'s shared `MetricsStore`) -- `metric_id="memory-bank"`,
     this `event_type`, `value=1`, no metadata. Deliberately separate from
     `record_memory_event`/`memory-events.db` above (see this module's
-    docstring): this is a plain call-count for `/my-metrics`'s `memory-bank`
+    docstring): this is a plain call-count for `/cr-metrics`'s `memory-bank`
     branch to read, not the rich per-point access log that function
     already provides.
 

@@ -109,7 +109,7 @@ MUST_SKIP = [
     # --- gh api: structured REST/GraphQL data, never prose ---
     (
         "gh api repos/Donelle/claude-runway/pulls/190/comments --paginate",
-        "plain gh api call with no --jq/--json at all (my-gh-pr-feedback's shape)",
+        "plain gh api call with no --jq/--json at all (cr-gh-pr-feedback's shape)",
     ),
     (
         "gh api graphql -f query='query { repository(name: \"x\") { pullRequest(number: 1) "
@@ -120,7 +120,7 @@ MUST_SKIP = [
         'COMMENT_IDS=$(gh api repos/Donelle/claude-runway/pulls/190/comments '
         '--paginate --jq ".[] | select(.user.login != \\"me\\") | \\"comment:\\" + (.id|tostring)") '
         "|| FETCH_FAILED=1",
-        "the real VAR=$(...) command-substitution shape used by my-gh-autowork's NEW_IDS diffing "
+        "the real VAR=$(...) command-substitution shape used by cr-gh-autowork's NEW_IDS diffing "
         "-- a start-anchored fix would have missed this",
     ),
     # --- Wrappers that used to hide the command from `^` anchoring ---
@@ -183,6 +183,32 @@ MUST_SKIP = [
     ('echo "\n<<EOF\n"\ngit diff\ncat <<EOF\nnotes\nEOF', "quote state carried across lines"),
     ('env -C "$PWD"/. git diff', "adjacent quoted/unquoted env operand"),
     ("env CI=1 /usr/bin/git diff", "launched executable given by path"),
+    # --- A file slice is a Bash spelling of Read, which is never compressed ---
+    ("sed -n '3,47p' notes.txt", "the exact command that got a stored session paraphrased"),
+    ("sed -ne '3,5p' f", "bundled -ne"),
+    ("sed -En '3,5p' f", "bundled -En"),
+    ("sed --quiet 1,3p f", "long --quiet"),
+    ("sed --silent 1,3p f", "long --silent"),
+    ("sed -E -n '3,5p' f", "another flag before -n"),
+    ("head -n 50 f", "head with a count"),
+    ("tail -c 2000 f", "tail by bytes"),
+    ("head f", "bare head"),
+    ("FOO=1 tail -n 5 f", "leading assignment"),
+    ("sudo sed -n '1,9p' f", "leading sudo"),
+    ("cd d && sed -n '1,9p' f", "after && it opens the file"),
+    ("echo x; head -n 3 f", "after ; it opens the file"),
+    ("echo x || tail -n 3 f", "after || (not a pipe) it opens the file"),
+    ("sed -n '1,5p' f | cut -c1-80", "the slice is the first stage; a later stage does not undo it"),
+    ("X=$(sed -n '3,4p' f)", "slice inside a command substitution"),
+    ("(sed -n '1,3p' f)", "subshell wrapper"),
+    # --- Review: the same slices launched through `env` / `sudo env` ---
+    ("env LC_ALL=C sed -n '3,47p' f", "env-launched slice, same as the bare-assignment form"),
+    ("env FOO=1 sed -n '3,47p' f", "env with an assignment"),
+    ("env -i tail -n 5 f", "env with a flag"),
+    ("env -C /tmp head -n 50 f", "env with an operand option"),
+    ("env /usr/bin/tail -n 5 f", "launched executable given by path"),
+    ("sudo env tail -n 5 f", "sudo before env"),
+    ("env -- head -n 3 f", "-- ends env's options"),
 ]
 
 # Commands that should still be compressed normally.
@@ -244,6 +270,24 @@ MUST_COMPRESS = [
     ("cat <<EOF\nEOF\ndotnet build", "empty heredoc followed by a non-exempt command"),
     ("bash -c 'dotnet build'", "quoted shell payload that is not exempt"),
     ("cat <<EOF\n$HOME git status\nEOF", "unquoted heredoc without a substitution is data"),
+    # --- near-misses: only a file slice is exempt ---
+    ("npm test 2>&1 | tail -100", "the standard log-skimming idiom: tail trims another command's stdout"),
+    ("dotnet build | head -50", "head as a pipe consumer"),
+    ("dotnet build 2>&1 | sed -n '1,40p'", "sed -n as a pipe consumer"),
+    ("sed 's/a/b/' f", "sed without -n edits text, it is not a slice"),
+    ("sed -i 's/a/b/' f", "in-place edit, no -n"),
+    ("cat SKILL.md | head -20", "cat stays compressible, and head after a pipe does not exempt it"),
+    ("tailor f", "`tail` must be a whole word"),
+    ("heading f", "`head` must be a whole word"),
+    ("head-tool f", "same, with a hyphen"),
+    ('echo "sed -n p f"', "slice text only inside a quoted argument"),
+    ("sed -n '3,47p' f # compress-ok", "escape hatch opts a large slice back in"),
+    ("tail -n 5 f # compress-ok", "escape hatch on tail"),
+    # --- Review: env must not reopen the pipe-consumer hole ---
+    ("npm test 2>&1 | env LC_ALL=C tail -100", "env-launched tail after a pipe still trims stdout"),
+    ("dotnet build | env -i head -50", "same, with head"),
+    ("env CI=1 sed 's/a/b/' f", "env launching sed without -n is not a slice"),
+    ("env LC_ALL=C sed -n '3,47p' f # compress-ok", "escape hatch beats the env-launched slice"),
 ]
 
 
@@ -276,6 +320,47 @@ class ExactnessCriticalIsLinearTime(unittest.TestCase):
             start = time.monotonic()
             _is_exactness_critical(cmd)
             self.assertLess(time.monotonic() - start, 2.0, cmd[:40])
+
+    def test_long_run_of_flags_before_a_sed_slice_is_linear(self):
+        # _FILE_SLICE_RE has a lazy `(?:-\S+\s+)*?` run of flags in
+        # front of the -n alternative; a long run of near-miss flags must not
+        # backtrack badly, matched or not.
+        import time
+
+        flags = "-E " * 2000
+        for cmd in ("sed " + flags + "-n p f", "sed " + flags + "p f"):
+            start = time.monotonic()
+            _is_exactness_critical(cmd)
+            self.assertLess(time.monotonic() - start, 2.0, cmd[:40])
+
+
+class CommandSegmentsKeepPipeInformation(unittest.TestCase):
+    """_command_segments must split exactly as _SEGMENT_SPLIT_RE does, plus say
+    whether each segment came straight after a single `|`."""
+
+    def test_same_segments_as_the_plain_split(self):
+        from compress_output import _SEGMENT_SPLIT_RE, _command_segments
+
+        for cmd in (
+            "a | b || c && d ; e",
+            "X=$(a | b)",
+            "echo `a` ; b\nc",
+            "",
+            "single",
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(
+                    [seg for seg, _ in _command_segments(cmd)],
+                    _SEGMENT_SPLIT_RE.split(cmd),
+                )
+
+    def test_follows_pipe_only_after_a_single_pipe(self):
+        from compress_output import _command_segments
+
+        self.assertEqual(
+            _command_segments("a | b || c && d ; e"),
+            [("a ", False), (" b ", True), (" c ", False), (" d ", False), (" e", False)],
+        )
 
 
 class CompileExtraExactPatterns(unittest.TestCase):
@@ -781,7 +866,7 @@ class MainFallsBackToGenericForNonEnvelopeMcpTools(unittest.TestCase):
         # all, and compress_file/compress_command_output/fetch_url omit one
         # whenever tracking is off server-side even though real compression
         # already ran -- with the caller's own focus/preserve_identifiers/
-        # preserve_sections (this is /my-compact's own real usage shape).
+        # preserve_sections (this is /cr-compact's own real usage shape).
         # None of these four must ever fall through to the generic
         # fallback: doing so would silently discard exactly what that first
         # pass was told to preserve.
@@ -914,11 +999,11 @@ class TimeoutErrorFlowsIntoTheWasntCompressedNote(unittest.TestCase):
 
 
 class CompactFindMultiEntryIsNeverGenericallyCompressed(unittest.TestCase):
-    """compact_find's output is structured data /my-resume
+    """compact_find's output is structured data /cr-resume
     parses for control flow (a "Found {N} compact(s)" header + N discrete
     dated/labeled entries), not prose to skim. Generic size-based
     compression collapses multiple entries into one flowing narrative
-    before /my-resume ever sees discrete entries to count, breaking its
+    before /cr-resume ever sees discrete entries to count, breaking its
     0/1/2+ branching. A response whose own header reports N > 1 must be
     left completely untouched, regardless of size -- the same true no-op
     _SELF_COMPRESSING_MCP_TOOLS gets. N <= 1 (including no header at all,
@@ -1079,7 +1164,7 @@ class CompactFindEntryCountHelper(unittest.TestCase):
         # The header regex must be anchored to the START of
         # the leaf, not just matched anywhere in it -- otherwise a STORED
         # compact's own content quoting this exact phrase mid-string (e.g. a
-        # past /my-compact session about debugging this very hook) would be
+        # past /cr-compact session about debugging this very hook) would be
         # mistaken for the real leading header. Reproduced live before the
         # fix: this returned 5, not None.
         fake = "Some earlier stored compact discusses: Found 5 compact(s) for project 'other':\nmore text"
@@ -1748,6 +1833,37 @@ class InvalidThresholdEnvTests(unittest.TestCase):
                 os.environ.pop("CLAUDE_RUNWAY_COMPRESS_THRESHOLD_CHARS", None)
             else:
                 os.environ["CLAUDE_RUNWAY_COMPRESS_THRESHOLD_CHARS"] = old
+
+
+class MissingOpenaiFailsOpenTests(unittest.TestCase):
+    """`lmstudio_client` imports `openai` only when a client is built, so a missing SDK surfaces in
+    _compress_text(), inside main()'s guard. The hook must still fail open: exit 0, leave the output unchanged,
+    and say why in the note main() already emits."""
+
+    HOOK = InvalidThresholdEnvTests.HOOK
+
+    def test_a_missing_openai_leaves_the_output_unchanged_and_says_why(self):
+        import subprocess
+
+        block = (
+            "import runpy, sys\n"
+            "class _Block:\n"
+            "    def find_spec(self, name, path=None, target=None):\n"
+            "        if name == 'openai' or name.startswith('openai.'):\n"
+            "            raise ImportError('openai is blocked for this test')\n"
+            "sys.meta_path.insert(0, _Block())\n"
+            "runpy.run_path(%r, run_name='__main__')\n"
+        ) % self.HOOK
+        payload = {"tool_name": "Bash", "tool_input": {"command": "echo hi"},
+                   "tool_response": {"stdout": "x" * 50000, "stderr": ""}}
+        r = subprocess.run([sys.executable, "-c", block], input=json.dumps(payload),
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        out = json.loads(r.stdout)["hookSpecificOutput"]
+        self.assertNotIn("updatedToolOutput", out)
+        self.assertIn("failed unexpectedly", out["additionalContext"])
+        self.assertIn("openai is blocked", out["additionalContext"])
 
 
 if __name__ == "__main__":

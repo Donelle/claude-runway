@@ -116,7 +116,7 @@ class TicketRefPatternTests(unittest.TestCase):
             "1. first item",
             "&#123; entity",
             "Fixes #<issue-number>",
-            "/my-gh-pr <issue-number>",
+            "/cr-gh-pr <issue-number>",
             "https://github.com/Donelle/claude-runway/issues/<N>",
             "gh api repos/OWNER/REPO/issues/comments/<id> --method DELETE",
             "gh api repos/OWNER/REPO/issues/<PR>/comments",
@@ -174,6 +174,19 @@ CODE_FIXTURE_ALLOWLIST: dict[str, set[str] | None] = {
     "tests/test_autowork_cost_lib.py": None,
     # an identifier inside a compression fixture
     "tests/test_local_compress_lib.py": {"PR 481200"},
+    # pull-request numbers in the output of the stubbed forge commands
+    "tests/test_cr_load_context_skill.py": {"#12", "#13", "#419499", "#425199", "#5", "#77", "#9"},
+    # pull-request numbers a history picker prints
+    "tests/test_history_choice.py": {"#11", "PR #11"},
+    # pull-request numbers and API paths in transcript fixtures and the lines a report prints
+    "tests/test_pr_round_backfill_lib.py": {"#15", "/issues/12", "PR 603", "PR 604"},
+    "tests/test_pr_round_capture.py": {"PR 603"},
+    "tests/test_pr_round_cost_lib.py": {"#11", "#13", "#5795366119", "#5795611231", "#5795628397", "#99", "/issues/603", "/pull/603"},
+    # a pull-request label as a report prints it
+    "tests/test_reviewer_db_lib.py": {"pr 7"},
+    "tests/test_reviewer_recording.py": {"pr 9"},
+    # a database file name with a "#" in it
+    "tests/test_reviewer_report_lib.py": {"#579"},
 }
 
 

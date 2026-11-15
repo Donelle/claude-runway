@@ -6,7 +6,7 @@ Storage + formatting for ClaudeRunway's opt-in savings tracker. Used by:
                                       an opt-in server: recording never depends on it)
   - mcpservers/compress_mcp_server.py     (the credited tools do NOT write this module's ledger --
                                       their savings-metrics helper only measures character counts)
-  - skills/my-savings/SKILL.md      (reads, via the savings_summary/savings_detail MCP tools)
+  - skills/cr-savings/SKILL.md      (reads, via the savings_summary/savings_detail MCP tools)
 
 This tracker observes a COUNTERFACTUAL online (the exact characters before and
 after compression, and the percent reduction between them), which is categorically
@@ -135,7 +135,7 @@ def project_name_from_cwd(cwd: str) -> str:
 
 def current_session_id(project: Optional[str] = None) -> Optional[str]:
     """
-    Best-effort guess at the currently-active session, for on-demand /my-savings
+    Best-effort guess at the currently-active session, for on-demand /cr-savings
     calls made mid-session. Unlike a hook, an MCP tool call has no direct access
     to Claude Code's session_id.
 
@@ -1366,7 +1366,7 @@ def finalize_owned_session(session_id: str, project: Optional[str] = None,
     SessionEnd hook reads it before taking the lock); recovery has no transcript
     path and passes None, so a recovered session has no per-model rows.
     ended_at is "now" for a graceful end, and the newest artifact's last
-    write for a recovery, so /my-savings trend buckets a session that
+    write for a recovery, so /cr-savings trend buckets a session that
     crashed weeks ago into the week it actually ran.
     """
     sid = _sanitize_session_id(session_id)
@@ -1463,7 +1463,7 @@ def recover_orphaned_sessions(exclude_session_id: Optional[str] = None, now: Opt
     reached a graceful SessionEnd -- a crash, a force-kill, a closed terminal.
     The SessionEnd hook is otherwise the ONLY path from a ledger
     into savings.db, so without this an orphan's credited savings never reach
-    /my-savings and its JSONL is never cleaned up. Returns how many sessions
+    /cr-savings and its JSONL is never cleaned up. Returns how many sessions
     were consumed.
 
     "Orphaned" means none of the session's artifacts has been written for
@@ -1524,7 +1524,7 @@ def get_live_session_aggregate(session_id: str) -> dict:
     """
     Same shape as finalize_session's return (minus `project` and the
     `by_model`/`attribution` fields finalize_session adds when given a
-    transcript index), but read-only -- for /my-savings
+    transcript index), but read-only -- for /cr-savings
     mid-session checks where the session hasn't ended yet, so nothing should
     be written to SQLite or have its JSONL deleted.
     """

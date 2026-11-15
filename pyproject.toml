@@ -13,11 +13,11 @@ dynamic = ["version"]
 description = "Local-compute token savings for Claude Code: Qdrant codebase memory + LM Studio local compression."
 readme = "README.md"
 license = { text = "MIT" }
-# Policy minimums are 3.12 (Qdrant piece) / 3.11 (local-compress piece) --
-# see docs/prerequisites.md -- but the dependency chain itself
-# only needs 3.10, and that's the honest floor for a packaging manifest
-# whose whole point is "works wherever pip/pipx/uvx can resolve it".
-requires-python = ">=3.10"
+# 3.12 is the project minimum for every piece (see docs/prerequisites.md): CI,
+# the bootstrap scripts and the Pyright check all run on it, and nothing older
+# is tested. The dependency chain itself would resolve on 3.10, but declaring a
+# floor nobody tests would promise support the project does not give.
+requires-python = ">=3.12"
 
 # Matches requirements.txt's "Core" + local-compress sections combined --
 # NOT split into an optional extra the way requirements.txt splits

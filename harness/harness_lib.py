@@ -40,17 +40,20 @@ for _directory in (REPO_ROOT / "libs", Path(__file__).resolve().parent):
 
 from cases import Case, bug_line, line_of  # noqa: E402
 
-# The development model for reviewers and verifiers (see README.md, "Code Reviewer Models"): the -Instruct build,
-# since the base build never ends its turn. Classifiers use Qwen2.5-Coder-3B-Instruct-8bit.
+# The development model for reviewers and verifiers (see harness/README.md, "Codebase-reviewer models"): the -Instruct build,
+# since the base build never ends its turn.
 DEFAULT_MODEL = "qwen2.5-coder-7b-instruct-mlx"
 DEFAULT_CONTEXT = 8192
 DEFAULT_LENS = (
     "You review Python changes for defects that would crash, lose data, or return a wrong result, "
     "and for security problems such as shell, SQL or path injection. Be specific and skip style remarks."
 )
+# The lens a verifier gets when no --prompt is given: the library adds how to verify and the reply format.
+DEFAULT_VERIFIER_LENS = "You confirm a reported defect with a concrete failing input, or reject it."
+DEFAULT_CLASSIFIER_LENS = "You check whether a reported defect falls under a category's definition."
+DEFAULT_STAGE_LENSES = {"verifier": DEFAULT_VERIFIER_LENS, "classifier": DEFAULT_CLASSIFIER_LENS}
 # Reported lines are the model's reading of a diff, and drift by a few lines.
 LINE_TOLERANCE = 3
-EXIT_NOT_BUILT = 3
 
 
 # ---------------------------------------------------------------------------
@@ -96,7 +99,10 @@ def logged_http(recorder: Recorder, real_http):
 
 
 def timed_complete(recorder: Recorder, real_complete):
-    """Wrap `local_compress_lib.complete` so each completion's thread, model, size and reply length are recorded."""
+    """Wrap `openai_lib.complete` so each completion's thread, model, size and reply length are recorded.
+
+    A request that got no reply at all (LM Studio refused it, or it timed out) is also logged as `fail`, so a
+    script can tell a request that failed from a reply the model wrote badly."""
 
     def call(client, model, system, content):
         started = recorder.elapsed()
@@ -106,7 +112,28 @@ def timed_complete(recorder: Recorder, real_complete):
             f"{threading.current_thread().name} {model} {started:6.1f}s -> {recorder.elapsed():6.1f}s "
             f"prompt={len(system)}+{len(content)} chars reply={len(reply) if reply is not None else None}",
         )
+        if reply is None:
+            recorder.log("fail", f"{threading.current_thread().name} {model}")
         return reply
+
+    return call
+
+
+def timed_probability(recorder: Recorder, real_probability):
+    """Wrap `openai_lib.yes_probability` the same way `timed_complete` wraps `complete`: each request's thread, model,
+    size and answer are recorded, and one that gave no probability is also logged as `fail`."""
+
+    def call(client, model, system, content):
+        started = recorder.elapsed()
+        value = real_probability(client, model, system, content)
+        recorder.log(
+            "req",
+            f"{threading.current_thread().name} {model} {started:6.1f}s -> {recorder.elapsed():6.1f}s "
+            f"prompt={len(system)}+{len(content)} chars p(yes)={'%.3f' % value if value is not None else None}",
+        )
+        if value is None:
+            recorder.log("fail", f"{threading.current_thread().name} {model}")
+        return value
 
     return call
 
@@ -378,6 +405,10 @@ def add_model_options(parser: argparse.ArgumentParser, *, config: bool = False) 
                         help=f"contextLength to load it with (default {DEFAULT_CONTEXT})")
     parser.add_argument("--prompt", default=None, help="the reviewer's lens (default: a general defect lens)")
     parser.add_argument("--prompt-file", default=None, help="use this promptFile instead of --prompt (a path)")
+    parser.add_argument("--reply-format", default=None, choices=("lines", "json"),
+                        help="how the reasoning reply is read: lines (the server's default) or json")
+    parser.add_argument("--translator", default=None, metavar="SCRIPT",
+                        help="a script that turns the model's reply into the --reply-format format (a reviewers-file `translator`)")
     parser.add_argument("--resident", action="store_true", help="the model is already loaded: do not load/unload it (loadOnDemand false)")
     parser.add_argument("--runs", type=int, default=1, help="repeat each case this many times (one run proves little)")
     parser.add_argument("--chunk-chars", type=int, default=None, help="override the chunk size in characters")
@@ -388,6 +419,31 @@ def add_model_options(parser: argparse.ArgumentParser, *, config: bool = False) 
                         help=f"token cap for that check (default {PROBE_MAX_TOKENS}; a reasoning model such as DeepSeek-R1 needs ~2000)")
 
 
+RUN_TYPES = ("synthetic", "live")
+
+
+def add_run_type_option(parser: argparse.ArgumentParser, *, live: bool = True) -> None:
+    """`--run-type synthetic|live` (and `--repo` for the live one), on the scripts that have a run type.
+
+    `synthetic` reviews the mock scenarios in `cases.py` and is the default, so nothing changes without the flag. `live`
+    reviews the tags of the `harness-live-tests` branch, scored from the `runType: live` sidecar beside `--config` (see
+    `live_branch_lib.py`). A script with no live mode (`live=False`) still takes the option, so asking it for `live` is
+    refused with the reason instead of being an unknown flag."""
+    parser.add_argument("--run-type", choices=RUN_TYPES, default="synthetic",
+                        help="synthetic: the seeded cases in harness/cases.py (default). live: the harness-live-tests branch, "
+                             "scored from the live baselines sidecar next to --config")
+    if live:
+        parser.add_argument("--repo", default=None, metavar="PATH",
+                            help="with --run-type live: a checkout that has the harness-live-tests tags (default: this one)")
+
+
+def refuse_live(args: argparse.Namespace, stage: str, why: str) -> None:
+    """Exit 2 with the reason when a script that has no live mode is asked for one."""
+    if args.run_type == "live":
+        print(f"--run-type live is not available for the {stage} stage: {why}", file=sys.stderr)
+        raise SystemExit(2)
+
+
 def absolute_path(raw: str, base: Optional[Path] = None) -> str:
     """`raw` as an absolute path (`~` expanded, relative to `base`, default the current directory). The reviewers
     file is written into a scratch directory, where a relative path would be looked up and not found."""
@@ -395,18 +451,11 @@ def absolute_path(raw: str, base: Optional[Path] = None) -> str:
     return str(path if path.is_absolute() else (base or Path.cwd()) / path)
 
 
-def absolutize_config(reviewers: list, rubric: list, base: Path) -> tuple:
-    """Copies of `reviewers` and `rubric` whose `promptFile` and `definitionFile` are absolute, resolved against
-    `base` (the directory of the reviewers file they came from), as `load_reviewers_file` itself would."""
-    def fix(entry: dict, key: str) -> dict:
-        return {**entry, key: absolute_path(entry[key], base)} if isinstance(entry.get(key), str) else dict(entry)
-
-    return [fix(r, "promptFile") for r in reviewers], [fix(r, "definitionFile") for r in rubric]
-
-
 def reviewer_entry(name: str, model: str, *, prompt: Optional[str], prompt_file: Optional[str], roles: tuple = ("reasoning",),
-                   on_demand: bool = True, context: int = DEFAULT_CONTEXT) -> dict:
-    """One `reviewers[]` entry in the reviewers-file format."""
+                   on_demand: bool = True, context: int = DEFAULT_CONTEXT, reply_format: Optional[str] = None,
+                   translator: Optional[str] = None) -> dict:
+    """One `reviewers[]` entry in the reviewers-file format. `reply_format` and `translator` are left out when not given,
+    so the server's own default applies."""
     entry: dict = {"name": name, "model": model, "active": True, "type": list(roles),
                    "loadOnDemand": on_demand, "contextLength": context}
     if prompt_file:
@@ -415,12 +464,17 @@ def reviewer_entry(name: str, model: str, *, prompt: Optional[str], prompt_file:
             entry["prompt"] = prompt
     else:
         entry["prompt"] = prompt or DEFAULT_LENS
+    if reply_format:
+        entry["replyFormat"] = reply_format
+    if translator:
+        entry["translator"] = absolute_path(translator)
     return entry
 
 
 def single_reviewer(args: argparse.Namespace, name: str = "general") -> dict:
     return reviewer_entry(name, args.model, prompt=args.prompt, prompt_file=args.prompt_file,
-                          on_demand=not args.resident, context=args.context)
+                          on_demand=not args.resident, context=args.context,
+                          reply_format=getattr(args, "reply_format", None), translator=getattr(args, "translator", None))
 
 
 def preflight(model: str) -> None:
@@ -434,6 +488,10 @@ def preflight(model: str) -> None:
 
 
 PROBE_MAX_TOKENS = 40
+# A verifier is a reasoning-distilled model (README.md): it thinks before it answers, so a one-word reply cannot fit in
+# 40 tokens and the probe would wrongly say it never ends its turn. A reviewer with the verifier role is probed with at
+# least this many.
+VERIFIER_PROBE_TOKENS = 2000
 PROBE_TIMEOUT_SECONDS = 90
 
 
@@ -472,13 +530,51 @@ def probe_ends_turn(model: str, *, on_demand: bool, context: int, max_tokens: in
     return problem or ("; ".join(unload_errors) or None)
 
 
-def require_chat_model(model: str, args: argparse.Namespace, *, on_demand: Optional[bool] = None, context: Optional[int] = None) -> None:
-    """Exit with the probe's explanation unless `model` ends its turn (or --no-probe was given)."""
+def probe_answers_yes_no(model: str, *, on_demand: bool, context: int) -> Optional[str]:
+    """Ask `model` one question with an obvious answer the way a classifier does; None when a probability came back, else why not.
+
+    `probe_ends_turn` passes a model that ends its turn but cannot be a classifier: Phi-3.5-mini ends its turn on "ok" and
+    then begins every yes/no reply with a blank token, which the first request of a real run only discovers after the
+    model is loaded and the run is under way. Asks through the OpenAI-compatible endpoint, the one the classifier uses."""
+    import openai_lib
+    from credential_redaction_lib import display_safe
+    from lmstudio_client import build_client
+    from lmstudio_model_loader_lib import ModelLoader, ModelLoadError
+
+    url = load_server().lmstudio_base_url()
+    loader = ModelLoader(url)
+    problem: Optional[str] = None
+    try:
+        loader.acquire(model, load_on_demand=on_demand, context_length=context)
+        value = openai_lib.yes_probability(
+            build_client(url), model, "You check whether a statement is true.", "Statement: 2 is greater than 1.\n\nIs the statement true?")
+        if value is None:
+            kind, detail = openai_lib.take_failure()
+            detail = display_safe(detail)  # the server's text, as sent: redacted here, where it is shown
+            if kind == "no_probabilities":
+                problem = f"{model} returned no token probabilities, which a classifier needs. Use a model and runtime that return them."
+            elif kind == "no_answer":
+                problem = (f"{model} cannot be a classifier: asked a yes/no question it began its reply with something other than "
+                           f"Yes or No (its likeliest first tokens: {detail}). Check its chat template in LM Studio or use another model.")
+            else:
+                problem = f"could not ask {model} a yes/no question: {kind or 'unknown'}{': ' + detail if detail else ''}"
+    except (ModelLoadError, OSError, ValueError) as exc:
+        problem = f"could not probe {model}: {type(exc).__name__}: {exc}"
+    finally:
+        unload_errors = loader.release_all()
+    return problem or ("; ".join(unload_errors) or None)
+
+
+def require_chat_model(model: str, args: argparse.Namespace, *, on_demand: Optional[bool] = None, context: Optional[int] = None,
+                       max_tokens: Optional[int] = None) -> None:
+    """Exit with the probe's explanation unless `model` ends its turn (or --no-probe was given).
+
+    `max_tokens` is the cap for the probe's reply; the default is --probe-tokens."""
     if getattr(args, "no_probe", False):
         return
     problem = probe_ends_turn(model, on_demand=(not args.resident) if on_demand is None else on_demand,
                               context=args.context if context is None else context,
-                              max_tokens=getattr(args, "probe_tokens", PROBE_MAX_TOKENS))
+                              max_tokens=max_tokens or getattr(args, "probe_tokens", PROBE_MAX_TOKENS))
     if problem:
         raise SystemExit(problem)
 
@@ -520,6 +616,13 @@ def entries_from_config(config) -> tuple:
             entry["prompt"] = reviewer.prompt
         if reviewer.prompt_file:
             entry["promptFile"] = reviewer.prompt_file
+        entry["replyFormat"] = reviewer.reply_format
+        if reviewer.translator:
+            entry["translator"] = reviewer.translator
+        if reviewer.tools:
+            # The `need:` loop's menu and budget: left out, a config with `tools` would silently run without them.
+            entry["tools"] = list(reviewer.tools)
+            entry["contextShare"] = reviewer.context_share
         reviewers.append(entry)
     rubric = []
     for item in config.rubric:
@@ -535,7 +638,7 @@ def load_config(path: str) -> HarnessConfig:
 
     The file is JSON with three optional keys:
       reviewers  the reviewers to test, exactly as in a reviewers file (name, model, prompt/promptFile, active,
-                 type, loadOnDemand, contextLength), and validated by the same code the server uses, so a file
+                 type, loadOnDemand, contextLength, replyFormat, translator, tools, contextShare), and validated by the same code the server uses, so a file
                  that passes here is one `REVIEWERS_FILE` accepts;
       rubric     the rubric the classifier matches against, also as in a reviewers file;
       stages     which of reasoning, verifier, classifier to test. Left out, it is every stage an active reviewer
@@ -566,6 +669,18 @@ def load_config(path: str) -> HarnessConfig:
             validated = validate_reviewers({"rubric": data.get("rubric", []), "reviewers": data["reviewers"]},
                                            base_dir=resolved.parent, path=str(resolved))
             reviewers, rubric = entries_from_config(validated)
+            for reviewer in validated.reviewers:
+                # A stage runs with each reviewer cut down to that stage's type, and a verifier's `promptFile` means something
+                # different when the verifier shares its entry with another type: the server then appends the built-in verify
+                # steps after the file, and a verifier-only copy would get the file alone. Say so instead of running a prompt
+                # the server would not.
+                if reviewer.prompt_file and "verifier" in reviewer.roles and len(reviewer.roles) > 1:
+                    problems.append(
+                        f"reviewer {reviewer.name!r} is a verifier that shares its entry with {[r for r in reviewer.roles if r != 'verifier']} "
+                        "and has a 'promptFile': the harness runs one stage at a time and would give its verifier the file alone, "
+                        "where the server adds the built-in verify steps; give the verifier its own entry (the same model and a "
+                        "different name) so the harness runs what the server runs"
+                    )
         except ConfigError as exc:
             problems.extend(exc.problems)
     elif "rubric" in data:
@@ -615,7 +730,8 @@ def finish_args(args: argparse.Namespace) -> argparse.Namespace:
         except ConfigError as exc:
             raise SystemExit(str(exc)) from exc
     given = [flag for flag, value in (("--model", args.model), ("--prompt", args.prompt),
-                                      ("--prompt-file", args.prompt_file), ("--context", args.context)) if value is not None]
+                                      ("--prompt-file", args.prompt_file), ("--context", args.context),
+                                      ("--reply-format", args.reply_format), ("--translator", args.translator)) if value is not None]
     if args.resident:
         given.append("--resident")
     if args.config_data is not None and args.config_data.reviewers and given:
@@ -647,8 +763,14 @@ def stage_reviewers(args: argparse.Namespace, stage: str) -> list:
     config = args.config_data
     if config is not None and config.reviewers:
         return [{**entry, "type": [stage]} for entry in config.reviewers if entry["active"] and stage in entry["type"]]
-    return [reviewer_entry("general", args.model, prompt=args.prompt, prompt_file=args.prompt_file, roles=(stage,),
-                           on_demand=not args.resident, context=args.context)]
+    # With no prompt of its own, a stage gets its own default lens (a verifier is not a general defect reviewer).
+    prompt = args.prompt or (None if args.prompt_file else DEFAULT_STAGE_LENSES.get(stage))
+    # The reply format and translator belong to the reasoning stage; the verifier and classifier read their own formats.
+    reasoning = stage == "reasoning"
+    return [reviewer_entry("general", args.model, prompt=prompt, prompt_file=args.prompt_file, roles=(stage,),
+                           on_demand=not args.resident, context=args.context,
+                           reply_format=args.reply_format if reasoning else None,
+                           translator=args.translator if reasoning else None)]
 
 
 def _loading(entry: dict) -> str:
@@ -674,8 +796,11 @@ def describe_config(args: argparse.Namespace) -> str:
         lines.append("reviewers: none in the file; each stage uses one reviewer built from the command line flags")
     for entry in config.reviewers:
         prompt = " + ".join((["inline text"] if "prompt" in entry else []) + ([entry["promptFile"]] if "promptFile" in entry else []))
+        reading = ""
+        if "reasoning" in entry["type"]:
+            reading = f"  reply: {entry.get('replyFormat', 'lines')}" + (f" via {entry['translator']}" if entry.get("translator") else "")
         lines.append(f"  {entry['name']:<18} {entry['model']:<34} {'active' if entry['active'] else 'inactive':<8} "
-                     f"roles={'/'.join(entry['type'])}  {_loading(entry)}  prompt: {prompt}")
+                     f"roles={'/'.join(entry['type'])}  {_loading(entry)}  prompt: {prompt}{reading}")
     if config.rubric:
         lines.append("rubric: " + ", ".join(f"{e['name']} ({e['level']}, score {e['score']})" for e in config.rubric))
     return "\n".join(lines)
@@ -688,11 +813,18 @@ def preflight_models(entries: list) -> None:
 
 
 def preflight_reviewers(entries: list, args: argparse.Namespace) -> None:
-    """Check each distinct model is listed and ends its turn, loading it the way the reviewer asks."""
+    """Check each distinct model is listed and ends its turn (and, for a classifier, answers yes or no), loading it the way the reviewer asks."""
     preflight_models(entries)
     for model in sorted({entry["model"] for entry in entries}):
         first = next(entry for entry in entries if entry["model"] == model)
-        require_chat_model(model, args, on_demand=first.get("loadOnDemand", True), context=first.get("contextLength") or args.context)
+        verifies = any("verifier" in entry.get("type", []) for entry in entries if entry["model"] == model)
+        require_chat_model(model, args, on_demand=first.get("loadOnDemand", True), context=first.get("contextLength") or args.context,
+                           max_tokens=max(getattr(args, "probe_tokens", PROBE_MAX_TOKENS), VERIFIER_PROBE_TOKENS) if verifies else None)
+        classifies = any("classifier" in entry.get("type", []) for entry in entries if entry["model"] == model)
+        if classifies and not getattr(args, "no_probe", False):
+            problem = probe_answers_yes_no(model, on_demand=first.get("loadOnDemand", True), context=first.get("contextLength") or args.context)
+            if problem:
+                raise SystemExit(problem)
 
 
 # ---------------------------------------------------------------------------
@@ -725,37 +857,171 @@ def write_reviewers_file(directory: Path, reviewers: list, rubric: Optional[list
     return path
 
 
+def _close_failed(run_recorder, exc: BaseException) -> None:
+    """Closes a harness run that raised, the way the server's `_recorded` does: a review refused before it could run
+    (a bad reviewers file, a bad ref, a model that is not loaded) as refused, anything else as errored."""
+    from codebase_reviewer_config_lib import ConfigError
+    from lmstudio_model_loader_lib import ModelLoadError
+    from reasoning_reviewer_lib import ReviewError
+
+    if isinstance(exc, (ConfigError, ModelLoadError, ReviewError)):
+        run_recorder.close("refused", error=str(exc))
+    else:
+        run_recorder.close("errored", error=f"{type(exc).__name__}: {exc}")
+
+
 def run_reasoning(repo: Path, base: str, head: str, reviewers: list, args: argparse.Namespace, recorder: Recorder,
-                  *, max_reviewers: Optional[int] = None, rubric: Optional[list] = None) -> tuple:
+                  *, max_reviewers: Optional[int] = None, rubric: Optional[list] = None, run_recorder=None) -> tuple:
     """Run the reasoning stage once over base...head. Returns (claims, ReasoningReview): the findings as
     reported, not the library's merged ones (see `distinct_claims`).
 
     Calls the library directly (not the `review` tool) so findings arrive as objects to score,
-    through the same `_git_diff`, config loader, scheduler and model loader the tool uses."""
-    import local_compress_lib
+    through the same `_git_diff`, config loader, scheduler and model loader the tool uses.
+
+    The run is written to the reviewer's own database. A caller that runs reasoning and then the verifier as one
+    review passes the same `run_recorder` to both and closes it itself, so the database holds ONE run with both
+    stages (and the model combination of both); without one, this call records and closes a run of its own."""
+    import openai_lib
     from codebase_reviewer_config_lib import load_reviewers_file
     from lmstudio_client import build_client
-    from lmstudio_model_loader_lib import ModelLoader, _urllib_http
+    from lmstudio_model_loader_lib import ModelLoader, _urllib_http, reviewer_api_url
     from reasoning_reviewer_lib import run_reasoning_review
+    from reviewer_db_lib import new_run_recorder
+    from reviewer_tools_lib import ToolExecutor
 
-    server = load_server()
-    with tempfile.TemporaryDirectory(prefix="live-reviewers-") as scratch:
-        config = load_reviewers_file(str(write_reviewers_file(Path(scratch), reviewers, rubric)))
-    url = server.lmstudio_base_url()
-    diff = server._git_diff(str(repo), base, head, args.context_lines)
     reported: list = []
-    with capture_reported(reported):
-        review = run_reasoning_review(
-            config,
-            ModelLoader(url, http=logged_http(recorder, _urllib_http)),
-            build_client(url),
-            diff,
-            repo,
-            max_reviewers or len(reviewers),
-            chunk_chars=args.chunk_chars,
-            complete=timed_complete(recorder, local_compress_lib.complete),
-        )
+    # Every run, the harness's too, goes in the reviewer's own database (fail-open; see libs/reviewer_db_lib.py). The
+    # recorder exists before the setup, so a bad reviewers file or ref is recorded as refused, as the server does.
+    own_run = run_recorder is None
+    if own_run:
+        run_recorder = new_run_recorder(source="harness", review_type="reasoning", repo_path=str(repo), base_ref=base, head_ref=head,
+                                        settings={"max_reviewers": max_reviewers or len(reviewers), "chunk_chars": args.chunk_chars,
+                                                  "context_lines": args.context_lines})
+    try:
+        server = load_server()
+        with tempfile.TemporaryDirectory(prefix="live-reviewers-") as scratch:
+            config = load_reviewers_file(str(write_reviewers_file(Path(scratch), reviewers, rubric)))
+        url = server.lmstudio_base_url()
+        run_recorder.lmstudio_url = url
+        diff = server._git_diff(str(repo), base, head, args.context_lines)
+        with capture_reported(reported):
+            review = run_reasoning_review(
+                config,
+                ModelLoader(url, http=logged_http(recorder, _urllib_http), observer=run_recorder),
+                build_client(reviewer_api_url(url)),
+                diff,
+                repo,
+                max_reviewers or len(reviewers),
+                chunk_chars=args.chunk_chars,
+                complete=timed_complete(recorder, openai_lib.complete),
+                recorder=run_recorder,
+                # Only a config with `tools` on a reviewer runs the `need:` loop; any other never builds one.
+                executor=ToolExecutor(repo, head) if any(r.tools for r in config.active_reviewers()) else None,
+            )
+    except BaseException as exc:
+        if own_run:
+            _close_failed(run_recorder, exc)
+        raise
+    run_recorder.set_counts(chunks=review.chunks, findings=review.finding_count)
+    if own_run:
+        run_recorder.close("finished")
     return distinct_claims(reported), review
+
+
+def run_verifier(repo: Path, head: str, findings: list, verifiers: list, args: argparse.Namespace, recorder: Recorder,
+                 *, max_reviewers: Optional[int] = None, paths: Optional[list] = None, run_recorder=None):
+    """Run the verifier stage once over `findings` (`Finding`s with a `quote`). Returns the `VerificationReview`.
+
+    The quoted code is looked up in `repo` as it is at `head`, in the files `paths` (default: the files the findings name),
+    which is what the `verifier` review type does for the files of a diff. Calls the library directly, like `run_reasoning`,
+    so each finding's verdict arrives as an object to score. `run_recorder` is as for `run_reasoning`: pass the reasoning
+    stage's recorder to record both stages as one run, which the caller then closes."""
+    import openai_lib
+    from codebase_reviewer_config_lib import load_reviewers_file
+    from lmstudio_client import build_client
+    from lmstudio_model_loader_lib import ModelLoader, _urllib_http, reviewer_api_url
+    from reviewer_db_lib import new_run_recorder
+    from reviewer_tools_lib import ToolExecutor
+    from verifier_reviewer_lib import git_file_reader, verify_findings
+
+    own_run = run_recorder is None
+    if own_run:
+        run_recorder = new_run_recorder(source="harness", review_type="verifier", repo_path=str(repo), base_ref="", head_ref=head,
+                                        settings={"max_reviewers": max_reviewers or len(verifiers)})
+    try:
+        server = load_server()
+        with tempfile.TemporaryDirectory(prefix="live-verifiers-") as scratch:
+            config = load_reviewers_file(str(write_reviewers_file(Path(scratch), verifiers)))
+        url = server.lmstudio_base_url()
+        run_recorder.lmstudio_url = url
+        read_file = git_file_reader(repo, head, paths if paths is not None else sorted({f.file for f in findings}))
+        verification = verify_findings(
+            config,
+            ModelLoader(url, http=logged_http(recorder, _urllib_http), observer=run_recorder),
+            build_client(reviewer_api_url(url)),
+            findings,
+            read_file,
+            max_reviewers or len(verifiers),
+            complete=timed_complete(recorder, openai_lib.complete),
+            recorder=run_recorder,
+            executor=ToolExecutor(repo, head) if any(r.tools for r in config.active_reviewers()) else None,
+        )
+    except BaseException as exc:
+        if own_run:
+            _close_failed(run_recorder, exc)
+        raise
+    run_recorder.set_counts(confirmed=len(verification.confirmed))
+    if own_run:
+        run_recorder.set_counts(findings=len(findings))
+        run_recorder.close("finished")
+    return verification
+
+
+def run_classifier(findings: list, classifiers: list, rubric: list, args: argparse.Namespace, recorder: Recorder,
+                   *, statuses: Optional[list] = None, max_reviewers: Optional[int] = None, run_recorder=None):
+    """Run the classifier stage once over `findings` (`Finding`s). Returns the `ClassificationReview`.
+
+    `rubric` is the list of rubric entries as a reviewers file writes them. The classifier is shown the finding's own text
+    (where, class, claim, failing input, quote), never the code, so no repository is needed. `statuses` is what a verifier
+    stage made of each finding (default: none). Calls the library directly, like `run_verifier`, so each finding's outcome
+    arrives as an object to score. `run_recorder` is as for `run_reasoning`: pass the earlier stages' recorder to record every
+    stage as one run, which the caller then closes."""
+    import openai_lib
+    from classifier_reviewer_lib import classify_findings
+    from codebase_reviewer_config_lib import load_reviewers_file
+    from lmstudio_client import build_client
+    from lmstudio_model_loader_lib import ModelLoader, _urllib_http, reviewer_api_url
+    from reviewer_db_lib import new_run_recorder
+
+    own_run = run_recorder is None
+    if own_run:
+        run_recorder = new_run_recorder(source="harness", review_type="classifier", repo_path="", base_ref="", head_ref="",
+                                        settings={"max_reviewers": max_reviewers or len(classifiers)})
+    try:
+        server = load_server()
+        with tempfile.TemporaryDirectory(prefix="live-classifiers-") as scratch:
+            config = load_reviewers_file(str(write_reviewers_file(Path(scratch), classifiers, rubric)))
+        url = server.lmstudio_base_url()
+        run_recorder.lmstudio_url = url
+        classification = classify_findings(
+            config,
+            ModelLoader(url, http=logged_http(recorder, _urllib_http), observer=run_recorder),
+            build_client(reviewer_api_url(url)),
+            findings,
+            max_reviewers or len(classifiers),
+            statuses=statuses,
+            probability=timed_probability(recorder, openai_lib.yes_probability),
+            probability_client=build_client(url),  # the OpenAI-compatible /v1: the native /api/v0 returns no token probabilities
+            recorder=run_recorder,
+        )
+    except BaseException as exc:
+        if own_run:
+            _close_failed(run_recorder, exc)
+        raise
+    if own_run:
+        run_recorder.set_counts(findings=len(findings))
+        run_recorder.close("finished")
+    return classification
 
 
 def report_run(args: argparse.Namespace, recorder: Recorder, base_url: str, before: list) -> str:
@@ -765,15 +1031,3 @@ def report_run(args: argparse.Namespace, recorder: Recorder, base_url: str, befo
     if args.timeline:
         lines += ["----- timeline", recorder.timeline()]
     return "\n".join(lines)
-
-
-def refuse_unbuilt(stage: str, needs: str) -> None:
-    """Exit with EXIT_NOT_BUILT and a message when the stage a harness exercises does not exist yet,
-    or exists but the harness has no runner for it."""
-    if stage not in available_review_types():
-        print(f"The {stage} stage is not built yet: `review` accepts only {available_review_types()}.\n"
-              f"Nothing to run. `--check` validates this harness's fixtures without it.")
-    else:
-        print(f"The `review` tool now accepts type {stage!r}, but this harness has no runner for it yet.\n"
-              f"Wire one in the `run_stage` function of this script: {needs}")
-    raise SystemExit(EXIT_NOT_BUILT)

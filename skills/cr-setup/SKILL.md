@@ -1,0 +1,482 @@
+# Skill: cr-setup
+
+Interactively configure any project for ClaudeRunway, or upgrade one that is
+already configured. Two paths, chosen in step 2:
+
+- **init** — generates `.mcp.json`, updates `.claude/settings.json` hooks, and adds the
+  correct usage guidance to `CLAUDE.md`, all in one pass (steps 3-7).
+- **upgrade** — applies only the specific, named config migrations a newer claude-runway
+  release added (e.g. a renamed hook script) and refreshes any already-installed product
+  skill that went stale, leaving every other setting alone (step 8).
+  This is the supported route for users who cannot install the `claude-runway-*` console
+  scripts: it runs the checkout's own `tools/setup_project.py upgrade`, so it always sees
+  the migrations that match the checkout rather than a possibly stale installed copy.
+
+## Prerequisites
+
+`CLAUDE_RUNWAY_DIR` must be exported in your shell profile, pointing to the
+claude-runway tools repo:
+
+```bash
+# macOS / Linux (~/.bashrc or ~/.zshrc)
+export CLAUDE_RUNWAY_DIR="$HOME/tools/claude-runway"
+
+# Windows (PowerShell profile)
+$env:CLAUDE_RUNWAY_DIR = "C:\tools\claude-runway"
+```
+
+Restart Claude Code after setting it so the new export is visible.
+
+## Installation
+
+```bash
+cp -r skills/cr-setup ~/.claude/skills/
+```
+
+## Usage
+
+Run `/cr-setup` from the root of the project you want to configure. It
+configures that project (the current working directory).
+
+## Steps
+
+### 1. Validate the tools repo
+
+Read the `CLAUDE_RUNWAY_DIR` environment variable from the shell. If it is not
+set or is empty, stop immediately and tell the user:
+
+> `CLAUDE_RUNWAY_DIR` is not set. Add `export CLAUDE_RUNWAY_DIR="/path/to/claude-runway"` to your shell profile (the same place you launch `claude` from), then restart Claude Code and try again.
+
+Check that `$CLAUDE_RUNWAY_DIR/tools/setup_project.py` exists. If the file is
+missing the path is wrong — stop and tell the user.
+
+Determine the venv Python path (exact platform rules — check both, use whichever exists):
+- Windows: `$CLAUDE_RUNWAY_DIR\.venv\Scripts\python.exe`
+- macOS/Linux: `$CLAUDE_RUNWAY_DIR/.venv/bin/python`
+
+If neither exists, stop and tell the user:
+
+> The claude-runway virtual environment is missing. Open a terminal in the tools repo and run:
+> ```
+> uv venv --python 3.12
+> uv pip install -r requirements.txt --index-url https://pypi.org/simple
+> ```
+> Then try `/cr-setup` again.
+
+### 2. Detect current project state
+
+Note the **current working directory** — this is the target project path.
+
+Derive the **slug default**: take the directory's leaf name, lowercase it, replace
+any run of non-alphanumeric characters with a single hyphen, strip leading/trailing
+hyphens, and fall back to `"project"` if the result is empty (e.g. `My.Cool.App` →
+`my-cool-app`; `___` → `project`). This matches `setup_project_lib.default_collection_name()`.
+
+Check whether `.mcp.json` already exists in the current directory. **Never `Read` the
+file whole, or `cat` it** — an inline `QDRANT_API_KEY` would land in the model context and
+the tool-call transcript. Inspect it with a local parser that prints only what you need,
+e.g. (single quotes per step 5's rules; adapt the quoting on PowerShell):
+
+```
+<venv-python> -c 'import json;d=json.load(open(".mcp.json"));print(sorted(d.get("mcpServers",{})))'
+```
+
+For the init-path values extracted below, print only those specific non-secret keys the
+same way (never the whole env block), and for `QDRANT_API_KEY` print only a key-present
+boolean. The output tells you which claude-runway servers are currently configured
+(`qdrant`, `codebase-indexer`, `memory-bank`, `local-compress`, and the opt-in `analytics`). Note this for the summary
+at the end.
+
+**Choose the path (init vs. upgrade):** the upgrade predicate is the presence of the
+`qdrant` server, because that is exactly what `setup_project.py upgrade` requires
+(`upgrade_lib.is_project_configured` — every real `init` writes it, even `--qdrant-only`).
+- No `.mcp.json`, or no `qdrant` server in it (including a partial/hand-edited config with
+  only `codebase-indexer`, `memory-bank`, or `local-compress`) → **init path** (steps 3-7,
+  unchanged). Do not offer upgrade: it refuses a project without a `qdrant` server.
+- `qdrant` server present → use `AskUserQuestion` (header
+  "Path"): "Upgrade (Recommended)" — apply only pending config migrations (and refresh
+  already-installed skills that went stale), nothing else
+  reset; "Re-run init" — reconfigure from scratch via the question flow below, which
+  resets every toolkit-owned setting to the answers you give. If the user asked for
+  one explicitly in their message, skip the question.
+- **Upgrade chosen → skip the rest of step 2 and go straight to step 8.** Everything
+  below in this step (value extraction, the `QDRANT_API_KEY` stop, the qdrant-only
+  detection) exists only because `init` rewrites those values; `upgrade` does not.
+
+The rest of this step applies to the **init path only**.
+
+Also extract the following values from the existing config — these would silently
+revert to defaults on re-run without preservation:
+- `COLLECTION_NAME` from `qdrant.env` — use as the collection name default in Q2 when
+  present, falling back to the slug default only for unconfigured projects
+- `QDRANT_URL` from `qdrant.env` (default: `http://localhost:6333`)
+- `QDRANT_API_KEY` — check only whether it is non-empty in **any** of the four owned
+  server env blocks (`qdrant.env`, `codebase-indexer.env`, `memory-bank.env`,
+  `local-compress.env`); do NOT read the value itself into context. `build_mcp_servers()`
+  sets the same key in the first three; `local-compress.env` is still checked because a
+  config written before the compact tools moved to the `qdrant` server has it there too,
+  and legacy or hand-edited configs may only have it in one.
+
+**If `QDRANT_API_KEY` is non-empty in any owned block (init path only — the upgrade path
+in step 8 proceeds), stop immediately** and tell the user:
+
+> This project has `QDRANT_API_KEY` configured. The skill cannot carry credentials
+> through safely — reading the key and passing it in a shell command would expose it
+> in context and the tool-call transcript. Run `setup_project.py` directly instead
+> (from inside the ClaudeRunway tools repo):
+> ```
+> <venv-python> <CLAUDE_RUNWAY_DIR>/tools/setup_project.py init <cwd> --qdrant-api-key <your-key> [other options]
+> ```
+> See `<CLAUDE_RUNWAY_DIR>/tools/setup_project.py init --help` for the full option list.
+>
+> (Use the absolute paths validated in step 1 — `<venv-python>` and `<CLAUDE_RUNWAY_DIR>` — when running this command.)
+
+- `COLLECTION_DESCRIPTION` from `codebase-indexer.env` (default: empty)
+- `INDEX_INCLUDE_EXTENSIONS` from `codebase-indexer.env` (default: empty)
+- `INDEX_EXCLUDE_DIRS` from `codebase-indexer.env` (default: empty)
+- `CLAUDE_RUNWAY_LMSTUDIO_URL` from `local-compress.env`, else from `qdrant.env` (default: `http://localhost:1234/v1`)
+- `CLAUDE_RUNWAY_LMSTUDIO_MODEL` from `local-compress.env`, else from `qdrant.env` (default: empty — auto-detect).
+  Both servers carry these two values (`qdrant`'s `compact_store` compresses with them);
+  a `--qdrant-only` config has them only in `qdrant.env`
+- `CLAUDE_RUNWAY_TRACK_SAVINGS` from `local-compress.env` (default: off)
+- `CLAUDE_RUNWAY_SAVINGS_DB` from `analytics.env`, else from `local-compress.env` for a config written before `init` stopped writing it there (the `local-compress` server never reads it) — first non-empty one (default: empty). The `analytics` block exists only when savings tracking was enabled, so never treat its absence as "no override".
+- `CLAUDE_RUNWAY_METRICS_DB` from `analytics.env`, else from `memory-bank.env` (where `init --metrics-db` also writes it, and the only place it lives when savings tracking is off or the setup is `--qdrant-only`), else from `local-compress.env` for a config written before the move — first non-empty one (default: empty). The `analytics` block exists only when savings tracking was enabled, so never treat its absence as "no override".
+- `COMPACT_COLLECTION` from `qdrant.env` (the `qdrant` server serves the compact tools),
+  falling back to `local-compress.env` for a config written before they moved — use as the
+  "Keep current" value in Q5 when present. Note this is a DIFFERENT env var than
+  `COLLECTION_NAME` above: it names the collection the `cr-compact`/`cr-resume` skills store
+  conversation compacts under, not the codebase-memory collection.
+- `MEMORY_BANK_COLLECTION` from `memory-bank.env` — use as the "Keep current" value in Q6
+  when present. A THIRD different collection concept from the two above: the ONE shared
+  Qdrant collection every project's `memory-bank` server stores memories in (default
+  `"memory-bank"`), common across every project on this machine -- unlike `COLLECTION_NAME`
+  (per-project) and `COMPACT_COLLECTION` (per-project by default). Found in a Copilot
+  review: without extracting this, re-running this skill on a project that had ever
+  customized it away from the default would silently reset it back to `"memory-bank"` on
+  the next run, splitting that project's future memories into a different collection than
+  its past ones -- existing memories wouldn't be deleted, but `recall` would no longer find
+  them, since it would now be pointed at the wrong shared collection entirely.
+- `MEMORY_BANK_ID` from `memory-bank.env` — if present, always pass it explicitly as
+  `--memory-bank-id` in step 5, regardless of what Q2 resolves to. This is a FOURTH,
+  independent identifier: unlike `MEMORY_BANK_COLLECTION` (shared storage location) and
+  `COLLECTION_NAME` (this run's resolved project name), `MEMORY_BANK_ID` is this project's
+  OWN identity tag for memory-bank specifically, and it is NOT re-derived from `COLLECTION_NAME`
+  on a re-run — `setup_project.py` only defaults it from `--collection-name` when
+  `--memory-bank-id` is omitted entirely. Found in a Copilot review: without this
+  extraction, changing `--collection-name` on a re-run (e.g. via Q2's "Specify") would
+  silently retag all FUTURE memories under the new identifier while every EXISTING memory
+  stayed tagged under the old one, becoming invisible to default recall/wipe scope — nothing
+  deleted, just orphaned. There's no interactive question for this (unlike Q5/Q6) since
+  there's no meaningful choice beyond "preserve whatever is already there" -- same treatment
+  as `COLLECTION_DESCRIPTION`/`INDEX_INCLUDE_EXTENSIONS` below.
+
+**Also detect a prior qdrant-only round-trip**: if `.mcp.json` already exists and has a
+`qdrant` and/or `codebase-indexer` server configured, but has **no** `local-compress` server
+at all (not just an empty one — the key itself absent) **and no `COMPACT_COLLECTION` in
+`qdrant.env`**, note this as `previously-qdrant-only = true`. `--qdrant-only` deliberately
+deletes the entire `local-compress` block (see `setup_project_lib.build_mcp_servers`'s
+`include_compress=False` path); a config written before the compact tools moved to the
+`qdrant` server kept `COMPACT_COLLECTION` only in that block, so this state is
+indistinguishable from a genuinely brand-new project by `COMPACT_COLLECTION`'s absence alone.
+(A newer config keeps it in `qdrant.env` in every mode, so it is found there and this
+detection does not fire.) This matters for Q5 in
+step 4 below: without this signal, re-enabling full setup on a project that was full →
+qdrant-only at some point silently computes a fresh `<collection-name>-conversation` default
+as if no prior compact history could possibly exist, when it might (found in a Copilot review). Only relevant if Q1 (step 3) ends up "Full setup" — a project going TO
+qdrant-only, or staying qdrant-only, never reaches Q5 at all (step 4 is skipped entirely).
+
+### 3. Ask configuration questions — scope, collection name, and memory-bank collection
+
+Use `AskUserQuestion` with three questions:
+
+**Q1 — Setup scope**
+Header: "Setup scope"
+- "Full setup (Recommended)" — Qdrant memory + LM Studio compression + PostToolUse/PreToolUse/SessionEnd hooks
+- "Qdrant-only" — no LM Studio server, no LM Studio-dependent hooks (good for projects where LM Studio isn't in use or you want to add it later). `/cr-compact` still works: `compact_store` stores the summary uncompressed when LM Studio isn't there. The CORE `record_session_id.py` hook (registered under `SessionStart`/`SessionEnd`) is still installed either way — it's a base-install hook independent of qdrant-only vs. full setup.
+
+**Q2 — Collection name**
+Header: "Collection"
+- If `.mcp.json` already has a `COLLECTION_NAME`: show `"Keep current"` as the first option (description: the existing collection name)
+- Otherwise: show `"Use default"` as the first option (description: the slug default you derived)
+- "Specify" — always present as the second option (description: "Enter a custom collection name"), triggers a follow-up
+
+If the user picks "Specify", ask them to type the exact collection name they
+want (use `AskUserQuestion` with a single text-entry option or just read their
+next message). Use whatever they provide for the remainder of the skill.
+
+**Q6 — Memory bank collection name**
+Header: "Memory bank"
+Asked here, in step 3 (NOT step 4 alongside Q3-Q5), because `memory-bank` is always
+configured regardless of Q1's answer — unlike Q5 (the compact collection), which is
+only asked for a full setup; a qdrant-only run keeps whatever compact collection the config
+already has (see step 5).
+- If `MEMORY_BANK_COLLECTION` already has a value: show `"Keep current"` as the first option (description: the existing value)
+- Otherwise: show `"Use default"` as the first option (description: `"memory-bank"` — the shared default every project uses unless customized)
+- "Specify" — always present as the second option (description: "Enter a custom shared memory-bank collection name — only do this if you deliberately want a DIFFERENT shared collection than other projects on this machine, since the whole point of this value is that every project sharing it agrees on it"), triggers a follow-up
+
+If the user picks "Specify", ask them to type the exact name they want. Use whatever they
+provide (or the resolved default/current value) as `--memory-bank-collection` in step 5.
+
+### 4. Ask configuration questions — LM Studio options (full setup only)
+
+Skip this entire step if "Qdrant-only" was selected in step 3.
+
+Use `AskUserQuestion` with three questions:
+
+**Q3 — LM Studio model**
+Header: "Model"
+- "Auto-detect" — (description: "Only works if exactly one model is loaded in LM Studio") always present; omits `--lmstudio-model` in step 5
+- If `CLAUDE_RUNWAY_LMSTUDIO_MODEL` is set: also show `"Keep current"` (description: the configured model name) as the **first/recommended** option, before "Auto-detect"
+- "Specify model" — (description: "Enter the exact model ID from LM Studio") triggers a follow-up
+
+If the user picks "Keep current", use the existing model value as `--lmstudio-model` in step 5.
+If the user picks "Auto-detect", omit `--lmstudio-model` entirely.
+If the user picks "Specify model", ask for the model ID and use it as `--lmstudio-model`.
+
+**Q4 — Savings tracker**
+Header: "Savings"
+- If `CLAUDE_RUNWAY_TRACK_SAVINGS` is currently on — trim whitespace and fold to lowercase before checking; on values are `"1"`, `"true"`, `"yes"`: show `"Enabled"` first (description: "Keep savings tracking on"); show `"Disabled"` second
+- Otherwise: show `"Disabled"` first (description: "No token savings tracking"); show `"Enabled"` second (description: "Set CLAUDE_RUNWAY_TRACK_SAVINGS=1; also requires a shell export, see step 7")
+
+**If `previously-qdrant-only` is true** (detected in step 2), print this note **before** asking
+Q5, so the user sees it while the choice is still live rather than after already picking
+"Use default":
+
+> This project previously had LM Studio compression removed (`--qdrant-only`), which also
+> deletes any compact-collection name it had. If it was ever fully configured before that
+> with a custom or auto-generated compact-collection name, this skill can't recover it —
+> Q5's "Use default" below will start a fresh `<collection-name>-conversation`, which won't
+> match any conversation history stored under the old name. If you remember the old name,
+> pick "Specify" and enter it instead.
+
+**Q5 — Compact collection name**
+Header: "Compacts"
+The default here is derived from Q2's answer (the resolved collection name), so ask this
+after Q2 has been answered — e.g. show it in the same `AskUserQuestion` call as Q3/Q4,
+never before step 3 completes.
+- If `COMPACT_COLLECTION` already has a value: show `"Keep current"` as the first option (description: the existing value)
+- Otherwise: show `"Use default"` as the first option (description: `<collection-name>-conversation`, using Q2's resolved collection name — if `previously-qdrant-only` is true, append " (can't recover a prior name — see note above)" to this description)
+- "Specify" — always present as the second option (description: "Enter a custom compact-collection name"), triggers a follow-up
+
+If the user picks "Specify", ask them to type the exact name they want. Use whatever they
+provide (or the resolved default/current value) as `--compact-collection` in step 5.
+
+### 5. Build and run setup_project.py
+
+Construct the command from all collected inputs. Start with:
+
+```
+<venv-python> <CLAUDE_RUNWAY_DIR>/tools/setup_project.py init <cwd>
+  --collection-name <name>
+  --memory-bank-collection <name>    # Q6's resolved value -- ALWAYS passed, regardless of qdrant-only
+  [--qdrant-only]                    # only if qdrant-only was selected
+  [--lmstudio-model <model>]         # only if the user gave a specific model name (omit for auto-detect)
+  [--track-savings]                  # only if savings tracker was enabled
+  [--compact-collection <name>]      # only for full setup -- Q5's resolved value
+```
+
+Then, for each value extracted from the existing `.mcp.json` in step 2 that is
+non-default, add the corresponding flag so it is not silently reset:
+- `QDRANT_URL` ≠ `http://localhost:6333` → add `--qdrant-url <value>`
+- `COLLECTION_DESCRIPTION` ≠ empty → add `--collection-description <value>`
+- `INDEX_INCLUDE_EXTENSIONS` ≠ empty → add `--include-extensions <value>`
+- `INDEX_EXCLUDE_DIRS` ≠ empty → add `--exclude-dirs <value>`
+- `CLAUDE_RUNWAY_LMSTUDIO_URL` ≠ `http://localhost:1234/v1` → add `--lmstudio-url <value>`
+- `CLAUDE_RUNWAY_SAVINGS_DB` ≠ empty → add `--savings-db <value>`
+- `CLAUDE_RUNWAY_METRICS_DB` ≠ empty → add `--metrics-db <value>`
+- `MEMORY_BANK_ID` present at all (regardless of value — it has no fixed default to compare
+  against; its "default" is simply being omitted) → add `--memory-bank-id <value>`. See the
+  extraction note in step 2 for why this must never be silently re-derived from Q2's answer
+  on a re-run.
+
+(Q3/Q4's answers already handle `--lmstudio-model` and `--track-savings`; skip those here.)
+
+`--compact-collection` is Q5's resolved value ("Keep current"'s existing value, "Use
+default"'s `<collection-name>-conversation`, or "Specify"'s typed name) — always pass it
+explicitly for a full setup, the same way `--collection-name` is always passed rather than
+only added when non-default. For `--qdrant-only`, Q5 was skipped in step 4, but the `qdrant`
+server (which serves the compact tools in every mode) still holds `COMPACT_COLLECTION`: if
+step 2 found an existing value, pass it as `--compact-collection` anyway so a re-run does
+not reset it to `conversation-compacts` and strand that project's saved compacts; if there
+was none, omit the flag. Likewise, for `--qdrant-only` add `--lmstudio-model <value>` when
+step 2 found a non-empty `CLAUDE_RUNWAY_LMSTUDIO_MODEL` (Q3 was skipped, and `compact_store`
+compresses with it).
+
+`--memory-bank-collection` is Q6's resolved value ("Keep current"'s existing value, "Use
+default"'s `"memory-bank"`, or "Specify"'s typed name) — unlike `--compact-collection`,
+this is passed explicitly for **every** run, `--qdrant-only` included, since `memory-bank`
+is never gated behind full-vs-qdrant-only the way `local-compress` is. Omitting this flag
+on a re-run of a project that had ever customized it would silently reset it back to the
+`"memory-bank"` default (found in a Copilot review) — `setup_project.py`'s
+`--memory-bank-collection` isn't "sticky" across runs any more than `--collection-name`/
+`--compact-collection` are, so it must be re-passed explicitly every time, the same way
+this skill already does for those two.
+
+Use **single quotes** around every dynamic argument on **both platforms** — PowerShell
+single-quotes and POSIX single-quotes both prevent expansion of `$`, `$()`, and
+backticks, unlike double quotes. This covers: `<venv-python>`, the script path,
+`<cwd>`, every `--flag <value>` argument (collection name, model name, and all
+values carried through from `.mcp.json`).
+
+If any value contains a literal `'`, escape it before quoting:
+- macOS/Linux: end the outer quote, escape the apostrophe, reopen — e.g.
+  `'O'\''Brien'` to represent `O'Brien`
+- PowerShell: double the apostrophe inside single quotes — e.g. `'O''Brien'`
+
+On **PowerShell**, prefix the entire command with `&` (the call operator):
+```
+& '<venv-python>' '<script-path>' init '<cwd>' --collection-name '<name>' ...
+```
+Without `&`, a single-quoted executable path is parsed as a string expression
+rather than a command and the invocation silently does nothing.
+
+Show the full command to the user before running it.
+
+Run it using Bash (macOS/Linux) or PowerShell (Windows). Capture both stdout and
+stderr.
+
+If the command exits non-zero, show the full output and stop.
+
+If it succeeds, extract the "Run the initial index" command line that
+`setup_project.py` prints at the end (the `ingest_to_qdrant.py ...` line). You
+will include this in the final summary.
+
+**Note on Windows:** `setup_project.py` formats this command with cmd.exe quoting
+(`subprocess.list2cmdline`). Run it in **Command Prompt** (`cmd.exe`), not
+PowerShell — cmd.exe quoting uses double quotes which PowerShell would expand.
+
+### 6. CLAUDE.md (done by step 5's command)
+
+`setup_project.py init` already created or updated the project's `CLAUDE.md` in step 5:
+do not edit it yourself. Its output has one line for it: `Writing CLAUDE.md (...)`, naming
+the sections it added (`new file with ...` when it created the file) and removed, or
+`CLAUDE.md already up to date, no changes`. Use that line in the summary below.
+
+What it does, so you can answer questions about it: it reads `templates/CLAUDE.md.template`
+from the same install and keeps the usage sections in step with the servers it just wrote.
+Vector memory and Durable memory are always present; Local compression only for a full
+setup (removed for qdrant-only); Analytics only with the savings tracker (removed
+otherwise); Local review only when `.mcp.json` has a `codebase-reviewer` block. A missing
+section is appended after a blank line, a section already present is left as it is, and
+nothing else in the file is touched. The template's "Setup and diagnostics" section is not
+managed; offer to copy it in if the user has the claude-runway skills installed and wants it.
+
+### 7. Report results and next steps
+
+Print a concise summary:
+
+```
+Done. Configured <target-project-path>:
+
+  ✓ .mcp.json              — qdrant, codebase-indexer, memory-bank[, local-compress][, analytics — only with the savings tracker]
+  ✓ .claude/settings.json  — SessionStart/SessionEnd record_session_id.py hook and SessionEnd session_end_pr_rounds.py hook (always; the second does nothing until CLAUDE_RUNWAY_CAPTURE_PR_ROUNDS=1 is exported)[; PostToolUse, PreToolUse, SessionEnd hooks — only if full setup]
+  ✓ CLAUDE.md              — <the sections init added/removed, or "already up to date">
+
+Next: run the initial index (from inside the tools repo, venv activated):
+  <exact ingest_to_qdrant.py command from setup_project.py output>     # with --dry-run to preview
+  <same command without --dry-run>                                     # to actually index
+```
+
+**Shell export reminders** — skip this block entirely if qdrant-only was selected
+(the CORE `record_session_id.py` hook is still installed, but it doesn't read
+any of the LM-Studio-related settings below, and none of the LM-Studio-dependent
+hooks that DO read them are installed in this mode — so there is nothing to
+export). This mirrors `setup_project.py`'s own behavior (`reminders = [] if
+qdrant_only`).
+
+Otherwise, print this block whenever ANY of the following apply (these settings must
+also be in the shell profile that launches `claude`, since hook scripts inherit the
+shell environment and have no env block of their own).
+
+Use the platform detected in step 1 to render the correct syntax:
+
+- macOS/Linux (`export` syntax):
+  ```bash
+  export CLAUDE_RUNWAY_TRACK_SAVINGS=1           # if savings tracker was enabled
+  export CLAUDE_RUNWAY_LMSTUDIO_MODEL='<model>'  # if a specific model was given
+  export CLAUDE_RUNWAY_LMSTUDIO_URL='<url>'      # if a non-default LM Studio URL was used
+  export CLAUDE_RUNWAY_SAVINGS_DB='<path>'       # if a non-default savings DB path was used
+  ```
+
+- Windows (PowerShell `$env:` syntax):
+  ```powershell
+  $env:CLAUDE_RUNWAY_TRACK_SAVINGS = '1'
+  $env:CLAUDE_RUNWAY_LMSTUDIO_MODEL = '<model>'
+  $env:CLAUDE_RUNWAY_LMSTUDIO_URL = '<url>'
+  $env:CLAUDE_RUNWAY_SAVINGS_DB = '<path>'
+  ```
+
+Only include the lines that actually apply. If any value contains a literal `'`,
+escape it (bash: `'\''`; PowerShell: `''`) before embedding it in the block.
+If none apply, skip the block entirely.
+
+**Shell unset reminders** — the dual-place requirement works in both directions. When
+a setting is being REMOVED from `.mcp.json`, the matching shell-profile export must
+also be removed or the hooks will keep using it regardless. Print an unset reminder
+whenever ANY of the following transitions apply:
+
+- User switched from a **pinned model to Auto-detect**: tell the user to remove
+  `CLAUDE_RUNWAY_LMSTUDIO_MODEL` from their shell profile (the hooks will otherwise
+  keep using the old model, and may fail if it is no longer loaded in LM Studio):
+  - macOS/Linux: `unset CLAUDE_RUNWAY_LMSTUDIO_MODEL` (and remove the `export` line from the profile)
+  - Windows: `Remove-Item Env:CLAUDE_RUNWAY_LMSTUDIO_MODEL` (and remove the `$env:` line)
+
+- User switched savings tracker from **Enabled to Disabled**: tell the user to remove
+  `CLAUDE_RUNWAY_TRACK_SAVINGS` from their shell profile (otherwise the hooks still
+  see it as enabled even though the MCP server now has it cleared):
+  - macOS/Linux: `unset CLAUDE_RUNWAY_TRACK_SAVINGS`
+  - Windows: `Remove-Item Env:CLAUDE_RUNWAY_TRACK_SAVINGS`
+
+### 8. Upgrade path
+
+Reached only when step 2 chose **upgrade**. Reuses step 1's validated `<CLAUDE_RUNWAY_DIR>`
+and `<venv-python>`; the quoting rules from step 5 apply here too (single quotes around
+every dynamic argument on both platforms, `&` call operator prefix on PowerShell).
+
+**`QDRANT_API_KEY` is not a blocker here.** Unlike `init`, `upgrade` never takes the key
+on its command line and never prints it: it reads the existing value from the target's own
+`.mcp.json` inside the Python process and copies it into any block it adds. So do NOT read
+the key into context, and do NOT stop for it — just proceed.
+
+1. **Preview.** Run, and show the user the full output:
+   ```
+   <venv-python> <CLAUDE_RUNWAY_DIR>/tools/setup_project.py upgrade <cwd> --dry-run
+   ```
+   The same command also previews the **installed-skill refresh**: after the migrations it
+   lists any skill already installed under `~/.claude/skills/` whose content differs from
+   the shipped version ("Would refresh <skill>"), writing nothing. It only ever refreshes
+   skills the user already has (it never installs new ones), and keeps an installed copy's
+   own `name`/`description` frontmatter. If it reports no pending migrations AND no stale
+   skills, say so ("already up to date"), skip to the `doctor` check (item 4 below), and
+   stop. If it exits non-zero, show the output and stop.
+2. **Approve.** Use `AskUserQuestion` (header "Apply"): "Apply all pending migrations"
+   / "Cancel" (name the stale skills in the question text if the preview listed any, e.g.
+   "Apply all pending migrations and refresh N installed skill(s)"). Be explicit that approval
+   is **all-or-nothing**: a skill cannot answer the CLI's interactive per-migration or
+   per-skill prompts, so every pending migration is applied and every stale installed skill
+   is refreshed (`--auto-yes` covers both). A user
+   who wants to pick migrations individually should decline and run the CLI directly
+   (`<venv-python> <CLAUDE_RUNWAY_DIR>/tools/setup_project.py upgrade <cwd>`) in their own
+   terminal. On "Cancel", stop and change nothing.
+3. **Apply.** Run:
+   ```
+   <venv-python> <CLAUDE_RUNWAY_DIR>/tools/setup_project.py upgrade <cwd> --auto-yes
+   ```
+   If it exits non-zero, show the full output and stop. Otherwise report the migrations
+   it applied and the skills it refreshed, from its output. Tell the user that the
+   refreshed skill text only takes effect in a new Claude Code session (step 5).
+4. **Verify.** Tell the user to confirm with `doctor` (it flags a stale compress-hook
+   path left by the hook's rename, among other things), and offer to run it (or point at
+   `/cr-doctor`, which runs the same check in the session's own environment):
+   ```
+   <venv-python> <CLAUDE_RUNWAY_DIR>/tools/doctor.py <cwd>
+   ```
+5. **Restart.** Remind the user to restart Claude Code: hook and MCP server config is
+   only read at startup, so the upgrade has no effect on the running session.
+
+`upgrade` does not touch `CLAUDE.md`; it has no CLAUDE.md step (that is `init`-only,
+see step 6). The migration list lives in `libs/upgrade_lib.py` (`MIGRATIONS`) and is the
+single source of truth for which CONFIG changes an upgrade can make; this skill adds nothing
+to it. The skill refresh is separate from `MIGRATIONS`: it compares each already-installed
+skill with the shipped `skills/*/SKILL.md` (`plan_skill_installs` in
+`libs/setup_project_lib.py`), so there is no list to keep in sync.

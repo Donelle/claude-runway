@@ -16,7 +16,7 @@ reaches Claude's context. The point: this costs zero Claude API tokens --
 only local compute -- and Claude only pays to read the (hopefully much
 smaller) compressed result.
 
-Project minimum: Python 3.11 (policy floor; the dependency chain supports >=3.10).
+Project minimum: Python 3.12.
 
 Setup:
     1. Install LM Studio (https://lmstudio.ai), load a small model, start
@@ -702,7 +702,7 @@ async def compress_text(
     complete. Safe to leave on for unstructured text, which falls back to
     ordinary whole-text compression. The qdrant server's compact_store sets
     both flags itself when it compresses a conversation summary, so
-    /my-compact no longer calls this tool.
+    /cr-compact no longer calls this tool.
     """
     return await _compress(
         text, focus, skip_if_under_chars, chunk_chars, max_total_chars,

@@ -1,0 +1,134 @@
+{
+  "measured": "not yet measured",
+  "model": "qwen2.5-coder-7b-instruct-mlx (verifier), qwen2.5-coder-7b-instruct-mlx (reasoning)",
+  "runType": "live",
+  "metadata": {
+    "tags": [
+      {
+        "tagId": "change-1",
+        "bugs": [
+          {
+            "id": "B1",
+            "file": "libs/qdrant_batch_store.py",
+            "line": 99,
+            "class": "logic",
+            "evidence": "other-file",
+            "claim": "make_point is called with its first two arguments swapped (it takes vector_name, embedding, entry), so a non-empty entries list raises TypeError."
+          },
+          {
+            "id": "B2",
+            "file": "libs/qdrant_batch_store.py",
+            "line": 48,
+            "class": "logic",
+            "evidence": "other-file",
+            "claim": "The payload index is on file_path, but points store the path nested as metadata.file_path, so the index is on a field no point has."
+          }
+        ],
+        "decoys": [
+          {
+            "id": "D1",
+            "file": "libs/qdrant_batch_store.py",
+            "line": 91,
+            "evidence": "other-file",
+            "claim": "Two processes can both find the collection missing and both create it, so one store_batch fails."
+          }
+        ]
+      },
+      {
+        "tagId": "change-2",
+        "bugs": [
+          {
+            "id": "B3",
+            "file": "libs/credential_redaction_lib.py",
+            "line": 177,
+            "class": "logic",
+            "evidence": "same-file",
+            "claim": "Redaction now runs after the text is cut to max_chars, so a secret that straddles the cut survives as a fragment."
+          },
+          {
+            "id": "B4",
+            "file": "libs/local_compress_lib.py",
+            "line": 1023,
+            "class": "logic",
+            "evidence": "other-file",
+            "claim": "credential_spans returns (start, end) tuples, not match objects, so .group raises AttributeError."
+          }
+        ],
+        "decoys": []
+      },
+      {
+        "tagId": "change-3",
+        "bugs": [
+          {
+            "id": "B5",
+            "file": "libs/sync_manifest_lib.py",
+            "line": 196,
+            "class": "logic",
+            "evidence": "same-file",
+            "claim": "missed files are always in baseline, so with the test inverted none is ever marked UNVERIFIED_HASH."
+          }
+        ],
+        "decoys": [
+          {
+            "id": "D2",
+            "file": "libs/sync_manifest_lib.py",
+            "line": 88,
+            "evidence": "same-file",
+            "claim": "The manifest write is not atomic, so a crash leaves a truncated manifest that the next sync trusts."
+          }
+        ]
+      },
+      {
+        "tagId": "change-4",
+        "bugs": [
+          {
+            "id": "B6",
+            "file": "libs/reviewer_tools_lib.py",
+            "line": 100,
+            "class": "logic",
+            "evidence": "same-file",
+            "claim": "has_line_cut matches only the old marker, so a clipped line no longer sets truncated."
+          }
+        ],
+        "decoys": [
+          {
+            "id": "D3",
+            "file": "libs/reviewer_tools_lib.py",
+            "line": 126,
+            "evidence": "same-file",
+            "claim": "When there is no newline before the limit the text is cut mid-line with no notice."
+          }
+        ]
+      },
+      {
+        "tagId": "change-5",
+        "clean": true,
+        "bugs": [],
+        "decoys": []
+      },
+      {
+        "tagId": "change-6",
+        "bugs": [
+          {
+            "id": "B7",
+            "file": "libs/version_lib.py",
+            "line": 35,
+            "class": "logic",
+            "evidence": "diff",
+            "claim": "The success test is inverted: git describe exits 0 on success, so a real result is thrown away."
+          }
+        ],
+        "decoys": [
+          {
+            "id": "D4",
+            "file": "libs/version_lib.py",
+            "line": 30,
+            "evidence": "diff",
+            "claim": "A slow git describe raises TimeoutExpired, which escapes."
+          }
+        ]
+      }
+    ]
+  },
+  "expect": {}
+}

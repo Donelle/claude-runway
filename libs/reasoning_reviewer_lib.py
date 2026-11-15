@@ -10,19 +10,19 @@ What this module does, in the order a review uses it:
      with absolute line numbers (removed lines become a one-line marker). A cut
      never lands inside a line, and every chunk starts with its `File:` line so
      the model knows which file it is reading.
-  2. `instruction_files_for` / `review_skills` gather the repo's own review
-     rules: the `.github/instructions/*.instructions.md` files whose `applyTo`
-     matches a changed path (the same files Copilot reads), and any review
-     skill. `build_system_prompt` puts the reviewer's lens, those rules, any
-     recalled lessons and the required output format together.
+  2. `instruction_files_for` gathers the repo's own review rules: the
+     `.github/instructions/*.instructions.md` files whose `applyTo` matches a
+     changed path (the same files Copilot reads). `build_system_prompt` puts the
+     reviewer's lens, those rules, any recalled lessons and the required output
+     format together.
   3. `run_reasoning_review` runs the active reasoning reviewers through
      `reviewer_scheduler_lib.run_stages` (so grouping, parallelism and model
      loading are the scheduler's), and `collect_findings` keeps EVERY finding
      from EVERY reviewer: there is no vote threshold, so a finding one reviewer
      alone saw is not lost. Findings are grouped by class and duplicates merge.
 
-Findings at this stage are unverified and unclassified: the verifier and
-classifier stages are separate, later pieces of work.
+Findings at this stage are unverified and unclassified: `verifier_reviewer_lib`
+and `classifier_reviewer_lib` are the stages that go on from here.
 
 Standard library only, apart from the sibling libs. The model client and the
 completion call are passed in, so tests run with a stub and no LM Studio.
@@ -33,18 +33,23 @@ import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, Optional, Sequence
+from typing import Any, Callable, Iterable, Optional, Sequence
 
-import local_compress_lib
-from codebase_reviewer_config_lib import Reviewer, ReviewersConfig, load_prompt
+import openai_lib
+from credential_redaction_lib import display_safe
+from codebase_reviewer_config_lib import DEFAULT_REPLY_FORMAT, Reviewer, ReviewersConfig, load_prompt
 from lmstudio_model_loader_lib import ModelLoader
+from reply_translator_lib import TranslatorError, translate
+from reviewer_db_lib import NULL_RECORDER, hash_text
+from reviewer_need_lib import ASKED, LIMIT, NeedSession, need_instructions, reference_budget
 from reviewer_scheduler_lib import run_stages
 
 # Sizing. A token count depends on the model's vocabulary, which is not known
 # here, so chunk sizes use a deliberately low characters-per-token guess: a
 # chunk that is a little small costs one more request, one that is too big is
 # refused by LM Studio (an HTTP 400). `chunk_chars` overrides the whole
-# calculation for a caller that knows better.
+# calculation for a caller that knows better, except that for a reviewer with
+# `tools` it is a ceiling: it never takes the room kept for the lookups' results.
 CHARS_PER_TOKEN_GUESS = 3
 # Assumed when a reviewer sets no `contextLength` (a model the user loaded keeps
 # whatever context they gave it, which the server cannot see).
@@ -57,6 +62,10 @@ MIN_CHUNK_CHARS = 500
 MAX_CHUNKS = 100
 # Each rules file (instructions, skill) is cut to this many characters.
 MAX_RULES_CHARS = 20000
+# A quote shorter than this (after whitespace is squeezed) says nothing about where the code is: `if` or
+# `x` is in every file. The verifier stage's grounding step treats one as ungrounded, and merging two
+# reports of a claim must not pick one.
+MIN_QUOTE_CHARS = 3
 
 UNCLASSIFIED_CLASS = "uncategorized"
 
@@ -81,6 +90,8 @@ class Alternate:
     reviewers: tuple
     line_start: int
     line_end: int
+    # The code the claim accuses, as the reviewer copied it; "" when it gave none.
+    quote: str = ""
 
 
 @dataclass(frozen=True)
@@ -96,6 +107,10 @@ class Finding:
     # Different claims (or the same claim with a different failing input) at overlapping lines in
     # the same class: two defects can share a class, so the second is never discarded.
     alternates: tuple = ()
+    # The exact line (or short span) of code the claim accuses, copied by the reviewer. The verifier
+    # stage checks that it occurs in the cited file before any model reads the finding; "" means the
+    # reviewer gave none, which that check treats as ungrounded.
+    quote: str = ""
 
 
 @dataclass(frozen=True)
@@ -113,6 +128,9 @@ class ReviewerResult:
     # Problems that did not lose the whole reviewer: a malformed reply, an item
     # skipped, one chunk whose request failed.
     problems: list = field(default_factory=list)
+    # Notes that are not problems: lookups of the `need:` loop that were cut to fit the reviewer's budget, or a reviewer with
+    # `tools` that ran without them.
+    warnings: list = field(default_factory=list)
     chunks: int = 0
 
 
@@ -378,27 +396,85 @@ def chunk_diff(diff_text: str, max_chars: int) -> list:
     return chunks
 
 
-def chunk_chars_for(reviewer: Reviewer, system_prompt: str, override: Optional[int] = None) -> int:
+def chunk_chars_for(reviewer: Reviewer, system_prompt: str, override: Optional[int] = None, reserve: int = 0) -> int:
     """How many characters of diff one request to `reviewer` can carry.
 
-    `override` (the caller's `chunk_chars`) wins. Otherwise: the reviewer's
+    `override` (the caller's `chunk_chars`) wins when there is no `reserve`, exactly as given. Otherwise: the reviewer's
     `contextLength` (or `ASSUMED_CONTEXT_TOKENS`), minus a share kept for the
     reply, at `CHARS_PER_TOKEN_GUESS` characters a token, minus the system
     prompt. Raises `ReviewError` when the prompt alone leaves less than
     `MIN_CHUNK_CHARS`, which is the reviewer's context being too small for its
-    own prompt, not something chunking can fix."""
-    if override is not None:
+    own prompt, not something chunking can fix.
+
+    `reserve` is room kept back for something else in the same request (the `need:` loop's reference block); it is
+    taken off before anything is sized, and 0 for every reviewer without `tools`, so their sizes are what they always were. With
+    a `reserve`, an `override` is a ceiling: it is used as given when it fits in what the reserve leaves, and is cut to that room
+    when it does not (a follow-up request carries the chunk and the reference block, so a chunk that took the reserve's room would
+    send a request larger than the sizing allows). When the room left is under `MIN_CHUNK_CHARS` and the override needs cutting,
+    it is refused as above."""
+    if override is not None and not reserve:
         return max(override, 1)
     context = reviewer.context_length or ASSUMED_CONTEXT_TOKENS
     usable_tokens = context - context // REPLY_RESERVE_DIVISOR
-    room = usable_tokens * CHARS_PER_TOKEN_GUESS - len(system_prompt)
+    room = usable_tokens * CHARS_PER_TOKEN_GUESS - len(system_prompt) - reserve
+    if override is not None and max(override, 1) <= room:
+        return max(override, 1)
     if room < MIN_CHUNK_CHARS:
+        kept = f" and {reserve} kept for what its lookups return" if reserve else ""
         raise ReviewError(
-            f"reviewer {reviewer.name!r}: its prompt and rules take about {len(system_prompt)} characters, "
+            f"reviewer {reviewer.name!r}: its prompt and rules take about {len(system_prompt)} characters{kept}, "
             f"which leaves under {MIN_CHUNK_CHARS} for the diff in a {context}-token context; "
             "raise its contextLength, shorten its prompt, or pass chunk_chars"
         )
     return room
+
+
+def loop_enabled(reviewer: Reviewer, executor: object) -> bool:
+    """Whether `reviewer` gets the `need:` feedback loop: it has `tools` and there is an executor to run them."""
+    return bool(reviewer.tools) and executor is not None
+
+
+def need_format_for(reviewer: Reviewer, role: str) -> str:
+    """The format a reviewer asks for lookups in: the one it replies in, so it is never asked to switch. A verifier always
+    replies in JSON; a reasoning reviewer in its `replyFormat`."""
+    return "json" if role == "verifier" else reviewer.reply_format
+
+
+def instructions_from_file(reviewer: Reviewer, role: str) -> bool:
+    """Whether the reviewer's `promptFile` carries `role`'s instructions for how to reply, and so for how to ask for lookups,
+    in place of the built-in ones.
+
+    Always for a reasoning reviewer (its file replaces the built-in reply instructions). For a verifier only when verifier is the
+    reviewer's ONLY type: a reviewer that is also a reasoning reviewer shares its file with that role, whose reply instructions
+    would not suit the verifier, so its verifier keeps the built-in instructions after the file, as it always did. False
+    for a reviewer without a `promptFile`."""
+    if not reviewer.prompt_file:
+        return False
+    return role == "reasoning" or tuple(reviewer.roles) == ("verifier",)
+
+
+def with_need_instructions(reviewer: Reviewer, system: str, executor: object, role: str = "reasoning") -> str:
+    """`system`, plus the section that tells a tools reviewer how to ask (in the format it replies in). Unchanged (the same
+    string) when the loop is off, and when the reviewer's `promptFile` carries the instructions (`instructions_from_file`): then
+    the file has to say how to ask, and the server adds nothing after it."""
+    if not loop_enabled(reviewer, executor) or instructions_from_file(reviewer, role):
+        return system
+    return system + "\n\n" + need_instructions(reviewer.tools, need_format_for(reviewer, role), role)
+
+
+def loop_reserve(reviewer: Reviewer, system: str, executor: object) -> int:
+    """The characters of `reviewer`'s room reserved for what its lookups return (`contextShare` of what its system prompt
+    leaves), 0 when the loop is off. `system` is the prompt as it will be sent, instructions included."""
+    if not loop_enabled(reviewer, executor):
+        return 0
+    return reference_budget(reviewer, chunk_chars_for(reviewer, system))
+
+
+def loop_unavailable(reviewer: Reviewer, executor: object) -> Optional[str]:
+    """A warning when `reviewer` has `tools` but there is nothing to run them (so it runs as if it had none), else None."""
+    if reviewer.tools and executor is None:
+        return f"reviewer {reviewer.name!r} has 'tools' but no tool executor was given, so it ran without lookups"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -605,24 +681,6 @@ def instruction_files_for(repo_root: "str | Path", changed_paths: Sequence[str])
     return found
 
 
-def review_skills(repo_root: "str | Path") -> list:
-    """`(relative path, text)` of each review skill: a `SKILL.md` under
-    `.claude/skills/` or `skills/` whose directory name or front-matter `name`
-    contains "review"."""
-    root = Path(repo_root)
-    found = []
-    for base in (root / ".claude" / "skills", root / "skills"):
-        for path in sorted(base.glob("*/SKILL.md")):
-            text = _read_text(path, root)
-            if text is None:
-                continue
-            fields, body = _split_front_matter(text)
-            name = f"{path.parent.name} {fields.get('name', '')}".lower()
-            if "review" in name:
-                found.append((path.relative_to(root).as_posix(), _bounded(body.strip())))
-    return found
-
-
 INPUT_FORMAT = """\
 Each request shows one file's change as the file's NEW version: a "File:" line, then lines with their
 line numbers on the left. A "+" after the number marks a line this change added or modified; an
@@ -636,28 +694,52 @@ Reply with ONLY a JSON object, no other text:
 {"findings": [{"file": "<path from the File: line>", "line_start": <int>, "line_end": <int>,
   "class": "<short-kebab-case name for the kind of defect>",
   "claim": "<what is wrong, in one or two sentences>",
+  "quote": "<the exact line of code the claim is about, copied character for character from the file>",
   "failing_input": "<a concrete input or state that makes it fail>"}]}
 Report each defect you can describe with a concrete failing input. Use the line numbers printed at the left of each line.
+The quote is checked against the file: copy the code itself, without the line number or the "+" mark, and do not paraphrase it.
+A finding whose quote is not in the file is thrown away.
 If you find nothing, reply {"findings": []}."""
+
+# The plain-lines reply format, the default. The `quote` field carries code, which is full of `"`,
+# `\` and string joins, and small models often fail to escape it inside a JSON string; a line that ends where
+# the code ends has nothing to escape. These are the exact instructions the format experiments used.
+OUTPUT_FORMAT_LINES = """\
+Reply with ONLY finding blocks, no other text. Write one block for each defect. A block is these lines, in this order:
+FINDING
+file: <path from the File: line>
+lines: <first line>-<last line>, using the line numbers printed at the left
+class: <short-kebab-case name for the kind of defect>
+claim: <what is wrong, in one or two sentences>
+quote: <the exact line of code the claim is about, copied character for character from the file>
+failing_input: <a concrete input or state that makes it fail>
+END
+Write the code as it is, on one line: no escaping and no extra quotes around it. A finding whose quote is not in the file is thrown away.
+Report each defect you can describe with a concrete failing input.
+If you find nothing, reply with the single word NONE."""
+
+OUTPUT_FORMATS = {"json": OUTPUT_FORMAT, "lines": OUTPUT_FORMAT_LINES}
 
 
 def build_system_prompt(
     reviewer: Reviewer,
     instructions: Sequence[tuple] = (),
-    skills: Sequence[tuple] = (),
     lessons: Sequence[str] = (),
 ) -> str:
     """The system prompt for one reasoning reviewer: its own prompt (lens), then
-    the repo's rules, then lessons recalled from past reviews, then the output
-    format. `lessons` is empty until the scoring database exists."""
+    the repo's rules, then lessons recalled from past reviews, then the input
+    format, then the output format for the reviewer's `reply_format`. A reviewer
+    with a `promptFile` is not given the output format: the file replaces it, so
+    it has to describe the format the reviewer's replies are read in.
+    `lessons` is empty until the scoring database exists."""
     parts = [load_prompt(reviewer)]
-    for label, items in (("Repository review instructions", instructions), ("Repository review skills", skills)):
-        for path, text in items:
-            parts.append(f"## {label}: {path}\n{text}")
+    for path, text in instructions:
+        parts.append(f"## Repository review instructions: {path}\n{text}")
     if lessons:
         parts.append("## Lessons from earlier reviews of this repository\n" + "\n".join(f"- {x}" for x in lessons))
     parts.append(INPUT_FORMAT)
-    parts.append(OUTPUT_FORMAT)
+    if not reviewer.prompt_file:
+        parts.append(OUTPUT_FORMATS[reviewer.reply_format])
     return "\n\n".join(parts)
 
 
@@ -726,19 +808,76 @@ def _extract_json(text: str) -> object:
     raise ValueError("no JSON object in the reply")
 
 
-def parse_findings(text: str, reviewer: str, default_file: str = "") -> tuple:
-    """`(findings, problems)` from one model reply.
+_LINE_KEYS = ("file", "lines", "line", "class", "claim", "quote", "failing_input")
+# A key at the start of a line, ignoring leading punctuation such as `**`, `__` or `-` and any between the key and its
+# colon. The match after the key is lazy so the FIRST colon ends the key: a value that itself starts with
+# punctuation and holds a colon (`quote: "/": 0,`, `failing_input: ':'`) keeps all of it.
+_KEY_LINE = re.compile(r"^[\W_]*(" + "|".join(_LINE_KEYS) + r")[\W_]*?\s*:\s*(.*)$", re.IGNORECASE)
+_FINDING_LINE = re.compile(r"\W*FINDING\W*", re.IGNORECASE)
+_END_LINE = re.compile(r"\W*END\W*", re.IGNORECASE)
+_NONE_REPLY = re.compile(r"\W*NONE\W*", re.IGNORECASE)
+# The keys whose value is free text and may legitimately be written twice in one block (a model that
+# does so is elaborating, not starting a second finding).
+_REPEATABLE_KEYS = ("claim", "quote", "failing_input")
 
-    Tolerant of fences and prose around the JSON, and of a bare list. A reply
-    with no JSON is one problem and no findings; an item without a `claim` is
-    skipped with a problem. Never raises."""
-    try:
-        data = _extract_json(text)
-    except ValueError:
-        return [], [f"reviewer {reviewer!r}: the reply was not JSON"]
-    items = data.get("findings") if isinstance(data, dict) else data
-    if not isinstance(items, list):
-        return [], [f"reviewer {reviewer!r}: the reply has no 'findings' list"]
+
+def _items_from_lines(text: str) -> list:
+    """The findings in a plain-lines reply, as the dicts `_findings_from_items` reads.
+
+    A block starts at a `FINDING` line, or at a key with no block open, and ends at `END`. A line is a
+    `key: value` pair when it starts with one of the known keys (case does not matter, nor punctuation such as
+    `**` or `-` before it); any other line continues the value above it. `lines` gives the first and last
+    integers in it. Tolerates a code fence and a leading `<think>` envelope. A reply with no block that is
+    the single word `NONE` is no findings. Raises `ValueError` when there is neither a block nor `NONE`."""
+    body = _without_thinking(text).strip()
+    fence = re.match(r"^```[a-zA-Z]*\s*\n(.*?)\n?```\s*$", body, re.DOTALL)
+    if fence:
+        body = fence.group(1).strip()
+    items: list = []
+    current: Optional[dict] = None
+    key = ""
+    for raw in body.splitlines():
+        line = raw.strip()
+        if _FINDING_LINE.fullmatch(line):
+            current, key = {}, ""
+            items.append(current)
+            continue
+        if _END_LINE.fullmatch(line):
+            current, key = None, ""
+            continue
+        match = _KEY_LINE.match(line)
+        if match:
+            name = match.group(1).lower()
+            if current is None or (name in current and name not in _REPEATABLE_KEYS):
+                # A field with no FINDING line before it, or a field written twice that is not free text,
+                # starts a block of its own.
+                current = {}
+                items.append(current)
+            key = name
+            value = match.group(2)
+            # Markdown bold written around the colon (`**file:** a.py`) leaves its closing marker at the start of
+            # the value. It is stripped only when the key's bold is still open at the colon: in `**quote**: **d,`
+            # the bold closed before the colon, so the `**` is the code's own (dictionary unpacking) and is kept.
+            opening = line[: match.start(1)]
+            before_colon = line[match.end(1) : match.start(2)].split(":", 1)[0]
+            for marker in ("**", "__"):
+                if marker in opening and marker not in before_colon and value.startswith(marker):
+                    value = value[len(marker):]
+            current[key] = value.strip()
+        elif current is not None and key and line:
+            current[key] += " " + line
+    for item in items:
+        span = item.pop("lines", None) or item.pop("line", None) or ""
+        numbers = [int(n) for n in re.findall(r"\d+", span)]
+        item["line_start"] = numbers[0] if numbers else 0
+        item["line_end"] = numbers[-1] if numbers else item["line_start"]
+    if items or _NONE_REPLY.fullmatch(body):
+        return items
+    raise ValueError("no finding blocks in the reply")
+
+
+def _findings_from_items(items: list, reviewer: str, default_file: str) -> tuple:
+    """`(findings, problems)` from the parsed items of a reply, whatever format it was in."""
     findings: list = []
     problems: list = []
     for index, item in enumerate(items):
@@ -750,6 +889,7 @@ def parse_findings(text: str, reviewer: str, default_file: str = "") -> tuple:
         end = _as_line(item.get("line_end")) or start
         file = item.get("file")
         failing = item.get("failing_input")
+        quote = item.get("quote")
         findings.append(
             Finding(
                 file=file.strip() if isinstance(file, str) and file.strip() else default_file,
@@ -759,9 +899,32 @@ def parse_findings(text: str, reviewer: str, default_file: str = "") -> tuple:
                 claim=claim.strip(),
                 failing_input=failing.strip() if isinstance(failing, str) else "",
                 reviewers=(reviewer,),
+                quote=quote.strip() if isinstance(quote, str) else "",
             )
         )
     return findings, problems
+
+
+def parse_findings(text: str, reviewer: str, default_file: str = "", reply_format: str = DEFAULT_REPLY_FORMAT) -> tuple:
+    """`(findings, problems)` from one model reply in `reply_format` (`lines` or `json`).
+
+    JSON is read tolerantly (fences and prose around it, a bare list); lines as `_items_from_lines` says. A
+    reply with no findings block and no JSON is one problem and no findings; an item without a `claim` is
+    skipped with a problem. Never raises."""
+    if reply_format == "lines":
+        try:
+            items = _items_from_lines(text)
+        except ValueError:
+            return [], [f"reviewer {reviewer!r}: the reply had no FINDING blocks and was not NONE"]
+        return _findings_from_items(items, reviewer, default_file)
+    try:
+        data = _extract_json(text)
+    except ValueError:
+        return [], [f"reviewer {reviewer!r}: the reply was not JSON"]
+    items = data.get("findings") if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        return [], [f"reviewer {reviewer!r}: the reply has no 'findings' list"]
+    return _findings_from_items(items, reviewer, default_file)
 
 
 def _same_finding(a: Finding, b: Finding) -> bool:
@@ -779,31 +942,53 @@ def _norm(text: str) -> str:
     return " ".join(text.lower().split()).rstrip(".")
 
 
+def _squeeze(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _same_quote(a: str, b: str) -> bool:
+    """Two quotes of one claim are the same code when either is empty or, with whitespace squeezed, one
+    contains the other. Quotes that differ are different code: the grounding step checks each one against
+    the file, and merging them to the first would lose a valid quote whenever the first is not in the file."""
+    a, b = _squeeze(a), _squeeze(b)
+    return not a or not b or a in b or b in a
+
+
+def _better_quote(a: str, b: str) -> str:
+    """The quote to keep when two reports of one claim merge: the shorter, which is likelier to be exact
+    in the file, but never one too short for grounding to place (`[]` inside `def f(items=[]):`)
+    while the other is long enough. An empty quote loses to any other."""
+    candidates = [q for q in (a, b) if q.strip()]
+    usable = [q for q in candidates if len(_squeeze(q)) >= MIN_QUOTE_CHARS]
+    return min(usable or candidates, key=lambda q: len(_squeeze(q)), default="")
+
+
 def _merge(a: Finding, b: Finding) -> Finding:
     """`b` folded into `a`. The same claim only adds `b`'s reviewers (and a failing input `a` lacked).
-    A different claim, or the same claim with a different failing input, is kept as an `Alternate`
-    with its own reviewers, so two defects that share a class and overlapping lines both survive and
-    each is credited only to the reviewers who raised it."""
-    pairs: list = [[a.claim, a.failing_input, list(a.reviewers), a.line_start, a.line_end]]
-    pairs += [[x.claim, x.failing_input, list(x.reviewers), x.line_start, x.line_end] for x in a.alternates]
-    incoming = [[b.claim, b.failing_input, list(b.reviewers), b.line_start, b.line_end]]
-    incoming += [[x.claim, x.failing_input, list(x.reviewers), x.line_start, x.line_end] for x in b.alternates]
-    for claim, failing, reviewers, start, end in incoming:
+    A different claim, the same claim with a different failing input, or the same claim quoting different
+    code is kept as an `Alternate` with its own reviewers, so two defects that share a class and
+    overlapping lines both survive and each is credited only to the reviewers who raised it."""
+    pairs: list = [[a.claim, a.failing_input, list(a.reviewers), a.line_start, a.line_end, a.quote]]
+    pairs += [[x.claim, x.failing_input, list(x.reviewers), x.line_start, x.line_end, x.quote] for x in a.alternates]
+    incoming = [[b.claim, b.failing_input, list(b.reviewers), b.line_start, b.line_end, b.quote]]
+    incoming += [[x.claim, x.failing_input, list(x.reviewers), x.line_start, x.line_end, x.quote] for x in b.alternates]
+    for claim, failing, reviewers, start, end, quote in incoming:
         for pair in pairs:
             same_claim = _norm(pair[0]) == _norm(claim)
             # Failing inputs are concrete reproducers (a path, a shell command): compared exactly, since
             # `Config.json` and `config.json`, or `a id` and `a\nid`, are different inputs. Only claims,
             # which are prose, are compared loosely.
             same_input = not pair[1] or not failing or pair[1].strip() == failing.strip()
-            if same_claim and same_input:
+            if same_claim and same_input and _same_quote(pair[5], quote):
                 pair[2] += [r for r in reviewers if r not in pair[2]]
                 pair[1] = pair[1] or failing
+                pair[5] = _better_quote(pair[5], quote)
                 # The repeated claim may cover lines the first report did not: keep the whole range.
                 pair[3] = min(pair[3], start) if pair[3] and start else pair[3] or start
                 pair[4] = max(pair[4], end)
                 break
         else:
-            pairs.append([claim, failing, reviewers, start, end])
+            pairs.append([claim, failing, reviewers, start, end, quote])
     primary, rest = pairs[0], pairs[1:]
     return Finding(
         file=a.file,
@@ -813,7 +998,8 @@ def _merge(a: Finding, b: Finding) -> Finding:
         claim=primary[0],
         failing_input=primary[1],
         reviewers=tuple(primary[2]),
-        alternates=tuple(Alternate(c, f, tuple(r), st, en) for c, f, r, st, en in rest),
+        alternates=tuple(Alternate(c, f, tuple(r), st, en, q) for c, f, r, st, en, q in rest),
+        quote=primary[5],
     )
 
 
@@ -848,9 +1034,55 @@ CompleteFn = Callable[[object, str, str, str], Optional[str]]
 
 
 def _failure_text() -> str:
-    kind, detail = local_compress_lib.take_failure()
+    kind, detail = openai_lib.take_failure()
+    detail = display_safe(detail)  # the server's text, as sent: redacted here, where it is shown
     suffix = f": {detail}" if detail else ""
     return f"LM Studio request failed ({kind or 'unknown'}){suffix}"
+
+
+def finish_request(req: Any, reply: Optional[str]) -> None:
+    """Closes a recorded request with what the model returned: the token counts of a reply, or why there
+    was none. Reads the failure reason without clearing it, so the message wording that follows still
+    gets it. A request that failed after the model had answered (a classifier reply with no readable
+    probability) keeps its token counts; one that never got a reply has none to keep. Never raises."""
+    try:
+        if reply is None:
+            req.finish(None, failure_kind=openai_lib.peek_failure()[0], usage=openai_lib.take_usage())
+        else:
+            req.finish(reply, usage=openai_lib.take_usage())
+    except Exception:
+        pass
+
+
+def describe_finding(finding: Finding) -> list:
+    """A finding as lines for the session log: where it is, its class and claim, the failing input and the quoted code."""
+    where = finding.file or "(unknown file)"
+    if finding.line_start:
+        where += f":{finding.line_start}" + (f"-{finding.line_end}" if finding.line_end != finding.line_start else "")
+    lines = [f"{where} [{finding.cls}] {finding.claim}"]
+    if finding.failing_input:
+        lines.append(f"  failing input: {finding.failing_input}")
+    if finding.quote:
+        lines.append(f"  quote: {finding.quote}")
+    return lines
+
+
+def prompt_hash_of(reviewer: Reviewer, loop: bool = False) -> Optional[str]:
+    """A hash of the reviewer's own prompt text (its lens, and its reply instructions when a promptFile
+    carries them), so a recorded request names the prompt it used without storing it.
+
+    A request made in the `need:` loop (`loop`) hashes the reviewer's tools and its `contextShare` in as well, so the same model
+    with and without lookups, or with two different reference budgets, is two setups and their timings are never mixed.
+    Without the loop the hash is what it always was."""
+    try:
+        text = load_prompt(reviewer)
+        if loop:
+            # The share sets the reference budget, so two shares are two setups; the default is hashed too (a hash kept
+            # only for the default would make its absence mean something).
+            text += "\ntools: " + ",".join(reviewer.tools) + f"\ncontextShare: {reviewer.context_share:g}"
+        return hash_text(text)
+    except Exception:
+        return None
 
 
 def _chunk_default_file(chunk: str) -> str:
@@ -864,26 +1096,76 @@ def _review_one(
     client: object,
     complete: CompleteFn,
     instructions: Sequence[tuple],
-    skills: Sequence[tuple],
     lessons: Sequence[str],
+    recorder: Any = NULL_RECORDER,
+    executor: object = None,
 ) -> ReviewerResult:
     """One reviewer over every chunk. Raises when it produced nothing at all
-    (every request failed); partial failures are recorded as problems."""
-    system = build_system_prompt(reviewer, instructions, skills, lessons)
+    (every request failed); partial failures are recorded as problems.
+
+    A reviewer with `tools` (and an `executor`) may answer a chunk with `need:` lines instead of findings: the chunk is then asked
+    again with what it asked for in front of it (`reviewer_need_lib`), up to the round limit. A reviewer without `tools` makes
+    one request per chunk, with exactly the prompt it always had."""
+    loop = loop_enabled(reviewer, executor)
+    system = with_need_instructions(reviewer, build_system_prompt(reviewer, instructions, lessons), executor)
+    budget = loop_reserve(reviewer, system, executor)
     chunks = chunks_for(reviewer, system)
     result = ReviewerResult(reviewer=reviewer.name, chunks=len(chunks))
+    unavailable = loop_unavailable(reviewer, executor)
+    if unavailable:
+        result.warnings.append(unavailable)
     failed = 0
     last_failure = ""
+    prompt_hash = prompt_hash_of(reviewer, loop) if recorder is not NULL_RECORDER else None
     for number, chunk in enumerate(chunks, start=1):
-        reply = complete(client, reviewer.model, system, chunk)
-        if reply is None:
-            failed += 1
-            last_failure = _failure_text()
-            result.problems.append(f"reviewer {reviewer.name!r}: chunk {number}/{len(chunks)}: {last_failure}")
-            continue
-        found, problems = parse_findings(reply, reviewer.name, _chunk_default_file(chunk))
-        result.findings.extend(found)
-        result.problems.extend(f"chunk {number}/{len(chunks)}: {p}" for p in problems)
+        session = NeedSession(reviewer, executor, budget, reply_format=need_format_for(reviewer, "reasoning")) if loop else None
+        asking = True
+        while asking:
+            asking = False
+            message = session.message(chunk) if session is not None else chunk
+            with recorder.request(
+                reviewer=reviewer.name, role="reasoning", model=reviewer.model, subject=("chunk", number),
+                prompt_chars=len(system) + len(message), reply_format=reviewer.reply_format, translator=reviewer.translator,
+                prompt_hash=prompt_hash,
+            ) as req:
+                reply = complete(client, reviewer.model, system, message)
+                finish_request(req, reply)
+                if reply is None:
+                    failed += 1
+                    last_failure = _failure_text()
+                    result.problems.append(f"reviewer {reviewer.name!r}: chunk {number}/{len(chunks)}: {last_failure}")
+                    req.problem(last_failure)
+                    continue
+                if session is not None:
+                    outcome = session.read(reply, req)
+                    if outcome == ASKED:
+                        asking = True
+                        continue
+                    if outcome == LIMIT:
+                        problem = "it kept asking for more context after the round limit, so this chunk has no answer from it"
+                        result.problems.append(f"reviewer {reviewer.name!r}: chunk {number}/{len(chunks)}: {problem}")
+                        req.problem(problem)
+                        continue
+                if reviewer.translator:
+                    try:
+                        reply = translate(reply, reviewer.translator)
+                    except TranslatorError as exc:
+                        # No fallback to the raw reply: the translator is what makes it readable.
+                        result.problems.append(f"reviewer {reviewer.name!r}: chunk {number}/{len(chunks)}: the translator {exc}")
+                        req.problem(f"the translator {exc.brief}")
+                        # The caller's result keeps what the translator printed; the session log's copy of it must not.
+                        recorder.withhold(exc.printed)
+                        continue
+                found, problems = parse_findings(reply, reviewer.name, _chunk_default_file(chunk), reviewer.reply_format)
+                if found or not problems:  # a reply that could not be read says nothing about what it found
+                    req.note(f"raised {len(found)} finding(s)" if found else "raised no finding",
+                             detail=tuple(line for f in found for line in describe_finding(f)))
+                result.findings.extend(found)
+                result.problems.extend(f"chunk {number}/{len(chunks)}: {p}" for p in problems)
+                for problem in problems:
+                    req.problem(problem)
+        if session is not None:
+            result.warnings.extend(w for w in session.warnings if w not in result.warnings)
     if chunks and failed == len(chunks):
         raise ReviewError(f"every request failed; the last one: {last_failure}")
     return result
@@ -900,8 +1182,13 @@ def run_reasoning_review(
     chunk_chars: Optional[int] = None,
     lessons: Sequence[str] = (),
     complete: Optional[CompleteFn] = None,
+    recorder: Any = NULL_RECORDER,
+    executor: object = None,
 ) -> ReasoningReview:
     """Runs every active reasoning reviewer over `diff_text` and collects the findings.
+
+    `executor` (a `reviewer_tools_lib.ToolExecutor`) is what a reviewer with `tools` asks for lookups through;
+    without one, such a reviewer runs without lookups and says so in the review's warnings.
 
     Raises `ReviewError` when no reasoning reviewer is active, the diff is
     empty, or it needs more than `MAX_CHUNKS` chunks. A model that is not
@@ -917,12 +1204,11 @@ def run_reasoning_review(
         raise ReviewError("the diff has no text changes to review (only binary, deleted, renamed or mode-only files)")
     changed = [s.path for s in sections]
     instructions = instruction_files_for(repo_root, changed)
-    skills = review_skills(repo_root)
-    complete_fn = complete or local_compress_lib.complete
+    complete_fn = complete or openai_lib.complete
     chunk_counts: dict = {}
 
     def chunks_for(reviewer: Reviewer, system: str) -> list:
-        size = chunk_chars_for(reviewer, system, chunk_chars)
+        size = chunk_chars_for(reviewer, system, chunk_chars, reserve=loop_reserve(reviewer, system, executor))
         chunks = chunk_diff(diff_text, size)
         if len(chunks) > MAX_CHUNKS:
             raise ReviewError(
@@ -933,9 +1219,9 @@ def run_reasoning_review(
         return chunks
 
     def run_reviewer(reviewer: Reviewer, role: str) -> ReviewerResult:
-        return _review_one(reviewer, chunks_for, client, complete_fn, instructions, skills, lessons)
+        return _review_one(reviewer, chunks_for, client, complete_fn, instructions, lessons, recorder, executor)
 
-    report = run_stages(config, loader, run_reviewer, max_reviewers, roles=("reasoning",))
+    report = run_stages(config, loader, run_reviewer, max_reviewers, roles=("reasoning",), recorder=recorder)
     review = ReasoningReview(warnings=list(report.warnings))
     unsent = [section.path for section in sections if not _render_section(section)[1]]
     if unsent:
@@ -954,19 +1240,40 @@ def run_reasoning_review(
         assert isinstance(result, ReviewerResult)
         review.reviewers_run.append(name)
         review.errors.extend(result.problems)
+        review.warnings.extend(w for w in result.warnings if w not in review.warnings)
         collected.extend(result.findings)
     review.chunks = max(chunk_counts.values(), default=0)
     review.groups = collect_findings(collected)
     return review
 
 
-def format_review(review: ReasoningReview) -> str:
-    """The review as text for the calling model: findings by class, then errors."""
+def stage_status_line(followed_by: Sequence[str] = ()) -> str:
+    """What the reasoning stage's findings have been through, given the stages that went on from them in the same
+    review (`followed_by`, any of "verifier" and "classifier"). With none, the findings are plain reasoning output and
+    the line says nothing was checked; with some, it names what each later stage did to them and what is still missing,
+    so a pipeline that ran every stage is never described as having run none."""
+    ran = [stage for stage in ("verifier", "classifier") if stage in followed_by]
+    if not ran:
+        return "These findings are NOT verified and NOT classified: no verifier or classifier stage ran."
+    missing = [word for stage, word in (("verifier", "verified"), ("classifier", "classified")) if stage not in ran]
+    before = " and ".join({"verifier": "verification", "classifier": "classification"}[stage] for stage in ran)
+    line = f"These are the reasoning stage's findings, before {before}: the result of the later stage(s) is reported separately."
+    if missing:
+        line += f" They are NOT {' and NOT '.join(missing)}: no {'verifier' if 'verified' in missing else 'classifier'} stage ran."
+    return line
+
+
+def format_review(review: ReasoningReview, *, followed_by: Sequence[str] = ()) -> str:
+    """The review as text for the calling model: findings by class, then errors.
+
+    `followed_by` names the stages that run on these findings in the same review (the `review` tool's "reasoning"
+    type passes none; a pipeline that goes on to verify and classify passes both), so the opening line says what the
+    findings have and have not been through."""
     lines = [
         f"Reasoning review: {review.finding_count} finding(s) in {len(review.groups)} class(es) "
         f"from {len(review.reviewers_run)} reviewer(s) ({', '.join(review.reviewers_run) or 'none'}), "
         f"up to {review.chunks} diff chunk(s) each.",
-        "These findings are NOT verified and NOT classified: no verifier or classifier stage ran.",
+        stage_status_line(followed_by),
     ]
     for group in review.groups:
         lines.append("")
@@ -1008,10 +1315,13 @@ __all__ = [
     "chunk_chars_for",
     "applies_to",
     "instruction_files_for",
-    "review_skills",
     "build_system_prompt",
+    "OUTPUT_FORMAT",
+    "OUTPUT_FORMAT_LINES",
     "parse_findings",
+    "describe_finding",
     "collect_findings",
     "run_reasoning_review",
     "format_review",
+    "stage_status_line",
 ]
