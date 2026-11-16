@@ -3224,6 +3224,43 @@ class LocalCompressDeadEnvDropped(unittest.TestCase):
         self.assertEqual(after, before)
         self.assertIn(self._ID, {m.id for m in pending_migrations(after, {})})
 
+    # --- mixed old compact blocks ---
+
+    _OWN_OLD = {"command": "py", "args": ["/r/mcpservers/qdrant_mcp_server.py"], "env": {}}
+    _THIRD = {"command": "/old/venv/bin/mcp-server-qdrant", "env": {}}
+
+    def _mixed(self, **blocks):
+        servers = {key: copy.deepcopy(block) for key, block in blocks.items()}
+        servers["local-compress"] = {"command": "py", "env": dict(self._LEFTOVERS, **self._KEPT)}
+        return {"mcpServers": servers}
+
+    def test_waits_while_more_than_one_old_compact_block_is_left(self):
+        # Every shape the other compact migrations refuse until the user keeps one block.
+        shapes = {
+            "two own blocks": self._mixed(a=self._OWN_OLD, b=self._OWN_OLD),
+            "own and third-party, no compact": self._mixed(qdrant=self._OWN_OLD, qtp=self._THIRD),
+            "two third-party blocks": self._mixed(a=self._THIRD, b=self._THIRD),
+            "old-script compact plus another own block": self._mixed(compact=self._OWN_OLD, qdrant=self._OWN_OLD),
+        }
+        for name, before in shapes.items():
+            with self.subTest(shape=name):
+                self.assertFalse(_migration(self._ID).detect(before, {}))
+                self.assertEqual(_migration(self._ID).apply(before, {}, _ctx())[0], before)
+                _, applied, after = self._run(before, auto_yes=True)
+                self.assertNotIn(self._ID, applied)
+                self.assertEqual(after["mcpServers"]["local-compress"], before["mcpServers"]["local-compress"])
+
+    def test_a_third_party_server_next_to_compact_is_the_users_own_and_does_not_hold_it_back(self):
+        # A review's shape: `compact` still launches the old own script and a
+        # third-party block sits beside it. That block is the user's own server,
+        # so no carry-over reads local-compress and the rename goes ahead.
+        before = self._mixed(compact=dict(self._OWN_OLD, env={"COMPACT_EMBEDDING_MODEL": "m"}), qtp=self._THIRD)
+        _, applied, after = self._run(before, auto_yes=True)
+        self.assertIn("compact-server-renamed", applied)
+        self.assertIn(self._ID, applied)
+        self.assertEqual(after["mcpServers"]["local-compress"]["env"], self._KEPT)
+        self.assertEqual(after["mcpServers"]["qtp"], before["mcpServers"]["qtp"])
+
 
 if __name__ == "__main__":
     unittest.main()

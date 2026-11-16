@@ -1558,7 +1558,14 @@ def _detect_local_compress_dead_env(mcp_json: dict, settings_json: dict) -> bool
     `--qdrant-only` install), and for one whose only leftover is an
     EMBEDDING_MODEL that is still the compact model's sole record, so that
     install is not offered a migration that could never apply.
+
+    Also False while more than one old compact block (of either shape) is
+    left: that install is waiting on the user to keep one, the other compact
+    migrations refuse until then, and trimming `local-compress` meanwhile
+    would be a partial migration (same rule as `compact-server-dead-env-dropped`).
     """
+    if len(find_old_compact_server_keys(mcp_json)) > 1:
+        return False
     env = _local_compress_env(mcp_json)
     if any(key in env for key in _LOCAL_COMPRESS_DEAD_ENV_KEYS):
         return True
@@ -1579,7 +1586,11 @@ def _apply_local_compress_dead_env(
     A no-op while any block still launches the third-party qdrant server:
     `qdrant-server-replaced` reads these values to build the compact block, so
     they must survive until it has. That covers it being declined, and it
-    refusing (more than one old block, or a clashing `compact` block). Checked
+    refusing over a clashing `compact` block. (An install with more than one
+    old compact block, of either shape, is never offered this at all: see
+    `detect`, re-checked here.) A third-party block next to a `compact` block
+    is the user's own server, not a pending carry-over (see
+    `_third_party_qdrant_keys`), so it does not hold this back. Checked
     here rather than in `detect` because `run_upgrade` computes the pending
     list once, before anything runs: when both are accepted in one run,
     `qdrant-server-replaced` (earlier in `MIGRATIONS`) has already replaced the
@@ -1587,7 +1598,7 @@ def _apply_local_compress_dead_env(
     `run_upgrade` reports it as still pending (same pattern as
     `local-compress-savings-db-inert`).
     """
-    if _third_party_qdrant_keys(mcp_json):
+    if _third_party_qdrant_keys(mcp_json) or len(find_old_compact_server_keys(mcp_json)) > 1:
         return mcp_json, settings_json
     drop_embedding = _embedding_model_droppable(mcp_json)
     mcp_json = copy.deepcopy(mcp_json)
