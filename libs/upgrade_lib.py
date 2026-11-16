@@ -2091,7 +2091,9 @@ MIGRATIONS: "list[Migration]" = [
             "If an earlier upgrade already replaced the mcp-server-qdrant block, rules still naming "
             "mcp__<old key>__qdrant-find/qdrant-store are left as they are (the old key can no longer be "
             "told apart from a server of your own): rename them to "
-            "mcp__codebase-indexer__cb_indexer_find_repo/cb_indexer_store_repo by hand."
+            "mcp__<indexer key>__cb_indexer_find_repo/cb_indexer_store_repo by hand, where <indexer key> is "
+            "the key of the .mcp.json block that launches codebase_indexer_mcp_server.py (codebase-indexer "
+            "unless you renamed it)."
         ),
         detect=_detect_cb_indexer_tools_renamed,
         apply=_apply_cb_indexer_tools_renamed,

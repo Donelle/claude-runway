@@ -2616,7 +2616,11 @@ class CbIndexerToolsRenamed(unittest.TestCase):
         self.assertEqual(json.loads(settings_path.read_text(encoding="utf-8"))["permissions"], settings["permissions"])
 
     def test_the_note_tells_an_already_upgraded_install_to_rename_by_hand(self):
-        self.assertIn("cb_indexer_find_repo/cb_indexer_store_repo by hand", _migration(self._ID).note)
+        note = _migration(self._ID).note
+        self.assertIn("cb_indexer_find_repo/cb_indexer_store_repo by hand", note)
+        # The indexer is found by its script, so the advice names no fixed key.
+        self.assertIn("mcp__<indexer key>__", note)
+        self.assertNotIn("mcp__codebase-indexer__", note)
 
 
 class CbIndexerClaudeMdRenamed(unittest.TestCase):
