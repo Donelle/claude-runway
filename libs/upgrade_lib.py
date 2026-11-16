@@ -71,7 +71,7 @@ from setup_project_lib import (
     read_claude_md,
 )
 from setup_project_lib import _section_spans
-from setup_project_lib import OLD_COMPACT_SERVER_SCRIPTS, launcher_keys, strip_launcher_version
+from setup_project_lib import launcher_keys, old_compact_server_keys, strip_launcher_version
 
 
 @dataclass
@@ -481,7 +481,7 @@ COMPACT_SERVER_KEY = "compact"
 
 def _launches_third_party_qdrant_server(block: object) -> bool:
     """
-    True when a `qdrant` server block still starts the third-party
+    True when a server block (any key) still starts the third-party
     `mcp-server-qdrant` console script -- as its `command` (what `init` wrote:
     `<venv>/bin/mcp-server-qdrant`, `.exe` on Windows) or, for a hand-edited
     launcher such as `uvx`/`pipx run`, as one of its `args`, with or without a
@@ -504,9 +504,11 @@ def _launches_third_party_qdrant_server(block: object) -> bool:
 
 def _third_party_qdrant_keys(mcp_json: dict) -> "list[str]":
     """Keys of the blocks that still start the third-party console script,
-    whatever the user named them (found by what they launch, not by key)."""
+    whatever the user named them (found by what they launch, not by key). Empty
+    once there is a `compact` block: a third-party server next to it is the
+    user's own, not this toolkit's old one (see `old_compact_server_keys`)."""
     servers = mcp_json.get("mcpServers")
-    if not isinstance(servers, dict):
+    if not isinstance(servers, dict) or isinstance(servers.get(COMPACT_SERVER_KEY), dict):
         return []
     return [key for key, block in servers.items() if _launches_third_party_qdrant_server(block)]
 
@@ -1193,9 +1195,6 @@ _RENAMED_INDEXER_TOOLS = {
 # The two tools that moved off the `qdrant` server.
 _MOVED_QDRANT_TOOLS = {"qdrant-find": "cb_indexer_find_repo", "qdrant-store": "cb_indexer_store_repo"}
 _INDEXER_SCRIPTS = ("ingest_mcp_server.py", "codebase_indexer_mcp_server.py")
-# The third-party console script counts too: `qdrant-server-replaced` swaps it for
-# qdrant_mcp_server.py, and rules written against it name the same tools.
-_QDRANT_SCRIPTS = OLD_COMPACT_SERVER_SCRIPTS
 
 
 def _launcher_keys(mcp_json: dict, script_names: "tuple[str, ...]") -> "list[str]":
@@ -1214,7 +1213,7 @@ def _tool_renames(mcp_json: dict) -> "tuple[dict, list[str]]":
     indexer block means there is nothing to rename to, so the map is empty.
     """
     indexer_keys = _launcher_keys(mcp_json, _INDEXER_SCRIPTS)
-    qdrant_keys = _launcher_keys(mcp_json, _QDRANT_SCRIPTS)
+    qdrant_keys = find_old_compact_server_keys(mcp_json)
     problems = []
     if len(indexer_keys) > 1:
         problems.append(
@@ -1239,7 +1238,7 @@ def _old_names_under_every_candidate_key(mcp_json: dict) -> "set[str]":
     names = set()
     for key in _launcher_keys(mcp_json, _INDEXER_SCRIPTS):
         names.update(f"mcp__{key}__{old}" for old in _RENAMED_INDEXER_TOOLS)
-    for key in _launcher_keys(mcp_json, _QDRANT_SCRIPTS):
+    for key in find_old_compact_server_keys(mcp_json):
         names.update(f"mcp__{key}__{old}" for old in _MOVED_QDRANT_TOOLS)
     return names
 
@@ -1365,11 +1364,13 @@ _PRE_RENAME_BLOCK_KEY = "qdrant"
 def find_old_compact_server_keys(mcp_json: dict) -> "list[str]":
     """
     Keys of every `.mcp.json` block that launches the pre-rename compact server
-    (`qdrant_mcp_server.py`, or the third-party `mcp-server-qdrant` it replaced),
-    whatever the user named the block. `/cr-setup` uses this to tell an install
-    that still needs `upgrade` from a current one.
+    (`qdrant_mcp_server.py`, or, while there is no `compact` block yet, the
+    third-party `mcp-server-qdrant` it replaced), whatever the user named the
+    block. Shared with `init` (`setup_project_lib.old_compact_server_keys`).
+    `/cr-setup` uses this to tell an install that still needs `upgrade` from a
+    current one.
     """
-    return _launcher_keys(mcp_json, _QDRANT_SCRIPTS)
+    return old_compact_server_keys(mcp_json)
 
 
 def _refuse_mixed_old_compact_blocks(mcp_json: dict) -> bool:
@@ -1562,16 +1563,7 @@ def _settings_with_compact_renamed(settings_json: dict, old_key: str) -> dict:
     permission rules. Every other alternative and rule is left exactly as it is."""
     new = copy.deepcopy(settings_json)
     names = {f"mcp__{old_key}__{tool}": f"mcp__{COMPACT_SERVER_KEY}__{tool}" for tool in _COMPACT_TOOL_NAMES}
-    rule_names = {
-        **names,
-        f"mcp__{old_key}": f"mcp__{COMPACT_SERVER_KEY}",
-        f"mcp__{old_key}__*": f"mcp__{COMPACT_SERVER_KEY}__*",
-        f"mcp__{old_key}__compact_*": f"mcp__{COMPACT_SERVER_KEY}__compact_*",
-    }
-    for list_name in _PERMISSION_LISTS:
-        rules = _permission_rules(new, list_name)
-        rewritten = [rule_names.get(r, r) if isinstance(r, str) else r for r in rules]
-        rules[:] = [r for i, r in enumerate(rewritten) if not (isinstance(r, str) and r in rewritten[:i])]
+    _rename_compact_permission_rules(new, old_key)
     old_alternative = f"mcp__{old_key}__(?:{'|'.join(_COMPACT_TOOL_NAMES)})$"
     for block in _compress_hook_matcher_blocks(new):
         matcher = block["matcher"].replace(old_alternative, COMPACT_TOOLS_MATCHER)
@@ -1579,11 +1571,33 @@ def _settings_with_compact_renamed(settings_json: dict, old_key: str) -> dict:
     return new
 
 
+def _rename_compact_permission_rules(settings: dict, old_key: str) -> None:
+    """Rewrites, in place, `settings`' `permissions.allow/deny/ask` rules on the
+    compact server from `old_key` to `compact`: `mcp__<old>`, `mcp__<old>__*`,
+    `mcp__<old>__compact_*` and each compact tool's full name. Every other rule
+    is left as it is; a rule that becomes a duplicate is dropped."""
+    names = {f"mcp__{old_key}__{tool}": f"mcp__{COMPACT_SERVER_KEY}__{tool}" for tool in _COMPACT_TOOL_NAMES}
+    rule_names = {
+        **names,
+        f"mcp__{old_key}": f"mcp__{COMPACT_SERVER_KEY}",
+        f"mcp__{old_key}__*": f"mcp__{COMPACT_SERVER_KEY}__*",
+        f"mcp__{old_key}__compact_*": f"mcp__{COMPACT_SERVER_KEY}__compact_*",
+    }
+    for list_name in _PERMISSION_LISTS:
+        rules = _permission_rules(settings, list_name)
+        rewritten = [rule_names.get(r, r) if isinstance(r, str) else r for r in rules]
+        rules[:] = [r for i, r in enumerate(rewritten) if not (isinstance(r, str) and r in rewritten[:i])]
+
+
 def _local_settings_with_compact_renamed(local_json: dict, old_key: str) -> dict:
     """A copy of `.claude/settings.local.json` with `old_key` replaced by
     `compact` in `enabledMcpjsonServers`/`disabledMcpjsonServers`, in place, so
-    Claude Code does not ask to approve the renamed server again."""
+    Claude Code does not ask to approve the renamed server again, and with its
+    `permissions.allow/deny/ask` rules on the compact server moved the same way
+    as in `.claude/settings.json` (Claude Code saves "don't ask again" approvals
+    here)."""
     new = copy.deepcopy(local_json)
+    _rename_compact_permission_rules(new, old_key)
     for list_name in _LOCAL_SETTINGS_LISTS:
         entries = new.get(list_name)
         if not isinstance(entries, list):
@@ -1846,8 +1860,8 @@ MIGRATIONS: "list[Migration]" = [
         kind="update",
         description=(
             "This project's .claude/settings.json compress hook matches the local-compress tools but not "
-            "mcp__qdrant__compact_store/compact_find/compact_prune, where the conversation-compact tools now "
-            "live, so their size-based compression stops after the qdrant server moves. Adds that "
+            "mcp__compact__compact_store/compact_find/compact_prune, where the conversation-compact tools now "
+            "live, so their size-based compression stops. Adds that "
             "alternative to the matcher right after mcp__local-compress__.*; every other part of the matcher, "
             "and every other hook, is left untouched. A matcher you wrote by hand (without "
             "mcp__local-compress__.*) is never edited."
@@ -2052,7 +2066,8 @@ REPO_MIGRATIONS: "list[RepoMigration]" = [
             "compress-hook matcher's mcp__<old>__(compact_store|compact_find|compact_prune) alternative and any "
             "permissions.allow/deny/ask rule on those tools, so compact results are still compressed and "
             "permission prompts do not come back. In .claude/settings.local.json it renames the server in "
-            "enabledMcpjsonServers/disabledMcpjsonServers, so Claude Code does not ask you to approve it again. "
+            "enabledMcpjsonServers/disabledMcpjsonServers, so Claude Code does not ask you to approve it again, "
+            "and moves the same permissions.allow/deny/ask rules (where Claude Code saves \"don't ask again\"). "
             "Every other matcher alternative (including ones you added), rule and entry is left as it is, and "
             "neither file is created."
         ),
@@ -2106,8 +2121,10 @@ def _unrecognised_qdrant_block_note(mcp_json: dict) -> str:
 def _has_compact_server(mcp_json: dict) -> bool:
     """True if `mcp_json` already has this toolkit's OWN base-install
     marker -- the `compact` server block, present in EVERY real `init` run
-    regardless of `--qdrant-only`/`--skip-hooks` -- or a block that launches the
-    server's old script (found by shape, whatever its key), which is an
+    regardless of `--qdrant-only`/`--skip-hooks` -- or a block that launches an
+    old compact server (`qdrant_mcp_server.py`, or the third-party
+    `mcp-server-qdrant`, version pin allowed, found by shape whatever its key),
+    which is an
     install `upgrade` renames to `compact`."""
     return COMPACT_SERVER_KEY in mcp_json.get("mcpServers", {}) or bool(find_old_compact_server_keys(mcp_json))
 

@@ -104,10 +104,11 @@ for anything else:
   `local-compress`) → **init path** (steps 3-7, unchanged). Do not offer upgrade: it
   refuses a project without a compact server.
 - An old block found and no `compact` block → this install needs `upgrade` (it renames
-  the block and the settings entries that name it). Tell the user that, then use
-  `AskUserQuestion` (header "Path") with "Upgrade (Recommended)" and "Re-run init" as
-  below. Say that "Re-run init" replaces the old block with `compact` but does not move the
-  permission rules or `enabledMcpjsonServers` entries that name its key (upgrade does). Do not read this block's `env` for the init-path values: take the upgrade.
+  the block and the settings entries that name it, and keeps every value it holds). Take
+  the **upgrade path** (step 8) without offering "Re-run init": every value the init path
+  preserves is read from `compact.env`, which this install does not have yet, so a re-run
+  would reset them. Tell the user that, and that `init` can be re-run afterwards if wanted. Do not read this
+  block's `env` for anything.
 - `compact` server present → use `AskUserQuestion` (header
   "Path"): "Upgrade (Recommended)" — apply only pending config migrations (and refresh
   already-installed skills that went stale), nothing else

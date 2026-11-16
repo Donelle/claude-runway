@@ -2922,6 +2922,24 @@ class CompactServerSettingsRenamed(unittest.TestCase):
         self.assertIn("'python -m mcp_server_qdrant.main'", out.getvalue())
         self.assertNotIn("s3cret", out.getvalue())
 
+    def test_permission_rules_in_the_local_settings_follow(self):
+        self._write_mcp()
+        data = {"enabledMcpjsonServers": ["qdrant"],
+                "permissions": {"allow": ["mcp__qdrant__compact_prune", "Bash(ls:*)"], "deny": ["mcp__qdrant__*"]}}
+        (self.repo / ".claude" / "settings.local.json").write_text(json.dumps(data), encoding="utf-8")
+        self._upgrade(auto_yes=True)
+        local = self._read("settings.local.json")
+        self.assertEqual(local["enabledMcpjsonServers"], ["compact"])
+        self.assertEqual(local["permissions"], {"allow": ["mcp__compact__compact_prune", "Bash(ls:*)"],
+                                                "deny": ["mcp__compact__*"]})
+
+    def test_a_third_party_qdrant_server_next_to_compact_is_not_pending(self):
+        mcp = {"mcpServers": {"compact": {"command": "py", "args": ["/r/mcpservers/compact_mcp_server.py"]},
+                              "my-notes": {"command": "uvx", "args": ["mcp-server-qdrant"]}}}
+        pending = {m.id for m in MIGRATIONS if m.detect(mcp, {})}
+        self.assertNotIn("qdrant-server-replaced", pending)
+        self.assertNotIn("compact-server-dead-env-dropped", pending)
+
     def test_ambiguous_old_blocks_leave_the_settings_alone(self):
         block = {"command": "py", "args": ["/r/mcpservers/qdrant_mcp_server.py"]}
         (self.repo / ".mcp.json").write_text(json.dumps({"mcpServers": {"one": block, "two": block}}), encoding="utf-8")

@@ -2,7 +2,7 @@
 Shared, dependency-free logic behind `tools/doctor.py` -- a validator that
 diffs each dual-config `CLAUDE_RUNWAY_*` env var (the ones
 docs/environment-variables.md's table marks "both") between a target repo's
-`.mcp.json` `local-compress` env block (and the `qdrant` block, which holds
+`.mcp.json` `local-compress` env block (and the `compact` block, which holds
 the LM Studio values `compact_store` compresses with, and the `analytics`
 block, which holds the savings DB override) and the live shell
 environment, flagging any mismatch instead of relying on a human to notice silently
@@ -323,7 +323,7 @@ class DoctorResult:
     mcp_json_path: Path
     local_compress_configured: bool
     mismatches: list = field(default_factory=list)
-    # True when the `qdrant` block carries at least one dual-config var (its
+    # True when the `compact` block carries at least one dual-config var (its
     # LM Studio values), so there was something to check there even with no
     # local-compress server (a `--qdrant-only` setup).
     qdrant_checked: bool = False

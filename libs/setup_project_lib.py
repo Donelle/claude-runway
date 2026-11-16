@@ -289,7 +289,7 @@ def build_mcp_servers(
 ) -> dict:
     """
     Returns a fresh `mcpServers` dict (deep-copied from `template`, never
-    mutated in place) with every placeholder in the qdrant/codebase-indexer/
+    mutated in place) with every placeholder in the compact/codebase-indexer/
     memory-bank/local-compress blocks resolved to a real value. Paths are emitted as
     forward-slash (`Path.as_posix()`) to match the templates' own style,
     which uses forward slashes even in its Windows-facing example paths.
@@ -379,7 +379,7 @@ def build_mcp_servers(
     drops it.
 
     `qdrant_api_key` is applied to the Qdrant-talking servers'
-    `QDRANT_API_KEY` (`qdrant`, `codebase-indexer` and `memory-bank`, plus
+    `QDRANT_API_KEY` (`compact`, `codebase-indexer` and `memory-bank`, plus
     `codebase-reviewer` when that opt-in block is written, which all read the
     exact same variable so a single project's `.mcp.json` keeps
     every one of them aligned). Found in review: since this script
@@ -390,7 +390,7 @@ def build_mcp_servers(
     name`/etc. -- none of this CLI's other options are "sticky" either) is
     what keeps it from reverting.
 
-    `compact_embedding_model` is the `qdrant` block's `COMPACT_EMBEDDING_MODEL`
+    `compact_embedding_model` is the `compact` block's `COMPACT_EMBEDDING_MODEL`
     (it was the `local-compress` block's `EMBEDDING_MODEL` before the compact
     tools moved), deliberately separate from `embedding_model`: compacts are
     stored under a model-named vector, so changing it orphans an existing
@@ -415,7 +415,7 @@ def build_mcp_servers(
     non-blank. The block's Qdrant settings follow `qdrant_url`/`qdrant_api_key`
     like every other server's.
 
-    The `qdrant` block also carries `lmstudio_url`/`lmstudio_model`, which
+    The `compact` block also carries `lmstudio_url`/`lmstudio_model`, which
     only `compact_store` uses (to compress a summary before storing it), so a
     `--qdrant-only` setup (`include_compress=False`) still writes them: the
     server stores uncompressed when LM Studio is not there.
@@ -814,16 +814,19 @@ def _non_blank(env: "Optional[dict]", key: str) -> str:
 def resolve_compact_embedding_model(existing_mcp: dict, project_model: str) -> str:
     """
     Which `COMPACT_EMBEDDING_MODEL` a (re-)run of `init`, and the migration that
-    moves the compact tools onto the `qdrant` server, writes. Unlike the
+    moves the compact tools onto the `compact` server, writes. Unlike the
     code-index model there is no explicit-override flag: changing it only ever
     orphans stored compacts, so a re-run must never do that on its own:
-      1. an existing `qdrant` block's own non-blank `COMPACT_EMBEDDING_MODEL`
-         is kept (the compact tools already live there);
+      1. the compact server block's own non-blank `COMPACT_EMBEDDING_MODEL` is
+         kept (the compact tools already live there). That block is the
+         `compact` block or, on an install from before the rename, the one old
+         compact-server block found by what it launches (`init` replaces that
+         block, so its value must be read here or it is lost);
       2. otherwise, an existing `local-compress` block is where a pre-move
          install's compacts were configured: its non-blank `EMBEDDING_MODEL`
          is kept;
-      3. otherwise, ANY existing toolkit config (a `qdrant` or `local-compress`
-         block) is pinned to the legacy model. A missing `local-compress`
+      3. otherwise, ANY existing toolkit config (a compact server block as in
+         step 1, or a `local-compress` block) is pinned to the legacy model. A missing `local-compress`
          block does not prove no compact was ever stored: a full setup later
          re-run with `--qdrant-only` deletes that block but leaves its
          compacts in Qdrant, and every compact stored before this setting
@@ -834,16 +837,30 @@ def resolve_compact_embedding_model(existing_mcp: dict, project_model: str) -> s
       4. only a config with neither block (genuinely empty, or holding just
          unrelated servers) uses the project model.
     """
-    qdrant_value = _non_blank(_server_env(existing_mcp, "compact"), "COMPACT_EMBEDDING_MODEL")
-    if qdrant_value:
-        return qdrant_value
+    compact_key = _compact_server_block_key(existing_mcp)
+    compact_value = _non_blank(_server_env(existing_mcp, compact_key), "COMPACT_EMBEDDING_MODEL") if compact_key else ""
+    if compact_value:
+        return compact_value
     compress_value = _non_blank(_server_env(existing_mcp, "local-compress"), "EMBEDDING_MODEL")
     if compress_value:
         return compress_value
     servers = existing_mcp.get("mcpServers") if isinstance(existing_mcp, dict) else None
-    if isinstance(servers, dict) and any(isinstance(servers.get(name), dict) for name in ("compact", "local-compress")):
+    if compact_key or (isinstance(servers, dict) and isinstance(servers.get("local-compress"), dict)):
         return LEGACY_COMPACT_EMBEDDING_MODEL
     return project_model
+
+
+def _compact_server_block_key(existing_mcp: dict) -> str:
+    """The key of this project's compact server block: `compact`, else the one
+    old compact-server block found by what it launches. "" when there is
+    neither, or more than one old block (nothing to pick from safely)."""
+    servers = existing_mcp.get("mcpServers") if isinstance(existing_mcp, dict) else None
+    if not isinstance(servers, dict):
+        return ""
+    if isinstance(servers.get("compact"), dict):
+        return "compact"
+    old = old_compact_server_keys(existing_mcp)
+    return old[0] if len(old) == 1 else ""
 
 
 # (event, script filename) for every hook this toolkit's templates define,
@@ -1034,10 +1051,27 @@ def launcher_keys(mcp_json: dict, script_names: "tuple[str, ...]") -> "list[str]
     return found
 
 
+_OWN_OLD_COMPACT_SCRIPTS = ("qdrant_mcp_server.py",)
+_THIRD_PARTY_QDRANT_SCRIPTS = ("mcp-server-qdrant", "mcp-server-qdrant.exe")
+
+
 def old_compact_server_keys(mcp_json: dict) -> "list[str]":
-    """Keys of every block that launches an old compact server (see
-    `OLD_COMPACT_SERVER_SCRIPTS`), whatever the user named it."""
-    return launcher_keys(mcp_json, OLD_COMPACT_SERVER_SCRIPTS)
+    """
+    Keys of every block that launches an old compact server, whatever the user
+    named it, in `.mcp.json` order. A block launching this toolkit's own
+    `qdrant_mcp_server.py` always counts: that script was only ever ours. A
+    block launching the third-party `mcp-server-qdrant` counts only while there
+    is no `compact` block yet: that is the pre-upgrade install it stands for,
+    while next to a `compact` block it is a general-purpose Qdrant server of
+    the user's own, which `init` and `upgrade` leave alone.
+    """
+    servers = mcp_json.get("mcpServers") if isinstance(mcp_json, dict) else None
+    if not isinstance(servers, dict):
+        return []
+    found = set(launcher_keys(mcp_json, _OWN_OLD_COMPACT_SCRIPTS))
+    if not isinstance(servers.get("compact"), dict):
+        found.update(launcher_keys(mcp_json, _THIRD_PARTY_QDRANT_SCRIPTS))
+    return [key for key in servers if key in found]
 
 
 def merge_mcp_json(existing: dict, generated_servers: dict, *, owned_keys: tuple = _OWNED_MCP_SERVER_KEYS) -> dict:
@@ -2080,7 +2114,8 @@ def run_setup(
     # replaced by the `compact` block written here, so it is dropped: kept, it
     # would point at a script that no longer exists, next to the new block, and
     # `upgrade` could never finish renaming it. Settings entries that name its
-    # key are not moved by `init` (that is `upgrade`'s job), so say so.
+    # key are not moved by `init`, and once the block is gone `upgrade` cannot
+    # find that key either, so say so.
     dropped_old_compact_keys = [k for k in old_compact_server_keys(existing_mcp) if k not in generated_servers]
     if dropped_old_compact_keys:
         existing_mcp = copy.deepcopy(existing_mcp)
@@ -2103,10 +2138,12 @@ def run_setup(
     if dropped_old_compact_keys:
         names = ", ".join(f"'{k}'" for k in dropped_old_compact_keys)
         changes.append(
-            f"WARNING: removed the old compact server block {names} from .mcp.json: the 'compact' block replaces it. "
-            "Permission rules in .claude/settings.json and enabledMcpjsonServers/disabledMcpjsonServers "
-            f"entries in .claude/settings.local.json that name {names} are not moved by init; change them to "
-            "'compact' by hand (`upgrade`, run instead of init on an old install, moves them for you)."
+            f"WARNING: the old compact server block {names} in .mcp.json is replaced by the 'compact' block. "
+            f"init does not rename entries that name {names}: permission rules in .claude/settings.json and "
+            ".claude/settings.local.json, enabledMcpjsonServers/disabledMcpjsonServers in "
+            ".claude/settings.local.json, and (with --skip-hooks) the compress-hook matcher. Change them to "
+            "'compact' by hand: `upgrade` cannot find them once the old block is gone. (On an old install, "
+            "running `upgrade` instead of init moves them for you.)"
         )
     if reviewer_file_unset:
         changes.append(f"WARNING: {REVIEWERS_FILE_REQUIRED_WARNING}")

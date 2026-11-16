@@ -610,17 +610,36 @@ class RunSetupEndToEnd(unittest.TestCase):
                 self.assertNotIn(key, servers)
                 self.assertIn("compact", servers)
                 self.assertEqual(servers["theirs"], theirs)
-                notes = [c for c in result.changes if "WARNING: removed the old compact server block" in c]
+                notes = [c for c in result.changes if "WARNING: the old compact server block" in c]
                 self.assertEqual(len(notes), 1)
                 self.assertIn(f"'{key}'", notes[0])
                 self.assertIn("enabledMcpjsonServers", notes[0])
+
+    def test_a_rerun_keeps_the_old_blocks_compact_embedding_model(self):
+        old = {"command": "py", "args": ["/r/mcpservers/qdrant_mcp_server.py"],
+               "env": {"COMPACT_EMBEDDING_MODEL": "sentence-transformers/all-MiniLM-L6-v2"}}
+        (self.target_repo / ".mcp.json").write_text(json.dumps({"mcpServers": {"qdrant": old, "local-compress": {"env": {}}}}))
+        result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
+        self.assertEqual(
+            result.mcp_json["mcpServers"]["compact"]["env"]["COMPACT_EMBEDDING_MODEL"],
+            "sentence-transformers/all-MiniLM-L6-v2",
+        )
+
+    def test_a_third_party_qdrant_server_next_to_compact_is_the_users_own_and_kept(self):
+        first = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user")).mcp_json
+        mine = {"command": "uvx", "args": ["mcp-server-qdrant"], "env": {}}
+        first["mcpServers"]["my-notes"] = mine
+        (self.target_repo / ".mcp.json").write_text(json.dumps(first))
+        result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
+        self.assertEqual(result.mcp_json["mcpServers"]["my-notes"], mine)
+        self.assertFalse(any("old compact server block" in c for c in result.changes))
 
     def test_a_rerun_keeps_a_users_own_block_called_qdrant(self):
         own = {"command": "node", "args": ["my-qdrant-tool.js"]}
         (self.target_repo / ".mcp.json").write_text(json.dumps({"mcpServers": {"qdrant": own}}))
         result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
         self.assertEqual(result.mcp_json["mcpServers"]["qdrant"], own)
-        self.assertFalse(any("WARNING: removed the old compact server block" in c for c in result.changes))
+        self.assertFalse(any("WARNING: the old compact server block" in c for c in result.changes))
 
     def test_collection_name_defaults_from_target_dir_name(self):
         result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))

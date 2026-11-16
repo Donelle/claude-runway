@@ -241,7 +241,7 @@ def _redact_secrets(mcp_servers: dict) -> dict:
 
 _QDRANT_MCP_JSON_COMMIT_CAUTION = (
     "  - WARNING: --qdrant-api-key was set, so .mcp.json now contains that credential in PLAINTEXT "
-    "across the env blocks of the Qdrant-talking servers (qdrant/codebase-indexer/memory-bank, and "
+    "across the env blocks of the Qdrant-talking servers (compact/codebase-indexer/memory-bank, and "
     "codebase-reviewer when present). Do NOT commit .mcp.json as-is "
     "if this repo is or will be shared -- either keep .mcp.json out of version control for this "
     "project (add it to .gitignore) or manage the key through your own untracked mechanism instead "
@@ -1115,7 +1115,7 @@ def parse_args() -> argparse.Namespace:
         "--qdrant-api-key",
         default="",
         help="API key for an authenticated remote Qdrant instance; leave blank for unauthenticated local "
-        "Qdrant. Applied to the qdrant, codebase-indexer and memory-bank servers' QDRANT_API_KEY -- not 'sticky': pass it on every run, "
+        "Qdrant. Applied to the compact, codebase-indexer and memory-bank servers' QDRANT_API_KEY -- not 'sticky': pass it on every run, "
         "the same as --qdrant-url/--collection-name, or a rerun without it resets these servers back "
         "to unauthenticated. WARNING: writes the key in PLAINTEXT into .mcp.json -- do not commit that "
         "file as-is if this repo is shared; this script will print a reminder instead of the usual "
@@ -1124,7 +1124,7 @@ def parse_args() -> argparse.Namespace:
     init.add_argument(
         "--embedding-model",
         default="",
-        help="EMBEDDING_MODEL written into the qdrant/codebase-indexer blocks (NOT memory-bank, which has "
+        help="EMBEDDING_MODEL written into the codebase-indexer block (NOT memory-bank, which has "
         "--memory-bank-embedding-model). Blank (default) PRESERVES the model already in the target's "
         "existing .mcp.json, falling back to the template "
         "default for a new project. Passing a value that differs from the existing one prints a warning: "
@@ -1147,7 +1147,7 @@ def parse_args() -> argparse.Namespace:
         "--lmstudio-model",
         default="",
         help="Exact model id loaded in LM Studio; leave blank to auto-detect (only works if exactly one model is loaded). "
-        "Written to the local-compress block and to the qdrant block (compact_store compresses with it)",
+        "Written to the local-compress block and to the compact block (compact_store compresses with it)",
     )
     init.add_argument(
         "--track-savings",

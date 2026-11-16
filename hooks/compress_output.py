@@ -343,10 +343,8 @@ MCP_SAVINGS_TOOL_PREFIX = "mcp__local-compress__"
 # first pass was told to preserve (this is /cr-compact's own
 # real usage, which sets preserve_identifiers=preserve_sections=True).
 _SELF_COMPRESSING_MCP_TOOLS = {"compress_file", "compress_command_output", "fetch_url", "compress_text"}
-# The qdrant server's tools. Only the three compact tools are ever compressed
-# here: `cb_indexer_find_repo` and `cb_indexer_store_repo` are deliberately left alone (their
-# results are code locations and stored notes Claude acts on directly, and the
-# matcher does not list them), so any other tool under this prefix exits
+# The compact server's tools. It serves only these three; any other tool name
+# under this prefix (only reachable through a hand-widened matcher) exits
 # untouched.
 MCP_COMPACT_TOOL_PREFIX = "mcp__compact__"
 _QDRANT_COMPACT_MCP_TOOLS = {"compact_store", "compact_find", "compact_prune"}
@@ -358,7 +356,7 @@ _QDRANT_COMPACT_MCP_TOOLS = {"compact_store", "compact_find", "compact_prune"}
 # passes THRESHOLD could silently drop or alter a specific number. So nothing
 # under this prefix is ever compressed, and the matcher does not list it; the
 # check in main() keeps that true even if a hand-edited matcher were widened
-# to `mcp__analytics__.*`. (The qdrant server's `compact_prune`, a list of
+# to `mcp__analytics__.*`. (The compact server's `compact_prune`, a list of
 # pruned compact ids, is the same class and is handled by its own branch.)
 MCP_ANALYTICS_TOOL_PREFIX = "mcp__analytics__"
 # Below this length, a string is assumed to be metadata (a URL, a file
@@ -1218,13 +1216,12 @@ def _dispatch(payload):
     if tool_name and tool_name.startswith(MCP_ANALYTICS_TOOL_PREFIX):
         sys.exit(0)
 
-    # The compact tools live on the qdrant server (they used to be on
+    # The compact tools live on the compact server (they used to be on
     # local-compress). They never compress anything themselves and carry no
     # savings envelope, so they take the same size-based path as any other
-    # matched tool, with the two exemptions below. Every OTHER tool on this
-    # server (`cb_indexer_find_repo`, `cb_indexer_store_repo`) is never compressed, and the
-    # matcher does not list them; this check keeps that true even if a
-    # hand-edited matcher were widened to `mcp__compact__.*`.
+    # matched tool, with the two exemptions below. Any other tool name under
+    # this prefix is never compressed, even if a hand-edited matcher were
+    # widened to `mcp__compact__.*`.
     # (compact_prune, an exact list of ids, is the same verbatim-report class
     # as the analytics tools above.)
     if tool_name and tool_name.startswith(MCP_COMPACT_TOOL_PREFIX):
