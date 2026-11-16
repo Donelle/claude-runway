@@ -2547,6 +2547,77 @@ class CbIndexerToolsRenamed(unittest.TestCase):
             self.assertNotIn(self._ID, second)
             self.assertEqual(settings_path.read_text(encoding="utf-8"), written)
 
+    # --- after qdrant-server-replaced in the same run (a third-party install) ---
+
+    def _third_party_repo(self, settings, *, extra_old_block=False):
+        """A temp repo whose `qdrant` block still launches the third-party
+        server, so qdrant-server-replaced turns it into `compact` before this
+        migration runs. Returns (repo, settings path)."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        repo = Path(tmp.name)
+        servers = {
+            "qdrant": {"command": "/old/venv/bin/mcp-server-qdrant", "env": {}},
+            "codebase-indexer": {"command": "py", "args": ["/r/mcpservers/codebase_indexer_mcp_server.py"], "env": {}},
+            "memory-bank": {"command": "py", "env": {}},
+        }
+        if extra_old_block:
+            servers["q2"] = {"command": "py", "args": ["/r/mcpservers/qdrant_mcp_server.py"], "env": {}}
+        (repo / ".mcp.json").write_text(json.dumps({"mcpServers": servers}), encoding="utf-8")
+        (repo / ".claude").mkdir()
+        settings_path = repo / ".claude" / "settings.json"
+        settings_path.write_text(json.dumps(settings), encoding="utf-8")
+        return repo, settings_path
+
+    def _upgrade(self, repo):
+        with redirect_stdout(io.StringIO()):
+            return run_upgrade(repo, REPO_ROOT, _VENV_PYTHON, auto_yes=True)
+
+    def test_moved_tool_rules_are_renamed_after_the_block_was_replaced_in_the_same_run(self):
+        repo, settings_path = self._third_party_repo(
+            {
+                "permissions": {
+                    "allow": ["mcp__qdrant__qdrant-find", "mcp__codebase-indexer__sync_repo"],
+                    "deny": ["mcp__qdrant__qdrant-store"],
+                    "ask": ["mcp__qdrant__qdrant-store"],
+                }
+            }
+        )
+        applied = self._upgrade(repo)
+        self.assertLess(applied.index("qdrant-server-replaced"), applied.index(self._ID))
+        permissions = json.loads(settings_path.read_text(encoding="utf-8"))["permissions"]
+        self.assertEqual(
+            permissions["allow"],
+            ["mcp__codebase-indexer__cb_indexer_find_repo", "mcp__codebase-indexer__cb_indexer_sync_repo"],
+        )
+        # A deny rule must keep denying the tool it meant, now under its new name.
+        self.assertEqual(permissions["deny"], ["mcp__codebase-indexer__cb_indexer_store_repo"])
+        self.assertEqual(permissions["ask"], ["mcp__codebase-indexer__cb_indexer_store_repo"])
+
+        written = settings_path.read_bytes()
+        self.assertNotIn(self._ID, self._upgrade(repo))
+        self.assertEqual(settings_path.read_bytes(), written)
+
+    def test_moved_tool_rules_alone_are_renamed_and_reported_applied(self):
+        # Nothing else for this migration to change: it used to change nothing,
+        # stay out of the applied list and then disappear from the pending one.
+        repo, settings_path = self._third_party_repo({"permissions": {"allow": ["mcp__qdrant__qdrant-find"]}})
+        self.assertIn(self._ID, self._upgrade(repo))
+        self.assertEqual(
+            json.loads(settings_path.read_text(encoding="utf-8"))["permissions"]["allow"],
+            ["mcp__codebase-indexer__cb_indexer_find_repo"],
+        )
+
+    def test_an_ambiguous_install_still_changes_nothing(self):
+        settings = {"permissions": {"allow": ["mcp__qdrant__qdrant-find", "mcp__codebase-indexer__sync_repo"]}}
+        repo, settings_path = self._third_party_repo(settings, extra_old_block=True)
+        self.assertNotIn(self._ID, self._upgrade(repo))
+        # Other migrations add their hooks to the same file; the rules are what matter here.
+        self.assertEqual(json.loads(settings_path.read_text(encoding="utf-8"))["permissions"], settings["permissions"])
+
+    def test_the_note_tells_an_already_upgraded_install_to_rename_by_hand(self):
+        self.assertIn("cb_indexer_find_repo/cb_indexer_store_repo by hand", _migration(self._ID).note)
+
 
 class CbIndexerClaudeMdRenamed(unittest.TestCase):
     """The CLAUDE.md half: the template-written Vector memory section is

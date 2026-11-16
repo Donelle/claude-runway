@@ -1210,15 +1210,28 @@ def _launcher_keys(mcp_json: dict, script_names: "tuple[str, ...]") -> "list[str
     return launcher_keys(mcp_json, script_names)
 
 
-def _tool_renames(mcp_json: dict) -> "tuple[dict, list[str]]":
+def _tool_renames(mcp_json: dict, ctx: "Optional[MigrationContext]" = None) -> "tuple[dict, list[str]]":
     """
     `({old full name: new full name}, problems)`. `problems` is non-empty when
     either launcher matches more than one block: which block owns a rule is then
     a guess, so nothing is renamed and the caller reports it instead. A missing
     indexer block means there is nothing to rename to, so the map is empty.
+
+    The old qdrant block's key comes from its shape when it is still there,
+    else from `ctx.compact_old_key`. That fallback is what an apply needs on a
+    third-party install: `qdrant-server-replaced` runs earlier in the same
+    `upgrade` and has already turned the block into `compact`, so no block of
+    the old shape is left to read the key from, and without it the
+    `qdrant-find`/`qdrant-store` rules would stay on a server that no longer
+    has those tools. `run_upgrade` reads that key before anything is applied,
+    and only when exactly one old block existed, so the ambiguity rule above
+    still holds. `detect` passes no `ctx`: it runs before anything is applied,
+    when the block is still found by shape.
     """
     indexer_keys = _launcher_keys(mcp_json, _INDEXER_SCRIPTS)
     qdrant_keys = find_old_compact_server_keys(mcp_json)
+    if not qdrant_keys and ctx is not None and ctx.compact_old_key:
+        qdrant_keys = [ctx.compact_old_key]
     problems = []
     if len(indexer_keys) > 1:
         problems.append(
@@ -1315,7 +1328,7 @@ def _apply_cb_indexer_tools_renamed(
     more than one block it says why and changes nothing, so `run_upgrade`
     reports the migration as still pending.
     """
-    renames, problems = _tool_renames(mcp_json)
+    renames, problems = _tool_renames(mcp_json, ctx)
     if problems:
         print(
             "      Not applied: " + "; ".join(problems) + ". Rename the old tool names in "
@@ -2074,7 +2087,11 @@ MIGRATIONS: "list[Migration]" = [
             "Restart Claude Code to load the renamed tools. Not touched, so update them by hand if they "
             "name an old tool: rules in your user-level ~/.claude/settings.json, rules in "
             ".claude/settings.local.json, and any rule of your own on a server this toolkit does not launch. "
-            "The new tools are deliberately not added to the compress hook, as qdrant-find/qdrant-store were not."
+            "The new tools are deliberately not added to the compress hook, as qdrant-find/qdrant-store were not. "
+            "If an earlier upgrade already replaced the mcp-server-qdrant block, rules still naming "
+            "mcp__<old key>__qdrant-find/qdrant-store are left as they are (the old key can no longer be "
+            "told apart from a server of your own): rename them to "
+            "mcp__codebase-indexer__cb_indexer_find_repo/cb_indexer_store_repo by hand."
         ),
         detect=_detect_cb_indexer_tools_renamed,
         apply=_apply_cb_indexer_tools_renamed,
