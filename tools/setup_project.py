@@ -241,7 +241,7 @@ def _redact_secrets(mcp_servers: dict) -> dict:
 
 _QDRANT_MCP_JSON_COMMIT_CAUTION = (
     "  - WARNING: --qdrant-api-key was set, so .mcp.json now contains that credential in PLAINTEXT "
-    "across the env blocks of the Qdrant-talking servers (qdrant/codebase-indexer/memory-bank, and "
+    "across the env blocks of the Qdrant-talking servers (compact/codebase-indexer/memory-bank, and "
     "codebase-reviewer when present). Do NOT commit .mcp.json as-is "
     "if this repo is or will be shared -- either keep .mcp.json out of version control for this "
     "project (add it to .gitignore) or manage the key through your own untracked mechanism instead "
@@ -590,7 +590,7 @@ def cmd_init(args: argparse.Namespace) -> None:
     # Quoted per-platform via _quote_command (see its docstring) so the
     # printed command is directly copy-pasteable even if target_repo (or
     # any option value) contains a space.
-    resolved_collection_name = result.mcp_json["mcpServers"]["qdrant"]["env"]["COLLECTION_NAME"]
+    resolved_collection_name = result.mcp_json["mcpServers"]["codebase-indexer"]["env"]["COLLECTION_NAME"]
     # A pip/pipx/uvx install (venv_python_override set, see above) puts
     # claude-runway-ingest on PATH -- no "python /path/to/script.py" needed,
     # and no local clone whose path this reminder could even print. The
@@ -614,7 +614,7 @@ def cmd_init(args: argparse.Namespace) -> None:
         # passed (the resolved value from what was generated), not only when
         # custom, so the reminder never depends on the two defaults agreeing.
         "--embedding-model",
-        result.generated_mcp_servers["qdrant"]["env"]["EMBEDDING_MODEL"],
+        result.generated_mcp_servers["codebase-indexer"]["env"]["EMBEDDING_MODEL"],
     ]
     if args.include_extensions:
         index_argv += ["--include-ext", args.include_extensions]
@@ -1042,7 +1042,7 @@ def cmd_upgrade(args: argparse.Namespace) -> None:
         sys.exit(1)
     if not configured:
         print(
-            f"error: {target_repo} has no existing toolkit configuration (.mcp.json with a 'qdrant' "
+            f"error: {target_repo} has no existing toolkit configuration (.mcp.json with a 'compact' "
             "server) -- `upgrade` only applies migrations to an ALREADY-configured project. Run "
             "`init` first, then `upgrade` to pick up anything released since.",
             file=sys.stderr,
@@ -1115,7 +1115,7 @@ def parse_args() -> argparse.Namespace:
         "--qdrant-api-key",
         default="",
         help="API key for an authenticated remote Qdrant instance; leave blank for unauthenticated local "
-        "Qdrant. Applied to the qdrant, codebase-indexer and memory-bank servers' QDRANT_API_KEY -- not 'sticky': pass it on every run, "
+        "Qdrant. Applied to the compact, codebase-indexer and memory-bank servers' QDRANT_API_KEY -- not 'sticky': pass it on every run, "
         "the same as --qdrant-url/--collection-name, or a rerun without it resets these servers back "
         "to unauthenticated. WARNING: writes the key in PLAINTEXT into .mcp.json -- do not commit that "
         "file as-is if this repo is shared; this script will print a reminder instead of the usual "
@@ -1124,7 +1124,7 @@ def parse_args() -> argparse.Namespace:
     init.add_argument(
         "--embedding-model",
         default="",
-        help="EMBEDDING_MODEL written into the qdrant/codebase-indexer blocks (NOT memory-bank, which has "
+        help="EMBEDDING_MODEL written into the codebase-indexer block (NOT memory-bank, which has "
         "--memory-bank-embedding-model). Blank (default) PRESERVES the model already in the target's "
         "existing .mcp.json, falling back to the template "
         "default for a new project. Passing a value that differs from the existing one prints a warning: "
@@ -1147,7 +1147,7 @@ def parse_args() -> argparse.Namespace:
         "--lmstudio-model",
         default="",
         help="Exact model id loaded in LM Studio; leave blank to auto-detect (only works if exactly one model is loaded). "
-        "Written to the local-compress block and to the qdrant block (compact_store compresses with it)",
+        "Written to the local-compress block and to the compact block (compact_store compresses with it)",
     )
     init.add_argument(
         "--track-savings",
@@ -1223,7 +1223,7 @@ def parse_args() -> argparse.Namespace:
         "--compact-collection",
         default="",
         help="Base Qdrant collection name the cr-compact/cr-resume skills store conversation compacts under "
-        "(qdrant_mcp_server.py's COMPACT_COLLECTION, in the qdrant block); leave blank to use the shared 'conversation-compacts' "
+        "(compact_mcp_server.py's COMPACT_COLLECTION, in the compact block); leave blank to use the shared 'conversation-compacts' "
         "default. NOT 'sticky' to a per-project value on its own (matches every other option here): omitting "
         "this flag ALWAYS resolves to 'conversation-compacts' regardless of what a project's .mcp.json currently "
         "has, so a re-run is only a no-op for a project that has never customized this (via /cr-setup's "
@@ -1231,7 +1231,7 @@ def parse_args() -> argparse.Namespace:
         "later raw-CLI re-run resets it back to 'conversation-compacts', orphaning that project's existing "
         "conversation-compact history from compact lookup. Repeat the same --compact-collection value on every "
         "re-run for such a project, or go through /cr-setup instead, which extracts and re-passes "
-        "the current value automatically. qdrant_mcp_server.py still appends its own "
+        "the current value automatically. compact_mcp_server.py still appends its own "
         "-<sanitized-project> suffix on top of whichever base this resolves to, at runtime "
         "(this base is a shared prefix; per-project isolation comes from payload filtering, not name uniqueness) "
         "-- so the final on-disk collection name is "

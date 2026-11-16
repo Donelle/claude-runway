@@ -29,7 +29,7 @@ Project-scoped to this repo (hardcodes `Donelle/claude-runway`, `.venv`-based te
 
 ## Steps (orchestrator — runs in the main conversation, kept deliberately thin)
 
-0. **Dogfood preflight — STOP before doing anything else if this checkout isn't configured for it.** `.claude/skills/` is committed to this repo, so this skill ships to every clone — but it grants full autonomous commit/push/merge authority with zero human approval gate, which should only run somewhere deliberately, verifiably set up for it, never assumed just because the skill file is present. This check has TWO parts, and the first one is not optional even though it seems obvious: **claude-runway is itself a toolkit meant to be installed into OTHER repos** ("one copy serves all projects," per its own README) — any OTHER project that installed it would have a `.mcp.json` with the exact same `qdrant`/`codebase-indexer` server names and a `.claude/settings.json` with the exact same `PostToolUse` hook shape, since those come from THIS project's own `templates/`. A file-shape check alone can't tell "a genuine claude-runway dogfood checkout" apart from "some unrelated repo that happens to have installed claude-runway's tools" — or a fork. Confirming the repo identity FIRST, before spawning anything, is what actually gates this — checking it only inside the subagent (too late: it would have already read files and run `cb_indexer_sync_repo` against whatever repo it's actually in by the time it notices) doesn't count:
+0. **Dogfood preflight — STOP before doing anything else if this checkout isn't configured for it.** `.claude/skills/` is committed to this repo, so this skill ships to every clone — but it grants full autonomous commit/push/merge authority with zero human approval gate, which should only run somewhere deliberately, verifiably set up for it, never assumed just because the skill file is present. This check has TWO parts, and the first one is not optional even though it seems obvious: **claude-runway is itself a toolkit meant to be installed into OTHER repos** ("one copy serves all projects," per its own README) — any OTHER project that installed it would have a `.mcp.json` with the exact same `compact`/`codebase-indexer` server names and a `.claude/settings.json` with the exact same `PostToolUse` hook shape, since those come from THIS project's own `templates/`. A file-shape check alone can't tell "a genuine claude-runway dogfood checkout" apart from "some unrelated repo that happens to have installed claude-runway's tools" — or a fork. Confirming the repo identity FIRST, before spawning anything, is what actually gates this — checking it only inside the subagent (too late: it would have already read files and run `cb_indexer_sync_repo` against whatever repo it's actually in by the time it notices) doesn't count:
    ```bash
    ORIGIN=$(git remote get-url origin 2>/dev/null)
    case "$ORIGIN" in
@@ -37,7 +37,7 @@ Project-scoped to this repo (hardcodes `Donelle/claude-runway`, `.venv`-based te
      *) REPO_OK=no ;;
    esac
    test -f .mcp.json && test -f .claude/settings.json \
-     && jq -e '.mcpServers | has("qdrant") and has("codebase-indexer")' .mcp.json >/dev/null 2>&1 \
+     && jq -e '.mcpServers | has("compact") and has("codebase-indexer")' .mcp.json >/dev/null 2>&1 \
      && jq -e '.hooks | has("PostToolUse")' .claude/settings.json >/dev/null 2>&1 \
      && [ "$REPO_OK" = "yes" ] \
      && echo "DOGFOODING: yes" || echo "DOGFOODING: no"

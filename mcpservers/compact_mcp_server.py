@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-The `qdrant` MCP server: the conversation-compact store.
+The `compact` MCP server: the conversation-compact store.
 
 Three tools:
 
@@ -120,13 +120,13 @@ COMPACT_EMBEDDING_MODEL = os.environ.get("COMPACT_EMBEDDING_MODEL") or LEGACY_CO
 # ("check the other repo's .mcp.json"), which is wrong for compacts.
 COMPACT_MODEL_MISMATCH_HINT = (
     "Compacts are stored under the embedding model that created their collection, so this "
-    "server's COMPACT_EMBEDDING_MODEL (qdrant env block in .mcp.json) must match it. Set "
+    "server's COMPACT_EMBEDDING_MODEL (compact env block in .mcp.json) must match it. Set "
     "COMPACT_EMBEDDING_MODEL back to the model the collection was created with (BAAI/bge-small-en "
     "for installs that predate this setting). Changing the model for an existing collection is "
     "not supported: it orphans the stored compacts."
 )
 
-mcp = MCPServer("qdrant")
+mcp = MCPServer("compact")
 
 def _normalize_project(project: str) -> str:
     """

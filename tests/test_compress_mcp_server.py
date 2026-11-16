@@ -64,7 +64,7 @@ class RegisteredToolSet(unittest.TestCase):
         # Pinned to the module's actual current tool set, not just a count, so a
         # rename/removal is caught too, not just a count drift. The three
         # conversation-compact tools live on the qdrant server now (see
-        # tests/test_qdrant_mcp_server.py) and the savings/metrics tools on the
+        # tests/test_compact_mcp_server.py) and the savings/metrics tools on the
         # analytics server (tests/test_analytics_mcp_server.py), and this server
         # must not serve either a second time under a different prefix.
         self.assertEqual(

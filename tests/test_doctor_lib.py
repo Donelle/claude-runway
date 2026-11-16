@@ -111,7 +111,7 @@ class LoadLocalCompressEnv(unittest.TestCase):
     def test_no_local_compress_server_returns_none(self):
         # e.g. a --qdrant-only setup: qdrant/codebase-indexer configured, no local-compress.
         self.mcp_json_path.write_text(
-            json.dumps({"mcpServers": {"qdrant": {"command": "x", "env": {}}}}), encoding="utf-8"
+            json.dumps({"mcpServers": {"compact": {"command": "x", "env": {}}}}), encoding="utf-8"
         )
         self.assertIsNone(doctor_lib.load_local_compress_env(self.mcp_json_path))
 
@@ -306,7 +306,7 @@ class RunDoctor(unittest.TestCase):
         self.home_dir = Path("/home/testuser")
 
     def _write_mcp_json(self, local_compress_env=None, analytics_env=None):
-        servers = {"qdrant": {"command": "x", "env": {}}}
+        servers = {"compact": {"command": "x", "env": {}}}
         if local_compress_env is not None:
             servers["local-compress"] = {"command": "x", "env": local_compress_env}
         if analytics_env is not None:
@@ -378,7 +378,7 @@ class SavingsDbIsCheckedInTheAnalyticsBlock(unittest.TestCase):
         self.abs_b = os.path.abspath("/custom/b.db")
 
     def _write(self, local_compress_env=None, analytics_env=None):
-        servers = {"qdrant": {"command": "x", "env": {}}}
+        servers = {"compact": {"command": "x", "env": {}}}
         if local_compress_env is not None:
             servers["local-compress"] = {"command": "x", "env": local_compress_env}
         if analytics_env is not None:
@@ -451,7 +451,7 @@ class QdrantBlockIsCheckedToo(unittest.TestCase):
         self.home_dir = Path("/home/testuser")
 
     def _write(self, qdrant_env, local_compress_env=None):
-        servers = {"qdrant": {"command": "x", "env": qdrant_env}}
+        servers = {"compact": {"command": "x", "env": qdrant_env}}
         if local_compress_env is not None:
             servers["local-compress"] = {"command": "x", "env": local_compress_env}
         (self.target_repo / ".mcp.json").write_text(json.dumps({"mcpServers": servers}), encoding="utf-8")
@@ -471,7 +471,7 @@ class QdrantBlockIsCheckedToo(unittest.TestCase):
         result = self._doctor({"CLAUDE_RUNWAY_LMSTUDIO_URL": "http://shell:1234/v1"})
         [mismatch] = result.mismatches
         self.assertEqual(mismatch.var, "CLAUDE_RUNWAY_LMSTUDIO_URL")
-        self.assertEqual(mismatch.server, "qdrant")
+        self.assertEqual(mismatch.server, "compact")
         self.assertEqual(mismatch.mcp_json_value, "http://block:1234/v1")
         self.assertEqual(mismatch.shell_value, "http://shell:1234/v1")
 
@@ -483,7 +483,7 @@ class QdrantBlockIsCheckedToo(unittest.TestCase):
         result = self._doctor({"CLAUDE_RUNWAY_LMSTUDIO_MODEL": "shell-model"})
         self.assertEqual(
             {(m.server, m.var) for m in result.mismatches},
-            {("qdrant", "CLAUDE_RUNWAY_LMSTUDIO_MODEL"), ("local-compress", "CLAUDE_RUNWAY_TRACK_SAVINGS")},
+            {("compact", "CLAUDE_RUNWAY_LMSTUDIO_MODEL"), ("local-compress", "CLAUDE_RUNWAY_TRACK_SAVINGS")},
         )
         self.assertTrue(result.local_compress_configured)
 
@@ -495,9 +495,9 @@ class QdrantBlockIsCheckedToo(unittest.TestCase):
         self.assertFalse(result.qdrant_checked)
 
     def test_a_malformed_qdrant_block_is_a_config_error(self):
-        (self.target_repo / ".mcp.json").write_text(json.dumps({"mcpServers": {"qdrant": None}}), encoding="utf-8")
+        (self.target_repo / ".mcp.json").write_text(json.dumps({"mcpServers": {"compact": None}}), encoding="utf-8")
         result = self._doctor({})
-        self.assertIn("qdrant", result.config_error or "")
+        self.assertIn("compact", result.config_error or "")
 
     def test_a_non_string_value_in_the_qdrant_env_is_a_config_error(self):
         self._write({"CLAUDE_RUNWAY_LMSTUDIO_URL": 5})
@@ -531,7 +531,7 @@ class LegacyCompressHook(unittest.TestCase):
         self.assertEqual(doctor_lib.find_legacy_compress_hook_events(self.repo), [])
 
     def test_run_doctor_reports_it_even_without_local_compress(self):
-        (self.repo / ".mcp.json").write_text(json.dumps({"mcpServers": {"qdrant": {}}}), encoding="utf-8")
+        (self.repo / ".mcp.json").write_text(json.dumps({"mcpServers": {"compact": {}}}), encoding="utf-8")
         self._settings({"hooks": {"PostToolUse": [{"hooks": [{"args": ["/t/hooks/compress_bash_output.py"]}]}]}})
         result = doctor_lib.run_doctor(self.repo, shell_env={}, home_dir=Path("/home/x"))
         self.assertFalse(result.local_compress_configured)

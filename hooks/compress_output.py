@@ -134,7 +134,7 @@ comments below):
   "hooks": {
     "PostToolUse": [
       {
-        "matcher": "Bash|Grep|WebFetch|Glob|WebSearch|mcp__local-compress__.*|mcp__qdrant__(?:compact_store|compact_find|compact_prune)$",
+        "matcher": "Bash|Grep|WebFetch|Glob|WebSearch|mcp__local-compress__.*|mcp__compact__(?:compact_store|compact_find|compact_prune)$",
         "hooks": [
           {
             "type": "command",
@@ -343,12 +343,10 @@ MCP_SAVINGS_TOOL_PREFIX = "mcp__local-compress__"
 # first pass was told to preserve (this is /cr-compact's own
 # real usage, which sets preserve_identifiers=preserve_sections=True).
 _SELF_COMPRESSING_MCP_TOOLS = {"compress_file", "compress_command_output", "fetch_url", "compress_text"}
-# The qdrant server's tools. Only the three compact tools are ever compressed
-# here: `cb_indexer_find_repo` and `cb_indexer_store_repo` are deliberately left alone (their
-# results are code locations and stored notes Claude acts on directly, and the
-# matcher does not list them), so any other tool under this prefix exits
+# The compact server's tools. It serves only these three; any other tool name
+# under this prefix (only reachable through a hand-widened matcher) exits
 # untouched.
-MCP_QDRANT_TOOL_PREFIX = "mcp__qdrant__"
+MCP_COMPACT_TOOL_PREFIX = "mcp__compact__"
 _QDRANT_COMPACT_MCP_TOOLS = {"compact_store", "compact_find", "compact_prune"}
 # The opt-in `analytics` server (savings_summary/savings_detail/savings_trend,
 # get_metrics, record_metric). Every tool there returns an exact numeric/
@@ -358,7 +356,7 @@ _QDRANT_COMPACT_MCP_TOOLS = {"compact_store", "compact_find", "compact_prune"}
 # passes THRESHOLD could silently drop or alter a specific number. So nothing
 # under this prefix is ever compressed, and the matcher does not list it; the
 # check in main() keeps that true even if a hand-edited matcher were widened
-# to `mcp__analytics__.*`. (The qdrant server's `compact_prune`, a list of
+# to `mcp__analytics__.*`. (The compact server's `compact_prune`, a list of
 # pruned compact ids, is the same class and is handled by its own branch.)
 MCP_ANALYTICS_TOOL_PREFIX = "mcp__analytics__"
 # Below this length, a string is assumed to be metadata (a URL, a file
@@ -1118,7 +1116,7 @@ def _finish_compression_outcome(outcome, tool_name, source, session_id, project,
     sys.exit(0)
 
 
-# Matches compact_find's own header verbatim (qdrant_mcp_server.py):
+# Matches compact_find's own header verbatim (compact_mcp_server.py):
 # f"Found {len(entries)} compact(s) for project '{project}':\n". Anchored to
 # the START of the leaf (^, no re.MULTILINE, so this only matches the
 # absolute beginning of the string) -- not just anchored to that exact
@@ -1218,17 +1216,16 @@ def _dispatch(payload):
     if tool_name and tool_name.startswith(MCP_ANALYTICS_TOOL_PREFIX):
         sys.exit(0)
 
-    # The compact tools live on the qdrant server (they used to be on
+    # The compact tools live on the compact server (they used to be on
     # local-compress). They never compress anything themselves and carry no
     # savings envelope, so they take the same size-based path as any other
-    # matched tool, with the two exemptions below. Every OTHER tool on this
-    # server (`cb_indexer_find_repo`, `cb_indexer_store_repo`) is never compressed, and the
-    # matcher does not list them; this check keeps that true even if a
-    # hand-edited matcher were widened to `mcp__qdrant__.*`.
+    # matched tool, with the two exemptions below. Any other tool name under
+    # this prefix is never compressed, even if a hand-edited matcher were
+    # widened to `mcp__compact__.*`.
     # (compact_prune, an exact list of ids, is the same verbatim-report class
     # as the analytics tools above.)
-    if tool_name and tool_name.startswith(MCP_QDRANT_TOOL_PREFIX):
-        bare_tool_name = tool_name[len(MCP_QDRANT_TOOL_PREFIX):]
+    if tool_name and tool_name.startswith(MCP_COMPACT_TOOL_PREFIX):
+        bare_tool_name = tool_name[len(MCP_COMPACT_TOOL_PREFIX):]
         if bare_tool_name not in _QDRANT_COMPACT_MCP_TOOLS or tool_response is None:
             sys.exit(0)
         # A list of pruned compact ids is an exact report, the same class as
