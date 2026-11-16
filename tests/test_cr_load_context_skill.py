@@ -838,8 +838,11 @@ class FactsPowerShellTest(_Env):
         self.log.write_text("")
         self.shadow_dirs = []
 
-    def run_ps(self, *, hide=("gh", "az"), env=None):
-        full_env = dict(os.environ, PATH=self.path_without(*hide))
+    def run_ps(self, *, hide=("gh", "az"), env=None, prepend=None):
+        path = self.path_without(*hide)
+        if prepend:
+            path = os.pathsep.join([str(prepend), path])
+        full_env = dict(os.environ, PATH=path)
         full_env.update(env or {})
         proc = subprocess.run(
             [POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(FACTS_PS1), "--porcelain"],
@@ -887,6 +890,55 @@ class FactsPowerShellTest(_Env):
         self.make_repo(origin="https://git.example.com/a/b.git")
         out, _ = self.run_ps()
         self.assertIn("forge facts skipped: origin host git.example.com is neither GitHub nor Azure DevOps", out)
+
+    # -- Azure DevOps: the same `az` stub drives facts.sh (tested against real az on macOS) and
+    # facts.ps1, so the PowerShell translation has to give the same answer, word for word. --
+
+    def _install_az_stub(self):
+        self.install_stub("az", self.AZ)
+        if sys.platform == "win32":
+            # PowerShell resolves `az` to az.cmd; it hands the call to the same sh stub.
+            (self.stubs / "az.cmd").write_text(f'@"{BASH}" "%~dp0az" %*\r\n', encoding="ascii")
+
+    def _ado_both(self, env, *, branch="feature/x"):
+        if BASH is None:
+            self.skipTest("no bash to compare against")
+        self.make_repo(branch=branch, origin=FactsAzureDevOpsTest.VS_URL)
+        self._install_az_stub()
+        env = dict(env, STUB_LOG=str(self.log))
+        ps_out, _ = self.run_ps(hide=("gh",), env=env, prepend=self.stubs)
+        full = dict(os.environ, PATH=os.pathsep.join([str(self.stubs), self.path_without("gh")]), **env)
+        sh = subprocess.run([BASH, str(FACTS), "--porcelain"], cwd=self.repo, env=full,
+                            capture_output=True, text=True, encoding="utf-8", timeout=180)
+        sh_out = sh.stdout.replace("\r\n", "\n")
+        self.assertEqual(ps_out, sh_out)
+        return ps_out
+
+    def test_ado_pull_requests_match_facts_sh_and_mark_the_current_branch(self):
+        prs = "\n".join(["\t".join(["9", "refs/heads/feature/x", "false", "PROJ-2135: the thing"]),
+                         "\t".join(["10", "refs/heads/other", "true", "A draft"])])
+        out = self._ado_both({"STUB_AZ_REPOS": "Contoso.Widgets.Api\tfalse", "STUB_AZ_PRS": prs})
+        self.assertIn("active pull requests: 2", out)
+        self.assertIn("#9 [feature/x] (active) PROJ-2135: the thing  <- current branch", out)
+        self.assertIn("#10 [other] (draft) A draft", out)
+        self.assertIn("scope: pull requests only", out)
+
+    def test_ado_disabled_repo_matches_facts_sh(self):
+        out = self._ado_both({"STUB_AZ_REPOS": "contoso.widgets.api\ttrue"})
+        self.assertIn("is disabled (isDisabled: true)", out)
+
+    def test_ado_tf401019_matches_facts_sh(self):
+        out = self._ado_both({"STUB_AZ_REPOS": "Contoso.Widgets.Api\tfalse",
+                              "STUB_AZ_PR_ERR": "ERROR: TF401019: The Git repository was not found"})
+        self.assertIn("(TF401019)", out)
+
+    def test_ado_not_signed_in_and_list_errors_match_facts_sh(self):
+        out = self._ado_both({"STUB_AZ_AUTH": "no"})
+        self.assertIn("forge facts skipped: az is not signed in (run: az login)", out)
+
+    def test_ado_missing_extension_matches_facts_sh(self):
+        out = self._ado_both({"STUB_AZ_LIST_ERR": "ERROR: 'repos' is misspelled or not recognized by the system."})
+        self.assertIn("the azure-devops extension is not installed", out)
 
     def test_it_matches_facts_sh_section_for_section(self):
         # The report must not depend on which script ran, so on a repo both can read the
