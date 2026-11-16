@@ -851,8 +851,15 @@ class PendingMigrations(unittest.TestCase):
                 # Still launched from the old tools/ folder: mcp-server-scripts-moved too.
                 "codebase-indexer": {"args": ["/old/tools-repo/tools/ingest_mcp_server.py"], "env": {}},
                 # Tracking on, no analytics block: analytics-server-missing too;
-                # the leftover SAVINGS_DB key: local-compress-savings-db-inert too.
-                "local-compress": {"env": {"CLAUDE_RUNWAY_TRACK_SAVINGS": "1", "CLAUDE_RUNWAY_SAVINGS_DB": ""}},
+                # the leftover SAVINGS_DB key: local-compress-savings-db-inert too;
+                # the leftover compact setting: local-compress-dead-env-dropped too.
+                "local-compress": {
+                    "env": {
+                        "CLAUDE_RUNWAY_TRACK_SAVINGS": "1",
+                        "CLAUDE_RUNWAY_SAVINGS_DB": "",
+                        "COMPACT_COLLECTION": "conversation-compacts",
+                    }
+                },
             }
         }
         settings_json = {
@@ -2354,8 +2361,9 @@ class CbIndexerToolsRenamed(unittest.TestCase):
         return _migration(self._ID).apply(mcp_json, settings, _ctx())[1]
 
     def test_registered_after_the_server_script_migrations(self):
-        # compact-server-renamed and compact-server-dead-env-dropped come after it, last.
-        self.assertEqual(MIGRATIONS[-3].id, self._ID)
+        # compact-server-renamed, compact-server-dead-env-dropped and
+        # local-compress-dead-env-dropped come after it, last.
+        self.assertEqual(MIGRATIONS[-4].id, self._ID)
 
     def test_not_pending_without_permissions_or_matchers(self):
         self.assertFalse(_migration(self._ID).detect(self._mcp(), {}))
@@ -3049,6 +3057,172 @@ class CompactServerDeadEnvDropped(unittest.TestCase):
     def test_a_third_party_block_is_left_to_qdrant_server_replaced(self):
         before = {"mcpServers": {"qdrant": {"command": "/old/bin/mcp-server-qdrant", "env": {"EMBEDDING_MODEL": "m"}}}}
         self.assertFalse(_migration(self._ID).detect(before, {}))
+
+
+class LocalCompressDeadEnvDropped(unittest.TestCase):
+    """local-compress-dead-env-dropped: the `local-compress` block loses the
+    Qdrant URL/key and compact settings its server never reads, but only after
+    qdrant-server-replaced has carried them over, and never the EMBEDDING_MODEL
+    that is still the only record of the compact model."""
+
+    _ID = "local-compress-dead-env-dropped"
+    _LEFTOVERS = {
+        "QDRANT_URL": "http://remote-qdrant:6333",
+        "QDRANT_API_KEY": "real-key",
+        "COMPACT_COLLECTION": "my-compacts",
+        "EMBEDDING_MODEL": "BAAI/bge-small-en",
+    }
+    _KEPT = {
+        "CLAUDE_RUNWAY_LMSTUDIO_URL": "http://lm-host:1234/v1",
+        "CLAUDE_RUNWAY_LMSTUDIO_MODEL": "qwen-small",
+        "CLAUDE_RUNWAY_TRACK_SAVINGS": "",
+        "MY_OWN_SETTING": "keep me",
+    }
+
+    def _mcp(self, compact_model="BAAI/bge-small-en", **compress_env):
+        compact_env = {"QDRANT_URL": "http://remote-qdrant:6333", "QDRANT_API_KEY": "real-key"}
+        if compact_model is not None:
+            compact_env["COMPACT_EMBEDDING_MODEL"] = compact_model
+        return {
+            "mcpServers": {
+                "compact": {"command": "py", "args": ["/r/mcpservers/compact_mcp_server.py"], "env": compact_env},
+                "codebase-indexer": {"env": {"COLLECTION_NAME": "p", "QDRANT_API_KEY": "real-key"}},
+                "local-compress": {"command": "py", "env": dict(compress_env)},
+            }
+        }
+
+    def _third_party(self, **compress_env):
+        """A pre-move install: the third-party block has NO key of its own, so
+        the carry-over finds the credential only in local-compress."""
+        return {
+            "mcpServers": {
+                "qdrant": {
+                    "command": "/old/venv/bin/mcp-server-qdrant",
+                    "type": "stdio",
+                    "env": {"QDRANT_URL": "", "QDRANT_API_KEY": "", "COLLECTION_NAME": "my-project"},
+                },
+                "codebase-indexer": {"command": "/old/venv/bin/python", "env": {"COLLECTION_NAME": "my-project"}},
+                "memory-bank": {"command": "/old/venv/bin/python", "env": {"MEMORY_BANK_ID": "my-project"}},
+                "local-compress": {"command": "/old/venv/bin/python", "env": dict(compress_env)},
+            }
+        }
+
+    # --- registry ---
+
+    def test_registered_last_and_after_the_carry_over(self):
+        ids = [m.id for m in MIGRATIONS]
+        self.assertEqual(ids[-1], self._ID)
+        self.assertLess(ids.index("qdrant-server-replaced"), ids.index(self._ID))
+
+    # --- detect ---
+
+    def test_detect_true_for_each_leftover_key(self):
+        for key in ("QDRANT_URL", "QDRANT_API_KEY", "COMPACT_COLLECTION", "EMBEDDING_MODEL"):
+            with self.subTest(key=key):
+                self.assertTrue(_migration(self._ID).detect(self._mcp(**{key: "v"}), {}))
+
+    def test_detect_false_for_a_clean_block_a_qdrant_only_install_or_odd_shapes(self):
+        self.assertFalse(_migration(self._ID).detect(self._mcp(**self._KEPT), {}))
+        qdrant_only = self._mcp()
+        del qdrant_only["mcpServers"]["local-compress"]
+        for mcp_json in (qdrant_only, {}, {"mcpServers": None}, {"mcpServers": {"local-compress": None}},
+                         {"mcpServers": {"local-compress": {"env": []}}}):
+            with self.subTest(mcp_json=mcp_json):
+                self.assertFalse(_migration(self._ID).detect(mcp_json, {}))
+                self.assertEqual(_migration(self._ID).apply(mcp_json, {}, _ctx())[0], mcp_json)
+
+    def test_the_keys_in_another_block_are_not_this_migrations_business(self):
+        # The compact and indexer blocks carry QDRANT_URL/QDRANT_API_KEY too.
+        self.assertFalse(_migration(self._ID).detect(self._mcp(), {}))
+
+    # --- apply ---
+
+    def test_apply_removes_only_the_four_keys_and_never_mutates_its_input(self):
+        before = self._mcp(**self._LEFTOVERS, **self._KEPT)
+        settings = {"hooks": {"SessionStart": []}}
+        snapshot = copy.deepcopy(before)
+        after, after_settings = _migration(self._ID).apply(before, settings, _ctx())
+        self.assertEqual(before, snapshot)
+        self.assertEqual(after_settings, settings)
+        expected = copy.deepcopy(before)
+        expected["mcpServers"]["local-compress"]["env"] = dict(self._KEPT)
+        self.assertEqual(after, expected)
+        self.assertFalse(_migration(self._ID).detect(after, {}))
+
+    def test_embedding_model_is_kept_while_it_is_the_compact_models_only_record(self):
+        # No COMPACT_EMBEDDING_MODEL in the compact block: `init` would read
+        # local-compress's EMBEDDING_MODEL, so dropping it could orphan compacts.
+        custom = dict(self._LEFTOVERS, EMBEDDING_MODEL="sentence-transformers/all-mpnet-base-v2")
+        for compact_model in (None, "", "  "):
+            with self.subTest(compact_model=compact_model):
+                before = self._mcp(compact_model=compact_model, **custom)
+                after = _migration(self._ID).apply(before, {}, _ctx())[0]
+                self.assertEqual(
+                    after["mcpServers"]["local-compress"]["env"],
+                    {"EMBEDDING_MODEL": "sentence-transformers/all-mpnet-base-v2"},
+                )
+                # Not offered again for that one key: it can never apply.
+                self.assertFalse(_migration(self._ID).detect(after, {}))
+
+    def test_a_legacy_embedding_model_is_dropped_since_init_would_pin_it_anyway(self):
+        # Without the key the resolver falls back to the legacy model, which is
+        # the same value, so nothing a later `init` writes changes.
+        before = self._mcp(compact_model=None, EMBEDDING_MODEL="BAAI/bge-small-en")
+        after = _migration(self._ID).apply(before, {}, _ctx())[0]
+        self.assertEqual(after["mcpServers"]["local-compress"]["env"], {})
+
+    def test_a_blank_embedding_model_is_dropped_even_without_a_compact_model(self):
+        before = self._mcp(compact_model=None, EMBEDDING_MODEL="")
+        self.assertTrue(_migration(self._ID).detect(before, {}))
+        after = _migration(self._ID).apply(before, {}, _ctx())[0]
+        self.assertEqual(after["mcpServers"]["local-compress"]["env"], {})
+
+    def test_apply_is_a_no_op_while_a_third_party_block_waits_on_the_carry_over(self):
+        before = self._third_party(**self._LEFTOVERS)
+        self.assertTrue(_migration(self._ID).detect(before, {}))
+        self.assertEqual(_migration(self._ID).apply(before, {}, _ctx())[0], before)
+        # Only EMBEDDING_MODEL left: still offered, since the carry-over will
+        # write COMPACT_EMBEDDING_MODEL in the same run.
+        self.assertTrue(_migration(self._ID).detect(self._third_party(EMBEDDING_MODEL="m"), {}))
+
+    # --- run_upgrade: ordering against the credential carry-over ---
+
+    def _run(self, mcp_json, **kwargs):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        target = Path(tmp.name)
+        (target / ".mcp.json").write_text(json.dumps(mcp_json), encoding="utf-8")
+        with redirect_stdout(io.StringIO()):
+            applied = run_upgrade(target, REPO_ROOT, _VENV_PYTHON, **kwargs)
+        return target, applied, json.loads((target / ".mcp.json").read_text(encoding="utf-8"))
+
+    def test_one_run_carries_the_credential_over_then_drops_the_leftovers(self):
+        target, applied, after = self._run(self._third_party(**self._LEFTOVERS, **self._KEPT), auto_yes=True)
+        ours = [i for i in applied if i in ("qdrant-server-replaced", self._ID)]
+        self.assertEqual(ours, ["qdrant-server-replaced", self._ID])
+        compact_env = after["mcpServers"]["compact"]["env"]
+        # The URL and key existed only in local-compress, and survived the move.
+        self.assertEqual(compact_env["QDRANT_URL"], "http://remote-qdrant:6333")
+        self.assertEqual(compact_env["QDRANT_API_KEY"], "real-key")
+        self.assertEqual(compact_env["COMPACT_COLLECTION"], "my-compacts")
+        self.assertEqual(compact_env["COMPACT_EMBEDDING_MODEL"], "BAAI/bge-small-en")
+        self.assertEqual(after["mcpServers"]["local-compress"]["env"], self._KEPT)
+
+        # A second run changes nothing.
+        before = (target / ".mcp.json").read_bytes()
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(run_upgrade(target, REPO_ROOT, _VENV_PYTHON, auto_yes=True), [])
+        self.assertEqual((target / ".mcp.json").read_bytes(), before)
+
+    def test_declining_the_carry_over_keeps_every_key_and_leaves_this_pending(self):
+        def accept_only_this_one(migration, index, total):
+            return migration.id == self._ID
+
+        before = self._third_party(**self._LEFTOVERS, **self._KEPT)
+        _, applied, after = self._run(before, prompt_fn=accept_only_this_one)
+        self.assertNotIn(self._ID, applied)
+        self.assertEqual(after, before)
+        self.assertIn(self._ID, {m.id for m in pending_migrations(after, {})})
 
 
 if __name__ == "__main__":
