@@ -2899,6 +2899,29 @@ class CompactServerSettingsRenamed(unittest.TestCase):
                     ["mcp__qdrant__compact_find", "mcp__qdrant-own__compact_find"],
                 )
 
+    def test_a_version_pinned_uvx_launcher_is_migrated(self):
+        for arg in ("mcp-server-qdrant@0.7.1", "mcp-server-qdrant==0.7.1"):
+            with self.subTest(arg=arg):
+                self.setUp()
+                block = {"command": "uvx", "args": [arg], "env": {}}
+                (self.repo / ".mcp.json").write_text(json.dumps({"mcpServers": {"qdrant": block}}), encoding="utf-8")
+                self._write_local()
+                applied = self._upgrade(auto_yes=True)
+                self.assertIn("qdrant-server-replaced", applied)
+                self.assertIn(self._ID, applied)
+                self.assertEqual(self._read("settings.local.json")["enabledMcpjsonServers"], ["compact", "memory-bank"])
+
+    def test_an_unrecognised_qdrant_block_is_named_in_the_refusal_without_its_env(self):
+        block = {"command": "python -m mcp_server_qdrant.main", "env": {"QDRANT_API_KEY": "s3cret"}}
+        (self.repo / ".mcp.json").write_text(json.dumps({"mcpServers": {"qdrant": block}}), encoding="utf-8")
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(run_upgrade(self.repo, REPO_ROOT, _VENV_PYTHON, auto_yes=True), [])
+        self.assertIn("no existing toolkit configuration", out.getvalue())
+        self.assertIn("upgrade cannot tell what it launches", out.getvalue())
+        self.assertIn("'python -m mcp_server_qdrant.main'", out.getvalue())
+        self.assertNotIn("s3cret", out.getvalue())
+
     def test_ambiguous_old_blocks_leave_the_settings_alone(self):
         block = {"command": "py", "args": ["/r/mcpservers/qdrant_mcp_server.py"]}
         (self.repo / ".mcp.json").write_text(json.dumps({"mcpServers": {"one": block, "two": block}}), encoding="utf-8")

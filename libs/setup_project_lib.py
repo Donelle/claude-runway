@@ -998,6 +998,47 @@ def build_settings_hooks(
 # letting this merge remove it.
 _OWNED_MCP_SERVER_KEYS = ("compact", "codebase-indexer", "memory-bank", "local-compress", "analytics")
 
+# What an old compact-server block launches, under whatever key it was given:
+# this toolkit's pre-rename script, or the third-party console script it replaced.
+OLD_COMPACT_SERVER_SCRIPTS = ("qdrant_mcp_server.py", "mcp-server-qdrant", "mcp-server-qdrant.exe")
+# A package version pinned on a `uvx`/`pipx run` argument: `mcp-server-qdrant@0.7.1`,
+# `mcp-server-qdrant==0.7.1`.
+_LAUNCHER_VERSION_SUFFIX = re.compile(r"(?:@|==)[^\\/]+$")
+
+
+def strip_launcher_version(name: str) -> str:
+    """`name` without a trailing `@<version>` or `==<version>` pin."""
+    return _LAUNCHER_VERSION_SUFFIX.sub("", name)
+
+
+def launcher_keys(mcp_json: dict, script_names: "tuple[str, ...]") -> "list[str]":
+    """Keys of every server block whose `command` or one of its `args` has a
+    basename (split on `/` and `\\`, version pin dropped) in `script_names`, so
+    the key the user chose does not matter."""
+    servers = mcp_json.get("mcpServers") if isinstance(mcp_json, dict) else None
+    if not isinstance(servers, dict):
+        return []
+    found = []
+    for key, block in servers.items():
+        if not isinstance(block, dict):
+            continue
+        candidates = [block.get("command")]
+        args = block.get("args")
+        if isinstance(args, list):
+            candidates.extend(args)
+        if any(
+            isinstance(v, str) and strip_launcher_version(re.split(r"[\\/]", v)[-1]) in script_names
+            for v in candidates
+        ):
+            found.append(key)
+    return found
+
+
+def old_compact_server_keys(mcp_json: dict) -> "list[str]":
+    """Keys of every block that launches an old compact server (see
+    `OLD_COMPACT_SERVER_SCRIPTS`), whatever the user named it."""
+    return launcher_keys(mcp_json, OLD_COMPACT_SERVER_SCRIPTS)
+
 
 def merge_mcp_json(existing: dict, generated_servers: dict, *, owned_keys: tuple = _OWNED_MCP_SERVER_KEYS) -> dict:
     """
@@ -2035,6 +2076,16 @@ def run_setup(
             f"setup_project_lib bug: unresolved placeholder(s) survived patching in mcp.json: {unresolved}"
         )
 
+    # An old compact-server block (found by what it launches, never by key) is
+    # replaced by the `compact` block written here, so it is dropped: kept, it
+    # would point at a script that no longer exists, next to the new block, and
+    # `upgrade` could never finish renaming it. Settings entries that name its
+    # key are not moved by `init` (that is `upgrade`'s job), so say so.
+    dropped_old_compact_keys = [k for k in old_compact_server_keys(existing_mcp) if k not in generated_servers]
+    if dropped_old_compact_keys:
+        existing_mcp = copy.deepcopy(existing_mcp)
+        for key in dropped_old_compact_keys:
+            existing_mcp["mcpServers"].pop(key, None)
     final_mcp = merge_mcp_json(existing_mcp, generated_servers)
     if include_reviewer and existing_reviewer_env is not None:
         # Custom entries the user added to the kept block (an LM Studio URL,
@@ -2049,6 +2100,14 @@ def run_setup(
             final_reviewer["env"].setdefault(key, value)
         final_mcp["mcpServers"]["codebase-reviewer"] = final_reviewer
     changes = [f"mcpServers ({', '.join(sorted(generated_servers))}) -> {mcp_json_path}"]
+    if dropped_old_compact_keys:
+        names = ", ".join(f"'{k}'" for k in dropped_old_compact_keys)
+        changes.append(
+            f"WARNING: removed the old compact server block {names} from .mcp.json: the 'compact' block replaces it. "
+            "Permission rules in .claude/settings.json and enabledMcpjsonServers/disabledMcpjsonServers "
+            f"entries in .claude/settings.local.json that name {names} are not moved by init; change them to "
+            "'compact' by hand (`upgrade`, run instead of init on an old install, moves them for you)."
+        )
     if reviewer_file_unset:
         changes.append(f"WARNING: {REVIEWERS_FILE_REQUIRED_WARNING}")
     if previous_embedding_model and resolved_embedding_model != previous_embedding_model:

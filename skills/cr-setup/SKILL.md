@@ -91,7 +91,8 @@ at the end.
 `compact` server, because that is exactly what `setup_project.py upgrade` requires
 (`upgrade_lib.is_project_configured` — every real `init` writes it, even `--qdrant-only`).
 An install from before the server was renamed has no `compact` block: its compact server
-is a block that launches `qdrant_mcp_server.py` under whatever key it was given. Find it
+is a block that launches `qdrant_mcp_server.py` (or, older still, the third-party
+`mcp-server-qdrant`) under whatever key it was given. Find it
 with `upgrade_lib`'s own helper, never by guessing a key, and never read any of its values
 for anything else:
 
@@ -105,7 +106,8 @@ for anything else:
 - An old block found and no `compact` block → this install needs `upgrade` (it renames
   the block and the settings entries that name it). Tell the user that, then use
   `AskUserQuestion` (header "Path") with "Upgrade (Recommended)" and "Re-run init" as
-  below. Do not read this block's `env` for the init-path values: take the upgrade.
+  below. Say that "Re-run init" replaces the old block with `compact` but does not move the
+  permission rules or `enabledMcpjsonServers` entries that name its key (upgrade does). Do not read this block's `env` for the init-path values: take the upgrade.
 - `compact` server present → use `AskUserQuestion` (header
   "Path"): "Upgrade (Recommended)" — apply only pending config migrations (and refresh
   already-installed skills that went stale), nothing else

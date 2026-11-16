@@ -595,6 +595,33 @@ class RunSetupEndToEnd(unittest.TestCase):
         self.assertIsNotNone(result.settings_json)
         self.assertEqual(find_unresolved_placeholders(result.settings_json), [])
 
+    def test_a_rerun_replaces_an_old_compact_block_of_either_shape_and_keeps_other_servers(self):
+        old_blocks = {
+            "qdrant": {"command": "py", "args": ["/r/mcpservers/qdrant_mcp_server.py"]},
+            "my-compacts": {"command": "/v/bin/mcp-server-qdrant"},
+            "pinned": {"command": "uvx", "args": ["mcp-server-qdrant@0.7.1"]},
+        }
+        for key, block in old_blocks.items():
+            with self.subTest(key=key):
+                theirs = {"command": "node", "args": ["theirs.js"]}
+                (self.target_repo / ".mcp.json").write_text(json.dumps({"mcpServers": {key: block, "theirs": theirs}}))
+                result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
+                servers = result.mcp_json["mcpServers"]
+                self.assertNotIn(key, servers)
+                self.assertIn("compact", servers)
+                self.assertEqual(servers["theirs"], theirs)
+                notes = [c for c in result.changes if "WARNING: removed the old compact server block" in c]
+                self.assertEqual(len(notes), 1)
+                self.assertIn(f"'{key}'", notes[0])
+                self.assertIn("enabledMcpjsonServers", notes[0])
+
+    def test_a_rerun_keeps_a_users_own_block_called_qdrant(self):
+        own = {"command": "node", "args": ["my-qdrant-tool.js"]}
+        (self.target_repo / ".mcp.json").write_text(json.dumps({"mcpServers": {"qdrant": own}}))
+        result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
+        self.assertEqual(result.mcp_json["mcpServers"]["qdrant"], own)
+        self.assertFalse(any("WARNING: removed the old compact server block" in c for c in result.changes))
+
     def test_collection_name_defaults_from_target_dir_name(self):
         result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
         self.assertEqual(

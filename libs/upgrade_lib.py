@@ -71,6 +71,7 @@ from setup_project_lib import (
     read_claude_md,
 )
 from setup_project_lib import _section_spans
+from setup_project_lib import OLD_COMPACT_SERVER_SCRIPTS, launcher_keys, strip_launcher_version
 
 
 @dataclass
@@ -483,8 +484,9 @@ def _launches_third_party_qdrant_server(block: object) -> bool:
     True when a `qdrant` server block still starts the third-party
     `mcp-server-qdrant` console script -- as its `command` (what `init` wrote:
     `<venv>/bin/mcp-server-qdrant`, `.exe` on Windows) or, for a hand-edited
-    launcher such as `uvx`/`pipx run`, as one of its `args`. Matched by
-    basename so it holds wherever the venv or tool environment lives.
+    launcher such as `uvx`/`pipx run`, as one of its `args`, with or without a
+    version pin (`mcp-server-qdrant@0.7.1`, `==0.7.1`). Matched by basename so
+    it holds wherever the venv or tool environment lives.
     """
     if not isinstance(block, dict):
         return False
@@ -492,7 +494,7 @@ def _launches_third_party_qdrant_server(block: object) -> bool:
     for value in candidates:
         if not isinstance(value, str):
             continue
-        name = Path(value).name
+        name = strip_launcher_version(Path(value).name)
         if name.lower().endswith(".exe"):
             name = name[: -len(".exe")]
         if name == _THIRD_PARTY_QDRANT_SCRIPT:
@@ -1193,27 +1195,15 @@ _MOVED_QDRANT_TOOLS = {"qdrant-find": "cb_indexer_find_repo", "qdrant-store": "c
 _INDEXER_SCRIPTS = ("ingest_mcp_server.py", "codebase_indexer_mcp_server.py")
 # The third-party console script counts too: `qdrant-server-replaced` swaps it for
 # qdrant_mcp_server.py, and rules written against it name the same tools.
-_QDRANT_SCRIPTS = ("qdrant_mcp_server.py", "mcp-server-qdrant", "mcp-server-qdrant.exe")
+_QDRANT_SCRIPTS = OLD_COMPACT_SERVER_SCRIPTS
 
 
 def _launcher_keys(mcp_json: dict, script_names: "tuple[str, ...]") -> "list[str]":
     """Keys of every server block whose `command` or `args` has a basename in
-    `script_names` -- matched by file name, as `_launches_third_party_qdrant_server`
-    does, so the key the user chose does not matter."""
-    servers = mcp_json.get("mcpServers")
-    if not isinstance(servers, dict):
-        return []
-    found = []
-    for key, block in servers.items():
-        if not isinstance(block, dict):
-            continue
-        candidates = [block.get("command")]
-        args = block.get("args")
-        if isinstance(args, list):
-            candidates.extend(args)
-        if any(isinstance(v, str) and re.split(r"[\\/]", v)[-1] in script_names for v in candidates):
-            found.append(key)
-    return found
+    `script_names` -- matched by file name (a `uvx`-style version pin such as
+    `mcp-server-qdrant@0.7.1` dropped), so the key the user chose does not
+    matter. Shared with `init` (`setup_project_lib.launcher_keys`)."""
+    return launcher_keys(mcp_json, script_names)
 
 
 def _tool_renames(mcp_json: dict) -> "tuple[dict, list[str]]":
@@ -1366,6 +1356,10 @@ _COMPACT_TOOL_NAMES = ("compact_store", "compact_find", "compact_prune")
 # the file there would point at a script that has never existed.
 _OLD_COMPACT_SCRIPT_PATH = re.compile(r"(^|[\\/])mcpservers([\\/])" + re.escape(_OWN_QDRANT_SCRIPT) + r"$")
 _LOCAL_SETTINGS_LISTS = ("enabledMcpjsonServers", "disabledMcpjsonServers")
+# The key every `init` wrote for the old block. Used ONLY to word the refusal
+# for a block upgrade cannot recognise (`_unrecognised_qdrant_block_note`);
+# migrations always find the old block by shape.
+_PRE_RENAME_BLOCK_KEY = "qdrant"
 
 
 def find_old_compact_server_keys(mcp_json: dict) -> "list[str]":
@@ -2087,6 +2081,28 @@ def pending_migrations(mcp_json: dict, settings_json: dict) -> "list[Migration]"
     return [m for m in MIGRATIONS if m.detect(mcp_json, settings_json)]
 
 
+def _unrecognised_qdrant_block_note(mcp_json: dict) -> str:
+    """
+    For a project `upgrade` refuses: a note naming a block keyed `qdrant` (what
+    every `init` wrote) whose launcher it cannot recognise, e.g. `python -m ...`
+    or a command string with its arguments in it. The key is used ONLY to word
+    this message; nothing is migrated by key. Only `command` is shown, never
+    `env`, which can hold a `QDRANT_API_KEY`. "" when there is no such block.
+    """
+    servers = mcp_json.get("mcpServers")
+    block = servers.get(_PRE_RENAME_BLOCK_KEY) if isinstance(servers, dict) else None
+    if not isinstance(block, dict):
+        return ""
+    command = block.get("command")
+    shown = f" (command: {command!r})" if isinstance(command, str) else ""
+    return (
+        f"note: .mcp.json has a '{_PRE_RENAME_BLOCK_KEY}' block{shown}, but upgrade cannot tell what it "
+        "launches: it recognises a command or argument that is qdrant_mcp_server.py or mcp-server-qdrant "
+        "(optionally @version / ==version). If that block is this toolkit's old compact server, edit it "
+        "to launch one of those directly and run upgrade again, or re-run `init` and remove the block by hand."
+    )
+
+
 def _has_compact_server(mcp_json: dict) -> bool:
     """True if `mcp_json` already has this toolkit's OWN base-install
     marker -- the `compact` server block, present in EVERY real `init` run
@@ -2325,6 +2341,9 @@ def run_upgrade(
             "server block) -- `upgrade` only applies migrations to an ALREADY-configured project. "
             "Run `init` first, then `upgrade` to pick up anything released since."
         )
+        unrecognised = _unrecognised_qdrant_block_note(mcp_json)
+        if unrecognised:
+            print(unrecognised)
         return []
 
     savings_offer_accepted = False
