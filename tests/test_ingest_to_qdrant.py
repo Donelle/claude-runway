@@ -385,6 +385,68 @@ class ResetRefusesMemoryBankCollection(unittest.TestCase):
             self.assertIsNone(mod.parse_args().memory_bank_collection)
 
 
+class RefusesNonDirectoryRepoPath(unittest.TestCase):
+    """A --repo-path that is missing or not a directory is refused before
+    anything is touched. It used to index 0 chunks and report "Done." with
+    exit 0, and with --reset the filtered delete had already emptied the
+    code index first."""
+
+    FLAG_COMBOS = (
+        {},
+        {"dry_run": True},
+        {"reset": True},
+        {"reset": True, "dry_run": True},
+        {"write_manifest": True},
+        {"reset": True, "write_manifest": True},
+    )
+
+    def _assert_refused(self, repo_path, **overrides):
+        fake_client_cls = mock.MagicMock()
+        fake_prepare = mock.MagicMock()
+        fake_lock_cls = mock.MagicMock()
+        err = io.StringIO()
+        with mock.patch.object(mod, "QdrantClient", fake_client_cls), \
+             mock.patch.object(mod, "prepare_collection_for_index", fake_prepare), \
+             mock.patch.object(mod, "ManifestLock", fake_lock_cls), \
+             mock.patch.object(mod, "FastEmbedProvider", new=_provider_mock()), \
+             mock.patch.object(mod, "QdrantConnector"), \
+             redirect_stderr(err), redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                _run(mod.ingest(_args(repo_path=str(repo_path), **overrides)))
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn("is not a directory.", err.getvalue())
+        self.assertTrue(err.getvalue().startswith("Error: "))
+        fake_client_cls.assert_not_called()
+        fake_prepare.assert_not_called()
+        fake_lock_cls.assert_not_called()
+
+    def test_missing_path_is_refused_for_every_flag_combination(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "does-not-exist"
+            for combo in self.FLAG_COMBOS:
+                with self.subTest(**combo):
+                    self._assert_refused(missing, **combo)
+
+    def test_file_path_is_refused_for_every_flag_combination(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a_file = Path(tmp) / "file.md"
+            a_file.write_text("x", encoding="utf-8")
+            for combo in self.FLAG_COMBOS:
+                with self.subTest(**combo):
+                    self._assert_refused(a_file, **combo)
+
+    def test_existing_empty_directory_still_runs_with_zero_chunks(self):
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(mod, "QdrantClient") as fake_client_cls, \
+             mock.patch.object(mod, "FastEmbedProvider", new=_provider_mock()), \
+             mock.patch.object(mod, "QdrantConnector"), \
+             redirect_stdout(out):
+            _run(mod.ingest(_args(repo_path=tmp, dry_run=True)))
+        self.assertIn("Found 0 chunks", out.getvalue())
+        fake_client_cls.assert_not_called()
+
+
 def _dry_run_indexed_paths(args) -> set:
     """Runs a real --dry-run ingest() over args.repo_path (no Qdrant, no
     embedding model -- both mocked) and returns the set of file_path values
