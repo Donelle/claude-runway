@@ -62,7 +62,16 @@ function Get-PlainFiles([string]$Dir) {
         Where-Object { -not $_.Name.StartsWith('.') } | Sort-Object Name)
 }
 
-function Get-FileLines([string]$Path) { return @(Get-Content -LiteralPath $Path -Encoding UTF8) }
+# The leading comma keeps a one-line file an ARRAY: without it PowerShell unrolls the
+# one-element result to a bare string, and $lines[0] would be its first character.
+function Get-FileLines([string]$Path) { return , @(Get-Content -LiteralPath $Path -Encoding UTF8) }
+
+function Get-NewlineCount([string]$Path) {
+    # wc -l counts newline characters, so a last line with no trailing newline is not
+    # counted; Get-Content counts lines, which would differ by one on such a file.
+    $text = [System.IO.File]::ReadAllText((Resolve-Path -LiteralPath $Path).ProviderPath)
+    return [regex]::Matches($text, "`n").Count
+}
 
 function Get-Short([string]$Ref) {
     $r = ((& git rev-parse --short $Ref 2>$null) | Out-String).Trim()
@@ -146,12 +155,12 @@ if (Test-Path -LiteralPath '.ai-plans' -PathType Container) {
         $lines = Get-FileLines $f.FullName
         $first = ''
         if ($lines.Count -gt 0) { $first = Get-Cut $lines[0] 90 }
-        Write-Output "$($f.Name) ($($lines.Count) lines): $first"
+        Write-Output "$($f.Name) ($(Get-NewlineCount $f.FullName) lines): $first"
     }
     $wo = '.ai-plans/ticket-work-order.md'
     if (Test-Path -LiteralPath $wo -PathType Leaf) {
         $lines = Get-FileLines $wo
-        $total = $lines.Count
+        $total = Get-NewlineCount $wo
         # 1-based line number of the first line matching a pattern, or $null.
         function Find-Line([string]$Re) {
             for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i] -cmatch $Re) { return ($i + 1) } }
@@ -260,6 +269,6 @@ foreach ($f in @(Get-ChildItem -LiteralPath 'docs' -File -Filter '*.md' -ErrorAc
     $title = ''
     if ($h) { $title = Get-Cut ($h -replace '^# ', '') 80 }
     if (-not $title) { $title = 'no title' }
-    Write-Output "docs/$($f.Name) ($($lines.Count) lines): $title"
+    Write-Output "docs/$($f.Name) ($(Get-NewlineCount $f.FullName) lines): $title"
 }
 exit 0

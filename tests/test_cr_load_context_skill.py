@@ -121,8 +121,17 @@ class CrLoadContextSkillTest(unittest.TestCase):
         self.assertIn("--porcelain", text)
         self.assertIn("Do not assume bash exists on Windows", text)
         self.assertIn("never use WSL", text)
+        # The whole command, with a real backslash: a "\f" typed in a Python string once put a
+        # form-feed byte in it, so only a full-string pin catches that.
+        self.assertIn(
+            r'powershell -NoProfile -ExecutionPolicy Bypass -File "<skill folder>\facts.ps1" --porcelain', text)
         prereq = _section(self.text, "## Prerequisites", "## Usage")
         self.assertIn("bash is not a prerequisite on Windows", prereq)
+
+    def test_the_skill_files_hold_no_control_characters(self):
+        for path in (SKILL_PATH, REPO_ROOT / ".claude" / "skills" / "cr-gh-load-context" / "SKILL.md"):
+            bad = sorted({hex(ord(c)) for c in path.read_text(encoding="utf-8") if ord(c) < 32 and c not in "\n\r\t"})
+            self.assertEqual(bad, [], f"{path.name} has control characters (a mangled escape in a path?)")
 
     def test_the_by_hand_fallback_quotes_the_json_list_for_powershell(self):
         # An unquoted `--json a,b` is an array in PowerShell and gh rejects it.
@@ -816,7 +825,9 @@ class PowerShellScriptsTest(unittest.TestCase):
 
     def test_the_contributor_skill_points_windows_at_its_script(self):
         text = (REPO_ROOT / ".claude" / "skills" / "cr-gh-load-context" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertIn("facts.ps1", text)
+        self.assertIn(
+            r'powershell -NoProfile -ExecutionPolicy Bypass -File .claude\skills\cr-gh-load-context\facts.ps1 --porcelain',
+            text)
         self.assertIn("Do not assume bash exists on Windows", text)
         self.assertIn("never use WSL", text)
 
@@ -838,14 +849,14 @@ class FactsPowerShellTest(_Env):
         self.log.write_text("")
         self.shadow_dirs = []
 
-    def run_ps(self, *, hide=("gh", "az"), env=None, prepend=None):
+    def run_ps(self, *, hide=("gh", "az"), env=None, prepend=None, interpreter=None):
         path = self.path_without(*hide)
         if prepend:
             path = os.pathsep.join([str(prepend), path])
         full_env = dict(os.environ, PATH=path)
         full_env.update(env or {})
         proc = subprocess.run(
-            [POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(FACTS_PS1), "--porcelain"],
+            [interpreter or POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(FACTS_PS1), "--porcelain"],
             cwd=self.repo, env=full_env, capture_output=True, text=True, encoding="utf-8", timeout=180,
         )
         return proc.stdout.replace("\r\n", "\n"), proc.returncode
@@ -890,6 +901,97 @@ class FactsPowerShellTest(_Env):
         self.make_repo(origin="https://git.example.com/a/b.git")
         out, _ = self.run_ps()
         self.assertIn("forge facts skipped: origin host git.example.com is neither GitHub nor Azure DevOps", out)
+
+    # -- GitHub: facts.ps1 reads `gh ... --json`, so it gets a JSON stub (facts.sh's stub prints
+    # --jq rows). The PowerShell side is checked for the same words facts.sh prints. --
+
+    GH_JSON = """#!/bin/sh
+echo "gh $*" >> "$STUB_LOG"
+case "$1 $2" in
+  "auth status")
+    [ "${STUB_GH_AUTH:-ok}" = ok ] && exit 0
+    echo "You are not logged into any GitHub hosts" >&2; exit 1 ;;
+  "pr list")
+    [ -n "${STUB_GH_STDERR:-}" ] && echo "warning: a new gh release is available" >&2
+    printf '%s\\n' "${STUB_GH_JSON:-[]}"
+    exit 0 ;;
+esac
+exit 0
+"""
+
+    def _gh_stub_run(self, env, *, branch="PROJ-4610", interpreter=None):
+        self.make_repo(branch=branch, origin="https://github.com/acme/widgets.git")
+        self.install_stub("gh", self.GH_JSON)
+        if sys.platform == "win32":
+            (self.stubs / "gh.cmd").write_text(f'@"{BASH}" "%~dp0gh" %*\r\n', encoding="ascii")
+        env = dict(env, STUB_LOG=str(self.log))
+        return self.run_ps(hide=("gh", "az"), env=env, prepend=self.stubs, interpreter=interpreter)
+
+    GH_PRS = (
+        '[{"number":12,"title":"PROJ-4610: the work","headRefName":"PROJ-4610","isDraft":false,"isCrossRepository":false},'
+        '{"number":13,"title":"A fork PR","headRefName":"PROJ-4610","isDraft":true,"isCrossRepository":true}]'
+    )
+
+    def test_github_pull_requests_are_listed_and_only_the_own_branch_is_marked(self):
+        if BASH is None:
+            self.skipTest("the gh stub runs under bash")
+        out, rc = self._gh_stub_run({"STUB_GH_JSON": self.GH_PRS})
+        self.assertEqual(rc, 0)
+        self.assertIn("open pull requests: 2", out)
+        self.assertIn("#12 [PROJ-4610] (open) PROJ-4610: the work  <- current branch", out)
+        self.assertIn("#13 [PROJ-4610] (draft) A fork PR\n", out)   # a fork's same-named branch is not ours
+        self.assertIn("scope: pull requests only", out)
+
+    def test_a_gh_warning_on_stderr_does_not_turn_the_list_into_zero_pull_requests(self):
+        if BASH is None:
+            self.skipTest("the gh stub runs under bash")
+        out, _ = self._gh_stub_run({"STUB_GH_JSON": self.GH_PRS, "STUB_GH_STDERR": "1"})
+        self.assertIn("open pull requests: 2", out)
+        self.assertNotIn("forge facts skipped", out)
+
+    def test_unreadable_gh_output_is_a_skip_not_zero_pull_requests(self):
+        if BASH is None:
+            self.skipTest("the gh stub runs under bash")
+        out, _ = self._gh_stub_run({"STUB_GH_JSON": "this is not json"})
+        self.assertIn("forge facts skipped: gh pr list output could not be read", out)
+        self.assertNotIn("open pull requests: 0", out)
+
+    def test_gh_not_signed_in_skips_only_the_forge(self):
+        if BASH is None:
+            self.skipTest("the gh stub runs under bash")
+        out, _ = self._gh_stub_run({"STUB_GH_AUTH": "no"})
+        self.assertIn("forge facts skipped: gh is not signed in to github.com (run: gh auth login)", out)
+        self.assertNotIn("pr list", self.calls())
+        self.assertIn("## entry docs", out)
+
+    def test_every_installed_powershell_runs_it_not_only_the_first(self):
+        # The docs promise Windows PowerShell 5.1 as well as 7; `pwsh` alone would never run 5.1.
+        shells = [x for x in {shutil.which("pwsh"), shutil.which("powershell")} if x]
+        self.make_repo(origin="https://github.com/acme/widgets.git")
+        for shell in shells:
+            with self.subTest(shell=Path(shell).name):
+                out, rc = self.run_ps(interpreter=shell)
+                self.assertEqual(rc, 0)
+                self.assertIn("forge facts skipped: gh is not installed", out)
+
+    def test_the_contributor_script_runs_and_reports_gh_trouble_without_stopping(self):
+        # With no gh the GitHub lines say so and every local section still prints (the exit code is 0).
+        self.make_repo(origin="https://github.com/acme/widgets.git",
+                       files={"docs/a.md": "# A\nbody\n", "EVALUATION.md": "## Track A: x\n"})
+        (self.repo / "skills").mkdir()
+        (self.repo / ".plans").mkdir()
+        (self.repo / ".plans" / "7-plan.md").write_text("## Open questions\n", encoding="utf-8")
+        (self.repo / ".plans" / "notes.md").write_text("x\n", encoding="utf-8")
+        env = dict(os.environ, PATH=self.path_without("gh", "az"))
+        proc = subprocess.run(
+            [POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(GH_FACTS_PS1), "--porcelain"],
+            cwd=self.repo, env=env, capture_output=True, text=True, encoding="utf-8", timeout=180)
+        out = proc.stdout.replace("\r\n", "\n")
+        self.assertEqual(proc.returncode, 0)
+        for text in ("## git", "gh issue list failed", "  gh failed", "MISPLACED (not part of a triad): notes.md",
+                     "#7: has plan; issue lookup failed", "7-plan.md: open questions at line 1",
+                     "1:## Track A: x", "docs/a.md (2 lines): A"):
+            self.assertIn(text, out)
 
     # -- Azure DevOps: the same `az` stub drives facts.sh (tested against real az on macOS) and
     # facts.ps1, so the PowerShell translation has to give the same answer, word for word. --

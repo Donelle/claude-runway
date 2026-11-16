@@ -50,29 +50,32 @@ function Get-FirstLine([string]$Text) {
 }
 
 # Runs an external command with a time limit, in a job so a hung az cannot hang
-# the script. Returns Out (stdout and stderr merged, as one string) and Rc;
+# the script. Returns Out (stdout and stderr merged, as one string), Stdout (stdout
+# alone, for output that is parsed: a warning on stderr must not corrupt it) and Rc;
 # Rc 124 means timed out, 127 means the command could not be started.
 function Invoke-Limited([int]$Secs, [string]$Exe, [string[]]$CmdArgs) {
     $job = Start-Job -ScriptBlock {
         param($e, $a)
         try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
         try {
-            $o = & $e @a 2>&1 | ForEach-Object { "$_" }
+            $all = @(& $e @a 2>&1)
             $rc = $LASTEXITCODE
             if ($null -eq $rc) { $rc = 0 }
-            [pscustomobject]@{ Out = ($o -join "`n"); Rc = $rc }
+            $out = @($all | ForEach-Object { "$_" })
+            $std = @($all | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] } | ForEach-Object { "$_" })
+            [pscustomobject]@{ Out = ($out -join "`n"); Stdout = ($std -join "`n"); Rc = $rc }
         } catch {
-            [pscustomobject]@{ Out = "$_"; Rc = 127 }
+            [pscustomobject]@{ Out = "$_"; Stdout = ''; Rc = 127 }
         }
     } -ArgumentList @($Exe, , $CmdArgs)
     if (-not (Wait-Job $job -Timeout $Secs)) {
         Stop-Job $job
         Remove-Job $job -Force
-        return [pscustomobject]@{ Out = ''; Rc = 124 }
+        return [pscustomobject]@{ Out = ''; Stdout = ''; Rc = 124 }
     }
     $res = Receive-Job $job
     Remove-Job $job -Force
-    if ($null -eq $res) { return [pscustomobject]@{ Out = ''; Rc = 127 } }
+    if ($null -eq $res) { return [pscustomobject]@{ Out = ''; Stdout = ''; Rc = 127 } }
     return $res
 }
 
@@ -134,7 +137,12 @@ if (-not $inGit) {
 
 # --- the project's own docs ------------------------------------------------
 
-function Get-LineCount([string]$Path) { return @(Get-Content -LiteralPath $Path -Encoding UTF8).Count }
+function Get-LineCount([string]$Path) {
+    # wc -l counts newline characters, so a last line with no trailing newline is not
+    # counted; Get-Content counts lines, which would differ by one on such a file.
+    $text = [System.IO.File]::ReadAllText((Resolve-Path -LiteralPath $Path).ProviderPath)
+    return [regex]::Matches($text, "`n").Count
+}
 
 Write-Section 'entry docs'
 $readmes = @(Get-ChildItem -File -Filter 'readme*' -ErrorAction SilentlyContinue | Sort-Object Name)
@@ -259,10 +267,15 @@ if ($forge -eq 'github') {
                 $forgeNote = "gh pr list failed: $(Get-FirstLine $res.Out)"
             } else {
                 $prs = @()
-                # Windows PowerShell 5.1 returns a JSON array as ONE object (and "[]" as a
-                # single empty one), so it is piped through ForEach-Object to unroll it and
-                # nulls are dropped; PowerShell 7 already unrolls.
-                try { $prs = @($res.Out | ConvertFrom-Json | ForEach-Object { $_ } | Where-Object { $null -ne $_ }) } catch { $prs = @() }
+                $parsed = $true
+                # Only stdout is parsed: a warning gh prints on stderr must not turn valid JSON
+                # into "0 pull requests". Windows PowerShell 5.1 returns a JSON array as ONE
+                # object (and "[]" as a single empty one), so it is piped through ForEach-Object
+                # to unroll it and nulls are dropped; PowerShell 7 already unrolls.
+                try { $prs = @($res.Stdout | ConvertFrom-Json | ForEach-Object { $_ } | Where-Object { $null -ne $_ }) } catch { $parsed = $false }
+                if (-not $parsed) { $forgeNote = 'gh pr list output could not be read' }
+            }
+            if (-not $forgeNote) {
                 Write-Output "open pull requests: $($prs.Count)"
                 if ($prs.Count -ge 30) { Write-Output '  (capped at 30)' }
                 foreach ($pr in $prs) {

@@ -175,7 +175,7 @@ CODE_FIXTURE_ALLOWLIST: dict[str, set[str] | None] = {
     # an identifier inside a compression fixture
     "tests/test_local_compress_lib.py": {"PR 481200"},
     # pull-request numbers in the output of the stubbed forge commands
-    "tests/test_cr_load_context_skill.py": {"#12", "#13", "#419499", "#425199", "#5", "#77", "#9"},
+    "tests/test_cr_load_context_skill.py": {"#10", "#12", "#13", "#419499", "#425199", "#5", "#7", "#77", "#9"},
     # pull-request numbers a history picker prints
     "tests/test_history_choice.py": {"#11", "PR #11"},
     # pull-request numbers and API paths in transcript fixtures and the lines a report prints
