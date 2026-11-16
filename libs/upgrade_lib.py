@@ -584,6 +584,8 @@ def _apply_qdrant_server_replaced(
     `FASTEMBED_CACHE_PATH` (set in code now) and the `TOOL_FIND_DESCRIPTION`/
     `TOOL_STORE_DESCRIPTION` texts (the descriptions live in the server).
     """
+    if _refuse_mixed_old_compact_blocks(mcp_json):
+        return mcp_json, settings_json
     third_party_keys = _third_party_qdrant_keys(mcp_json)
     if len(third_party_keys) != 1:
         print(
@@ -1376,6 +1378,27 @@ def find_old_compact_server_keys(mcp_json: dict) -> "list[str]":
     return _launcher_keys(mcp_json, _QDRANT_SCRIPTS)
 
 
+def _refuse_mixed_old_compact_blocks(mcp_json: dict) -> bool:
+    """
+    True (after saying why) when more than one block launches an old compact
+    server, counting both old shapes together: our `qdrant_mcp_server.py` and
+    the third-party `mcp-server-qdrant`. Both are one set of candidates for the
+    compact block, so more than one match means stop and report every match,
+    never pick one. Each
+    block migration checks this before changing anything, so neither
+    `qdrant-server-replaced` nor `compact-server-renamed` half-migrates an
+    install that has one block of each shape; both stay pending.
+    """
+    keys = find_old_compact_server_keys(mcp_json)
+    if len(keys) <= 1:
+        return False
+    print(
+        "      Not applied: more than one .mcp.json block launches an old compact server "
+        f"({', '.join(keys)}). Leave one, then run upgrade again."
+    )
+    return True
+
+
 def _compact_server_env(mcp_json: dict) -> dict:
     """The `env` of this project's compact server block: the `compact` block, or
     else the one old block found by shape. `{}` when there is none or it is
@@ -1419,6 +1442,8 @@ def _apply_compact_server_renamed(
     """
     keys = _launcher_keys(mcp_json, (_OWN_QDRANT_SCRIPT,))
     if not keys:
+        return mcp_json, settings_json
+    if _refuse_mixed_old_compact_blocks(mcp_json):
         return mcp_json, settings_json
     if len(keys) > 1:
         print(
@@ -1469,7 +1494,9 @@ def _own_compact_server_keys(mcp_json: dict) -> "list[str]":
 def _detect_compact_server_dead_env(mcp_json: dict, settings_json: dict) -> bool:
     servers = mcp_json.get("mcpServers")
     keys = _own_compact_server_keys(mcp_json)
-    if len(keys) != 1 or not isinstance(servers, dict):
+    # An install with more than one old compact block (of either shape) is
+    # waiting on the user; changing one of its blocks would be a partial migration.
+    if len(keys) != 1 or not isinstance(servers, dict) or len(find_old_compact_server_keys(mcp_json)) > 1:
         return False
     env = servers[keys[0]].get("env")
     return isinstance(env, dict) and any(k in env for k in _COMPACT_DEAD_ENV_KEYS)

@@ -2858,6 +2858,47 @@ class CompactServerSettingsRenamed(unittest.TestCase):
         self.assertEqual(self._read("settings.local.json")["enabledMcpjsonServers"], ["qdrant", "memory-bank"])
         self.assertTrue(_repo_migration(self._ID).detect(self.repo))
 
+    def _write_mixed_old_blocks(self):
+        servers = {
+            "qdrant": {"command": "/venv/bin/mcp-server-qdrant", "env": {"COLLECTION_NAME": "p"}},
+            "qdrant-own": {"command": "py", "args": ["/r/mcpservers/qdrant_mcp_server.py"], "env": {"COLLECTION_NAME": "p"}},
+        }
+        (self.repo / ".mcp.json").write_text(json.dumps({"mcpServers": servers}), encoding="utf-8")
+        self._write_settings(allow=["mcp__qdrant__compact_find", "mcp__qdrant-own__compact_find"])
+        self._write_local(enabled=("qdrant", "qdrant-own"))
+
+    def test_one_old_block_of_each_shape_is_refused_by_every_compact_migration(self):
+        # Both old shapes are one set of candidates; more than one match means
+        # stop and report, never migrate one of them.
+        cases = {
+            "auto-yes": {"auto_yes": True},
+            "decline the third-party replacement": {"prompt_fn": lambda m, i, t: m.id != "qdrant-server-replaced"},
+            "decline the rename": {"prompt_fn": lambda m, i, t: m.id != "compact-server-renamed"},
+        }
+        compact_ids = {"qdrant-server-replaced", "compact-server-renamed", "compact-server-dead-env-dropped", self._ID}
+        for label, kw in cases.items():
+            with self.subTest(label):
+                self.setUp()
+                self._write_mixed_old_blocks()
+                mcp_before = json.loads((self.repo / ".mcp.json").read_text(encoding="utf-8"))
+                claude_before = {p.name: p.read_bytes() for p in (self.repo / ".claude").iterdir()}
+                out = io.StringIO()
+                with redirect_stdout(out):
+                    applied = run_upgrade(self.repo, REPO_ROOT, _VENV_PYTHON, **kw)
+                self.assertFalse(compact_ids & set(applied), applied)
+                self.assertIn("(qdrant, qdrant-own)", out.getvalue())
+                mcp_after = json.loads((self.repo / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"]
+                for key in ("qdrant", "qdrant-own"):
+                    self.assertEqual(mcp_after[key], mcp_before["mcpServers"][key])
+                self.assertNotIn("compact", mcp_after)
+                self.assertEqual(
+                    (self.repo / ".claude" / "settings.local.json").read_bytes(), claude_before["settings.local.json"]
+                )
+                self.assertEqual(
+                    self._read("settings.json")["permissions"]["allow"],
+                    ["mcp__qdrant__compact_find", "mcp__qdrant-own__compact_find"],
+                )
+
     def test_ambiguous_old_blocks_leave_the_settings_alone(self):
         block = {"command": "py", "args": ["/r/mcpservers/qdrant_mcp_server.py"]}
         (self.repo / ".mcp.json").write_text(json.dumps({"mcpServers": {"one": block, "two": block}}), encoding="utf-8")
