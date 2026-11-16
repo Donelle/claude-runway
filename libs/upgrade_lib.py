@@ -106,9 +106,12 @@ class Migration:
     arguments.
 
     `apply(mcp_json, settings_json, ctx) -> (mcp_json, settings_json)`:
-    returns NEW dicts (never mutates the inputs in place -- callers/tests
-    rely on being able to compare before/after) with exactly this
-    migration's own fix applied, nothing else.
+    never mutates the inputs in place (callers/tests rely on being able to
+    compare before/after) and returns the documents with exactly this
+    migration's own fix applied, nothing else. A document it changes is a
+    new copy; one it leaves alone, including both when a guard makes the
+    whole call a no-op, may be returned as the same object. `run_upgrade`
+    compares by value, so a no-op is reported as still pending either way.
     """
 
     id: str
@@ -581,8 +584,10 @@ def _apply_qdrant_server_replaced(
         resolved by `resolve_compact_embedding_model`, so an install whose
         compacts were stored before that setting existed is pinned to
         `BAAI/bge-small-en`, never the new default, which would orphan them.
-        (The `local-compress` block itself is left alone: it keeps working, it
-        just no longer serves the compact tools, and `init` rewrites it.)
+        (The `local-compress` block itself is left alone here: it keeps
+        working, it just no longer serves the compact tools. Its leftover
+        Qdrant and compact keys are removed afterwards by
+        `local-compress-dead-env-dropped`, which waits for this step.)
 
     What is dropped, because the new server has no use for it: `HF_HUB_OFFLINE`,
     `FASTEMBED_CACHE_PATH` (set in code now) and the `TOOL_FIND_DESCRIPTION`/
@@ -1511,6 +1516,103 @@ def _apply_compact_server_dead_env(
     return mcp_json, settings_json
 
 
+# ---------------------------------------------------------------------------
+# local-compress-dead-env-dropped
+# ---------------------------------------------------------------------------
+#
+# Every `init` from before the compact tools moved wrote the Qdrant URL/key and
+# the compact settings into the `local-compress` block, because that server
+# held the compact tools then. `compress_mcp_server.py` reads none of them now,
+# but they make the block look as if it needs Qdrant. Two things still read
+# them, which is why this has guards instead of a plain pop:
+#   - `qdrant-server-replaced` falls back to `local-compress`'s
+#     QDRANT_URL/QDRANT_API_KEY and reads its COMPACT_COLLECTION, so nothing is
+#     removed while a third-party block is still waiting on that carry-over;
+#   - `resolve_compact_embedding_model` (used by `init` re-runs too) keeps
+#     `local-compress`'s EMBEDDING_MODEL when the compact block has no
+#     COMPACT_EMBEDDING_MODEL. In that case the key is the only record of the
+#     model the compacts were stored with, and dropping it would make a later
+#     `init` pin the legacy model and orphan them, so it stays.
+
+_LOCAL_COMPRESS_DEAD_ENV_KEYS = ("QDRANT_URL", "QDRANT_API_KEY", "COMPACT_COLLECTION")
+_LOCAL_COMPRESS_EMBEDDING_KEY = "EMBEDDING_MODEL"
+# Any string the resolver can never return from the config itself, so a
+# with/without comparison cannot be fooled by its last-resort fallback.
+_RESOLVER_PROBE_MODEL = "\0no-project-model"
+
+
+def _embedding_model_droppable(mcp_json: dict) -> bool:
+    """True when removing `local-compress`'s EMBEDDING_MODEL does not change
+    which compact model `resolve_compact_embedding_model` picks, i.e. the
+    compact block already records it (or a blank value was never used)."""
+    without = copy.deepcopy(mcp_json)
+    _local_compress_env(without).pop(_LOCAL_COMPRESS_EMBEDDING_KEY, None)
+    return resolve_compact_embedding_model(mcp_json, _RESOLVER_PROBE_MODEL) == resolve_compact_embedding_model(
+        without, _RESOLVER_PROBE_MODEL
+    )
+
+
+def _detect_local_compress_dead_env(mcp_json: dict, settings_json: dict) -> bool:
+    """
+    True when the `local-compress` env still has QDRANT_URL, QDRANT_API_KEY or
+    COMPACT_COLLECTION, or an EMBEDDING_MODEL that is (or, once a pending
+    `qdrant-server-replaced` writes COMPACT_EMBEDDING_MODEL in this same run,
+    will be) safe to drop. False with no `local-compress` block (a
+    `--qdrant-only` install), and for one whose only leftover is an
+    EMBEDDING_MODEL that is still the compact model's sole record, so that
+    install is not offered a migration that could never apply.
+
+    Also False while more than one old compact block (of either shape) is
+    left: that install is waiting on the user to keep one, the other compact
+    migrations refuse until then, and trimming `local-compress` meanwhile
+    would be a partial migration (same rule as `compact-server-dead-env-dropped`).
+    """
+    if len(find_old_compact_server_keys(mcp_json)) > 1:
+        return False
+    env = _local_compress_env(mcp_json)
+    if any(key in env for key in _LOCAL_COMPRESS_DEAD_ENV_KEYS):
+        return True
+    if _LOCAL_COMPRESS_EMBEDDING_KEY not in env:
+        return False
+    return bool(_third_party_qdrant_keys(mcp_json)) or _embedding_model_droppable(mcp_json)
+
+
+def _apply_local_compress_dead_env(
+    mcp_json: dict, settings_json: dict, ctx: MigrationContext
+) -> "tuple[dict, dict]":
+    """
+    Removes QDRANT_URL, QDRANT_API_KEY and COMPACT_COLLECTION from the
+    `local-compress` env, and EMBEDDING_MODEL when `_embedding_model_droppable`
+    says so. Every other key in it (including any the user added), every other
+    server and the whole of `settings.json` are left as they were.
+
+    A no-op while any block still launches the third-party qdrant server:
+    `qdrant-server-replaced` reads these values to build the compact block, so
+    they must survive until it has. That covers it being declined, and it
+    refusing over a clashing `compact` block. (An install with more than one
+    old compact block, of either shape, is never offered this at all: see
+    `detect`, re-checked here.) A third-party block next to a `compact` block
+    is the user's own server, not a pending carry-over (see
+    `_third_party_qdrant_keys`), so it does not hold this back. Checked
+    here rather than in `detect` because `run_upgrade` computes the pending
+    list once, before anything runs: when both are accepted in one run,
+    `qdrant-server-replaced` (earlier in `MIGRATIONS`) has already replaced the
+    block by the time this runs; otherwise this changes nothing and
+    `run_upgrade` reports it as still pending (same pattern as
+    `local-compress-savings-db-inert`).
+    """
+    if _third_party_qdrant_keys(mcp_json) or len(find_old_compact_server_keys(mcp_json)) > 1:
+        return mcp_json, settings_json
+    drop_embedding = _embedding_model_droppable(mcp_json)
+    mcp_json = copy.deepcopy(mcp_json)
+    env = _local_compress_env(mcp_json)
+    for key in _LOCAL_COMPRESS_DEAD_ENV_KEYS:
+        env.pop(key, None)
+    if drop_embedding:
+        env.pop(_LOCAL_COMPRESS_EMBEDDING_KEY, None)
+    return mcp_json, settings_json
+
+
 def _read_json_object(path: Path) -> "Optional[dict]":
     """A JSON object read from `path`, or None when the file is missing,
     unreadable or not an object -- a file this migration cannot safely edit."""
@@ -1718,8 +1820,9 @@ def _apply_cb_indexer_claude_md_renamed(target_repo: Path, ctx: Optional[Migrati
 # matters where one migration's guard depends on another:
 # record-session-id-sessionstart needs record-session-id-hooks-missing to
 # appear (and be applied) earlier in this list,
-# local-compress-savings-db-inert needs analytics-server-missing earlier, and
-# codebase-indexer-script-renamed needs mcp-server-scripts-moved earlier.
+# local-compress-savings-db-inert needs analytics-server-missing earlier,
+# codebase-indexer-script-renamed needs mcp-server-scripts-moved earlier, and
+# local-compress-dead-env-dropped needs qdrant-server-replaced earlier.
 MIGRATIONS: "list[Migration]" = [
     Migration(
         id="memory-bank-server-missing",
@@ -1811,10 +1914,10 @@ MIGRATIONS: "list[Migration]" = [
         note=(
             "Restart Claude Code to load the new server. Your stored compacts stay readable: "
             "COMPACT_EMBEDDING_MODEL is pinned to the model they were stored with (BAAI/bge-small-en for "
-            "installs that never set one). Do NOT change it once you have saved compacts. Re-run "
-            "`claude-runway-setup init` to also drop the compact settings the local-compress block no "
-            "longer uses; `/cr-compact` and `/cr-resume` copies installed under ~/.claude/skills/ are "
-            "refreshed by `upgrade` itself."
+            "installs that never set one). Do NOT change it once you have saved compacts. The Qdrant "
+            "and compact settings the local-compress block no longer uses are removed by "
+            "local-compress-dead-env-dropped, later in this list; `/cr-compact` and `/cr-resume` copies "
+            "installed under ~/.claude/skills/ are refreshed by `upgrade` itself."
         ),
         detect=_detect_qdrant_server_replaced,
         apply=_apply_qdrant_server_replaced,
@@ -2011,6 +2114,29 @@ MIGRATIONS: "list[Migration]" = [
         note="Restart Claude Code afterwards. Your codebase-indexer block is not changed.",
         detect=_detect_compact_server_dead_env,
         apply=_apply_compact_server_dead_env,
+    ),
+    # Must stay AFTER qdrant-server-replaced: that one reads these keys to
+    # build the compact block, and this one's apply is a no-op until it has.
+    Migration(
+        id="local-compress-dead-env-dropped",
+        title="Drop the Qdrant and compact settings from the local-compress block in .mcp.json",
+        kind="remove",
+        description=(
+            "This project's local-compress block still carries QDRANT_URL, QDRANT_API_KEY, "
+            "COMPACT_COLLECTION and/or EMBEDDING_MODEL, left over from when it also served the "
+            "conversation-compact tools. That server reads none of them now; the compact block has its "
+            "own copies. Removes just those keys from the local-compress block; every other value "
+            "(including CLAUDE_RUNWAY_LMSTUDIO_URL/MODEL and CLAUDE_RUNWAY_TRACK_SAVINGS, which it does "
+            "read) and every other server is left untouched. EMBEDDING_MODEL is kept when the compact "
+            "block has no COMPACT_EMBEDDING_MODEL, since it is then the only record of the model your "
+            "compacts were stored with."
+        ),
+        note=(
+            "Restart Claude Code afterwards. If qdrant-server-replaced is also pending, this changes "
+            "nothing until that one has carried your Qdrant URL/key and compact settings over."
+        ),
+        detect=_detect_local_compress_dead_env,
+        apply=_apply_local_compress_dead_env,
     ),
 ]
 
