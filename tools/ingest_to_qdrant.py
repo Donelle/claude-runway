@@ -126,14 +126,27 @@ async def ingest(args):
     # collection; a run without the flag never touches the manifest and never
     # locks. Released here however the run ends, including the sys.exit()
     # calls _ingest makes on an error.
-    manifest_lock = ManifestLock(Path(args.repo_path).resolve())
+    #
+    # --repo-path is resolved once, here, and refused unless it is a directory.
+    # iter_files yields nothing for a missing directory, so a typo used to print
+    # "Found 0 chunks ... Done." and exit 0 -- and with --reset the filtered
+    # delete had already emptied the code index by then. Checked before the
+    # lock, the memory-bank lookup and any Qdrant client, so a refused run
+    # touches nothing. is_dir(), not exists(): a file is refused too, matching
+    # the MCP tools (index_repo/sync_repo/preview_index). An existing empty
+    # directory is still a legitimate 0-chunk run.
+    repo_path = Path(args.repo_path).resolve()
+    if not repo_path.is_dir():
+        print(f"Error: {repo_path} is not a directory.", file=sys.stderr)
+        sys.exit(1)
+    manifest_lock = ManifestLock(repo_path)
     try:
-        await _ingest(args, manifest_lock)
+        await _ingest(args, manifest_lock, repo_path)
     finally:
         manifest_lock.release()
 
 
-async def _ingest(args, manifest_lock: ManifestLock):
+async def _ingest(args, manifest_lock: ManifestLock, repo_path: Path):
     # --reset used to be a raw delete_collection with none of the protections
     # cb_indexer_index_repo(reset=True) has.
     # Layer 1 (name refusal), ported from cb_indexer_index_repo: the shared memory-bank
@@ -153,7 +166,7 @@ async def _ingest(args, manifest_lock: ManifestLock):
     # only the shell left a custom name unprotected here while cb_indexer_index_repo
     # refused it. resolve_memory_bank_collection also reads --repo-path's
     # .mcp.json, after the flag and the shell variable.
-    memory_bank = resolve_memory_bank_collection(args.memory_bank_collection, args.repo_path)
+    memory_bank = resolve_memory_bank_collection(args.memory_bank_collection, repo_path)
     if memory_bank.warning:
         print(f"Warning: {memory_bank.warning}", file=sys.stderr)
     reserved_by = memory_bank.reserved_source(args.collection)
@@ -176,7 +189,6 @@ async def _ingest(args, manifest_lock: ManifestLock):
     # "preview only" contract. `--reset --dry-run` likewise must not delete.
     embedding_provider = None
     budgets: dict = {}
-    repo_path = Path(args.repo_path).resolve()
 
     # --write-manifest: a preview writes nothing, the manifest
     # included, so the flag only counts on a real run.
