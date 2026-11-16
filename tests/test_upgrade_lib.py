@@ -2813,7 +2813,9 @@ class CompactServerSettingsRenamed(unittest.TestCase):
         self._write_settings()
         self._write_local()
         before_local = (self.repo / ".claude" / "settings.local.json").read_bytes()
-        self._upgrade(prompt_fn=lambda m, i, t: m.id != "compact-server-renamed")
+        applied = self._upgrade(prompt_fn=lambda m, i, t: m.id != "compact-server-renamed")
+        # A guarded no-op is never reported as applied.
+        self.assertNotIn(self._ID, applied)
         self.assertEqual((self.repo / ".claude" / "settings.local.json").read_bytes(), before_local)
         settings = self._read("settings.json")
         self.assertIn("mcp__qdrant__compact_find", settings["permissions"]["allow"])
@@ -2836,6 +2838,25 @@ class CompactServerSettingsRenamed(unittest.TestCase):
         (self.repo / ".claude" / "settings.json").write_text(json.dumps(data), encoding="utf-8")
         self._upgrade(auto_yes=True)
         self.assertIn(block, self._read("settings.json")["hooks"]["PostToolUse"])
+
+    def test_an_occupied_compact_key_is_reported_as_still_pending_not_applied(self):
+        # The user's own block already holds `compact`, so the rename is blocked
+        # and the settings step has nothing it may do yet.
+        (self.repo / ".mcp.json").write_text(
+            json.dumps({"mcpServers": {"qdrant": {"command": "py", "args": ["/r/mcpservers/qdrant_mcp_server.py"]},
+                                       "compact": {"command": "node", "args": ["theirs.js"]}}}),
+            encoding="utf-8",
+        )
+        self._write_settings()
+        self._write_local()
+        out = io.StringIO()
+        with redirect_stdout(out):
+            applied = run_upgrade(self.repo, REPO_ROOT, _VENV_PYTHON, auto_yes=True)
+        self.assertNotIn(self._ID, applied)
+        self.assertIn(f"so {self._ID} stays pending", out.getvalue())
+        self.assertIn("had nothing to change (still pending)", out.getvalue())
+        self.assertEqual(self._read("settings.local.json")["enabledMcpjsonServers"], ["qdrant", "memory-bank"])
+        self.assertTrue(_repo_migration(self._ID).detect(self.repo))
 
     def test_ambiguous_old_blocks_leave_the_settings_alone(self):
         block = {"command": "py", "args": ["/r/mcpservers/qdrant_mcp_server.py"]}
@@ -2891,7 +2912,8 @@ class CompactServerSettingsRenamed(unittest.TestCase):
         self._write_third_party_mcp("qdrant")
         self._write_local()
         before = (self.repo / ".claude" / "settings.local.json").read_bytes()
-        self._upgrade(prompt_fn=lambda m, i, t: m.id != "qdrant-server-replaced")
+        applied = self._upgrade(prompt_fn=lambda m, i, t: m.id != "qdrant-server-replaced")
+        self.assertNotIn(self._ID, applied)
         self.assertEqual((self.repo / ".claude" / "settings.local.json").read_bytes(), before)
 
     def test_the_old_key_is_never_guessed_once_the_block_is_renamed(self):

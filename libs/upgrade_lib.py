@@ -2426,6 +2426,16 @@ def run_upgrade(
             skipped += 1
             continue
         repo_migration.apply(target_repo, ctx)
+        # A guarded apply can return without changing anything (e.g.
+        # compact-server-settings-renamed when compact-server-renamed was
+        # declined or another block already holds `compact`). Each repo
+        # migration's detect() reads the disk state its apply clears, so if it
+        # still detects, nothing was done: count it the way the config loop
+        # counts a no-op, still pending, never as applied.
+        if repo_migration.detect(target_repo):
+            print(f"      Not applied: its precondition isn't met yet, so {repo_migration.id} stays pending.")
+            noop += 1
+            continue
         applied.append(repo_migration.id)
 
     if dry_run:
