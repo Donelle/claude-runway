@@ -9,7 +9,7 @@ It replaces the prose in a project's `CLAUDE.md` that asks Claude to run `cb_ind
 - `git`.
 - claude-runway's own MCP tools, configured in the project: `compact`, `codebase-indexer`, `local-compress` and `memory-bank`. Run `/cr-setup` if they are not.
 
-Nothing else is required. `gh` (GitHub) and `az` (Azure DevOps, with the `azure-devops` extension) are optional extras: when one is missing, not signed in, slow or failing, only its own section of the report says `skipped: <reason>`, and every other section is unaffected. No step below may stop because of them.
+Nothing else is required: bash is not a prerequisite on Windows (step 1 runs `facts.ps1` there). `gh` (GitHub) and `az` (Azure DevOps, with the `azure-devops` extension) are optional extras: when one is missing, not signed in, slow or failing, only its own section of the report says `skipped: <reason>`, and every other section is unaffected. No step below may stop because of them.
 
 ## Usage
 
@@ -19,7 +19,7 @@ Run `/cr-load-context` from the root of a project. It loads that project (the cu
 
 ### 0. Locate the facts script
 
-`facts.sh` sits next to this file. Claude Code prints a "Base directory for this skill: <path>" line when it loads a skill: the script is `<that path>/facts.sh`. If there is no such line, use `~/.claude/skills/cr-load-context/facts.sh`, then `skills/cr-load-context/facts.sh` in a claude-runway checkout. If none exists, skip the script and do the same by hand (step 1's facts bullet below).
+`facts.sh` and `facts.ps1` sit next to this file. Claude Code prints a "Base directory for this skill: <path>" line when it loads a skill: the script is `<that path>/facts.sh`. If there is no such line, use `~/.claude/skills/cr-load-context/facts.sh`, then `skills/cr-load-context/facts.sh` in a claude-runway checkout. On Windows the user-level folder is `$HOME\.claude\skills\cr-load-context\`. If none exists, use the matching script for the platform ("Which script to run" after step 1): `facts.ps1` on Windows. If none exists, skip the script and get the facts by hand (the last bullet there).
 
 ### 1. Round 1: everything that needs no reading, in ONE message
 
@@ -32,7 +32,7 @@ Send all of these as parallel tool calls in a single message:
   bash "<skill folder>/facts.sh" --porcelain
   ```
 
-  It prints git state, the entry docs (README, `CLAUDE.md`, a `docs/` listing with each page's title), whether the sync manifest exists, and the forge's open pull requests (GitHub through `gh`, Azure DevOps through `az`). It never reads `.mcp.json` and never prints a credential. If bash is not available, get the same facts by hand: `git branch --show-current`, `git status --porcelain`, the origin URL with any credential removed, and `gh pr list --state open --limit 30` or `az repos pr list --status active` when that CLI exists. Remove the credential in the same command that reads the URL: `git remote get-url origin | sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://)[^/]*@#\1#'`, or in PowerShell `(git remote get-url origin) -replace '^([A-Za-z][A-Za-z0-9+.-]*://)[^/]*@','$1'`. Never run a plain `git remote get-url origin` or `git config remote.origin.url`: an HTTPS origin can carry a password or token, and the output goes straight into your context. Read files with Read.
+  It prints git state, the entry docs (README, `CLAUDE.md`, a `docs/` listing with each page's title), whether the sync manifest exists, and the forge's open pull requests (GitHub through `gh`, Azure DevOps through `az`). It never reads `.mcp.json` and never prints a credential. On Windows run `facts.ps1` instead ("Which script to run" below); it prints the same sections. Never run a plain `git remote get-url origin` or `git config remote.origin.url`: an HTTPS origin can carry a password or token, and the output goes straight into your context. Read files with Read.
 - **`cb_indexer_get_collection_info`** (`codebase-indexer`): does the index have data?
 - **`list_local_models`** (`local-compress`): is LM Studio up, and is a model loaded?
 - **`recall`** (`memory-bank`): `query` set to the project's name plus "decisions, corrections and gotchas". It defaults to this project's memories plus general ones; leave `repo` and `all_repos` alone. Each hit's `summary` is what to report; its `description` is long, so read it only for a memory that bears on this session.
@@ -40,6 +40,12 @@ Send all of these as parallel tool calls in a single message:
 A tool that is not connected, or errors, is a status line in the report, not a reason to stop: carry on with the rest.
 
 Never read or print `.mcp.json` yourself: an inline `QDRANT_API_KEY` would reach the model context. What is configured is learned from which tools above exist and answer.
+
+### Which script to run
+
+- **macOS and Linux:** `bash "<skill folder>/facts.sh" --porcelain`.
+- **Windows:** `powershell -NoProfile -ExecutionPolicy Bypass -File "<skill folder>acts.ps1" --porcelain` (`pwsh` works the same; Windows PowerShell 5.1 is always there). `facts.ps1` prints the same sections in the same words as `facts.sh`, so the rest of this skill does not care which ran. **Do not assume bash exists on Windows, and never use WSL for this** (`wsl`, or the System32 `bash.exe`): WSL has its own filesystem view and its own `git`, `gh` and `az` with separate sign-ins, so its facts would describe a different environment. Keep `--porcelain` on the command line, bare: the compress hook reads it as "exact output, do not summarize".
+- **If the script cannot run at all** (it is missing, or PowerShell blocks scripts): get the facts by hand with `git branch --show-current`, `git status --porcelain`, the origin URL with any credential removed in the same command that reads it (`git remote get-url origin | sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://)[^/]*@#\1#'`, or in PowerShell `(git remote get-url origin) -replace '^([A-Za-z][A-Za-z0-9+.-]*://)[^/]*@','$1'`), a check that `.qdrant_index_manifest.json` exists, and `gh pr list --state open --limit 30` or `az repos pr list --status active` when that CLI exists; a failing optional CLI is `skipped: <reason>`, never a stop. In PowerShell quote every `--json` list (`--json 'number,title'`): an unquoted comma makes an array and `gh` rejects it.
 
 ### 2. Read what the project says to read
 

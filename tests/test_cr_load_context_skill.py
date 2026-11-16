@@ -114,6 +114,26 @@ class CrLoadContextSkillTest(unittest.TestCase):
         report = _section(self.text, "### 4. Report")
         self.assertIn("suggest `cb_indexer_index_repo`", report)
 
+    def test_windows_runs_facts_ps1_and_never_assumes_bash_or_wsl(self):
+        text = _section(self.text, "### Which script to run", "### 2.")
+        self.assertIn("facts.ps1", text)
+        self.assertIn("-ExecutionPolicy Bypass -File", text)
+        self.assertIn("--porcelain", text)
+        self.assertIn("Do not assume bash exists on Windows", text)
+        self.assertIn("never use WSL", text)
+        prereq = _section(self.text, "## Prerequisites", "## Usage")
+        self.assertIn("bash is not a prerequisite on Windows", prereq)
+
+    def test_the_by_hand_fallback_quotes_the_json_list_for_powershell(self):
+        # An unquoted `--json a,b` is an array in PowerShell and gh rejects it.
+        text = _section(self.text, "### Which script to run", "### 2.")
+        self.assertIn("--json 'number,title'", text)
+
+    def test_facts_sh_is_pinned_to_lf_line_endings(self):
+        # A CRLF checkout (git autocrlf on Windows) breaks a bash script, so the repo says LF.
+        attrs = (REPO_ROOT / ".gitattributes").read_text(encoding="utf-8")
+        self.assertIn("*.sh text eol=lf", attrs)
+
     def test_the_script_is_run_with_a_bare_porcelain_flag(self):
         self.assertIn('bash "<skill folder>/facts.sh" --porcelain', self.text)
         # The hook exempts the real command line, so the output is never summarized.
@@ -236,7 +256,7 @@ class CrLoadContextSkillTest(unittest.TestCase):
             plan = {p.name: p for p in lib.plan_skill_installs(REPO_ROOT, Path(d))}
         self.assertIn("cr-load-context", plan)
         self.assertEqual(plan["cr-load-context"].action, "install")
-        self.assertEqual([e.name for e in plan["cr-load-context"].extra_files], ["facts.sh"])
+        self.assertEqual([e.name for e in plan["cr-load-context"].extra_files], ["facts.ps1", "facts.sh"])
 
     def test_the_wheel_ships_the_script_too(self):
         # setup.py's data_files() globs each skill folder; a script beside SKILL.md must be in it,
@@ -253,7 +273,7 @@ class CrLoadContextSkillTest(unittest.TestCase):
             os.chdir(previous)
         self.assertEqual(
             targets["src/skills/cr-load-context"],
-            ["skills/cr-load-context/SKILL.md", "skills/cr-load-context/facts.sh"],
+            ["skills/cr-load-context/SKILL.md", "skills/cr-load-context/facts.ps1", "skills/cr-load-context/facts.sh"],
         )
         self.assertEqual(targets["src/skills/cr-doctor"], ["skills/cr-doctor/SKILL.md"])
 
@@ -262,6 +282,7 @@ class CrLoadContextSkillTest(unittest.TestCase):
         skills = (REPO_ROOT / "docs" / "skills-and-hooks.md").read_text(encoding="utf-8")
         self.assertIn("`skills/cr-load-context/SKILL.md`", files)
         self.assertIn("`skills/cr-load-context/facts.sh`", files)
+        self.assertIn("`skills/cr-load-context/facts.ps1`", files)
         self.assertIn("| `cr-load-context` |", skills)
         self.assertIn("cr-load-context", (REPO_ROOT / "docs" / "installation.md").read_text(encoding="utf-8"))
         self.assertIn("/cr-load-context", (REPO_ROOT / "templates" / "CLAUDE.md.template").read_text(encoding="utf-8"))
@@ -392,6 +413,9 @@ exit 0
     def path_without(self, *names):
         """The caller's PATH with `names` hidden: a directory holding one of them is
         replaced by a directory of symlinks to everything else in it."""
+        # On Windows an executable is `gh.exe` / `az.cmd`, never a bare `gh`, so each name
+        # is hidden under every extension the shell would resolve it with.
+        names = tuple(n + ext for n in names for ext in ("", ".exe", ".cmd", ".bat"))
         dirs = []
         for d in os.environ.get("PATH", "").split(os.pathsep):
             if d and any((Path(d) / n).exists() for n in names):
@@ -446,10 +470,13 @@ class RunLimitedTest(_Env):
         return text[start: text.index("\n}\n", start) + 3]
 
     def _run(self, body: str, *, hide_timeout: bool):
-        path = self.path_without("timeout", "gtimeout") if hide_timeout else os.environ.get("PATH", "")
-        env = dict(os.environ, PATH=path)
+        # Hide timeout/gtimeout by overriding `command -v` inside the shell, not by editing
+        # PATH: on Windows Git Bash `timeout` lives in /usr/bin beside bash itself, so
+        # shadowing that directory would hide everything else the script needs too.
+        hide = ('command() { case "$2" in timeout|gtimeout) return 1;; esac; builtin command "$@"; }\n'
+                if hide_timeout else "")
         start = time.monotonic()
-        proc = subprocess.run([BASH, "-c", self._function() + "\n" + body], env=env,
+        proc = subprocess.run([BASH, "-c", hide + self._function() + "\n" + body], env=dict(os.environ),
                               capture_output=True, text=True, timeout=60)
         return proc, time.monotonic() - start
 
@@ -463,6 +490,10 @@ class RunLimitedTest(_Env):
     def test_the_perl_fallback_kills_the_whole_process_group_not_just_the_wrapper(self):
         if shutil.which("perl") is None:
             self.skipTest("no perl")
+        if sys.platform == "win32":
+            # Git for Windows always ships timeout(1), so this fallback never runs there; its
+            # msys perl cannot exec a Windows-path script (rc=127), which says nothing about macOS.
+            self.skipTest("the perl fallback is a macOS-only path; Git Bash has timeout")
         proc, elapsed = self._run(f'run_limited 2 "{self._wrapper()}"; echo "rc=$?"', hide_timeout=True)
         self.assertIn("rc=142", proc.stdout)
         self.assertLess(elapsed, 15, "the call was not bounded by its limit")
@@ -749,6 +780,128 @@ class FactsNoTicketTest(_Env):
         out, _ = self.run_facts(env={"STUB_AZ_REPOS": "Contoso.Widgets.Api\tfalse", "STUB_AZ_PRS": prs})
         self.assertIn("<- current branch", out)
         self.assertNotIn("## ticket", out)
+
+
+POWERSHELL = shutil.which("pwsh") or shutil.which("powershell")
+GH_FACTS_PS1 = REPO_ROOT / ".claude" / "skills" / "cr-gh-load-context" / "facts.ps1"
+FACTS_PS1 = SKILL_DIR / "facts.ps1"
+
+
+class PowerShellScriptsTest(unittest.TestCase):
+    """The two facts.ps1 files are the Windows default (bash is not assumed there). They
+    are checked as text on every platform, and RUN for real wherever PowerShell exists."""
+
+    def test_the_scripts_are_ascii_only(self):
+        # Windows PowerShell 5.1 reads a BOM-less file as the ANSI codepage, so a non-ASCII
+        # character (an em dash in a comment) would corrupt it there.
+        for path in (FACTS_PS1, GH_FACTS_PS1):
+            with self.subTest(path=path.name):
+                path.read_bytes().decode("ascii")
+
+    def test_the_scripts_avoid_powershell_7_only_syntax(self):
+        # No ternary, null-coalescing or pipeline chains: Windows PowerShell 5.1 must parse them.
+        for path in (FACTS_PS1, GH_FACTS_PS1):
+            text = path.read_text(encoding="ascii")
+            code = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
+            for bad in (" ?? ", "&& ", " ? $", "?."):
+                with self.subTest(path=path.name, bad=bad):
+                    self.assertNotIn(bad, code)
+
+    def test_the_scripts_force_utf8_and_never_read_mcp_json(self):
+        for path in (FACTS_PS1, GH_FACTS_PS1):
+            text = path.read_text(encoding="ascii")
+            self.assertIn("[Console]::OutputEncoding", text)
+            code = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
+            self.assertNotIn(".mcp.json", code)
+
+    def test_the_contributor_skill_points_windows_at_its_script(self):
+        text = (REPO_ROOT / ".claude" / "skills" / "cr-gh-load-context" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("facts.ps1", text)
+        self.assertIn("Do not assume bash exists on Windows", text)
+        self.assertIn("never use WSL", text)
+
+
+@unittest.skipIf(POWERSHELL is None, "no PowerShell")
+class FactsPowerShellTest(_Env):
+    """facts.ps1 run for real against throwaway repos, with the real gh hidden or stubbed
+    out of the way (no network, no real forge). Same cases as the bash script, same words."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name).resolve()
+        self.repo = self.tmp / "project"
+        self.repo.mkdir()
+        self.stubs = self.tmp / "stubs"
+        self.stubs.mkdir()
+        self.log = self.tmp / "calls.log"
+        self.log.write_text("")
+        self.shadow_dirs = []
+
+    def run_ps(self, *, hide=("gh", "az"), env=None):
+        full_env = dict(os.environ, PATH=self.path_without(*hide))
+        full_env.update(env or {})
+        proc = subprocess.run(
+            [POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(FACTS_PS1), "--porcelain"],
+            cwd=self.repo, env=full_env, capture_output=True, text=True, encoding="utf-8", timeout=180,
+        )
+        return proc.stdout.replace("\r\n", "\n"), proc.returncode
+
+    def test_no_origin_prints_every_core_section_and_skips_the_forge(self):
+        self.make_repo()
+        out, rc = self.run_ps()
+        self.assertEqual(rc, 0)
+        for heading in ("## git", "## entry docs", "## index", "## forge"):
+            self.assertIn(heading, out)
+        self.assertIn("branch: main", out)
+        self.assertIn("README: README.md", out)
+        self.assertIn("CLAUDE.md: absent", out)
+        self.assertIn("sync manifest: ABSENT", out)
+        self.assertIn("forge facts skipped: no origin remote", out)
+
+    def test_not_a_git_repository_still_exits_zero_with_its_sections(self):
+        out, rc = self.run_ps()
+        self.assertEqual(rc, 0)
+        self.assertIn("not a git repository", out)
+        self.assertIn("## entry docs", out)
+
+    def test_gh_missing_skips_only_the_forge_and_never_prints_the_credential(self):
+        self.make_repo(origin="https://user:s3cr3t-token@github.com/acme/widgets.git")
+        out, rc = self.run_ps()
+        self.assertEqual(rc, 0)
+        self.assertIn("forge: GitHub (acme/widgets)", out)
+        self.assertIn("forge facts skipped: gh is not installed", out)
+        self.assertIn("origin: https://github.com/acme/widgets.git", out)
+        self.assertNotIn("s3cr3t-token", out)
+        for heading in ("## git", "## entry docs", "## index"):
+            self.assertIn(heading, out)
+
+    def test_azure_devops_origin_is_parsed_and_az_missing_skips_only_the_forge(self):
+        self.make_repo(origin="https://user:tok@contoso.visualstudio.com/DefaultCollection/Proj%20X/_git/repo")
+        out, _ = self.run_ps()
+        self.assertIn("forge: Azure DevOps (org contoso, project Proj X, repo repo)", out)
+        self.assertIn("forge facts skipped: az is not installed", out)
+        self.assertNotIn("tok@", out)
+
+    def test_an_unknown_host_is_skipped_with_its_name(self):
+        self.make_repo(origin="https://git.example.com/a/b.git")
+        out, _ = self.run_ps()
+        self.assertIn("forge facts skipped: origin host git.example.com is neither GitHub nor Azure DevOps", out)
+
+    def test_it_matches_facts_sh_section_for_section(self):
+        # The report must not depend on which script ran, so on a repo both can read the
+        # two outputs are identical.
+        if BASH is None:
+            self.skipTest("no bash to compare against")
+        self.make_repo(
+            origin="git@ssh.dev.azure.com:v3/contoso/Proj/repo",
+            files={"CLAUDE.md": "x\n", "docs/a.md": "# Page A\n\nbody\n", "docs/b.md": "no heading\n"},
+        )
+        ps_out, _ = self.run_ps()
+        env = dict(os.environ, PATH=self.path_without("gh", "az"))
+        sh = subprocess.run([BASH, str(FACTS), "--porcelain"], cwd=self.repo, env=env,
+                            capture_output=True, text=True, encoding="utf-8", timeout=120)
+        self.assertEqual(ps_out, sh.stdout.replace("\r\n", "\n"))
 
 
 if __name__ == "__main__":

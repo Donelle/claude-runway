@@ -1,0 +1,2 @@
+# facts.sh must keep LF line endings: a CRLF copy (git autocrlf on Windows) fails under bash.
+*.sh text eol=lf
