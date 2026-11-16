@@ -525,26 +525,26 @@ class EmbeddingModelFlag(unittest.TestCase):
         written = json.loads((self.target_repo / ".mcp.json").read_text(encoding="utf-8"))
         return {
             s: written["mcpServers"][s]["env"]["EMBEDDING_MODEL"]
-            for s in ("compact", "codebase-indexer", "memory-bank")
+            for s in ("codebase-indexer", "memory-bank")
         }
 
     def test_flag_is_written_into_code_blocks_only_and_survives_a_plain_rerun(self):
         self.mod.cmd_init(_init_args(self.target_repo, embedding_model=self.CUSTOM, dry_run=False))
         models = self._written_models()
-        self.assertEqual({models["compact"], models["codebase-indexer"]}, {self.CUSTOM})
+        self.assertEqual({models["codebase-indexer"]}, {self.CUSTOM})
         # memory-bank's model is its own value, never taken from --embedding-model.
         self.assertNotEqual(models["memory-bank"], self.CUSTOM)
         # A plain re-run (no flag) must not reset it to the template default.
         self.mod.cmd_init(_init_args(self.target_repo, dry_run=False))
         again = self._written_models()
-        self.assertEqual({again["compact"], again["codebase-indexer"]}, {self.CUSTOM})
+        self.assertEqual({again["codebase-indexer"]}, {self.CUSTOM})
         self.assertEqual(again["memory-bank"], models["memory-bank"])
 
     def test_memory_bank_flag_is_written_into_memory_bank_block_only(self):
         self.mod.cmd_init(_init_args(self.target_repo, memory_bank_embedding_model=self.CUSTOM, dry_run=False))
         models = self._written_models()
         self.assertEqual(models["memory-bank"], self.CUSTOM)
-        self.assertNotEqual(models["compact"], self.CUSTOM)
+        self.assertNotEqual(models["codebase-indexer"], self.CUSTOM)
         # Sticky across a plain re-run.
         self.mod.cmd_init(_init_args(self.target_repo, dry_run=False))
         self.assertEqual(self._written_models()["memory-bank"], self.CUSTOM)

@@ -302,7 +302,7 @@ def build_mcp_servers(
     unique (see `_collections_for_project`'s sibling-scan there, which finds other
     collections for the same project by matching this exact prefix).
     Deliberately NOT derived from `collection_name` here the way
-    `COLLECTION_NAME` on the qdrant/codebase-indexer servers is: found in review that
+    `COLLECTION_NAME` on the codebase-indexer server is: found in review that
     doing so silently changes this value on EVERY
     already-configured project the moment its `.mcp.json` gets regenerated
     (a plain re-run with no new flags, the exact "safe to re-run" workflow
@@ -421,9 +421,9 @@ def build_mcp_servers(
     server stores uncompressed when LM Studio is not there.
 
     `embedding_model`, if blank, leaves the template's own
-    `EMBEDDING_MODEL` default in place; otherwise it is written into the two
-    code-index blocks (`qdrant`, `codebase-indexer`), which must agree on one
-    model. It is never written into `memory-bank`: that block's
+    `EMBEDDING_MODEL` default in place; otherwise it is written into the
+    `codebase-indexer` block, the only one that reads it (the `compact` block
+    has no `COLLECTION_NAME` or `EMBEDDING_MODEL`). It is never written into `memory-bank`: that block's
     model is `memory_bank_embedding_model`, a separate value. Like
     everything else here this function does not detect re-runs itself:
     deciding WHICH value to pass (explicit flag > the target's existing
@@ -447,7 +447,6 @@ def build_mcp_servers(
     compact["args"] = [f"{tools_repo_str}/mcpservers/compact_mcp_server.py"]
     compact["env"]["QDRANT_URL"] = qdrant_url
     compact["env"]["QDRANT_API_KEY"] = qdrant_api_key
-    compact["env"]["COLLECTION_NAME"] = collection_name
     compact["env"]["COMPACT_COLLECTION"] = compact_collection or "conversation-compacts"
     compact["env"]["CLAUDE_RUNWAY_LMSTUDIO_URL"] = lmstudio_url
     compact["env"]["CLAUDE_RUNWAY_LMSTUDIO_MODEL"] = lmstudio_model
@@ -495,8 +494,7 @@ def build_mcp_servers(
     memory_bank["env"]["MEMORY_BANK_FOLLOW_REPOS"] = memory_bank_follow_repos.strip()
 
     if embedding_model:
-        for block in (compact, indexer):
-            block["env"]["EMBEDDING_MODEL"] = embedding_model
+        indexer["env"]["EMBEDDING_MODEL"] = embedding_model
     if memory_bank_embedding_model:
         memory_bank["env"]["EMBEDDING_MODEL"] = memory_bank_embedding_model
 
@@ -563,18 +561,22 @@ def build_mcp_servers(
     return servers
 
 
-# Code-index servers whose env carries `EMBEDDING_MODEL`, in the order
-# `existing_embedding_model` consults them. `memory-bank` is deliberately NOT
-# here: its model belongs to a shared, cross-project collection
-# and is resolved on its own, see `resolve_memory_bank_embedding_model`.
-_EMBEDDING_MODEL_SERVERS = ("compact", "codebase-indexer")
+# Blocks whose env may carry the code-index `EMBEDDING_MODEL`, in the order
+# `existing_embedding_model` consults them. `codebase-indexer` is the one that
+# reads it; `compact` is read only as a fallback for a config written before
+# that block stopped carrying the key (`compact-server-dead-env-dropped`
+# removes it). `memory-bank` is deliberately NOT here: its model belongs to a
+# shared, cross-project collection and is resolved on its own, see
+# `resolve_memory_bank_embedding_model`.
+_EMBEDDING_MODEL_SERVERS = ("codebase-indexer", "compact")
 
 
 def existing_embedding_model(existing_mcp: dict) -> str:
     """
     Returns the `EMBEDDING_MODEL` already configured in an existing
-    `.mcp.json` document (first non-blank string found across the `qdrant`
-    and `codebase-indexer` blocks -- never `memory-bank`'s), or ""
+    `.mcp.json` document (first non-blank string found across the
+    `codebase-indexer` and, for an older config, `compact` blocks -- never
+    `memory-bank`'s), or ""
     if none is set. Tolerant
     of missing/odd-shaped blocks -- a hand-edited file may lack any of them.
     """
@@ -1955,7 +1957,7 @@ def run_setup(
     # the explicit > existing > template rule.
     mcp_json_path = target_repo / ".mcp.json"
     existing_mcp = load_existing_mcp_json(mcp_json_path)
-    template_embedding_model = mcp_template["mcpServers"]["compact"]["env"]["EMBEDDING_MODEL"]
+    template_embedding_model = mcp_template["mcpServers"]["codebase-indexer"]["env"]["EMBEDDING_MODEL"]
     previous_embedding_model = existing_embedding_model(existing_mcp)
     resolved_embedding_model = resolve_embedding_model(embedding_model, existing_mcp, template_embedding_model)
     # memory-bank's model is resolved from its own sources only

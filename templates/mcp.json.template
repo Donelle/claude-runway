@@ -3,15 +3,13 @@
 
   "mcpServers": {
     "compact": {
-      "_comment": "This repo's own server, `compact`: compact_store, compact_find and compact_prune (the conversation compacts /cr-compact and /cr-resume use, under COMPACT_COLLECTION plus the project name). Searching and saving notes in the project's own collection is served by the codebase-indexer block (cb_indexer_find_repo, cb_indexer_store_repo). EMBEDDING_MODEL is the code-index model and must match the codebase-indexer block. COMPACT_EMBEDDING_MODEL is the model conversation compacts are embedded with, deliberately separate: compacts are stored under a model-named vector, so changing it for an install that already has compacts orphans them -- leave it alone once /cr-compact has been used (installs that predate this setting are pinned to BAAI/bge-small-en by `upgrade`). CLAUDE_RUNWAY_LMSTUDIO_URL/CLAUDE_RUNWAY_LMSTUDIO_MODEL are used only by compact_store, which compresses the summary through the local model before storing it and stores it uncompressed if LM Studio is unavailable (blank CLAUDE_RUNWAY_LMSTUDIO_MODEL auto-detects the loaded model). They are read from THIS env block, not a shell export. Leave QDRANT_API_KEY empty for unauthenticated local Qdrant; if you DO set a real key, see the top-level _comment's warning about not committing this file as-is.",
+      "_comment": "This repo's own server, `compact`: compact_store, compact_find and compact_prune (the conversation compacts /cr-compact and /cr-resume use, under COMPACT_COLLECTION plus the project name). Searching and saving notes in the project's own collection is served by the codebase-indexer block (cb_indexer_find_repo, cb_indexer_store_repo). It has no COLLECTION_NAME or EMBEDDING_MODEL: the project collection and the code-index model belong to the codebase-indexer block. COMPACT_EMBEDDING_MODEL is the model conversation compacts are embedded with, deliberately separate: compacts are stored under a model-named vector, so changing it for an install that already has compacts orphans them -- leave it alone once /cr-compact has been used (installs that predate this setting are pinned to BAAI/bge-small-en by `upgrade`). CLAUDE_RUNWAY_LMSTUDIO_URL/CLAUDE_RUNWAY_LMSTUDIO_MODEL are used only by compact_store, which compresses the summary through the local model before storing it and stores it uncompressed if LM Studio is unavailable (blank CLAUDE_RUNWAY_LMSTUDIO_MODEL auto-detects the loaded model). They are read from THIS env block, not a shell export. Leave QDRANT_API_KEY empty for unauthenticated local Qdrant; if you DO set a real key, see the top-level _comment's warning about not committing this file as-is.",
       "command": "REPLACE-WITH-VENV-PYTHON",
       "type": "stdio",
       "args": ["/absolute/path/to/mcpservers/compact_mcp_server.py"],
       "env": {
         "QDRANT_URL": "http://localhost:6333",
         "QDRANT_API_KEY": "",
-        "COLLECTION_NAME": "REPLACE-WITH-THIS-PROJECTS-NAME",
-        "EMBEDDING_MODEL": "sentence-transformers/all-MiniLM-L6-v2",
         "COMPACT_COLLECTION": "conversation-compacts",
         "COMPACT_EMBEDDING_MODEL": "sentence-transformers/all-MiniLM-L6-v2",
         "CLAUDE_RUNWAY_LMSTUDIO_URL": "http://localhost:1234/v1",

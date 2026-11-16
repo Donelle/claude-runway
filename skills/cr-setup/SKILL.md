@@ -120,7 +120,8 @@ The rest of this step applies to the **init path only**.
 
 Also extract the following values from the existing config — these would silently
 revert to defaults on re-run without preservation:
-- `COLLECTION_NAME` from `compact.env` — use as the collection name default in Q2 when
+- `COLLECTION_NAME` from `codebase-indexer.env`, else from `compact.env` for a config written
+  before that block stopped carrying it — use as the collection name default in Q2 when
   present, falling back to the slug default only for unconfigured projects
 - `QDRANT_URL` from `compact.env` (default: `http://localhost:6333`)
 - `QDRANT_API_KEY` — check only whether it is non-empty in **any** of the four owned

@@ -590,7 +590,7 @@ def cmd_init(args: argparse.Namespace) -> None:
     # Quoted per-platform via _quote_command (see its docstring) so the
     # printed command is directly copy-pasteable even if target_repo (or
     # any option value) contains a space.
-    resolved_collection_name = result.mcp_json["mcpServers"]["compact"]["env"]["COLLECTION_NAME"]
+    resolved_collection_name = result.mcp_json["mcpServers"]["codebase-indexer"]["env"]["COLLECTION_NAME"]
     # A pip/pipx/uvx install (venv_python_override set, see above) puts
     # claude-runway-ingest on PATH -- no "python /path/to/script.py" needed,
     # and no local clone whose path this reminder could even print. The
@@ -614,7 +614,7 @@ def cmd_init(args: argparse.Namespace) -> None:
         # passed (the resolved value from what was generated), not only when
         # custom, so the reminder never depends on the two defaults agreeing.
         "--embedding-model",
-        result.generated_mcp_servers["compact"]["env"]["EMBEDDING_MODEL"],
+        result.generated_mcp_servers["codebase-indexer"]["env"]["EMBEDDING_MODEL"],
     ]
     if args.include_extensions:
         index_argv += ["--include-ext", args.include_extensions]

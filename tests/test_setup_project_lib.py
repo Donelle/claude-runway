@@ -210,13 +210,15 @@ class BuildMcpServers(unittest.TestCase):
     def test_compact_embedding_model_explicit_value_used_verbatim(self):
         env = self._build(compact_embedding_model="BAAI/bge-small-en")["compact"]["env"]
         self.assertEqual(env["COMPACT_EMBEDDING_MODEL"], "BAAI/bge-small-en")
-        # ... and never leaks into the code-index model.
-        self.assertNotEqual(env["EMBEDDING_MODEL"], "BAAI/bge-small-en")
+        # ... and the block carries no code-index model at all.
+        self.assertNotIn("EMBEDDING_MODEL", env)
 
-    def test_collection_name_applied_to_both_qdrant_and_indexer(self):
+    def test_collection_name_applied_to_indexer_only(self):
         servers = self._build()
-        self.assertEqual(servers["compact"]["env"]["COLLECTION_NAME"], "my-project")
         self.assertEqual(servers["codebase-indexer"]["env"]["COLLECTION_NAME"], "my-project")
+        # The compact server reads neither key, so its block carries neither.
+        self.assertNotIn("COLLECTION_NAME", servers["compact"]["env"])
+        self.assertNotIn("EMBEDDING_MODEL", servers["compact"]["env"])
 
     def test_include_compress_false_omits_the_server(self):
         servers = self._build(include_compress=False)
@@ -596,7 +598,7 @@ class RunSetupEndToEnd(unittest.TestCase):
     def test_collection_name_defaults_from_target_dir_name(self):
         result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
         self.assertEqual(
-            result.mcp_json["mcpServers"]["compact"]["env"]["COLLECTION_NAME"], "my-target-project"
+            result.mcp_json["mcpServers"]["codebase-indexer"]["env"]["COLLECTION_NAME"], "my-target-project"
         )
 
     def test_compact_collection_defaults_to_the_shared_historical_name(self):
@@ -880,10 +882,12 @@ class RunSetupEndToEnd(unittest.TestCase):
 
     # --- Init re-run must not reset a customized EMBEDDING_MODEL ---
 
-    _EMBED_SERVERS = ("compact", "codebase-indexer", "memory-bank")
+    # The compact block carries no EMBEDDING_MODEL (its server never reads one).
+    _EMBED_SERVERS = ("codebase-indexer", "memory-bank")
     _CUSTOM_MODEL = "BAAI/bge-small-en"
 
     def _models(self, result):
+        self.assertNotIn("EMBEDDING_MODEL", result.mcp_json["mcpServers"]["compact"]["env"])
         return {s: result.mcp_json["mcpServers"][s]["env"]["EMBEDDING_MODEL"] for s in self._EMBED_SERVERS}
 
     def _write_customized_existing_config(self, model):
@@ -894,7 +898,7 @@ class RunSetupEndToEnd(unittest.TestCase):
         (self.target_repo / ".mcp.json").write_text(json.dumps(cfg))
 
     def test_fresh_target_uses_template_default_embedding_model(self):
-        default = MCP_TEMPLATE["mcpServers"]["compact"]["env"]["EMBEDDING_MODEL"]
+        default = MCP_TEMPLATE["mcpServers"]["codebase-indexer"]["env"]["EMBEDDING_MODEL"]
         result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
         self.assertEqual(set(self._models(result).values()), {default})
 
@@ -912,7 +916,6 @@ class RunSetupEndToEnd(unittest.TestCase):
         models = self._models(result)
         # Per-project code collections move to the new model; memory-bank's model is
         # its own value and is untouched.
-        self.assertEqual(models["compact"], new_model)
         self.assertEqual(models["codebase-indexer"], new_model)
         self.assertEqual(models["memory-bank"], self._CUSTOM_MODEL)
         self.assertTrue(any("EMBEDDING_MODEL changed" in c and "WARNING" in c for c in result.changes))
@@ -937,7 +940,7 @@ class RunSetupEndToEnd(unittest.TestCase):
         self._drop_memory_bank_block()
         result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"), embedding_model=self._OTHER_MODEL)
         models = self._models(result)
-        self.assertEqual(models["compact"], self._OTHER_MODEL)
+        self.assertEqual(models["codebase-indexer"], self._OTHER_MODEL)
         self.assertEqual(models["memory-bank"], MCP_TEMPLATE["mcpServers"]["memory-bank"]["env"]["EMBEDDING_MODEL"])
 
     def test_no_memory_bank_block_does_not_inherit_custom_code_model(self):
@@ -946,7 +949,7 @@ class RunSetupEndToEnd(unittest.TestCase):
         self._write_customized_existing_config(self._CUSTOM_MODEL)
         self._drop_memory_bank_block()
         models = self._models(run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user")))
-        self.assertEqual(models["compact"], self._CUSTOM_MODEL)
+        self.assertEqual(models["codebase-indexer"], self._CUSTOM_MODEL)
         self.assertEqual(models["memory-bank"], MCP_TEMPLATE["mcpServers"]["memory-bank"]["env"]["EMBEDDING_MODEL"])
 
     def test_code_side_model_is_never_read_from_memory_bank_block(self):
@@ -955,12 +958,10 @@ class RunSetupEndToEnd(unittest.TestCase):
         first = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
         cfg = first.mcp_json
         cfg["mcpServers"]["memory-bank"]["env"]["EMBEDDING_MODEL"] = self._CUSTOM_MODEL
-        for s in ("compact", "codebase-indexer"):
-            del cfg["mcpServers"][s]["env"]["EMBEDDING_MODEL"]
+        del cfg["mcpServers"]["codebase-indexer"]["env"]["EMBEDDING_MODEL"]
         (self.target_repo / ".mcp.json").write_text(json.dumps(cfg))
         models = self._models(run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user")))
-        default = MCP_TEMPLATE["mcpServers"]["compact"]["env"]["EMBEDDING_MODEL"]
-        self.assertEqual(models["compact"], default)
+        default = MCP_TEMPLATE["mcpServers"]["codebase-indexer"]["env"]["EMBEDDING_MODEL"]
         self.assertEqual(models["codebase-indexer"], default)
         self.assertEqual(models["memory-bank"], self._CUSTOM_MODEL)
 
@@ -971,7 +972,6 @@ class RunSetupEndToEnd(unittest.TestCase):
         )
         models = self._models(result)
         self.assertEqual(models["memory-bank"], self._OTHER_MODEL)
-        self.assertEqual(models["compact"], self._CUSTOM_MODEL)
         self.assertEqual(models["codebase-indexer"], self._CUSTOM_MODEL)
         self.assertTrue(
             any("memory-bank EMBEDDING_MODEL changed" in c and "WARNING" in c and "EVERY project" in c
@@ -998,7 +998,7 @@ class RunSetupEndToEnd(unittest.TestCase):
         self._set_memory_bank_model(self._OTHER_MODEL)
         models = self._models(run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user")))
         self.assertEqual(models["memory-bank"], self._OTHER_MODEL)
-        self.assertEqual(models["compact"], self._CUSTOM_MODEL)
+        self.assertEqual(models["codebase-indexer"], self._CUSTOM_MODEL)
 
     def test_explicit_embedding_model_same_as_existing_does_not_warn(self):
         self._write_customized_existing_config(self._CUSTOM_MODEL)
@@ -1013,31 +1013,32 @@ class RunSetupEndToEnd(unittest.TestCase):
             self.target_repo, REPO_ROOT, home_dir=Path("/home/user"), embedding_model=self._CUSTOM_MODEL
         )
         models = self._models(result)
-        self.assertEqual({models["compact"], models["codebase-indexer"]}, {self._CUSTOM_MODEL})
+        self.assertEqual({models["codebase-indexer"]}, {self._CUSTOM_MODEL})
         self.assertEqual(models["memory-bank"], MCP_TEMPLATE["mcpServers"]["memory-bank"]["env"]["EMBEDDING_MODEL"])
         self.assertFalse(any("WARNING" in c for c in result.changes))
 
     def test_existing_config_without_embedding_model_falls_back_to_template(self):
-        default = MCP_TEMPLATE["mcpServers"]["compact"]["env"]["EMBEDDING_MODEL"]
+        default = MCP_TEMPLATE["mcpServers"]["codebase-indexer"]["env"]["EMBEDDING_MODEL"]
         (self.target_repo / ".mcp.json").write_text(json.dumps({"mcpServers": {"compact": {"env": {}}}}))
         result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
         self.assertEqual(set(self._models(result).values()), {default})
 
-    def test_existing_model_falls_back_to_another_block_when_qdrant_has_none(self):
-        # The qdrant block's value wins when present (the issue's stated
-        # source of truth); a missing/blank key there falls through to the
-        # next toolkit block rather than to the template default.
+    def test_existing_model_falls_back_to_an_old_compact_block_when_the_indexer_has_none(self):
+        # The codebase-indexer block's value wins when present; a config
+        # written before the compact block dropped the key still has it there,
+        # and a blank indexer value falls through to it rather than to the
+        # template default.
         first = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
         cfg = first.mcp_json
-        del cfg["mcpServers"]["compact"]["env"]["EMBEDDING_MODEL"]
-        cfg["mcpServers"]["codebase-indexer"]["env"]["EMBEDDING_MODEL"] = self._CUSTOM_MODEL
+        del cfg["mcpServers"]["codebase-indexer"]["env"]["EMBEDDING_MODEL"]
+        cfg["mcpServers"]["compact"]["env"]["EMBEDDING_MODEL"] = self._CUSTOM_MODEL
         (self.target_repo / ".mcp.json").write_text(json.dumps(cfg))
         result = run_setup(self.target_repo, REPO_ROOT, home_dir=Path("/home/user"))
         models = self._models(result)
-        self.assertEqual({models["compact"], models["codebase-indexer"]}, {self._CUSTOM_MODEL})
+        self.assertEqual({models["codebase-indexer"]}, {self._CUSTOM_MODEL})
 
     def test_build_mcp_servers_embedding_model_blank_keeps_template_default(self):
-        default = MCP_TEMPLATE["mcpServers"]["compact"]["env"]["EMBEDDING_MODEL"]
+        default = MCP_TEMPLATE["mcpServers"]["codebase-indexer"]["env"]["EMBEDDING_MODEL"]
         servers = build_mcp_servers(
             MCP_TEMPLATE, collection_name="c", venv_python=Path("/v/bin/python"),
             tools_repo_dir=REPO_ROOT, home_dir=Path("/home/user"),
@@ -1468,7 +1469,7 @@ class CompactEmbeddingModelOnInit(unittest.TestCase):
                      "local-compress": {"env": {"EMBEDDING_MODEL": "x/custom"}}})
         result = self._run(embedding_model="c/d")
         self.assertEqual(self._model(result), "x/custom")
-        self.assertEqual(result.mcp_json["mcpServers"]["compact"]["env"]["EMBEDDING_MODEL"], "c/d")
+        self.assertEqual(result.mcp_json["mcpServers"]["codebase-indexer"]["env"]["EMBEDDING_MODEL"], "c/d")
 
     def test_the_qdrant_blocks_own_value_wins_over_a_stale_local_compress_one(self):
         self._write({"compact": {"env": {"COMPACT_EMBEDDING_MODEL": "x/current"}},
@@ -1479,7 +1480,7 @@ class CompactEmbeddingModelOnInit(unittest.TestCase):
         self._write({"compact": {"env": {"EMBEDDING_MODEL": "a/b", "COMPACT_EMBEDDING_MODEL": self.LEGACY}}})
         result = self._run(embedding_model="c/d")
         self.assertEqual(self._model(result), self.LEGACY)
-        self.assertEqual(result.mcp_json["mcpServers"]["compact"]["env"]["EMBEDDING_MODEL"], "c/d")
+        self.assertEqual(result.mcp_json["mcpServers"]["codebase-indexer"]["env"]["EMBEDDING_MODEL"], "c/d")
 
     def test_qdrant_only_rerun_keeps_the_value_after_local_compress_is_removed(self):
         self._write({"compact": {"env": {"COMPACT_EMBEDDING_MODEL": self.LEGACY}}, "local-compress": {"env": {}}})
