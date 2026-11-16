@@ -53,7 +53,7 @@ class DoctorCli(unittest.TestCase):
         self.target_repo.mkdir()
 
     def _write_mcp_json(self, local_compress_env=None):
-        servers = {"qdrant": {"command": "x", "env": {}}}
+        servers = {"compact": {"command": "x", "env": {}}}
         if local_compress_env is not None:
             servers["local-compress"] = {"command": "x", "env": local_compress_env}
         (self.target_repo / ".mcp.json").write_text(json.dumps({"mcpServers": servers}), encoding="utf-8")
@@ -113,7 +113,7 @@ class DoctorCli(unittest.TestCase):
         block_path = os.path.abspath("/custom/block.db")
         shell_path = os.path.abspath("/custom/shell.db")
         servers = {
-            "qdrant": {"command": "x", "env": {}},
+            "compact": {"command": "x", "env": {}},
             "analytics": {"command": "x", "env": {"CLAUDE_RUNWAY_SAVINGS_DB": block_path}},
         }
         (self.target_repo / ".mcp.json").write_text(json.dumps({"mcpServers": servers}), encoding="utf-8")

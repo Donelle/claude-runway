@@ -24,7 +24,7 @@ EXPECTED_SERVERS = {
     "compress_mcp_server.py",
     "codebase_indexer_mcp_server.py",
     "memory_bank_mcp_server.py",
-    "qdrant_mcp_server.py",
+    "compact_mcp_server.py",
 }
 
 

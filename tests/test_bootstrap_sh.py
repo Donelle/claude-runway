@@ -176,13 +176,13 @@ class ReadDeclaredTests(EnvStepTestCase):
         })
 
     def test_qdrant_only_project_still_declares_its_lm_studio_values(self):
-        self.write_mcp({"qdrant": {"env": {"CLAUDE_RUNWAY_LMSTUDIO_MODEL": "pinned"}}})
+        self.write_mcp({"compact": {"env": {"CLAUDE_RUNWAY_LMSTUDIO_MODEL": "pinned"}}})
         declared, _ = self.read()
         self.assertEqual(declared, {"CLAUDE_RUNWAY_LMSTUDIO_MODEL": "pinned"})
 
     def test_first_declaring_block_wins(self):
         self.write_mcp({
-            "qdrant": {"env": {"CLAUDE_RUNWAY_LMSTUDIO_MODEL": "from-qdrant"}},
+            "compact": {"env": {"CLAUDE_RUNWAY_LMSTUDIO_MODEL": "from-qdrant"}},
             "local-compress": {"env": {"CLAUDE_RUNWAY_LMSTUDIO_MODEL": "from-local-compress"}},
         })
         declared, _ = self.read()

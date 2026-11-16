@@ -30,7 +30,7 @@ note unless the opt-in is on (then nothing records the rounds, which is a proble
 
 Exit code is 1 if any mismatch (or stale hook, or unusable reviewers file, or the capture opted in
 without its hook) is found, 0 otherwise (including when
-there is nothing to check -- e.g. a `--qdrant-only` setup whose `qdrant` block
+there is nothing to check -- e.g. a `--qdrant-only` setup whose `compact` block
 carries no dual-config values -- which is a valid state, not a misconfiguration) -- usable as a CI/
 pre-flight gate, not just an interactive report.
 """

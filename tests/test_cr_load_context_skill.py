@@ -62,7 +62,7 @@ class CrLoadContextSkillTest(unittest.TestCase):
     def test_prerequisites_are_git_and_the_mcp_tools_only(self):
         prereq = _section(self.text, "## Prerequisites", "## Usage")
         self.assertIn("`git`", prereq)
-        for server in ("qdrant", "codebase-indexer", "local-compress", "memory-bank"):
+        for server in ("compact", "codebase-indexer", "local-compress", "memory-bank"):
             self.assertIn(f"`{server}`", prereq)
         # gh and az appear only as optional extras, never as requirements.
         self.assertIn("optional", prereq)
@@ -126,7 +126,7 @@ class CrLoadContextSkillTest(unittest.TestCase):
         self.assertIn("live", guide)
         self.assertIn("Skip the entry of a group that is missing or errored", guide)
         self.assertIn("do not recite it in the report", guide)
-        for server in ("qdrant", "codebase-indexer", "memory-bank", "local-compress"):
+        for server in ("compact", "codebase-indexer", "memory-bank", "local-compress"):
             self.assertIn(f"**`{server}`**", guide)
         # The rules that change what the model does, one or two per server.
         for rule in (
@@ -149,7 +149,7 @@ class CrLoadContextSkillTest(unittest.TestCase):
 
     # Each MCP server's file and the group heading the skill's guide uses for it.
     SERVERS = {
-        "qdrant_mcp_server.py": "qdrant",
+        "compact_mcp_server.py": "compact",
         "codebase_indexer_mcp_server.py": "codebase-indexer",
         "memory_bank_mcp_server.py": "memory-bank",
         "compress_mcp_server.py": "local-compress",

@@ -589,7 +589,7 @@ class Doctor(unittest.TestCase):
         self.home = Path(self._tmp.name) / "home"
 
     def _config(self, env=None, include_block=True):
-        servers: dict = {"qdrant": {"command": "p", "type": "stdio", "args": ["x"], "env": {}}}
+        servers: dict = {"compact": {"command": "p", "type": "stdio", "args": ["x"], "env": {}}}
         if include_block:
             servers[BLOCK] = {"command": "p", "type": "stdio", "args": ["x"], "env": env if env is not None else {}}
         (self.target / ".mcp.json").write_text(json.dumps({"mcpServers": servers}), encoding="utf-8")

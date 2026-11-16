@@ -84,16 +84,32 @@ e.g. (single quotes per step 5's rules; adapt the quoting on PowerShell):
 For the init-path values extracted below, print only those specific non-secret keys the
 same way (never the whole env block), and for `QDRANT_API_KEY` print only a key-present
 boolean. The output tells you which claude-runway servers are currently configured
-(`qdrant`, `codebase-indexer`, `memory-bank`, `local-compress`, and the opt-in `analytics`). Note this for the summary
+(`compact`, `codebase-indexer`, `memory-bank`, `local-compress`, and the opt-in `analytics`). Note this for the summary
 at the end.
 
 **Choose the path (init vs. upgrade):** the upgrade predicate is the presence of the
-`qdrant` server, because that is exactly what `setup_project.py upgrade` requires
+`compact` server, because that is exactly what `setup_project.py upgrade` requires
 (`upgrade_lib.is_project_configured` — every real `init` writes it, even `--qdrant-only`).
-- No `.mcp.json`, or no `qdrant` server in it (including a partial/hand-edited config with
-  only `codebase-indexer`, `memory-bank`, or `local-compress`) → **init path** (steps 3-7,
-  unchanged). Do not offer upgrade: it refuses a project without a `qdrant` server.
-- `qdrant` server present → use `AskUserQuestion` (header
+An install from before the server was renamed has no `compact` block: its compact server
+is a block that launches `qdrant_mcp_server.py` (or, older still, the third-party
+`mcp-server-qdrant`) under whatever key it was given. Find it
+with `upgrade_lib`'s own helper, never by guessing a key, and never read any of its values
+for anything else:
+
+```
+<venv-python> -c 'import sys,json;sys.path.insert(0,"<CLAUDE_RUNWAY_DIR>/libs");import upgrade_lib as u,setup_project_lib as s;print(u.find_old_compact_server_keys(s.load_existing_mcp_json(__import__("pathlib").Path(".mcp.json"))))'
+```
+- No `.mcp.json`, or neither a `compact` block nor an old block in it (including a
+  partial/hand-edited config with only `codebase-indexer`, `memory-bank`, or
+  `local-compress`) → **init path** (steps 3-7, unchanged). Do not offer upgrade: it
+  refuses a project without a compact server.
+- An old block found and no `compact` block → this install needs `upgrade` (it renames
+  the block and the settings entries that name it, and keeps every value it holds). Take
+  the **upgrade path** (step 8) without offering "Re-run init": every value the init path
+  preserves is read from `compact.env`, which this install does not have yet, so a re-run
+  would reset them. Tell the user that, and that `init` can be re-run afterwards if wanted. Do not read this
+  block's `env` for anything.
+- `compact` server present → use `AskUserQuestion` (header
   "Path"): "Upgrade (Recommended)" — apply only pending config migrations (and refresh
   already-installed skills that went stale), nothing else
   reset; "Re-run init" — reconfigure from scratch via the question flow below, which
@@ -107,14 +123,15 @@ The rest of this step applies to the **init path only**.
 
 Also extract the following values from the existing config — these would silently
 revert to defaults on re-run without preservation:
-- `COLLECTION_NAME` from `qdrant.env` — use as the collection name default in Q2 when
+- `COLLECTION_NAME` from `codebase-indexer.env`, else from `compact.env` for a config written
+  before that block stopped carrying it — use as the collection name default in Q2 when
   present, falling back to the slug default only for unconfigured projects
-- `QDRANT_URL` from `qdrant.env` (default: `http://localhost:6333`)
+- `QDRANT_URL` from `compact.env` (default: `http://localhost:6333`)
 - `QDRANT_API_KEY` — check only whether it is non-empty in **any** of the four owned
-  server env blocks (`qdrant.env`, `codebase-indexer.env`, `memory-bank.env`,
+  server env blocks (`compact.env`, `codebase-indexer.env`, `memory-bank.env`,
   `local-compress.env`); do NOT read the value itself into context. `build_mcp_servers()`
   sets the same key in the first three; `local-compress.env` is still checked because a
-  config written before the compact tools moved to the `qdrant` server has it there too,
+  config written before the compact tools moved to the `compact` server has it there too,
   and legacy or hand-edited configs may only have it in one.
 
 **If `QDRANT_API_KEY` is non-empty in any owned block (init path only — the upgrade path
@@ -134,14 +151,14 @@ in step 8 proceeds), stop immediately** and tell the user:
 - `COLLECTION_DESCRIPTION` from `codebase-indexer.env` (default: empty)
 - `INDEX_INCLUDE_EXTENSIONS` from `codebase-indexer.env` (default: empty)
 - `INDEX_EXCLUDE_DIRS` from `codebase-indexer.env` (default: empty)
-- `CLAUDE_RUNWAY_LMSTUDIO_URL` from `local-compress.env`, else from `qdrant.env` (default: `http://localhost:1234/v1`)
-- `CLAUDE_RUNWAY_LMSTUDIO_MODEL` from `local-compress.env`, else from `qdrant.env` (default: empty — auto-detect).
-  Both servers carry these two values (`qdrant`'s `compact_store` compresses with them);
-  a `--qdrant-only` config has them only in `qdrant.env`
+- `CLAUDE_RUNWAY_LMSTUDIO_URL` from `local-compress.env`, else from `compact.env` (default: `http://localhost:1234/v1`)
+- `CLAUDE_RUNWAY_LMSTUDIO_MODEL` from `local-compress.env`, else from `compact.env` (default: empty — auto-detect).
+  Both servers carry these two values (`compact`'s `compact_store` compresses with them);
+  a `--qdrant-only` config has them only in `compact.env`
 - `CLAUDE_RUNWAY_TRACK_SAVINGS` from `local-compress.env` (default: off)
 - `CLAUDE_RUNWAY_SAVINGS_DB` from `analytics.env`, else from `local-compress.env` for a config written before `init` stopped writing it there (the `local-compress` server never reads it) — first non-empty one (default: empty). The `analytics` block exists only when savings tracking was enabled, so never treat its absence as "no override".
 - `CLAUDE_RUNWAY_METRICS_DB` from `analytics.env`, else from `memory-bank.env` (where `init --metrics-db` also writes it, and the only place it lives when savings tracking is off or the setup is `--qdrant-only`), else from `local-compress.env` for a config written before the move — first non-empty one (default: empty). The `analytics` block exists only when savings tracking was enabled, so never treat its absence as "no override".
-- `COMPACT_COLLECTION` from `qdrant.env` (the `qdrant` server serves the compact tools),
+- `COMPACT_COLLECTION` from `compact.env` (the `compact` server serves the compact tools),
   falling back to `local-compress.env` for a config written before they moved — use as the
   "Keep current" value in Q5 when present. Note this is a DIFFERENT env var than
   `COLLECTION_NAME` above: it names the collection the `cr-compact`/`cr-resume` skills store
@@ -171,14 +188,14 @@ in step 8 proceeds), stop immediately** and tell the user:
   as `COLLECTION_DESCRIPTION`/`INDEX_INCLUDE_EXTENSIONS` below.
 
 **Also detect a prior qdrant-only round-trip**: if `.mcp.json` already exists and has a
-`qdrant` and/or `codebase-indexer` server configured, but has **no** `local-compress` server
+`compact` and/or `codebase-indexer` server configured, but has **no** `local-compress` server
 at all (not just an empty one — the key itself absent) **and no `COMPACT_COLLECTION` in
-`qdrant.env`**, note this as `previously-qdrant-only = true`. `--qdrant-only` deliberately
+`compact.env`**, note this as `previously-qdrant-only = true`. `--qdrant-only` deliberately
 deletes the entire `local-compress` block (see `setup_project_lib.build_mcp_servers`'s
 `include_compress=False` path); a config written before the compact tools moved to the
-`qdrant` server kept `COMPACT_COLLECTION` only in that block, so this state is
+`compact` server kept `COMPACT_COLLECTION` only in that block, so this state is
 indistinguishable from a genuinely brand-new project by `COMPACT_COLLECTION`'s absence alone.
-(A newer config keeps it in `qdrant.env` in every mode, so it is found there and this
+(A newer config keeps it in `compact.env` in every mode, so it is found there and this
 detection does not fire.) This matters for Q5 in
 step 4 below: without this signal, re-enabling full setup on a project that was full →
 qdrant-only at some point silently computes a fresh `<collection-name>-conversation` default
@@ -294,7 +311,7 @@ non-default, add the corresponding flag so it is not silently reset:
 `--compact-collection` is Q5's resolved value ("Keep current"'s existing value, "Use
 default"'s `<collection-name>-conversation`, or "Specify"'s typed name) — always pass it
 explicitly for a full setup, the same way `--collection-name` is always passed rather than
-only added when non-default. For `--qdrant-only`, Q5 was skipped in step 4, but the `qdrant`
+only added when non-default. For `--qdrant-only`, Q5 was skipped in step 4, but the `compact`
 server (which serves the compact tools in every mode) still holds `COMPACT_COLLECTION`: if
 step 2 found an existing value, pass it as `--compact-collection` anyway so a re-run does
 not reset it to `conversation-compacts` and strand that project's saved compacts; if there
@@ -368,7 +385,7 @@ Print a concise summary:
 ```
 Done. Configured <target-project-path>:
 
-  ✓ .mcp.json              — qdrant, codebase-indexer, memory-bank[, local-compress][, analytics — only with the savings tracker]
+  ✓ .mcp.json              — compact, codebase-indexer, memory-bank[, local-compress][, analytics — only with the savings tracker]
   ✓ .claude/settings.json  — SessionStart/SessionEnd record_session_id.py hook and SessionEnd session_end_pr_rounds.py hook (always; the second does nothing until CLAUDE_RUNWAY_CAPTURE_PR_ROUNDS=1 is exported)[; PostToolUse, PreToolUse, SessionEnd hooks — only if full setup]
   ✓ CLAUDE.md              — <the sections init added/removed, or "already up to date">
 

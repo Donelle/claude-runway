@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for mcpservers/qdrant_mcp_server.py.
+"""Tests for mcpservers/compact_mcp_server.py.
 
 Stdlib-only (unittest, no pytest) and no network -- needs neither a live model
 nor a real database (a fake Qdrant client and a fake embedding provider stand
@@ -32,7 +32,7 @@ async def _identity_compression(information):
     return information, "stored uncompressed: test"
 
 
-def _load_qdrant_mcp_server(stub_compression=True):
+def _load_compact_mcp_server(stub_compression=True):
     """
     Loads a FRESH copy of the module per call (its own MCPServer instance, its
     own registered tools) so tests that register an extra ad-hoc tool, or
@@ -41,7 +41,7 @@ def _load_qdrant_mcp_server(stub_compression=True):
     replaced by a no-op; the compression tests load the module with it off.
     """
     spec = importlib.util.spec_from_file_location(
-        "qdrant_mcp_server", REPO_ROOT / "mcpservers" / "qdrant_mcp_server.py"
+        "compact_mcp_server", REPO_ROOT / "mcpservers" / "compact_mcp_server.py"
     )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -59,7 +59,7 @@ class SanitizeProjectCollectionName(unittest.TestCase):
     """
 
     def test_punctuation_variants_collapse_to_the_same_name(self):
-        mod = _load_qdrant_mcp_server()
+        mod = _load_compact_mcp_server()
         variants = ["my.project", "my project", "my@project", "my-project"]
         sanitized = {mod._sanitize_project(v) for v in variants}
         self.assertEqual(sanitized, {"my-project"})
@@ -69,19 +69,19 @@ class SanitizeProjectCollectionName(unittest.TestCase):
         # independently and must agree on the same collection name for the
         # same project, or /cr-resume would never find what /cr-compact
         # just stored.
-        mod = _load_qdrant_mcp_server()
+        mod = _load_compact_mcp_server()
         first = mod._sanitize_project("Acme.Support.TicketsApi")
         second = mod._sanitize_project("Acme.Support.TicketsApi")
         self.assertEqual(first, second)
 
     def test_output_contains_only_valid_qdrant_collection_characters(self):
-        mod = _load_qdrant_mcp_server()
+        mod = _load_compact_mcp_server()
         for project in ["my.project", "my project", "my@project", "plain-name", "Mixed_Case-123"]:
             result = mod._sanitize_project(project)
             self.assertRegex(result, r"^[a-zA-Z0-9_-]+$")
 
     def test_plain_alphanumeric_name_is_unchanged_with_no_suffix(self):
-        mod = _load_qdrant_mcp_server()
+        mod = _load_compact_mcp_server()
         self.assertEqual(mod._sanitize_project("myproject"), "myproject")
         self.assertEqual(mod._sanitize_project("claude-runway"), "claude-runway")
 
@@ -90,7 +90,7 @@ class SanitizeProjectCollectionName(unittest.TestCase):
         # same project string must sanitize IDENTICALLY, or a casing drift
         # between /cr-compact and /cr-resume points at a nonexistent
         # collection.
-        mod = _load_qdrant_mcp_server()
+        mod = _load_compact_mcp_server()
         variants = ["MyProject", "myproject", "MYPROJECT", "mYpRoJeCt"]
         sanitized = {mod._sanitize_project(v) for v in variants}
         self.assertEqual(len(sanitized), 1)
@@ -224,13 +224,13 @@ class CompactPointIdIsDeterministic(unittest.TestCase):
     lands on the SAME id -- otherwise there's nothing to dedupe against."""
 
     def test_same_inputs_produce_same_id(self):
-        mod = _load_qdrant_mcp_server()
+        mod = _load_compact_mcp_server()
         first = mod._compact_point_id("proj", "label", "2026-08-27")
         second = mod._compact_point_id("proj", "label", "2026-08-27")
         self.assertEqual(first, second)
 
     def test_different_inputs_produce_different_ids(self):
-        mod = _load_qdrant_mcp_server()
+        mod = _load_compact_mcp_server()
         base = mod._compact_point_id("proj", "label", "2026-08-27")
         variants = [
             mod._compact_point_id("other-proj", "label", "2026-08-27"),
@@ -253,7 +253,7 @@ class CompactStoreIsIdempotent(unittest.TestCase):
     instead of inserting a second, indistinguishable one."""
 
     def _patched_module(self):
-        mod = _load_qdrant_mcp_server()
+        mod = _load_compact_mcp_server()
         client_cls = _make_fake_qdrant_client_class()
         mod.QdrantClient = client_cls
         mod.FastEmbedProvider = _FakeEmbeddingProvider
@@ -325,7 +325,7 @@ class CompactStoreServerSideLabelDerivation(unittest.TestCase):
     omits it or passes blank, reducing label-quality variance across models."""
 
     def _patched_module(self):
-        mod = _load_qdrant_mcp_server()
+        mod = _load_compact_mcp_server()
         client_cls = _make_fake_qdrant_client_class()
         mod.QdrantClient = client_cls
         mod.FastEmbedProvider = _FakeEmbeddingProvider
@@ -411,7 +411,7 @@ class CompactFindSurfacesPointId(unittest.TestCase):
     (same date and label)."""
 
     def _patched_module(self):
-        mod = _load_qdrant_mcp_server()
+        mod = _load_compact_mcp_server()
         mod.QdrantClient = _make_fake_qdrant_client_class()
         mod.FastEmbedProvider = _FakeEmbeddingProvider
         return mod
@@ -448,7 +448,7 @@ class CompactFindIsCaseInsensitiveToProject(unittest.TestCase):
     (different shell, different mount, etc.)."""
 
     def _patched_module(self):
-        mod = _load_qdrant_mcp_server()
+        mod = _load_compact_mcp_server()
         mod.QdrantClient = _make_fake_qdrant_client_class()
         mod.FastEmbedProvider = _FakeEmbeddingProvider
         return mod
@@ -477,7 +477,7 @@ class CompactFindSuggestsSiblingProjects(unittest.TestCase):
     that do have saved compacts instead of just failing flatly."""
 
     def _patched_module(self):
-        mod = _load_qdrant_mcp_server()
+        mod = _load_compact_mcp_server()
         mod.QdrantClient = _make_fake_qdrant_client_class()
         mod.FastEmbedProvider = _FakeEmbeddingProvider
         return mod
@@ -539,7 +539,7 @@ class CollectionsForProjectFindsEveryCasingVariant(unittest.TestCase):
     re-deriving a name algorithmically."""
 
     def _patched_module(self):
-        mod = _load_qdrant_mcp_server()
+        mod = _load_compact_mcp_server()
         mod.QdrantClient = _make_fake_qdrant_client_class()
         mod.FastEmbedProvider = _FakeEmbeddingProvider
         return mod
@@ -697,7 +697,7 @@ class MostRecentSiblingEntryPaginatesFully(unittest.TestCase):
             return self._pages[offset]
 
     def test_picks_up_most_recent_entry_from_a_later_page(self):
-        mod = _load_qdrant_mcp_server()
+        mod = _load_compact_mcp_server()
 
         class _Point:
             def __init__(self, payload):
@@ -722,7 +722,7 @@ class SameDayCompactsAreOrderedByStoredAt(unittest.TestCase):
     compact_prune's keep_last_n all break date ties on it."""
 
     def _patched_module(self):
-        mod = _load_qdrant_mcp_server()
+        mod = _load_compact_mcp_server()
         mod.QdrantClient = _make_fake_qdrant_client_class()
         mod.FastEmbedProvider = _FakeEmbeddingProvider
         return mod
@@ -862,7 +862,7 @@ class CompactFindDoesNotLeakOtherProjectsFromAnUnprovenCollection(unittest.TestC
     any collection it didn't derive by construction."""
 
     def _patched_module(self):
-        mod = _load_qdrant_mcp_server()
+        mod = _load_compact_mcp_server()
         mod.QdrantClient = _make_fake_qdrant_client_class()
         mod.FastEmbedProvider = _FakeEmbeddingProvider
         return mod
@@ -935,12 +935,12 @@ class AuthoritativeResolutionPropagatesFailuresInsteadOfHidingThem(unittest.Test
             raise RuntimeError("simulated Qdrant outage")
 
     def test_collections_for_project_propagates_get_collections_failure(self):
-        mod = _load_qdrant_mcp_server()
+        mod = _load_compact_mcp_server()
         with self.assertRaises(RuntimeError):
             mod._collections_for_project(self._BrokenGetCollectionsClient(), "some-project")
 
     def test_candidate_hint_degrades_gracefully_on_the_same_failure(self):
-        mod = _load_qdrant_mcp_server()
+        mod = _load_compact_mcp_server()
         # _candidate_hint's own _sibling_compact_collections call hits the
         # SAME get_collections() failure, but this path is a best-effort
         # hint, not authoritative resolution -- it must return "" rather
@@ -961,7 +961,7 @@ class CollectionMatchingScansEveryPointNotJustTheNewest(unittest.TestCase):
     that actually already held this project's data."""
 
     def _patched_module(self):
-        mod = _load_qdrant_mcp_server()
+        mod = _load_compact_mcp_server()
         mod.QdrantClient = _make_fake_qdrant_client_class()
         mod.FastEmbedProvider = _FakeEmbeddingProvider
         return mod
@@ -1029,7 +1029,7 @@ class CompactFindQueryPathFiltersBeforeQdrantTruncates(unittest.TestCase):
     other-project points than any plausible over-fetch buffer to prove that."""
 
     def _patched_module(self):
-        mod = _load_qdrant_mcp_server()
+        mod = _load_compact_mcp_server()
         mod.QdrantClient = _make_fake_qdrant_client_class()
         mod.FastEmbedProvider = _FakeEmbeddingProvider
         return mod
@@ -1072,7 +1072,7 @@ class CandidateHintSkipsPastEmptySiblingsToFindRealOnes(unittest.TestCase):
     list."""
 
     def _patched_module(self):
-        mod = _load_qdrant_mcp_server()
+        mod = _load_compact_mcp_server()
         mod.QdrantClient = _make_fake_qdrant_client_class()
         mod.FastEmbedProvider = _FakeEmbeddingProvider
         return mod
@@ -1111,7 +1111,7 @@ class CompactFindFiltersTheCanonicalCollectionToo(unittest.TestCase):
     the canonical collection too."""
 
     def _patched_module(self):
-        mod = _load_qdrant_mcp_server()
+        mod = _load_compact_mcp_server()
         mod.QdrantClient = _make_fake_qdrant_client_class()
         mod.FastEmbedProvider = _FakeEmbeddingProvider
         return mod
@@ -1145,7 +1145,7 @@ class CompactPruneTests(unittest.TestCase):
     """
 
     def _patched_module(self):
-        mod = _load_qdrant_mcp_server()
+        mod = _load_compact_mcp_server()
         mod.QdrantClient = _make_fake_qdrant_client_class()
         mod.FastEmbedProvider = _FakeEmbeddingProvider
         return mod
@@ -1375,17 +1375,17 @@ class RegisteredToolSet(unittest.TestCase):
     registered here under any name."""
 
     def test_the_registered_tool_set_is_the_documented_one(self):
-        mod = _load_qdrant_mcp_server()
+        mod = _load_compact_mcp_server()
         names = {info.name for info in mod.mcp._tool_manager.list_tools()}
         self.assertEqual(names, {"compact_store", "compact_find", "compact_prune"})
 
     def test_the_server_is_registered_under_the_name_qdrant(self):
         # The tool prefix Claude Code shows is mcp__<this name>__, and existing
-        # permission rules and the compress hook match on `mcp__qdrant__`.
-        self.assertEqual(_load_qdrant_mcp_server().mcp.name, "qdrant")
+        # permission rules and the compress hook match on `mcp__compact__`.
+        self.assertEqual(_load_compact_mcp_server().mcp.name, "compact")
 
     def test_this_server_does_not_register_the_compression_tools(self):
-        names = {info.name for info in _load_qdrant_mcp_server().mcp._tool_manager.list_tools()}
+        names = {info.name for info in _load_compact_mcp_server().mcp._tool_manager.list_tools()}
         self.assertFalse(names & {"compress_file", "compress_command_output", "fetch_url", "compress_text"})
 
 
@@ -1403,7 +1403,7 @@ class ServerStartsOverStdio(unittest.TestCase):
 
         params = StdioServerParameters(
             command=sys.executable,
-            args=[str(REPO_ROOT / "mcpservers" / "qdrant_mcp_server.py")],
+            args=[str(REPO_ROOT / "mcpservers" / "compact_mcp_server.py")],
             env={"QDRANT_URL": "http://127.0.0.1:9", "COLLECTION_NAME": "never-contacted"},
         )
 
@@ -1424,7 +1424,7 @@ class FastembedCachePersistenceTests(unittest.TestCase):
     def test_module_load_sets_persistent_cache_when_unset(self):
         env = {k: v for k, v in os.environ.items() if k != "FASTEMBED_CACHE_PATH"}
         with mock.patch.dict(os.environ, env, clear=True):
-            _load_qdrant_mcp_server()
+            _load_compact_mcp_server()
             self.assertEqual(
                 os.environ["FASTEMBED_CACHE_PATH"],
                 str(Path.home() / ".claude" / "claude-runway" / "fastembed-cache"),
@@ -1432,7 +1432,7 @@ class FastembedCachePersistenceTests(unittest.TestCase):
 
     def test_module_load_respects_existing_value(self):
         with mock.patch.dict(os.environ, {"FASTEMBED_CACHE_PATH": "/custom/cache"}):
-            _load_qdrant_mcp_server()
+            _load_compact_mcp_server()
             self.assertEqual(os.environ["FASTEMBED_CACHE_PATH"], "/custom/cache")
 
 
@@ -1447,7 +1447,7 @@ class EmbeddingModelsAreConfiguredIndependently(unittest.TestCase):
         base = {k: v for k, v in os.environ.items() if k not in keys}
         base.update(env)
         with mock.patch.dict(os.environ, base, clear=True):
-            return _load_qdrant_mcp_server()
+            return _load_compact_mcp_server()
 
     def test_compact_model_falls_back_to_the_legacy_model_when_unset(self):
         mod = self._load_with_env(EMBEDDING_MODEL="sentence-transformers/all-MiniLM-L6-v2")
@@ -1484,7 +1484,7 @@ class QdrantServerDoesNotLoadTheModelAtStartup(unittest.TestCase):
         import qdrant_embeddings
 
         with mock.patch.object(qdrant_embeddings, "TextEmbedding", side_effect=AssertionError("model loaded at import")):
-            _load_qdrant_mcp_server()
+            _load_compact_mcp_server()
 
 
 class _FakeLmStudioClientModule:
@@ -1510,7 +1510,7 @@ class CompactStoreCompressesBeforeStoring(unittest.TestCase):
     )
 
     def _module(self, compress):
-        mod = _load_qdrant_mcp_server(stub_compression=False)
+        mod = _load_compact_mcp_server(stub_compression=False)
         mod.QdrantClient = _make_fake_qdrant_client_class()
         mod.FastEmbedProvider = _FakeEmbeddingProvider
         mod._compress_impl = compress
@@ -1665,7 +1665,7 @@ class CompactStoreSurvivesAConcurrentFirstWrite(unittest.TestCase):
     re-raise when the collection is still absent."""
 
     def _module(self, client_cls):
-        mod = _load_qdrant_mcp_server()
+        mod = _load_compact_mcp_server()
         mod.QdrantClient = client_cls
         mod.FastEmbedProvider = _FakeEmbeddingProvider
         return mod
@@ -1745,7 +1745,7 @@ class CompactsStoredBeforeTheServerMovedStayReadable(unittest.TestCase):
     def _module_with_legacy_point(self):
         from qdrant_client import models
 
-        mod = _load_qdrant_mcp_server()
+        mod = _load_compact_mcp_server()
         client_cls = _make_fake_qdrant_client_class()
         mod.QdrantClient = client_cls
         mod.FastEmbedProvider = _FakeEmbeddingProvider

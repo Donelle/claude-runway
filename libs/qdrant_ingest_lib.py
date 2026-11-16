@@ -164,7 +164,7 @@ def ingest_env_defaults(environ=None) -> dict:
     embedding_model, include_extensions, exclude_dirs,
     memory_bank_collection.
 
-    Reads the same env var names qdrant_mcp_server and memory_bank_mcp_server
+    Reads the same env var names compact_mcp_server and memory_bank_mcp_server
     read (QDRANT_URL, QDRANT_API_KEY, EMBEDDING_MODEL, MEMORY_BANK_COLLECTION)
     plus this repo's INDEX_INCLUDE_EXTENSIONS/INDEX_EXCLUDE_DIRS. A blank
     value counts as unset -- the rule MEMORY_BANK_COLLECTION already had --
