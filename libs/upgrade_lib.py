@@ -106,9 +106,12 @@ class Migration:
     arguments.
 
     `apply(mcp_json, settings_json, ctx) -> (mcp_json, settings_json)`:
-    returns NEW dicts (never mutates the inputs in place -- callers/tests
-    rely on being able to compare before/after) with exactly this
-    migration's own fix applied, nothing else.
+    never mutates the inputs in place (callers/tests rely on being able to
+    compare before/after) and returns the documents with exactly this
+    migration's own fix applied, nothing else. A document it changes is a
+    new copy; one it leaves alone, including both when a guard makes the
+    whole call a no-op, may be returned as the same object. `run_upgrade`
+    compares by value, so a no-op is reported as still pending either way.
     """
 
     id: str

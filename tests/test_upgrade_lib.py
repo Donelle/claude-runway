@@ -2361,9 +2361,13 @@ class CbIndexerToolsRenamed(unittest.TestCase):
         return _migration(self._ID).apply(mcp_json, settings, _ctx())[1]
 
     def test_registered_after_the_server_script_migrations(self):
-        # compact-server-renamed, compact-server-dead-env-dropped and
-        # local-compress-dead-env-dropped come after it, last.
-        self.assertEqual(MIGRATIONS[-4].id, self._ID)
+        # The order the code needs, not a position: after the two script-path
+        # migrations, and before compact-server-renamed: run after it, the old
+        # mcp__qdrant__qdrant-find/-store rules are no longer recognised and stay stale.
+        ids = [m.id for m in MIGRATIONS]
+        self.assertLess(ids.index("mcp-server-scripts-moved"), ids.index(self._ID))
+        self.assertLess(ids.index("codebase-indexer-script-renamed"), ids.index(self._ID))
+        self.assertLess(ids.index(self._ID), ids.index("compact-server-renamed"))
 
     def test_not_pending_without_permissions_or_matchers(self):
         self.assertFalse(_migration(self._ID).detect(self._mcp(), {}))
@@ -3109,9 +3113,8 @@ class LocalCompressDeadEnvDropped(unittest.TestCase):
 
     # --- registry ---
 
-    def test_registered_last_and_after_the_carry_over(self):
+    def test_registered_after_the_carry_over(self):
         ids = [m.id for m in MIGRATIONS]
-        self.assertEqual(ids[-1], self._ID)
         self.assertLess(ids.index("qdrant-server-replaced"), ids.index(self._ID))
 
     # --- detect ---
@@ -3149,7 +3152,7 @@ class LocalCompressDeadEnvDropped(unittest.TestCase):
         self.assertEqual(after, expected)
         self.assertFalse(_migration(self._ID).detect(after, {}))
 
-    def test_embedding_model_is_kept_while_it_is_the_compact_models_only_record(self):
+    def test_embedding_model_is_kept_while_it_is_the_only_record_of_the_compact_model(self):
         # No COMPACT_EMBEDDING_MODEL in the compact block: `init` would read
         # local-compress's EMBEDDING_MODEL, so dropping it could orphan compacts.
         custom = dict(self._LEFTOVERS, EMBEDDING_MODEL="sentence-transformers/all-mpnet-base-v2")
