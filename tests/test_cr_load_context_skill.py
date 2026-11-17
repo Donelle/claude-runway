@@ -826,8 +826,10 @@ class PowerShellScriptsTest(unittest.TestCase):
     def test_the_contributor_skill_points_windows_at_its_script(self):
         text = (REPO_ROOT / ".claude" / "skills" / "cr-gh-load-context" / "SKILL.md").read_text(encoding="utf-8")
         self.assertIn(
-            r'powershell -NoProfile -ExecutionPolicy Bypass -File .claude\skills\cr-gh-load-context\facts.ps1 --porcelain',
+            'powershell -NoProfile -ExecutionPolicy Bypass -File .claude/skills/cr-gh-load-context/facts.ps1 --porcelain',
             text)
+        # Git Bash (the Bash tool on Windows) strips backslashes from an unquoted path.
+        self.assertNotIn(r".claude\skills\cr-gh-load-context\facts.ps1", text)
         self.assertIn("Do not assume bash exists on Windows", text)
         self.assertIn("never use WSL", text)
 
