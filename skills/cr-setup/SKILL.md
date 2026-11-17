@@ -1,3 +1,8 @@
+---
+name: cr-setup
+description: "Interactively configure a project for claude-runway (init) or apply named config migrations from a newer release (upgrade)."
+---
+
 # Skill: cr-setup
 
 Interactively configure any project for ClaudeRunway, or upgrade one that is

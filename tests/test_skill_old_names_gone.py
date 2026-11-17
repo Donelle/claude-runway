@@ -93,8 +93,8 @@ class OldSkillNamesGoneTest(unittest.TestCase):
         self.assertEqual(found, [], "old skill names found:\n" + "\n".join(found))
 
     def test_every_skill_directory_name_equals_its_declared_name(self):
-        # Contributor skills carry `name:` frontmatter; product skills ship without it (the installer adds it to
-        # the installed copy) and are named by their `# Skill: <name>` heading, so check whichever one exists.
+        # Every skill carries `name:` frontmatter (product skills also have a `# Skill: <name>` heading), so check
+        # whichever one exists.
         checked = 0
         for base in ("skills", ".claude/skills"):
             for skill_md in _tracked_skill_mds(base):

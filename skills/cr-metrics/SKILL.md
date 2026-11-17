@@ -1,3 +1,8 @@
+---
+name: cr-metrics
+description: "Show a view of claude-runway's shared cross-tool metrics store (autowork and memory-bank rows) through the analytics server's get_metrics tool."
+---
+
 # Skill: cr-metrics
 
 Show a view of ClaudeRunway's shared cross-tool metrics store: a generic SQLite table (`~/.claude/claude-runway/metrics.db`) any domain in this toolkit can write into via `libs/metrics_lib.py`'s `MetricsStore` class, read here through the `get_metrics` MCP tool from the opt-in `analytics` server. That server exists only when the project's `.mcp.json` has an `analytics` block (`setup_project.py init --track-savings` writes it; `upgrade` offers it to a project that already tracks savings). Without that block `get_metrics` does not exist, and the call fails as an unknown tool, which is not the same as "no data".

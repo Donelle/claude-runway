@@ -1364,8 +1364,8 @@ class SkillExtraFiles(unittest.TestCase):
 
 
 class SkillFrontmatterHandling(unittest.TestCase):
-    """Shipped skills have no frontmatter, installed ones do. The
-    installed copy's frontmatter is preserved and only the body is compared,
+    """An installed copy's own frontmatter (hand-edited, or left by an install
+    from before the shipped skills had a header) is preserved and only the body is compared,
     so there is no perpetual false "update" and no frontmatter is deleted."""
 
     FM = b'---\nname: skill-a\ndescription: "hand edited description"\n---\n\n'

@@ -53,7 +53,8 @@ class CrLoadContextSkillTest(unittest.TestCase):
         self.text = SKILL_PATH.read_text(encoding="utf-8")
 
     def test_uses_the_repos_skill_layout(self):
-        self.assertTrue(self.text.startswith("# Skill: cr-load-context\n"))
+        self.assertTrue(self.text.startswith("---\nname: cr-load-context\ndescription: "))
+        self.assertIn("\n---\n\n# Skill: cr-load-context\n", self.text)
         for heading in ("## Prerequisites", "## Usage", "## Steps"):
             self.assertIn(heading, self.text)
         # Installing is the installer's job (`init --install-skills`), not the skill's.

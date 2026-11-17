@@ -1,3 +1,8 @@
+---
+name: cr-savings
+description: "Show the opt-in savings tracker: exact characters before and after local compression this session, percent reduction, and project history (detail and trend views)."
+---
+
 # Skill: cr-savings
 
 Show the opt-in ClaudeRunway savings tracker: the exact characters before and after local compression this session, and the percent reduction, plus this project's history. This includes both the `local-compress` MCP server's tools (`compress_file`, `compress_command_output`, `fetch_url`) and the `compress_output.py` hook's own compressions of Bash/Grep/Glob/WebFetch/WebSearch output — both contribute to the same session total.

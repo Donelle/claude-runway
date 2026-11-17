@@ -1,3 +1,8 @@
+---
+name: cr-doctor
+description: "Run claude-runway's doctor check against this project (dual-config env values, stale hook, reviewers file) and say plainly whether it passed."
+---
+
 # Skill: cr-doctor
 
 Run claude-runway's `doctor` check against the current project and say plainly whether it passed. `doctor` diffs the project's `.mcp.json` dual-config `CLAUDE_RUNWAY_*` values against the live environment, flags a stale `compress_bash_output.py` hook, an unusable `codebase-reviewer` reviewers file, and the PR-round capture opt-in set without its hook. It exits 0 when nothing is wrong and 1 on any problem.
