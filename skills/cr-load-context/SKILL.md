@@ -1,3 +1,8 @@
+---
+name: cr-load-context
+description: "Load this project's context at session start: sync the Qdrant index while reading the docs, then report what the project is, recalled memories, open pull requests and which toolkit tools are live."
+---
+
 # Skill: cr-load-context
 
 Load this project's context at the start of a session, fast. The Qdrant index is synced in the background while the docs are read, then the skill reports what the project is, what was recalled about it, which pull requests are in play, and which of the toolkit's tools are live.

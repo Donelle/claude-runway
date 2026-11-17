@@ -1234,12 +1234,13 @@ def split_skill_frontmatter(data: bytes) -> "tuple[bytes, bytes]":
     `frontmatter_prefix + body == data` always holds; it is `b""` when
     `data` has no frontmatter block.
 
-    Why this exists: the shipped `skills/*/SKILL.md` files carry NO
-    frontmatter (they start at `# Skill: <name>`), but a skill installed on
-    a user's machine needs `name`/`description` frontmatter to be listed,
-    so real installed copies start with a `---` ... `---` block the source
-    lacks. A raw byte comparison would therefore call such a copy "update"
-    on EVERY run. The decision (see `plan_skill_installs`): the installed
+    Why this exists: every shipped `skills/*/SKILL.md` carries `name`/
+    `description` frontmatter (a skill needs it to be listed with a real
+    description), but an installed copy may carry its own, hand-edited
+    block, or none at all (an install made before the shipped files had
+    one). A raw byte comparison would call a copy whose header differs from
+    the shipped one "update" on EVERY run. The decision (see
+    `plan_skill_installs`): the installed
     copy's frontmatter is the USER'S (it may carry a hand-edited
     description), so it is preserved verbatim and only the body is compared
     and replaced. Never delete it, never invent one.
@@ -1364,17 +1365,16 @@ def plan_skill_installs(tools_repo_dir: Path, skills_dir: Path) -> list:
     CLI does the actual writing" split, so this stays trivially testable
     with only tmp directories, no mocking of file I/O needed.
 
-    Frontmatter rule: when the shipped source has no
-    frontmatter but the installed copy does, the installed copy's
-    frontmatter block is preserved and only the body is compared/replaced
+    Frontmatter rule: when the installed copy has a frontmatter block, it is
+    preserved and only the body is compared/replaced
     (`split_skill_frontmatter`). So an installed copy that differs from the
     shipped one ONLY by its frontmatter is "up_to_date" (no perpetual false
     "update"), and an "update" rewrites the body while keeping the user's
-    frontmatter. A fresh "install" writes the shipped source as-is (no
-    frontmatter is invented). If the shipped source itself ever gains
-    frontmatter, an installed copy's own block STILL wins (the shipped block
-    is not written over it); only an installed copy with no frontmatter gets
-    the shipped file whole.
+    frontmatter. A fresh "install" writes the shipped source as-is, which
+    carries its own `name`/`description` header. An installed copy's own
+    block STILL wins over the shipped one; only an installed copy with no
+    frontmatter (an install made before the shipped files had one) gets the
+    shipped file whole, header included, which is how `upgrade` repairs it.
 
     Files beside `SKILL.md` (a skill's own script) are planned and
     installed with it, byte for byte, as `SkillInstallPlan.extra_files`.

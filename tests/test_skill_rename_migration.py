@@ -149,7 +149,7 @@ class Migration(SkillRenameBase):
         self.assertEqual(self._read("cr-compact"), _fm("cr-compact", "hand edited") + "kept\n")
 
     def test_existing_frontmatterless_new_copy_gains_the_old_frontmatter_before_removal(self):
-        # What `init --install-skills` leaves behind when the shipped cr-* has no frontmatter.
+        # What an install made before the shipped cr-* files had a header leaves behind.
         self._install("my-resume", _fm("my-resume", "customized") + "# Skill: my-resume\nold body\n")
         self._install("cr-resume", "# Skill: cr-resume\nbody on disk\n")
         self._migrate()
@@ -301,9 +301,9 @@ class FrontmatterRewrite(unittest.TestCase):
 class DirectoryMatchesFrontmatterName(unittest.TestCase):
     """A skill's directory name is the name it is installed and listed under; a
     frontmatter `name:` that disagrees makes the two diverge (the failure a
-    rename is most likely to leave behind). Shipped `skills/` files may carry no
-    frontmatter at all (the installer's copy supplies it); only a present `name:`
-    is checked."""
+    rename is most likely to leave behind). Every shipped `skills/` file carries
+    frontmatter (tests/test_skill_frontmatter.py requires it); this checks that
+    the `name:` it holds is the directory's."""
 
     def test_every_skill_directory_matches_its_frontmatter_name(self):
         checked = 0

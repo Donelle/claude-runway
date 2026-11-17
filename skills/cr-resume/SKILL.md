@@ -1,3 +1,8 @@
+---
+name: cr-resume
+description: "Restore a conversation saved by /cr-compact at the start of a fresh session; optional keyword narrows which compact is found."
+---
+
 # Skill: cr-resume
 
 Restore a compacted conversation that was previously saved by `/cr-compact`. Run this at the start of a fresh session (after `/clear`) to pick up where you left off.
