@@ -1,3 +1,8 @@
+---
+name: cr-compact
+description: "Summarize the current conversation locally and save it to Qdrant so /cr-resume can restore it in a fresh session; optional label argument."
+---
+
 # Skill: cr-compact
 
 Locally summarize and persist the current conversation to Qdrant so it can be restored in a fresh session with `/cr-resume`. Everything stays local — `compact_store` (on the `compact` MCP server) compresses the summary on LM Studio and stores it in Qdrant, in one call. No Anthropic tokens are spent on the compression step, and the summary passes through your output only once.
