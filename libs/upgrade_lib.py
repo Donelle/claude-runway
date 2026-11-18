@@ -49,6 +49,7 @@ from typing import Callable, Optional
 from qdrant_ingest_lib import MANIFEST_FILENAME, is_old_format_manifest
 from setup_project_lib import (
     CLAUDE_MD_FILENAME,
+    CLAUDE_MD_MEMORY_BANK_HEADING,
     CLAUDE_MD_QDRANT_HEADING,
     CLAUDE_MD_TEMPLATE_NAME,
     COMPRESS_HOOK_SCRIPT,
@@ -1774,6 +1775,17 @@ _OLD_TOOL_NAME_IN_TEXT = re.compile(
     r"(?<![\w-])(?:index_repo|sync_repo|preview_index|get_collection_info|find_in_collection|"
     r"set_collection_description|list_collections|qdrant-find|qdrant-store)(?![\w-])"
 )
+# The Durable memory section only ever cross-referenced the old third-party
+# tools ("separate from qdrant-store/qdrant-find above"). Only those two names
+# are renamed there, in place: that section has drifted from the template in
+# other ways, and a whole-section replace would discard those edits.
+_OLD_MEMORY_BANK_TOOL_NAMES = {
+    "qdrant-store": "cb_indexer_store_repo",
+    "qdrant-find": "cb_indexer_find_repo",
+}
+_OLD_MEMORY_BANK_NAME_IN_TEXT = re.compile(
+    r"(?<![\w-])(" + "|".join(_OLD_MEMORY_BANK_TOOL_NAMES) + r")(?![\w-])"
+)
 _CLAUDE_MD_TEMPLATE = Path(__file__).resolve().parent.parent / "templates" / CLAUDE_MD_TEMPLATE_NAME
 _BOM = "\ufeff"
 
@@ -1788,21 +1800,34 @@ def _stale_claude_md_spans(lines: list) -> "list[tuple[int, int]]":
     ]
 
 
+def _stale_memory_bank_spans(lines: list) -> "list[tuple[int, int]]":
+    """Spans of the `## Durable memory (memory-bank MCP)` section(s) that still
+    name `qdrant-store`/`qdrant-find`."""
+    return [
+        (start, end)
+        for start, end in _section_spans(lines, CLAUDE_MD_MEMORY_BANK_HEADING)
+        if _OLD_MEMORY_BANK_NAME_IN_TEXT.search("".join(lines[start:end]))
+    ]
+
+
 def _detect_cb_indexer_claude_md_renamed(target_repo: Path) -> bool:
     text = read_claude_md(Path(target_repo) / CLAUDE_MD_FILENAME)
     if text is None:
         return False
-    return bool(_stale_claude_md_spans(text.removeprefix(_BOM).splitlines(keepends=True)))
+    lines = text.removeprefix(_BOM).splitlines(keepends=True)
+    return bool(_stale_claude_md_spans(lines) or _stale_memory_bank_spans(lines))
 
 
 def _apply_cb_indexer_claude_md_renamed(target_repo: Path, ctx: Optional[MigrationContext] = None) -> None:
     """
     Replaces each stale `## Vector memory (Qdrant MCP)` section with the
     current template's, so the tool names AND the sentence about which server
-    they come from are right. Everything outside that section -- the user's own
-    text, every other section -- is left byte for byte as it was, and so are the
-    file's line ending and byte-order mark. Edits made inside that one section
-    are replaced; it named tools that no longer exist.
+    they come from are right. In the `## Durable memory (memory-bank MCP)`
+    section it only renames `qdrant-store`/`qdrant-find` in place. Everything
+    outside those two sections -- the user's own text, every other section --
+    is left byte for byte as it was, and so are the file's line ending and
+    byte-order mark. Edits made inside the Vector memory section are replaced;
+    it named tools that no longer exist.
     """
     path = Path(target_repo) / CLAUDE_MD_FILENAME
     text = read_claude_md(path)
@@ -1813,8 +1838,16 @@ def _apply_cb_indexer_claude_md_renamed(target_repo: Path, ctx: Optional[Migrati
     newline = "\r\n" if "\r\n" in body else "\n"
     lines = body.splitlines(keepends=True)
     spans = _stale_claude_md_spans(lines)
-    if not spans:
+    memory_bank_spans = _stale_memory_bank_spans(lines)
+    if not spans and not memory_bank_spans:
         return
+    # Rename in the Durable memory section first: it is a line-for-line edit, so
+    # the line indexes the Vector memory replacement below relies on stay valid.
+    for start, end in memory_bank_spans:
+        for i in range(start, end):
+            lines[i] = _OLD_MEMORY_BANK_NAME_IN_TEXT.sub(
+                lambda m: _OLD_MEMORY_BANK_TOOL_NAMES[m.group(1)], lines[i]
+            )
     section = extract_claude_md_sections(_CLAUDE_MD_TEMPLATE.read_text(encoding="utf-8"))[CLAUDE_MD_QDRANT_HEADING]
     for start, end in reversed(spans):
         trailing = 0
@@ -2189,16 +2222,21 @@ REPO_MIGRATIONS: "list[RepoMigration]" = [
     ),
     RepoMigration(
         id="cb-indexer-claude-md-renamed",
-        title="Update CLAUDE.md's Vector memory section to the cb_indexer_* tool names",
+        title="Update CLAUDE.md's Vector and Durable memory sections to the cb_indexer_* tool names",
         kind="update",
         description=(
             "This repo's CLAUDE.md has the toolkit's '## Vector memory (Qdrant MCP)' section, and it still "
             "names the old tools (qdrant-find, sync_repo, ...), so Claude is told to call tools that no longer "
             "exist. Replaces that one section with the current template's, which names the cb_indexer_* tools "
-            "and says they come from the codebase-indexer server. Everything else in CLAUDE.md, including your "
-            "own text and every other section, is left exactly as it is."
+            "and says they come from the codebase-indexer server. The '## Durable memory (memory-bank MCP)' "
+            "section's reference to qdrant-store/qdrant-find is renamed to cb_indexer_store_repo/"
+            "cb_indexer_find_repo in place. Everything else in CLAUDE.md, including your own text and every "
+            "other section, is left exactly as it is."
         ),
-        note="Any edit you made inside that one section is replaced; re-apply it after upgrading.",
+        note=(
+            "Any edit you made inside the Vector memory section is replaced; re-apply it after upgrading. "
+            "In the Durable memory section only those two tool names change."
+        ),
         detect=_detect_cb_indexer_claude_md_renamed,
         apply=_apply_cb_indexer_claude_md_renamed,
     ),
