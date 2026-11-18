@@ -2705,6 +2705,65 @@ class CbIndexerClaudeMdRenamed(unittest.TestCase):
         self._write("# Mine\n\n```\n" + self._HEADING + "\nsync_repo\n```\n")
         self.assertFalse(self.migration.detect(self.repo))
 
+    # --- Durable memory section: only its qdrant-store/qdrant-find names change ---
+
+    _MB_HEADING = "## Durable memory (memory-bank MCP)"
+    _OLD_MB = (
+        "## Durable memory (memory-bank MCP)\n\n"
+        "Three tools: `remember`, `recall`, `forget`, separate from `qdrant-store`/`qdrant-find` above.\n\n"
+        "My own local rule: keep `weight` at 1.0.\n"
+    )
+
+    def _current_vector_section(self):
+        return self._template_section() + "\n"
+
+    def test_stale_names_only_in_durable_memory_are_pending(self):
+        self._write("# Mine\n\n" + self._current_vector_section() + self._OLD_MB)
+        self.assertTrue(self.migration.detect(self.repo))
+
+    def test_durable_memory_names_are_renamed_in_place_and_nothing_else_moves(self):
+        before = "# Mine\n\n" + self._current_vector_section()
+        after = "\n## Mine too\n\nI use `qdrant-find` for my own thing.\n"
+        self._write(before + self._OLD_MB + after)
+        self.migration.apply(self.repo)
+        expected = (
+            before
+            + self._OLD_MB.replace("`qdrant-store`", "`cb_indexer_store_repo`").replace(
+                "`qdrant-find`", "`cb_indexer_find_repo`"
+            )
+            + after
+        )
+        self.assertEqual(self._read(), expected)
+        self.assertFalse(self.migration.detect(self.repo))
+
+    def test_both_sections_stale_are_both_fixed(self):
+        self._write("# Mine\n\n" + self._OLD_SECTION + "\n" + self._OLD_MB)
+        self.migration.apply(self.repo)
+        result = self._read()
+        self.assertNotIn("`qdrant-find`", result)
+        self.assertNotIn("`qdrant-store`", result)
+        self.assertIn("My own local rule: keep `weight` at 1.0.", result)
+        self.assertFalse(self.migration.detect(self.repo))
+
+    def test_fully_current_file_is_not_pending(self):
+        template = (REPO_ROOT / "templates" / "CLAUDE.md.template").read_text(encoding="utf-8")
+        self._write(template)
+        self.assertFalse(self.migration.detect(self.repo))
+
+    def test_durable_memory_rename_keeps_crlf_and_bom(self):
+        self.path.write_bytes(("﻿# Mine\n\n" + self._OLD_MB).replace("\n", "\r\n").encode("utf-8"))
+        self.migration.apply(self.repo)
+        raw = self.path.read_bytes()
+        self.assertTrue(raw.startswith("﻿".encode("utf-8")))
+        text = raw.decode("utf-8")
+        self.assertNotIn("\r\r", text)
+        self.assertEqual(text.count("\n"), text.count("\r\n"))
+        self.assertIn("`cb_indexer_find_repo`", text)
+
+    def test_a_fenced_durable_memory_heading_is_not_mistaken_for_the_section(self):
+        self._write("# Mine\n\n```\n" + self._MB_HEADING + "\nqdrant-find\n```\n")
+        self.assertFalse(self.migration.detect(self.repo))
+
     def test_the_fresh_template_names_no_old_tool_anywhere(self):
         template = (REPO_ROOT / "templates" / "CLAUDE.md.template").read_text(encoding="utf-8")
         old = re.compile(
