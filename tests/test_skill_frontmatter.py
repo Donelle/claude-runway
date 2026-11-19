@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tests that every shipped skills/*/SKILL.md carries a `name`/`description`
 header, and that installing or upgrading handles it the way the installer
-documents (issue #169).
+documents.
 
 Without a header Claude Code lists a skill as "Skill: <name>" and cannot tell
 when it applies. Against temp directories only, stdlib-only, no network:
