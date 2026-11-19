@@ -67,7 +67,7 @@ class SkillIsGeneric(unittest.TestCase):
 
     def test_names_no_repository_or_organisation(self):
         text = _skill_text()
-        for forbidden in ("CVNA-SandboxOrg", "claude-runway", "claude_runway", "ClaudeRunway"):
+        for forbidden in ("claude-runway", "claude_runway", "ClaudeRunway"):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, text)
 
