@@ -388,7 +388,7 @@ class TranscriptScanStrategy(SessionIdLibTestCase):
     def test_windows_slug_replaces_backslashes_and_drive_colon(self):
         # a Windows absolute path must collapse every backslash AND
         # the drive-letter colon to `-`, matching the real layout verified live
-        # under ~/.claude/projects/ on this machine
+        # under ~/.claude/projects/ on a Windows machine
         # (C:\Repos\Acme\claude-runway ->
         #  C--Repos-Acme-claude-runway). The drive root `C:\`
         # produces `C--` (colon + backslash, each -> one `-`).
