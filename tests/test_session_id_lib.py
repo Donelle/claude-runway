@@ -388,9 +388,9 @@ class TranscriptScanStrategy(SessionIdLibTestCase):
     def test_windows_slug_replaces_backslashes_and_drive_colon(self):
         # a Windows absolute path must collapse every backslash AND
         # the drive-letter colon to `-`, matching the real layout verified live
-        # under ~/.claude/projects/ on this machine
-        # (C:\Repos\CVNA-Github\SandboxOrg\claude-runway ->
-        #  C--Repos-CVNA-Github-SandboxOrg-claude-runway). The drive root `C:\`
+        # under ~/.claude/projects/ on a Windows machine
+        # (C:\Repos\Acme\claude-runway ->
+        #  C--Repos-Acme-claude-runway). The drive root `C:\`
         # produces `C--` (colon + backslash, each -> one `-`).
         #
         # Stub _resolve_project: _project_slug routes
@@ -401,8 +401,8 @@ class TranscriptScanStrategy(SessionIdLibTestCase):
         # weakening production's absolute-path validation.
         with mock.patch.object(L, "_resolve_project", side_effect=lambda p: p):
             self.assertEqual(
-                L._project_slug(r"C:\Repos\CVNA-Github\SandboxOrg\claude-runway"),
-                "C--Repos-CVNA-Github-SandboxOrg-claude-runway",
+                L._project_slug(r"C:\Repos\Acme\claude-runway"),
+                "C--Repos-Acme-claude-runway",
             )
             self.assertEqual(L._project_slug(r"D:\dev\app"), "D--dev-app")
 
@@ -423,7 +423,7 @@ class TranscriptScanStrategy(SessionIdLibTestCase):
         # fixture setup AND the scan. Keep the stub active through both the slug
         # computation and the session_id() call so the test runs cross-platform
         # without changing production validation.
-        win_project = r"C:\Repos\CVNA-Github\SandboxOrg\claude-runway"
+        win_project = r"C:\Repos\Acme\claude-runway"
         with mock.patch.object(L, "_resolve_project", side_effect=lambda p: p):
             slug = L._project_slug(win_project)
             project_dir = self.projects_dir / slug
