@@ -36,6 +36,7 @@ os.environ.setdefault("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2
 import codebase_indexer_mcp_server as _ims  # noqa: E402
 from fake_token_budget import word_budget  # noqa: E402
 from qdrant_client import QdrantClient, models  # noqa: E402
+from fake_ownership_client import accept_ownership  # noqa: E402
 from qdrant_ingest_lib import (  # noqa: E402
     MANIFEST_FILENAME,
     MANIFEST_FORMAT_VERSION,
@@ -99,6 +100,24 @@ def _reader_that_predates_the_key(data):
 # ---------------------------------------------------------------------------
 # The manifest format
 # ---------------------------------------------------------------------------
+
+
+# Every run here is about what happens AFTER the codebase-indexer's ownership
+# guard (libs/qdrant_code_index_marker.py); these MagicMock clients carry no
+# real collection metadata, so the real guard would refuse them. It is tested
+# in test_qdrant_code_index_marker.py and through the tools in
+# test_codebase_indexer_mcp_server_memory_bank_guards.py / test_ingest_to_qdrant.py.
+_ownership_patchers: list = []
+
+
+def setUpModule():
+    _ownership_patchers.extend(accept_ownership(_ims))
+
+
+def tearDownModule():
+    for patcher in _ownership_patchers:
+        patcher.stop()
+    _ownership_patchers.clear()
 
 
 class PreservedKeyInTheManifest(unittest.TestCase):

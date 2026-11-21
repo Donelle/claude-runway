@@ -66,8 +66,8 @@ from qdrant_model_check import check_embedding_model_mismatch
 # call site -- the shared check's DEFAULT text tells a caller
 # to "use cb_indexer_index_repo(reset=true)"/mentions "cb_indexer_find_in_collection", both wrong
 # here: cb_indexer_index_repo refuses to ever touch the shared memory-bank collection
-# (see is_memory_bank_collection_name's callers in mcpservers/codebase_indexer_mcp_server.py),
-# and memory-bank isn't a cross-repo lookup.
+# (it refuses every existing collection it did not create, see
+# libs/qdrant_code_index_marker.py), and memory-bank isn't a cross-repo lookup.
 MISMATCH_RECOVERY_HINT = (
     "This shared memory-bank collection was created with a different embedding "
     "model than this project's EMBEDDING_MODEL. Every project sharing it must "
@@ -257,23 +257,13 @@ def parse_follow_repos(raw: Optional[str], own_repo: Optional[str]) -> tuple:
     return followed, ignored
 
 
-def is_memory_bank_collection_name(collection: str, memory_bank_collection: str) -> bool:
-    """
-    True if `collection` (an cb_indexer_index_repo/cb_indexer_sync_repo target) matches the
-    configured memory-bank collection name -- used by codebase_indexer_mcp_server.py
-    to refuse indexing/syncing directly into the shared memory bank,
-    regardless of reset/force, rather than only guarding the reset path.
-    """
-    return collection == memory_bank_collection
-
-
 def memory_bank_exclusion_filter() -> models.Filter:
     """
     The reusable `must_not` fragment cb_indexer_index_repo/cb_indexer_sync_repo fold into their own
     delete filters, so a collection that ever ends up holding both code
-    chunks and protected points (it shouldn't, given
-    is_memory_bank_collection_name's guard, but this stays as
-    defense-in-depth) never has them caught by an unrelated
+    chunks and protected points (it shouldn't, given the indexer's refusal of
+    any collection it did not create -- libs/qdrant_code_index_marker.py --
+    but this stays as defense-in-depth) never has them caught by an unrelated
     delete. Protects memory-bank points (metadata.source == "memory-bank")
     and conversation compacts (metadata.source ==
     "conversation-compact"). Compacts stored before that marker existed carry no

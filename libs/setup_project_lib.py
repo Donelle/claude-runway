@@ -345,9 +345,11 @@ def build_mcp_servers(
     blank in the generated env block for the same reason `compact_collection`
     isn't (see that paragraph above) -- `os.environ.get("MEMORY_BANK_COLLECTION",
     "memory-bank")`'s own fallback only fires when the key is genuinely
-    ABSENT, not present-but-empty. Applied to BOTH the `codebase-indexer`
-    block (which needs to know this value purely to refuse ever indexing
-    code into it) and the `memory-bank` block itself.
+    ABSENT, not present-but-empty. Written into the `memory-bank` block only:
+    the `codebase-indexer` block once carried a copy purely to refuse
+    indexing code into it, but the indexer now refuses every existing
+    collection it did not create (libs/qdrant_code_index_marker.py), so it
+    needs no copy, and `upgrade` removes an old one.
 
     `memory_bank_id`, if blank, defaults to `collection_name` -- a
     convenient one-time default for a brand-new project, since most
@@ -468,7 +470,6 @@ def build_mcp_servers(
     indexer["env"]["COLLECTION_DESCRIPTION"] = collection_description
     indexer["env"]["INDEX_INCLUDE_EXTENSIONS"] = include_extensions
     indexer["env"]["INDEX_EXCLUDE_DIRS"] = exclude_dirs
-    indexer["env"]["MEMORY_BANK_COLLECTION"] = resolved_memory_bank_collection
 
     memory_bank = servers["memory-bank"]
     memory_bank["command"] = venv_python_str
@@ -2222,18 +2223,19 @@ def run_setup(
 
     # Found in review: a target repo directory named e.g. "memory-bank"
     # with both COLLECTION_NAME and MEMORY_BANK_COLLECTION left at their
-    # defaults resolves them to the SAME string -- mcpservers/codebase_indexer_mcp_server.py's
-    # reserved-collection-name guard then refuses EVERY cb_indexer_index_repo/cb_indexer_sync_repo
-    # call for this project, since its own code-index collection IS the
-    # reserved memory-bank name. Warn at setup time rather than leaving this
-    # to surface later as a confusing "Error: ... is configured as the shared
-    # memory-bank collection" on the very first index attempt.
+    # defaults resolves them to the SAME string. Once the memory bank holds
+    # memories, mcpservers/codebase_indexer_mcp_server.py refuses EVERY
+    # cb_indexer_index_repo/cb_indexer_sync_repo call for this project (the
+    # collection exists and the indexer did not create it), and if the
+    # indexer gets there first, memories land in the code index. Setup is the
+    # one place that knows both names, so it warns here rather than leaving
+    # this to surface later as a confusing refusal on the first index attempt.
     if resolved_collection_name == resolved_memory_bank_collection:
         changes.append(
             f"WARNING: this project's COLLECTION_NAME ('{resolved_collection_name}') is the same "
             f"as MEMORY_BANK_COLLECTION -- cb_indexer_index_repo/cb_indexer_sync_repo will refuse to run at all for this "
-            f"project (they never touch the shared memory-bank collection). Pass --collection-name "
-            f"or --memory-bank-collection so the two differ."
+            f"project (they never write into a collection the codebase-indexer did not create, such as the "
+            f"shared memory-bank collection). Pass --collection-name or --memory-bank-collection so the two differ."
         )
 
     final_settings: Optional[dict] = None

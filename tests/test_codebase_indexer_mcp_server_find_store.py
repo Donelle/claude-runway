@@ -276,7 +276,7 @@ class FindStoreDoNotLoadTheModelAtStartup(unittest.TestCase):
                 self.model_name = model_name
 
         class _Connector:
-            def __init__(self, url, key, collection, provider):
+            def __init__(self, url, key, collection, provider, collection_metadata=None):
                 built.append((url, key, collection, provider.model_name))
 
             async def search(self, query, *, collection_name, limit):

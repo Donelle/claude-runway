@@ -94,6 +94,7 @@ from qdrant_collection_hints import (
     set_cached_search_limit,
 )
 from qdrant_compact_marker import collection_is_marked_compact, is_marked_compact
+from qdrant_code_index_marker import check_code_index_ownership, code_index_metadata
 from qdrant_model_check import check_embedding_model_mismatch
 from qdrant_credentials import resolve_qdrant_credentials, same_endpoint
 from mcp_tool_introspect import tool_count
@@ -463,13 +464,6 @@ DEFAULT_EMBEDDING_MODEL = _ENV_DEFAULTS["embedding_model"]
 # _sync_static_collection_description() below.
 DEFAULT_COLLECTION_DESCRIPTION = os.environ.get("COLLECTION_DESCRIPTION")
 
-# Same env var name memory_bank_mcp_server.py reads -- used
-# here ONLY to refuse cb_indexer_index_repo/cb_indexer_sync_repo ever targeting the shared
-# memory-bank collection, not to write into it. Defaults to the same
-# "memory-bank" default so the guard still applies out of the box even on a
-# project that hasn't explicitly configured this var.
-DEFAULT_MEMORY_BANK_COLLECTION = _ENV_DEFAULTS["memory_bank_collection"]
-
 
 def _resolve_credentials(
     qdrant_url: Optional[str], qdrant_api_key: Optional[str]
@@ -577,19 +571,18 @@ def _sync_static_collection_description(collection: Optional[str], qdrant_url: s
     """
     if not DEFAULT_COLLECTION_DESCRIPTION or not collection:
         return
-    # Same guard cb_indexer_index_repo/cb_indexer_sync_repo have: a project misconfigured with
-    # COLLECTION_NAME == MEMORY_BANK_COLLECTION must never stamp its code-index
-    # description onto the shared memory-bank collection.
-    if mb.is_memory_bank_collection_name(collection, DEFAULT_MEMORY_BANK_COLLECTION):
-        print(
-            f"[claude-runway] not syncing COLLECTION_DESCRIPTION: '{collection}' is the shared "
-            f"memory-bank collection (MEMORY_BANK_COLLECTION)",
-            file=sys.stderr,
-        )
-        return
     try:
         client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
         if not call_with_retry(client.collection_exists, collection):
+            return
+        # Same guard cb_indexer_index_repo/cb_indexer_sync_repo run: this
+        # project's code-index description must never be stamped onto a
+        # collection the codebase-indexer did not create (the memory bank, a
+        # compact collection, anything else), whatever it is called. It fails
+        # closed, so an unreadable collection is skipped rather than stamped.
+        ownership = check_code_index_ownership(client, collection, retry=call_with_retry)
+        if ownership.error:
+            print(f"[claude-runway] not syncing COLLECTION_DESCRIPTION: {ownership.error}", file=sys.stderr)
             return
         info = call_with_retry(client.get_collection, collection)
         current = (info.config.metadata or {}).get("description", "")
@@ -776,6 +769,13 @@ async def index_repo(
     cb_indexer_find_repo/cb_indexer_store_repo MCP server, or search relevance will silently
     break (different models produce incompatible vector spaces).
 
+    A collection this tool creates is marked as the codebase-indexer's own.
+    An EXISTING collection without that mark is refused, whatever reset/force
+    say and whatever it is called (the memory bank, a compact collection,
+    anything else). One indexed before the mark existed is adopted if it holds
+    indexed file chunks and no memory-bank or compact points; an empty
+    unmarked one is refused.
+
     Set reset=true to delete all existing UNPROTECTED entries (everything
     except the protected sources listed below) in the collection first -- otherwise re-running this on an already-indexed repo
     creates duplicate chunks. memory-bank points (metadata.source ==
@@ -943,17 +943,6 @@ async def _index_repo(
             "configured for this project's .mcp.json. Pass collection explicitly "
             "or set COLLECTION_NAME in this server's env block."
         )
-    # Refuse outright, regardless of reset/force, if this would
-    # index code chunks into (or, via reset, wipe) the shared memory-bank
-    # collection -- e.g. a code repo accidentally configured with the same
-    # COLLECTION_NAME as MEMORY_BANK_COLLECTION.
-    if mb.is_memory_bank_collection_name(collection, DEFAULT_MEMORY_BANK_COLLECTION):
-        return (
-            f"Error: '{collection}' is configured as the shared memory-bank "
-            f"collection (MEMORY_BANK_COLLECTION). Refusing to index code into it "
-            f"or reset it via cb_indexer_index_repo -- use a different COLLECTION_NAME for "
-            f"this project's code index."
-        )
     qdrant_url, qdrant_api_key = _resolve_credentials(qdrant_url, qdrant_api_key)
     embedding_model = embedding_model or DEFAULT_EMBEDDING_MODEL
 
@@ -964,6 +953,16 @@ async def _index_repo(
     # the first one after an arbitrarily long idle period since the
     # previous tool invocation.
     client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
+
+    # Refuse outright, regardless of reset/force, an existing collection the
+    # codebase-indexer did not create: indexing would write code chunks into
+    # it, and reset would delete its unprotected points. That covers the
+    # memory bank and compact collections under any name, and anything else
+    # already in Qdrant (libs/qdrant_code_index_marker.py). Before the
+    # manifest lock and before any delete, so a refused run touches nothing.
+    ownership = check_code_index_ownership(client, collection, retry=call_with_retry)
+    if ownership.error:
+        return ownership.error
 
     # How many points the collection held before this run added to it. Stays
     # 0 for a collection that does not exist yet; reset=True never
@@ -1102,6 +1101,9 @@ async def _index_repo(
         collection_name=collection,
         embedding_provider=embedding_provider,
         field_indexes=FIELD_INDEXES,
+        # A collection this run creates is marked as the indexer's own in
+        # the same request (libs/qdrant_code_index_marker.py).
+        collection_metadata=code_index_metadata(),
     )
 
     # Collect chunks via iter_entries() with concurrent progress reporting:
@@ -1441,6 +1443,10 @@ async def sync_repo(
     configured QDRANT_API_KEY is only sent to the configured QDRANT_URL; a
     different qdrant_url needs its own qdrant_api_key if it requires one.
 
+    Refuses an existing collection the codebase-indexer did not create, by
+    the same rule as cb_indexer_index_repo, before reading the manifest or
+    deleting anything.
+
     Reports progress via MCP progress notifications in each phase: a running
     count while the repo's files are hashed (no total, the scan is lazy), the
     file being chunked, "i/N" over the changed files, and chunks embedded and
@@ -1513,16 +1519,18 @@ async def _sync_repo(
             "Error: no collection specified and no COLLECTION_NAME env var "
             "configured for this project's .mcp.json."
         )
-    # Same reserved-collection-name refusal as cb_indexer_index_repo -- see
-    # its comment above for why.
-    if mb.is_memory_bank_collection_name(collection, DEFAULT_MEMORY_BANK_COLLECTION):
-        return (
-            f"Error: '{collection}' is configured as the shared memory-bank "
-            f"collection (MEMORY_BANK_COLLECTION). Refusing to sync code into it -- "
-            f"use a different COLLECTION_NAME for this project's code index."
-        )
     qdrant_url, qdrant_api_key = _resolve_credentials(qdrant_url, qdrant_api_key)
     embedding_model = embedding_model or DEFAULT_EMBEDDING_MODEL
+
+    # Constructed here, before the manifest lock, so the ownership refusal
+    # below runs first; every later Qdrant call in this sync reuses it.
+    client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
+    # Same refusal as cb_indexer_index_repo -- see its comment above for why.
+    # A sync deletes the old chunks of every changed or removed file, so it
+    # must never run against a collection the codebase-indexer did not create.
+    ownership = check_code_index_ownership(client, collection, retry=call_with_retry)
+    if ownership.error:
+        return ownership.error
 
     resolved_include_extensions = parse_csv_set(include_extensions) or DEFAULT_INCLUDE_EXTENSIONS
     resolved_exclude_dirs = parse_csv_set(exclude_dirs) or DEFAULT_EXTRA_EXCLUDE_DIRS
@@ -1582,9 +1590,9 @@ async def _sync_repo(
         [rel for rel in preserved_before if rel not in current_hashes and rel not in hash_skipped_paths],
     )
 
-    # Constructed before the "no changes" early return below so
-    # the index-consistency check can run ahead of it.
-    client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
+    # `client` (constructed above, before the ownership check) is used
+    # before the "no changes" early return below so the index-consistency
+    # check can run ahead of it.
 
     async def _check_index_invariant(will_be_indexed):
         """ONE invariant: "every manifest file that
@@ -1890,6 +1898,9 @@ async def _sync_repo(
         collection_name=collection,
         embedding_provider=embedding_provider,
         field_indexes=FIELD_INDEXES,
+        # A collection this run creates is marked as the indexer's own in
+        # the same request (libs/qdrant_code_index_marker.py).
+        collection_metadata=code_index_metadata(),
     )
 
     async def _report_progress(stored, total_entries):
@@ -2343,6 +2354,11 @@ def _get_find_store_connector() -> QdrantConnector:
             DEFAULT_QDRANT_API_KEY,
             DEFAULT_COLLECTION,
             FastEmbedProvider(DEFAULT_EMBEDDING_MODEL),
+            # cb_indexer_store_repo can be the first write into this project's
+            # collection; a collection it creates carries the indexer's mark
+            # like one created by an index or sync, so those are not refused
+            # on it later.
+            collection_metadata=code_index_metadata(),
         )
     return _find_store_connector
 

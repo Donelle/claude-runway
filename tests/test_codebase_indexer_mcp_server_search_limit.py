@@ -22,6 +22,8 @@ os.environ.setdefault("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2
 
 import codebase_indexer_mcp_server as _ims  # noqa: E402
 from qdrant_client import models as _m  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # fake_ownership_client
+from fake_ownership_client import accept_ownership  # noqa: E402
 
 
 def _run(coro):
@@ -36,6 +38,24 @@ def _client(points: int, metadata=None, exists: bool = True) -> MagicMock:
     info.config.metadata = metadata
     client.get_collection.return_value = info
     return client
+
+
+# Every run here is about what happens AFTER the codebase-indexer's ownership
+# guard (libs/qdrant_code_index_marker.py); these MagicMock clients carry no
+# real collection metadata, so the real guard would refuse them. It is tested
+# in test_qdrant_code_index_marker.py and through the tools in
+# test_codebase_indexer_mcp_server_memory_bank_guards.py / test_ingest_to_qdrant.py.
+_ownership_patchers: list = []
+
+
+def setUpModule():
+    _ownership_patchers.extend(accept_ownership(_ims))
+
+
+def tearDownModule():
+    for patcher in _ownership_patchers:
+        patcher.stop()
+    _ownership_patchers.clear()
 
 
 class RecomputeSearchLimitTest(unittest.TestCase):

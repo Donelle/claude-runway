@@ -109,6 +109,42 @@ class OnDiskFormat(unittest.TestCase):
         self.assertEqual(vectors["fast-test-model"].size, 7)
         self.assertEqual(vectors["fast-test-model"].distance, models.Distance.COSINE)
 
+    def test_collection_metadata_is_written_in_the_create_request(self):
+        # The codebase-indexer's ownership mark (libs/qdrant_code_index_marker.py)
+        # rides on this, so a collection it creates is never briefly unmarked.
+        async def go(exists):
+            c = _connector(collection_metadata={"claude_runway_kind": "code-index"})
+            c.client = mock.AsyncMock()
+            c.client.collection_exists.return_value = exists
+            await c.ensure_collection_exists("coll")
+            return c.client
+
+        created = _run(go(False))
+        self.assertEqual(
+            created.create_collection.call_args.kwargs["metadata"], {"claude_runway_kind": "code-index"}
+        )
+        existing = _run(go(True))
+        existing.create_collection.assert_not_awaited()
+        existing.update_collection.assert_not_awaited()
+
+    def test_no_collection_metadata_sends_none(self):
+        async def go():
+            c = _connector()
+            c.client = mock.AsyncMock()
+            c.client.collection_exists.return_value = False
+            await c.ensure_collection_exists("coll")
+            return c.client
+
+        self.assertIsNone(_run(go()).create_collection.call_args.kwargs["metadata"])
+
+    def test_collection_metadata_round_trips_in_process(self):
+        async def go():
+            c = _connector(collection_metadata={"claude_runway_kind": "code-index"})
+            await c.ensure_collection_exists("coll")
+            return (await c.client.get_collection("coll")).config.metadata
+
+        self.assertEqual(_run(go()), {"claude_runway_kind": "code-index"})
+
     def test_store_writes_the_documented_payload_and_vector_name(self):
         async def go():
             c = _connector()

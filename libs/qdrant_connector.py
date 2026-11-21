@@ -64,6 +64,7 @@ class QdrantConnector:
         embedding_provider,
         qdrant_local_path: Optional[str] = None,
         field_indexes: Optional[dict[str, models.PayloadSchemaType]] = None,
+        collection_metadata: Optional[dict[str, Any]] = None,
     ):
         self.qdrant_url = qdrant_url.rstrip("/") if qdrant_url else None
         self.qdrant_api_key = qdrant_api_key
@@ -73,6 +74,13 @@ class QdrantConnector:
             location=qdrant_url, api_key=qdrant_api_key, path=qdrant_local_path
         )
         self.field_indexes = field_indexes
+        # Written in the create_collection request itself, never afterwards,
+        # so a collection this connector creates cannot exist for a moment
+        # without it. The codebase-indexer passes its ownership mark here
+        # (libs/qdrant_code_index_marker.py): a separate update after the
+        # create could fail and leave an unmarked collection the indexer would
+        # then refuse as not its own.
+        self.collection_metadata = collection_metadata
 
     async def get_collection_names(self) -> list[str]:
         response = await self.client.get_collections()
@@ -128,11 +136,14 @@ class QdrantConnector:
         ]
 
     async def ensure_collection_exists(self, collection_name: str) -> None:
-        """Creates the collection (and any `field_indexes`) if it is missing.
+        """Creates the collection (with any `collection_metadata`, and any
+        `field_indexes`) if it is missing.
 
-        `field_indexes` are applied ONLY when this call creates the collection,
-        never to one that already exists; `qdrant_batch_store
-        .ensure_file_path_index` is the explicit backfill for those.
+        `field_indexes` and `collection_metadata` are applied ONLY when this
+        call creates the collection, never to one that already exists;
+        `qdrant_batch_store.ensure_file_path_index` is the explicit backfill
+        for the indexes, and `qdrant_code_index_marker
+        .check_code_index_ownership` the one for the codebase-indexer's mark.
 
         Safe against a concurrent creator: two MCP/CLI processes indexing a
         missing collection can both see it absent, and the loser's
@@ -151,6 +162,7 @@ class QdrantConnector:
                 vectors_config={
                     vector_name: models.VectorParams(size=vector_size, distance=models.Distance.COSINE)
                 },
+                metadata=dict(self.collection_metadata) if self.collection_metadata else None,
             )
         except Exception:
             if not await self.client.collection_exists(collection_name):

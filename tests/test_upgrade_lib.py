@@ -165,75 +165,79 @@ class MemoryBankServerMissing(unittest.TestCase):
         )
 
 
-class CodebaseIndexerMemoryBankCollectionMissing(unittest.TestCase):
-    """`upgrade` never added MEMORY_BANK_COLLECTION to an existing
-    codebase-indexer block, leaving cb_indexer_index_repo/cb_indexer_sync_repo's memory-bank guard
-    protecting only the default name for a project with a custom one."""
+class CodebaseIndexerMemoryBankCollectionDropped(unittest.TestCase):
+    """The codebase-indexer no longer reads MEMORY_BANK_COLLECTION: it refuses
+    every existing collection it did not create (libs/qdrant_code_index_marker.py).
+    `upgrade` removes the old copy from its block, never the memory-bank
+    block's own key, and never the only record of a custom name."""
 
-    _ID = "codebase-indexer-memory-bank-collection-missing"
+    _ID = "codebase-indexer-memory-bank-collection-dropped"
 
-    def test_detect_true_when_key_absent(self):
-        mcp_json = {"mcpServers": {"codebase-indexer": {"env": {"COLLECTION_NAME": "p"}}}}
-        self.assertTrue(_migration(self._ID).detect(mcp_json, {}))
+    def test_the_old_add_migration_is_gone(self):
+        self.assertNotIn("codebase-indexer-memory-bank-collection-missing", {m.id for m in MIGRATIONS})
 
-    def test_detect_true_when_indexer_has_no_env_block_at_all(self):
-        mcp_json = {"mcpServers": {"codebase-indexer": {}}}
-        self.assertTrue(_migration(self._ID).detect(mcp_json, {}))
+    def test_detect_true_when_the_indexer_has_the_key_and_a_memory_bank_block_exists(self):
+        for value in ("memory-bank", "custom-mb", ""):
+            with self.subTest(value=value):
+                mcp_json = {"mcpServers": {
+                    "codebase-indexer": {"env": {"MEMORY_BANK_COLLECTION": value}},
+                    "memory-bank": {"env": {"MEMORY_BANK_COLLECTION": "custom-mb"}},
+                }}
+                self.assertTrue(_migration(self._ID).detect(mcp_json, {}))
 
-    def test_detect_false_when_key_present_and_set(self):
-        for value in ("memory-bank", "custom-mb"):
-            mcp_json = {"mcpServers": {"codebase-indexer": {"env": {"MEMORY_BANK_COLLECTION": value}}}}
-            self.assertFalse(_migration(self._ID).detect(mcp_json, {}), value)
+    def test_detect_true_without_a_memory_bank_block_for_a_default_or_blank_value(self):
+        for value in ("memory-bank", ""):
+            with self.subTest(value=value):
+                mcp_json = {"mcpServers": {"codebase-indexer": {"env": {"MEMORY_BANK_COLLECTION": value}}}}
+                self.assertTrue(_migration(self._ID).detect(mcp_json, {}))
 
-    def test_detect_true_when_key_present_but_blank(self):
-        # A blank value is what the template writes by default; it leaves the
-        # memory-bank guard disabled, so it must count as unconfigured.
-        mcp_json = {"mcpServers": {"codebase-indexer": {"env": {"MEMORY_BANK_COLLECTION": ""}}}}
-        self.assertTrue(_migration(self._ID).detect(mcp_json, {}))
-
-    def test_detect_false_when_no_codebase_indexer_block(self):
-        mcp_json = {"mcpServers": {"qdrant": {"env": {}}, "memory-bank": {"env": {}}}}
+    def test_detect_false_while_a_custom_name_is_its_only_record(self):
+        # memory-bank-server-missing reads it to build the memory-bank block.
+        mcp_json = {"mcpServers": {"codebase-indexer": {"env": {"MEMORY_BANK_COLLECTION": "custom-mb"}}}}
         self.assertFalse(_migration(self._ID).detect(mcp_json, {}))
-        self.assertFalse(_migration(self._ID).detect({}, {}))
+        after, _ = _migration(self._ID).apply(mcp_json, {}, _ctx())
+        self.assertEqual(after, mcp_json)
 
-    def test_apply_uses_default_with_default_memory_bank_block(self):
+    def test_detect_false_without_the_key_or_the_block(self):
+        for mcp_json in (
+            {},
+            {"mcpServers": {"memory-bank": {"env": {"MEMORY_BANK_COLLECTION": "m"}}}},
+            {"mcpServers": {"codebase-indexer": {}}},
+            {"mcpServers": {"codebase-indexer": {"env": {"COLLECTION_NAME": "p"}}}},
+        ):
+            with self.subTest(mcp_json=mcp_json):
+                self.assertFalse(_migration(self._ID).detect(mcp_json, {}))
+
+    def test_apply_removes_only_the_indexer_copy(self):
         before = {
             "mcpServers": {
-                "codebase-indexer": {"env": {"COLLECTION_NAME": "p"}},
-                "memory-bank": {"env": {"MEMORY_BANK_COLLECTION": "memory-bank"}},
-            }
-        }
-        after, after_settings = _migration(self._ID).apply(before, {"x": 1}, _ctx())
-        self.assertEqual(
-            after["mcpServers"]["codebase-indexer"]["env"],
-            {"COLLECTION_NAME": "p", "MEMORY_BANK_COLLECTION": "memory-bank"},
-        )
-        self.assertEqual(after["mcpServers"]["memory-bank"], before["mcpServers"]["memory-bank"])
-        self.assertEqual(after_settings, {"x": 1})
-        # Input never mutated in place.
-        self.assertNotIn("MEMORY_BANK_COLLECTION", before["mcpServers"]["codebase-indexer"]["env"])
-
-    def test_apply_copies_custom_value_from_memory_bank_block(self):
-        before = {
-            "mcpServers": {
-                "codebase-indexer": {"env": {"COLLECTION_NAME": "p"}},
+                "codebase-indexer": {"env": {"COLLECTION_NAME": "p", "MEMORY_BANK_COLLECTION": "custom-mb"}},
                 "memory-bank": {"env": {"MEMORY_BANK_COLLECTION": "custom-mb"}},
             }
         }
-        after, _ = _migration(self._ID).apply(before, {}, _ctx())
-        self.assertEqual(after["mcpServers"]["codebase-indexer"]["env"]["MEMORY_BANK_COLLECTION"], "custom-mb")
+        after, after_settings = _migration(self._ID).apply(before, {"x": 1}, _ctx())
+        self.assertEqual(after["mcpServers"]["codebase-indexer"]["env"], {"COLLECTION_NAME": "p"})
+        self.assertEqual(after["mcpServers"]["memory-bank"], before["mcpServers"]["memory-bank"])
+        self.assertEqual(after_settings, {"x": 1})
+        # Input never mutated in place.
+        self.assertIn("MEMORY_BANK_COLLECTION", before["mcpServers"]["codebase-indexer"]["env"])
+        self.assertFalse(_migration(self._ID).detect(after, {}))
 
-    def test_apply_defaults_when_no_memory_bank_block(self):
-        before = {"mcpServers": {"codebase-indexer": {}}}
-        after, _ = _migration(self._ID).apply(before, {}, _ctx())
-        self.assertEqual(after["mcpServers"]["codebase-indexer"]["env"], {"MEMORY_BANK_COLLECTION": "memory-bank"})
-        self.assertNotIn("memory-bank", after["mcpServers"])
+    def test_runs_after_memory_bank_server_missing(self):
+        # That migration reads the indexer's copy when it builds the block.
+        ids = [m.id for m in MIGRATIONS]
+        self.assertLess(ids.index("memory-bank-server-missing"), ids.index(self._ID))
 
-    def test_apply_is_idempotent_via_detect(self):
-        migration = _migration(self._ID)
-        before = {"mcpServers": {"codebase-indexer": {"env": {}}}}
-        after, _ = migration.apply(before, {}, _ctx())
-        self.assertFalse(migration.detect(after, {}))
+    def test_both_pending_keeps_the_default_name_in_the_new_memory_bank_block(self):
+        before = {"mcpServers": {
+            "qdrant": {"env": {"COLLECTION_NAME": "p"}},
+            "codebase-indexer": {"env": {"COLLECTION_NAME": "p", "MEMORY_BANK_COLLECTION": "memory-bank"}},
+        }}
+        mcp_json, settings = before, {}
+        for migration_id in ("memory-bank-server-missing", self._ID):
+            mcp_json, settings = _migration(migration_id).apply(mcp_json, settings, _ctx())
+        self.assertEqual(mcp_json["mcpServers"]["memory-bank"]["env"]["MEMORY_BANK_COLLECTION"], "memory-bank")
+        self.assertNotIn("MEMORY_BANK_COLLECTION", mcp_json["mcpServers"]["codebase-indexer"]["env"])
 
 
 class RecordSessionIdHooksMissing(unittest.TestCase):
@@ -426,7 +430,7 @@ class ObsoleteMigrationsAreGone(unittest.TestCase):
     def test_a_block_without_hf_hub_offline_is_not_pending_on_its_own(self):
         mcp_json = {"mcpServers": {"compact": {"command": "/venv/bin/python", "args": ["/t/mcpservers/compact_mcp_server.py"],
                                               "env": {"COMPACT_COLLECTION": "p"}},
-                                   "memory-bank": {"env": {}}, "codebase-indexer": {"env": {"MEMORY_BANK_COLLECTION": "m"}}}}
+                                   "memory-bank": {"env": {}}, "codebase-indexer": {"env": {}}}}
         settings = {"hooks": {"SessionStart": [{"hooks": [{"args": ["/x/hooks/record_session_id.py"]}]}],
                               "SessionEnd": [{"hooks": [{"args": ["/x/hooks/record_session_id.py"]}]},
                                              {"hooks": [{"args": ["/x/hooks/session_end_pr_rounds.py"]}]}]}}
@@ -848,8 +852,12 @@ class PendingMigrations(unittest.TestCase):
         mcp_json = {
             "mcpServers": {
                 "qdrant": {"command": "/old/venv/bin/mcp-server-qdrant", "env": {}},
-                # Still launched from the old tools/ folder: mcp-server-scripts-moved too.
-                "codebase-indexer": {"args": ["/old/tools-repo/tools/ingest_mcp_server.py"], "env": {}},
+                # Still launched from the old tools/ folder: mcp-server-scripts-moved too;
+                # the old MEMORY_BANK_COLLECTION copy: codebase-indexer-memory-bank-collection-dropped too.
+                "codebase-indexer": {
+                    "args": ["/old/tools-repo/tools/ingest_mcp_server.py"],
+                    "env": {"MEMORY_BANK_COLLECTION": "memory-bank"},
+                },
                 # Tracking on, no analytics block: analytics-server-missing too;
                 # the leftover SAVINGS_DB key: local-compress-savings-db-inert too;
                 # the leftover compact setting: local-compress-dead-env-dropped too.
@@ -879,7 +887,7 @@ class PendingMigrations(unittest.TestCase):
         mcp_json = {
             "mcpServers": {
                 "compact": {"command": "/venv/bin/python", "args": ["/t/mcpservers/compact_mcp_server.py"], "env": {}},
-                "codebase-indexer": {"env": {"MEMORY_BANK_COLLECTION": "memory-bank"}},
+                "codebase-indexer": {"env": {}},
                 "memory-bank": {"env": {}},
             }
         }
@@ -974,9 +982,10 @@ class RunUpgradeEndToEnd(unittest.TestCase):
                         },
                         # Launched from the old tools/ folder, before the servers moved
                         # to mcpservers/.
+                        # Still carries the old MEMORY_BANK_COLLECTION copy.
                         "codebase-indexer": {
                             "args": ["/old/tools-repo/tools/ingest_mcp_server.py"],
-                            "env": {"COLLECTION_NAME": "my-target-project"},
+                            "env": {"COLLECTION_NAME": "my-target-project", "MEMORY_BANK_COLLECTION": "memory-bank"},
                         },
                         # No EMBEDDING_MODEL in the local-compress env: compacts were stored
                         # under the legacy model.

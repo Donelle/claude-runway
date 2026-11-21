@@ -32,6 +32,8 @@ os.environ.setdefault("COLLECTION_NAME", "test-collection")
 os.environ.setdefault("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 
 import codebase_indexer_mcp_server as _ims  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # fake_ownership_client
+from fake_ownership_client import accept_ownership  # noqa: E402
 
 
 def _make_collection_info(points_count: int) -> MagicMock:
@@ -44,6 +46,24 @@ def _make_collection_info(points_count: int) -> MagicMock:
 def _run(coro):
     """Run an async coroutine in the test runner's sync context."""
     return asyncio.run(coro)
+
+
+# Every run here is about what happens AFTER the codebase-indexer's ownership
+# guard (libs/qdrant_code_index_marker.py); these MagicMock clients carry no
+# real collection metadata, so the real guard would refuse them. It is tested
+# in test_qdrant_code_index_marker.py and through the tools in
+# test_codebase_indexer_mcp_server_memory_bank_guards.py / test_ingest_to_qdrant.py.
+_ownership_patchers: list = []
+
+
+def setUpModule():
+    _ownership_patchers.extend(accept_ownership(_ims))
+
+
+def tearDownModule():
+    for patcher in _ownership_patchers:
+        patcher.stop()
+    _ownership_patchers.clear()
 
 
 class IndexRepoPreflightWarningTest(unittest.TestCase):

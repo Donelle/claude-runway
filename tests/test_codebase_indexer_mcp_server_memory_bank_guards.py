@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""Tests for the memory-bank guards added to mcpservers/codebase_indexer_mcp_server.py:
+"""Tests for the protected-collection guards in mcpservers/codebase_indexer_mcp_server.py:
 
 
-- cb_indexer_index_repo/cb_indexer_sync_repo refuse outright when their target collection matches
-  the configured shared memory-bank collection name.
+- cb_indexer_index_repo/cb_indexer_sync_repo refuse outright an existing collection
+  the codebase-indexer did not create (libs/qdrant_code_index_marker.py): the
+  memory bank under any name, a compact collection, an empty or unrelated
+  one. This replaced a check against the indexer's own copy of
+  MEMORY_BANK_COLLECTION, which protected one name only; no env var is set
+  here, so a refusal below can only come from the mark.
 - cb_indexer_index_repo(reset=True) ALWAYS preserves memory-bank points via a filtered
   delete, and never calls delete_collection or counts anything first (PR
   An earlier version branched on a memory-bank point count, but
@@ -29,6 +33,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "libs"))
 sys.path.insert(0, os.path.join(REPO_ROOT, "mcpservers"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # fake_ownership_client
 
 os.environ.setdefault("QDRANT_URL", "http://localhost:6333")
 os.environ.setdefault("COLLECTION_NAME", "test-collection")
@@ -36,38 +41,150 @@ os.environ.setdefault("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2
 
 import codebase_indexer_mcp_server as _ims  # noqa: E402
 import memory_bank_lib as mb  # noqa: E402
+import qdrant_code_index_marker as marker  # noqa: E402
+from fake_ownership_client import (  # noqa: E402
+    FakeOwnershipClient,
+    code_chunk,
+    memory_point,
+    unrelated_point,
+)
 from qdrant_client.http.models import models as _m  # noqa: E402
+from qdrant_compact_marker import MARKER_KEY as COMPACT_KEY, MARKER_VALUE as COMPACT_VALUE  # noqa: E402
 
 
 def _run(coro):
     return asyncio.run(coro)
 
 
-class ReservedCollectionNameGuardTest(unittest.TestCase):
-    """No client/network mocking needed -- this guard fires before any
-    QdrantClient is even constructed."""
+def _accept_ownership(test: unittest.TestCase) -> None:
+    """For tests about what happens AFTER the ownership guard: their MagicMock
+    clients carry no real collection metadata, so the guard (which fails
+    closed) would refuse them. The guard has its own tests below."""
+    patcher = patch.object(_ims, "check_code_index_ownership", return_value=marker.OwnershipCheck())
+    patcher.start()
+    test.addCleanup(patcher.stop)
 
-    def test_index_repo_refuses_memory_bank_collection(self):
-        result = _run(_ims.index_repo(repo_path=REPO_ROOT, collection=_ims.DEFAULT_MEMORY_BANK_COLLECTION))
-        self.assertIn("Error", result)
-        self.assertIn("memory-bank", result)
 
-    def test_index_repo_refuses_regardless_of_reset_and_force(self):
-        result = _run(
-            _ims.index_repo(
-                repo_path=REPO_ROOT, collection=_ims.DEFAULT_MEMORY_BANK_COLLECTION, reset=True, force=True
-            )
-        )
-        self.assertIn("Error", result)
+def _foreign_collections():
+    """(label, client) for every existing collection the indexer must refuse,
+    whatever it is called -- the issue's acceptance list."""
+    return (
+        ("memory bank under a non-default name", FakeOwnershipClient(payloads=[memory_point()])),
+        ("marked compact collection", FakeOwnershipClient(metadata={COMPACT_KEY: COMPACT_VALUE})),
+        ("empty unmarked collection", FakeOwnershipClient(payloads=[])),
+        ("unmarked collection of unrelated points", FakeOwnershipClient(payloads=[unrelated_point()])),
+        ("unreadable metadata", FakeOwnershipClient(fail_on="get_collection")),
+    )
 
-    def test_sync_repo_refuses_memory_bank_collection(self):
-        result = _run(_ims.sync_repo(repo_path=REPO_ROOT, collection=_ims.DEFAULT_MEMORY_BANK_COLLECTION))
-        self.assertIn("Error", result)
-        self.assertIn("memory-bank", result)
+
+class OwnershipGuardTest(unittest.TestCase):
+    """The FakeOwnershipClient has no delete/upsert/count methods at all, so a
+    run that got past a refusal would raise instead of returning the error."""
+
+    def setUp(self):
+        for target, kwargs in (
+            ("call_with_retry", {"side_effect": lambda fn, *a, **kw: fn(*a, **kw)}),
+            ("_save_manifest", {}),
+            ("_discard_manifest", {}),
+            ("_load_manifest", {}),
+            # Neither may be reached on a refusal: no model load, no store.
+            ("FastEmbedProvider", {}),
+            ("store_batch", {"new_callable": AsyncMock}),
+        ):
+            patcher = patch.object(_ims, target, **kwargs)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _assert_refused(self, client, call):
+        with patch("codebase_indexer_mcp_server.QdrantClient", return_value=client):
+            result = _run(call())
+        self.assertTrue(result.startswith("Error"), result)
+        self.assertIn("'shared-thing'", result)
+        self.assertEqual(client.updates, [])
+        _ims.FastEmbedProvider.assert_not_called()
+        _ims.store_batch.assert_not_called()
+        _ims._discard_manifest.assert_not_called()
+        _ims._load_manifest.assert_not_called()
+
+    def test_index_repo_refuses_with_and_without_reset_and_force(self):
+        for reset, force in ((False, False), (True, False), (False, True), (True, True)):
+            for label, client in _foreign_collections():
+                with self.subTest(label=label, reset=reset, force=force):
+                    # Bound as defaults: the lambda runs inside this iteration.
+                    self._assert_refused(client, lambda reset=reset, force=force: _ims.index_repo(
+                        repo_path=REPO_ROOT, collection="shared-thing", reset=reset, force=force
+                    ))
+
+    def test_sync_repo_refuses(self):
+        for label, client in _foreign_collections():
+            with self.subTest(label=label):
+                self._assert_refused(client, lambda: _ims.sync_repo(repo_path=REPO_ROOT, collection="shared-thing"))
+
+    def test_no_memory_bank_name_is_kept_by_the_indexer(self):
+        # The indexer no longer has its own copy of the memory-bank name.
+        self.assertFalse(hasattr(_ims, "DEFAULT_MEMORY_BANK_COLLECTION"))
+        self.assertFalse(hasattr(mb, "is_memory_bank_collection_name"))
+
+    def test_unmarked_code_collection_is_adopted_and_indexed(self):
+        # The issue's step-3 decision: a collection indexed before the mark
+        # existed is marked and used, not refused.
+        client = FakeOwnershipClient(payloads=[code_chunk()])
+        with patch("codebase_indexer_mcp_server.QdrantClient", return_value=client), \
+             patch.object(_ims, "prepare_collection_for_index", return_value=MagicMock(error="stop-here")):
+            result = _run(_ims.index_repo(repo_path=REPO_ROOT, collection="shared-thing", force=True))
+        self.assertEqual(result, "stop-here")  # got past the guard to the preparation step
+        self.assertEqual(client.updates, [marker.code_index_metadata()])
+
+
+class NewCollectionsCarryTheMarkTest(unittest.TestCase):
+    """The connector every write path builds passes the mark, so a collection
+    it creates is marked in the create request itself."""
+
+    def setUp(self):
+        _accept_ownership(self)
+        for target, kwargs in (
+            ("call_with_retry", {"side_effect": lambda fn, *a, **kw: fn(*a, **kw)}),
+            ("store_batch", {"new_callable": AsyncMock}),
+            ("iter_entries", {"return_value": iter([])}),
+            ("ensure_file_path_index", {}),
+            ("_save_manifest", {}),
+            ("_discard_manifest", {}),
+            ("_load_manifest", {"return_value": {}}),
+            ("compute_file_hashes", {"return_value": ({"a.py": "h"}, [])}),
+            ("chunk_file", {"return_value": iter([])}),
+            ("FastEmbedProvider", {}),
+        ):
+            patcher = patch.object(_ims, target, **kwargs)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _connector_kwargs(self, call):
+        client = MagicMock()
+        client.collection_exists.return_value = False
+        with patch("codebase_indexer_mcp_server.QdrantClient", return_value=client), \
+             patch("codebase_indexer_mcp_server.QdrantConnector") as connector_cls:
+            _run(call())
+        connector_cls.assert_called_once()
+        return connector_cls.call_args.kwargs
+
+    def test_index_repo(self):
+        kwargs = self._connector_kwargs(lambda: _ims.index_repo(repo_path=REPO_ROOT, collection="new-coll"))
+        self.assertEqual(kwargs["collection_metadata"], marker.code_index_metadata())
+
+    def test_sync_repo(self):
+        kwargs = self._connector_kwargs(lambda: _ims.sync_repo(repo_path=REPO_ROOT, collection="new-coll"))
+        self.assertEqual(kwargs["collection_metadata"], marker.code_index_metadata())
+
+    def test_store_repo_connector(self):
+        with patch.object(_ims, "_find_store_connector", None), \
+             patch("codebase_indexer_mcp_server.QdrantConnector") as connector_cls:
+            _ims._get_find_store_connector()
+        self.assertEqual(connector_cls.call_args.kwargs["collection_metadata"], marker.code_index_metadata())
 
 
 class IndexRepoResetGuardTest(unittest.TestCase):
     def setUp(self):
+        _accept_ownership(self)
         self._retry_patcher = patch.object(_ims, "call_with_retry", side_effect=lambda fn, *a, **kw: fn(*a, **kw))
         self._retry_patcher.start()
         self.addCleanup(self._retry_patcher.stop)
@@ -185,6 +302,7 @@ class IndexRepoResetGuardTest(unittest.TestCase):
 
 class SyncRepoDeleteFilterTest(unittest.TestCase):
     def setUp(self):
+        _accept_ownership(self)
         self._retry_patcher = patch.object(_ims, "call_with_retry", side_effect=lambda fn, *a, **kw: fn(*a, **kw))
         self._retry_patcher.start()
         self.addCleanup(self._retry_patcher.stop)
@@ -301,6 +419,7 @@ class SyncRepoMissingCollectionTest(unittest.TestCase):
     (manually drop the collection) leaves behind."""
 
     def setUp(self):
+        _accept_ownership(self)
         for target, kwargs in (
             ("call_with_retry", {"side_effect": lambda fn, *a, **kw: fn(*a, **kw)}),
             ("compute_file_hashes", {"return_value": ({"a.py": "h1", "b.py": "h2"}, [])}),

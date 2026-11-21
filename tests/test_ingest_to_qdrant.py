@@ -29,7 +29,16 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # fake_token_bud
 
 import ingest_to_qdrant as mod  # noqa: E402
 from fake_token_budget import word_budget  # noqa: E402
+from fake_ownership_client import (  # noqa: E402
+    FakeOwnershipClient,
+    accept_ownership,
+    code_chunk,
+    memory_point,
+    unrelated_point,
+)
 import memory_bank_lib  # noqa: E402
+import qdrant_code_index_marker as marker  # noqa: E402
+from qdrant_compact_marker import MARKER_KEY as COMPACT_KEY, MARKER_VALUE as COMPACT_VALUE  # noqa: E402
 import qdrant_ingest_lib as lib  # noqa: E402
 from qdrant_ingest_lib import MANIFEST_FILENAME, MANIFEST_FORMAT_VERSION, TokenBudgetError  # noqa: E402
 from sync_manifest_lib import UNVERIFIED_HASH, discard_manifest, load_manifest, save_manifest  # noqa: E402
@@ -60,7 +69,6 @@ def _args(**overrides) -> argparse.Namespace:
         dry_run=False,
         reset=False,
         write_manifest=False,
-        memory_bank_collection=None,
     )
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -68,6 +76,24 @@ def _args(**overrides) -> argparse.Namespace:
 
 def _run(coro):
     return asyncio.run(coro)
+
+
+# Most runs here are about what happens AFTER the codebase-indexer's ownership
+# guard (libs/qdrant_code_index_marker.py): their MagicMock clients carry no
+# real collection metadata, which the real guard (failing closed) would
+# refuse. CliOwnershipGuard below restores the real guard for its own tests.
+_ownership_patchers: list = []
+_REAL_OWNERSHIP_CHECK = mod.check_code_index_ownership
+
+
+def setUpModule():
+    _ownership_patchers.extend(accept_ownership(mod))
+
+
+def tearDownModule():
+    for patcher in _ownership_patchers:
+        patcher.stop()
+    _ownership_patchers.clear()
 
 
 class DryRunNeverTouchesQdrant(unittest.TestCase):
@@ -257,132 +283,86 @@ class SharedPreparationWithIndexRepo(unittest.TestCase):
         )
 
 
-class ResetRefusesMemoryBankCollection(unittest.TestCase):
-    """The configured memory-bank collection is refused outright, before any
-    Qdrant client is even constructed. It is refused on every run, not only
-    --reset (as cb_indexer_index_repo/cb_indexer_sync_repo refuse it), and with the name also read
-    from --repo-path's .mcp.json, where setup writes it -- the shell normally
-    doesn't export MEMORY_BANK_COLLECTION, so a custom name there used to go
-    unprotected by the CLI while cb_indexer_index_repo refused it."""
+class CliOwnershipGuard(unittest.TestCase):
+    """The CLI refuses an existing collection the codebase-indexer did not
+    create, on every real run with or without --reset, exactly as
+    cb_indexer_index_repo/cb_indexer_sync_repo do. It used to refuse one
+    memory-bank NAME, resolved from a flag, the shell or .mcp.json; none of
+    those is set or read here, so a refusal can only come from the mark."""
 
     def setUp(self):
-        # The developer's own shell may export MEMORY_BANK_COLLECTION, which
-        # would outrank the .mcp.json these tests write.
-        patcher = mock.patch.dict(os.environ)
+        patcher = mock.patch.object(mod, "check_code_index_ownership", _REAL_OWNERSHIP_CHECK)
         patcher.start()
         self.addCleanup(patcher.stop)
-        os.environ.pop("MEMORY_BANK_COLLECTION", None)
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.repo = Path(tmp.name)
         (self.repo / "a.md").write_text("# Title\n\nbody\n")
 
-    def _write_mcp_json(self, text):
-        (self.repo / ".mcp.json").write_text(text, encoding="utf-8")
-
-    def _run_ingest(self, fake_client_cls, err, **overrides):
-        with mock.patch.object(mod, "QdrantClient", fake_client_cls), \
-             mock.patch.object(mod, "FastEmbedProvider", new=_provider_mock()), \
-             mock.patch.object(mod, "QdrantConnector"), \
+    def _run_ingest(self, client, err, **overrides):
+        with mock.patch.object(mod, "QdrantClient", return_value=client), \
+             mock.patch.object(mod, "call_with_retry", side_effect=lambda fn, *a, **kw: fn(*a, **kw)), \
+             mock.patch.object(mod, "FastEmbedProvider", new=_provider_mock()) as provider_cls, \
+             mock.patch.object(mod, "QdrantConnector") as connector_cls, \
              mock.patch.object(mod, "store_batch", new=mock.AsyncMock(return_value=0)) as fake_store:
             with redirect_stdout(io.StringIO()), redirect_stderr(err):
-                _run(mod.ingest(_args(repo_path=str(self.repo), **overrides)))
-        return fake_store
+                _run(mod.ingest(_args(repo_path=str(self.repo), collection="shared-thing", **overrides)))
+        return fake_store, provider_cls, connector_cls
 
-    def _assert_refused(self, **overrides):
-        fake_client_cls = mock.MagicMock()
-        err = io.StringIO()
-        with self.assertRaises(SystemExit) as cm:
-            self._run_ingest(fake_client_cls, err, **{"collection": "my-shared-bank", **overrides})
-        self.assertEqual(cm.exception.code, 1)
-        self.assertIn("memory-bank", err.getvalue())
-        fake_client_cls.assert_not_called()
-        return err.getvalue()
-
-    def test_reset_of_memory_bank_collection_is_refused(self):
-        self._assert_refused(reset=True, dry_run=False, memory_bank_collection="my-shared-bank")
-
-    def test_refusal_also_applies_alongside_dry_run(self):
-        self._assert_refused(reset=True, dry_run=True, memory_bank_collection="my-shared-bank")
-
-    def test_plain_ingest_into_memory_bank_collection_is_refused_too(self):
-        """This used to be pinned as NOT refused (only --reset was guarded);
-        cb_indexer_index_repo/cb_indexer_sync_repo refuse it regardless of reset/force."""
-        self._assert_refused(reset=False, memory_bank_collection="my-shared-bank")
-
-    def test_name_from_the_shell_environment_is_refused(self):
-        os.environ["MEMORY_BANK_COLLECTION"] = "my-shared-bank"
-        err = self._assert_refused(reset=True)
-        self.assertIn("MEMORY_BANK_COLLECTION environment variable", err)
-
-    def test_custom_name_only_in_mcp_json_is_refused(self):
-        """The issue's exact reproduction: `--reset --collection team-memory`
-        with team-memory set only in .mcp.json's codebase-indexer block. On
-        main this ran (the shell gave the "memory-bank" default)."""
-        self._write_mcp_json(json.dumps({"mcpServers": {
-            "codebase-indexer": {"env": {"MEMORY_BANK_COLLECTION": "team-memory"}},
-        }}))
-        for reset in (True, False):
-            with self.subTest(reset=reset):
-                err = self._assert_refused(collection="team-memory", reset=reset)
-                self.assertIn('"codebase-indexer" block', err)
-
-    def test_every_name_is_refused_when_the_mcp_json_blocks_disagree(self):
-        # memory-bank stores in team-memory; taking only codebase-indexer's name left it open.
-        self._write_mcp_json(json.dumps({"mcpServers": {
-            "codebase-indexer": {"env": {"MEMORY_BANK_COLLECTION": "memory-bank"}},
-            "memory-bank": {"env": {"MEMORY_BANK_COLLECTION": "team-memory"}},
-        }}))
-        for collection, block in (("team-memory", '"memory-bank" block'), ("memory-bank", '"codebase-indexer" block')):
-            with self.subTest(collection=collection):
-                err = self._assert_refused(collection=collection, reset=False)
-                self.assertIn(block, err)
-                self.assertIn("disagree", err)
-
-    def test_an_override_does_not_unreserve_the_mcp_json_name(self):
-        self._write_mcp_json(json.dumps({"mcpServers": {
-            "memory-bank": {"env": {"MEMORY_BANK_COLLECTION": "team-memory"}},
-        }}))
-        err = self._assert_refused(collection="team-memory", reset=False, memory_bank_collection="memory-bank")
-        self.assertIn('"memory-bank" block', err)
-        os.environ["MEMORY_BANK_COLLECTION"] = "memory-bank"
-        err = self._assert_refused(collection="team-memory", reset=False)
-        self.assertIn('"memory-bank" block', err)
-
-    def test_default_name_is_still_refused_with_nothing_configured(self):
-        self._assert_refused(collection="memory-bank", reset=True)
-
-    def test_other_collection_still_indexes(self):
-        self._write_mcp_json(json.dumps({"mcpServers": {
-            "codebase-indexer": {"env": {"MEMORY_BANK_COLLECTION": "team-memory"}},
-        }}))
-        fake_client = mock.MagicMock()
-        fake_client.collection_exists.return_value = False
-        fake_store = self._run_ingest(
-            mock.MagicMock(return_value=fake_client), io.StringIO(), collection="memory-bank"
+    def test_foreign_collections_are_refused_with_and_without_reset(self):
+        cases = (
+            ("memory bank under a non-default name", lambda: FakeOwnershipClient(payloads=[memory_point()])),
+            ("marked compact collection", lambda: FakeOwnershipClient(metadata={COMPACT_KEY: COMPACT_VALUE})),
+            ("empty unmarked collection", lambda: FakeOwnershipClient()),
+            ("unrelated points", lambda: FakeOwnershipClient(payloads=[unrelated_point()])),
+            ("unreadable metadata", lambda: FakeOwnershipClient(fail_on="get_collection")),
         )
-        fake_store.assert_awaited_once()
+        for reset in (False, True):
+            for label, make_client in cases:
+                with self.subTest(label=label, reset=reset):
+                    # FakeOwnershipClient has no delete/upsert: a run that got
+                    # past the refusal would raise AttributeError, not exit 1.
+                    client = make_client()
+                    err = io.StringIO()
+                    with mock.patch.object(mod, "prepare_collection_for_index") as prep, \
+                         self.assertRaises(SystemExit) as cm:
+                        self._run_ingest(client, err, reset=reset)
+                    self.assertEqual(cm.exception.code, 1)
+                    self.assertIn("'shared-thing'", err.getvalue())
+                    prep.assert_not_called()
+                    self.assertEqual(client.updates, [])
 
-    def test_malformed_mcp_json_warns_and_does_not_crash(self):
-        self._write_mcp_json("{not json")
-        fake_client = mock.MagicMock()
-        fake_client.collection_exists.return_value = False
-        err = io.StringIO()
-        fake_store = self._run_ingest(
-            mock.MagicMock(return_value=fake_client), err, collection="test-collection"
-        )
-        fake_store.assert_awaited_once()
-        self.assertIn("Warning: could not read MEMORY_BANK_COLLECTION", err.getvalue())
-        # And the default is still protected while the file is unreadable.
-        self._assert_refused(collection="memory-bank")
+    def test_unmarked_code_collection_is_adopted(self):
+        client = FakeOwnershipClient(payloads=[code_chunk()])
+        with mock.patch.object(mod, "prepare_collection_for_index", return_value=mock.MagicMock(error="stop-here")), \
+             self.assertRaises(SystemExit):
+            self._run_ingest(client, io.StringIO())
+        self.assertEqual(client.updates, [marker.code_index_metadata()])
 
-    def test_flag_is_parsed(self):
+    def test_dry_run_skips_the_check_and_stays_offline(self):
+        client = FakeOwnershipClient(payloads=[memory_point()])
+        with mock.patch.object(mod, "QdrantClient") as client_cls, \
+             mock.patch.object(mod, "FastEmbedProvider", new=_provider_mock()):
+            with redirect_stdout(io.StringIO()):
+                _run(mod.ingest(_args(repo_path=str(self.repo), collection="shared-thing", dry_run=True)))
+        client_cls.assert_not_called()
+        self.assertEqual(client.calls, [])
+
+    def test_a_new_collection_is_created_with_the_mark(self):
+        client = mock.MagicMock()
+        client.collection_exists.return_value = False
+        fake_store, _, connector_cls = self._run_ingest(client, io.StringIO())
+        fake_store.assert_awaited_once()
+        self.assertEqual(connector_cls.call_args.kwargs["collection_metadata"], marker.code_index_metadata())
+
+    def test_memory_bank_collection_flag_is_gone(self):
         argv = ["ingest_to_qdrant.py", "--repo-path", ".", "--collection", "c",
                 "--memory-bank-collection", "team-memory"]
-        with mock.patch.object(sys, "argv", argv):
-            self.assertEqual(mod.parse_args().memory_bank_collection, "team-memory")
+        with mock.patch.object(sys, "argv", argv), redirect_stderr(io.StringIO()), \
+             self.assertRaises(SystemExit):
+            mod.parse_args()
         with mock.patch.object(sys, "argv", argv[:5]):
-            self.assertIsNone(mod.parse_args().memory_bank_collection)
+            self.assertFalse(hasattr(mod.parse_args(), "memory_bank_collection"))
 
 
 class RefusesNonDirectoryRepoPath(unittest.TestCase):

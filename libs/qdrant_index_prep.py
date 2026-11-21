@@ -13,8 +13,10 @@ first-big-index path (the one docs/installation.md recommends). One shared
 code path means a future fix to this sequence lands in both callers at once.
 
 What deliberately stays with each caller, because the two differ on purpose:
-  - the memory-bank NAME refusal (cb_indexer_index_repo refuses that collection
-    regardless of reset; the CLI only refuses it with --reset),
+  - the refusal of an existing collection the codebase-indexer did not create
+    (libs/qdrant_code_index_marker.py; both callers run it on every run, but
+    the CLI skips it on --dry-run, which never calls this either, and each
+    surfaces the refusal its own way),
   - --dry-run (the CLI never calls this at all on a dry run, so a preview
     touches neither Qdrant nor the embedding model),
   - how an error is surfaced (cb_indexer_index_repo returns the string; the CLI prints
