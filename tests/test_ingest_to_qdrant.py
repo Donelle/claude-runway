@@ -354,6 +354,7 @@ class CliOwnershipGuard(unittest.TestCase):
         fake_store, _, connector_cls = self._run_ingest(client, io.StringIO())
         fake_store.assert_awaited_once()
         self.assertEqual(connector_cls.call_args.kwargs["collection_metadata"], marker.code_index_metadata())
+        self.assertIs(connector_cls.call_args.kwargs["existing_collection_check"], marker.metadata_ownership_error)
 
     def test_memory_bank_collection_flag_is_gone(self):
         argv = ["ingest_to_qdrant.py", "--repo-path", ".", "--collection", "c",

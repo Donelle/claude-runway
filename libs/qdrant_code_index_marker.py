@@ -94,6 +94,27 @@ def _not_ours(collection: str, why: str) -> str:
     )
 
 
+def metadata_ownership_error(collection: str, metadata: Optional[dict]) -> Optional[str]:
+    """
+    The metadata-only half of the ownership decision: None when `metadata`
+    says the collection is the indexer's own, else the refusal message. The
+    compact marker is checked FIRST: metadata updates merge keys, so one
+    collection can carry both marks (an indexer-created collection that
+    compact_store later wrote into and marked under the same name), and a
+    compact-marked collection is never ours, whatever else it carries.
+
+    Passed to QdrantConnector as `existing_collection_check`, so the write
+    path re-applies exactly this rule to a collection's current metadata
+    right before each batch, with no adoption: adoption is decided once, by
+    check_code_index_ownership, before a run starts.
+    """
+    if is_marked_compact(metadata):
+        return _not_ours(collection, "it is marked as a conversation-compact collection")
+    if is_marked_code_index(metadata):
+        return None
+    return _not_ours(collection, "it has no code-index mark")
+
+
 def _has_point(client, collection: str, scroll_filter: models.Filter, retry: Callable[..., Any]) -> bool:
     points, _next = retry(
         client.scroll,
@@ -131,15 +152,9 @@ def check_code_index_ownership(
             return OwnershipCheck()
         info = retry(client.get_collection, collection)
         metadata = info.config.metadata
-        # The compact marker is checked FIRST: metadata updates merge keys, so
-        # one collection can carry both marks (an indexer-created collection
-        # that compact_store later wrote into and marked under the same
-        # name). A compact-marked collection is never ours, whatever else it
-        # carries.
-        if is_marked_compact(metadata):
-            return OwnershipCheck(_not_ours(collection, "it is marked as a conversation-compact collection"))
-        if is_marked_code_index(metadata):
-            return OwnershipCheck()
+        # Compact marker first, then the mark (see metadata_ownership_error).
+        if is_marked_compact(metadata) or is_marked_code_index(metadata):
+            return OwnershipCheck(metadata_ownership_error(collection, metadata))
         protected = models.Filter(
             should=[
                 models.FieldCondition(key=mb.SOURCE_FIELD, match=models.MatchValue(value=mb.MEMORY_BANK_SOURCE)),

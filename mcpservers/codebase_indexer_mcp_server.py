@@ -94,7 +94,7 @@ from qdrant_collection_hints import (
     set_cached_search_limit,
 )
 from qdrant_compact_marker import collection_is_marked_compact, is_marked_compact
-from qdrant_code_index_marker import check_code_index_ownership, code_index_metadata
+from qdrant_code_index_marker import check_code_index_ownership, code_index_metadata, metadata_ownership_error
 from qdrant_model_check import check_embedding_model_mismatch
 from qdrant_credentials import resolve_qdrant_credentials, same_endpoint
 from mcp_tool_introspect import tool_count
@@ -1102,8 +1102,10 @@ async def _index_repo(
         embedding_provider=embedding_provider,
         field_indexes=FIELD_INDEXES,
         # A collection this run creates is marked as the indexer's own in
-        # the same request (libs/qdrant_code_index_marker.py).
+        # the same request, and one it did not create is re-checked before
+        # every batch (libs/qdrant_code_index_marker.py).
         collection_metadata=code_index_metadata(),
+        existing_collection_check=metadata_ownership_error,
     )
 
     # Collect chunks via iter_entries() with concurrent progress reporting:
@@ -1899,8 +1901,10 @@ async def _sync_repo(
         embedding_provider=embedding_provider,
         field_indexes=FIELD_INDEXES,
         # A collection this run creates is marked as the indexer's own in
-        # the same request (libs/qdrant_code_index_marker.py).
+        # the same request, and one it did not create is re-checked before
+        # every batch (libs/qdrant_code_index_marker.py).
         collection_metadata=code_index_metadata(),
+        existing_collection_check=metadata_ownership_error,
     )
 
     async def _report_progress(stored, total_entries):
@@ -2357,8 +2361,10 @@ def _get_find_store_connector() -> QdrantConnector:
             # cb_indexer_store_repo can be the first write into this project's
             # collection; a collection it creates carries the indexer's mark
             # like one created by an index or sync, so those are not refused
-            # on it later.
+            # on it later. The ownership re-check before each write applies
+            # here too.
             collection_metadata=code_index_metadata(),
+            existing_collection_check=metadata_ownership_error,
         )
     return _find_store_connector
 
@@ -2406,8 +2412,8 @@ async def cb_indexer_store_repo(information: str, metadata: Optional[dict[str, A
     # into the memory bank, a compact collection or anything else that
     # happens to share COLLECTION_NAME. Checked before the connector is
     # built, so a refusal loads no embedding model; a legacy code collection
-    # is adopted here the same way. The connector re-checks the mark itself
-    # if the collection appears after this (libs/qdrant_connector.py).
+    # is adopted here the same way. The connector re-checks the collection's
+    # current metadata itself right before the write (libs/qdrant_connector.py).
     ownership = check_code_index_ownership(
         QdrantClient(url=DEFAULT_QDRANT_URL, api_key=DEFAULT_QDRANT_API_KEY),
         DEFAULT_COLLECTION,

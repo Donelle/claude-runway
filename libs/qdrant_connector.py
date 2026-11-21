@@ -24,7 +24,7 @@ batched writes on them.
 import json
 import uuid
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from qdrant_client import AsyncQdrantClient, models
 
@@ -65,6 +65,7 @@ class QdrantConnector:
         qdrant_local_path: Optional[str] = None,
         field_indexes: Optional[dict[str, models.PayloadSchemaType]] = None,
         collection_metadata: Optional[dict[str, Any]] = None,
+        existing_collection_check: Optional[Callable[[str, Optional[dict]], Optional[str]]] = None,
     ):
         self.qdrant_url = qdrant_url.rstrip("/") if qdrant_url else None
         self.qdrant_api_key = qdrant_api_key
@@ -81,10 +82,15 @@ class QdrantConnector:
         # create could fail and leave an unmarked collection the indexer would
         # then refuse as not its own.
         self.collection_metadata = collection_metadata
-        # Collections this connector has already seen carry
-        # `collection_metadata` (it created them, or checked them once), so
-        # the check below costs one read per collection, not one per batch.
-        self._metadata_verified: set = set()
+        # Called with (collection name, its current metadata) for every
+        # collection this connector writes into but did not just create;
+        # a non-None return is raised before anything is written. The
+        # codebase-indexer passes qdrant_code_index_marker
+        # .metadata_ownership_error. Deliberately not cached: a collection
+        # name can be dropped and recreated by another writer between two
+        # batches, so each write re-reads the metadata (one read per
+        # store_batch call, i.e. per up to UPSERT_BATCH_SIZE points).
+        self.existing_collection_check = existing_collection_check
 
     async def get_collection_names(self) -> list[str]:
         response = await self.client.get_collections()
@@ -156,17 +162,18 @@ class QdrantConnector:
         checked against this provider's and indexing carries on, otherwise
         the original error is re-raised.
 
-        With `collection_metadata`, a collection this call did not create
-        (it already existed, or another process won the create) must carry
-        every one of those keys, checked once per collection per connector;
-        otherwise this raises before anything is written. The codebase-
-        indexer checks ownership before it starts, but chunking and embedding
-        can take minutes, and a memory-bank, compact or other writer creating
-        the same name in that gap must not have code chunks written into its
-        collection.
+        With `existing_collection_check`, a collection this call did not
+        create (it already existed, or another process won the create) is
+        checked against its CURRENT metadata on every call, and this raises
+        before anything is written if the check objects. The codebase-indexer
+        checks ownership before it starts, but chunking and embedding can take
+        minutes, and a memory-bank, compact or other writer creating (or
+        recreating, or marking) the same name in that gap must not have code
+        chunks written into its collection. What remains is the gap between
+        this read and the upsert that follows it, which no read can close.
         """
         if await self.client.collection_exists(collection_name):
-            await self._require_collection_metadata(collection_name)
+            await self._require_owned(collection_name)
             return
         vector_name = self.embedding_provider.get_vector_name()
         vector_size = self.embedding_provider.get_vector_size()
@@ -182,9 +189,8 @@ class QdrantConnector:
             if not await self.client.collection_exists(collection_name):
                 raise
             await self._require_matching_schema(collection_name, vector_name, vector_size)
-            await self._require_collection_metadata(collection_name)
+            await self._require_owned(collection_name)
             return
-        self._metadata_verified.add(collection_name)
         for field_name, field_type in (self.field_indexes or {}).items():
             await self.client.create_payload_index(
                 collection_name=collection_name,
@@ -192,25 +198,15 @@ class QdrantConnector:
                 field_schema=field_type,
             )
 
-    async def _require_collection_metadata(self, collection_name: str) -> None:
-        """Raises unless `collection_name` carries every `collection_metadata`
-        key with its value. A no-op without `collection_metadata`, and after
-        the first success for a collection."""
-        if not self.collection_metadata or collection_name in self._metadata_verified:
+    async def _require_owned(self, collection_name: str) -> None:
+        """Raises with `existing_collection_check`'s message if it objects to
+        the collection's current metadata. A no-op without a check."""
+        if self.existing_collection_check is None:
             return
         info = await self.client.get_collection(collection_name)
-        metadata = info.config.metadata
-        missing = [
-            key for key, value in self.collection_metadata.items()
-            if not isinstance(metadata, dict) or metadata.get(key) != value
-        ]
-        if missing:
-            raise RuntimeError(
-                f"Collection '{collection_name}' exists without the metadata this writer requires "
-                f"({', '.join(sorted(missing))}): it was created by another writer, not this one. "
-                f"Refusing to write into it."
-            )
-        self._metadata_verified.add(collection_name)
+        error = self.existing_collection_check(collection_name, info.config.metadata)
+        if error:
+            raise RuntimeError(error)
 
     async def _require_matching_schema(self, collection_name: str, vector_name: str, vector_size: int) -> None:
         """Raises if the collection a concurrent creator won has no vector

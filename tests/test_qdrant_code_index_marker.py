@@ -59,6 +59,20 @@ class MarkHelpers(unittest.TestCase):
         self.assertNotEqual(marker.MARKER_KEY, COMPACT_KEY)
 
 
+class MetadataOwnershipError(unittest.TestCase):
+    """The metadata-only rule the connector re-applies before each batch."""
+
+    def test_only_the_mark_without_the_compact_marker_passes(self):
+        self.assertIsNone(marker.metadata_ownership_error("coll", {"description": "d", **marker.code_index_metadata()}))
+        for metadata in (None, {}, {"description": "d"}, {COMPACT_KEY: COMPACT_VALUE},
+                         {COMPACT_KEY: COMPACT_VALUE, **marker.code_index_metadata()}):
+            with self.subTest(metadata=metadata):
+                error = marker.metadata_ownership_error("coll", metadata)
+                self.assertIsNotNone(error)
+                assert error is not None
+                self.assertIn("'coll'", error)
+
+
 class OwnershipAccepted(unittest.TestCase):
     def test_missing_collection_is_accepted_without_writing(self):
         client = FakeClient(exists=False)

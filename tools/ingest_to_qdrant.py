@@ -103,7 +103,7 @@ from qdrant_ingest_lib import (
 )
 from qdrant_batch_store import store_batch, ensure_file_path_index, FIELD_INDEXES
 from qdrant_index_prep import prepare_collection_for_index
-from qdrant_code_index_marker import check_code_index_ownership, code_index_metadata
+from qdrant_code_index_marker import check_code_index_ownership, code_index_metadata, metadata_ownership_error
 from qdrant_model_check import check_embedding_model_mismatch
 from qdrant_retry import call_with_retry
 from qdrant_credentials import resolve_qdrant_credentials
@@ -379,8 +379,10 @@ async def _ingest(args, manifest_lock: ManifestLock, repo_path: Path):
         embedding_provider=embedding_provider,
         field_indexes=FIELD_INDEXES,
         # A collection this run creates is marked as the indexer's own in the
-        # same request, so cb_indexer_sync_repo accepts it afterwards.
+        # same request, so cb_indexer_sync_repo accepts it afterwards; one it
+        # did not create is re-checked before every batch.
         collection_metadata=code_index_metadata(),
+        existing_collection_check=metadata_ownership_error,
     )
 
     async def _print_progress(stored, total):

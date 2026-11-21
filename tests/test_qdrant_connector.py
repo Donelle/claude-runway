@@ -43,6 +43,8 @@ from qdrant_connector import (  # noqa: E402
     store_entry,
 )
 from qdrant_embeddings import FastEmbedProvider, vector_name_for_model  # noqa: E402
+from qdrant_code_index_marker import code_index_metadata, metadata_ownership_error  # noqa: E402
+from qdrant_compact_marker import MARKER_KEY as COMPACT_KEY, MARKER_VALUE as COMPACT_VALUE  # noqa: E402
 
 def _run(coro):
     return asyncio.run(coro)
@@ -127,48 +129,79 @@ class OnDiskFormat(unittest.TestCase):
         # instead, see the tests below).
         created.update_collection.assert_not_awaited()
 
-    def _existing(self, metadata, *, lose_race=False):
-        """A connector requiring the code-index mark, over a mock client whose
-        collection already exists (or, with lose_race, is created by another
-        writer between this connector's existence check and its create)."""
-        c = _connector(_FakeProvider("fast-x", 4), collection_metadata={"claude_runway_kind": "code-index"})
+    def _existing(self, *metadata_seq, lose_race=False):
+        """A connector with the codebase-indexer's mark and ownership check,
+        over a mock client whose collection already exists (or, with
+        lose_race, is created by another writer between this connector's
+        existence check and its create). Each get_collection returns the
+        next metadata in `metadata_seq`, so a collection can change between
+        calls (dropped and recreated, or marked compact)."""
+        c = _connector(
+            _FakeProvider("fast-x", 4),
+            collection_metadata=code_index_metadata(),
+            existing_collection_check=metadata_ownership_error,
+        )
         c.client = mock.AsyncMock()
         if lose_race:
             c.client.collection_exists.side_effect = [False, True]
             c.client.create_collection.side_effect = RuntimeError("already exists")
         else:
             c.client.collection_exists.return_value = True
-        info = mock.MagicMock()
-        info.config.params.vectors = {"fast-x": models.VectorParams(size=4, distance=models.Distance.COSINE)}
-        info.config.metadata = metadata
-        c.client.get_collection.return_value = info
+        infos = []
+        for metadata in metadata_seq:
+            info = mock.MagicMock()
+            info.config.params.vectors = {"fast-x": models.VectorParams(size=4, distance=models.Distance.COSINE)}
+            info.config.metadata = metadata
+            infos.append(info)
+        # The lost-race path reads the collection twice (schema, then metadata).
+        c.client.get_collection.side_effect = [i for i in infos for _ in range(2 if lose_race else 1)]
         return c
 
-    def test_an_existing_collection_without_the_metadata_is_refused(self):
+    def test_an_existing_foreign_collection_is_refused(self):
         # A memory-bank or compact collection created under this name after
         # the indexer's ownership check, while it was chunking and embedding.
         for lose_race in (False, True):
-            for metadata in (None, {}, {"claude_runway_kind": "other"}, {"description": "x"}):
+            for metadata in (
+                None, {}, {"claude_runway_kind": "other"}, {"description": "x"},
+                {COMPACT_KEY: COMPACT_VALUE},
+                # Both marks: metadata merges keys, and the compact marker wins.
+                {COMPACT_KEY: COMPACT_VALUE, **code_index_metadata()},
+            ):
                 with self.subTest(lose_race=lose_race, metadata=metadata):
                     c = self._existing(metadata, lose_race=lose_race)
                     with self.assertRaises(RuntimeError) as caught:
                         _run(c.ensure_collection_exists("coll"))
-                    self.assertIn("Refusing to write", str(caught.exception))
+                    self.assertIn("not created by the codebase-indexer", str(caught.exception))
+                    c.client.upsert.assert_not_awaited()
 
-    def test_an_existing_collection_with_the_metadata_is_used_and_checked_once(self):
+    def test_an_owned_collection_is_used(self):
         for lose_race in (False, True):
             with self.subTest(lose_race=lose_race):
-                c = self._existing({"claude_runway_kind": "code-index", "description": "d"}, lose_race=lose_race)
+                c = self._existing({**code_index_metadata(), "description": "d"}, lose_race=lose_race)
                 _run(c.ensure_collection_exists("coll"))
-                if not lose_race:
-                    _run(c.ensure_collection_exists("coll"))
-                # The schema check (race only) plus one metadata read, never per batch.
-                self.assertEqual(c.client.get_collection.await_count, 2 if lose_race else 1)
 
-    def test_without_collection_metadata_an_existing_collection_is_not_read(self):
-        c = _connector()
+    def test_the_check_is_repeated_on_every_call_not_cached(self):
+        # The same name can be dropped and recreated by another writer
+        # between two batches, or marked compact by compact_store.
+        for later in (None, {COMPACT_KEY: COMPACT_VALUE, **code_index_metadata()}):
+            with self.subTest(later=later):
+                c = self._existing(code_index_metadata(), later)
+                _run(c.ensure_collection_exists("coll"))
+                with self.assertRaises(RuntimeError):
+                    _run(c.ensure_collection_exists("coll"))
+                self.assertEqual(c.client.get_collection.await_count, 2)
+
+    def test_without_a_check_an_existing_collection_is_not_read(self):
+        c = _connector(collection_metadata=code_index_metadata())
         c.client = mock.AsyncMock()
         c.client.collection_exists.return_value = True
+        _run(c.ensure_collection_exists("coll"))
+        c.client.get_collection.assert_not_awaited()
+
+    def test_a_collection_this_call_creates_is_not_re_read(self):
+        c = _connector(collection_metadata=code_index_metadata(), existing_collection_check=metadata_ownership_error)
+        c.client = mock.AsyncMock()
+        c.client.collection_exists.return_value = False
         _run(c.ensure_collection_exists("coll"))
         c.client.get_collection.assert_not_awaited()
 

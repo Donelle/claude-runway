@@ -167,19 +167,26 @@ class NewCollectionsCarryTheMarkTest(unittest.TestCase):
         connector_cls.assert_called_once()
         return connector_cls.call_args.kwargs
 
-    def test_index_repo(self):
-        kwargs = self._connector_kwargs(lambda: _ims.index_repo(repo_path=REPO_ROOT, collection="new-coll"))
+    def _assert_marks_and_checks(self, kwargs):
         self.assertEqual(kwargs["collection_metadata"], marker.code_index_metadata())
+        # An existing collection is re-checked before every batch.
+        self.assertIs(kwargs["existing_collection_check"], marker.metadata_ownership_error)
+
+    def test_index_repo(self):
+        self._assert_marks_and_checks(
+            self._connector_kwargs(lambda: _ims.index_repo(repo_path=REPO_ROOT, collection="new-coll"))
+        )
 
     def test_sync_repo(self):
-        kwargs = self._connector_kwargs(lambda: _ims.sync_repo(repo_path=REPO_ROOT, collection="new-coll"))
-        self.assertEqual(kwargs["collection_metadata"], marker.code_index_metadata())
+        self._assert_marks_and_checks(
+            self._connector_kwargs(lambda: _ims.sync_repo(repo_path=REPO_ROOT, collection="new-coll"))
+        )
 
     def test_store_repo_connector(self):
         with patch.object(_ims, "_find_store_connector", None), \
              patch("codebase_indexer_mcp_server.QdrantConnector") as connector_cls:
             _ims._get_find_store_connector()
-        self.assertEqual(connector_cls.call_args.kwargs["collection_metadata"], marker.code_index_metadata())
+        self._assert_marks_and_checks(connector_cls.call_args.kwargs)
 
 
 class IndexRepoResetGuardTest(unittest.TestCase):
