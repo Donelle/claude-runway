@@ -142,6 +142,26 @@ class AutoPickExclusionContentRequirements(unittest.TestCase):
     def test_excludes_theme_design_label_from_search(self):
         self.assertIn("-label:theme-design", self.content)
 
+    def test_excludes_spike_issue_type_from_search(self):
+        # A Spike ticket asks a question and ends in findings, not a PR, so auto-pick
+        # must never choose one. The exclusion is on the native issue type, in the same
+        # --search query as the label exclusions.
+        match = re.search(r'--search "([^"]+)"', self.content)
+        self.assertIsNotNone(match, "Step 0's --search command must be present")
+        self.assertIn("-type:Spike", match.group(1).split())
+
+    def test_explicit_spike_ticket_is_reported_blocked_before_any_mutation(self):
+        # The auto-pick exclusion does not cover an explicit {ISSUE_NUMBER}, so the step
+        # that fetches the issue must catch a spike, ahead of the assignee/type steps.
+        fetch = self.content.find("7. Fetch the issue:")
+        assignee_gate = self.content.find("8. **Check whether this ticket is already being worked on")
+        self.assertNotEqual(fetch, -1)
+        self.assertNotEqual(assignee_gate, -1)
+        step = self.content[fetch:assignee_gate]
+        self.assertIn("`Spike`", step)
+        self.assertIn("OUTCOME: BLOCKED", step)
+        self.assertIn("/cr-gh-spike", step)
+
     def test_prose_documents_both_exclusions(self):
         self.assertIn("NOT labeled", self.content)
         self.assertIn("`blocked` or `theme-design`", self.content)

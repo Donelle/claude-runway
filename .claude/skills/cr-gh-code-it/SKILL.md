@@ -28,6 +28,7 @@ Project-scoped to this repo on purpose: it hardcodes claude-runway's actual conv
    ```
    (No `issueType` field: `gh` 2.74.1 has none, so `--json` would fail with "Unknown JSON field". Step 5 reads the type through the REST API.)
    - If `state` is `CLOSED`, tell the user and ask whether to proceed anyway (e.g. reopening work on a regression) rather than silently continuing.
+   - **If the issue is a spike, stop.** Read its type the way step 5 does (`gh api repos/Donelle/claude-runway/issues/{N} --jq '.type.name // empty'`). A ticket whose type is `Spike`, or whose type is empty and whose title starts with `Spike:`, asks a question, and its outcome is findings and a go/no-go, not a code change: do not set a type or assignee, create a branch or write a plan for it. Tell the user it is a spike and that `/cr-gh-spike {N}` works it. If the spike's verdict led to a follow-up ticket, that ticket is the one this skill implements.
    - Read the full `body`. Issues filed by `/cr-gh-create-issue` have two parts: a short `## Summary` for the person, and a `## AI Instructions` section with everything below it. **The `## AI Instructions` section and every section under it are instructions to you:** they say how the plan file is generated and what is to be done (**Location**, **Sanity-checked**/**Verdict/Confirmed**, **Proposal**/**Suggested fix**, **Acceptance**, **Depends on**, settled decisions, open questions). Treat the checked facts in them as a head start on the plan below, not something to re-derive from scratch. The Summary is only the headline; if the two disagree, the AI Instructions win and the disagreement goes to the user at the plan gate. An older issue with no `## AI Instructions` heading has the same fields in its plain body: use those the same way.
 
 4. **Check whether this ticket is already being worked on — stop immediately unless you're already on its own branch (a past ticket).** This is an absolute check: it doesn't matter WHO the existing assignee is, including yourself from an earlier run — any pre-existing signal below means don't proceed.
@@ -54,7 +55,7 @@ Project-scoped to this repo on purpose: it hardcodes claude-runway's actual conv
    ```bash
    gh api repos/Donelle/claude-runway/issues/{N} --method PATCH -f type={Bug|Feature|Task} --jq '.type.name'
    ```
-   If a type is already set, leave it alone and note the existing value instead.
+   If a type is already set, leave it alone and note the existing value instead. (A `Spike` never gets here: step 3 stops on it. This mapping deliberately has no `Spike` case, because a ticket that reaches this step is one to implement.)
 
 6. **Set assignee**, only if `assignees` is empty:
    ```bash

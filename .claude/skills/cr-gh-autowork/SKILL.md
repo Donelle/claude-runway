@@ -290,21 +290,23 @@ literal character, matches nothing, and a failed run then looks the same as no o
 {ISSUE_NUMBER}                                   <-- orchestrator fills in ONE of these two
 --- OR ---
 Pick the highest-priority open issue on Donelle/claude-runway — of ANY label or
-issue type — that has no assignee at all, is NOT labeled `blocked` or `theme-design`, and
-whose number is NOT in this already-attempted list this run: {ATTEMPTED_LIST}. This is
-deliberately not restricted to `bug`/`enhancement` — any open, unassigned, unblocked,
-non-design ticket is fair game, not just those two labels. The
-`blocked`/`theme-design` exclusion is deliberate: a `blocked` issue is waiting on something
-outside this skill's control (an upstream fix, a human decision), and a `theme-design`
+issue type — that has no assignee at all, is NOT labeled `blocked` or `theme-design`, is
+NOT of issue type `Spike`, and whose number is NOT in this already-attempted list this run:
+{ATTEMPTED_LIST}. This is deliberately not restricted to `bug`/`enhancement` — any open,
+unassigned, unblocked, non-design, non-spike ticket is fair game, not just those two labels.
+The `blocked`/`theme-design`/`Spike` exclusion is deliberate: a `blocked` issue is waiting on
+something outside this skill's control (an upstream fix, a human decision), a `theme-design`
 issue is a pre-implementation design/brainstorm doc, not a ticket with a concrete fix to
-implement — auto-picking either would either stall the run or produce the wrong kind of
-output. IMPORTANT: `gh issue list` silently truncates to 30 results with no `--limit` flag
+implement, and a `Spike` issue asks a question whose outcome is findings and a go/no-go
+posted on the ticket (`/cr-gh-spike` works it), with no code change and so no PR to
+review or merge — auto-picking any of them would either stall the run or produce the wrong
+kind of output. IMPORTANT: `gh issue list` silently truncates to 30 results with no `--limit` flag
 — always pass one. GitHub's search syntax negates a qualifier with a leading `-`
-(`-label:X` excludes issues carrying that label). `no:assignee` matches only issues with
+(`-label:X` excludes issues carrying that label, `-type:X` those of that issue type). `no:assignee` matches only issues with
 ZERO assignees — not "not assigned to me"; any assignee at all, including yourself from an
 earlier attempt, excludes an issue from auto-pick now:
   gh issue list -R Donelle/claude-runway --state open \
-    --search "-label:blocked -label:theme-design no:assignee" \
+    --search "-label:blocked -label:theme-design -type:Spike no:assignee" \
     --limit 200 --json number,title,labels,assignees
 Sort by priority label (priority-p0 > p1 > p2 > p3, i.e. ascending by the number N in
 `priority-p{N}` so a lower N always comes first; unlabeled sorts last — and ONLY an issue
@@ -330,8 +332,9 @@ If nothing qualifies at all, or every remaining candidate after this walk turns 
 already be spoken for, output exactly `OUTCOME: DONE` as your entire response and stop — do
 not proceed to any step below. **The label-based exclusions above (`blocked`/
 `theme-design`) apply to auto-pick only — if the orchestrator instead passes an explicit
-{ISSUE_NUMBER}, work it regardless of its labels; a human naming a specific ticket is a
-deliberate override of that default. The assignee/branch/PR check is NOT overridden by an
+{ISSUE_NUMBER}, work it regardless of its labels (the one exception is a `Spike` ticket,
+which Step 7 reports BLOCKED: it has no code change to work); a human naming a specific
+ticket is a deliberate override of that default. The assignee/branch/PR check is NOT overridden by an
 explicit issue number, though** — Step 8 below runs this same check again for every
 invocation, auto-picked or explicit, and reports BLOCKED if it's already spoken for and you
 aren't already on its own branch. The difference an explicit invocation makes is only that
@@ -388,7 +391,13 @@ under `~/.claude/skills/`, not guaranteed to exist on whichever machine is runni
    number,title,body,labels,assignees,state,url` (no `issueType` field: `gh` 2.74.1 has
    none, so `--json` fails with "Unknown JSON field" — Step 9 reads the type through the
    REST API instead). If state is CLOSED, report
-   BLOCKED — don't reopen work on a closed ticket autonomously. Read the body's
+   BLOCKED — don't reopen work on a closed ticket autonomously. If the issue is a spike,
+   report BLOCKED too: read its type with `gh api repos/Donelle/claude-runway/issues/<N>
+   --jq '.type.name // empty'`; a type of `Spike`, or an empty type with a title starting
+   `Spike:`, means a question whose outcome is findings, not a PR, so report
+   `OUTCOME: BLOCKED (issue #<N>) — spike: its outcome is findings, not a PR; /cr-gh-spike
+   works it` and stop before any mutation (no assignee, no issue type, no branch). Step 0's
+   auto-pick never reaches this, so it only catches an explicit `{ISSUE_NUMBER}`. Read the body's
    **Location**/**Verdict**/**Suggested fix** sections as a head start, not something to
    re-derive from zero.
 8. **Check whether this ticket is already being worked on — report BLOCKED immediately
