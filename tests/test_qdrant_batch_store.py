@@ -77,9 +77,17 @@ class _FakeConnector:
         self.embedding_provider = _FakeEmbeddingProvider()
         self.client = _FakeAsyncClient(**client_kwargs)
         self.ensure_calls = []
+        self.require_owned_calls = []
+        # require_owned raises from this call on (None: never).
+        self.disowned_after = None
 
     async def ensure_collection_exists(self, collection_name):
         self.ensure_calls.append(collection_name)
+
+    async def require_owned(self, collection_name):
+        self.require_owned_calls.append(collection_name)
+        if self.disowned_after is not None and len(self.require_owned_calls) >= self.disowned_after:
+            raise RuntimeError("not ours any more")
 
 
 class _FakeCollectionInfo:
@@ -125,6 +133,23 @@ class StoreBatch(unittest.TestCase):
         self.assertEqual(stored, 0)
         self.assertEqual(connector.ensure_calls, [])
         self.assertEqual(connector.client.upsert_calls, [])
+
+    def test_ownership_is_rechecked_before_every_batch_after_the_first(self):
+        # A sync or CLI run stores everything in ONE call, so a check only in
+        # ensure_collection_exists would cover the first batch alone.
+        connector = _FakeConnector()
+        entries = [_Entry(f"content {i}", {"file_path": f"f{i}.py"}) for i in range(23)]
+        _run(store_batch(connector, entries, batch_size=10))
+        self.assertEqual(connector.ensure_calls, ["test-collection"])
+        self.assertEqual(connector.require_owned_calls, ["test-collection"] * 2)
+
+    def test_a_collection_that_stops_being_ours_gets_no_further_batch(self):
+        connector = _FakeConnector()
+        connector.disowned_after = 1  # the recheck before the second batch fails
+        entries = [_Entry(f"content {i}", {"file_path": f"f{i}.py"}) for i in range(23)]
+        with self.assertRaises(RuntimeError):
+            _run(store_batch(connector, entries, batch_size=10))
+        self.assertEqual(len(connector.client.upsert_calls), 1)
 
     def test_all_entries_stored_across_multiple_batches(self):
         connector = _FakeConnector()

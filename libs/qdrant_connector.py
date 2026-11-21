@@ -24,7 +24,7 @@ batched writes on them.
 import json
 import uuid
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from qdrant_client import AsyncQdrantClient, models
 
@@ -64,6 +64,8 @@ class QdrantConnector:
         embedding_provider,
         qdrant_local_path: Optional[str] = None,
         field_indexes: Optional[dict[str, models.PayloadSchemaType]] = None,
+        collection_metadata: Optional[dict[str, Any]] = None,
+        existing_collection_check: Optional[Callable[[str, Optional[dict]], Optional[str]]] = None,
     ):
         self.qdrant_url = qdrant_url.rstrip("/") if qdrant_url else None
         self.qdrant_api_key = qdrant_api_key
@@ -73,6 +75,23 @@ class QdrantConnector:
             location=qdrant_url, api_key=qdrant_api_key, path=qdrant_local_path
         )
         self.field_indexes = field_indexes
+        # Written in the create_collection request itself, never afterwards,
+        # so a collection this connector creates cannot exist for a moment
+        # without it. The codebase-indexer passes its ownership mark here
+        # (libs/qdrant_code_index_marker.py): a separate update after the
+        # create could fail and leave an unmarked collection the indexer would
+        # then refuse as not its own.
+        self.collection_metadata = collection_metadata
+        # Called with (collection name, its current metadata) for every
+        # collection this connector writes into but did not just create;
+        # a non-None return is raised before anything is written. The
+        # codebase-indexer passes qdrant_code_index_marker
+        # .metadata_ownership_error. Deliberately not cached: a collection
+        # name can be dropped and recreated by another writer between two
+        # batches, so it is re-read before every upsert batch
+        # (ensure_collection_exists before the first, require_owned before
+        # each later one; see qdrant_batch_store.store_batch).
+        self.existing_collection_check = existing_collection_check
 
     async def get_collection_names(self) -> list[str]:
         response = await self.client.get_collections()
@@ -128,11 +147,14 @@ class QdrantConnector:
         ]
 
     async def ensure_collection_exists(self, collection_name: str) -> None:
-        """Creates the collection (and any `field_indexes`) if it is missing.
+        """Creates the collection (with any `collection_metadata`, and any
+        `field_indexes`) if it is missing.
 
-        `field_indexes` are applied ONLY when this call creates the collection,
-        never to one that already exists; `qdrant_batch_store
-        .ensure_file_path_index` is the explicit backfill for those.
+        `field_indexes` and `collection_metadata` are applied ONLY when this
+        call creates the collection, never to one that already exists;
+        `qdrant_batch_store.ensure_file_path_index` is the explicit backfill
+        for the indexes, and `qdrant_code_index_marker
+        .check_code_index_ownership` the one for the codebase-indexer's mark.
 
         Safe against a concurrent creator: two MCP/CLI processes indexing a
         missing collection can both see it absent, and the loser's
@@ -140,8 +162,19 @@ class QdrantConnector:
         exists after a failed create, the other process won; its schema is
         checked against this provider's and indexing carries on, otherwise
         the original error is re-raised.
+
+        With `existing_collection_check`, a collection this call did not
+        create (it already existed, or another process won the create) is
+        checked against its CURRENT metadata on every call, and this raises
+        before anything is written if the check objects. The codebase-indexer
+        checks ownership before it starts, but chunking and embedding can take
+        minutes, and a memory-bank, compact or other writer creating (or
+        recreating, or marking) the same name in that gap must not have code
+        chunks written into its collection. What remains is the gap between
+        this read and the upsert that follows it, which no read can close.
         """
         if await self.client.collection_exists(collection_name):
+            await self.require_owned(collection_name)
             return
         vector_name = self.embedding_provider.get_vector_name()
         vector_size = self.embedding_provider.get_vector_size()
@@ -151,11 +184,13 @@ class QdrantConnector:
                 vectors_config={
                     vector_name: models.VectorParams(size=vector_size, distance=models.Distance.COSINE)
                 },
+                metadata=dict(self.collection_metadata) if self.collection_metadata else None,
             )
         except Exception:
             if not await self.client.collection_exists(collection_name):
                 raise
             await self._require_matching_schema(collection_name, vector_name, vector_size)
+            await self.require_owned(collection_name)
             return
         for field_name, field_type in (self.field_indexes or {}).items():
             await self.client.create_payload_index(
@@ -163,6 +198,18 @@ class QdrantConnector:
                 field_name=field_name,
                 field_schema=field_type,
             )
+
+    async def require_owned(self, collection_name: str) -> None:
+        """Raises with `existing_collection_check`'s message if it objects to
+        the collection's current metadata. A no-op without a check. Called by
+        ensure_collection_exists for a collection it did not create, and by
+        store_batch before every batch after the first."""
+        if self.existing_collection_check is None:
+            return
+        info = await self.client.get_collection(collection_name)
+        error = self.existing_collection_check(collection_name, info.config.metadata)
+        if error:
+            raise RuntimeError(error)
 
     async def _require_matching_schema(self, collection_name: str, vector_name: str, vector_size: int) -> None:
         """Raises if the collection a concurrent creator won has no vector

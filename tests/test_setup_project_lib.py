@@ -308,12 +308,18 @@ class BuildMcpServers(unittest.TestCase):
         # be shared/found across projects.
         servers = self._build()
         self.assertEqual(servers["memory-bank"]["env"]["MEMORY_BANK_COLLECTION"], "memory-bank")
-        self.assertEqual(servers["codebase-indexer"]["env"]["MEMORY_BANK_COLLECTION"], "memory-bank")
 
     def test_memory_bank_collection_explicit_value_used_verbatim(self):
         servers = self._build(memory_bank_collection="my-custom-memory-bank")
         self.assertEqual(servers["memory-bank"]["env"]["MEMORY_BANK_COLLECTION"], "my-custom-memory-bank")
-        self.assertEqual(servers["codebase-indexer"]["env"]["MEMORY_BANK_COLLECTION"], "my-custom-memory-bank")
+
+    def test_codebase_indexer_block_carries_no_memory_bank_copy(self):
+        # The indexer refuses every existing collection it did not create
+        # (libs/qdrant_code_index_marker.py), so it needs no copy of the name.
+        for value in ("", "my-custom-memory-bank"):
+            with self.subTest(memory_bank_collection=value):
+                servers = self._build(memory_bank_collection=value)
+                self.assertNotIn("MEMORY_BANK_COLLECTION", servers["codebase-indexer"]["env"])
 
     def test_memory_bank_collection_never_left_blank(self):
         # Same "present-but-empty defeats os.environ.get's own fallback"

@@ -46,6 +46,7 @@ import codebase_indexer_mcp_server as _ims  # noqa: E402
 import ingest_to_qdrant as _cli  # noqa: E402
 import sync_manifest_lib as lib  # noqa: E402
 from fake_token_budget import word_budget  # noqa: E402
+from fake_ownership_client import accept_ownership  # noqa: E402
 from qdrant_ingest_lib import (  # noqa: E402
     MANIFEST_FILENAME,
     MANIFEST_LOCK_FILENAME,
@@ -60,6 +61,24 @@ def _provider_cls():
     cls = mock.MagicMock(name="FastEmbedProvider")
     cls.return_value.build_token_budget.return_value = word_budget(20)
     return cls
+
+
+# Every run here is about what happens AFTER the codebase-indexer's ownership
+# guard (libs/qdrant_code_index_marker.py); these MagicMock clients carry no
+# real collection metadata, so the real guard would refuse them. It is tested
+# in test_qdrant_code_index_marker.py and through the tools in
+# test_codebase_indexer_mcp_server_memory_bank_guards.py / test_ingest_to_qdrant.py.
+_ownership_patchers: list = []
+
+
+def setUpModule():
+    _ownership_patchers.extend(accept_ownership(_ims, _cli))
+
+
+def tearDownModule():
+    for patcher in _ownership_patchers:
+        patcher.stop()
+    _ownership_patchers.clear()
 
 
 class RepoTestCase(unittest.TestCase):

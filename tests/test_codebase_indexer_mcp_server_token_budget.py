@@ -37,6 +37,7 @@ import qdrant_ingest_lib as _lib  # noqa: E402
 from fake_token_budget import word_budget  # noqa: E402
 from qdrant_client import QdrantClient, models  # noqa: E402
 from qdrant_ingest_lib import MANIFEST_FILENAME, TokenBudgetError  # noqa: E402
+from fake_ownership_client import accept_ownership  # noqa: E402
 
 
 def _run(coro):
@@ -89,6 +90,24 @@ def _local_collection(points):
 
 def _ids(client):
     return sorted(p.id for p in client.scroll("col", limit=1000)[0])
+
+
+# Every run here is about what happens AFTER the codebase-indexer's ownership
+# guard (libs/qdrant_code_index_marker.py); these MagicMock clients carry no
+# real collection metadata, so the real guard would refuse them. It is tested
+# in test_qdrant_code_index_marker.py and through the tools in
+# test_codebase_indexer_mcp_server_memory_bank_guards.py / test_ingest_to_qdrant.py.
+_ownership_patchers: list = []
+
+
+def setUpModule():
+    _ownership_patchers.extend(accept_ownership(_ims))
+
+
+def tearDownModule():
+    for patcher in _ownership_patchers:
+        patcher.stop()
+    _ownership_patchers.clear()
 
 
 class NonChunkPointsWarning(unittest.TestCase):

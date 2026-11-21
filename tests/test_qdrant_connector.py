@@ -43,6 +43,8 @@ from qdrant_connector import (  # noqa: E402
     store_entry,
 )
 from qdrant_embeddings import FastEmbedProvider, vector_name_for_model  # noqa: E402
+from qdrant_code_index_marker import code_index_metadata, metadata_ownership_error  # noqa: E402
+from qdrant_compact_marker import MARKER_KEY as COMPACT_KEY, MARKER_VALUE as COMPACT_VALUE  # noqa: E402
 
 def _run(coro):
     return asyncio.run(coro)
@@ -108,6 +110,118 @@ class OnDiskFormat(unittest.TestCase):
         self.assertEqual(list(vectors), ["fast-test-model"])
         self.assertEqual(vectors["fast-test-model"].size, 7)
         self.assertEqual(vectors["fast-test-model"].distance, models.Distance.COSINE)
+
+    def test_collection_metadata_is_written_in_the_create_request(self):
+        # The codebase-indexer's ownership mark (libs/qdrant_code_index_marker.py)
+        # rides on this, so a collection it creates is never briefly unmarked.
+        async def go(exists):
+            c = _connector(collection_metadata={"claude_runway_kind": "code-index"})
+            c.client = mock.AsyncMock()
+            c.client.collection_exists.return_value = exists
+            await c.ensure_collection_exists("coll")
+            return c.client
+
+        created = _run(go(False))
+        self.assertEqual(
+            created.create_collection.call_args.kwargs["metadata"], {"claude_runway_kind": "code-index"}
+        )
+        # Nothing is written onto an existing collection (it is checked
+        # instead, see the tests below).
+        created.update_collection.assert_not_awaited()
+
+    def _existing(self, *metadata_seq, lose_race=False):
+        """A connector with the codebase-indexer's mark and ownership check,
+        over a mock client whose collection already exists (or, with
+        lose_race, is created by another writer between this connector's
+        existence check and its create). Each get_collection returns the
+        next metadata in `metadata_seq`, so a collection can change between
+        calls (dropped and recreated, or marked compact)."""
+        c = _connector(
+            _FakeProvider("fast-x", 4),
+            collection_metadata=code_index_metadata(),
+            existing_collection_check=metadata_ownership_error,
+        )
+        c.client = mock.AsyncMock()
+        if lose_race:
+            c.client.collection_exists.side_effect = [False, True]
+            c.client.create_collection.side_effect = RuntimeError("already exists")
+        else:
+            c.client.collection_exists.return_value = True
+        infos = []
+        for metadata in metadata_seq:
+            info = mock.MagicMock()
+            info.config.params.vectors = {"fast-x": models.VectorParams(size=4, distance=models.Distance.COSINE)}
+            info.config.metadata = metadata
+            infos.append(info)
+        # The lost-race path reads the collection twice (schema, then metadata).
+        c.client.get_collection.side_effect = [i for i in infos for _ in range(2 if lose_race else 1)]
+        return c
+
+    def test_an_existing_foreign_collection_is_refused(self):
+        # A memory-bank or compact collection created under this name after
+        # the indexer's ownership check, while it was chunking and embedding.
+        for lose_race in (False, True):
+            for metadata in (
+                None, {}, {"claude_runway_kind": "other"}, {"description": "x"},
+                {COMPACT_KEY: COMPACT_VALUE},
+                # Both marks: metadata merges keys, and the compact marker wins.
+                {COMPACT_KEY: COMPACT_VALUE, **code_index_metadata()},
+            ):
+                with self.subTest(lose_race=lose_race, metadata=metadata):
+                    c = self._existing(metadata, lose_race=lose_race)
+                    with self.assertRaises(RuntimeError) as caught:
+                        _run(c.ensure_collection_exists("coll"))
+                    self.assertIn("not created by the codebase-indexer", str(caught.exception))
+                    c.client.upsert.assert_not_awaited()
+
+    def test_an_owned_collection_is_used(self):
+        for lose_race in (False, True):
+            with self.subTest(lose_race=lose_race):
+                c = self._existing({**code_index_metadata(), "description": "d"}, lose_race=lose_race)
+                _run(c.ensure_collection_exists("coll"))
+
+    def test_the_check_is_repeated_on_every_call_not_cached(self):
+        # The same name can be dropped and recreated by another writer
+        # between two batches, or marked compact by compact_store.
+        for later in (None, {COMPACT_KEY: COMPACT_VALUE, **code_index_metadata()}):
+            with self.subTest(later=later):
+                c = self._existing(code_index_metadata(), later)
+                _run(c.ensure_collection_exists("coll"))
+                with self.assertRaises(RuntimeError):
+                    _run(c.ensure_collection_exists("coll"))
+                self.assertEqual(c.client.get_collection.await_count, 2)
+
+    def test_without_a_check_an_existing_collection_is_not_read(self):
+        c = _connector(collection_metadata=code_index_metadata())
+        c.client = mock.AsyncMock()
+        c.client.collection_exists.return_value = True
+        _run(c.ensure_collection_exists("coll"))
+        c.client.get_collection.assert_not_awaited()
+
+    def test_a_collection_this_call_creates_is_not_re_read(self):
+        c = _connector(collection_metadata=code_index_metadata(), existing_collection_check=metadata_ownership_error)
+        c.client = mock.AsyncMock()
+        c.client.collection_exists.return_value = False
+        _run(c.ensure_collection_exists("coll"))
+        c.client.get_collection.assert_not_awaited()
+
+    def test_no_collection_metadata_sends_none(self):
+        async def go():
+            c = _connector()
+            c.client = mock.AsyncMock()
+            c.client.collection_exists.return_value = False
+            await c.ensure_collection_exists("coll")
+            return c.client
+
+        self.assertIsNone(_run(go()).create_collection.call_args.kwargs["metadata"])
+
+    def test_collection_metadata_round_trips_in_process(self):
+        async def go():
+            c = _connector(collection_metadata={"claude_runway_kind": "code-index"})
+            await c.ensure_collection_exists("coll")
+            return (await c.client.get_collection("coll")).config.metadata
+
+        self.assertEqual(_run(go()), {"claude_runway_kind": "code-index"})
 
     def test_store_writes_the_documented_payload_and_vector_name(self):
         async def go():

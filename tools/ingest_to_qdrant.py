@@ -20,11 +20,13 @@ server reads, read from this shell's environment (not from .mcp.json).
 QDRANT_API_KEY is used only when --qdrant-url is QDRANT_URL (or the built-in
 default); any other --qdrant-url needs its own --qdrant-api-key.
 
---collection is refused on every run if it is the shared memory-bank
-collection, as cb_indexer_index_repo/cb_indexer_sync_repo refuse it. That name comes from
---memory-bank-collection, else $MEMORY_BANK_COLLECTION, else
-MEMORY_BANK_COLLECTION in --repo-path's .mcp.json (where setup writes it, the
-codebase-indexer block first), else "memory-bank".
+--collection is refused, with or without --reset, if it already exists and
+was not created by the codebase-indexer, exactly as cb_indexer_index_repo/
+cb_indexer_sync_repo refuse it (libs/qdrant_code_index_marker.py): the memory
+bank, a compact collection or anything else, whatever it is called. A
+collection this CLI creates carries the indexer's mark. One indexed before the
+mark existed is adopted if it holds indexed file chunks and no memory-bank or
+compact points. --dry-run writes nothing and skips the check.
 
 Chunking is by the embedding model's own token window, not by line count:
 the model embeds only the first N tokens of a text (N is read
@@ -97,11 +99,16 @@ from qdrant_ingest_lib import (
     format_largest_files,
     ingest_env_defaults,
     parse_csv_set,
-    resolve_memory_bank_collection,
     validate_token_overlap,
 )
 from qdrant_batch_store import store_batch, ensure_file_path_index, FIELD_INDEXES
 from qdrant_index_prep import prepare_collection_for_index
+from qdrant_code_index_marker import (
+    check_code_index_ownership,
+    code_index_metadata,
+    current_ownership_error,
+    metadata_ownership_error,
+)
 from qdrant_model_check import check_embedding_model_mismatch
 from qdrant_retry import call_with_retry
 from qdrant_credentials import resolve_qdrant_credentials
@@ -131,7 +138,7 @@ async def ingest(args):
     # iter_files yields nothing for a missing directory, so a typo used to print
     # "Found 0 chunks ... Done." and exit 0 -- and with --reset the filtered
     # delete had already emptied the code index by then. Checked before the
-    # lock, the memory-bank lookup and any Qdrant client, so a refused run
+    # lock and any Qdrant client, so a refused run
     # touches nothing. is_dir(), not exists(): a file is refused too, matching
     # the MCP tools (index_repo/sync_repo/preview_index). An existing empty
     # directory is still a legitimate 0-chunk run.
@@ -147,38 +154,6 @@ async def ingest(args):
 
 
 async def _ingest(args, manifest_lock: ManifestLock, repo_path: Path):
-    # --reset used to be a raw delete_collection with none of the protections
-    # cb_indexer_index_repo(reset=True) has.
-    # Layer 1 (name refusal), ported from cb_indexer_index_repo: the shared memory-bank
-    # collection is reserved for every project's durable memories, so no code
-    # index goes there. It is not the only protection -- --reset's filtered
-    # delete keeps memory-bank points, and recall only matches points with
-    # the memory-bank source marker -- but it stops the mistake at the name
-    # instead of relying on those. Refused on EVERY run, as
-    # cb_indexer_index_repo/cb_indexer_sync_repo refuse it regardless of reset/force; this used
-    # to guard --reset only. Checked BEFORE the dry-run guard and before any
-    # Qdrant client exists, so it needs no network and a refused command
-    # fails fast even when combined with --dry-run.
-    #
-    # The name is resolved per run, not at import: the MCP
-    # server reads MEMORY_BANK_COLLECTION from its .mcp.json env block, but
-    # this CLI runs from a shell that normally doesn't export it, so reading
-    # only the shell left a custom name unprotected here while cb_indexer_index_repo
-    # refused it. resolve_memory_bank_collection also reads --repo-path's
-    # .mcp.json, after the flag and the shell variable.
-    memory_bank = resolve_memory_bank_collection(args.memory_bank_collection, repo_path)
-    if memory_bank.warning:
-        print(f"Warning: {memory_bank.warning}", file=sys.stderr)
-    reserved_by = memory_bank.reserved_source(args.collection)
-    if reserved_by:
-        print(
-            f"Error: '{args.collection}' is configured as the shared memory-bank "
-            f"collection ({reserved_by}). Refusing to index into it -- "
-            f"that collection is reserved for every project's durable memories. "
-            f"Use a different --collection for this project's code index.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
     # --dry-run is documented (both in --help and this preview print below)
     # as writing NOTHING to Qdrant -- so all collection maintenance
     # (reset-delete, file_path index backfill) must stay entirely behind
@@ -245,6 +220,17 @@ async def _ingest(args, manifest_lock: ManifestLock, repo_path: Path):
 
     if not args.dry_run:
         client = QdrantClient(url=args.qdrant_url, api_key=args.qdrant_api_key)
+        # Layer 1, the same refusal cb_indexer_index_repo/cb_indexer_sync_repo run, on
+        # every real run with or without --reset: an existing collection the
+        # codebase-indexer did not create (the memory bank or a compact
+        # collection under any name, anything else) is never indexed into or
+        # reset. Before prepare_collection_for_index, so a refused run deletes
+        # nothing. A dry run writes nothing, so it needs no check and stays
+        # offline.
+        ownership = check_code_index_ownership(client, args.collection, retry=call_with_retry)
+        if ownership.error:
+            print(ownership.error, file=sys.stderr)
+            sys.exit(1)
         # The same preparation cb_indexer_index_repo runs (libs/
         # qdrant_index_prep.py) -- --reset's pre-delete model check (Layer 3,
         # fail_closed) and always-filtered delete (Layer 2), or
@@ -271,6 +257,9 @@ async def _ingest(args, manifest_lock: ManifestLock, repo_path: Path):
                 # that cannot remove the old manifest does not start, so nothing
                 # is deleted and a manifest never outlives the index it described.
                 before_reset_delete=_invalidate_manifest if write_manifest and args.reset else None,
+                # Last, immediately before the delete: the guard above ran
+                # before the model load, so ownership is re-read here.
+                ownership_recheck=lambda: current_ownership_error(client, args.collection, retry=call_with_retry),
             )
         except TokenBudgetError as e:
             print(f"Error: {e}", file=sys.stderr)
@@ -397,6 +386,11 @@ async def _ingest(args, manifest_lock: ManifestLock, repo_path: Path):
         collection_name=args.collection,
         embedding_provider=embedding_provider,
         field_indexes=FIELD_INDEXES,
+        # A collection this run creates is marked as the indexer's own in the
+        # same request, so cb_indexer_sync_repo accepts it afterwards; one it
+        # did not create is re-checked before every batch.
+        collection_metadata=code_index_metadata(),
+        existing_collection_check=metadata_ownership_error,
     )
 
     async def _print_progress(stored, total):
@@ -500,13 +494,9 @@ def parse_args():
                          "collection itself, any memory-bank points and marked conversation compacts, "
                          "and aborts before deleting on an embedding-model "
                          "mismatch -- so it can no longer rebuild a collection's vector schema after an "
-                         "EMBEDDING_MODEL change (drop the collection manually for that). The shared memory-bank "
-                         "collection is refused outright, with or without --reset (see --memory-bank-collection)")
-    p.add_argument("--memory-bank-collection", default=None,
-                    help="Name of the shared memory-bank collection, which this CLI refuses to index into on any run, "
-                         "as cb_indexer_index_repo/cb_indexer_sync_repo do. Default: $MEMORY_BANK_COLLECTION if set, else "
-                         "MEMORY_BANK_COLLECTION from --repo-path's .mcp.json (the codebase-indexer block, then the "
-                         "memory-bank block), else 'memory-bank'")
+                         "EMBEDDING_MODEL change (drop the collection manually for that). An existing collection "
+                         "the codebase-indexer did not create (the memory bank, a compact collection, anything "
+                         "else) is refused outright, with or without --reset")
     args = p.parse_args()
     # The same key rule the MCP tools follow (libs/qdrant_credentials.py): an
     # explicit --qdrant-api-key always wins, $QDRANT_API_KEY goes only to the

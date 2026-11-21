@@ -81,14 +81,6 @@ class ResolveRepoTest(unittest.TestCase):
         self.assertIsNone(err)
 
 
-class IsMemoryBankCollectionNameTest(unittest.TestCase):
-    def test_matches(self):
-        self.assertTrue(mb.is_memory_bank_collection_name("memory-bank", "memory-bank"))
-
-    def test_does_not_match(self):
-        self.assertFalse(mb.is_memory_bank_collection_name("my-code-repo", "memory-bank"))
-
-
 class MemoryBankExclusionFilterTest(unittest.TestCase):
     def test_excludes_memory_bank_source(self):
         f = mb.memory_bank_exclusion_filter()

@@ -204,10 +204,12 @@ def _apply_memory_bank_server_missing(
     Qdrant setup gets the memory-bank server pointed at the SAME instance,
     not silently reset to the unauthenticated localhost default.
     `MEMORY_BANK_COLLECTION` similarly reuses whatever the existing
-    `codebase-indexer` block already has recorded (it's the one other place
-    this value is written -- see `build_mcp_servers`'s own docstring),
-    falling back to the template's own `"memory-bank"` default only if that
-    key is somehow itself missing. `MEMORY_BANK_ID` defaults to the
+    `codebase-indexer` block has recorded (an install set up before the
+    indexer dropped its copy still has one, and with no memory-bank block it
+    is the only record of a custom name; see
+    `codebase-indexer-memory-bank-collection-dropped`, which waits for this),
+    falling back to the template's own `"memory-bank"` default when it is
+    missing, as it is on every newer install. `MEMORY_BANK_ID` defaults to the
     project's own `COLLECTION_NAME` -- the issue's own specified default,
     matching what a fresh `init` run does when `--memory-bank-id` isn't
     passed.
@@ -255,46 +257,76 @@ def _apply_memory_bank_server_missing(
 
 
 # ---------------------------------------------------------------------------
-# codebase-indexer-memory-bank-collection-missing
+# codebase-indexer-memory-bank-collection-dropped
 # ---------------------------------------------------------------------------
+#
+# The codebase-indexer used to carry a copy of the memory-bank server's
+# MEMORY_BANK_COLLECTION, only to refuse indexing into that one name. It now
+# refuses every existing collection it did not create
+# (libs/qdrant_code_index_marker.py) and reads the key no more, so an old
+# copy is dead config that also had to be kept equal to the memory-bank
+# block by hand. The memory-bank block holds the real value, so removing the
+# copy orphans nothing -- except where no memory-bank block names its
+# collection: with no block, `memory-bank-server-missing` reads the copy to
+# build one, and a hand-edited block without the key is left alone by it. A
+# custom name is then its only record, so it stays until a block records it.
+
+_INDEXER_MEMORY_BANK_KEY = "MEMORY_BANK_COLLECTION"
 
 
-def _detect_indexer_memory_bank_collection_missing(mcp_json: dict, settings_json: dict) -> bool:
-    """
-    True only when a `codebase-indexer` server EXISTS and its env lacks the
-    key. A project with no indexer block at all (e.g. hand-built with only
-    `qdrant`) has nothing for this migration to fix -- creating a whole
-    indexer server here would be far outside "touch only what detect found
-    missing".
-    """
-    indexer = mcp_json.get("mcpServers", {}).get("codebase-indexer")
-    if indexer is None:
+def _indexer_memory_bank_copy_droppable(mcp_json: dict) -> bool:
+    """True when the `codebase-indexer` env has the key and removing it loses
+    nothing: the copy is blank or the default name (what the memory-bank
+    server and `memory-bank-server-missing` fall back to anyway), or the
+    `memory-bank` block records its own non-blank MEMORY_BANK_COLLECTION
+    (the real value). A `memory-bank` block that exists but records no name
+    (no `env`, or no such key) does not count: `memory-bank-server-missing`
+    leaves an existing block alone, so the copy may be the only record of a
+    custom name and is kept until that block names its collection."""
+    servers = mcp_json.get("mcpServers", {})
+    indexer = servers.get("codebase-indexer")
+    if not isinstance(indexer, dict):
         return False
-    return not indexer.get("env", {}).get("MEMORY_BANK_COLLECTION")
+    env = indexer.get("env")
+    if not isinstance(env, dict) or _INDEXER_MEMORY_BANK_KEY not in env:
+        return False
+    value = env.get(_INDEXER_MEMORY_BANK_KEY)
+    if not value or value == "memory-bank":
+        return True
+    memory_bank = servers.get("memory-bank")
+    memory_bank_env = memory_bank.get("env") if isinstance(memory_bank, dict) else None
+    recorded = memory_bank_env.get(_INDEXER_MEMORY_BANK_KEY) if isinstance(memory_bank_env, dict) else None
+    return isinstance(recorded, str) and bool(recorded.strip())
 
 
-def _apply_indexer_memory_bank_collection_missing(
+def _detect_indexer_memory_bank_collection_dropped(mcp_json: dict, settings_json: dict) -> bool:
+    """
+    True when an existing `codebase-indexer` block still carries
+    MEMORY_BANK_COLLECTION and it can be removed without losing a value (see
+    `_indexer_memory_bank_copy_droppable`). False with no indexer block, with
+    no such key, and while a custom name in it is the only record of where
+    this install's memories live (no `memory-bank` block naming its
+    collection yet): that install is offered this again once a block records
+    the name (`memory-bank-server-missing` adds one when it is missing),
+    rather than being shown a migration that could not apply.
+    """
+    return _indexer_memory_bank_copy_droppable(mcp_json)
+
+
+def _apply_indexer_memory_bank_collection_dropped(
     mcp_json: dict, settings_json: dict, ctx: MigrationContext
 ) -> "tuple[dict, dict]":
     """
-    Adds `MEMORY_BANK_COLLECTION` to the existing `codebase-indexer` env.
-    `cb_indexer_index_repo`/`cb_indexer_sync_repo`'s refusal to touch the shared memory-bank
-    collection compares against THIS block's own copy (falling back to the
-    default name when unset), so a project whose memories live under a
-    custom collection name is unprotected until this key matches it.
-
-    The value is copied from the existing `memory-bank` block when it has
-    one (that block is where the memories really live, so it's the source of
-    truth for what the guard must protect), else the template's own
-    `"memory-bank"` default. Only this one key is written.
+    Removes MEMORY_BANK_COLLECTION from the `codebase-indexer` env. Every
+    other key in that block, every other server (the `memory-bank` block's
+    own MEMORY_BANK_COLLECTION included) and the whole of `settings.json` are
+    left as they were. Re-checks `detect`'s rule, so it never removes the
+    only record of a custom name.
     """
+    if not _indexer_memory_bank_copy_droppable(mcp_json):
+        return mcp_json, settings_json
     mcp_json = copy.deepcopy(mcp_json)
-    servers = mcp_json.setdefault("mcpServers", {})
-    memory_bank_env = servers.get("memory-bank", {}).get("env", {})
-    value = memory_bank_env.get("MEMORY_BANK_COLLECTION") or "memory-bank"
-    indexer_env = servers["codebase-indexer"].setdefault("env", {})
-    if not indexer_env.get("MEMORY_BANK_COLLECTION"):
-        indexer_env["MEMORY_BANK_COLLECTION"] = value
+    mcp_json["mcpServers"]["codebase-indexer"]["env"].pop(_INDEXER_MEMORY_BANK_KEY, None)
     return mcp_json, settings_json
 
 
@@ -1867,8 +1899,10 @@ def _apply_cb_indexer_claude_md_renamed(target_repo: Path, ctx: Optional[Migrati
 # record-session-id-sessionstart needs record-session-id-hooks-missing to
 # appear (and be applied) earlier in this list,
 # local-compress-savings-db-inert needs analytics-server-missing earlier,
-# codebase-indexer-script-renamed needs mcp-server-scripts-moved earlier, and
-# local-compress-dead-env-dropped needs qdrant-server-replaced earlier.
+# codebase-indexer-script-renamed needs mcp-server-scripts-moved earlier,
+# local-compress-dead-env-dropped needs qdrant-server-replaced earlier, and
+# codebase-indexer-memory-bank-collection-dropped needs
+# memory-bank-server-missing earlier.
 MIGRATIONS: "list[Migration]" = [
     Migration(
         id="memory-bank-server-missing",
@@ -1886,24 +1920,24 @@ MIGRATIONS: "list[Migration]" = [
         detect=_detect_memory_bank_server_missing,
         apply=_apply_memory_bank_server_missing,
     ),
-    # Placed next to memory-bank-server-missing purely for display grouping --
-    # there is no ordering dependency: when both are pending no memory-bank
-    # block exists yet, so either order yields the same "memory-bank" default
-    # in both places.
+    # Must stay AFTER memory-bank-server-missing: that one reads this key to
+    # build the memory-bank block. This one is only offered once removing the
+    # key loses nothing (see _indexer_memory_bank_copy_droppable).
     Migration(
-        id="codebase-indexer-memory-bank-collection-missing",
-        title="Add MEMORY_BANK_COLLECTION to codebase-indexer server env",
-        kind="add",
+        id="codebase-indexer-memory-bank-collection-dropped",
+        title="Drop MEMORY_BANK_COLLECTION from the codebase-indexer block in .mcp.json",
+        kind="remove",
         description=(
-            "This project's codebase-indexer server has no MEMORY_BANK_COLLECTION in its env, so "
-            "cb_indexer_index_repo/cb_indexer_sync_repo's guard against touching the shared memory-bank collection only "
-            "protects the default name -- unprotected if your memory-bank server uses a custom one. "
-            "Adds the key, copied from the memory-bank server's own value if present, "
-            'else "memory-bank".'
+            "This project's codebase-indexer block still carries MEMORY_BANK_COLLECTION, a copy of the "
+            "memory-bank server's setting it once used to refuse indexing into the shared memory-bank "
+            "collection. The indexer no longer reads it: it now refuses every existing collection it did not "
+            "create, whatever its name. Removes just that key from the codebase-indexer block; the "
+            "memory-bank block keeps its own MEMORY_BANK_COLLECTION, and every other value and server is "
+            "left untouched."
         ),
-        note="",
-        detect=_detect_indexer_memory_bank_collection_missing,
-        apply=_apply_indexer_memory_bank_collection_missing,
+        note="Restart Claude Code afterwards.",
+        detect=_detect_indexer_memory_bank_collection_dropped,
+        apply=_apply_indexer_memory_bank_collection_dropped,
     ),
     Migration(
         id="record-session-id-hooks-missing",

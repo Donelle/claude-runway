@@ -107,6 +107,31 @@ class PrepareCollectionForIndex(unittest.TestCase):
         self._prep(client, reset=False, before=before)
         before.assert_not_called()
 
+    def test_ownership_recheck_runs_last_and_its_error_aborts_the_delete(self):
+        # The caller's ownership guard ran before the model load; a collection
+        # recreated (or marked compact) under this name since then is refused.
+        events = []
+        client = mock.MagicMock()
+        client.collection_exists.return_value = True
+        client.delete.side_effect = lambda **kw: events.append("delete")
+        for recheck_error in (None, "Error: not ours"):
+            with self.subTest(recheck_error=recheck_error):
+                events.clear()
+                client.delete.reset_mock()
+                result = prep_mod.prepare_collection_for_index(
+                    client, "coll", "model-x", reset=True, provider_factory=mock.MagicMock(),
+                    model_check=mock.MagicMock(side_effect=lambda *a, **kw: events.append("check")),
+                    before_reset_delete=lambda: events.append("before"),
+                    ownership_recheck=lambda e=recheck_error: events.append("recheck") or e,
+                )
+                if recheck_error:
+                    self.assertEqual(result.error, recheck_error)
+                    self.assertFalse(result.reset_deleted)
+                    self.assertEqual(events, ["check", "before", "recheck"])
+                else:
+                    self.assertIsNone(result.error)
+                    self.assertEqual(events, ["check", "before", "recheck", "delete"])
+
     def test_missing_collection_is_a_no_op_and_loads_no_model(self):
         for reset in (True, False):
             with self.subTest(reset=reset):
