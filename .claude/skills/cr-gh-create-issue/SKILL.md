@@ -13,8 +13,9 @@ Interactively create a GitHub issue for claude-runway — the GitHub-issue equiv
 ```
 /cr-gh-create-issue type=bug theme=theme-savings-tracker priority=priority-p1 Description of the suspected issue...
 /cr-gh-create-issue A rough description of a bug or feature idea, no fields given
+/cr-gh-create-issue type=spike theme=theme-metrics priority=priority-p3 The question to be answered...
 ```
-Any of `type=`/`theme=`/`priority=` may be omitted — missing ones get inferred from investigation (steps 4–6) and confirmed with the user, the same way `/my-create-task` asks clarifying questions rather than guessing silently.
+`type=spike` files a spike ticket, a research question whose outcome is findings and a go/no-go rather than code; `/cr-gh-spike` works it. Any of `type=`/`theme=`/`priority=` may be omitted — missing ones get inferred from investigation (steps 4–6) and confirmed with the user, the same way `/my-create-task` asks clarifying questions rather than guessing silently.
 
 ## Steps
 
@@ -25,13 +26,17 @@ Any of `type=`/`theme=`/`priority=` may be omitted — missing ones get inferred
 3. **Investigate before writing anything.** This is the step that makes the output trustworthy, and it branches by what kind of claim this is:
    - **Suspected bug** — actually find the relevant code (`Grep`/`Read`, or `cb_indexer_find_repo` if available) and either reproduce the failure (a small script, a live call, or rigorous step-by-step tracing through the real mechanism — same discipline as `/cr-gh-pr-feedback`'s verification step) or confirm the defect by direct code reading with exact file:line citations. If it doesn't reproduce and doesn't hold up on reading, say so and ask the user whether to still file it as an unverified/plausible risk (lower priority, said so explicitly in the body) or drop it — don't silently file an unconfirmed claim as if it were confirmed.
    - **Feature/enhancement idea** — sanity-check that its premise still holds against current code (e.g. "no caching exists" → actually grep for one first) the same way the growth-opportunity pass in this repo's history did before filing that backlog batch.
+   - **Spike (a question to answer, not a change to make)** — do not investigate the answer: that is the spike's own job, and a half-answered spike ticket hides what is still open. Check only that the premise holds (the code, tool or limit the question is about exists as described) and that the question is not already answered by the code, `docs/` or a stored memory (`recall`). If it already is, say so and ask whether to still file it.
    - Record what was actually checked (files read, commands run, repro result) — this becomes the **Location**/**Sanity-checked** line in the body, not a to-do.
 
-4. **Determine the type label** if not given by `type=`:
+4. **Determine the type** if not given by `type=`:
    - A confirmed or plausible defect → `bug`
    - A new capability/idea → `enhancement`
    - Pure documentation fix → `documentation`
-   This is the *label*, not GitHub's native Issue Type field (`Task`/`Bug`/`Feature`) — that field gets set later by `/cr-gh-code-it` when work actually starts, derived from this same label, so don't set it here.
+   - A question to be answered before deciding on a change ("can we", "is it feasible", "which of these") → `spike`
+   For `bug`, `enhancement` and `documentation` this is the *label*, not GitHub's native Issue Type field (`Task`/`Bug`/`Feature`) — that field gets set later by `/cr-gh-code-it` when work actually starts, derived from this same label, so don't set it here.
+
+   `spike` is the exception, and it is not a label: a spike ticket gets no `bug`/`enhancement`/`documentation` label and no `spike` label, and its native Issue Type is `Spike`. `/cr-gh-code-it` never works a spike, so nothing later would set that type: step 12 sets it right after the issue is created. A spike ticket's title starts with `Spike:`.
 
 5. **Determine the theme label** if not given by `theme=`. Run `gh label list -R Donelle/claude-runway` to see the live set (don't hardcode a list here — it will drift) and match against whichever `theme-*` label fits the subsystem step 3 actually touched. As of this skill's creation the themes are:
    - `theme-install-config` — installation/configuration friction
@@ -97,6 +102,23 @@ Any of `type=`/`theme=`/`priority=` may be omitted — missing ones get inferred
    **Proposal:** {the concrete shape of the fix/feature}
    ```
 
+   **Spike-shaped** (`spike`), under `## AI Instructions`. Its Summary uses the same four fields, with **Ask** phrased as the question and **Done when** as "each question below is answered with evidence (or marked not answerable), a verdict and recommendation are posted on this ticket, and follow-up tickets are filed if worth it":
+   ```
+   - **Part of:** {the parent ticket's title, if any}
+   - **Depends on:** {what must happen first, or "nothing"}
+   - **Leverage/effort rationale:** {why this priority: the full reasoning behind the Summary's few words}
+   - **Sanity-checked:** {what was confirmed about the premise in step 3, with evidence}
+
+   **Questions.**
+   1. {a question with an answer}
+   2. ...
+
+   **Done looks like:** {the evidence that settles each question: a measurement, a working call, a file:line fact, a documented limit}
+
+   **Out of scope:** {what the spike will not look into}
+   ```
+   Do not put a verdict or a suggested fix in it: the findings are posted later as a comment by `/cr-gh-spike`.
+
    Only add a `Tracked in ...` footer line if this issue genuinely originates from an existing note in `.ai-plans/` — don't fabricate a reference to one that doesn't exist for this issue.
 
 8. **Check for duplicates** before filing:
@@ -122,10 +144,17 @@ Any of `type=`/`theme=`/`priority=` may be omitted — missing ones get inferred
       --body-file .ai-plans/{slug}.md \
       --label "<type>,<priority>,<theme if any>"
     ```
+    For a spike, leave the type out of `--label` (the labels are just `<priority>,<theme if any>`).
 
-12. **Delete the draft** (`.ai-plans/{slug}.md`) once the issue exists. The issue body now holds its full text, and a leftover copy only drifts from it.
+12. **Set the Issue Type of a spike**, right after creating it; skip this step for every other type. `gh issue edit` has no `--type` flag, so use the REST API, with the number `gh issue create` printed at the end of its URL:
+    ```bash
+    gh api repos/Donelle/claude-runway/issues/{N} --method PATCH -f type=Spike --jq '.type.name'
+    ```
+    It must print `Spike`. If it fails, say so in the confirmation rather than leaving the ticket untyped silently.
 
-13. **Confirm with**:
+13. **Delete the draft** (`.ai-plans/{slug}.md`) once the issue exists. The issue body now holds its full text, and a leftover copy only drifts from it.
+
+14. **Confirm with**:
     - Issue URL and number
-    - Labels applied
-    - Next step: `/cr-gh-code-it {N}` whenever ready to work it
+    - Labels applied (and, for a spike, the Issue Type)
+    - Next step: `/cr-gh-code-it {N}` whenever ready to work it, or for a spike `/cr-gh-spike {N}`
