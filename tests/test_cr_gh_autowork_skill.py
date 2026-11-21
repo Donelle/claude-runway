@@ -161,6 +161,11 @@ class AutoPickExclusionContentRequirements(unittest.TestCase):
         self.assertIn("`Spike`", step)
         self.assertIn("OUTCOME: BLOCKED", step)
         self.assertIn("/cr-gh-spike", step)
+        # The `-type:Spike` exclusion lets an untyped ticket through, so this step is also
+        # the backstop for an auto-picked spike whose type was never set; it must not
+        # claim to catch only an explicit number.
+        self.assertIn("whose type was never set", step)
+        self.assertNotIn("it only catches an explicit", step)
 
     def test_prose_documents_both_exclusions(self):
         self.assertIn("NOT labeled", self.content)

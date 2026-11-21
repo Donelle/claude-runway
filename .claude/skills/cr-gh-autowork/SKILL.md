@@ -397,7 +397,9 @@ under `~/.claude/skills/`, not guaranteed to exist on whichever machine is runni
    `Spike:`, means a question whose outcome is findings, not a PR, so report
    `OUTCOME: BLOCKED (issue #<N>) — spike: its outcome is findings, not a PR; /cr-gh-spike
    works it` and stop before any mutation (no assignee, no issue type, no branch). Step 0's
-   auto-pick never reaches this, so it only catches an explicit `{ISSUE_NUMBER}`. Read the body's
+   query excludes typed spikes, so this catches an explicit `{ISSUE_NUMBER}` and an
+   auto-picked ticket whose type was never set (an untyped `Spike:` ticket, for example
+   one whose type-set failed at filing). Read the body's
    **Location**/**Verdict**/**Suggested fix** sections as a head start, not something to
    re-derive from zero.
 8. **Check whether this ticket is already being worked on — report BLOCKED immediately
