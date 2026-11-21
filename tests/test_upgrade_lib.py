@@ -185,6 +185,21 @@ class CodebaseIndexerMemoryBankCollectionDropped(unittest.TestCase):
                 }}
                 self.assertTrue(_migration(self._ID).detect(mcp_json, {}))
 
+    def test_detect_false_when_the_memory_bank_block_records_no_name(self):
+        # memory-bank-server-missing leaves an existing block alone, so a
+        # block with no env, or no (or a blank) MEMORY_BANK_COLLECTION, would
+        # lose a custom name if the indexer's copy were dropped.
+        for block in ({}, {"env": {}}, {"env": {"MEMORY_BANK_COLLECTION": "  "}}, {"env": None},
+                      {"env": {"MEMORY_BANK_COLLECTION": 5}}):
+            with self.subTest(block=block):
+                mcp_json = {"mcpServers": {
+                    "codebase-indexer": {"env": {"MEMORY_BANK_COLLECTION": "team-memory"}},
+                    "memory-bank": block,
+                }}
+                self.assertFalse(_migration(self._ID).detect(mcp_json, {}))
+                after, _ = _migration(self._ID).apply(mcp_json, {}, _ctx())
+                self.assertEqual(after, mcp_json)
+
     def test_detect_true_without_a_memory_bank_block_for_a_default_or_blank_value(self):
         for value in ("memory-bank", ""):
             with self.subTest(value=value):

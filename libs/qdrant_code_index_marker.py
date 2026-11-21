@@ -89,7 +89,7 @@ class OwnershipCheck:
 def _not_ours(collection: str, why: str) -> str:
     return (
         f"Error: collection '{collection}' already exists and was not created by the codebase-indexer "
-        f"({why}). Refusing to index into, reset or sync it -- use a different COLLECTION_NAME (or "
+        f"({why}). Refusing to write into it (index, reset, sync or store) -- use a different COLLECTION_NAME (or "
         f"collection argument) for this project's code index."
     )
 
@@ -113,8 +113,9 @@ def check_code_index_ownership(
     Decides whether the indexer may write into (or delete from) `collection`.
 
     - It does not exist: accepted. QdrantConnector creates it with the mark.
+    - It exists and carries the compact marker: refused, even if it also
+      carries the code-index mark.
     - It exists and carries the mark: accepted.
-    - It exists, carries the compact marker: refused.
     - It exists unmarked, holds a point with metadata.file_path and none with a
       protected metadata.source: adopted (the mark is written) and accepted.
     - Anything else that exists (empty, the memory bank under any name,
@@ -130,10 +131,15 @@ def check_code_index_ownership(
             return OwnershipCheck()
         info = retry(client.get_collection, collection)
         metadata = info.config.metadata
-        if is_marked_code_index(metadata):
-            return OwnershipCheck()
+        # The compact marker is checked FIRST: metadata updates merge keys, so
+        # one collection can carry both marks (an indexer-created collection
+        # that compact_store later wrote into and marked under the same
+        # name). A compact-marked collection is never ours, whatever else it
+        # carries.
         if is_marked_compact(metadata):
             return OwnershipCheck(_not_ours(collection, "it is marked as a conversation-compact collection"))
+        if is_marked_code_index(metadata):
+            return OwnershipCheck()
         protected = models.Filter(
             should=[
                 models.FieldCondition(key=mb.SOURCE_FIELD, match=models.MatchValue(value=mb.MEMORY_BANK_SOURCE)),
@@ -155,7 +161,7 @@ def check_code_index_ownership(
     except Exception as e:
         return OwnershipCheck(
             f"Error: could not confirm that collection '{collection}' was created by the codebase-indexer "
-            f"({e}). Refusing to index into, reset or sync it until its metadata can be read."
+            f"({e}). Refusing to write into it until its metadata can be read."
         )
     print(
         f"[claude-runway] adopted '{collection}' as a codebase-indexer collection: it predates the "

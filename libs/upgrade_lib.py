@@ -266,18 +266,23 @@ def _apply_memory_bank_server_missing(
 # (libs/qdrant_code_index_marker.py) and reads the key no more, so an old
 # copy is dead config that also had to be kept equal to the memory-bank
 # block by hand. The memory-bank block holds the real value, so removing the
-# copy orphans nothing -- except on an install with NO memory-bank block,
-# where `memory-bank-server-missing` reads the copy to build that block. A
-# custom name is then its only record, so it stays until that block exists.
+# copy orphans nothing -- except where no memory-bank block names its
+# collection: with no block, `memory-bank-server-missing` reads the copy to
+# build one, and a hand-edited block without the key is left alone by it. A
+# custom name is then its only record, so it stays until a block records it.
 
 _INDEXER_MEMORY_BANK_KEY = "MEMORY_BANK_COLLECTION"
 
 
 def _indexer_memory_bank_copy_droppable(mcp_json: dict) -> bool:
     """True when the `codebase-indexer` env has the key and removing it loses
-    nothing: a `memory-bank` block exists (it holds the real value), or the
-    copy is blank or the default name `memory-bank-server-missing` would
-    fall back to anyway."""
+    nothing: the copy is blank or the default name (what the memory-bank
+    server and `memory-bank-server-missing` fall back to anyway), or the
+    `memory-bank` block records its own non-blank MEMORY_BANK_COLLECTION
+    (the real value). A `memory-bank` block that exists but records no name
+    (no `env`, or no such key) does not count: `memory-bank-server-missing`
+    leaves an existing block alone, so the copy may be the only record of a
+    custom name and is kept until that block names its collection."""
     servers = mcp_json.get("mcpServers", {})
     indexer = servers.get("codebase-indexer")
     if not isinstance(indexer, dict):
@@ -285,10 +290,13 @@ def _indexer_memory_bank_copy_droppable(mcp_json: dict) -> bool:
     env = indexer.get("env")
     if not isinstance(env, dict) or _INDEXER_MEMORY_BANK_KEY not in env:
         return False
-    if "memory-bank" in servers:
-        return True
     value = env.get(_INDEXER_MEMORY_BANK_KEY)
-    return not value or value == "memory-bank"
+    if not value or value == "memory-bank":
+        return True
+    memory_bank = servers.get("memory-bank")
+    memory_bank_env = memory_bank.get("env") if isinstance(memory_bank, dict) else None
+    recorded = memory_bank_env.get(_INDEXER_MEMORY_BANK_KEY) if isinstance(memory_bank_env, dict) else None
+    return isinstance(recorded, str) and bool(recorded.strip())
 
 
 def _detect_indexer_memory_bank_collection_dropped(mcp_json: dict, settings_json: dict) -> bool:
@@ -297,9 +305,10 @@ def _detect_indexer_memory_bank_collection_dropped(mcp_json: dict, settings_json
     MEMORY_BANK_COLLECTION and it can be removed without losing a value (see
     `_indexer_memory_bank_copy_droppable`). False with no indexer block, with
     no such key, and while a custom name in it is the only record of where
-    this install's memories live (no `memory-bank` block yet): that install
-    is offered this again once `memory-bank-server-missing` has added the
-    block, rather than being shown a migration that could not apply.
+    this install's memories live (no `memory-bank` block naming its
+    collection yet): that install is offered this again once a block records
+    the name (`memory-bank-server-missing` adds one when it is missing),
+    rather than being shown a migration that could not apply.
     """
     return _indexer_memory_bank_copy_droppable(mcp_json)
 

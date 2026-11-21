@@ -25,9 +25,13 @@ from unittest import mock
 REPO_ROOT = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, str(REPO_ROOT / "libs"))
 sys.path.insert(0, str(REPO_ROOT / "mcpservers"))
+sys.path.insert(0, str(REPO_ROOT / "tests"))  # fake_ownership_client
 os.environ.setdefault("QDRANT_URL", "http://localhost:6333")
 os.environ.setdefault("COLLECTION_NAME", "test-collection")
 
+from fake_ownership_client import FakeOwnershipClient, code_chunk, memory_point, unrelated_point  # noqa: E402
+from qdrant_code_index_marker import OwnershipCheck, code_index_metadata  # noqa: E402
+from qdrant_compact_marker import MARKER_KEY as COMPACT_KEY, MARKER_VALUE as COMPACT_VALUE  # noqa: E402
 from qdrant_connector import NO_COLLECTION_ERROR, SEARCH_LIMIT, QdrantConnector  # noqa: E402
 
 EXPECTED_TOOLS = {
@@ -145,7 +149,14 @@ class CbIndexerFindAndStoreTools(unittest.TestCase):
     def _server(self, collection="proj"):
         mod = _load_server()
         mod.DEFAULT_COLLECTION = collection
-        mod._find_store_connector = QdrantConnector(":memory:", None, collection, _VectorProvider())
+        # Marks what it creates, as the real store connector does.
+        mod._find_store_connector = QdrantConnector(
+            ":memory:", None, collection, _VectorProvider(), collection_metadata=code_index_metadata()
+        )
+        # The ownership guard runs on a separate sync client (tested in
+        # StoreRefusesForeignCollections below); the in-memory async client
+        # above cannot be shared with it, so it is accepted here.
+        mod.check_code_index_ownership = lambda *a, **kw: OwnershipCheck()
         return mod
 
     def test_store_then_find_round_trips_content_and_metadata(self):
@@ -235,6 +246,55 @@ class CbIndexerFindAndStoreTools(unittest.TestCase):
         client = mod._find_store_connector.client
         points, _ = _run(client.scroll("proj", limit=10, with_payload=True))
         self.assertEqual([p.payload for p in points], [{"document": "a note", "metadata": {"source": "design"}}])
+
+
+class StoreRefusesForeignCollections(unittest.TestCase):
+    """cb_indexer_store_repo runs the indexer's ownership guard before it
+    stores anything: a note must never be upserted into the memory bank, a
+    compact collection or any other collection the indexer did not create."""
+
+    def _store(self, client):
+        mod = _load_server()
+        mod.DEFAULT_COLLECTION = "shared-thing"
+        mod.QdrantClient = lambda **kw: client
+        mod.call_with_retry = lambda fn, *a, **kw: fn(*a, **kw)
+        connector = mock.MagicMock()
+        mod._get_find_store_connector = lambda: connector
+        stored = []
+
+        async def _store_entry(*args):
+            stored.append(args)
+            return "Remembered"
+
+        mod.store_entry = _store_entry
+        return _run(mod.cb_indexer_store_repo("a note", None)), stored
+
+    def test_foreign_collections_are_refused_before_anything_is_stored(self):
+        for label, client in (
+            ("memory bank", FakeOwnershipClient(payloads=[memory_point()])),
+            ("marked compact collection", FakeOwnershipClient(metadata={COMPACT_KEY: COMPACT_VALUE})),
+            ("empty unmarked collection", FakeOwnershipClient()),
+            ("unrelated points", FakeOwnershipClient(payloads=[unrelated_point()])),
+            ("unreadable metadata", FakeOwnershipClient(fail_on="get_collection")),
+        ):
+            with self.subTest(label=label):
+                result, stored = self._store(client)
+                self.assertTrue(result.startswith("Error"), result)
+                self.assertIn("'shared-thing'", result)
+                self.assertEqual(stored, [])
+                self.assertEqual(client.updates, [])
+
+    def test_own_missing_and_legacy_collections_are_stored_into(self):
+        for label, client, adopted in (
+            ("marked", FakeOwnershipClient(metadata=code_index_metadata()), False),
+            ("missing", FakeOwnershipClient(exists=False), False),
+            ("legacy code collection", FakeOwnershipClient(payloads=[code_chunk()]), True),
+        ):
+            with self.subTest(label=label):
+                result, stored = self._store(client)
+                self.assertEqual(result, "Remembered")
+                self.assertEqual(len(stored), 1)
+                self.assertEqual(client.updates, [code_index_metadata()] if adopted else [])
 
 
 class FindStoreDoNotLoadTheModelAtStartup(unittest.TestCase):

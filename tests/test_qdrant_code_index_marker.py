@@ -109,6 +109,11 @@ class OwnershipRefused(unittest.TestCase):
         client = FakeClient(metadata={COMPACT_KEY: COMPACT_VALUE}, payloads=[_code_chunk()])
         self._assert_refused(client, "conversation-compact collection")
 
+    def test_compact_marker_wins_over_the_code_index_mark(self):
+        # Metadata merges keys, so one collection can carry both marks.
+        client = FakeClient(metadata={COMPACT_KEY: COMPACT_VALUE, **marker.code_index_metadata()})
+        self._assert_refused(client, "conversation-compact collection")
+
     def test_unmarked_compact_points(self):
         self._assert_refused(FakeClient(payloads=[_compact()]), "conversation-compact points")
 

@@ -2396,10 +2396,25 @@ async def cb_indexer_store_repo(information: str, metadata: Optional[dict[str, A
     store raw file dumps or speculative, in-progress reasoning. Metadata is optional: add file_path and line_number
     when the text is about a file, source or url when it comes from somewhere
     else, or nothing. Input: information (the text to store), metadata
-    (optional JSON).
+    (optional JSON). Refuses, like cb_indexer_index_repo, when this project's
+    collection exists but was not created by the codebase-indexer.
     """
     if not DEFAULT_COLLECTION:  # same order as cb_indexer_find_repo: no model load for an unset collection
         return NO_COLLECTION_ERROR
+    # The same ownership refusal cb_indexer_index_repo/cb_indexer_sync_repo
+    # run (libs/qdrant_code_index_marker.py), so a note is never upserted
+    # into the memory bank, a compact collection or anything else that
+    # happens to share COLLECTION_NAME. Checked before the connector is
+    # built, so a refusal loads no embedding model; a legacy code collection
+    # is adopted here the same way. The connector re-checks the mark itself
+    # if the collection appears after this (libs/qdrant_connector.py).
+    ownership = check_code_index_ownership(
+        QdrantClient(url=DEFAULT_QDRANT_URL, api_key=DEFAULT_QDRANT_API_KEY),
+        DEFAULT_COLLECTION,
+        retry=call_with_retry,
+    )
+    if ownership.error:
+        return ownership.error
     return await store_entry(_get_find_store_connector(), DEFAULT_COLLECTION, information, metadata)
 
 

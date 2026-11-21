@@ -123,9 +123,54 @@ class OnDiskFormat(unittest.TestCase):
         self.assertEqual(
             created.create_collection.call_args.kwargs["metadata"], {"claude_runway_kind": "code-index"}
         )
-        existing = _run(go(True))
-        existing.create_collection.assert_not_awaited()
-        existing.update_collection.assert_not_awaited()
+        # Nothing is written onto an existing collection (it is checked
+        # instead, see the tests below).
+        created.update_collection.assert_not_awaited()
+
+    def _existing(self, metadata, *, lose_race=False):
+        """A connector requiring the code-index mark, over a mock client whose
+        collection already exists (or, with lose_race, is created by another
+        writer between this connector's existence check and its create)."""
+        c = _connector(_FakeProvider("fast-x", 4), collection_metadata={"claude_runway_kind": "code-index"})
+        c.client = mock.AsyncMock()
+        if lose_race:
+            c.client.collection_exists.side_effect = [False, True]
+            c.client.create_collection.side_effect = RuntimeError("already exists")
+        else:
+            c.client.collection_exists.return_value = True
+        info = mock.MagicMock()
+        info.config.params.vectors = {"fast-x": models.VectorParams(size=4, distance=models.Distance.COSINE)}
+        info.config.metadata = metadata
+        c.client.get_collection.return_value = info
+        return c
+
+    def test_an_existing_collection_without_the_metadata_is_refused(self):
+        # A memory-bank or compact collection created under this name after
+        # the indexer's ownership check, while it was chunking and embedding.
+        for lose_race in (False, True):
+            for metadata in (None, {}, {"claude_runway_kind": "other"}, {"description": "x"}):
+                with self.subTest(lose_race=lose_race, metadata=metadata):
+                    c = self._existing(metadata, lose_race=lose_race)
+                    with self.assertRaises(RuntimeError) as caught:
+                        _run(c.ensure_collection_exists("coll"))
+                    self.assertIn("Refusing to write", str(caught.exception))
+
+    def test_an_existing_collection_with_the_metadata_is_used_and_checked_once(self):
+        for lose_race in (False, True):
+            with self.subTest(lose_race=lose_race):
+                c = self._existing({"claude_runway_kind": "code-index", "description": "d"}, lose_race=lose_race)
+                _run(c.ensure_collection_exists("coll"))
+                if not lose_race:
+                    _run(c.ensure_collection_exists("coll"))
+                # The schema check (race only) plus one metadata read, never per batch.
+                self.assertEqual(c.client.get_collection.await_count, 2 if lose_race else 1)
+
+    def test_without_collection_metadata_an_existing_collection_is_not_read(self):
+        c = _connector()
+        c.client = mock.AsyncMock()
+        c.client.collection_exists.return_value = True
+        _run(c.ensure_collection_exists("coll"))
+        c.client.get_collection.assert_not_awaited()
 
     def test_no_collection_metadata_sends_none(self):
         async def go():
