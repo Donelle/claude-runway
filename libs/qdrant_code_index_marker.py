@@ -115,6 +115,26 @@ def metadata_ownership_error(collection: str, metadata: Optional[dict]) -> Optio
     return _not_ours(collection, "it has no code-index mark")
 
 
+def current_ownership_error(client, collection: str, *, retry: Callable[..., Any] = call_with_retry) -> Optional[str]:
+    """
+    Re-reads `collection`'s metadata NOW and applies metadata_ownership_error,
+    failing closed (an unreadable or vanished collection is refused). For the
+    points between check_code_index_ownership and a destructive or
+    metadata-changing write that come seconds later (a reset delete after the
+    model load, a sync's deletes after hashing and chunking, a description
+    write): a collection dropped and recreated, or marked compact, in that
+    gap is refused rather than deleted from or stamped. No adoption here.
+    """
+    try:
+        info = retry(client.get_collection, collection)
+    except Exception as e:
+        return (
+            f"Error: could not confirm that collection '{collection}' was created by the codebase-indexer "
+            f"({e}). Refusing to write into it until its metadata can be read."
+        )
+    return metadata_ownership_error(collection, info.config.metadata)
+
+
 def _has_point(client, collection: str, scroll_filter: models.Filter, retry: Callable[..., Any]) -> bool:
     points, _next = retry(
         client.scroll,

@@ -79,6 +79,8 @@ class FakeOwnershipClient:
     def update_collection(self, collection_name, metadata):
         self._maybe_fail("update_collection")
         self.updates.append(metadata)
+        # Qdrant merges metadata key by key; a later get_collection sees it.
+        self.metadata = {**(self.metadata or {}), **metadata}
 
 
 def code_chunk(path="a.py"):
@@ -98,8 +100,11 @@ def unrelated_point():
 
 
 def accept_ownership(*modules):
-    """Starts one patcher per module making its `check_code_index_ownership`
-    accept every collection, and returns them for the caller to stop.
+    """Starts patchers making each module's ownership guard
+    (`check_code_index_ownership`) and its later re-checks
+    (`current_ownership_error`, and `metadata_ownership_error` where the
+    module calls it directly) accept every collection, and returns them for
+    the caller to stop.
 
     For test modules about what happens AFTER the ownership guard: their
     MagicMock clients carry no real collection metadata, so the real guard
@@ -112,10 +117,12 @@ def accept_ownership(*modules):
 
     from qdrant_code_index_marker import OwnershipCheck
 
-    patchers = [
-        mock.patch.object(module, "check_code_index_ownership", return_value=OwnershipCheck())
-        for module in modules
-    ]
+    patchers = []
+    for module in modules:
+        patchers.append(mock.patch.object(module, "check_code_index_ownership", return_value=OwnershipCheck()))
+        for name in ("current_ownership_error", "metadata_ownership_error"):
+            if hasattr(module, name):
+                patchers.append(mock.patch.object(module, name, return_value=None))
     for patcher in patchers:
         patcher.start()
     return patchers

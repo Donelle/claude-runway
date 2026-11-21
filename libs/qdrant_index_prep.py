@@ -69,6 +69,7 @@ def prepare_collection_for_index(
     model_check: Callable[..., Optional[str]] = check_embedding_model_mismatch,
     backfill: Callable[..., bool] = ensure_file_path_index,
     before_reset_delete: Optional[Callable[[], Optional[str]]] = None,
+    ownership_recheck: Optional[Callable[[], Optional[str]]] = None,
 ) -> IndexPreparation:
     """
     Run the pre-index collection maintenance for a full index of `collection`.
@@ -91,6 +92,10 @@ def prepare_collection_for_index(
     deleted (cb_indexer_index_repo uses it to invalidate its sync manifest first, so no
     failure after the wipe can leave a manifest describing an index that is
     gone). Not called when the collection does not exist: nothing is deleted.
+    `ownership_recheck`, if given, runs last, immediately before the delete,
+    with the same abort rule: the caller's ownership guard ran before the
+    model load, and a collection dropped and recreated (or marked compact)
+    under this name in those seconds must not have its points deleted.
 
     reset=False and the collection exists: if existing_points_guard is
     given, call it with the collection's current point count; a non-None
@@ -117,6 +122,11 @@ def prepare_collection_for_index(
                 hook_error = before_reset_delete()
                 if hook_error:
                     result.error = hook_error
+                    return result
+            if ownership_recheck is not None:
+                recheck_error = ownership_recheck()
+                if recheck_error:
+                    result.error = recheck_error
                     return result
             retry(client.delete, collection_name=collection, points_selector=mb.memory_bank_exclusion_filter())
             result.reset_deleted = True

@@ -84,6 +84,13 @@ async def store_batch(
     that report MCP progress (to avoid client-side call timeouts on large
     repos) should pass one instead of trying to report per-chunk, since
     there's no longer a per-chunk round-trip to hang a progress report off.
+
+    Before every batch after the first, `connector.require_owned` is awaited
+    (the first is covered by ensure_collection_exists), so a connector with
+    an ownership check (the codebase-indexer's, see qdrant_connector.py)
+    re-reads the collection's metadata before each upsert: a sync or a CLI
+    run stores all its entries in one call, and a collection dropped and
+    recreated, or marked compact, partway through must not receive the rest.
     """
     if not entries:
         return 0
@@ -95,6 +102,8 @@ async def store_batch(
     vector_name = connector.embedding_provider.get_vector_name()
     stored = 0
     for i in range(0, len(entries), batch_size):
+        if i:
+            await connector.require_owned(collection_name)
         batch = entries[i:i + batch_size]
         contents = [entry.content for entry in batch]
         embeddings = await connector.embedding_provider.embed_documents(contents)

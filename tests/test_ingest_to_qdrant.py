@@ -83,7 +83,10 @@ def _run(coro):
 # real collection metadata, which the real guard (failing closed) would
 # refuse. CliOwnershipGuard below restores the real guard for its own tests.
 _ownership_patchers: list = []
-_REAL_OWNERSHIP_CHECK = mod.check_code_index_ownership
+_REAL_OWNERSHIP_NAMES = {
+    name: getattr(mod, name)
+    for name in ("check_code_index_ownership", "current_ownership_error", "metadata_ownership_error")
+}
 
 
 def setUpModule():
@@ -291,9 +294,10 @@ class CliOwnershipGuard(unittest.TestCase):
     those is set or read here, so a refusal can only come from the mark."""
 
     def setUp(self):
-        patcher = mock.patch.object(mod, "check_code_index_ownership", _REAL_OWNERSHIP_CHECK)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        for name, real in _REAL_OWNERSHIP_NAMES.items():
+            patcher = mock.patch.object(mod, name, real)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.repo = Path(tmp.name)
@@ -331,6 +335,20 @@ class CliOwnershipGuard(unittest.TestCase):
                     self.assertIn("'shared-thing'", err.getvalue())
                     prep.assert_not_called()
                     self.assertEqual(client.updates, [])
+
+    def test_reset_rechecks_ownership_right_before_its_delete(self):
+        # The guard passed, then the collection changed during the model load.
+        client = mock.MagicMock()
+        client.collection_exists.return_value = True
+        err = io.StringIO()
+        with mock.patch.object(mod, "check_code_index_ownership", return_value=marker.OwnershipCheck()), \
+             mock.patch.object(mod, "current_ownership_error", return_value="Error: no longer ours") as recheck, \
+             mock.patch.object(mod, "check_embedding_model_mismatch", return_value=None), \
+             self.assertRaises(SystemExit):
+            self._run_ingest(client, err, reset=True)
+        self.assertIn("Error: no longer ours", err.getvalue())
+        recheck.assert_called_once_with(client, "shared-thing", retry=mock.ANY)
+        client.delete.assert_not_called()
 
     def test_unmarked_code_collection_is_adopted(self):
         client = FakeOwnershipClient(payloads=[code_chunk()])

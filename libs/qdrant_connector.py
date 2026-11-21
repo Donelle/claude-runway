@@ -88,8 +88,9 @@ class QdrantConnector:
         # codebase-indexer passes qdrant_code_index_marker
         # .metadata_ownership_error. Deliberately not cached: a collection
         # name can be dropped and recreated by another writer between two
-        # batches, so each write re-reads the metadata (one read per
-        # store_batch call, i.e. per up to UPSERT_BATCH_SIZE points).
+        # batches, so it is re-read before every upsert batch
+        # (ensure_collection_exists before the first, require_owned before
+        # each later one; see qdrant_batch_store.store_batch).
         self.existing_collection_check = existing_collection_check
 
     async def get_collection_names(self) -> list[str]:
@@ -173,7 +174,7 @@ class QdrantConnector:
         this read and the upsert that follows it, which no read can close.
         """
         if await self.client.collection_exists(collection_name):
-            await self._require_owned(collection_name)
+            await self.require_owned(collection_name)
             return
         vector_name = self.embedding_provider.get_vector_name()
         vector_size = self.embedding_provider.get_vector_size()
@@ -189,7 +190,7 @@ class QdrantConnector:
             if not await self.client.collection_exists(collection_name):
                 raise
             await self._require_matching_schema(collection_name, vector_name, vector_size)
-            await self._require_owned(collection_name)
+            await self.require_owned(collection_name)
             return
         for field_name, field_type in (self.field_indexes or {}).items():
             await self.client.create_payload_index(
@@ -198,9 +199,11 @@ class QdrantConnector:
                 field_schema=field_type,
             )
 
-    async def _require_owned(self, collection_name: str) -> None:
+    async def require_owned(self, collection_name: str) -> None:
         """Raises with `existing_collection_check`'s message if it objects to
-        the collection's current metadata. A no-op without a check."""
+        the collection's current metadata. A no-op without a check. Called by
+        ensure_collection_exists for a collection it did not create, and by
+        store_batch before every batch after the first."""
         if self.existing_collection_check is None:
             return
         info = await self.client.get_collection(collection_name)

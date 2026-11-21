@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))  # fake_ownership_clien
 
 from mcpservers import codebase_indexer_mcp_server as _ims  # noqa: E402
 from fake_ownership_client import FakeOwnershipClient, code_chunk, memory_point, unrelated_point  # noqa: E402
-from qdrant_code_index_marker import code_index_metadata  # noqa: E402
+from qdrant_code_index_marker import OwnershipCheck, code_index_metadata  # noqa: E402
 from qdrant_compact_marker import MARKER_KEY as COMPACT_KEY, MARKER_VALUE as COMPACT_VALUE  # noqa: E402
 
 OWN_URL = "http://own-qdrant:6333"
@@ -106,6 +106,19 @@ class DescriptionSyncOnlyStampsOwnCollections(unittest.TestCase):
                 redirect_stderr(io.StringIO()):
             _ims._sync_static_collection_description("proj", OWN_URL, None)
         client.update_collection.assert_called_once_with(collection_name="proj", metadata={"description": "desc"})
+
+    def test_a_collection_that_changed_after_the_guard_is_not_stamped(self):
+        # The guard accepted it, but the metadata read right before the write
+        # shows another writer's collection now (recreated, or marked compact).
+        for metadata in (None, {COMPACT_KEY: COMPACT_VALUE, **code_index_metadata()}):
+            with self.subTest(metadata=metadata):
+                client = MagicMock()
+                client.get_collection.return_value = SimpleNamespace(config=SimpleNamespace(metadata=metadata))
+                with patch.object(_ims, "check_code_index_ownership", return_value=OwnershipCheck()):
+                    cached, err = self._sync(client)
+                client.update_collection.assert_not_called()
+                cached.assert_not_called()
+                self.assertIn("not syncing COLLECTION_DESCRIPTION", err)
 
     def test_unmarked_code_collection_is_adopted_then_stamped(self):
         client = FakeOwnershipClient(payloads=[code_chunk()])

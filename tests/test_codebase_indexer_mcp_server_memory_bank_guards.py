@@ -60,9 +60,10 @@ def _accept_ownership(test: unittest.TestCase) -> None:
     """For tests about what happens AFTER the ownership guard: their MagicMock
     clients carry no real collection metadata, so the guard (which fails
     closed) would refuse them. The guard has its own tests below."""
-    patcher = patch.object(_ims, "check_code_index_ownership", return_value=marker.OwnershipCheck())
-    patcher.start()
-    test.addCleanup(patcher.stop)
+    for name, value in (("check_code_index_ownership", marker.OwnershipCheck()), ("current_ownership_error", None)):
+        patcher = patch.object(_ims, name, return_value=value)
+        patcher.start()
+        test.addCleanup(patcher.stop)
 
 
 def _foreign_collections():
@@ -134,6 +135,59 @@ class OwnershipGuardTest(unittest.TestCase):
             result = _run(_ims.index_repo(repo_path=REPO_ROOT, collection="shared-thing", force=True))
         self.assertEqual(result, "stop-here")  # got past the guard to the preparation step
         self.assertEqual(client.updates, [marker.code_index_metadata()])
+
+
+class DestructiveStepsRecheckOwnershipTest(unittest.TestCase):
+    """The guard runs before the model load, hashing and chunking; each
+    destructive step re-reads the collection's metadata right before it runs,
+    so a collection recreated (or marked compact) under the name meanwhile is
+    refused rather than deleted from."""
+
+    def setUp(self):
+        for target, kwargs in (
+            ("call_with_retry", {"side_effect": lambda fn, *a, **kw: fn(*a, **kw)}),
+            ("check_code_index_ownership", {"return_value": marker.OwnershipCheck()}),
+            ("current_ownership_error", {"return_value": "Error: no longer ours"}),
+            ("store_batch", {"new_callable": AsyncMock}),
+            ("iter_entries", {"return_value": iter([])}),
+            ("ensure_file_path_index", {}),
+            ("_save_manifest", {}),
+            ("_discard_manifest", {}),
+            ("_load_manifest", {"return_value": {}}),
+            ("compute_file_hashes", {"return_value": ({"changed_file.py": "newhash"}, [])}),
+            ("chunk_file", {"return_value": iter([])}),
+            ("_non_chunk_points_warning", {"return_value": ""}),
+            ("_delete_orphaned_chunks", {"return_value": []}),
+            ("check_embedding_model_mismatch", {"return_value": None}),
+            ("FastEmbedProvider", {}),
+            ("QdrantConnector", {}),
+        ):
+            patcher = patch.object(_ims, target, **kwargs)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _client(self):
+        client = MagicMock()
+        client.collection_exists.return_value = True
+        client.count.return_value = MagicMock(count=5)
+        return client
+
+    def test_index_repo_reset_deletes_nothing(self):
+        client = self._client()
+        with patch("codebase_indexer_mcp_server.QdrantClient", return_value=client):
+            result = _run(_ims.index_repo(repo_path=REPO_ROOT, collection="other-coll", reset=True))
+        self.assertEqual(result, "Error: no longer ours")
+        client.delete.assert_not_called()
+        _ims.current_ownership_error.assert_called_once_with(client, "other-coll", retry=_ims.call_with_retry)
+
+    def test_sync_repo_deletes_nothing(self):
+        client = self._client()
+        with patch("codebase_indexer_mcp_server.QdrantClient", return_value=client):
+            result = _run(_ims.sync_repo(repo_path=REPO_ROOT, collection="other-coll"))
+        self.assertEqual(result, "Error: no longer ours")
+        client.delete.assert_not_called()
+        _ims._delete_orphaned_chunks.assert_not_called()
+        _ims.store_batch.assert_not_called()
 
 
 class NewCollectionsCarryTheMarkTest(unittest.TestCase):

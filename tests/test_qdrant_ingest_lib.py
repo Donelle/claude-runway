@@ -1382,11 +1382,11 @@ class SyncRepoPreservesEmbeddingsOnChunkAndHashFailures(unittest.TestCase):
         # About what cb_indexer_sync_repo does after its ownership guard
         # (libs/qdrant_code_index_marker.py, tested on its own); this
         # MagicMock client carries no real collection metadata, which the
-        # guard would refuse.
-        from qdrant_code_index_marker import OwnershipCheck
-        patcher = mock.patch.object(self.ims, "check_code_index_ownership", return_value=OwnershipCheck())
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        # guard (and its re-check before the deletes) would refuse.
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from fake_ownership_client import accept_ownership
+        for patcher in accept_ownership(self.ims):
+            self.addCleanup(patcher.stop)
 
     @staticmethod
     def _sha(content):

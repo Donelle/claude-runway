@@ -103,7 +103,12 @@ from qdrant_ingest_lib import (
 )
 from qdrant_batch_store import store_batch, ensure_file_path_index, FIELD_INDEXES
 from qdrant_index_prep import prepare_collection_for_index
-from qdrant_code_index_marker import check_code_index_ownership, code_index_metadata, metadata_ownership_error
+from qdrant_code_index_marker import (
+    check_code_index_ownership,
+    code_index_metadata,
+    current_ownership_error,
+    metadata_ownership_error,
+)
 from qdrant_model_check import check_embedding_model_mismatch
 from qdrant_retry import call_with_retry
 from qdrant_credentials import resolve_qdrant_credentials
@@ -252,6 +257,9 @@ async def _ingest(args, manifest_lock: ManifestLock, repo_path: Path):
                 # that cannot remove the old manifest does not start, so nothing
                 # is deleted and a manifest never outlives the index it described.
                 before_reset_delete=_invalidate_manifest if write_manifest and args.reset else None,
+                # Last, immediately before the delete: the guard above ran
+                # before the model load, so ownership is re-read here.
+                ownership_recheck=lambda: current_ownership_error(client, args.collection, retry=call_with_retry),
             )
         except TokenBudgetError as e:
             print(f"Error: {e}", file=sys.stderr)

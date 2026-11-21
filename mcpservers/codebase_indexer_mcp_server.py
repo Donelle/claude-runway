@@ -94,7 +94,12 @@ from qdrant_collection_hints import (
     set_cached_search_limit,
 )
 from qdrant_compact_marker import collection_is_marked_compact, is_marked_compact
-from qdrant_code_index_marker import check_code_index_ownership, code_index_metadata, metadata_ownership_error
+from qdrant_code_index_marker import (
+    check_code_index_ownership,
+    code_index_metadata,
+    current_ownership_error,
+    metadata_ownership_error,
+)
 from qdrant_model_check import check_embedding_model_mismatch
 from qdrant_credentials import resolve_qdrant_credentials, same_endpoint
 from mcp_tool_introspect import tool_count
@@ -585,6 +590,13 @@ def _sync_static_collection_description(collection: Optional[str], qdrant_url: s
             print(f"[claude-runway] not syncing COLLECTION_DESCRIPTION: {ownership.error}", file=sys.stderr)
             return
         info = call_with_retry(client.get_collection, collection)
+        # Re-applied to the metadata just read, right before the write below:
+        # a collection dropped and recreated (or marked compact) under this
+        # name since the guard must not get the description stamped on it.
+        recheck_error = metadata_ownership_error(collection, info.config.metadata)
+        if recheck_error:
+            print(f"[claude-runway] not syncing COLLECTION_DESCRIPTION: {recheck_error}", file=sys.stderr)
+            return
         current = (info.config.metadata or {}).get("description", "")
         if not isinstance(current, str):
             current = ""
@@ -1067,6 +1079,9 @@ async def _index_repo(
             # After the model check, before the destructive delete:
             # a reset that cannot invalidate the manifest does not start.
             before_reset_delete=_invalidate_manifest if reset and owns_manifest else None,
+            # Last, immediately before the delete: the ownership guard above
+            # ran before the model load, so it is re-read here.
+            ownership_recheck=lambda: current_ownership_error(client, collection, retry=call_with_retry),
         )
         if prep.error:
             return prep.error
@@ -1717,6 +1732,11 @@ async def _sync_repo(
             mismatch = check_embedding_model_mismatch(client, collection, sweep_provider, fail_closed=True)
             if mismatch:
                 return mismatch
+            # The ownership guard ran before hashing; re-read it right before
+            # this sweep deletes anything (see current_ownership_error).
+            recheck_error = current_ownership_error(client, collection, retry=call_with_retry)
+            if recheck_error:
+                return recheck_error
             # Hash-skipped files are tracked below (UNVERIFIED_HASH), so the scan
             # for this purpose is everything the hash phase visited.
             scanned_paths = set(current_hashes) | hash_skipped_paths
@@ -1847,6 +1867,11 @@ async def _sync_repo(
         mismatch = check_embedding_model_mismatch(client, collection, embedding_provider, fail_closed=True)
         if mismatch:
             return mismatch
+        # The ownership guard ran before hashing and chunking, which can take
+        # minutes; re-read it right before the per-file deletes below.
+        recheck_error = current_ownership_error(client, collection, retry=call_with_retry)
+        if recheck_error:
+            return recheck_error
         if rebuild:
             # After the model check (nothing is deleted on a mismatch) and
             # before the per-file deletes below, which are what the warning is
@@ -1930,6 +1955,12 @@ async def _sync_repo(
         # After the new chunks are stored, so a failure above
         # never leaves a collection both emptied of orphans and missing chunks.
         scanned_paths = set(current_hashes) | hash_skipped_paths
+        recheck_error = current_ownership_error(client, collection, retry=call_with_retry)
+        if recheck_error:
+            # The chunks are stored but the collection is no longer ours, so
+            # nothing is deleted from it; raised like any other failure after
+            # the store, so no manifest is saved for it.
+            raise RuntimeError(recheck_error)
         rebuild_notes += _orphans_note(
             await asyncio.to_thread(_delete_orphaned_chunks, client, collection, repo, scanned_paths, preserved_after)
         )

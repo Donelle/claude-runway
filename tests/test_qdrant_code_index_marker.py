@@ -73,6 +73,23 @@ class MetadataOwnershipError(unittest.TestCase):
                 self.assertIn("'coll'", error)
 
 
+class CurrentOwnershipError(unittest.TestCase):
+    """The re-read before a delete or metadata write: no adoption, fails closed."""
+
+    def test_decisions(self):
+        cases = (
+            (FakeClient(metadata=marker.code_index_metadata()), False),
+            (FakeClient(metadata=None, payloads=[_code_chunk()]), True),  # unmarked: no adoption here
+            (FakeClient(metadata={COMPACT_KEY: COMPACT_VALUE, **marker.code_index_metadata()}), True),
+            (FakeClient(fail_on="get_collection"), True),
+        )
+        for client, refused in cases:
+            with self.subTest(metadata=client.metadata, fail_on=client.fail_on):
+                error = marker.current_ownership_error(client, "coll", retry=_no_retry)
+                self.assertEqual(error is not None, refused, error)
+                self.assertEqual(client.updates, [])
+
+
 class OwnershipAccepted(unittest.TestCase):
     def test_missing_collection_is_accepted_without_writing(self):
         client = FakeClient(exists=False)
