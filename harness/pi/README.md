@@ -1,0 +1,61 @@
+# Testing the codebase-reviewer through Pi, in a container
+
+`pi_driver.py` runs [Pi](https://pi.dev) (a coding agent) in a throwaway Docker container, gives it the reviewer's MCP server, and asks it to call the `review` tool on a small scratch repository. It tests the path a real caller takes, finding the tool over MCP and calling it, which the `live_*.py` scripts never do: they call the reviewer's libraries directly.
+
+A development tool, not product code. CI does not run it (it needs Docker, LM Studio and real models); the driver's logic is covered by `tests/test_harness_pi_driver.py` with a fake `docker`.
+
+## Run it
+
+```
+docker build -t claude-runway-pi:dev harness/pi          # once; or add --build below
+.venv/bin/python harness/pi/pi_driver.py \
+    --model <caller model> \
+    --config harness/live-tests/configs/reasoning-seed-coder-8b.json
+```
+
+- `--model` is the model **Pi** calls the tool with (the caller). It must be one LM Studio lists (`lms ls`) and it must make tool calls reliably. Load it first, with the context you pass to `--context-length` (default 16384).
+- `--config` is a `harness/live-tests/configs/*.json` file; its reviewers become the reviewer's `REVIEWERS_FILE`, so the reviewer models and contexts come from where the harness already records them. Without it, one reasoning reviewer is built from `--model` (`--reviewer-model` changes it). A config that uses `promptFile` or `translator` is refused: the container does not have those files.
+- The reviewer model is loaded by the reviewer server when its reviewer has `loadOnDemand: true` (the config says), and unloaded again afterwards. The driver loads nothing.
+- Other options: `--case` (a case from `harness/cases.py`, default `seeded-three`), `--max-turns`, `--max-tool-calls`, `--timeout`, `--log FILE` (every event Pi emitted), `--dry-run` (print the `docker run` command and stop).
+
+Output: one progress line per turn and tool call on stderr, then a JSON summary on stdout. Read **`review_text`**, the reviewer tool's own result; `final_text` is the caller's summary of it, which varies from run to run and can leave most of it out.
+
+| Exit code | Meaning |
+| :-- | :-- |
+| 0 | Pi finished and called `review` |
+| 1 | it finished without calling `review`, or the container failed |
+| 2 | a bad argument, or the preflight found the model missing (nothing was run) |
+| 3 | a cap stopped it (`stopped_by` says `turns`, `tool_calls` or `timeout`) |
+
+## What keeps it contained
+
+Pi has no turn or tool-call limit of its own, so the driver reads Pi's JSON event stream (split on LF only, as Pi's docs require) and runs `docker kill` when a cap is reached. A turn cap alone would not stop a flood of tool calls inside one turn, hence the three caps.
+
+The container sees only: the reviewer's `libs/` and `mcpservers/` (read-only), a scratch case repository (read-only), the reviewers file (read-only), and two scratch folders (Pi's agent directory and the reviewer's database and logs). It never sees the checkout, `~/.claude`, `~/.pi`, Qdrant or the memory bank, and the driver refuses to start if a mount would overlap one. `~/.pi/agent` is Pi's own folder, where it keeps credentials, settings, extensions and sessions; the container gets a scratch one through `PI_CODING_AGENT_DIR` instead. Pi runs with its read-only tools plus the reviewer's, never `bash`, `edit` or `write`. Memory, CPU and process limits are set, and capabilities are dropped.
+
+The limits that remain: the container runs as root on Windows (as your user on Linux and macOS) and has open outbound network access, so it is a sandbox for files and not an egress barrier.
+
+## LM Studio and the models
+
+LM Studio's address comes from `libs/runway_defaults.py` (`CLAUDE_RUNWAY_LMSTUDIO_URL`, else `http://localhost:1234/v1`). The container cannot use `localhost`, so the driver swaps that name for `host.docker.internal` and keeps the port; `--lmstudio-url` and `--host-lmstudio-url` override either side.
+
+Which model to use per hardware tier is not settled here: see "codebase-reviewer harness: compare local models per hardware tier through Pi and name a default caller and reviewer per tier in the kit's doc". The sizes below are the weights only. Only the row marked "run" has been tried; the rest are candidates. MLX builds run on Apple Silicon only (see the harness README's "Which build runs where"), so the candidates here are the builds that run on any platform.
+
+| Tier | Reference machine | Weights that fit | Candidates installed on the maintainer's machine | Status |
+| :-- | :-- | :-- | :-- | :-- |
+| Small | 24 GB RAM, no large GPU | 3 to 9 GB | `seed-coder-8b-instruct` 4.8 GB | run as the **reviewer** (below) |
+| Small | | | `meta-llama-3.1-8b-instruct` 4.9 GB | not run; a poor caller in an earlier spike |
+| Moderate | 32 GB VRAM | up to about 20 GB | `openai/gpt-oss-20b` 12.1 GB (tool-trained) | run as the **caller** (below) |
+| Moderate | | | `meta/muse-glimmer` 18.2 GB (tool-trained) | not run |
+| Large | more than 32 GB VRAM | 40 GB and up | `meta/llama-3.3-70b` 42.5 GB (tool-trained) | not run; would spill into system memory here |
+
+**The one measured run (2026-11-22, Windows, Docker 29.9.3, Pi 1.6.0).** Caller `openai/gpt-oss-20b` at 16384 context; reviewer `seed-coder-8b-instruct` (`reasoning-seed-coder-8b.json`); case `seeded-three`. Pi called `mcp__reviewer__review` once, with the parameters the prompt gave, in 2 turns and about 9 to 11 seconds, and the driver exited 0. The reviewer reported a shell injection and an off-by-one, two of the case's three seeded kinds of defect (not the division by zero), unverified, as its own result says; the lines were not scored against the case's answers. A second run with `--max-turns 1` was stopped at the start of turn 2: exit 3, `stopped_by: turns`, and no container left behind. After the runs `~/.pi` did not exist, there was no reviewer database under `~/.claude` (the newest file in `~/.claude/claude-runway/` predates the runs), and no container or scratch folder remained. One case and one model pair is a trial that the kit works, not a measurement of either model.
+
+## What this showed that the orchestrator will need
+
+- **Read the tool's result, not the caller's summary.** The caller's final text differed between two identical runs, and dropped the descriptions and failing inputs; the reviewer's result was the same both times.
+- **A caller needs Pi's MCP naming.** Pi names the tool `mcp__<server>__<tool>`, and `--tools` must list `mcp__reviewer__*` or the tool is not offered.
+- **A run needs a models file for LM Studio.** Pi starts with no models; the driver writes a `models.json` that points an OpenAI-compatible provider at LM Studio.
+- **An unreadable or empty reviewer reply** shows up in the tool result's text, not in Pi's exit status: a run can exit 0 and still carry a failed review. That is the subject of "codebase-reviewer: put a review's failure state at the top of the result so a caller cannot report 'no bugs' when a reviewer's reply was unreadable".
+
+On Windows with Git Bash, if you run the `docker` command it prints by hand, set `MSYS_NO_PATHCONV=1` or Git Bash rewrites the mount paths. The driver itself passes paths as a list and is not affected.

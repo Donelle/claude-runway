@@ -24,6 +24,10 @@ shipped in the wheel, and nothing here gates a PR. Run the scripts by hand:
 `live_classifier.py` and `live_verifier.py` take `--check` to validate and print
 their fixtures without LM Studio; without it they run the stage.
 
+## Through Pi, in a container: `pi/`
+
+`pi/pi_driver.py` runs Pi (a coding agent) in a throwaway Docker container, gives it the reviewer's MCP server and asks it to call the `review` tool, so the path a real caller takes is tested and not only the libraries. It caps turns, tool calls and time, and leaves the checkout, `~/.claude` and `~/.pi` untouched. See [pi/README.md](pi/README.md).
+
 ## Checks to run: `live-tests/`
 
 `live-tests/` runs the scripts for real against LM Studio models with explicit pass/fail checks (mechanics that must always hold, and quality baselines that catch a regression): `.venv/bin/python harness/live-tests/run_live_tests.py`. Each config in `live-tests/configs/` is a test, picked by name (`--list` shows them), and `/cr-gh-run-harness` does the choosing and running from Claude Code. See its README.
@@ -320,6 +324,19 @@ Models the harness loads are unloaded again; models you had loaded are left alon
 
 For local deployment within a **3 GB to 9 GB** memory or VRAM footprint, here are the recommended **Instruct-tuned** models. These models include built-in chat templates (like ChatML or Llama-3) and pre-configured stop tokens, ensuring they answer your prompts directly without endlessly hallucinating text.
 
+### Which build runs where
+
+A model ships in more than one file format, and the format decides which machines can run it:
+
+| Format | Runs on | Builds with results in this harness |
+| :-- | :-- | :-- |
+| **MLX** | Apple Silicon (M-series Macs) only | Reviewer: Qwen2.5-Coder-7B 4-bit and 8-bit, Llama-3.1-8B 4-bit, Llama-3.2-3B 4-bit and 8-bit. Classifier: Qwen2.5-Coder-7B 4-bit, Granite-3.3-8B 4-bit, Qwen3-4B-Instruct-2507 4-bit |
+| **GGUF** | Any platform LM Studio runs on (Windows, Linux, macOS), Apple Silicon included | Reviewer: Seed-Coder-8B Q4_K_S, Llama-3.2-3B Q4_K_S. Classifier: Qwen2.5-Coder-14B Q4_K_M |
+
+- **On a machine without Apple Silicon only the GGUF builds run.** The MLX numbers below do not carry over to a GGUF build of the same model: Llama-3.2-3B at 4 bits found 19 of 38 bugs with 21 false alarms per run as MLX, and 15 of 38 with 11 as Q4_K_S GGUF (`prompts/README.md` has both rows).
+- **A model id does not say its format.** `meta-llama-3.1-8b-instruct` was the 4-bit MLX build when `live-tests/configs/reasoning-llama-3.1-8b-4bit.json` was measured, and the same id on a Windows machine can be a Q4_K_M GGUF build, which the baselines were never counted on. Check what an id loads with `lms ls --json` (`path` and `quantization`) before trusting a number.
+- **The GGUF alternatives named under each model in section 1 were not run.** Only a build marked "measured" has numbers; on Windows or Linux read the rest as a pointer to try, not as a result. The GGUF builds that were measured are listed in "Measured GGUF builds" below.
+
 ### 1. Codebase-reviewer models
 
 The models behind the `codebase-reviewer` need to hold large contexts (e.g., git diffs, pull request comments, project style guides) and communicate structured, actionable suggestions in idiomatic English.
@@ -341,6 +358,17 @@ When you report or compare a result, name the build (format and quant, for examp
   - **Embedded Template:** Llama-3 (`<|start_header_id|>`, `<|eot_id|>`)
   - **Reply format and prompt:** `lines`, built-in reply instructions, no `promptFile`, no `translator` (config `reasoning-llama-3.1-8b-4bit`). Measured on 38 seeded bugs over 14 cases, 2 runs: 42 of 44 requests answered and every reply that came back readable, and it passes the live test's mechanics checks. It raised 26 false alarms per run on `lines`, against 5 for either Qwen build (the fewest), 11 to 21 for the Llama-3.2-3B builds and 32 for Seed-Coder-8B (the most, with the most bugs found, 24 of 38), so prefer the Qwen builds when fewer false alarms matter. The 8-bit MLX build and the other 4-bit conversion did worse and were dropped; see `prompts/README.md` for each build's source and numbers.
   - **Why it works out of the box:** Highly aligned for stylistic critique and conversational feedback. It adheres strictly to custom review rules (e.g., "only highlight severity P0/P1 bugs and do not touch formatting").
+
+### Measured GGUF builds (any platform)
+
+The reviewer builds above are MLX, so they need Apple Silicon. These two GGUF builds were measured on the same 14 cases (38 seeded bugs, 13 decoys, 5 clean), 2 runs, `lines` route, at `temperature: 0`; the full table, with the `json` route and the unanswered requests, is in `prompts/README.md`.
+
+| Build | LM Studio id | Source | Size | `lines` readable | Bugs found of 38 | False alarms per run | Config |
+| :-- | :-- | :-- | :-- | :-- | :-- | :-- | :-- |
+| Seed-Coder-8B-Instruct Q4_K_S | `seed-coder-8b-instruct` | `unsloth/Seed-Coder-8B-Instruct-GGUF` | 4.84 GB | 44 of 44 | 24 | 32 | `reasoning-seed-coder-8b` |
+| Llama-3.2-3B-Instruct Q4_K_S | `bartowski/llama-3.2-3b-instruct` | `bartowski/Llama-3.2-3B-Instruct-GGUF` | 1.93 GB | 44 of 44 | 15 | 11 | `reasoning-llama-3.2-3b-gguf` |
+
+On `lines`, Seed-Coder-8B found the most bugs of any build measured and raised the most false alarms (the Qwen2.5-Coder-7B MLX builds found 13 with 5). The Llama-3.2-3B GGUF's `json` route was not reliable (62% readable), so use `lines`. The Qwen2.5-Coder-14B Q4_K_M GGUF is measured as a classifier, in the next section.
 
 ### 2. Code Classifier Models
 
@@ -382,18 +410,31 @@ Code verification requires explicit logic-tracing to catch off-by-one errors, ra
 
 ### Hugging Face Direct Download Reference
 
-| Role           | Hugging Face Repository (MLX unless marked GGUF)  | Parameters | Precision / Quant | Memory Footprint | Embedded Template |
+Split by what runs where (see "Which build runs where"). A build in a table here was measured; a GGUF alternative named in a list above and absent from these tables was not.
+
+#### Apple Silicon only (MLX)
+
+| Role           | Hugging Face Repository (MLX)                     | Parameters | Precision / Quant | Memory Footprint | Embedded Template |
 | -------------- | ------------------------------------------------- | ---------- | ----------------- | ---------------- | ----------------- |
 | **Reviewer**   | `lmstudio-community/Qwen2.5-Coder-7B-Instruct-MLX-4bit` | 7B   | 4-bit             | \~4.3 GB         | ChatML            |
 | **Reviewer**   | `mlx-community/Qwen2.5-Coder-7B-Instruct-8bit`    | 7B         | 8-bit             | \~7.9 GB         | ChatML            |
 | **Reviewer**   | `mlx-community/Meta-Llama-3.1-8B-Instruct-4bit`   | 8B         | 4-bit             | \~4.5 GB         | Llama-3           |
 | **Classifier** | `lmstudio-community/Qwen2.5-Coder-7B-Instruct-MLX-4bit` | 7B   | 4-bit             | \~4.3 GB         | ChatML            |
-| **Classifier** | `lmstudio-community/Qwen2.5-Coder-14B-Instruct-GGUF` (GGUF) | 14B | Q4_K_M       | \~8.4 GB         | ChatML            |
 | **Classifier** | `mlx-community/granite-3.3-8b-instruct-4bit`      | 8B         | 4-bit             | \~4.3 GB         | Granite           |
 | **Classifier** | `lmstudio-community/Qwen3-4B-Instruct-2507-MLX-4bit` | 4B      | 4-bit             | \~2.3 GB         | ChatML            |
 | **Verifier**   | `mlx-community/DeepSeek-R1-Distill-Qwen-7B-4bit`  | 7B         | 4-bit             | \~4.4 GB         | Reasoning ChatML  |
 | **Verifier**   | `mlx-community/DeepSeek-R1-Distill-Qwen-7B-8bit`  | 7B         | 8-bit             | \~7.8 GB         | Reasoning ChatML  |
 | **Verifier**   | `mlx-community/DeepSeek-R1-Distill-Llama-8B-4bit` | 8B         | 4-bit             | \~4.9 GB         | Reasoning Llama-3 |
+
+#### Any platform (GGUF)
+
+| Role           | Hugging Face Repository (GGUF)                    | Parameters | Precision / Quant | Memory Footprint | Embedded Template |
+| -------------- | ------------------------------------------------- | ---------- | ----------------- | ---------------- | ----------------- |
+| **Reviewer**   | `unsloth/Seed-Coder-8B-Instruct-GGUF`             | 8B         | Q4_K_S            | \~4.8 GB         | not recorded      |
+| **Reviewer**   | `bartowski/Llama-3.2-3B-Instruct-GGUF`            | 3B         | Q4_K_S            | \~1.9 GB         | not recorded      |
+| **Classifier** | `lmstudio-community/Qwen2.5-Coder-14B-Instruct-GGUF` | 14B     | Q4_K_M            | \~8.4 GB         | ChatML            |
+
+The DeepSeek verifier builds above are listed from their MLX repositories; the harness's verifier configs name an id (`deepseek-r1-distill-qwen-7b@4bit`, `deepseek-r1-distill-llama-8b`) and not a format, and no GGUF verifier build has recorded results, so on a non-Apple machine a verifier needs measuring before it is trusted.
 
 ### Quick Verification Test
 
