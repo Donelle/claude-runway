@@ -11,7 +11,10 @@ Stdlib-only (unittest, no pytest).
     .venv/bin/python -m unittest discover -s tests
 """
 
+import contextlib
+import io
 import json
+import os
 import queue
 import re
 import subprocess
@@ -19,6 +22,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PI_DIR = REPO_ROOT / "harness" / "pi"
@@ -72,12 +76,16 @@ class FakeStdout:
 
 
 class FakeProcess:
-    def __init__(self, chunks, hang: bool = False, returncode: int = 0) -> None:
+    def __init__(self, chunks, hang: bool = False, returncode: int = 0, wait_times_out: bool = False) -> None:
         self.stdout = FakeStdout(chunks, hang)
         self.returncode = returncode
         self.killed = False
+        self._wait_times_out = wait_times_out  # the first wait() raises TimeoutExpired, as a docker client that will not end does
 
     def wait(self, timeout=None) -> int:
+        if self._wait_times_out:
+            self._wait_times_out = False
+            raise subprocess.TimeoutExpired("docker", timeout)
         return self.returncode
 
     def kill(self) -> None:
@@ -124,11 +132,17 @@ class LineSplitterTests(unittest.TestCase):
         self.assertEqual(splitter.feed(record[cut:]), ['{"t":"é"}'])
 
     def test_unicode_line_separators_inside_a_string_do_not_split_the_record(self):
-        # U+2028 and U+2029 are legal inside a JSON string. str.splitlines() would cut this record in three.
-        record = json.dumps({"t": "abc"}, ensure_ascii=False)
+        # U+2028 and U+2029 are legal inside a JSON string. str.splitlines() would cut this record in three. The characters
+        # are built with chr() because they are invisible and a file write once stripped them from the source, which left
+        # a test that passed for any splitter; the assertions below fail if they are ever missing again.
+        value = f"a{chr(0x2028)}b{chr(0x2029)}c"
+        record = json.dumps({"t": value}, ensure_ascii=False)
+        self.assertIn(chr(0x2028), record)
+        self.assertIn(chr(0x2029), record)
+        self.assertEqual(len(record.splitlines()), 3)  # what a splitlines-based reader would have made of it
         lines = d.LineSplitter().feed((record + "\n").encode("utf-8"))
         self.assertEqual(lines, [record])
-        self.assertEqual(d.parse_event(lines[0]), {"t": "abc"})
+        self.assertEqual(d.parse_event(lines[0]), {"t": value})
 
     def test_flush_returns_a_last_record_with_no_lf(self):
         splitter = d.LineSplitter()
@@ -259,6 +273,18 @@ class RunCappedTests(unittest.TestCase):
         self.assertEqual(result.final_text, "injection, off by one")
         self.assertEqual(result.review_text, "2 finding(s)\n- backup.py:6-8 shell injection")
 
+    def test_a_long_reviewer_result_is_returned_whole(self):
+        # It was once cut at 4,000 characters with no marker, which would have passed for the whole result.
+        text = "finding " * 2000
+        end = event("tool_execution_end", toolName=d.REVIEW_TOOL, isError=False, result={"content": [{"type": "text", "text": text}]})
+        result, _, _ = run([event("turn_start"), end, event("agent_settled", aborted=False)])
+        self.assertEqual(result.review_text, text)
+
+    def test_when_every_review_call_errored_the_run_is_not_a_pass(self):
+        errored = d.RunResult(stopped_by="completed", review_calls=2, review_errors=2)
+        mixed = d.RunResult(stopped_by="completed", review_calls=2, review_errors=1)
+        self.assertEqual((errored.exit_status(), mixed.exit_status()), (1, 0))
+
     def test_another_tools_result_is_not_taken_for_the_reviewers(self):
         end = event("tool_execution_end", toolName="read", isError=False, result={"content": [{"type": "text", "text": "file text"}]})
         result, _, _ = run([event("turn_start"), end, event("agent_settled", aborted=False)])
@@ -274,6 +300,44 @@ class RunCappedTests(unittest.TestCase):
                          stderr_path=Path(tmp) / "e.log",
                          on_event=lambda e: seen.append(tracker.turns_started) if e.get("type") == "turn_start" else None)
         self.assertEqual(seen, [1, 2])
+
+    def test_an_exception_while_reading_still_stops_the_container(self):
+        # A failed log write, say: without this the container would go on, uncapped, while its folders are deleted.
+        process = FakeProcess([turn(), event("agent_settled", aborted=False)])
+        recorder = Recorder(process)
+
+        def explode(_event):
+            raise OSError("log write failed")
+
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaises(OSError):
+            d.run_capped(["docker"], d.CapTracker(10, 30, 600, FakeClock()), spawn=lambda c, e: process,
+                         kill_container=recorder, stderr_path=Path(tmp) / "e.log", on_event=explode)
+        self.assertEqual(recorder.calls, 1)
+
+    def test_ctrl_c_while_reading_still_stops_the_container(self):
+        process = FakeProcess([turn()], hang=True)
+        recorder = Recorder(process)
+
+        def interrupt(_event):
+            raise KeyboardInterrupt
+
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaises(KeyboardInterrupt):
+            d.run_capped(["docker"], d.CapTracker(10, 30, 600, FakeClock()), spawn=lambda c, e: process,
+                         kill_container=recorder, stderr_path=Path(tmp) / "e.log", on_event=interrupt)
+        self.assertEqual(recorder.calls, 1)
+
+    def test_a_client_that_will_not_end_has_its_container_stopped_and_not_only_the_client(self):
+        process = FakeProcess([event("agent_settled", aborted=False)], wait_times_out=True)
+        recorder = Recorder(process)
+        with tempfile.TemporaryDirectory() as tmp:
+            result = d.run_capped(["docker"], d.CapTracker(10, 30, 600, FakeClock()), spawn=lambda c, e: process,
+                                  kill_container=recorder, stderr_path=Path(tmp) / "e.log")
+        self.assertEqual((recorder.calls, process.killed), (1, True))
+        self.assertEqual(result.stopped_by, "completed")
+
+    def test_a_run_that_ends_by_itself_never_runs_docker_kill(self):
+        result, kill, _ = run([turn([d.REVIEW_TOOL]), event("agent_settled", aborted=False)])
+        self.assertEqual((result.stopped_by, kill.calls), ("completed", 0))
 
     def test_the_stderr_tail_is_returned(self):
         process = FakeProcess([event("agent_settled", aborted=False)])
@@ -326,7 +390,7 @@ class DockerCommandTests(unittest.TestCase):
 
     def test_the_resource_limits_the_environment_and_the_hardening_are_present(self):
         text = " ".join(self.command)
-        for expected in ("--memory 4g", "--cpus 2", "--pids-limit 256", "--cap-drop ALL", "no-new-privileges",
+        for expected in ("--memory 4g", "--cpus 2", "--pids-limit 256", "--cap-drop ALL", "no-new-privileges", "--init",
                          f"PI_CODING_AGENT_DIR={d.C_AGENT}", "PI_TELEMETRY=0", "PI_OFFLINE=1", "PI_SKIP_VERSION_CHECK=1", "--rm"):
             self.assertIn(expected, text)
 
@@ -337,12 +401,13 @@ class DockerCommandTests(unittest.TestCase):
             self.assertNotIn(forbidden, tools.split(","))
 
     def test_the_prompt_is_one_argument_after_the_double_dash_not_text_in_a_shell_string(self):
-        script = self.command[self.command.index("-c") + 1]
-        self.assertNotIn("Do not", script)
         prompt = 'it\'s "quoted"; rm -rf /'
         command = d.docker_run_command(docker="docker", image="img", name="n", mounts=self.mounts, model="m", prompt=prompt,
                                        lmstudio_url="u", memory="4g", cpus="2", pids_limit=1)
-        self.assertEqual(command[-1], prompt)
+        script = command[command.index("-c") + 1]
+        self.assertNotIn(prompt, script)  # never spliced into the shell text...
+        self.assertNotIn("rm -rf", script)
+        self.assertEqual(command[-1], prompt)  # ...but handed over whole, as the last argument after "--"
         self.assertEqual(command[-2], "--")
 
     def test_the_container_script_registers_the_reviewer_with_the_scratch_database_and_keeps_stdout_clean(self):
@@ -351,8 +416,10 @@ class DockerCommandTests(unittest.TestCase):
         self.assertIn(f"REVIEWERS_FILE={d.C_CONFIG}/reviewers.json", script)
         self.assertIn(">&2 && exec pi", script)
 
-    def test_every_event_name_the_driver_counts_is_one_pi_documents(self):
-        # The names come from Pi's docs (json.md); this pins them so a typo in the driver cannot silently count nothing.
+    def test_the_driver_source_spells_each_event_name_it_counts(self):
+        # Only a spelling guard: it reads the driver's own source, so it cannot tell whether Pi uses these names. They come
+        # from Pi's docs (json.md) and were seen in a real run's event log; the cap and counting tests above feed the same
+        # names in, so a misspelling in the driver alone would make those fail.
         source = (PI_DIR / "pi_driver.py").read_text(encoding="utf-8")
         for name in ("turn_start", "turn_end", "tool_execution_start", "tool_execution_end", "agent_settled", "message_end"):
             self.assertIn(f'"{name}"', source)
@@ -506,7 +573,6 @@ class LmStudioUrlTests(unittest.TestCase):
             self.assertNotIn(assumption, source)
 
     def test_a_dry_run_follows_the_environment_variable(self):
-        import os
         environment = {**os.environ, "CLAUDE_RUNWAY_LMSTUDIO_URL": "http://localhost:5555/v1"}
         completed = subprocess.run([sys.executable, "-I", str(PI_DIR / "pi_driver.py"), "--dry-run", "--model", "m"],
                                    capture_output=True, text=True, timeout=60, env=environment)
@@ -514,7 +580,6 @@ class LmStudioUrlTests(unittest.TestCase):
         self.assertIn("CLAUDE_RUNWAY_LMSTUDIO_URL=http://host.docker.internal:5555/v1", completed.stdout)
 
     def test_a_bad_port_in_the_environment_is_a_usage_error_not_a_traceback(self):
-        import os
         environment = {**os.environ, "CLAUDE_RUNWAY_LMSTUDIO_URL": "http://localhost:abc/v1"}
         completed = subprocess.run([sys.executable, "-I", str(PI_DIR / "pi_driver.py"), "--dry-run", "--model", "m"],
                                    capture_output=True, text=True, timeout=60, env=environment)
@@ -548,6 +613,67 @@ class MainTests(unittest.TestCase):
             capture_output=True, text=True, timeout=60,
         )
         self.assertEqual(completed.returncode, 2)
+
+
+class FailurePathTests(unittest.TestCase):
+    """What happens when something outside the run is wrong: no docker, a bad log path, a model LM Studio lacks."""
+
+    def run_driver(self, *extra):
+        return subprocess.run([sys.executable, "-I", str(PI_DIR / "pi_driver.py"), "--model", "m", "--no-preflight", *extra],
+                              capture_output=True, text=True, timeout=120)
+
+    def scratch_dirs(self) -> set:
+        return set(Path(tempfile.gettempdir()).glob("claude-runway-pi-*"))
+
+    def test_a_docker_that_cannot_be_started_is_a_usage_error_not_a_traceback(self):
+        before = self.scratch_dirs()
+        completed = self.run_driver("--docker", "no-such-docker-xyz")
+        self.assertEqual(completed.returncode, 2, completed.stderr)
+        self.assertIn("could not start", completed.stderr)
+        self.assertNotIn("Traceback", completed.stderr)
+        self.assertEqual(self.scratch_dirs(), before)  # the scratch folder is removed on this path too
+
+    def test_spawning_a_missing_executable_raises_launch_error(self):
+        with tempfile.TemporaryFile() as stderr_file, self.assertRaises(d.LaunchError):
+            d._spawn(["no-such-docker-xyz", "run"], stderr_file)
+
+    def test_a_log_path_that_cannot_be_written_is_a_usage_error_not_a_traceback(self):
+        before = self.scratch_dirs()
+        with tempfile.TemporaryDirectory() as tmp:
+            completed = self.run_driver("--log", str(Path(tmp) / "missing-dir" / "events.jsonl"))
+        self.assertEqual(completed.returncode, 2, completed.stderr)
+        self.assertIn("--log", completed.stderr)
+        self.assertNotIn("Traceback", completed.stderr)
+        self.assertEqual(self.scratch_dirs(), before)
+
+    def test_read_only_files_in_the_scratch_folder_are_still_removed(self):
+        # Git's object files are read-only, which Windows will not delete without a chmod.
+        directory = Path(tempfile.mkdtemp(prefix="claude-runway-pi-test-"))
+        locked = directory / "objects" / "ab" / "cdef"
+        locked.parent.mkdir(parents=True)
+        locked.write_text("x", encoding="utf-8")
+        os.chmod(locked, 0o444)
+        d._remove_tree(directory)
+        self.assertFalse(directory.exists())
+
+    def test_a_model_lm_studio_does_not_list_is_a_preflight_problem(self):
+        import harness_lib
+        with mock.patch.object(harness_lib, "model_known", return_value=False):
+            problem = d.host_model_check("http://h:1/v1", "ghost-model")
+        self.assertIn("ghost-model", problem)
+
+    def test_when_lm_studio_cannot_be_asked_the_run_goes_on_with_a_warning(self):
+        import harness_lib
+        err = io.StringIO()
+        with mock.patch.object(harness_lib, "model_known", return_value=None), contextlib.redirect_stderr(err):
+            problem = d.host_model_check("http://h:1/v1", "some-model")
+        self.assertIsNone(problem)
+        self.assertIn("could not ask", err.getvalue())
+
+    def test_a_known_model_is_no_problem(self):
+        import harness_lib
+        with mock.patch.object(harness_lib, "model_known", return_value=True):
+            self.assertIsNone(d.host_model_check("http://h:1/v1", "m"))
 
 
 class DockerfileTests(unittest.TestCase):

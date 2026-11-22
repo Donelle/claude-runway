@@ -11,8 +11,9 @@ A development tool, not product code (CI does not lint or type-check `harness/`;
 
     .venv/bin/python harness/pi/pi_driver.py --build --model <lm-studio-id>
 
-Standard library only. Exit code: 0 = Pi finished and called the reviewer; 1 = it finished without calling it (or the
-container failed); 2 = a bad argument or a failed preflight (nothing was run); 3 = a cap stopped the run.
+Standard library only. Exit code: 0 = Pi finished and the reviewer returned a result; 1 = it finished without calling the
+reviewer, every call to it errored, or the container failed; 2 = a bad argument, a failed preflight or docker could not be
+started (nothing was run); 3 = a cap stopped the run.
 """
 
 import argparse
@@ -130,13 +131,14 @@ def message_text(event: dict) -> str:
     return "".join(block.get("text", "") for block in content if isinstance(block, dict) and block.get("type") == "text")
 
 
-def tool_result_text(event: dict, limit: int = 4000) -> str:
-    """The text of a `tool_execution_end` record's result (its content blocks joined), cut to `limit` characters."""
+def tool_result_text(event: dict) -> str:
+    """The text of a `tool_execution_end` record's result (its content blocks joined), in full: it is the evidence a run
+    is judged by, and a cut with no marker would pass for the whole result."""
     result = event.get("result")
     content = result.get("content") if isinstance(result, dict) else None
     if not isinstance(content, list):
         return ""
-    return "".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text")[:limit]
+    return "".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text")
 
 
 class CapTracker:
@@ -218,7 +220,8 @@ class RunResult:
         if self.stopped_by in ("turns", "tool_calls", "timeout"):
             return 3
         if self.stopped_by == "completed" and self.review_calls > 0:
-            return 0
+            # Every call to the reviewer errored: the run worked and the review did not, which must not read as a pass.
+            return 1 if self.review_errors >= self.review_calls else 0
         return 1
 
 
@@ -369,7 +372,9 @@ def docker_run_command(
 ) -> list:
     """The whole `docker run` command line, as a list (never a shell string, so no quoting problem and no injection)."""
     command = [
-        docker, "run", "--rm", "--name", name,
+        # --init: Pi runs as PID 1, which the kernel gives no default signal handling, so a stop signal would never reach it;
+        # the small init process forwards signals and reaps children.
+        docker, "run", "--rm", "--init", "--name", name,
         "--memory", memory, "--cpus", cpus, "--pids-limit", str(pids_limit),
         "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
         # Docker Desktop already knows this name; plain Linux Docker needs to be told.
@@ -449,31 +454,38 @@ def run_capped(
         splitter = LineSplitter()
         stopped_by: Optional[str] = None
         ended = False
-        while not ended and stopped_by is None:
-            if tracker.out_of_time():
-                stopped_by = "timeout"
-                break
-            try:
-                chunk = chunks.get(timeout=max(0.05, min(0.5, tracker.remaining())))
-            except queue.Empty:
-                continue
-            lines = splitter.flush() if chunk is None else splitter.feed(chunk)
-            ended = chunk is None
-            for line in lines:
-                event = parse_event(line)
-                if event is None:
-                    continue
-                # Count first, then report, so what `on_event` prints (turn 1, turn 2...) already includes this event.
-                stopped_by = tracker.observe(event)
-                on_event(event)
-                if stopped_by:
+        read_through = False
+        try:
+            while not ended and stopped_by is None:
+                if tracker.out_of_time():
+                    stopped_by = "timeout"
                     break
-
-        if stopped_by:
-            kill_container()
+                try:
+                    chunk = chunks.get(timeout=max(0.05, min(0.5, tracker.remaining())))
+                except queue.Empty:
+                    continue
+                lines = splitter.flush() if chunk is None else splitter.feed(chunk)
+                ended = chunk is None
+                for line in lines:
+                    event = parse_event(line)
+                    if event is None:
+                        continue
+                    # Count first, then report, so what `on_event` prints (turn 1, turn 2...) already includes this event.
+                    stopped_by = tracker.observe(event)
+                    on_event(event)
+                    if stopped_by:
+                        break
+            read_through = True
+        finally:
+            # The container must stop on EVERY way out, not only when a cap trips: an exception here (Ctrl+C, a failed log
+            # write) would otherwise leave Pi running with no caps while the caller deletes the folders it has mounted.
+            if stopped_by or not read_through:
+                kill_container()
         try:
             result.exit_code = process.wait(timeout=30)
         except subprocess.TimeoutExpired:
+            # Killing the `docker` client alone would leave the container running, so stop the container first.
+            kill_container()
             process.kill()
             result.exit_code = process.wait(timeout=30)
 
@@ -489,8 +501,15 @@ def run_capped(
     return result
 
 
+class LaunchError(Exception):
+    """`docker` could not be started at all (not installed, not on PATH): nothing ran, so it is a usage error, not a failed run."""
+
+
 def _spawn(command: list, stderr_file) -> subprocess.Popen:
-    return subprocess.Popen(command, stdout=subprocess.PIPE, stderr=stderr_file, stdin=subprocess.DEVNULL)
+    try:
+        return subprocess.Popen(command, stdout=subprocess.PIPE, stderr=stderr_file, stdin=subprocess.DEVNULL)
+    except OSError as exc:
+        raise LaunchError(f"could not start {command[0]!r}: {exc}") from exc
 
 
 def _remove_tree(directory: Path) -> None:
@@ -603,7 +622,11 @@ def main(argv: Optional[list] = None) -> int:
                 return 2
 
     if args.build and not args.dry_run:
-        build = subprocess.run([args.docker, "build", "-t", args.image, str(PI_DIR)])
+        try:
+            build = subprocess.run([args.docker, "build", "-t", args.image, str(PI_DIR)])
+        except OSError as exc:
+            print(f"error: could not start {args.docker!r}: {exc}", file=sys.stderr)
+            return 2
         if build.returncode != 0:
             print("error: docker build failed", file=sys.stderr)
             return 2
@@ -626,7 +649,11 @@ def main(argv: Optional[list] = None) -> int:
             return 0
 
         tracker = CapTracker(args.max_turns, args.max_tool_calls, args.timeout)
-        log_file = open(args.log, "w", encoding="utf-8") if args.log else None
+        try:
+            log_file = open(args.log, "w", encoding="utf-8") if args.log else None
+        except OSError as exc:
+            print(f"error: cannot write --log {args.log}: {exc}", file=sys.stderr)
+            return 2
 
         def on_event(event: dict) -> None:
             if log_file:
@@ -643,6 +670,9 @@ def main(argv: Optional[list] = None) -> int:
         try:
             result = run_capped(command, tracker, spawn=_spawn, kill_container=kill_container,
                                 stderr_path=scratch / "pi-stderr.log", on_event=on_event)
+        except LaunchError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
         finally:
             if log_file:
                 log_file.close()

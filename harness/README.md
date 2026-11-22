@@ -335,7 +335,7 @@ A model ships in more than one file format, and the format decides which machine
 
 - **On a machine without Apple Silicon only the GGUF builds run.** The MLX numbers below do not carry over to a GGUF build of the same model: Llama-3.2-3B at 4 bits found 19 of 38 bugs with 21 false alarms per run as MLX, and 15 of 38 with 11 as Q4_K_S GGUF (`prompts/README.md` has both rows).
 - **A model id does not say its format.** `meta-llama-3.1-8b-instruct` was the 4-bit MLX build when `live-tests/configs/reasoning-llama-3.1-8b-4bit.json` was measured, and the same id on a Windows machine can be a Q4_K_M GGUF build, which the baselines were never counted on. Check what an id loads with `lms ls --json` (`path` and `quantization`) before trusting a number.
-- **The GGUF alternatives named under each model in section 1 were not run.** Only a build marked "measured" has numbers; on Windows or Linux read the rest as a pointer to try, not as a result. The GGUF builds that were measured are listed in "Measured GGUF builds" below.
+- **The GGUF alternatives named under each model in sections 1 to 3 were not run.** Only a build marked "measured" has numbers; on Windows or Linux read the rest as a pointer to try, not as a result. The GGUF builds that were measured are listed in "Measured GGUF builds" below.
 
 ### 1. Codebase-reviewer models
 

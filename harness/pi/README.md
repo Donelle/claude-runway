@@ -13,23 +13,38 @@ docker build -t claude-runway-pi:dev harness/pi          # once; or add --build 
     --config harness/live-tests/configs/reasoning-seed-coder-8b.json
 ```
 
-- `--model` is the model **Pi** calls the tool with (the caller). It must be one LM Studio lists (`lms ls`) and it must make tool calls reliably. Load it first, with the context you pass to `--context-length` (default 16384).
+- `--model` is the model **Pi** calls the tool with (the caller). It must be one LM Studio lists (`lms ls`) and it must make tool calls reliably. Load it first, with the context you pass to `--context-length` (default 16384); see "Before and after" below.
 - `--config` is a `harness/live-tests/configs/*.json` file; its reviewers become the reviewer's `REVIEWERS_FILE`, so the reviewer models and contexts come from where the harness already records them. Without it, one reasoning reviewer is built from `--model` (`--reviewer-model` changes it). A config that uses `promptFile` or `translator` is refused: the container does not have those files.
 - The reviewer model is loaded by the reviewer server when its reviewer has `loadOnDemand: true` (the config says), and unloaded again afterwards. The driver loads nothing.
-- Other options: `--case` (a case from `harness/cases.py`, default `seeded-three`), `--max-turns`, `--max-tool-calls`, `--timeout`, `--log FILE` (every event Pi emitted), `--dry-run` (print the `docker run` command and stop).
+- Other options: `--case` (a case from `harness/cases.py`, default `seeded-three`), `--log FILE` (every event Pi emitted), `--dry-run` (print the `docker run` command and stop), `--build` and `--image` (build or name the image), and the container's limits `--memory` (default `4g`), `--cpus` (`2`) and `--pids-limit` (`256`).
+- The caps are `--max-turns` (default 10), `--max-tool-calls` (30) and `--timeout` (600 seconds for the whole run).
+
+### Before and after: loading and restoring models
+
+The driver loads and unloads nothing in LM Studio, so a run starts and ends with whatever you left loaded. To keep your own setup:
+
+```
+lms ps                                              # note what is loaded now (and its context length)
+lms load <caller model> --context-length 16384      # the same context you pass to --context-length
+.venv/bin/python harness/pi/pi_driver.py --model <caller model> --config ...
+lms unload <caller model>                           # afterwards
+lms load <each model that lms ps showed>            # restore what was loaded before, with its context
+```
+
+The reviewer's model is not part of this: a reviewer with `loadOnDemand: true` is loaded by the reviewer server when it runs and unloaded again afterwards. If the caller and the reviewer are the same model, load it once. Both models need room at the same time, so check `lms ps` against your GPU memory first (the sizes are in the tier table below).
 
 Output: one progress line per turn and tool call on stderr, then a JSON summary on stdout. Read **`review_text`**, the reviewer tool's own result; `final_text` is the caller's summary of it, which varies from run to run and can leave most of it out.
 
 | Exit code | Meaning |
 | :-- | :-- |
-| 0 | Pi finished and called `review` |
-| 1 | it finished without calling `review`, or the container failed |
-| 2 | a bad argument, or the preflight found the model missing (nothing was run) |
+| 0 | Pi finished and the reviewer returned a result |
+| 1 | it finished without calling `review`, every call to it errored, or the container failed |
+| 2 | a bad argument, a model the preflight could not find, or `docker` could not be started (nothing was run) |
 | 3 | a cap stopped it (`stopped_by` says `turns`, `tool_calls` or `timeout`) |
 
 ## What keeps it contained
 
-Pi has no turn or tool-call limit of its own, so the driver reads Pi's JSON event stream (split on LF only, as Pi's docs require) and runs `docker kill` when a cap is reached. A turn cap alone would not stop a flood of tool calls inside one turn, hence the three caps.
+Pi has no turn or tool-call limit of its own, so the driver reads Pi's JSON event stream (split on LF only, as Pi's docs require) and runs `docker kill` when a cap is reached. A turn cap alone would not stop a flood of tool calls inside one turn, hence the three caps. The container is also killed if the driver itself stops for any other reason (Ctrl+C, an error), and runs with `--init` so Pi, as the container's first process, receives stop signals.
 
 The container sees only: the reviewer's `libs/` and `mcpservers/` (read-only), a scratch case repository (read-only), the reviewers file (read-only), and two scratch folders (Pi's agent directory and the reviewer's database and logs). It never sees the checkout, `~/.claude`, `~/.pi`, Qdrant or the memory bank, and the driver refuses to start if a mount would overlap one. `~/.pi/agent` is Pi's own folder, where it keeps credentials, settings, extensions and sessions; the container gets a scratch one through `PI_CODING_AGENT_DIR` instead. Pi runs with its read-only tools plus the reviewer's, never `bash`, `edit` or `write`. Memory, CPU and process limits are set, and capabilities are dropped.
 
@@ -37,7 +52,7 @@ The limits that remain: the container runs as root on Windows (as your user on L
 
 ## LM Studio and the models
 
-LM Studio's address comes from `libs/runway_defaults.py` (`CLAUDE_RUNWAY_LMSTUDIO_URL`, else `http://localhost:1234/v1`). The container cannot use `localhost`, so the driver swaps that name for `host.docker.internal` and keeps the port; `--lmstudio-url` and `--host-lmstudio-url` override either side.
+LM Studio's address comes from `libs/runway_defaults.py` (`CLAUDE_RUNWAY_LMSTUDIO_URL`, else `http://localhost:1234/v1`). The container cannot use `localhost`, so the driver swaps that name for `host.docker.internal` and keeps the port; `--lmstudio-url` and `--host-lmstudio-url` override either side. Only Windows with Docker Desktop has been run: on plain Linux Docker the name comes from `--add-host host.docker.internal:host-gateway`, which reaches LM Studio only if it listens beyond `127.0.0.1`, and that has not been tried.
 
 Which model to use per hardware tier is not settled here: see "codebase-reviewer harness: compare local models per hardware tier through Pi and name a default caller and reviewer per tier in the kit's doc". The sizes below are the weights only. Only the row marked "run" has been tried; the rest are candidates. MLX builds run on Apple Silicon only (see the harness README's "Which build runs where"), so the candidates here are the builds that run on any platform.
 
