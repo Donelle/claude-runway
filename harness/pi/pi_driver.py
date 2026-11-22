@@ -3,7 +3,8 @@
 
 Why this exists: the harness scripts call the reviewer's libraries directly, so they never exercise the path an agent
 takes: finding the `review` tool over MCP and calling it. This does, with Pi as the agent, and it keeps the whole run in a
-container so the host checkout, `~/.claude` and `~/.pi` are never touched. Pi has no turn or tool-call limit of its own,
+container so the host checkout, `~/.claude` and `~/.pi` are never touched (the container never sees them, and `--log`, the one
+file the driver itself writes, is refused under `~/.claude` and `~/.pi` and never overwrites a file). Pi has no turn or tool-call limit of its own,
 so the driver enforces them: it reads Pi's JSON event stream and runs `docker kill` when a cap is reached.
 
 A development tool, not product code (CI does not lint or type-check `harness/`; the logic here is covered by
@@ -435,6 +436,19 @@ def unsafe_mounts(mounts: Mounts, home: Path, checkout: Path) -> list:
     return problems
 
 
+def unsafe_log(path: Path, home: Path) -> Optional[str]:
+    """Why `--log` must not write to `path`, or None when it may.
+
+    The log is written by the driver on the host, so the container's mount checks do not cover it. Pi's own folder
+    (`~/.pi`, where its credentials live) and `~/.claude` are never written to, whatever the user typed; the checkout is
+    allowed, since a log kept beside the harness is natural. Symlinks and `..` are resolved first."""
+    resolved = path.resolve()
+    for label, protected in (("~/.claude", (home / ".claude").resolve()), ("~/.pi", (home / ".pi").resolve())):
+        if resolved == protected or protected in resolved.parents:
+            return f"--log {path} is inside {label} ({protected}), which the driver never writes to"
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Running it
 # ---------------------------------------------------------------------------
@@ -507,8 +521,9 @@ def run_capped(
             result.exit_code = process.wait(timeout=30)
 
     # A settle that says `aborted` is not a finished run, whatever the container's exit code was: it must not read as a pass.
-    result.stopped_by = stopped_by or (
-        "aborted" if tracker.aborted else "completed" if tracker.settled or result.exit_code == 0 else "error")
+    # Nor is a settle followed by a failing container (Pi settles before it shuts its MCP server down, so an OOM kill or a
+    # crash during that shutdown still ends nonzero): only a clean container exit counts as completed.
+    result.stopped_by = stopped_by or ("aborted" if tracker.aborted else "completed" if result.exit_code == 0 else "error")
     result.turns, result.tool_calls = tracker.turns, tracker.tool_calls
     result.review_calls, result.review_errors = tracker.review_calls, tracker.review_errors
     result.elapsed_seconds = round(tracker.elapsed(), 1)
@@ -600,7 +615,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--memory", default="4g")
     p.add_argument("--cpus", default="2")
     p.add_argument("--pids-limit", type=int, default=256)
-    p.add_argument("--log", type=Path, help="write every event Pi emitted to this file (JSON lines)")
+    p.add_argument("--log", type=Path, help="write every event Pi emitted to this new file (JSON lines); an existing file, "
+                   "or one under ~/.claude or ~/.pi, is refused")
     p.add_argument("--dry-run", action="store_true", help="print the docker command and exit; nothing is built or run")
     p.add_argument("--no-preflight", action="store_true", help="skip asking the host's LM Studio whether the model exists")
     return p
@@ -615,6 +631,11 @@ def main(argv: Optional[list] = None) -> int:
     if min(args.max_turns, args.max_tool_calls, args.timeout) < 1:
         print("error: --max-turns, --max-tool-calls and --timeout must each be 1 or more", file=sys.stderr)
         return 2
+    if args.log:
+        problem = unsafe_log(args.log, Path.home())
+        if problem:
+            print(f"error: {problem}", file=sys.stderr)
+            return 2
     if args.config and (args.reviewer_model or args.load_on_demand):
         print("error: --config carries its own reviewers; do not combine it with --reviewer-model or --load-on-demand", file=sys.stderr)
         return 2
@@ -669,7 +690,11 @@ def main(argv: Optional[list] = None) -> int:
 
         tracker = CapTracker(args.max_turns, args.max_tool_calls, args.timeout)
         try:
-            log_file = open(args.log, "w", encoding="utf-8") if args.log else None
+            # "x", not "w": a mistyped path must not truncate a file that is already there.
+            log_file = open(args.log, "x", encoding="utf-8") if args.log else None
+        except FileExistsError:
+            print(f"error: --log {args.log} already exists; the driver does not overwrite a file. Choose a new name.", file=sys.stderr)
+            return 2
         except OSError as exc:
             print(f"error: cannot write --log {args.log}: {exc}", file=sys.stderr)
             return 2

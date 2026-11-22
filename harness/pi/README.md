@@ -16,7 +16,7 @@ docker build -t claude-runway-pi:dev harness/pi          # once; or add --build 
 - `--model` is the model **Pi** calls the tool with (the caller). It must be one LM Studio lists (`lms ls`) and it must make tool calls reliably. Load it first, with the context you pass to `--context-length` (default 16384); see "Before and after" below.
 - `--config` is a `harness/live-tests/configs/*.json` file; its reviewers become the reviewer's `REVIEWERS_FILE`, so the reviewer models and contexts come from where the harness already records them. Without it, one reasoning reviewer is built from `--model` (`--reviewer-model` changes it). A config that uses `promptFile` or `translator` is refused: the container does not have those files.
 - The reviewer model is loaded by the reviewer server when its reviewer has `loadOnDemand: true` (the config says), and unloaded again afterwards. The driver loads nothing.
-- Other options: `--case` (a case from `harness/cases.py`, default `seeded-three`), `--log FILE` (every event Pi emitted), `--dry-run` (print the `docker run` command and stop), `--build` and `--image` (build or name the image), and the container's limits `--memory` (default `4g`), `--cpus` (`2`) and `--pids-limit` (`256`).
+- Other options: `--case` (a case from `harness/cases.py`, default `seeded-three`), `--log FILE` (every event Pi emitted, written to a new file: an existing file, or any path under `~/.claude` or `~/.pi`, is refused), `--dry-run` (print the `docker run` command and stop), `--build` and `--image` (build or name the image), and the container's limits `--memory` (default `4g`), `--cpus` (`2`) and `--pids-limit` (`256`).
 - The caps are `--max-turns` (default 10), `--max-tool-calls` (30) and `--timeout` (600 seconds for the whole run).
 
 ### Before and after: loading and restoring models
@@ -38,7 +38,7 @@ Output: one progress line per turn and tool call on stderr, then a JSON summary 
 | Exit code | Meaning |
 | :-- | :-- |
 | 0 | Pi finished and the reviewer returned a result |
-| 1 | it finished without calling `review`, every call to it errored (an error result, or the tool's own `Error: ...` refusal, which it returns as plain text), Pi aborted (`stopped_by: aborted`), or the container failed |
+| 1 | it finished without calling `review`, every call to it errored (an error result, or the tool's own `Error: ...` refusal, which it returns as plain text), Pi aborted (`stopped_by: aborted`), or the container failed, including a nonzero exit after Pi had settled (`stopped_by: error`) |
 | 2 | a bad argument, a model the preflight could not find, or `docker` could not be started (nothing was run) |
 | 3 | a cap stopped it (`stopped_by` says `turns`, `tool_calls` or `timeout`) |
 

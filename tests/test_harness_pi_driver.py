@@ -228,6 +228,14 @@ class RunCappedTests(unittest.TestCase):
             self.assertTrue(tracker.settled and tracker.aborted)
             self.assertEqual((result.stopped_by, result.exit_status()), ("aborted", 1), container_exit)
 
+    def test_a_settle_followed_by_a_failing_container_is_an_error_not_a_pass(self):
+        # Pi settles before it shuts its MCP server down, so an OOM kill (137) or a crash in that shutdown ends nonzero after a
+        # clean settle: the run must not read as success, as the docs say a failed container is exit 1.
+        for container_exit in (1, 137):
+            result, _, tracker = run([turn([d.REVIEW_TOOL]), event("agent_settled", aborted=False)], returncode=container_exit)
+            self.assertTrue(tracker.settled)
+            self.assertEqual((result.stopped_by, result.exit_status()), ("error", 1), container_exit)
+
     def test_a_settle_that_is_not_aborted_still_completes(self):
         result, _, tracker = run([turn([d.REVIEW_TOOL]), event("agent_settled", aborted=False)])
         self.assertFalse(tracker.aborted)
@@ -669,6 +677,41 @@ class MainTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 2)
 
 
+class UnsafeLogTests(unittest.TestCase):
+    """`--log` is written by the driver on the host, so the container's mount checks do not cover it."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.home = self.root / "home"
+        (self.home / ".claude").mkdir(parents=True)
+        (self.home / ".pi" / "agent").mkdir(parents=True)
+
+    def test_paths_under_claude_and_pi_are_refused(self):
+        for target in (".claude/events.jsonl", ".pi/events.jsonl", ".pi/agent/auth.json", ".pi/agent/not-yet/x.jsonl", ".pi", ".claude"):
+            self.assertTrue(d.unsafe_log(self.home / target, self.home), target)
+
+    def test_dot_dot_cannot_reach_around_the_check(self):
+        self.assertTrue(d.unsafe_log(self.home / "elsewhere" / ".." / ".pi" / "agent" / "settings.json", self.home))
+
+    def test_a_path_in_the_checkout_or_a_temp_folder_is_allowed(self):
+        self.assertIsNone(d.unsafe_log(d.REPO_ROOT / "pi-events.jsonl", self.home))
+        self.assertIsNone(d.unsafe_log(self.root / "events.jsonl", self.home))
+        self.assertIsNone(d.unsafe_log(self.home / ".pi-notes.jsonl", self.home))  # a sibling that only shares a prefix
+
+    def test_the_driver_refuses_such_a_log_before_running_anything(self):
+        env = dict(os.environ, HOME=str(self.home), USERPROFILE=str(self.home))
+        target = self.home / ".pi" / "agent" / "settings.json"
+        target.write_text("precious", encoding="utf-8")
+        completed = subprocess.run(
+            [sys.executable, "-I", str(PI_DIR / "pi_driver.py"), "--model", "m", "--no-preflight", "--dry-run", "--log", str(target)],
+            capture_output=True, text=True, timeout=60, env=env)
+        self.assertEqual(completed.returncode, 2, completed.stderr)
+        self.assertIn("~/.pi", completed.stderr)
+        self.assertEqual(target.read_text(encoding="utf-8"), "precious")
+
+
 class FailurePathTests(unittest.TestCase):
     """What happens when something outside the run is wrong: no docker, a bad log path, a model LM Studio lacks."""
 
@@ -697,6 +740,18 @@ class FailurePathTests(unittest.TestCase):
             completed = self.run_driver("--log", str(Path(tmp) / "missing-dir" / "events.jsonl"))
         self.assertEqual(completed.returncode, 2, completed.stderr)
         self.assertIn("--log", completed.stderr)
+        self.assertNotIn("Traceback", completed.stderr)
+        self.assertEqual(self.scratch_dirs(), before)
+
+    def test_an_existing_log_file_is_refused_and_left_as_it_was(self):
+        before = self.scratch_dirs()
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "events.jsonl"
+            log.write_text("keep me", encoding="utf-8")
+            completed = self.run_driver("--log", str(log))
+            self.assertEqual(log.read_text(encoding="utf-8"), "keep me")
+        self.assertEqual(completed.returncode, 2, completed.stderr)
+        self.assertIn("already exists", completed.stderr)
         self.assertNotIn("Traceback", completed.stderr)
         self.assertEqual(self.scratch_dirs(), before)
 
