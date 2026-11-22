@@ -350,6 +350,19 @@ class RunCappedTests(unittest.TestCase):
                          kill_container=recorder, stderr_path=Path(tmp) / "e.log", on_event=explode)
         self.assertEqual(recorder.calls, 1)
 
+    def test_ctrl_c_while_waiting_for_the_client_after_the_stream_ended_still_stops_the_container(self):
+        # The stream has drained and the read loop's cleanup has finished; the interrupt lands in the final wait.
+        class InterruptedWait(FakeProcess):
+            def wait(self, timeout=None):
+                raise KeyboardInterrupt
+
+        process = InterruptedWait([turn(), event("agent_settled", aborted=False)])
+        recorder = Recorder(process)
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaises(KeyboardInterrupt):
+            d.run_capped(["docker"], d.CapTracker(10, 30, 600, FakeClock()), spawn=lambda c, e: process,
+                         kill_container=recorder, stderr_path=Path(tmp) / "e.log")
+        self.assertEqual((recorder.calls, process.killed), (1, True))
+
     def test_ctrl_c_while_reading_still_stops_the_container(self):
         process = FakeProcess([turn()], hang=True)
         recorder = Recorder(process)

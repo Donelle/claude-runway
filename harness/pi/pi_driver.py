@@ -513,12 +513,19 @@ def run_capped(
             if stopped_by or not read_through:
                 kill_container()
         try:
-            result.exit_code = process.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            # Killing the `docker` client alone would leave the container running, so stop the container first.
+            try:
+                result.exit_code = process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                # Killing the `docker` client alone would leave the container running, so stop the container first.
+                kill_container()
+                process.kill()
+                result.exit_code = process.wait(timeout=30)
+        except BaseException:
+            # The read loop's `finally` above has already finished, so an interrupt (Ctrl+C) while waiting for the client to
+            # exit must stop the container here too: "killed on every way out" has to include this wait.
             kill_container()
             process.kill()
-            result.exit_code = process.wait(timeout=30)
+            raise
 
     # A settle that says `aborted` is not a finished run, whatever the container's exit code was: it must not read as a pass.
     # Nor is a settle followed by a failing container (Pi settles before it shuts its MCP server down, so an OOM kill or a
