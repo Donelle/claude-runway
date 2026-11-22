@@ -38,7 +38,7 @@ Output: one progress line per turn and tool call on stderr, then a JSON summary 
 | Exit code | Meaning |
 | :-- | :-- |
 | 0 | Pi finished and the reviewer returned a result |
-| 1 | it finished without calling `review`, every call to it errored, or the container failed |
+| 1 | it finished without calling `review`, every call to it errored (an error result, or the tool's own `Error: ...` refusal, which it returns as plain text), Pi aborted (`stopped_by: aborted`), or the container failed |
 | 2 | a bad argument, a model the preflight could not find, or `docker` could not be started (nothing was run) |
 | 3 | a cap stopped it (`stopped_by` says `turns`, `tool_calls` or `timeout`) |
 

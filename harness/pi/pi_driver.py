@@ -12,7 +12,7 @@ A development tool, not product code (CI does not lint or type-check `harness/`;
     .venv/bin/python harness/pi/pi_driver.py --build --model <lm-studio-id>
 
 Standard library only. Exit code: 0 = Pi finished and the reviewer returned a result; 1 = it finished without calling the
-reviewer, every call to it errored, or the container failed; 2 = a bad argument, a failed preflight or docker could not be
+reviewer, every call to it errored, Pi aborted, or the container failed; 2 = a bad argument, a failed preflight or docker could not be
 started (nothing was run); 3 = a cap stopped the run.
 """
 
@@ -64,6 +64,9 @@ PROVIDER = "lmstudio"
 MCP_SERVER_NAME = "reviewer"
 # Pi names an MCP tool mcp__<server>__<tool>; --tools takes the pattern to expose the server's tools and nothing else MCP.
 REVIEW_TOOL = f"mcp__{MCP_SERVER_NAME}__review"
+# How the review tool words a refusal: `review()` in mcpservers/codebase_reviewer_mcp_server.py returns "Error: ..." as a normal
+# result for an invalid reviewers file, bad parameters or nothing to run (its docstring promises the prefix).
+REVIEW_REFUSAL_PREFIX = "Error:"
 # Pi's own read-only tools. Never `bash`, `edit` or `write`: the run needs to look, not change.
 READ_ONLY_TOOLS = ("read", "grep", "find", "ls")
 
@@ -160,6 +163,7 @@ class CapTracker:
         self.review_calls = 0
         self.review_errors = 0
         self.settled = False
+        self.aborted = False  # Pi settled because the run was aborted, which is not a finished run
         self.final_text = ""
         self.review_text = ""
 
@@ -189,22 +193,26 @@ class CapTracker:
                 return "tool_calls"
         elif kind == "tool_execution_end":
             if event.get("toolName") == REVIEW_TOOL:
-                if event.get("isError"):
-                    self.review_errors += 1
                 # What the reviewer itself returned, kept because the caller's own summary of it can drop most of it.
-                self.review_text = tool_result_text(event)
+                text = tool_result_text(event)
+                self.review_text = text
+                # The review tool reports its own refusals (a bad reviewers file, nothing to run) as ordinary text that
+                # starts with "Error:" and an isError of false, so a refused review would otherwise read as a success.
+                if event.get("isError") or text.lstrip().startswith(REVIEW_REFUSAL_PREFIX):
+                    self.review_errors += 1
         elif kind == "message_end":
             text = message_text(event)
             if text:
                 self.final_text = text
         elif kind == "agent_settled":
             self.settled = True
+            self.aborted = bool(event.get("aborted"))
         return None
 
 
 @dataclass
 class RunResult:
-    stopped_by: str = "completed"  # completed | turns | tool_calls | timeout | error
+    stopped_by: str = "completed"  # completed | turns | tool_calls | timeout | aborted | error
     turns: int = 0
     tool_calls: int = 0
     review_calls: int = 0
@@ -257,6 +265,8 @@ def reviewers_file(model: str, context_length: int, load_on_demand: bool) -> dic
     """A reviewers file with one reasoning reviewer. The model and context are arguments, never constants, so a bigger
     machine changes the command line and nothing else."""
     return {
+        # The server refuses a reviewers file without a `rubric` key; an empty one is valid until a classifier is active.
+        "rubric": [],
         "reviewers": [
             {
                 "name": "general",
@@ -289,18 +299,25 @@ def reviewers_from_config(path: Path) -> dict:
         used = [key for key in ("promptFile", "translator") if isinstance(reviewer, dict) and key in reviewer]
         if used:
             raise ValueError(f"{path}: reviewer {reviewer.get('name')!r} uses {', '.join(used)}, a file the container does not have")
-    for entry in data.get("rubric", []):
-        if isinstance(entry, dict) and "definitionFile" in entry:
-            raise ValueError(f"{path}: a rubric entry uses definitionFile, a file the container does not have")
     # The harness fills in its own rubric for a config that has none; the server does not, and refuses a file without the key.
     # An empty one is valid until a classifier reviewer is active (the validator then says so).
-    reviewers = {"rubric": data.get("rubric", []), "reviewers": data["reviewers"]}
+    rubric = data.get("rubric", [])
+    if isinstance(rubric, list):  # anything else is left for the validator below to name, not iterated here
+        for entry in rubric:
+            if isinstance(entry, dict) and "definitionFile" in entry:
+                raise ValueError(f"{path}: a rubric entry uses definitionFile, a file the container does not have")
+    reviewers = {"rubric": rubric, "reviewers": data["reviewers"]}
     import_harness()  # puts libs/ on sys.path, so this works when called on its own and not only from main()
     from codebase_reviewer_config_lib import ConfigError, validate_reviewers
     try:
         validate_reviewers(reviewers, path=str(path))
     except ConfigError as exc:
         raise ValueError(str(exc)) from exc
+    # The driver always asks for review type "reasoning", and every review type begins with the reasoning stage, so a
+    # config with no active reasoning reviewer (a verifier-only or classifier-only one) would be refused by the server.
+    if not any(r.get("active", True) and "reasoning" in r["type"] for r in reviewers["reviewers"]):
+        raise ValueError(f"{path} has no active reasoning reviewer: the review tool would refuse it, because every review "
+                         "type starts with the reasoning stage")
     return reviewers
 
 
@@ -489,7 +506,9 @@ def run_capped(
             process.kill()
             result.exit_code = process.wait(timeout=30)
 
-    result.stopped_by = stopped_by or ("completed" if tracker.settled or result.exit_code == 0 else "error")
+    # A settle that says `aborted` is not a finished run, whatever the container's exit code was: it must not read as a pass.
+    result.stopped_by = stopped_by or (
+        "aborted" if tracker.aborted else "completed" if tracker.settled or result.exit_code == 0 else "error")
     result.turns, result.tool_calls = tracker.turns, tracker.tool_calls
     result.review_calls, result.review_errors = tracker.review_calls, tracker.review_errors
     result.elapsed_seconds = round(tracker.elapsed(), 1)

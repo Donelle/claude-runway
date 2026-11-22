@@ -221,6 +221,18 @@ class RunCappedTests(unittest.TestCase):
         self.assertEqual(kill.calls, 0)
         self.assertEqual(result.exit_status(), 0)
 
+    def test_an_aborted_settle_is_not_a_completed_run(self):
+        # Pi settles with aborted=true when the run was cut short; whatever the container's exit code, that is not a pass.
+        for container_exit in (0, 1, 130):
+            result, _, tracker = run([turn([d.REVIEW_TOOL]), event("agent_settled", aborted=True)], returncode=container_exit)
+            self.assertTrue(tracker.settled and tracker.aborted)
+            self.assertEqual((result.stopped_by, result.exit_status()), ("aborted", 1), container_exit)
+
+    def test_a_settle_that_is_not_aborted_still_completes(self):
+        result, _, tracker = run([turn([d.REVIEW_TOOL]), event("agent_settled", aborted=False)])
+        self.assertFalse(tracker.aborted)
+        self.assertEqual((result.stopped_by, result.exit_status()), ("completed", 0))
+
     def test_a_run_that_never_calls_the_reviewer_is_not_a_pass(self):
         result, _, _ = run([turn(["read"]), event("agent_settled", aborted=False)])
         self.assertEqual(result.stopped_by, "completed")
@@ -272,6 +284,22 @@ class RunCappedTests(unittest.TestCase):
                             final_message("injection, off by one"), event("agent_settled", aborted=False)])
         self.assertEqual(result.final_text, "injection, off by one")
         self.assertEqual(result.review_text, "2 finding(s)\n- backup.py:6-8 shell injection")
+
+    def test_a_refusal_the_review_tool_returns_as_text_counts_as_a_review_error(self):
+        # The tool answers a refused review with ordinary text starting "Error:" and isError false (a bad reviewers file,
+        # nothing to run). Without this the run would exit 0.
+        for text in ("Error: no active reasoning reviewer is configured; nothing to run", "  Error: Reviewers file 'x' is invalid"):
+            end = event("tool_execution_end", toolName=d.REVIEW_TOOL, isError=False, result={"content": [{"type": "text", "text": text}]})
+            result, _, _ = run([event("turn_start"), event("tool_execution_start", toolName=d.REVIEW_TOOL), end,
+                                event("agent_settled", aborted=False)])
+            self.assertEqual((result.review_calls, result.review_errors, result.exit_status()), (1, 1, 1), text)
+
+    def test_a_result_that_only_mentions_an_error_later_is_not_a_refusal(self):
+        text = "Reasoning review: 1 finding(s)\n## error-handling (1)\n- a.py:3 Error: swallowed exception"
+        end = event("tool_execution_end", toolName=d.REVIEW_TOOL, isError=False, result={"content": [{"type": "text", "text": text}]})
+        result, _, _ = run([event("turn_start"), event("tool_execution_start", toolName=d.REVIEW_TOOL), end,
+                            event("agent_settled", aborted=False)])
+        self.assertEqual((result.review_errors, result.exit_status()), (0, 0))
 
     def test_a_long_reviewer_result_is_returned_whole(self):
         # It was once cut at 4,000 characters with no marker, which would have passed for the whole result.
@@ -481,7 +509,9 @@ class ReviewersFileTests(unittest.TestCase):
 
     def test_the_built_file_is_accepted_by_the_servers_own_validator(self):
         from codebase_reviewer_config_lib import validate_reviewers
-        validate_reviewers({"rubric": [], **d.reviewers_file("m", 8192, False)})
+        # The function's own output, as is. This once added the missing `rubric` key itself before validating, which hid
+        # that the default (no --config) file was refused by the server.
+        validate_reviewers(d.reviewers_file("m", 8192, False))
 
     def test_the_models_file_points_pi_at_lm_studio_with_the_model_and_context(self):
         data = d.models_file("a/b", 8192, "http://host.docker.internal:1234/v1")
@@ -519,6 +549,30 @@ class ConfigTests(unittest.TestCase):
             path = self.write({"reviewers": [{**self.REVIEWER, key: "x.md"}]})
             with self.assertRaisesRegex(ValueError, key):
                 d.reviewers_from_config(path)
+
+    def test_a_config_with_no_active_reasoning_reviewer_is_refused(self):
+        # The driver asks for review type "reasoning" and every type starts with that stage, so the server would refuse it
+        # with a plain "Error:" result, which a run would then have reported as a pass.
+        for reviewers in ([{**self.REVIEWER, "type": ["verifier"]}], [{**self.REVIEWER, "active": False}]):
+            with self.subTest(reviewers=reviewers), self.assertRaisesRegex(ValueError, "no active reasoning reviewer"):
+                d.reviewers_from_config(self.write({"reviewers": reviewers}))
+
+    def test_a_config_whose_reasoning_reviewer_sits_beside_others_is_accepted(self):
+        verifier = {**self.REVIEWER, "name": "v", "type": ["verifier"]}
+        result = d.reviewers_from_config(self.write({"reviewers": [self.REVIEWER, verifier]}))
+        self.assertEqual([r["name"] for r in result["reviewers"]], ["g", "v"])
+
+    def test_a_rubric_that_is_not_a_list_is_refused_not_iterated(self):
+        for rubric in (None, "text", 3, {"name": "x"}):
+            with self.subTest(rubric=rubric), self.assertRaises(ValueError):
+                d.reviewers_from_config(self.write({"rubric": rubric, "reviewers": [self.REVIEWER]}))
+
+    def test_a_rubric_that_is_not_a_list_is_a_usage_error_not_a_traceback(self):
+        path = self.write({"rubric": None, "reviewers": [self.REVIEWER]})
+        completed = subprocess.run([sys.executable, "-I", str(PI_DIR / "pi_driver.py"), "--dry-run", "--model", "m", "--config", str(path)],
+                                   capture_output=True, text=True, timeout=60)
+        self.assertEqual(completed.returncode, 2, completed.stderr)
+        self.assertNotIn("Traceback", completed.stderr)
 
     def test_missing_unreadable_and_invalid_configs_say_so(self):
         with self.assertRaisesRegex(ValueError, "cannot read"):
