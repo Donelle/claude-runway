@@ -276,6 +276,9 @@ class RunCappedTests(unittest.TestCase):
         # a stream that ends without a clean finish is followed by a `docker kill` (a no-op if the container already exited).
         result, kill, _ = run([turn()], returncode=137)
         self.assertEqual((result.stopped_by, kill.calls, result.exit_status()), ("error", 1, 1))
+        # A clean container exit does not make it a finished run: without a settle, Pi never said it was done.
+        result, kill, _ = run([turn()], returncode=0)
+        self.assertEqual((result.stopped_by, kill.calls, result.exit_status()), ("error", 1, 1))
 
     def test_a_settle_followed_by_a_failing_container_also_stops_it(self):
         result, kill, _ = run([turn(), event("agent_settled", aborted=False)], returncode=137)
@@ -452,8 +455,7 @@ def mounts_in(root: Path) -> d.Mounts:
 
 def command_for(mounts: d.Mounts) -> list:
     return d.docker_run_command(
-        docker="docker", image="img", name="n", mounts=mounts, model="m", prompt="p", lmstudio_url="http://host.docker.internal:1234/v1",
-        memory="4g", cpus="2", pids_limit=256,
+        docker="docker", image="img", name="n", mounts=mounts, model="m", prompt="p", memory="4g", cpus="2", pids_limit=256,
     )
 
 
@@ -492,18 +494,24 @@ class DockerCommandTests(unittest.TestCase):
     def test_the_prompt_is_one_argument_after_the_double_dash_not_text_in_a_shell_string(self):
         prompt = 'it\'s "quoted"; rm -rf /'
         command = d.docker_run_command(docker="docker", image="img", name="n", mounts=self.mounts, model="m", prompt=prompt,
-                                       lmstudio_url="u", memory="4g", cpus="2", pids_limit=1)
-        script = command[command.index("-c") + 1]
-        self.assertNotIn(prompt, script)  # never spliced into the shell text...
-        self.assertNotIn("rm -rf", script)
-        self.assertEqual(command[-1], prompt)  # ...but handed over whole, as the last argument after "--"
+                                       memory="4g", cpus="2", pids_limit=1)
+        self.assertNotIn("sh", command[command.index("--entrypoint") + 1])  # no shell to splice it into...
+        self.assertEqual(command.count(prompt), 1)
+        self.assertEqual(command[-1], prompt)  # ...and handed over whole, as the last argument after "--"
         self.assertEqual(command[-2], "--")
 
-    def test_the_container_script_registers_the_reviewer_with_the_scratch_database_and_keeps_stdout_clean(self):
-        script = d.container_script("http://host.docker.internal:1234/v1")
-        self.assertIn(f"CLAUDE_RUNWAY_CODEBASE_REVIEWER_DB={d.C_STATE}/codebase-reviewer.db", script)
-        self.assertIn(f"REVIEWERS_FILE={d.C_CONFIG}/reviewers.json", script)
-        self.assertIn(">&2 && exec pi", script)
+    def test_the_mcp_file_registers_the_reviewer_with_the_scratch_database(self):
+        server = d.mcp_file("http://host.docker.internal:1234/v1")["mcpServers"][d.MCP_SERVER_NAME]
+        self.assertEqual(server["command"], d.C_VENV_PYTHON)
+        self.assertEqual(server["exposure"], "direct")
+        self.assertEqual(server["env"]["CLAUDE_RUNWAY_CODEBASE_REVIEWER_DB"], f"{d.C_STATE}/codebase-reviewer.db")
+        self.assertEqual(server["env"]["REVIEWERS_FILE"], f"{d.C_CONFIG}/reviewers.json")
+        self.assertEqual(server["env"]["CLAUDE_RUNWAY_LMSTUDIO_URL"], "http://host.docker.internal:1234/v1")
+
+    def test_display_url_hides_a_user_name_and_password_and_nothing_else(self):
+        self.assertEqual(d.display_url("http://alice:s3cret@host.docker.internal:1234/v1"), "http://***@host.docker.internal:1234/v1")
+        self.assertEqual(d.display_url("http://alice@h:1/v1"), "http://***@h:1/v1")
+        self.assertEqual(d.display_url("http://h:1234/v1"), "http://h:1234/v1")
 
     def test_the_driver_source_spells_each_event_name_it_counts(self):
         # Only a spelling guard: it reads the driver's own source, so it cannot tell whether Pi uses these names. They come
@@ -559,6 +567,41 @@ class UnsafeMountsTests(unittest.TestCase):
         mounts = self.fresh_mounts()
         mounts.state = self.home
         self.assertTrue(d.unsafe_mounts(mounts, self.home, d.REPO_ROOT))
+
+    def fake_checkout(self) -> Path:
+        checkout = Path(tempfile.mkdtemp(dir=self.root))
+        (checkout / "libs").mkdir()
+        (checkout / "mcpservers").mkdir()
+        return checkout
+
+    def test_the_reviewer_code_of_a_real_checkout_is_accepted(self):
+        checkout = self.fake_checkout()
+        mounts = self.fresh_mounts()
+        mounts.libs, mounts.mcpservers = checkout / "libs", checkout / "mcpservers"
+        self.assertEqual(d.unsafe_mounts(mounts, self.home, checkout), [])
+
+    def test_a_symlinked_reviewer_folder_is_refused_wherever_it_points(self):
+        # Without this check a link to an unrelated folder (say ~/.ssh) passed: it overlaps none of the three roots.
+        outside = Path(tempfile.mkdtemp(dir=self.root))
+        for name in ("libs", "mcpservers"):
+            for target in (outside, self.home / ".claude"):
+                checkout = self.fake_checkout()
+                (checkout / name).rmdir()
+                try:
+                    (checkout / name).symlink_to(target, target_is_directory=True)
+                except OSError as error:  # Windows without the symlink privilege
+                    self.skipTest(f"cannot create a symlink here: {error}")
+                mounts = self.fresh_mounts()
+                mounts.libs, mounts.mcpservers = checkout / "libs", checkout / "mcpservers"
+                problems = d.unsafe_mounts(mounts, self.home, checkout)
+                self.assertTrue(any(f"own {name}/ folder" in p for p in problems), (name, target, problems))
+
+    def test_reviewer_code_from_another_folder_is_refused(self):
+        checkout = self.fake_checkout()
+        mounts = self.fresh_mounts()
+        mounts.libs = self.fake_checkout() / "libs"
+        mounts.mcpservers = checkout / "mcpservers"
+        self.assertTrue(d.unsafe_mounts(mounts, self.home, checkout))
 
 
 class ReviewersFileTests(unittest.TestCase):
@@ -692,7 +735,25 @@ class LmStudioUrlTests(unittest.TestCase):
         completed = subprocess.run([sys.executable, "-I", str(PI_DIR / "pi_driver.py"), "--dry-run", "--model", "m"],
                                    capture_output=True, text=True, timeout=60, env=environment)
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertIn("CLAUDE_RUNWAY_LMSTUDIO_URL=http://host.docker.internal:5555/v1", completed.stdout)
+        self.assertIn("http://host.docker.internal:5555/v1", completed.stderr)
+
+    def test_a_password_in_the_url_reaches_neither_the_command_nor_any_output(self):
+        # The URL goes into files in the agent scratch folder; the command line is visible to `ps` and `docker inspect`.
+        environment = {**os.environ, "CLAUDE_RUNWAY_LMSTUDIO_URL": "http://alice:s3cret@localhost:5555/v1"}
+        completed = subprocess.run([sys.executable, "-I", str(PI_DIR / "pi_driver.py"), "--dry-run", "--model", "m"],
+                                   capture_output=True, text=True, timeout=60, env=environment)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertNotIn("s3cret", completed.stdout + completed.stderr)
+        self.assertIn("http://***@host.docker.internal:5555/v1", completed.stderr)
+
+    def test_the_preflight_messages_hide_a_password_in_the_url(self):
+        harness_lib, _ = d.import_harness()
+        url = "http://alice:s3cret@127.0.0.1:1/v1"
+        for known in (False, None):
+            with mock.patch.object(harness_lib, "model_known", return_value=known), \
+                    mock.patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                problem = d.host_model_check(url, "m") or ""
+            self.assertNotIn("s3cret", problem + stderr.getvalue(), known)
 
     def test_a_bad_port_in_the_environment_is_a_usage_error_not_a_traceback(self):
         environment = {**os.environ, "CLAUDE_RUNWAY_LMSTUDIO_URL": "http://localhost:abc/v1"}

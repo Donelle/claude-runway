@@ -369,26 +369,43 @@ def pi_arguments(model: str, prompt: str) -> list:
     ]
 
 
-def container_script(lmstudio_url: str) -> str:
-    """What the container runs: register the reviewer MCP server, then exec Pi with the arguments that follow.
+def mcp_file(lmstudio_url: str) -> dict:
+    """Pi's mcp.json, registering the reviewer MCP server: the file `pi mcp add` would write, in the same shape.
 
-    `pi mcp add` writes to PI_CODING_AGENT_DIR (the scratch mount), and its output goes to stderr so that stdout is only
-    Pi's JSON stream."""
-    add = [
-        "pi", "mcp", "add", MCP_SERVER_NAME, "--exposure", "direct",
-        "--env", f"REVIEWERS_FILE={C_CONFIG}/reviewers.json",
-        "--env", f"CLAUDE_RUNWAY_CODEBASE_REVIEWER_DB={C_STATE}/codebase-reviewer.db",
-        "--env", f"CLAUDE_RUNWAY_LMSTUDIO_URL={lmstudio_url}",
-        "--", C_VENV_PYTHON, f"{C_REVIEWER}/mcpservers/codebase_reviewer_mcp_server.py",
-    ]
-    return f'{shlex.join(add)} >&2 && exec pi "$@"'
+    The driver writes it into the agent scratch folder instead of running `pi mcp add` in the container, so the LM Studio
+    URL, which can carry a user name and password, is never on a command line (host `ps`, `docker inspect`, --dry-run)."""
+    return {
+        "mcpServers": {
+            MCP_SERVER_NAME: {
+                "command": C_VENV_PYTHON,
+                "args": [f"{C_REVIEWER}/mcpservers/codebase_reviewer_mcp_server.py"],
+                "env": {
+                    "REVIEWERS_FILE": f"{C_CONFIG}/reviewers.json",
+                    "CLAUDE_RUNWAY_CODEBASE_REVIEWER_DB": f"{C_STATE}/codebase-reviewer.db",
+                    "CLAUDE_RUNWAY_LMSTUDIO_URL": lmstudio_url,
+                },
+                "exposure": "direct",
+            }
+        }
+    }
+
+
+def display_url(url: str) -> str:
+    """`url` safe to print: a user name and password in it become `***`. Nothing else is changed."""
+    parts = urllib.parse.urlsplit(url)
+    _userinfo, at, host = parts.netloc.rpartition("@")
+    if not at:
+        return url
+    return urllib.parse.urlunsplit(parts._replace(netloc=f"***@{host}"))
 
 
 def docker_run_command(
-    *, docker: str, image: str, name: str, mounts: Mounts, model: str, prompt: str, lmstudio_url: str,
+    *, docker: str, image: str, name: str, mounts: Mounts, model: str, prompt: str,
     memory: str, cpus: str, pids_limit: int,
 ) -> list:
-    """The whole `docker run` command line, as a list (never a shell string, so no quoting problem and no injection)."""
+    """The whole `docker run` command line, as a list (never a shell string, so no quoting problem and no injection).
+
+    It carries no LM Studio URL: that is in the models.json and mcp.json the driver wrote into the agent scratch folder."""
     command = [
         # --init: Pi runs as PID 1, which the kernel gives no default signal handling, so a stop signal would never reach it;
         # the small init process forwards signals and reaps children.
@@ -412,7 +429,7 @@ def docker_run_command(
     for host, inside, writable in mounts.as_list():
         spec = f"type=bind,source={host},target={inside}"
         command += ["--mount", spec if writable else spec + ",readonly"]
-    command += ["--entrypoint", "sh", image, "-c", container_script(lmstudio_url), "sh", *pi_arguments(model, prompt)]
+    command += ["--entrypoint", "pi", image, *pi_arguments(model, prompt)]
     return command
 
 
@@ -421,11 +438,16 @@ def unsafe_mounts(mounts: Mounts, home: Path, checkout: Path) -> list:
 
     The kit promises never to expose the checkout, `~/.claude` or `~/.pi`. A mount overlaps one of them when it is the
     folder, a folder above it (which contains it) or a folder inside it. The one exception is the reviewer's own code:
-    `libs/` and `mcpservers/` of the checkout, read-only, because the MCP server cannot run without them."""
+    `libs/` and `mcpservers/` of the checkout, read-only, because the MCP server cannot run without them. Those two
+    must be the checkout's real folders: a symlink in their place could point anywhere outside the three roots, and
+    Docker would mount whatever it points to."""
     checkout = checkout.resolve()
     code = {checkout / "libs", checkout / "mcpservers"}
     forbidden = {"the checkout": checkout, "~/.claude": (home / ".claude").resolve(), "~/.pi": (home / ".pi").resolve()}
     problems = []
+    for name, host in (("libs", mounts.libs), ("mcpservers", mounts.mcpservers)):
+        if host.is_symlink() or host.resolve() != checkout / name:
+            problems.append(f"{host} is not the checkout's own {name}/ folder ({checkout / name})")
     for host, _inside, writable in mounts.as_list():
         resolved = host.resolve()
         if resolved in code and not writable:
@@ -534,8 +556,11 @@ def run_capped(
 
     # A settle that says `aborted` is not a finished run, whatever the container's exit code was: it must not read as a pass.
     # Nor is a settle followed by a failing container (Pi settles before it shuts its MCP server down, so an OOM kill or a
-    # crash during that shutdown still ends nonzero): only a clean container exit counts as completed.
-    result.stopped_by = stopped_by or ("aborted" if tracker.aborted else "completed" if result.exit_code == 0 else "error")
+    # crash during that shutdown still ends nonzero): only a settle and a clean container exit count as completed. A stream
+    # that ends without a settle is an error even when the container exits 0, since Pi never said it had finished.
+    result.stopped_by = stopped_by or (
+        "aborted" if tracker.aborted else "completed" if tracker.settled and result.exit_code == 0 else "error"
+    )
     result.turns, result.tool_calls = tracker.turns, tracker.tool_calls
     result.review_calls, result.review_errors = tracker.review_calls, tracker.review_errors
     result.elapsed_seconds = round(tracker.elapsed(), 1)
@@ -587,6 +612,7 @@ def prepare_scratch(scratch: Path, case_name: str, model: str, reviewers: dict, 
         directory.mkdir()
     (config / "reviewers.json").write_text(json.dumps(reviewers, indent=2), encoding="utf-8")
     (agent / "models.json").write_text(json.dumps(models_file(model, context_length, lmstudio_url), indent=2), encoding="utf-8")
+    (agent / "mcp.json").write_text(json.dumps(mcp_file(lmstudio_url), indent=2), encoding="utf-8")
     return Mounts(REPO_ROOT / "libs", REPO_ROOT / "mcpservers", repo, config, agent, state), base, head
 
 
@@ -595,9 +621,9 @@ def host_model_check(host_url: str, model: str) -> Optional[str]:
     harness_lib, _cases = import_harness()
     known = harness_lib.model_known(host_url, model)
     if known is False:
-        return f"LM Studio at {host_url} does not list a model named {model!r} (`lms ls` shows the ids)"
+        return f"LM Studio at {display_url(host_url)} does not list a model named {model!r} (`lms ls` shows the ids)"
     if known is None:
-        print(f"warning: could not ask LM Studio at {host_url} whether {model!r} exists; going on", file=sys.stderr)
+        print(f"warning: could not ask LM Studio at {display_url(host_url)} whether {model!r} exists; going on", file=sys.stderr)
     return None
 
 
@@ -694,10 +720,12 @@ def main(argv: Optional[list] = None) -> int:
         name = f"claude-runway-pi-{os.getpid()}-{int(time.time())}"
         command = docker_run_command(
             docker=args.docker, image=args.image, name=name, mounts=mounts, model=args.model, prompt=prompt,
-            lmstudio_url=lmstudio_in_container, memory=args.memory, cpus=args.cpus, pids_limit=args.pids_limit,
+            memory=args.memory, cpus=args.cpus, pids_limit=args.pids_limit,
         )
         if args.dry_run:
             print(shlex.join(command))
+            print(f"LM Studio as the container sees it (in the agent folder's models.json and mcp.json): "
+                  f"{display_url(lmstudio_in_container)}", file=sys.stderr)
             return 0
 
         tracker = CapTracker(args.max_turns, args.max_tool_calls, args.timeout)
