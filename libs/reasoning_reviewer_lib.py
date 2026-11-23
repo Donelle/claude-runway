@@ -1263,13 +1263,31 @@ def stage_status_line(followed_by: Sequence[str] = ()) -> str:
     return line
 
 
+def incomplete_review_line(problems: Sequence[str]) -> Optional[str]:
+    """The line every review's text opens with when any stage reported a problem, or None for a clean run.
+
+    The result text is the only thing a calling model reads, and the detail list (`Problems (N):`) sits at the end, after
+    the finding count. A small caller was seen reading `0 finding(s)` on the first line and reporting "no bugs" when the
+    only reviewer's reply had been unreadable, so the failure state goes first, before any count. The count is of the
+    same list the formatter prints under "Problems", so the two always agree. Warnings do not trigger it: they are notes
+    about a run, not a failure. No language-specific text: the reviewer is programming-language agnostic by rule."""
+    if not problems:
+        return None
+    return (
+        f"INCOMPLETE REVIEW: {len(problems)} problem(s) (listed under \"Problems\" at the end); findings may be missing, "
+        "so do NOT report this review as clean."
+    )
+
+
 def format_review(review: ReasoningReview, *, followed_by: Sequence[str] = ()) -> str:
     """The review as text for the calling model: findings by class, then errors.
 
     `followed_by` names the stages that run on these findings in the same review (the `review` tool's "reasoning"
     type passes none; a pipeline that goes on to verify and classify passes both), so the opening line says what the
     findings have and have not been through."""
-    lines = [
+    header = incomplete_review_line(review.errors)
+    lines = [] if header is None else [header]
+    lines += [
         f"Reasoning review: {review.finding_count} finding(s) in {len(review.groups)} class(es) "
         f"from {len(review.reviewers_run)} reviewer(s) ({', '.join(review.reviewers_run) or 'none'}), "
         f"up to {review.chunks} diff chunk(s) each.",
@@ -1323,5 +1341,6 @@ __all__ = [
     "collect_findings",
     "run_reasoning_review",
     "format_review",
+    "incomplete_review_line",
     "stage_status_line",
 ]

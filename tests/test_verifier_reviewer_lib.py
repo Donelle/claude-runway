@@ -637,6 +637,20 @@ class FormatVerifiedReview(unittest.TestCase):
         text = format_verified_review(VerifiedReview(reasoning, review))
         for part in ("reasoning problem", "verifier problem", "reasoning warning", "verifier warning", "Problems (2)"):
             self.assertIn(part, text)
+        self.assertTrue(text.startswith("INCOMPLETE REVIEW: 2 problem(s)"), text)
+
+    def test_a_problem_in_either_stage_alone_opens_the_text_before_the_counts(self):
+        for reasoning, review in ((ReasoningReview(errors=["reasoning problem"]), VerificationReview()),
+                                  (ReasoningReview(), VerificationReview(errors=["verifier problem"]))):
+            lines = format_verified_review(VerifiedReview(reasoning, review)).splitlines()
+            self.assertTrue(lines[0].startswith("INCOMPLETE REVIEW: 1 problem(s)"), lines[0])
+            self.assertTrue(lines[1].startswith("Verified review:"), lines[1])
+
+    def test_a_clean_or_warnings_only_review_has_no_failure_header(self):
+        for reasoning in (ReasoningReview(reviewers_run=["r"]), ReasoningReview(reviewers_run=["r"], warnings=["a note"])):
+            text = format_verified_review(VerifiedReview(reasoning, VerificationReview(warnings=["another"])))
+            self.assertTrue(text.startswith("Verified review:"), text)
+            self.assertNotIn("INCOMPLETE", text)
 
 
 if __name__ == "__main__":
