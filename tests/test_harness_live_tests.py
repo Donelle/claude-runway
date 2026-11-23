@@ -995,7 +995,7 @@ class ShippedConfigs(unittest.TestCase):
                 self.assertIsNotNone(live.kind)
 
     def test_the_measured_baselines_are_the_ones_the_tests_were_written_with(self):
-        verifier = self.configs["verifier-deepseek-7b"]
+        verifier = self.configs["verifier-mlx-deepseek-7b"]
         self.assertEqual(verifier.kind.script, "live_verifier.py")
         self.assertEqual(verifier.baselines.expect, {"min_real_confirmed": 4, "max_false_confirmed": 0})
         self.assertEqual(verifier.baselines.measured, "2026-10-27")
@@ -1039,7 +1039,7 @@ class ShippedConfigs(unittest.TestCase):
                 self.assertEqual(list(passed[1::2]), data["metadata"]["cases"])
 
     def test_the_verifier_and_pipeline_bars_were_counted_on_orders_and_the_reasoning_numbers_on_every_case(self):
-        for name in ("verifier-deepseek-7b", "pipeline-mlx-qwen-7b-deepseek-7b"):
+        for name in ("verifier-mlx-deepseek-7b", "pipeline-mlx-qwen-7b-deepseek-7b"):
             self.assertEqual(self.configs[name].baselines.cases, ("orders",), name)
             self.assertEqual(lc.script_args(self.configs[name]), ("--case", "orders"), name)
         reasoning = [live for name, live in self.configs.items() if name.startswith("reasoning-") and live.baselines]

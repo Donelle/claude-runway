@@ -3,7 +3,7 @@
 
     .venv/bin/python harness/live-tests/run_live_tests.py                       # every config in configs/
     .venv/bin/python harness/live-tests/run_live_tests.py --list                # the configs, and what each would run
-    .venv/bin/python harness/live-tests/run_live_tests.py verifier-deepseek-7b  # one config, by its file name without .json
+    .venv/bin/python harness/live-tests/run_live_tests.py verifier-mlx-deepseek-7b  # one config, by its file name without .json
     .venv/bin/python harness/live-tests/run_live_tests.py --only verifier --runs 1   # the configs whose name contains "verifier", one run (quick)
 
 A config in `configs/` IS a live test; adding a test is adding a file there (see `live_configs.py` and the README):

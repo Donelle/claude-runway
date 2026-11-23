@@ -8,7 +8,7 @@ enabled and the models in `configs/` downloaded. Each test takes minutes, so run
 
 ```
 .venv/bin/python harness/live-tests/run_live_tests.py --list                       # each config: script, models, runs, baselines
-.venv/bin/python harness/live-tests/run_live_tests.py verifier-deepseek-7b         # one config, by file name without .json
+.venv/bin/python harness/live-tests/run_live_tests.py verifier-mlx-deepseek-7b         # one config, by file name without .json
 .venv/bin/python harness/live-tests/run_live_tests.py                              # every runnable config
 .venv/bin/python harness/live-tests/run_live_tests.py --only verifier --runs 1     # configs whose name contains "verifier", one run (quick)
 ```
@@ -44,10 +44,10 @@ The configs that ship:
 
 | Config | Stage | Models | Baselines | Runs on |
 | :--- | :--- | :--- | :--- | :--- |
-| `verifier-deepseek-7b.json` | verification | `deepseek-r1-distill-qwen-7b@4bit` | yes | format not recorded |
-| `verifier-deepseek-7b-8bit.json` | verification | `deepseek-r1-distill-qwen-7b@8bit` | mechanics only | format not recorded |
-| `verifier-deepseek-7b-need-loop.json` | verification | `deepseek-r1-distill-qwen-7b@4bit` loaded with a 32768-token context, with `"tools": ["read_file", "grep"]` and `"promptFile": "../prompts/deepseek-loop-prompt.md"`: it may ask for more code in a JSON `need` request, and the whole verifier prompt (how to verify, both reply shapes, the lookup menu) comes from that file instead of the server's built-in text; compare it with `verifier-deepseek-7b.json`, which has the built-in prompt and no tools | mechanics only | format not recorded |
-| `verifier-deepseek-llama-8b.json` | verification | `deepseek-r1-distill-llama-8b` | mechanics only | format not recorded |
+| `verifier-mlx-deepseek-7b.json` | verification | `deepseek-r1-distill-qwen-7b@4bit` | yes | Apple Silicon only (MLX) |
+| `verifier-mlx-deepseek-7b-8bit.json` | verification | `deepseek-r1-distill-qwen-7b@8bit` | mechanics only | Apple Silicon only (MLX) |
+| `verifier-deepseek-7b-need-loop.json` | verification | `deepseek-r1-distill-qwen-7b@4bit` loaded with a 32768-token context, with `"tools": ["read_file", "grep"]` and `"promptFile": "../prompts/deepseek-loop-prompt.md"`: it may ask for more code in a JSON `need` request, and the whole verifier prompt (how to verify, both reply shapes, the lookup menu) comes from that file instead of the server's built-in text; compare it with `verifier-mlx-deepseek-7b.json`, which has the built-in prompt and no tools | mechanics only | format not recorded |
+| `verifier-mlx-deepseek-llama-8b.json` | verification | `deepseek-r1-distill-llama-8b` | mechanics only | Apple Silicon only (MLX) |
 | `classifier-mlx-qwen-7b-4bit.json` | classification | `qwen2.5-coder-7b-instruct-mlx` (4-bit MLX), with the shipped rubric of `harness/cases.py` (scores are probabilities), one yes/no question per rubric entry | mechanics only | Apple Silicon only (MLX) |
 | `reasoning-mlx-qwen-7b-4bit.json` | reasoning | `qwen2.5-coder-7b-instruct-mlx` (4-bit MLX) | measured reply route, no pass/fail bar | Apple Silicon only (MLX) |
 | `reasoning-mlx-qwen-7b-4bit-promptfile.json` | reasoning | `qwen2.5-coder-7b-instruct-mlx` (4-bit MLX, the model of `reasoning-mlx-qwen-7b-4bit`), with `prompts/reasoning-lines.md` as the whole prompt | mechanics only | Apple Silicon only (MLX) |
@@ -64,7 +64,7 @@ The configs that ship:
 | `pipeline-mlx-qwen-7b-8bit-deepseek-llama-8b.json` | both | `qwen2.5-coder-7b-instruct` (reasoning), `deepseek-r1-distill-llama-8b` (verifier) | mechanics only | Apple Silicon only (the reasoning model is MLX) |
 | `pipeline-mlx-qwen-7b-deepseek-7b-classifier-qwen-7b.json` | all three: reasoning, verification, then classification | `qwen2.5-coder-7b-instruct-mlx` (reasoning and classifier, the classifier asked 3 times per finding), `deepseek-r1-distill-qwen-7b@4bit` (verifier) | mechanics only | Apple Silicon only (the reasoning model is MLX) |
 
-**Runs on.** MLX builds run on Apple Silicon only; GGUF builds run on any platform LM Studio runs on, Apple Silicon included. On a machine without Apple Silicon only the two GGUF reasoning configs can be reproduced as measured. A `pipeline-` config needs Apple Silicon because its reasoning model is an MLX build; its verifier's format is not recorded. `verifier-` configs name an id (`deepseek-r1-distill-qwen-7b@4bit`, `deepseek-r1-distill-llama-8b`) and the docs record no format for it, so on another machine check what the id loads (`lms ls --json`) before trusting a baseline. Even a config marked MLX can name an id that another machine resolves to a different build (for example `meta-llama-3.1-8b-instruct`, which a Windows machine can serve as a Q4_K_M GGUF build); a baseline was counted on the build in `prompts/README.md`, not on the id.
+**Runs on.** MLX builds run on Apple Silicon only; GGUF builds run on any platform LM Studio runs on, Apple Silicon included. On a machine without Apple Silicon only the two GGUF reasoning configs can be reproduced as measured. A `pipeline-mlx-` config needs Apple Silicon because its models are MLX builds, and the `verifier-mlx-` configs were measured on MLX builds of the DeepSeek verifiers (see `prompts/README.md`). Even a config marked MLX can name an id that another machine resolves to a different build (for example `meta-llama-3.1-8b-instruct`, which a Windows machine can serve as a Q4_K_M GGUF build); a baseline was counted on the build in `prompts/README.md`, not on the id.
 
 LM Studio's id for a build can change when a second build of the same model is installed, so name the quant in a config's file name and say which build a model id is; `prompts/README.md` maps each config to its id, source and quant. The reasoning configs set `replyFormat` to `lines`. The ones that measure a model's reply route each have a `.baselines.json` that records what `live_routes.py` measured for that model (see [the harness README](../README.md#reply-routes-which-way-a-models-reply-reaches-the-server)); the two `-promptfile` configs have none, since they check that a prompt file is read by a real model, not how well it finds bugs. A synthetic `live_reasoning.py` run reads no key from `expect`, so those numbers are a record, not a bar: nothing fails when a model scores lower. (A live sidecar is the exception: its per-kind bars are applied, see below.)
 
