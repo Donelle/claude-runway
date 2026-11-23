@@ -783,7 +783,7 @@ class MainTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 2, extra)
 
     def test_config_cannot_be_combined_with_a_reviewer_model(self):
-        config = REPO_ROOT / "harness" / "live-tests" / "configs" / "reasoning-seed-coder-8b.json"
+        config = REPO_ROOT / "harness" / "live-tests" / "configs" / "reasoning-gguf-seed-coder-8b.json"
         completed = subprocess.run(
             [sys.executable, "-I", str(PI_DIR / "pi_driver.py"), "--dry-run", "--model", "m", "--config", str(config), "--reviewer-model", "x"],
             capture_output=True, text=True, timeout=60,
