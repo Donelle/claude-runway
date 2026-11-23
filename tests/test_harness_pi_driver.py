@@ -271,9 +271,49 @@ class RunCappedTests(unittest.TestCase):
                                   stderr_path=Path(tmp) / "e.log")
         self.assertEqual((result.stopped_by, recorder.calls, result.exit_status()), ("timeout", 1, 3))
 
-    def test_a_container_that_dies_without_settling_is_an_error(self):
+    def test_a_stream_that_ends_without_a_settle_is_an_error_and_the_container_is_stopped(self):
+        # The output of a `docker` client that was killed or crashed ends while its container goes on running with no caps, so
+        # a stream that ends without a clean finish is followed by a `docker kill` (a no-op if the container already exited).
         result, kill, _ = run([turn()], returncode=137)
-        self.assertEqual((result.stopped_by, kill.calls, result.exit_status()), ("error", 0, 1))
+        self.assertEqual((result.stopped_by, kill.calls, result.exit_status()), ("error", 1, 1))
+
+    def test_a_settle_followed_by_a_failing_container_also_stops_it(self):
+        result, kill, _ = run([turn(), event("agent_settled", aborted=False)], returncode=137)
+        self.assertEqual((result.stopped_by, kill.calls), ("error", 1))
+
+    def test_an_interrupt_stops_the_client_before_the_container(self):
+        # If the daemon has not created the container yet `docker kill` fails, so the client must already be dead by then or it
+        # goes on to create the container.
+        order = []
+
+        class Process(FakeProcess):
+            def kill(self):
+                order.append("client")
+                super().kill()
+
+        process = Process([turn()], hang=True)
+        recorder = Recorder(process)
+
+        def kill_container():
+            order.append("container")
+            recorder()
+
+        def interrupt(_event):
+            raise KeyboardInterrupt
+
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaises(KeyboardInterrupt):
+            d.run_capped(["docker"], d.CapTracker(10, 30, 600, FakeClock()), spawn=lambda c, e: process,
+                         kill_container=kill_container, stderr_path=Path(tmp) / "e.log", on_event=interrupt)
+        self.assertEqual(order, ["client", "container"])
+
+    def test_an_interrupt_straight_after_the_client_starts_is_covered_too(self):
+        process = FakeProcess([turn()], hang=True)
+        recorder = Recorder(process)
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(d.threading, "Thread", side_effect=KeyboardInterrupt), \
+                self.assertRaises(KeyboardInterrupt):
+            d.run_capped(["docker"], d.CapTracker(10, 30, 600, FakeClock()), spawn=lambda c, e: process,
+                         kill_container=recorder, stderr_path=Path(tmp) / "e.log")
+        self.assertEqual((recorder.calls, process.killed), (1, True))
 
     def test_noise_between_events_is_ignored(self):
         chunks = [b"warning: something\n", b"\n", turn([d.REVIEW_TOOL]), b"{broken\n", event("agent_settled", aborted=False)]

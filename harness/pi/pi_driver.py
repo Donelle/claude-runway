@@ -467,26 +467,27 @@ def run_capped(
     chunks: queue.Queue = queue.Queue()
     with open(stderr_path, "wb") as stderr_file:
         process = spawn(command, stderr_file)
-
-        def read_stdout() -> None:
-            # A thread, so the wall clock can fire while Pi is silent: a blocking read on this thread would wait forever.
-            try:
-                while True:
-                    chunk = process.stdout.read1(65536)
-                    if not chunk:
-                        break
-                    chunks.put(chunk)
-            except (OSError, ValueError):
-                pass  # the pipe was closed under us: the container is gone
-            chunks.put(None)
-
-        threading.Thread(target=read_stdout, daemon=True).start()
-
-        splitter = LineSplitter()
         stopped_by: Optional[str] = None
-        ended = False
-        read_through = False
+        # Everything from here to the end of the wait is one protected block: the container must stop on EVERY way out, not
+        # only when a cap trips (see the `except` below). Starting it straight after `spawn` leaves no gap before it.
         try:
+
+            def read_stdout() -> None:
+                # A thread, so the wall clock can fire while Pi is silent: a blocking read on this thread would wait forever.
+                try:
+                    while True:
+                        chunk = process.stdout.read1(65536)
+                        if not chunk:
+                            break
+                        chunks.put(chunk)
+                except (OSError, ValueError):
+                    pass  # the pipe was closed under us: the container is gone
+                chunks.put(None)
+
+            threading.Thread(target=read_stdout, daemon=True).start()
+
+            splitter = LineSplitter()
+            ended = False
             while not ended and stopped_by is None:
                 if tracker.out_of_time():
                     stopped_by = "timeout"
@@ -506,13 +507,8 @@ def run_capped(
                     on_event(event)
                     if stopped_by:
                         break
-            read_through = True
-        finally:
-            # The container must stop on EVERY way out, not only when a cap trips: an exception here (Ctrl+C, a failed log
-            # write) would otherwise leave Pi running with no caps while the caller deletes the folders it has mounted.
-            if stopped_by or not read_through:
+            if stopped_by:
                 kill_container()
-        try:
             try:
                 result.exit_code = process.wait(timeout=30)
             except subprocess.TimeoutExpired:
@@ -520,11 +516,20 @@ def run_capped(
                 kill_container()
                 process.kill()
                 result.exit_code = process.wait(timeout=30)
+            if stopped_by is None and (not tracker.settled or result.exit_code != 0):
+                # The stream ended without a clean finish. A `docker` client that was killed or crashed ends its output while
+                # the container goes on running with no caps, so make sure it is stopped (a no-op if it already exited).
+                kill_container()
         except BaseException:
-            # The read loop's `finally` above has already finished, so an interrupt (Ctrl+C) while waiting for the client to
-            # exit must stop the container here too: "killed on every way out" has to include this wait.
+            # An exception (Ctrl+C, a failed log write) while reading or waiting. Stop the client first, so that if the
+            # daemon has not created the container yet it never will (`docker kill` fails on a name that does not exist yet),
+            # then the container itself, which would otherwise run on uncapped while the caller deletes the folders it has
+            # mounted.
+            try:
+                process.kill()
+            except OSError:
+                pass
             kill_container()
-            process.kill()
             raise
 
     # A settle that says `aborted` is not a finished run, whatever the container's exit code was: it must not read as a pass.
@@ -716,7 +721,12 @@ def main(argv: Optional[list] = None) -> int:
                 print(f"[{tracker.elapsed():5.1f}s]   tool {event.get('toolName')}", file=sys.stderr)
 
         def kill_container() -> None:
-            subprocess.run([args.docker, "kill", name], capture_output=True, check=False)
+            try:
+                subprocess.run([args.docker, "kill", name], capture_output=True, check=False, timeout=30)
+            except subprocess.TimeoutExpired:
+                # A docker daemon that does not answer must not hang the driver on its way out; say so, since the container
+                # may still be running.
+                print(f"warning: docker kill {name} did not answer in 30 s; check `docker ps`", file=sys.stderr)
 
         try:
             result = run_capped(command, tracker, spawn=_spawn, kill_container=kill_container,
