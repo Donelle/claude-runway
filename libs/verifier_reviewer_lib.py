@@ -49,6 +49,7 @@ from reasoning_reviewer_lib import (
     chunk_chars_for,
     describe_finding,
     finish_request,
+    incomplete_review_line,
     loop_enabled,
     loop_reserve,
     instructions_from_file,
@@ -748,7 +749,11 @@ def format_verified_review(result: VerifiedReview) -> str:
     review = result.verification
     reasoning = result.reasoning
     produced = len(review.verified) + len(review.ungrounded)
-    lines = [
+    problems = [*reasoning.errors, *review.errors]
+    # A failure in either stage opens the text, before any count (see `incomplete_review_line`).
+    header = incomplete_review_line(problems)
+    lines = [] if header is None else [header]
+    lines += [
         f"Verified review: {len(review.confirmed)} confirmed, {len(review.disputed)} disputed, {len(review.unchecked)} unchecked; "
         f"dropped {len(review.rejected)} rejected and {len(review.ungrounded)} ungrounded "
         f"(of {produced} claim(s) from {len(reasoning.reviewers_run)} reasoning reviewer(s): {', '.join(reasoning.reviewers_run) or 'none'}).",
@@ -791,7 +796,6 @@ def format_verified_review(result: VerifiedReview) -> str:
         for u in sorted(review.ungrounded, key=lambda x: (x.finding.cls, x.finding.file, x.finding.line_start, x.finding.claim)):
             lines.append(_finding_line(u.finding))
             lines.append(f"    ungrounded: {u.reason}")
-    problems = [*reasoning.errors, *review.errors]
     if problems:
         lines.append("")
         lines.append(f"Problems ({len(problems)}):")

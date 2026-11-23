@@ -209,6 +209,16 @@ class ARunNeedsNoRecorder(unittest.TestCase):
         text = orch.run_orchestrated(self.default_state(), orch.RulesPolicy("reasoning"))
         self.assertIn("2 finding(s)", text)
 
+    def test_an_unreadable_reply_opens_every_review_type_with_the_failure_line(self):
+        # The orchestrated path (what every `type`, pipeline included, goes through) puts the failure first.
+        for review_type, opening in (("reasoning", "Reasoning review:"), ("verifier", "Verified review:"),
+                                     ("classifier", "Classified review:")):
+            state = self.default_state()
+            state.complete = lambda client, model, system, text: "this is not a review"
+            lines = orch.run_orchestrated(state, orch.RulesPolicy(review_type)).splitlines()
+            self.assertTrue(lines[0].startswith("INCOMPLETE REVIEW: "), (review_type, lines[0]))
+            self.assertTrue(lines[1].startswith(opening), (review_type, lines[1]))
+
     def test_a_failing_review_raises_its_own_error_not_an_attribute_error(self):
         config = ReviewersConfig(rubric=RUBRIC, reviewers=(reviewer("v", roles=("verifier",)),))  # no reasoning reviewer
         with self.assertRaises(ReviewError) as raised:
