@@ -210,6 +210,7 @@ def main(argv=None) -> int:
         case, hist_base, hist_head = None, None, None
     else:
         case, hist_base, hist_head = ALL_CASES[args.case or "orders"], None, None
+    h.isolate_reviewer_db()  # past every exit that runs no review, the preflight included: from here the run records
     base_url = h.load_server().lmstudio_base_url()
     before = h.loaded_models(base_url)
     recorder = h.Recorder()

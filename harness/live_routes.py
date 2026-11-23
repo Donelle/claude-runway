@@ -338,6 +338,7 @@ def main(argv=None, *, run_fn: RunFn = h.run_reasoning) -> int:
     probe_entries = [h.reviewer_entry("general", model, prompt=None, prompt_file=None, on_demand=not args.resident,
                                       context=args.context) for model in args.model]
     h.preflight_reviewers(probe_entries, args)
+    h.isolate_reviewer_db()  # past every exit that runs no review, the preflight included: from here the run records
     cases = [ALL_CASES[name] for name in case_names]
     base_url = h.load_server().lmstudio_base_url()
     before = h.loaded_models(base_url)

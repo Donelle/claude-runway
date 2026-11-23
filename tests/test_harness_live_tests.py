@@ -896,7 +896,9 @@ class Main(Folder):
         original = rlt.CONFIGS
         rlt.CONFIGS = self.dir
         try:
-            with contextlib.redirect_stdout(out):
+            # `main` would make a throwaway reviewer-database folder and set the variables for the scripts it starts; neither belongs
+            # to these tests (tests/test_harness_reviewer_db.py covers it), so the helper is a no-op: nothing is left in the temp folder.
+            with contextlib.redirect_stdout(out), unittest.mock.patch.object(h, "isolate_reviewer_db"):
                 code = rlt.main(list(argv))
         finally:
             rlt.CONFIGS = original

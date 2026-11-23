@@ -224,6 +224,7 @@ def main(argv=None) -> int:
     rubric = rubric_for(args)
     print(summarise(args))
     h.preflight_reviewers(classifiers, args)
+    h.isolate_reviewer_db()  # past every exit that runs no review, the preflight included: from here the run records
     base_url = h.load_server().lmstudio_base_url()
     before = h.loaded_models(base_url)
     recorder = h.Recorder()

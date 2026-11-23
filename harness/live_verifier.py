@@ -155,6 +155,7 @@ def main(argv=None) -> int:
         raise SystemExit("no active reviewer with the `verifier` type to run: add one to the config, or leave --config out and pass --model.")
     print(summarise(args))
     h.preflight_reviewers(verifiers, args)
+    h.isolate_reviewer_db()  # past every exit that runs no review, the preflight included: from here the run records
     base_url = h.load_server().lmstudio_base_url()
     before = h.loaded_models(base_url)
     recorder = h.Recorder()

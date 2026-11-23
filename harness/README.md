@@ -305,6 +305,12 @@ no probability can be read. The probe stops the run, naming the model and the fi
 tokens it began with, and says to check the model's chat template in LM Studio or use
 another model. A model that returns no token probabilities is refused the same way.
 
+## Where a run is recorded
+
+Every harness run is recorded in the reviewer's SQLite database (`libs/reviewer_db_lib.py`), because that is how models are compared. By default that is a **throwaway** one: when `CLAUDE_RUNWAY_CODEBASE_REVIEWER_DB` is not set, each script creates a new private folder `<system temp folder>/claude-runway-harness-<time>-<random>/` (`tempfile.mkdtemp`), uses `codebase-reviewer.db` in it and says so before it starts the run, once its preflight has passed (`reviewer database: ...`, with the folder of the reviewer's logs, one file per session, beside it). A closed run also writes a summary event to the shared metrics database and, with `CLAUDE_RUNWAY_TRACK_SAVINGS` on, a record to the savings ledger, so the same folder holds a throwaway `metrics.db` and `savings.db` (each used unless you set `CLAUDE_RUNWAY_METRICS_DB` or `CLAUDE_RUNWAY_SAVINGS_DB` yourself). A test run therefore writes nothing under `~/.claude/claude-runway/` and mixes no test rows with real review history. The folder is not deleted, so the printed path is how you find the logs; delete it when you are done (the operating system does not always clear its temp folder).
+
+To record into a database you keep (a model comparison you want in the real history), set `CLAUDE_RUNWAY_CODEBASE_REVIEWER_DB` to its path before the run. A path you set is used, and then nothing else is redirected: the metrics and savings databases stay wherever your environment puts them (the real ones, unless you set those too), because recording into a real database on purpose includes its summary event. A relative path is anchored at the home folder, as the reviewer reads it, and the printed line shows the result. A run that does not start (`--show-config`, `--check`, a failed preflight such as LM Studio not reachable) chooses and creates nothing. `live-tests/run_live_tests.py` chooses once, after its checks, and every config in that invocation shares it. The logic is `isolate_reviewer_db` in `harness_lib.py`.
+
 ## Useful options
 
 | Option                                 | Meaning                                                                        |
