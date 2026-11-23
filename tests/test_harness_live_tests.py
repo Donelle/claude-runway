@@ -60,6 +60,16 @@ def write_baselines(config: Path, expect: dict, measured="2026-01-02", model="so
     lc.baselines_path(config).write_text(json.dumps({k: v for k, v in data.items() if k not in omit}), encoding="utf-8")
 
 
+def orphan_sidecars(folder: Path) -> list:
+    """Every sidecar in `folder` with no config of the same stem beside it.
+
+    A sidecar is found only by name (`lc.baselines_path`), and `lc.load_baselines` treats a missing one as "no bars",
+    so a config renamed without its sidecar loses its quality bars silently: no error and no failure. This is the
+    check that turns that into a failure."""
+    return sorted(p.name for p in folder.glob("*" + lc.BASELINES_SUFFIX)
+                  if not (folder / (p.name[: -len(lc.BASELINES_SUFFIX)] + ".json")).is_file())
+
+
 class Folder(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -77,6 +87,15 @@ class Discover(Folder):
 
     def test_empty_folder(self):
         self.assertEqual(lc.discover(self.dir), [])
+
+    def test_a_sidecar_whose_config_was_renamed_without_it_is_reported(self):
+        kept = write_config(self.dir, "reasoning-kept", ["reasoning"], roles=("reasoning",))
+        write_baselines(kept, {"min_bugs_after": 1})
+        renamed = write_config(self.dir, "reasoning-old-name", ["reasoning"], roles=("reasoning",))
+        write_baselines(renamed, {"min_bugs_after": 1})
+        self.assertEqual(orphan_sidecars(self.dir), [])
+        renamed.rename(self.dir / "reasoning-new-name.json")  # the config moved, its sidecar did not
+        self.assertEqual(orphan_sidecars(self.dir), ["reasoning-old-name.baselines.json"])
 
 
 class KindFor(unittest.TestCase):
@@ -963,6 +982,11 @@ class ShippedConfigs(unittest.TestCase):
     def setUp(self):
         self.configs = {p.stem: lc.describe(p) for p in lc.discover(lc.CONFIGS)}
 
+    def test_every_shipped_sidecar_has_its_config_beside_it(self):
+        # Config names carry the build format (`reasoning-mlx-...`, `reasoning-gguf-...`), so renaming a config is a normal
+        # change, and a rename that forgets the sidecar would otherwise drop that config's bars without a word.
+        self.assertEqual(orphan_sidecars(lc.CONFIGS), [])
+
     def test_every_shipped_config_is_runnable(self):
         self.assertTrue(self.configs)
         for name, live in self.configs.items():
@@ -971,19 +995,19 @@ class ShippedConfigs(unittest.TestCase):
                 self.assertIsNotNone(live.kind)
 
     def test_the_measured_baselines_are_the_ones_the_tests_were_written_with(self):
-        verifier = self.configs["verifier-deepseek-7b"]
+        verifier = self.configs["verifier-mlx-deepseek-7b"]
         self.assertEqual(verifier.kind.script, "live_verifier.py")
         self.assertEqual(verifier.baselines.expect, {"min_real_confirmed": 4, "max_false_confirmed": 0})
         self.assertEqual(verifier.baselines.measured, "2026-10-27")
-        pipeline = self.configs["pipeline-qwen-7b-deepseek-7b"]
+        pipeline = self.configs["pipeline-mlx-qwen-7b-deepseek-7b"]
         self.assertEqual(pipeline.kind.script, "live_all_reviewers.py")
         self.assertEqual(pipeline.kind.args, ("--case", "orders"))
         self.assertEqual(pipeline.baselines.expect, {"max_decoy_alarms_after": 0, "min_bugs_after": 1})
 
     def test_the_classifier_configs_run_the_classifier_script_and_the_three_stage_pipeline_and_hold_only_mechanics(self):
-        alone = self.configs["classifier-qwen-7b-4bit"]
+        alone = self.configs["classifier-mlx-qwen-7b-4bit"]
         self.assertEqual((alone.stages, alone.kind.script), (("classifier",), "live_classifier.py"))
-        pipeline = self.configs["pipeline-qwen-7b-deepseek-7b-classifier-qwen-7b"]
+        pipeline = self.configs["pipeline-mlx-qwen-7b-deepseek-7b-classifier-qwen-7b"]
         self.assertEqual((pipeline.stages, pipeline.kind.name, pipeline.kind.script),
                          (("reasoning", "verifier", "classifier"), "pipeline", "live_all_reviewers.py"))
         for live in (alone, pipeline):
@@ -1015,7 +1039,7 @@ class ShippedConfigs(unittest.TestCase):
                 self.assertEqual(list(passed[1::2]), data["metadata"]["cases"])
 
     def test_the_verifier_and_pipeline_bars_were_counted_on_orders_and_the_reasoning_numbers_on_every_case(self):
-        for name in ("verifier-deepseek-7b", "pipeline-qwen-7b-deepseek-7b"):
+        for name in ("verifier-mlx-deepseek-7b", "pipeline-mlx-qwen-7b-deepseek-7b"):
             self.assertEqual(self.configs[name].baselines.cases, ("orders",), name)
             self.assertEqual(lc.script_args(self.configs[name]), ("--case", "orders"), name)
         reasoning = [live for name, live in self.configs.items() if name.startswith("reasoning-") and live.baselines]
