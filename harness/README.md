@@ -305,6 +305,12 @@ no probability can be read. The probe stops the run, naming the model and the fi
 tokens it began with, and says to check the model's chat template in LM Studio or use
 another model. A model that returns no token probabilities is refused the same way.
 
+## Where a run is recorded
+
+Every harness run is recorded in the reviewer's SQLite database (`libs/reviewer_db_lib.py`), because that is how models are compared. By default that is a **throwaway** one: when `CLAUDE_RUNWAY_CODEBASE_REVIEWER_DB` is not set, each script chooses `<system temp folder>/claude-runway-harness-<time>-<pid>/codebase-reviewer.db` and says so on its first lines (`reviewer database: ...`); the per-run logs are in `codebase-reviewer-logs/` beside it. A test run therefore never writes to `~/.claude/claude-runway/` or mixes test rows with real review history. The folder is not deleted, so the printed path is how you find the logs; the operating system clears its temp folder in time.
+
+To record into a database you keep (a model comparison you want in the real history), set `CLAUDE_RUNWAY_CODEBASE_REVIEWER_DB` to its path before the run; a path you set is always used as given. The scripts that only print (`--show-config`, `--check`) choose nothing. `live-tests/run_live_tests.py` chooses once and every config in that invocation shares it. The logic is `isolate_reviewer_db` in `libs/runway_defaults.py`.
+
 ## Useful options
 
 | Option                                 | Meaning                                                                        |

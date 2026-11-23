@@ -39,6 +39,9 @@ for _directory in (REPO_ROOT / "libs", Path(__file__).resolve().parent):
         sys.path.insert(0, str(_directory))
 
 from cases import Case, bug_line, line_of  # noqa: E402
+# Re-exported for the live_*.py scripts: each calls `h.isolate_reviewer_db()` once its early exits are past, so a run records in a
+# throwaway reviewer database rather than the real one under ~/.claude unless the caller chose a path.
+from runway_defaults import isolate_reviewer_db  # noqa: E402, F401
 
 # The development model for reviewers and verifiers (see harness/README.md, "Codebase-reviewer models"): the -Instruct build,
 # since the base build never ends its turn.

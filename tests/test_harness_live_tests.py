@@ -877,7 +877,8 @@ class Main(Folder):
         original = rlt.CONFIGS
         rlt.CONFIGS = self.dir
         try:
-            with contextlib.redirect_stdout(out):
+            # `main` sets the reviewer-database variable for the scripts it starts; restore the environment so it does not leak.
+            with contextlib.redirect_stdout(out), unittest.mock.patch.dict(os.environ):
                 code = rlt.main(list(argv))
         finally:
             rlt.CONFIGS = original

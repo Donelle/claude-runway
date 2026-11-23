@@ -142,6 +142,7 @@ def main(argv=None) -> int:
     # Before any model loads: a missing sidecar or tag must stop the run here, not after a load.
     live_repo, live_tags = lb.live_target(args) if args.run_type == "live" else (h.REPO_ROOT, ())
     reviewers = h.stage_reviewers(args, "reasoning")
+    h.isolate_reviewer_db()  # past every no-model exit: from here the run records
     h.preflight_reviewers(reviewers, args)
     base_url = h.load_server().lmstudio_base_url()
     before = h.loaded_models(base_url)

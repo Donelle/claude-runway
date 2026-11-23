@@ -59,6 +59,7 @@ import live_configs as lc  # noqa: E402
 HARNESS_DIR = str(HERE.parent)
 if HARNESS_DIR not in sys.path:
     sys.path.insert(0, HARNESS_DIR)
+import harness_lib as h  # noqa: E402
 import live_branch_lib as lb  # noqa: E402
 
 HARNESS = HERE.parent
@@ -507,6 +508,11 @@ def main(argv=None) -> int:
         print(f"NOT RUN: LM Studio does not list {missing}. Download them, or point the configs in {CONFIGS} at models `lms ls` shows.")
         return EXIT_NOT_RUN
     LOGS.mkdir(exist_ok=True)
+    # One throwaway reviewer database for every config this invocation runs, unless the caller set one: the scripts below
+    # record their runs, and a test run must not write into the real database under ~/.claude. It is set in os.environ,
+    # before `env` is built, so each child inherits it and finds the variable already set. Placed after the checks that can
+    # end the run without a model (preflight, LM Studio not reachable) so those never announce a database they do not use.
+    h.isolate_reviewer_db()
     env = {**os.environ, "PYTHONUNBUFFERED": "1"}
     results: list = []
     for config in chosen:

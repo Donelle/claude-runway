@@ -335,6 +335,7 @@ def main(argv=None, *, run_fn: RunFn = h.run_reasoning) -> int:
     if args.show_config:
         print(describe_run(args.model, routes, case_names, args.runs))
         return 0
+    h.isolate_reviewer_db()  # past the no-model exit: from here the run records
     probe_entries = [h.reviewer_entry("general", model, prompt=None, prompt_file=None, on_demand=not args.resident,
                                       context=args.context) for model in args.model]
     h.preflight_reviewers(probe_entries, args)

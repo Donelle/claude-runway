@@ -203,6 +203,7 @@ def main(argv=None) -> int:
     # The classifiers run last, on what is left standing. Restricted to their role for the same reason as the verifiers.
     classifiers = [{**e, "type": ["classifier"]} for e in entries
                    if e.get("active", True) and "classifier" in e.get("type", [])] if "classifier" in stages else []
+    h.isolate_reviewer_db()  # past every no-model exit: from here the run records
     h.preflight_reviewers(reasoning + verifiers + classifiers, args)
     if args.history:
         case, hist_base, hist_head = h.history_case(args.history, args.round - 1)
