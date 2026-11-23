@@ -45,6 +45,7 @@ from reasoning_reviewer_lib import (
     chunk_chars_for,
     describe_finding,
     finish_request,
+    incomplete_review_line,
     prompt_hash_of,
 )
 from reviewer_db_lib import NULL_RECORDER
@@ -517,7 +518,11 @@ def format_classified_review(result: ClassifiedReview) -> str:
     verified = result.verified
     verification = verified.verification
     reasoning = verified.reasoning
-    lines = [
+    problems = [*reasoning.errors, *verification.errors, *review.errors]
+    # A failure in any of the three stages opens the text, before any count (see `incomplete_review_line`).
+    header = incomplete_review_line(problems)
+    lines = [] if header is None else [header]
+    lines += [
         f"Classified review: {len(review.matched)} classified, {len(review.unchecked)} without a "
         f"rubric level; dropped {len(review.unclassified)} unclassified, {len(verification.rejected)} rejected and "
         f"{len(verification.ungrounded)} ungrounded "
@@ -578,7 +583,6 @@ def format_classified_review(result: ClassifiedReview) -> str:
         for u in sorted(verification.ungrounded, key=lambda x: (x.finding.cls, x.finding.file, x.finding.line_start, x.finding.claim)):
             lines.append(f"- {_where(u.finding)} [{u.finding.cls}] {u.finding.claim}")
             lines.append(f"    ungrounded: {u.reason}")
-    problems = [*reasoning.errors, *verification.errors, *review.errors]
     if problems:
         lines.append("")
         lines.append(f"Problems ({len(problems)}):")

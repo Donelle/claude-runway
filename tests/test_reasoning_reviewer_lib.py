@@ -555,6 +555,30 @@ class CollectFindings(unittest.TestCase):
         self.assertIn("before classification", only_classifier)
         self.assertIn("NOT verified: no verifier stage ran", only_classifier)
 
+    def test_an_unreadable_reply_puts_the_failure_on_the_first_line_before_the_finding_count(self):
+        # The case seen through Pi: no findings and one unreadable reply, which a small caller read as "no bugs".
+        review = ReasoningReview(reviewers_run=["general"], chunks=1,
+                                 errors=["chunk 1/1: reviewer 'general': the reply had no FINDING blocks and was not NONE"])
+        lines = format_review(review).splitlines()
+        self.assertTrue(lines[0].startswith("INCOMPLETE REVIEW: 1 problem(s)"), lines[0])
+        self.assertIn("do NOT report this review as clean", lines[0])
+        self.assertTrue(lines[1].startswith("Reasoning review: 0 finding(s)"), lines[1])
+        # The detail stays at the end, where it was.
+        self.assertIn("Problems (1):", lines)
+        self.assertGreater(lines.index("Problems (1):"), 1)
+
+    def test_the_header_counts_every_problem_and_also_leads_when_later_stages_follow(self):
+        review = ReasoningReview(groups=collect_findings([f("one")]), reviewers_run=["one"], errors=["a", "b"])
+        lines = format_review(review, followed_by=("verifier", "classifier")).splitlines()
+        self.assertTrue(lines[0].startswith("INCOMPLETE REVIEW: 2 problem(s)"), lines[0])
+        self.assertIn("Problems (2):", lines)
+
+    def test_a_clean_or_warnings_only_review_has_no_failure_header(self):
+        for review in (ReasoningReview(reviewers_run=["one"]), ReasoningReview(reviewers_run=["one"], warnings=["a note"])):
+            text = format_review(review)
+            self.assertTrue(text.startswith("Reasoning review:"), text)
+            self.assertNotIn("INCOMPLETE", text)
+
     def test_a_merged_finding_takes_a_quote_the_first_lacked_and_the_shorter_of_two_that_hold_each_other(self):
         def quoted(reviewer, quote, claim="same"):
             return Finding("a.py", 3, 3, "quoting", claim, "x", (reviewer,), quote=quote)

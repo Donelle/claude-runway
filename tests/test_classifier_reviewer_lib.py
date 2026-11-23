@@ -27,6 +27,8 @@ from classifier_reviewer_lib import (  # noqa: E402
     UNCHECKED,
     UNCLASSIFIED,
     Classification,
+    ClassificationReview,
+    ClassifiedReview,
     Rating,
     build_classifier_message,
     build_classifier_prompt,
@@ -40,7 +42,8 @@ from classifier_reviewer_lib import (  # noqa: E402
 from codebase_reviewer_config_lib import ConfigError, Reviewer, ReviewersConfig, RubricEntry, load_definition  # noqa: E402
 from fake_lmstudio import FakeLmStudio  # noqa: E402
 from lmstudio_model_loader_lib import ModelLoader, ModelNotLoadedError  # noqa: E402
-from reasoning_reviewer_lib import Finding  # noqa: E402
+from reasoning_reviewer_lib import Finding, ReasoningReview  # noqa: E402
+from verifier_reviewer_lib import VerificationReview, VerifiedReview  # noqa: E402
 from reviewer_db_lib import NullRecorder  # noqa: E402
 
 BASE = "http://localhost:1234/v1"
@@ -582,6 +585,22 @@ class RunClassifiedReview(unittest.TestCase):
         self.assertIn("Problems (1):", text)
         self.assertIn("'sorter'", text)
         self.assertIn("every request failed", text)
+        # The classifier stage's failure opens the text, before the counts.
+        lines = text.splitlines()
+        self.assertTrue(lines[0].startswith("INCOMPLETE REVIEW: 1 problem(s)"), lines[0])
+        self.assertTrue(lines[1].startswith("Classified review:"), lines[1])
+
+    def test_a_problem_in_any_stage_opens_the_text_and_a_clean_review_has_no_header(self):
+        def text_for(reasoning_errors=(), verifier_errors=(), classifier_errors=(), warnings=()):
+            verified = VerifiedReview(ReasoningReview(errors=list(reasoning_errors), warnings=list(warnings)),
+                                      VerificationReview(errors=list(verifier_errors)))
+            return format_classified_review(ClassifiedReview(verified, ClassificationReview(errors=list(classifier_errors))))
+        for kwargs in ({"reasoning_errors": ["r"]}, {"verifier_errors": ["v"]}, {"classifier_errors": ["c"]}):
+            self.assertTrue(text_for(**kwargs).startswith("INCOMPLETE REVIEW: 1 problem(s)"), kwargs)
+        self.assertTrue(text_for(["r"], ["v"], ["c"]).startswith("INCOMPLETE REVIEW: 3 problem(s)"))
+        for clean in (text_for(), text_for(warnings=["a note"])):
+            self.assertTrue(clean.startswith("Classified review:"), clean)
+            self.assertNotIn("INCOMPLETE", clean)
 
 
 class EveryRequestFails(unittest.TestCase):
