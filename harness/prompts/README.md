@@ -51,28 +51,44 @@ Measured with `live_routes.py` on 14 cases (the 9 seeded cases holding 38 bugs a
 
 **Name the build, not just the model.** A model family comes in several quantizations and several conversions of the same weights, and they behave differently (the Llama-3.1-8B builds listed after the table are the clearest case). LM Studio's id for a build can also change: it was `meta-llama-3.1-8b-instruct` while one Llama-3.1 build was installed and became `meta-llama-3.1-8b-instruct@8bit` once a second was added, and back to `meta-llama-3.1-8b-instruct` once that second build was removed. Two 4-bit conversions of the same model also behaved differently. So re-check an id with `lms ls --json` before trusting it. So every row says the quant, and this table gives the exact source of each build as `lms ls --json` reports it (`path` and `quantization`). Use it, not the family name, to say which model a number belongs to.
 
+The builds are split by where they run. **MLX runs on Apple Silicon only; GGUF runs on any platform LM Studio runs on, Apple Silicon included.** A machine without Apple Silicon can only reproduce the GGUF rows, and an MLX number does not describe the GGUF build of the same model (the two Llama-3.2-3B 4-bit rows below differ: 19 of 38 bugs and 21 false alarms per run as MLX, 15 and 11 as GGUF). An id is not a format: the id in a row is what `lms ls` showed for the build in that row, and the same id on another machine may load a different build.
+
+**Apple Silicon only (MLX)**
+
 | Config | LM Studio id | Source (`path`) | Format | Quant | Size |
 |---|---|---|---|---|---|
 | `reasoning-qwen-7b-4bit` | `qwen2.5-coder-7b-instruct-mlx` | `lmstudio-community/Qwen2.5-Coder-7B-Instruct-MLX-4bit` | MLX | 4-bit | 4.30 GB |
 | `reasoning-qwen-7b-4bit-promptfile` | `qwen2.5-coder-7b-instruct-mlx` | `lmstudio-community/Qwen2.5-Coder-7B-Instruct-MLX-4bit` | MLX | 4-bit | 4.30 GB |
 | `reasoning-qwen-7b-4bit-promptfile-example` | `qwen2.5-coder-7b-instruct-mlx` | `lmstudio-community/Qwen2.5-Coder-7B-Instruct-MLX-4bit` | MLX | 4-bit | 4.30 GB |
 | `reasoning-qwen-7b-8bit` | `qwen2.5-coder-7b-instruct` | `mlx-community/Qwen2.5-Coder-7B-Instruct-8bit` | MLX | 8-bit | 8.10 GB |
-| `reasoning-seed-coder-8b` | `seed-coder-8b-instruct` | `unsloth/Seed-Coder-8B-Instruct-GGUF` (`Seed-Coder-8B-Instruct-Q4_K_S.gguf`) | GGUF | Q4_K_S | 4.84 GB |
 | `reasoning-llama-3.1-8b-4bit` | `meta-llama-3.1-8b-instruct` | `mlx-community/Meta-Llama-3.1-8B-Instruct-4bit` | MLX | 4-bit | 4.53 GB |
 | `reasoning-llama-3.2-3b-4bit` | `llama-3.2-3b-instruct@4bit` | `mlx-community/Llama-3.2-3B-Instruct-4bit` | MLX | 4-bit | 1.82 GB |
 | `reasoning-llama-3.2-3b-8bit` | `llama-3.2-3b-instruct@8bit` | `mlx-community/Llama-3.2-3B-Instruct-8bit` | MLX | 8-bit | 3.42 GB |
+
+**Any platform (GGUF)**
+
+| Config | LM Studio id | Source (`path`) | Format | Quant | Size |
+|---|---|---|---|---|---|
+| `reasoning-seed-coder-8b` | `seed-coder-8b-instruct` | `unsloth/Seed-Coder-8B-Instruct-GGUF` (`Seed-Coder-8B-Instruct-Q4_K_S.gguf`) | GGUF | Q4_K_S | 4.84 GB |
 | `reasoning-llama-3.2-3b-gguf` | `bartowski/llama-3.2-3b-instruct` | `bartowski/Llama-3.2-3B-Instruct-GGUF` (`Llama-3.2-3B-Instruct-Q4_K_S.gguf`) | GGUF | Q4_K_S | 1.93 GB |
 
 **Llama-3.1-8B builds measured and not kept.** Three builds of Llama-3.1-8B-Instruct were measured on the same cases, and only the one in the table above is kept, because the other two did not serve the reasoning stage: `mlx-community/Llama-3.1-8B-Instruct-4bit` (id `llama-3.1-8b-instruct`, 4-bit MLX, a different conversion from the kept one) answered 42 of 44 `lines` requests but skipped 4 findings for having no `claim`, found 17 of 38 bugs, and its live test failed the mechanics check (0 of 3 seeded bugs on `seeded-three`); `json` was 90.9% readable, under the 95% gate. `mlx-community/Meta-Llama-3.1-8B-Instruct-8bit` (id `meta-llama-3.1-8b-instruct@8bit`, 8-bit MLX, 8.54 GB) did not answer 10 of 44 `lines` requests (the model did not end its turn), took 1775 seconds against 1119, and failed the mechanics check on the timeouts. Their configs were removed; the numbers stay here so nobody re-measures them to find out. The first experiment's rows (2026-10-29) are labeled only as far as the row says: the Llama-3.1-8B row names no quant, and the Llama-3.2-3B GGUF row names no GGUF quant, so those two were not recorded and should be read as unlabeled.
+
+**Apple Silicon only (MLX)**
 
 | Model and build | lines: readable | json: readable | Bugs found of 38, lines / json | False alarms per run, lines / json | Route set |
 |---|---|---|---|---|---|
 | Qwen2.5-Coder-7B 4-bit MLX | 44 of 44 | 40 of 42 (2 unanswered) | 13 / 21 | 5 / 11 | `lines` |
 | Qwen2.5-Coder-7B 8-bit MLX | 44 of 44 | 42 of 44 | 13 / 23 | 5 / 8 | `lines` |
-| Seed-Coder-8B Q4_K_S GGUF | 44 of 44 | 32 of 44 | 24 / 16 | 32 / 13 | `lines` |
 | Llama-3.1-8B 4-bit MLX (`mlx-community/Meta-Llama-3.1-8B-Instruct-4bit`) | 42 of 42 (2 unanswered) | 40 of 42 (2 unanswered) | 21 / 18 | 26 / 37 | `lines` |
 | Llama-3.2-3B 4-bit MLX | 44 of 44 | 42 of 44 | 19 / 8 | 21 / 19 | `lines` |
 | Llama-3.2-3B 8-bit MLX | 44 of 44 | 26 of 40 (4 unanswered) | 19 / 12 | 15 / 11 | `lines` |
+
+**Any platform (GGUF)**
+
+| Model and build | lines: readable | json: readable | Bugs found of 38, lines / json | False alarms per run, lines / json | Route set |
+|---|---|---|---|---|---|
+| Seed-Coder-8B Q4_K_S GGUF | 44 of 44 | 32 of 44 | 24 / 16 | 32 / 13 | `lines` |
 | Llama-3.2-3B Q4_K_S GGUF | 44 of 44 | 26 of 42 (2 unanswered) | 15 / 7 | 11 / 9 | `lines` |
 
 What this does and does not show:
