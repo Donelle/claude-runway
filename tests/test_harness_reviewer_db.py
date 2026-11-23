@@ -145,9 +145,19 @@ class Helper(Sandboxed):
         first, _ = self.isolate()
         for variable in ALL_ENVS:
             os.environ.pop(variable)
-        with mock.patch.object(h.os, "getpid", return_value=os.getpid() + 1):
-            second, _ = self.isolate()
+        second, _ = self.isolate()
         self.assertNotEqual(first.parent, second.parent)
+
+    def test_the_folder_is_created_new_and_a_name_that_exists_is_never_reused(self):
+        # A name made from the time and the process id can be guessed: another user (or a link) could be there first, and the
+        # databases would then be written into a folder they own. The folder is created atomically, so one that exists is skipped.
+        with mock.patch.object(h.time, "strftime", return_value="20991231-235959"):
+            first, _ = self.isolate()
+            os.environ.pop(REVIEWER_DB_ENV)
+            second, _ = self.isolate()
+        self.assertTrue(first.parent.is_dir() and second.parent.is_dir())
+        self.assertNotEqual(first.parent, second.parent)
+        self.assertTrue(first.parent.name.startswith("claude-runway-harness-20991231-235959-"))
 
     def test_importing_the_module_does_not_touch_the_variables(self):
         env = {k: v for k, v in os.environ.items() if k not in ALL_ENVS}
@@ -201,6 +211,28 @@ class AStageScriptRecordsInTheThrowawayDatabase(tc.Isolated):
             self.assertNotIn("reviewer database", out)
             for variable in ALL_ENVS:
                 self.assertNotIn(variable, os.environ)
+
+
+class AFailedPreflightChoosesNothing(unittest.TestCase):
+    """A stage script whose preflight fails (here LM Studio is not reachable) must not announce a database or create a folder:
+    the run never starts, so a throwaway database named in its output would be one it never used."""
+
+    SCRIPTS = (("live_reasoning.py",), ("live_verifier.py",), ("live_classifier.py",), ("live_all_reviewers.py",),
+               ("live_routes.py", "--model", "some-model"))
+
+    def test_every_stage_script_says_nothing_and_creates_nothing_when_lmstudio_is_not_reachable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temp = Path(tmp).resolve()
+            env = {k: v for k, v in os.environ.items() if k not in ALL_ENVS}
+            env.update({"CLAUDE_RUNWAY_LMSTUDIO_URL": "http://127.0.0.1:9/v1", "TMP": str(temp), "TEMP": str(temp), "TMPDIR": str(temp)})
+            for script, *args in self.SCRIPTS:
+                with self.subTest(script=script):
+                    done = subprocess.run([sys.executable, "-I", str(REPO_ROOT / "harness" / script), *args], capture_output=True,
+                                          text=True, env=env, cwd=REPO_ROOT, check=False, timeout=120)
+                    output = done.stdout + done.stderr
+                    self.assertIn("not reachable", output)
+                    self.assertNotIn("reviewer database", output)
+                    self.assertEqual(sorted(temp.iterdir()), [], "a failed preflight left a folder in the temp folder")
 
 
 class TheRunnerSetsItForEveryScriptItStarts(tl.Folder):

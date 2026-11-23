@@ -222,9 +222,9 @@ def main(argv=None) -> int:
     if not classifiers:
         raise SystemExit("no active reviewer with the `classifier` type to run: add one to the config, or leave --config out and pass --model.")
     rubric = rubric_for(args)
-    h.isolate_reviewer_db()  # past every no-model exit: from here the run records
     print(summarise(args))
     h.preflight_reviewers(classifiers, args)
+    h.isolate_reviewer_db()  # past every exit that runs no review, the preflight included: from here the run records
     base_url = h.load_server().lmstudio_base_url()
     before = h.loaded_models(base_url)
     recorder = h.Recorder()

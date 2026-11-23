@@ -13,7 +13,6 @@ Stdlib-only (unittest, no pytest).
 import contextlib
 import io
 import json
-import os
 import subprocess
 import sys
 import tempfile
@@ -347,8 +346,9 @@ class LiveTarget(Folder):
 class RunTypeOption(Folder):
     def run_script(self, module, *argv) -> tuple:
         out, err = io.StringIO(), io.StringIO()
-        # `main` sets the reviewer-database variables for what it runs; restore the environment so they do not leak.
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), unittest.mock.patch.dict(os.environ):
+        # `main` would make a throwaway reviewer-database folder and set the variables for what it runs: neither belongs to these
+        # tests (tests/test_harness_reviewer_db.py covers it), so the helper is a no-op here and nothing is left in the temp folder.
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), unittest.mock.patch.object(h, "isolate_reviewer_db"):
             try:
                 code = module.main(list(argv))
             except SystemExit as exc:
@@ -457,7 +457,7 @@ class AllReviewersPipeline(Folder):
             for patch in patches:
                 stack.enter_context(patch)
             stack.enter_context(contextlib.redirect_stdout(out))
-            stack.enter_context(unittest.mock.patch.dict(os.environ))  # `main` sets the reviewer-database variables: do not leak them
+            stack.enter_context(unittest.mock.patch.object(h, "isolate_reviewer_db"))  # no throwaway folder, no variables set: see test_harness_reviewer_db.py
             code = live_all_reviewers.main(argv)
         return code, out.getvalue(), calls
 
