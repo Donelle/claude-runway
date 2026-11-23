@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Tests for `runway_defaults.isolate_reviewer_db`: a harness run records in a throwaway reviewer database unless the caller
-chose one, and never in the real one under `~/.claude`.
+"""Tests for `harness_lib.isolate_reviewer_db`: a harness run records in a throwaway reviewer database (and metrics and
+savings database) unless the caller chose one, and never in the real ones under `~/.claude`.
 
 Stdlib-only (unittest), no network, no LM Studio: LM Studio's REST API is `tests/fake_lmstudio.py` and the model's answer is a
 stub, as in `test_harness_classifier.py`, whose set-up this reuses. The home folder is a temporary one, so "the default
@@ -13,6 +13,7 @@ import contextlib
 import io
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -25,32 +26,41 @@ for _directory in (LIVE_TESTS, REPO_ROOT / "harness", REPO_ROOT / "libs", REPO_R
     if str(_directory) not in sys.path:
         sys.path.insert(0, str(_directory))
 
+import harness_lib as h  # noqa: E402
 import run_live_tests as rlt  # noqa: E402
-import runway_defaults  # noqa: E402
 import test_harness_classifier as tc  # noqa: E402
 import test_harness_live_tests as tl  # noqa: E402
-from runway_defaults import REVIEWER_DB_ENV, isolate_reviewer_db  # noqa: E402
+from harness_lib import REVIEWER_DB_ENV, SIDE_STORE_ENVS, isolate_reviewer_db  # noqa: E402
 
+METRICS_ENV, SAVINGS_ENV = (variable for variable, _ in SIDE_STORE_ENVS)
+ALL_ENVS = (REVIEWER_DB_ENV, METRICS_ENV, SAVINGS_ENV)
 DEFAULT_DB = Path(".claude") / "claude-runway" / "codebase-reviewer.db"
 
 
+def sandbox_home(case: unittest.TestCase, folder: Path) -> Path:
+    """Make `Path.home()` a folder of the test's own, so the real default paths can be asserted never to be created."""
+    home = folder / "home"
+    home.mkdir()
+    patcher = mock.patch.object(Path, "home", return_value=home)
+    patcher.start()
+    case.addCleanup(patcher.stop)
+    return home
+
+
 class Sandboxed(unittest.TestCase):
-    """A home folder that is a temp folder, and the reviewer-database variable unset: what a harness run starts from."""
+    """A home folder that is a temp folder, and the three variables unset: what a harness run starts from."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.dir = Path(self._tmp.name).resolve()
-        self.home = self.dir / "home"
-        self.home.mkdir()
-        # `os.environ` is restored at cleanup, so the variable the helper sets does not leak into other tests.
+        # `os.environ` is restored at cleanup, so what the helper sets does not leak into other tests.
         patcher = mock.patch.dict(os.environ)
         patcher.start()
         self.addCleanup(patcher.stop)
-        os.environ.pop(REVIEWER_DB_ENV, None)
-        home = mock.patch.object(Path, "home", return_value=self.home)
-        home.start()
-        self.addCleanup(home.stop)
+        for variable in ALL_ENVS:
+            os.environ.pop(variable, None)
+        self.home = sandbox_home(self, self.dir)
 
     def isolate(self) -> tuple:
         """`(path, announced)`: what the helper returns, and what it printed."""
@@ -75,6 +85,18 @@ class Helper(Sandboxed):
         self.assertNotEqual(path, self.home / DEFAULT_DB)
         self.assertFalse((self.home / ".claude").exists())
 
+    def test_the_metrics_and_savings_databases_move_with_it_into_the_same_folder(self):
+        path, _ = self.isolate()
+        self.assertEqual(Path(os.environ[METRICS_ENV]), path.parent / "metrics.db")
+        self.assertEqual(Path(os.environ[SAVINGS_ENV]), path.parent / "savings.db")
+
+    def test_a_metrics_or_savings_path_the_caller_set_is_kept_in_throwaway_mode(self):
+        mine = str(self.dir / "mine-metrics.db")
+        os.environ[METRICS_ENV] = mine
+        path, _ = self.isolate()
+        self.assertEqual(os.environ[METRICS_ENV], mine)
+        self.assertEqual(Path(os.environ[SAVINGS_ENV]), path.parent / "savings.db")
+
     def test_a_callers_path_is_kept_and_is_what_resolve_db_path_returns(self):
         import reviewer_db_lib
         mine = self.dir / "mine" / "r.db"
@@ -84,16 +106,32 @@ class Helper(Sandboxed):
         self.assertEqual(os.environ[REVIEWER_DB_ENV], str(mine))
         self.assertEqual(reviewer_db_lib.resolve_db_path(), mine)
 
+    def test_a_caller_who_chose_the_reviewer_database_leaves_the_metrics_and_savings_ones_alone(self):
+        os.environ[REVIEWER_DB_ENV] = str(self.dir / "mine.db")
+        self.isolate()
+        self.assertNotIn(METRICS_ENV, os.environ)
+        self.assertNotIn(SAVINGS_ENV, os.environ)
+
+    def test_a_relative_path_is_anchored_at_the_home_folder_as_the_reviewer_reads_it(self):
+        import reviewer_db_lib
+        os.environ[REVIEWER_DB_ENV] = str(Path("runs") / "x.db")
+        path, said = self.isolate()
+        self.assertEqual(path, self.home / "runs" / "x.db")
+        self.assertEqual(path, reviewer_db_lib.resolve_db_path())
+        self.assertIn(str(self.home / "runs" / "x.db"), said[0])
+
     def test_an_empty_variable_counts_as_unset_as_resolve_db_path_treats_it(self):
         os.environ[REVIEWER_DB_ENV] = ""
         path, _ = self.isolate()
         self.assertEqual(os.environ[REVIEWER_DB_ENV], str(path))
         self.assertEqual(path.parent.parent, Path(tempfile.gettempdir()))
 
-    def test_the_chosen_path_is_announced_in_both_cases(self):
+    def test_the_chosen_path_and_the_log_folder_are_announced_in_both_cases(self):
+        import reviewer_db_lib
         path, said = self.isolate()
         self.assertEqual(len(said), 1)
         self.assertIn(str(path), said[0])
+        self.assertIn(str(reviewer_db_lib.log_dir(path)), said[0])
         self.assertIn("throwaway", said[0])
         mine = self.dir / "mine.db"
         os.environ[REVIEWER_DB_ENV] = str(mine)
@@ -105,30 +143,31 @@ class Helper(Sandboxed):
 
     def test_two_runs_get_two_folders(self):
         first, _ = self.isolate()
-        os.environ.pop(REVIEWER_DB_ENV)
-        with mock.patch.object(runway_defaults.os, "getpid", return_value=os.getpid() + 1):
+        for variable in ALL_ENVS:
+            os.environ.pop(variable)
+        with mock.patch.object(h.os, "getpid", return_value=os.getpid() + 1):
             second, _ = self.isolate()
         self.assertNotEqual(first.parent, second.parent)
 
-    def test_importing_the_module_does_not_touch_the_variable(self):
-        import importlib
-        importlib.reload(runway_defaults)
-        self.assertNotIn(REVIEWER_DB_ENV, os.environ)
+    def test_importing_the_module_does_not_touch_the_variables(self):
+        env = {k: v for k, v in os.environ.items() if k not in ALL_ENVS}
+        code = ("import sys, os; sys.path[:0] = [r'%s', r'%s']; import harness_lib; "
+                "print([v for v in %r if v in os.environ])" % (REPO_ROOT / "harness", REPO_ROOT / "libs", ALL_ENVS))
+        done = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, env=env, check=False)
+        self.assertEqual((done.returncode, done.stdout.strip()), (0, "[]"), done.stderr)
 
 
 class AStageScriptRecordsInTheThrowawayDatabase(tc.Isolated):
-    """The ticket's check: a stage script run with a fake LM Studio and the variable unset leaves the default path alone."""
+    """The ticket's check: a stage script run with a fake LM Studio and the variables unset leaves the default paths alone."""
 
     def setUp(self):
         super().setUp()
-        os.environ.pop(REVIEWER_DB_ENV)  # `Isolated` pins it to a temp file; this test is about it being unset
-        self.home = self.dir / "home"
-        self.home.mkdir()
-        home = mock.patch.object(Path, "home", return_value=self.home)
-        home.start()
-        self.addCleanup(home.stop)
+        # `Isolated` pins all three to temp files; these tests are about what a run does when they are not set.
+        for variable in ALL_ENVS:
+            os.environ.pop(variable)
+        self.home = sandbox_home(self, self.dir)
 
-    def test_a_run_with_the_variable_unset_writes_only_under_the_system_temp_folder(self):
+    def test_a_run_with_the_variables_unset_writes_only_under_the_system_temp_folder(self):
         self.lmstudio(lambda client, model, system, content: tc.perfect_probability(content))
         code, out = self.run_main("--config", self.config(), "--runs", "1")
         self.assertEqual(code, 0, out)
@@ -136,20 +175,23 @@ class AStageScriptRecordsInTheThrowawayDatabase(tc.Isolated):
         self.addCleanup(shutil.rmtree, throwaway.parent, True)
         self.assertEqual(throwaway.parent.parent, Path(tempfile.gettempdir()))
         self.assertTrue(throwaway.is_file(), "the run recorded nothing in the throwaway database")
+        # The summary event a closed run writes went to the throwaway metrics database, not the shared one.
+        self.assertTrue((throwaway.parent / "metrics.db").is_file(), "the run's summary event did not reach the throwaway metrics database")
         self.assertIn(f"reviewer database: {throwaway}", out)  # said at the start so the logs can be found
-        # The real default, and the folder around it, were never created.
-        self.assertFalse((self.home / DEFAULT_DB).exists())
+        # Nothing was created under the home folder: no default database, no metrics database, no log folder.
         self.assertFalse((self.home / ".claude").exists())
-        self.assertFalse((self.home / ".claude" / "claude-runway" / "codebase-reviewer-logs").exists())
 
-    def test_a_run_with_the_variable_set_records_where_the_caller_said(self):
+    def test_a_run_with_the_reviewer_variable_set_records_where_the_caller_said(self):
         mine = self.dir / "mine" / "r.db"
         os.environ[REVIEWER_DB_ENV] = str(mine)
+        os.environ[METRICS_ENV] = str(self.dir / "mine-metrics.db")
         self.lmstudio(lambda client, model, system, content: tc.perfect_probability(content))
         code, out = self.run_main("--config", self.config(), "--runs", "1")
         self.assertEqual(code, 0, out)
         self.assertTrue(mine.is_file())
+        self.assertTrue((self.dir / "mine-metrics.db").is_file())
         self.assertEqual(os.environ[REVIEWER_DB_ENV], str(mine))
+        self.assertNotIn(SAVINGS_ENV, os.environ)
         self.assertFalse((self.home / ".claude").exists())
 
     def test_the_no_model_exits_neither_announce_nor_choose_a_database(self):
@@ -157,7 +199,8 @@ class AStageScriptRecordsInTheThrowawayDatabase(tc.Isolated):
             code, out = self.run_main(*argv)
             self.assertEqual(code, 0)
             self.assertNotIn("reviewer database", out)
-            self.assertNotIn(REVIEWER_DB_ENV, os.environ)
+            for variable in ALL_ENVS:
+                self.assertNotIn(variable, os.environ)
 
 
 class TheRunnerSetsItForEveryScriptItStarts(tl.Folder):
@@ -168,7 +211,8 @@ class TheRunnerSetsItForEveryScriptItStarts(tl.Folder):
         patcher = mock.patch.dict(os.environ)
         patcher.start()
         self.addCleanup(patcher.stop)
-        os.environ.pop(REVIEWER_DB_ENV, None)
+        for variable in ALL_ENVS:
+            os.environ.pop(variable, None)
 
     def run_runner(self) -> tuple:
         tl.write_config(self.dir, "one", ["verifier"])
@@ -176,7 +220,7 @@ class TheRunnerSetsItForEveryScriptItStarts(tl.Folder):
         seen: list = []
 
         def run_script(config, runs, timeout, log, env):
-            seen.append(env.get(REVIEWER_DB_ENV))
+            seen.append(tuple(env.get(variable) for variable in ALL_ENVS))
             return 0, "loaded before: ['x']\nloaded after:  ['x']\n"
 
         out = io.StringIO()
@@ -185,19 +229,21 @@ class TheRunnerSetsItForEveryScriptItStarts(tl.Folder):
             rlt.main(["--skip-checks"])
         return seen, out.getvalue()
 
-    def test_every_config_gets_the_same_throwaway_database_under_the_temp_folder(self):
+    def test_every_config_gets_the_same_throwaway_databases_under_the_temp_folder(self):
         seen, out = self.run_runner()
         self.assertEqual(len(seen), 2)
         self.assertEqual(seen[0], seen[1])
-        self.assertEqual(Path(seen[0]).parent.parent, Path(tempfile.gettempdir()))
-        self.addCleanup(shutil.rmtree, Path(seen[0]).parent, True)
-        self.assertIn(f"reviewer database: {seen[0]}", out)
+        reviewer, metrics, savings = (Path(p) for p in seen[0])
+        self.addCleanup(shutil.rmtree, reviewer.parent, True)
+        self.assertEqual(reviewer.parent.parent, Path(tempfile.gettempdir()))
+        self.assertEqual((metrics.parent, savings.parent), (reviewer.parent, reviewer.parent))
+        self.assertIn(f"reviewer database: {reviewer}", out)
 
     def test_a_callers_path_reaches_every_script_unchanged(self):
         mine = str(self.dir / "mine.db")
         os.environ[REVIEWER_DB_ENV] = mine
         seen, _ = self.run_runner()
-        self.assertEqual(seen, [mine, mine])
+        self.assertEqual(seen, [(mine, None, None)] * 2)
 
     def test_a_run_that_cannot_start_chooses_no_database(self):
         tl.write_config(self.dir, "one", ["verifier"])
@@ -206,7 +252,8 @@ class TheRunnerSetsItForEveryScriptItStarts(tl.Folder):
             code = rlt.main(["--skip-checks"])
         self.assertEqual(code, rlt.EXIT_NOT_RUN)
         self.assertNotIn("reviewer database", out.getvalue())
-        self.assertNotIn(REVIEWER_DB_ENV, os.environ)
+        for variable in ALL_ENVS:
+            self.assertNotIn(variable, os.environ)
 
 
 if __name__ == "__main__":

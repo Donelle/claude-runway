@@ -39,9 +39,6 @@ for _directory in (REPO_ROOT / "libs", Path(__file__).resolve().parent):
         sys.path.insert(0, str(_directory))
 
 from cases import Case, bug_line, line_of  # noqa: E402
-# Re-exported for the live_*.py scripts: each calls `h.isolate_reviewer_db()` once its early exits are past, so a run records in a
-# throwaway reviewer database rather than the real one under ~/.claude unless the caller chose a path.
-from runway_defaults import isolate_reviewer_db  # noqa: E402, F401
 
 # The development model for reviewers and verifiers (see harness/README.md, "Codebase-reviewer models"): the -Instruct build,
 # since the base build never ends its turn.
@@ -57,6 +54,45 @@ DEFAULT_CLASSIFIER_LENS = "You check whether a reported defect falls under a cat
 DEFAULT_STAGE_LENSES = {"verifier": DEFAULT_VERIFIER_LENS, "classifier": DEFAULT_CLASSIFIER_LENS}
 # Reported lines are the model's reading of a diff, and drift by a few lines.
 LINE_TOLERANCE = 3
+
+# The variables that decide where a recorded run goes. libs/reviewer_db_lib.py reads the first and owns the real default
+# (~/.claude/claude-runway/codebase-reviewer.db); closing a run also writes a summary event to libs/metrics_lib.py's database and,
+# with CLAUDE_RUNWAY_TRACK_SAVINGS on, a record to libs/savings_ledger.py's (both under ~/.claude/claude-runway/ by default).
+REVIEWER_DB_ENV = "CLAUDE_RUNWAY_CODEBASE_REVIEWER_DB"
+SIDE_STORE_ENVS = (("CLAUDE_RUNWAY_METRICS_DB", "metrics.db"), ("CLAUDE_RUNWAY_SAVINGS_DB", "savings.db"))
+
+
+def isolate_reviewer_db(announce=print) -> Path:
+    """Point this process, and every child it starts, at a throwaway reviewer database unless the caller chose one.
+
+    The harness records its runs on purpose (that is how models are compared), but a test run must not write into the
+    reviewer's real database under `~/.claude` and mix test rows with real review history. So when
+    `CLAUDE_RUNWAY_CODEBASE_REVIEWER_DB` is unset (or empty, as `reviewer_db_lib.resolve_db_path` treats it) it is set to a new
+    folder under the system temp folder, and so are the metrics and savings databases a closed run also writes to
+    (`CLAUDE_RUNWAY_METRICS_DB`, `CLAUDE_RUNWAY_SAVINGS_DB`), each unless the caller set that one. A caller who set the reviewer
+    variable, to the real database or any other path, chose where the run records: nothing is changed then, the two side stores
+    included, which stay wherever the caller's environment puts them.
+
+    Called by each entry point once its no-model exits are past, never when this module is imported. It writes `os.environ`
+    itself, not a copy, so a script started afterwards inherits it. The folder is not created here (the databases and the
+    reviewer's log folder create their parents) and never deleted, since its path, announced here, is how the logs are found
+    after the run. Returns the reviewer database path as `reviewer_db_lib.resolve_db_path()` reads it, a relative one anchored at
+    the home folder."""
+    from reviewer_db_lib import log_dir, resolve_db_path
+
+    if os.environ.get(REVIEWER_DB_ENV):
+        path = resolve_db_path()
+        announce(f"reviewer database: {path} (from {REVIEWER_DB_ENV})")
+        return path
+    folder = Path(tempfile.gettempdir()) / f"claude-runway-harness-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
+    os.environ[REVIEWER_DB_ENV] = str(folder / "codebase-reviewer.db")
+    for variable, name in SIDE_STORE_ENVS:
+        if not os.environ.get(variable):
+            os.environ[variable] = str(folder / name)
+    path = resolve_db_path()
+    announce(f"reviewer database: {path} (throwaway, with its metrics and savings databases; set {REVIEWER_DB_ENV} to record "
+             f"into one you keep). The reviewer's logs are in {log_dir(path)}")
+    return path
 
 
 # ---------------------------------------------------------------------------

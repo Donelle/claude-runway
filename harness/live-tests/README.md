@@ -24,7 +24,7 @@ Exit status: `0` every check passed, `1` a check failed (a preflight failure inc
 was named but cannot be run), `3` nothing was run (LM Studio not reachable, or a model the configs name is not listed).
 A skipped run is not a pass. The full output of every run is kept in `logs/` (not committed).
 
-The runs the scripts make are recorded in a **throwaway** reviewer database under the system temp folder, not in `~/.claude`: the runner picks one for the whole invocation, shared by every config it runs, and prints `reviewer database: <path>` (the reviewer's own logs are beside it). Set `CLAUDE_RUNWAY_CODEBASE_REVIEWER_DB` first to record into a database you keep. See [Where a run is recorded](../README.md#where-a-run-is-recorded).
+The runs the scripts make are recorded in a **throwaway** reviewer database under the system temp folder, not in `~/.claude`: the runner picks one for the whole invocation, after its checks and shared by every config it runs, and prints `reviewer database: <path>` (its metrics and savings databases and the reviewer's own logs are beside it). Set `CLAUDE_RUNWAY_CODEBASE_REVIEWER_DB` first to record into a database you keep. See [Where a run is recorded](../README.md#where-a-run-is-recorded).
 
 ## How a config becomes a test
 
