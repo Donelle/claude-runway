@@ -434,7 +434,7 @@ Split by what runs where (see "Which build runs where"). A build in a table here
 | **Reviewer**   | `bartowski/Llama-3.2-3B-Instruct-GGUF`            | 3B         | Q4_K_S            | \~1.9 GB         | not recorded      |
 | **Classifier** | `lmstudio-community/Qwen2.5-Coder-14B-Instruct-GGUF` | 14B     | Q4_K_M            | \~8.4 GB         | ChatML            |
 
-The DeepSeek verifier builds above are listed from their MLX repositories, and the harness's verifier configs (`verifier-mlx-...`) were measured on MLX builds. No GGUF verifier build has recorded results, so on a non-Apple machine a verifier needs measuring before it is trusted.
+The DeepSeek verifier builds above are listed from their MLX repositories. Of the harness's verifier configs, the two DeepSeek-Qwen ones (`verifier-mlx-...`) were measured on MLX builds and the DeepSeek-Llama one (`verifier-gguf-deepseek-llama-8b`) on a GGUF build, with mechanics checks only and no recorded quant. No GGUF verifier has a quality baseline, so on a non-Apple machine a verifier needs measuring before it is trusted.
 
 ### Quick Verification Test
 

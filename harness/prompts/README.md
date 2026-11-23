@@ -71,13 +71,13 @@ The builds are split by where they run. **MLX runs on Apple Silicon only; GGUF r
 | `reasoning-gguf-seed-coder-8b` | `seed-coder-8b-instruct` | `unsloth/Seed-Coder-8B-Instruct-GGUF` (`Seed-Coder-8B-Instruct-Q4_K_S.gguf`) | GGUF | Q4_K_S | 4.84 GB |
 | `reasoning-gguf-llama-3.2-3b` | `bartowski/llama-3.2-3b-instruct` | `bartowski/Llama-3.2-3B-Instruct-GGUF` (`Llama-3.2-3B-Instruct-Q4_K_S.gguf`) | GGUF | Q4_K_S | 1.93 GB |
 
-**Verifier builds (Apple Silicon only, MLX).** The verifier configs were measured on MLX builds (confirmed 2026-11-22); `lms ls --json` paths were not recorded for them, so the table gives only the id and the format.
+**Verifier builds.** The two DeepSeek-Qwen verifier configs were measured on MLX builds (Apple Silicon only) and the DeepSeek-Llama one on a GGUF build (any platform), as confirmed on 2026-11-22. `lms ls --json` paths and the GGUF quant were not recorded for them, so the table gives only the id and the format.
 
 | Config | LM Studio id | Format |
 |---|---|---|
 | `verifier-mlx-deepseek-7b` | `deepseek-r1-distill-qwen-7b@4bit` | MLX |
 | `verifier-mlx-deepseek-7b-8bit` | `deepseek-r1-distill-qwen-7b@8bit` | MLX |
-| `verifier-mlx-deepseek-llama-8b` | `deepseek-r1-distill-llama-8b` | MLX |
+| `verifier-gguf-deepseek-llama-8b` | `deepseek-r1-distill-llama-8b` | GGUF |
 
 **Llama-3.1-8B builds measured and not kept.** Three builds of Llama-3.1-8B-Instruct were measured on the same cases, and only the one in the table above is kept, because the other two did not serve the reasoning stage: `mlx-community/Llama-3.1-8B-Instruct-4bit` (id `llama-3.1-8b-instruct`, 4-bit MLX, a different conversion from the kept one) answered 42 of 44 `lines` requests but skipped 4 findings for having no `claim`, found 17 of 38 bugs, and its live test failed the mechanics check (0 of 3 seeded bugs on `seeded-three`); `json` was 90.9% readable, under the 95% gate. `mlx-community/Meta-Llama-3.1-8B-Instruct-8bit` (id `meta-llama-3.1-8b-instruct@8bit`, 8-bit MLX, 8.54 GB) did not answer 10 of 44 `lines` requests (the model did not end its turn), took 1775 seconds against 1119, and failed the mechanics check on the timeouts. Their configs were removed; the numbers stay here so nobody re-measures them to find out. The first experiment's rows (2026-10-29) are labeled only as far as the row says: the Llama-3.1-8B row names no quant, and the Llama-3.2-3B GGUF row names no GGUF quant, so those two were not recorded and should be read as unlabeled.
 
