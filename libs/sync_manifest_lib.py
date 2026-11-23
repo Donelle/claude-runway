@@ -62,7 +62,32 @@ from qdrant_ingest_lib import (
 UNVERIFIED_HASH = "unverified"
 
 
-def load_manifest(repo: Path, preserved_out: Optional[set] = None) -> dict:
+def _read_text_retrying(path: Path, sleep: Callable[[float], None]) -> str:
+    """
+    `path`'s text (UTF-8), retrying a PermissionError up to _REPLACE_ATTEMPTS
+    times in all with _REPLACE_RETRY_SECONDS between attempts.
+
+    On Windows, opening the manifest at the instant a writer's os.replace swaps
+    it in fails with a sharing violation (PermissionError) even though the file
+    is fine a moment later; the writer retries its side of the same collision.
+    Only PermissionError is retried: a missing file or a decode problem will not
+    change by waiting. The last PermissionError, or any other error, is raised.
+    """
+    for attempt in range(1, _REPLACE_ATTEMPTS + 1):
+        try:
+            return path.read_text(encoding="utf-8")
+        except PermissionError:
+            if attempt == _REPLACE_ATTEMPTS:
+                raise
+            sleep(_REPLACE_RETRY_SECONDS)
+    raise AssertionError("unreachable")  # pragma: no cover - the loop returns or raises
+
+
+def load_manifest(
+    repo: Path,
+    preserved_out: Optional[set] = None,
+    sleep: Optional[Callable[[float], None]] = None,
+) -> dict:
     """
     The {file: content hash} map from the repo's sync manifest, or {} when
     there is no usable manifest -- in which case every file counts as changed
@@ -82,7 +107,13 @@ def load_manifest(repo: Path, preserved_out: Optional[set] = None) -> dict:
     {file: hash} shape is ignored on purpose: it records file content but not
     how files were chunked, so trusting it after the chunker changed would make
     cb_indexer_sync_repo report "No changes" and keep serving the old chunks indefinitely.
+
+    A read that fails with PermissionError is retried (see _read_text_retrying)
+    before giving up, so a save landing mid-read does not cost a full rebuild;
+    `sleep` is injectable for tests and defaults to time.sleep, looked up at
+    call time. A persistent PermissionError still ends in {}.
     """
+    sleep = sleep if sleep is not None else time.sleep
     manifest_path = repo / MANIFEST_FILENAME
     if manifest_path.exists():
         try:
@@ -91,7 +122,7 @@ def load_manifest(repo: Path, preserved_out: Optional[set] = None) -> dict:
             # alongside the others because it is NOT a json.JSONDecodeError --
             # uncaught, it would propagate out of a sync and fail the tool call
             # rather than degrading to "no manifest, treat everything as new."
-            data = json.loads(manifest_path.read_text(encoding="utf-8"))
+            data = json.loads(_read_text_retrying(manifest_path, sleep))
         except (json.JSONDecodeError, UnicodeDecodeError, OSError):
             return {}
         files = parse_manifest(data)
@@ -119,9 +150,12 @@ def save_manifest(repo: Path, manifest: dict, preserved=()) -> None:
     _atomic_write_text(repo / MANIFEST_FILENAME, manifest_to_json(manifest, preserved))
 
 
-# os.replace onto the manifest can fail with PermissionError on Windows while
-# another process has it open (a load_manifest that is reading it, which takes
-# no lock). Those reads are short, so a few short retries ride them out.
+# Windows refuses with PermissionError when a reader and a writer collide on the
+# manifest, from either side: os.replace onto it fails while another process has
+# it open (a load_manifest that is reading it, which takes no lock), and opening
+# it for reading fails while a replace is in flight. Both are short, so a few
+# short retries ride them out. They bound the writer's replace (in
+# _atomic_write_text) and the reader's read (in _read_text_retrying).
 _REPLACE_ATTEMPTS = 5
 _REPLACE_RETRY_SECONDS = 0.05
 

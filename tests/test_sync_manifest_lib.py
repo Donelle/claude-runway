@@ -7,6 +7,7 @@ both callers use the very same functions (so the format cannot drift).
     .venv/bin/python -m unittest discover -s tests
 """
 
+import errno
 import json
 import os
 import sys
@@ -69,6 +70,69 @@ class LoadManifest(ManifestFileTestCase):
         self.assertEqual(files, {"a.py": "h1"})
         self.assertEqual(preserved, {"kept.py"})
         self.assertEqual(len(reads), 1)
+
+    def _read_raising(self, error):
+        """Patch Path.read_text so reads of the manifest raise `error` (a
+        callable taking the attempt number and returning an exception to raise,
+        or None to read for real). Returns the list of attempt paths."""
+        attempts: list = []
+        real_read_text = Path.read_text
+
+        def fake(path, *a, **kw):
+            if path.name != MANIFEST_FILENAME:
+                return real_read_text(path, *a, **kw)
+            attempts.append(path)
+            exc = error(len(attempts))
+            if exc is not None:
+                raise exc
+            return real_read_text(path, *a, **kw)
+
+        patcher = mock.patch.object(Path, "read_text", fake)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return attempts
+
+    def test_a_transient_permission_error_is_retried_then_the_manifest_is_read(self):
+        # Windows: a read landing on a writer's os.replace gets a sharing
+        # violation, and the file is fine a moment later.
+        lib.save_manifest(self.repo, {"a.py": "h1"}, preserved={"kept.py"})
+        attempts = self._read_raising(
+            lambda n: PermissionError(errno.EACCES, "in use") if n <= 2 else None
+        )
+        sleeps: list = []
+        preserved: set = set()
+        files = lib.load_manifest(self.repo, preserved, sleep=sleeps.append)
+        self.assertEqual(files, {"a.py": "h1"})
+        self.assertEqual(preserved, {"kept.py"})
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(sleeps, [lib._REPLACE_RETRY_SECONDS] * 2)
+
+    def test_a_lasting_permission_error_is_an_empty_map_after_the_retries(self):
+        lib.save_manifest(self.repo, {"a.py": "h1"}, preserved={"kept.py"})
+        attempts = self._read_raising(lambda n: PermissionError(errno.EACCES, "denied"))
+        sleeps: list = []
+        preserved: set = set()
+        self.assertEqual(lib.load_manifest(self.repo, preserved, sleep=sleeps.append), {})
+        self.assertEqual(preserved, set())
+        self.assertEqual(len(attempts), lib._REPLACE_ATTEMPTS)
+        self.assertEqual(len(sleeps), lib._REPLACE_ATTEMPTS - 1)
+
+    def test_bad_content_is_not_retried(self):
+        # Retrying cannot fix a manifest a release before atomic saves left truncated.
+        self.path.write_bytes(b"{not json")
+        attempts = self._read_raising(lambda n: None)
+        sleeps: list = []
+        self.assertEqual(lib.load_manifest(self.repo, sleep=sleeps.append), {})
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(sleeps, [])
+
+    def test_a_manifest_that_vanishes_after_the_exists_check_is_not_retried(self):
+        lib.save_manifest(self.repo, {"a.py": "h1"})
+        attempts = self._read_raising(lambda n: FileNotFoundError(errno.ENOENT, "gone"))
+        sleeps: list = []
+        self.assertEqual(lib.load_manifest(self.repo, sleep=sleeps.append), {})
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(sleeps, [])
 
     def test_the_preserved_set_is_left_empty_when_the_map_is(self):
         self.path.write_text(json.dumps({"a.py": "h1"}), encoding="utf-8")  # old format
