@@ -56,6 +56,15 @@ LM Studio's address comes from `libs/runway_defaults.py` (`CLAUDE_RUNWAY_LMSTUDI
 
 Which model to use per hardware tier is not settled here: see "codebase-reviewer harness: compare local models per hardware tier through Pi and name a default caller and reviewer per tier in the kit's doc". The sizes below are the weights only. Only the row marked "run" has been tried; the rest are candidates. MLX builds run on Apple Silicon only (see the harness README's "Which build runs where"), so the candidates here are the builds that run on any platform.
 
+**Machines the comparison is run on** (recorded 2026-11-23; the caller and the reviewer are loaded at the same time, so both must fit in what the GPU can use, which on a Mac is less than the unified memory):
+
+| Machine | CPU / GPU | Memory | OS | Builds it runs |
+| :-- | :-- | :-- | :-- | :-- |
+| MacBook Pro (Mac17,6) | Apple M5 Max, 18 cores (6 Super, 12 Performance), 40-core GPU | 48 GB unified | macOS 27.2.1 | MLX (`safetensors` in `lms ls`); GGUF also runs under llama.cpp |
+| Windows desktop (the maintainer's) | Intel Core Ultra 9 285K, NVIDIA RTX 5090 | 191 GB RAM, 32 GB VRAM | Windows | GGUF |
+
+`score_run.py` turns a run's JSON summary into one table row (`found=2/3 readable=yes turns=2 seconds=9.5 ...`), so every run is scored the same way: `.venv/bin/python harness/pi/pi_driver.py ... > run.json`, then `.venv/bin/python harness/pi/score_run.py run.json`.
+
 | Tier | Reference machine | Weights that fit | Candidates installed on the maintainer's machine | Status |
 | :-- | :-- | :-- | :-- | :-- |
 | Small | 24 GB RAM, no large GPU | 3 to 9 GB | `seed-coder-8b-instruct` 4.8 GB | run as the **reviewer** (below) |
