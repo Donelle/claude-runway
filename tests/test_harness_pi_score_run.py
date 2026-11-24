@@ -62,9 +62,10 @@ class ParseTests(unittest.TestCase):
         self.assertEqual({f.file for f in findings}, {"backup.py"})
 
     def test_a_finding_with_no_line_gets_line_zero_and_matches_nothing(self):
-        findings = s.parse_review_text("## other (1)\n- backup.py [general] vague\n")
+        text = "Reasoning review: 1 finding(s)\n\n## other (1)\n- backup.py [general] vague\n"
+        findings = s.parse_review_text(text)
         self.assertEqual(findings[0].line_start, 0)
-        score = s.score_summary({"review_text": "## other (1)\n- backup.py [general] vague\n"})
+        score = s.score_summary({"review_text": text})
         self.assertEqual(score.found, [])
         self.assertEqual(len(score.other), 1)
 
@@ -90,6 +91,15 @@ class ScoreTests(unittest.TestCase):
         score = s.score_summary({"review_text": ""})
         self.assertFalse(score.readable)
         self.assertEqual(len(score.missed), 3)
+
+    def test_a_caller_error_or_a_timeout_is_not_a_review(self):
+        # What Pi puts in the tool result when the caller's arguments were wrong, and when the reviewer was too slow.
+        for text in ('Validation failed for tool "mcp__reviewer__review":\n  - type: missing', "MCP request timed out after 60000ms"):
+            with self.subTest(text=text[:30]):
+                score = s.score_summary({"review_text": text})
+                self.assertFalse(score.readable)
+                self.assertEqual(len(score.missed), 3)
+                self.assertIn("no review ran", score.note)
 
     def test_a_refusal_is_not_scored_as_a_review(self):
         score = s.score_summary({"review_text": "Error: the reviewers file is invalid"})

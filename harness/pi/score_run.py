@@ -31,6 +31,8 @@ FINDING_LINE = re.compile(r"^- (?P<file>\(unknown file\)|[^\s:\[]+)(?::(?P<start
 CLASS_LINE = re.compile(r"^## (?P<cls>.+?) \(\d+\)$")
 INCOMPLETE_PREFIX = "INCOMPLETE REVIEW:"
 REFUSAL_PREFIX = "Error:"
+# The line a reasoning review's text opens with (after an INCOMPLETE REVIEW line, when there is one): `format_review`.
+REVIEW_HEADER = "Reasoning review:"
 
 
 @dataclass
@@ -103,6 +105,10 @@ def score_summary(summary: dict, case_name: str = DEFAULT_CASE) -> RunScore:
         return RunScore(False, missed=[b.id for b in case.bugs], note="no review text: the review tool returned nothing")
     if stripped.startswith(REFUSAL_PREFIX):
         return RunScore(False, missed=[b.id for b in case.bugs], note="the review tool refused: " + stripped.splitlines()[0])
+    if REVIEW_HEADER not in stripped.splitlines()[0] and not stripped.startswith(INCOMPLETE_PREFIX):
+        # Not a review at all: Pi's own "Validation failed for tool ..." (the caller sent the call wrongly), "MCP request timed
+        # out after 60000ms", or anything else the tool's result does not open with. A reviewer never ran, or never answered.
+        return RunScore(False, missed=[b.id for b in case.bugs], note="no review ran: " + stripped.splitlines()[0][:90])
     findings = parse_review_text(text)
     scored = harness_lib.score(findings, case)
     # An INCOMPLETE REVIEW header means a reviewer's reply was unreadable or failed: any bug missing may be that, not the model's eye.
@@ -118,7 +124,8 @@ def one_line(summary: dict, score: RunScore) -> str:
     bugs = len(score.found) + len(score.missed)
     return (
         f"stopped_by={summary.get('stopped_by')} readable={'yes' if score.readable else 'NO'} found={len(score.found)}/{bugs} "
-        f"findings={score.findings} turns={summary.get('turns')} tool_calls={summary.get('tool_calls')} "
+        f"findings={score.findings} review_calls={summary.get('review_calls')} review_errors={summary.get('review_errors')} "
+        f"turns={summary.get('turns')} tool_calls={summary.get('tool_calls')} "
         f"seconds={summary.get('elapsed_seconds')} caller_repeated={score.final_repeats}/{score.findings}"
         + (f" ({score.note})" if score.note else "")
     )
