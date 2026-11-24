@@ -70,16 +70,15 @@ Which reviewer model to use is not a question for this kit: `harness/README.md` 
 | Tier | Weights | Caller | Clean | Failed calls before the review | Seconds |
 | :-- | :-- | :-- | :-- | :-- | :-- |
 | Small | 3 to 9 GB | `google/gemma-4-e4b` (6.9 GB) | 7 of 8 | the first call failed Pi's argument check in 6 of the 7 clean runs and the retry worked | 8 to 40 |
-| Small | | `meta-llama-3.1-8b-instruct` (8.5 GB) | **0 of 8** | every call: `params` sent as a string (`expected object, got string`) | 4 to 13 |
 | Moderate | 15 to 17 GB | `mistralai/devstral-small-2-2512` (15.1 GB) | 8 of 8 | none | 8 to 16 |
 | Moderate | | `qwen3-coder-30b-a3b-instruct-mlx` (17.2 GB) | 15 of 16 | none; the one failure never called `review` (it called `list_reviewers`, then hit the turn cap) | 6 to 26 |
 | Moderate | | `qwen/qwen3.8-27b` (16.1 GB) | 4 of 4 | none | 14 to 23 |
 | Large | 40 GB and up | none measured | | | no model of this size fits this Mac |
 
-- **Default caller on this Mac:** `devstral-small-2` for the moderate tier (8 of 8, no failed calls); `gemma-4-e4b` for the small tier, with the caveat that it usually needs a retry. `meta-llama-3.1-8b-instruct` is not usable as a caller: this is the failure the earlier spike saw with the GGUF build, so it is not specific to GGUF.
+- **Default caller on this Mac:** `devstral-small-2` for the moderate tier (8 of 8, no failed calls); `gemma-4-e4b` for the small tier, with the caveat that it usually needs a retry.
 - **Excluded runs:** `qwen3.8-27b` as the caller of itself (4 runs) is left out of the table, because its reviewer decided those runs, not the caller. The 27B never finishes a review inside Pi's 60-second MCP timeout (`MCP request timed out after 60000ms`), which is why it appears only with a fast reviewer above.
-- **Where the reviewer varied:** `qwen3-coder-30b` as the caller ran under four reviewers (itself, `gemma-4-e4b`, `meta-llama-3.1-8b-instruct`, `devstral-small-2`); `gemma-4-e4b` ran under itself and under `qwen3-coder-30b`.
-- **Failure state:** not tested on `INCOMPLETE REVIEW`, because no run produced that header. Where no review ran (a validation failure or a timeout), no caller reported "no bugs": `gemma-4-e4b` said it could not list findings because of a validation error, `meta-llama-3.1-8b-instruct` said no output file was generated (wrong, but not a clean bill), and `qwen3.8-27b`'s final message was blank.
+- **Where the reviewer varied:** `qwen3-coder-30b` as the caller ran under four reviewers (itself, `gemma-4-e4b`, `devstral-small-2`, and `meta-llama-3.1-8b-instruct` as a reviewer); `gemma-4-e4b` ran under itself and under `qwen3-coder-30b`.
+- **Failure state:** not tested on `INCOMPLETE REVIEW`, because no run produced that header. Where no review ran (a validation failure or a timeout), no caller reported "no bugs": `gemma-4-e4b` said it could not list findings because of a validation error.
 
 ### Scoring more callers
 
@@ -98,8 +97,7 @@ Not run yet. The same settings and `score_run.py`, with the reviewer held fixed 
 
 | Tier | Reference machine | Weights that fit | Caller candidate | Status |
 | :-- | :-- | :-- | :-- | :-- |
-| Small | 24 GB RAM, no large GPU | 3 to 9 GB | `meta-llama-3.1-8b-instruct` 4.9 GB (tool-trained) | a poor caller in an earlier spike; not run through `score_run.py` |
-| Small | | | `bartowski/llama-3.2-3b-instruct` 1.9 GB (tool-trained) | not run |
+| Small | 24 GB RAM, no large GPU | 3 to 9 GB | `bartowski/llama-3.2-3b-instruct` 1.9 GB (tool-trained) | not run |
 | Moderate | 32 GB VRAM | up to about 20 GB | `openai/gpt-oss-20b` 12.1 GB (tool-trained) | run once as the caller (below), not scored over 4 runs |
 | Moderate | | | `meta/muse-glimmer` 18.2 GB (tool-trained) | not run |
 | Large | more than 32 GB VRAM | 40 GB and up | `meta/llama-3.3-70b` 42.5 GB (tool-trained) | not run; would spill into system memory here |
