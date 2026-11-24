@@ -54,48 +54,7 @@ The limits that remain: the container runs as root on Windows (as your user on L
 
 LM Studio's address comes from `libs/runway_defaults.py` (`CLAUDE_RUNWAY_LMSTUDIO_URL`, else `http://localhost:1234/v1`). The container cannot use `localhost`, so the driver swaps that name for `host.docker.internal` and keeps the port; `--lmstudio-url` and `--host-lmstudio-url` override either side. Windows, macOS and Linux (WSL2) with Docker Desktop have been run (Docker Desktop resolves the name on all three): on plain Linux Docker Engine, without Docker Desktop, the name comes from `--add-host host.docker.internal:host-gateway`, which reaches LM Studio only if it listens beyond `127.0.0.1`, and that has not been tried.
 
-Which model to use per hardware tier is measured below for the Mac (2026-11-23) and still open for the Windows machine. The sizes are the weights only. MLX builds run on Apple Silicon only (see the harness README's "Which build runs where"), so the Windows candidates are GGUF builds and the Mac ones are MLX: the two sets of rows are not comparable.
-
-### Defaults per tier, measured on the Mac (Apple M5 Max, 48 GB)
-
-One case (`seeded-three`, three seeded bugs in one file), 4 runs per pair, so these are a first measurement, not a ranking. Settings were the same for every run: caller and reviewer both loaded beforehand at 16384 context (no on-demand load), the default prompt, caps of 10 turns, 30 tool calls and 240 seconds, and each side's own sampling (the reviewer's requests are at temperature 0; Pi's caller sampling is Pi's default, so no run above temperature 0 was possible). "Clean" is a run where the driver exited 0 and a review actually ran; "found" is the seeded bugs the reviewer's text named (`score_run.py`).
-
-| Tier | Weights | Default caller | Default reviewer | Runs behind it |
-| :-- | :-- | :-- | :-- | :-- |
-| Small | 3 to 9 GB | `google/gemma-4-e4b` (6.9 GB) | `google/gemma-4-e4b` | caller: clean 7 of 8 runs (3 of 4 under itself, 4 of 4 under `qwen3-coder-30b`), but its first call failed Pi's validation in 6 of those 7 clean runs and a retry worked (8 to 40 s); reviewer: 3 of 3 bugs in all 7 clean runs (3 under itself, 4 under `qwen3-coder-30b`), about 26 s under a fast caller |
-| Moderate | 15 to 17 GB | `mistralai/devstral-small-2-2512` (15.1 GB) | `qwen3-coder-30b-a3b-instruct-mlx` (17.2 GB) | devstral as caller: 8 of 8 clean runs, one call each, 3 of 3 bugs, 8 to 16 s; coder-30b as reviewer: 16 of 16 runs that reached it, under four callers (the fifth, `meta-llama-3.1-8b-instruct`, never got a review started), 3 of 3 bugs, 6 to 26 s |
-| Large | 40 GB and up | none measured | none measured | no model of this size fits this Mac |
-
-Not recommended on this Mac:
-- **`meta-llama-3.1-8b-instruct` as the caller**: 0 of 8 runs. It passes the tool's `params` as a string (`expected object, got string`) every time, so the review never runs. This is the failure the earlier spike saw with the GGUF build; it is not specific to GGUF.
-- **`qwen/qwen3.8-27b` as the reviewer**: 0 of 4 runs. It takes longer than Pi's 60-second MCP timeout, so the call returns `MCP request timed out after 60000ms`. It works as a caller (4 of 4 clean under `qwen3-coder-30b`, 14 to 23 s).
-
-### Every Mac pair
-
-Caller to reviewer; "clean" counts the 4 runs of the pair that ran a review and exited 0; "found" is bugs named of 3 in each clean run.
-
-| Caller | Reviewer | Clean | Found | Seconds | What went wrong, if anything |
-| :-- | :-- | :-- | :-- | :-- | :-- |
-| `gemma-4-e4b` | itself | 3 of 4 | 3, 3, 3 | 31 to 40 | run 4: the caller made 4 malformed calls and never got a review |
-| `meta-llama-3.1-8b-instruct` | itself | 0 of 4 | none | 5 to 13 | `params` sent as a string, every call |
-| `devstral-small-2` | itself | 4 of 4 | 3 each | 12 to 16 | |
-| `qwen3.8-27b` | itself | 0 of 4 | none | 69 to 240 | MCP timeout; three runs reached the 240 s cap |
-| `qwen3-coder-30b` | itself | 4 of 4 | 3 each | 6 to 7 | one extra finding (a resource leak on the shell-injection line) |
-| `gemma-4-e4b` | `qwen3-coder-30b` | 4 of 4 | 3 each | 8 to 26 | the first call failed validation in 3 of 4 runs (twice in one); the retry worked |
-| `meta-llama-3.1-8b-instruct` | `qwen3-coder-30b` | 0 of 4 | none | 4 to 7 | `params` sent as a string, 8 failed calls |
-| `qwen3.8-27b` | `qwen3-coder-30b` | 4 of 4 | 3 each | 14 to 23 | |
-| `devstral-small-2` | `qwen3-coder-30b` | 4 of 4 | 3 each | 8 to 15 | |
-| `qwen3-coder-30b` | `gemma-4-e4b` | 4 of 4 | 3 each | 26 | |
-| `qwen3-coder-30b` | `meta-llama-3.1-8b-instruct` | 3 of 4 | 2, 2, 2 (division by zero missed) | 6 to 9 | run 4: the caller never called `review` (10 tool calls, stopped at the turn cap) |
-| `qwen3-coder-30b` | `devstral-small-2` | 4 of 4 | 3 each | 10 to 15 | |
-
-### What the Mac runs answered
-
-- **Does the reviewer role need a tool-trained model?** Not answered here: every model on this Mac is tool-trained. The question needs `seed-coder-8b-instruct`, which is not, so the Windows run is where it gets answered.
-- **Does a good caller read the failure state correctly?** Only partly. No run produced an `INCOMPLETE REVIEW` result to test it on. Where the review did not run (a validation failure or a timeout), no caller reported "no bugs": `gemma-4-e4b` said it could not list findings because of a validation error, `meta-llama-3.1-8b-instruct` said no output file was generated (wrong, but not a clean bill), and `qwen3.8-27b`'s final message was blank.
-- **Is the `lines` reply format the problem for small models?** Not on these builds. As a reviewer, `meta-llama-3.1-8b-instruct` returned readable `lines` output in all 3 runs where it was asked (2 of 3 bugs found each), and `gemma-4-e4b` in all 4 (3 of 3). What failed for the small models was calling the tool (a string for `params`, a missing `type` on the first try), not the reviewer's reply.
-
-The Windows (GGUF) rows are not run yet: they need `seed-coder-8b-instruct`, `llama-3.2-3b-instruct`, `gpt-oss-20b`, `muse-glimmer` and `llama-3.3-70b` on that machine, with the same settings and `score_run.py`.
+Which reviewer model to use is not a question for this kit: `harness/README.md` records the measured reviewer builds per role (reasoning, verifier, classifier) and which build runs where. What Pi adds is the **caller**: the model that finds the `review` tool over MCP and calls it with the right arguments. This section records which models can do that, per hardware tier. Sizes are the weights only. MLX builds run on Apple Silicon only, so the Mac rows (MLX) and the Windows rows (GGUF) are different builds and are not comparable.
 
 **Machines the comparison is run on** (recorded 2026-11-23; the caller and the reviewer are loaded at the same time, so both must fit in what the GPU can use, which on a Mac is less than the unified memory):
 
@@ -104,19 +63,52 @@ The Windows (GGUF) rows are not run yet: they need `seed-coder-8b-instruct`, `ll
 | MacBook Pro (Mac17,6) | Apple M5 Max, 18 cores (6 Super, 12 Performance), 40-core GPU | 48 GB unified | macOS 27.2.1 | MLX (`safetensors` in `lms ls`); GGUF also runs under llama.cpp |
 | Windows desktop (the maintainer's) | Intel Core Ultra 9 285K, NVIDIA RTX 5090 | 191 GB RAM, 32 GB VRAM | Windows | GGUF |
 
-`score_run.py` turns a run's JSON summary into one table row (`found=2/3 readable=yes turns=2 seconds=9.5 ...`), so every run is scored the same way: `.venv/bin/python harness/pi/pi_driver.py ... > run.json`, then `.venv/bin/python harness/pi/score_run.py run.json`.
+### Callers, measured on the Mac (Apple M5 Max, 48 GB)
 
-| Tier | Reference machine | Weights that fit | Candidates installed on the maintainer's machine | Status |
+`seeded-three`, 4 runs per pair, so this is a first measurement, not a ranking. Every model was loaded beforehand at 16384 context (no on-demand load), with the default prompt, caps of 10 turns, 30 tool calls and 240 seconds, and Pi's own sampling (the driver sets no caller temperature). A run is **clean** when the driver exited 0 and a review actually ran. Seconds include the reviewer's time. The reviewer is held to a model that answers well inside Pi's 60-second MCP timeout (`qwen3-coder-30b-a3b-instruct-mlx`, 6 to 7 seconds when it calls itself), so that a failure is the caller's; a few runs use another reviewer and are marked.
+
+| Tier | Weights | Caller | Clean | Failed calls before the review | Seconds |
+| :-- | :-- | :-- | :-- | :-- | :-- |
+| Small | 3 to 9 GB | `google/gemma-4-e4b` (6.9 GB) | 7 of 8 | the first call failed Pi's argument check in 6 of the 7 clean runs and the retry worked | 8 to 40 |
+| Small | | `meta-llama-3.1-8b-instruct` (8.5 GB) | **0 of 8** | every call: `params` sent as a string (`expected object, got string`) | 4 to 13 |
+| Moderate | 15 to 17 GB | `mistralai/devstral-small-2-2512` (15.1 GB) | 8 of 8 | none | 8 to 16 |
+| Moderate | | `qwen3-coder-30b-a3b-instruct-mlx` (17.2 GB) | 15 of 16 | none; the one failure never called `review` (it called `list_reviewers`, then hit the turn cap) | 6 to 26 |
+| Moderate | | `qwen/qwen3.8-27b` (16.1 GB) | 4 of 4 | none | 14 to 23 |
+| Large | 40 GB and up | none measured | | | no model of this size fits this Mac |
+
+- **Default caller on this Mac:** `devstral-small-2` for the moderate tier (8 of 8, no failed calls); `gemma-4-e4b` for the small tier, with the caveat that it usually needs a retry. `meta-llama-3.1-8b-instruct` is not usable as a caller: this is the failure the earlier spike saw with the GGUF build, so it is not specific to GGUF.
+- **Excluded runs:** `qwen3.8-27b` as the caller of itself (4 runs) is left out of the table, because its reviewer decided those runs, not the caller. The 27B never finishes a review inside Pi's 60-second MCP timeout (`MCP request timed out after 60000ms`), which is why it appears only with a fast reviewer above.
+- **Where the reviewer varied:** `qwen3-coder-30b` as the caller ran under four reviewers (itself, `gemma-4-e4b`, `meta-llama-3.1-8b-instruct`, `devstral-small-2`); `gemma-4-e4b` ran under itself and under `qwen3-coder-30b`.
+- **Failure state:** not tested on `INCOMPLETE REVIEW`, because no run produced that header. Where no review ran (a validation failure or a timeout), no caller reported "no bugs": `gemma-4-e4b` said it could not list findings because of a validation error, `meta-llama-3.1-8b-instruct` said no output file was generated (wrong, but not a clean bill), and `qwen3.8-27b`'s final message was blank.
+
+### Scoring more callers
+
+`score_run.py` turns one run's JSON summary into one row, so every caller is scored the same way. The reviewer's text is matched to the case's seeded bugs by file and line, and a result that is not a review at all (Pi's `Validation failed for tool ...`, `MCP request timed out`) is marked `no review ran` instead of being scored as an empty review:
+
+```
+.venv/bin/python harness/pi/pi_driver.py --model <caller> --reviewer-model <reviewer> > run.json
+.venv/bin/python harness/pi/score_run.py run.json
+```
+
+The row reads `stopped_by=completed readable=yes found=3/3 findings=3 review_calls=1 review_errors=0 turns=2 tool_calls=1 seconds=9.5 caller_repeated=3/3`. For a caller, the columns that matter are `readable`, `review_calls` against `review_errors` (failed calls before the review) and `turns`. `found` says the reviewer worked, not the caller, and `caller_repeated` is how many of the findings the caller's final message repeats. Run each caller 4 times, with the same reviewer, and record it as a row of the table above.
+
+### Windows (GGUF) callers still to run
+
+Not run yet. The same settings and `score_run.py`, with the reviewer held fixed (the earlier Windows runs used `reasoning-gguf-seed-coder-8b.json`). Candidates installed on the maintainer's machine:
+
+| Tier | Reference machine | Weights that fit | Caller candidate | Status |
 | :-- | :-- | :-- | :-- | :-- |
-| Small | 24 GB RAM, no large GPU | 3 to 9 GB | `seed-coder-8b-instruct` 4.8 GB | run as the **reviewer** (below) |
-| Small | | | `meta-llama-3.1-8b-instruct` 4.9 GB | not run; a poor caller in an earlier spike |
-| Moderate | 32 GB VRAM | up to about 20 GB | `openai/gpt-oss-20b` 12.1 GB (tool-trained) | run as the **caller** (below) |
+| Small | 24 GB RAM, no large GPU | 3 to 9 GB | `meta-llama-3.1-8b-instruct` 4.9 GB (tool-trained) | a poor caller in an earlier spike; not run through `score_run.py` |
+| Small | | | `bartowski/llama-3.2-3b-instruct` 1.9 GB (tool-trained) | not run |
+| Moderate | 32 GB VRAM | up to about 20 GB | `openai/gpt-oss-20b` 12.1 GB (tool-trained) | run once as the caller (below), not scored over 4 runs |
 | Moderate | | | `meta/muse-glimmer` 18.2 GB (tool-trained) | not run |
 | Large | more than 32 GB VRAM | 40 GB and up | `meta/llama-3.3-70b` 42.5 GB (tool-trained) | not run; would spill into system memory here |
 
+`seed-coder-8b-instruct` is not tool-trained, so it is not a caller candidate: it appears below as the reviewer of the earlier runs.
+
 **The Windows run (2026-11-22, Windows, Docker 29.9.3, Pi 1.6.0).** Caller `openai/gpt-oss-20b` at 16384 context; reviewer `seed-coder-8b-instruct` (`reasoning-gguf-seed-coder-8b.json`); case `seeded-three`. Pi called `mcp__reviewer__review` once, with the parameters the prompt gave, in 2 turns and about 9 to 11 seconds, and the driver exited 0. The reviewer reported a shell injection and an off-by-one, two of the case's three seeded kinds of defect (not the division by zero), unverified, as its own result says; the lines were not scored against the case's answers. A second run with `--max-turns 1` was stopped at the start of turn 2: exit 3, `stopped_by: turns`, and no container left behind. After the runs `~/.pi` did not exist, there was no reviewer database under `~/.claude` (the newest file in `~/.claude/claude-runway/` predates the runs), and no container or scratch folder remained. One case and one model pair is a trial that the kit works, not a measurement of either model.
 
-**The macOS run (2026-11-22, Apple Silicon with 48 GB, Docker Desktop 29.9.3 arm64, Pi 1.6.0).** The models installed there are not in the table above, so the config's reviewer was replaced by one built from the arguments. Caller `qwen/qwen3.8-27b` at 16384 context; case `seeded-three`. With `--reviewer-model google/gemma-4-e4b --load-on-demand`, Pi called `mcp__reviewer__review` once, in 2 turns and about 32 to 34 seconds, and the driver exited 0. The reviewer reported all three seeded kinds of defect (shell injection, off-by-one, division by zero), unverified. The reviewer server loaded gemma at 16384 for the review and unloaded it afterwards. The container ran as the host user, `~/.pi` was never created, and no container or scratch folder remained. With the 27B caller also used as the reviewer, the review call hit Pi's 60-second MCP timeout (below): `review_text` was `MCP request timed out after 60000ms`, the caller wandered until the turn cap stopped it (exit 3), and no container was left behind.
+**The macOS run (2026-11-22, Apple Silicon with 48 GB, Docker Desktop 29.9.3 arm64, Pi 1.6.0).** The models installed there are not the ones the config names, so the config's reviewer was replaced by one built from the arguments. Caller `qwen/qwen3.8-27b` at 16384 context; case `seeded-three`. With `--reviewer-model google/gemma-4-e4b --load-on-demand`, Pi called `mcp__reviewer__review` once, in 2 turns and about 32 to 34 seconds, and the driver exited 0. The reviewer reported all three seeded kinds of defect (shell injection, off-by-one, division by zero), unverified. The reviewer server loaded gemma at 16384 for the review and unloaded it afterwards. The container ran as the host user, `~/.pi` was never created, and no container or scratch folder remained. With the 27B caller also used as the reviewer, the review call hit Pi's 60-second MCP timeout (below): `review_text` was `MCP request timed out after 60000ms`, the caller wandered until the turn cap stopped it (exit 3), and no container was left behind.
 
 **The Linux run (2026-11-22, Ubuntu on WSL2 with mirrored networking, Docker Desktop 29.9.3 through its WSL integration, Pi 1.6.0).** LM Studio ran on the Windows host. The same models and config as the Windows run: caller `openai/gpt-oss-20b` at 16384 context, `reasoning-gguf-seed-coder-8b.json`, case `seeded-three`. Pi called `mcp__reviewer__review` once, in 2 turns and about 25 seconds, and the driver exited 0, with the same two findings as on Windows (shell injection at `backup.py:6-8`, off-by-one at `backup.py:10-12`). The container ran as the host user (`--user 1000:1000`) and the read-only bind mounts worked. `--max-turns 1` stopped the run at the start of turn 2 (exit 3, `stopped_by: turns`). A repeat of the plain run hit Pi's 60-second MCP timeout while another large model was loaded beside the reviewer: `review_errors: 1` and exit 1, so it did not read as a pass. A SIGINT to the driver's process group (what Ctrl+C sends) during the review call stopped it in 0.2 seconds (exit 130) and killed the container. After all four runs no container or scratch folder remained, `~/.pi` did not exist, and nothing under `~/.claude/claude-runway/` had changed. The interrupted run left the reviewer model loaded (see "Before and after"). This is Docker Desktop's engine reached from Linux, so plain Docker Engine's `host-gateway` route is still untried.
 

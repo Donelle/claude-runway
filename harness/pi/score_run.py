@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Score one `pi_driver.py` run against its case's seeded bugs.
+"""Score one `pi_driver.py` run, to compare callers: did a review run, and how many seeded bugs does its text name.
 
-The driver prints a JSON summary whose `review_text` is the reviewer tool's own result. It does not say how many of the
-case's known defects that text names; this does, so a model comparison records the same numbers for every run:
+The driver prints a JSON summary whose `review_text` is the reviewer tool's own result. It does not say whether that text
+is a review at all (a caller's malformed call or a timeout produces text that is not), nor how many of the case's known defects
+it names; this does, so a comparison of callers records the same numbers for every run:
 
     .venv/bin/python harness/pi/pi_driver.py --model <caller> --config <config> > run.json
     .venv/bin/python harness/pi/score_run.py run.json            # or: ... | score_run.py -
