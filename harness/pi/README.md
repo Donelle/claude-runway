@@ -18,6 +18,7 @@ docker build -t claude-runway-pi:dev harness/pi          # once; or add --build 
 - The reviewer model is loaded by the reviewer server when its reviewer has `loadOnDemand: true` (the config says), and unloaded again afterwards. The driver loads nothing.
 - Other options: `--case` (a case from `harness/cases.py`, default `seeded-three`), `--log FILE` (every event Pi emitted, written to a new file: an existing file, or any path under `~/.claude` or `~/.pi`, is refused), `--dry-run` (print the `docker run` command and stop), `--build` and `--image` (build or name the image), and the container's limits `--memory` (default `4g`), `--cpus` (`2`) and `--pids-limit` (`256`).
 - The caps are `--max-turns` (default 10), `--max-tool-calls` (30) and `--timeout` (600 seconds for the whole run).
+- `--mcp-timeout` and `--lmstudio-timeout` (seconds) raise the two 60-second limits on a long review. Neither is set unless you pass it; see "A review has to finish within Pi's MCP timeout" below.
 
 ### Before and after: loading and restoring models
 
@@ -103,7 +104,7 @@ The row reads `stopped_by=completed readable=yes found=3/3 findings=3 review_cal
 ## What this showed that the orchestrator will need
 
 - **Read the tool's result, not the caller's summary.** The caller's final text differed between two identical runs, and dropped the descriptions and failing inputs; the reviewer's result was the same both times.
-- **A review has to finish within Pi's MCP timeout.** Pi gives up on an MCP call after 60 seconds (`MCP request timed out after 60000ms`), and the driver does not change that. A slow reviewer, such as a 27B model on a laptop, needs a smaller reviewer model or a shorter case.
+- **A review has to finish within Pi's MCP timeout.** The default is 60 seconds per MCP request (`MCP request timed out after 60000ms`). The `timeout` setting (in seconds) on the server's `mcp.json` entry changes it, and Pi's documentation says progress notifications reset it. The reviewer sends no progress, so the whole `review` call has to fit in that time; the driver raises it with `--mcp-timeout`. Each model request also has its own limit, 60 seconds by default (`CLAUDE_RUNWAY_LMSTUDIO_TIMEOUT_SECONDS`); the driver raises it with `--lmstudio-timeout`. `--timeout` still bounds the whole run.
 - **A caller needs Pi's MCP naming.** Pi names the tool `mcp__<server>__<tool>`, and `--tools` must list `mcp__reviewer__*` or the tool is not offered.
 - **A run needs a models file for LM Studio.** Pi starts with no models; the driver writes a `models.json` that points an OpenAI-compatible provider at LM Studio.
 - **The reviewer is registered by a file, not a command.** The driver writes Pi's `mcp.json` (the file `pi mcp add` would write) into the agent scratch folder, so the LM Studio URL, which can carry a user name and password, never appears on a command line (host `ps`, `docker inspect`, `--dry-run`). Printed URLs show `***` in place of a user name and password. Pi itself cannot use such a URL as its own provider address: with `http://user:pass@...` the caller made no tool calls at all.
