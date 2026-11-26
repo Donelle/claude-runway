@@ -151,6 +151,25 @@ class MainTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("not a JSON object", err)
 
+    def test_a_file_with_a_byte_order_mark_is_read(self):
+        # Windows PowerShell 5.1's `>` writes UTF-16 with a mark; some editors put a mark on UTF-8.
+        text = json.dumps({"review_text": ALL_THREE})
+        for encoding, mark in (("utf-16-le", b"\xff\xfe"), ("utf-16-be", b"\xfe\xff"), ("utf-8", b"\xef\xbb\xbf")):
+            with self.subTest(encoding=encoding), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "run.json"
+                path.write_bytes(mark + text.encode(encoding))
+                code, out, err = self.run_main(str(path), "--json")
+                self.assertEqual(code, 0, err)
+                self.assertEqual(json.loads(out)["missed"], [])
+
+    def test_a_file_that_is_not_text_in_either_encoding_exits_2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "run.json"
+            path.write_bytes(b'{"review_text": "\x80"}')
+            code, _out, err = self.run_main(str(path))
+        self.assertEqual(code, 2)
+        self.assertIn("cannot read", err)
+
     def test_a_missing_file_exits_2(self):
         code, _out, err = self.run_main("/no/such/run.json")
         self.assertEqual(code, 2)

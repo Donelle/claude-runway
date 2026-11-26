@@ -66,7 +66,7 @@ Which reviewer model to use is not a question for this kit: `harness/README.md` 
 
 ### Callers, measured on the Mac (Apple M5 Max, 48 GB)
 
-`seeded-three`, 4 runs per pair, so this is a first measurement, not a ranking. Every model was loaded beforehand at 16384 context (no on-demand load), with the default prompt, caps of 10 turns, 30 tool calls and 240 seconds, and Pi's own sampling (the driver sets no caller temperature). A run is **clean** when the driver exited 0 and a review actually ran. Seconds include the reviewer's time. The reviewer is held to a model that answers well inside Pi's 60-second MCP timeout (`qwen3-coder-30b-a3b-instruct-mlx`, 6 to 7 seconds when it calls itself), so that a failure is the caller's; a few runs use another reviewer and are marked.
+`seeded-three`, 4 runs per pair, so this is a first measurement, not a ranking. Every model was loaded beforehand at 16384 context (no on-demand load), with the default prompt, caps of 10 turns, 30 tool calls and 240 seconds, and Pi's own sampling (the driver sets no caller temperature). A run is **clean** when the driver exited 0 and a review actually ran. Seconds include the reviewer's time. The reviewer is held to a model that answers well inside Pi's 60-second MCP timeout (`qwen3-coder-30b-a3b-instruct-mlx`, 6 to 7 seconds when it calls itself), so that a failure is the caller's; a few runs use another reviewer.
 
 | Tier | Weights | Caller | Clean | Failed calls before the review | Seconds |
 | :-- | :-- | :-- | :-- | :-- | :-- |

@@ -17,6 +17,7 @@ Exit code: 0 = scored; 2 = the input could not be read or the case is unknown.
 """
 
 import argparse
+import codecs
 import json
 import re
 import sys
@@ -133,8 +134,15 @@ def one_line(summary: dict, score: RunScore) -> str:
 
 
 def load_summary(source: str) -> Optional[dict]:
-    """The driver's JSON from a file, or from stdin for `-`. None when it is not a JSON object."""
-    raw = sys.stdin.read() if source == "-" else Path(source).read_text(encoding="utf-8")
+    """The driver's JSON from a file, or from stdin for `-`. None when it is not a JSON object.
+
+    A file is decoded by its byte order mark: Windows PowerShell 5.1's `>` writes UTF-16, and some editors put a mark on
+    UTF-8. Raises UnicodeDecodeError for a file in neither."""
+    if source == "-":
+        raw = sys.stdin.read()
+    else:
+        data = Path(source).read_bytes()
+        raw = data.decode("utf-16" if data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)) else "utf-8-sig")
     try:
         data = json.loads(raw)
     except ValueError:
@@ -150,7 +158,7 @@ def main(argv: Optional[list] = None) -> int:
     args = parser.parse_args(argv)
     try:
         summary = load_summary(args.summary)
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         print(f"error: cannot read {args.summary}: {exc}", file=sys.stderr)
         return 2
     if summary is None:
