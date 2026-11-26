@@ -90,11 +90,13 @@ The row reads `stopped_by=completed readable=yes found=3/3 findings=3 review_cal
 
 ### Callers, measured on Windows (NVIDIA RTX 5090, 32 GB VRAM)
 
-`seeded-three`, 4 runs per caller, so this is a first measurement, not a ranking. Every model is a GGUF build, loaded beforehand at 16384 context with full GPU offload, with the default prompt, caps of 10 turns, 30 tool calls and 240 seconds, and Pi's own sampling. The reviewer is `seed-coder-8b-instruct` (`reasoning-gguf-seed-coder-8b.json`). A run is **clean** when the driver exited 0 and a review actually ran. The callers listed are those whose final message also reported the review's findings. Seconds include the reviewer's time.
+`seeded-three`, 4 runs per caller, so this is a first measurement, not a ranking. Every model is a GGUF build, loaded beforehand at 16384 context with full GPU offload, with the default prompt, caps of 10 turns, 30 tool calls and 240 seconds, and Pi's own sampling. The reviewer is `seed-coder-8b-instruct` (`reasoning-gguf-seed-coder-8b.json`). A run is **clean** when the driver exited 0 and a review actually ran. Seconds include the reviewer's time.
 
 | Tier | Weights | Caller | Clean | Failed calls before the review | Seconds |
 | :-- | :-- | :-- | :-- | :-- | :-- |
-| Small | 3 to 9 GB | `google/gemma-4-12b` (7.6 GB) | 4 of 4 | none | 10 to 14 |
+| Small | 2 to 9 GB | `llama-3.2-3b-instruct` (1.9 GB) | 4 of 4 | none | 10 to 17 |
+| Small | | `meta-llama-3.1-8b-instruct` (4.9 GB) | 4 of 4 | none | 10 to 26 |
+| Small | | `google/gemma-4-12b` (7.6 GB) | 4 of 4 | none | 10 to 14 |
 | Moderate | 12 to 20 GB | `openai/gpt-oss-20b` (12.1 GB) | 4 of 4 | none | 9 to 19 |
 | Moderate | | `qwen/qwen3.8-27b` (17.7 GB) | 4 of 4 | none | 10 to 13 |
 | Moderate | | `meta/muse-glimmer` (18.2 GB) | 4 of 4 | none | 18 to 26 |
