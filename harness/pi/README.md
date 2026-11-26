@@ -61,7 +61,7 @@ Which reviewer model to use is not a question for this kit: `harness/README.md` 
 | Machine | CPU / GPU | Memory | OS | Builds it runs |
 | :-- | :-- | :-- | :-- | :-- |
 | MacBook Pro (Mac17,6) | Apple M5 Max, 18 cores (6 Super, 12 Performance), 40-core GPU | 48 GB unified | macOS 27.2.1 | MLX (`safetensors` in `lms ls`); GGUF also runs under llama.cpp |
-| Windows desktop (the maintainer's) | Intel Core Ultra 9 285K, NVIDIA RTX 5090 | 191 GB RAM, 32 GB VRAM | Windows | GGUF |
+| Windows desktop | Intel Core Ultra 9 285K, NVIDIA RTX 5090 | 191 GB RAM, 32 GB VRAM | Windows | GGUF |
 
 ### Callers, measured on the Mac (Apple M5 Max, 48 GB)
 
@@ -87,16 +87,18 @@ Which reviewer model to use is not a question for this kit: `harness/README.md` 
 
 The row reads `stopped_by=completed readable=yes found=3/3 findings=3 review_calls=1 review_errors=0 turns=2 tool_calls=1 seconds=9.5 caller_repeated=3/3`. For a caller, the columns that matter are `readable`, `review_calls` against `review_errors` (failed calls before the review) and `turns`. `found` says the reviewer worked, not the caller, and `caller_repeated` is how many of the findings the caller's final message repeats. Run each caller 4 times, with the same reviewer, and record it as a row of the table above.
 
-### Windows (GGUF) callers still to run
+### Callers, measured on Windows (NVIDIA RTX 5090, 32 GB VRAM)
 
-Not run yet. The same settings and `score_run.py`, with the reviewer held fixed (the earlier Windows runs used `reasoning-gguf-seed-coder-8b.json`). Candidates installed on the maintainer's machine:
+`seeded-three`, 4 runs per caller, so this is a first measurement, not a ranking. Every model is a GGUF build, loaded beforehand at 16384 context with full GPU offload, with the default prompt, caps of 10 turns, 30 tool calls and 240 seconds, and Pi's own sampling. The reviewer is `seed-coder-8b-instruct` (`reasoning-gguf-seed-coder-8b.json`). A run is **clean** when the driver exited 0 and a review actually ran. The callers listed are those whose final message also reported the review's findings. Seconds include the reviewer's time.
 
-| Tier | Reference machine | Weights that fit | Caller candidate | Status |
-| :-- | :-- | :-- | :-- | :-- |
-| Small | 24 GB RAM, no large GPU | 3 to 9 GB | `bartowski/llama-3.2-3b-instruct` 1.9 GB (tool-trained) | not run |
-| Moderate | 32 GB VRAM | up to about 20 GB | `openai/gpt-oss-20b` 12.1 GB (tool-trained) | run once as the caller (below), not scored over 4 runs |
-| Moderate | | | `meta/muse-glimmer` 18.2 GB (tool-trained) | not run |
-| Large | more than 32 GB VRAM | 40 GB and up | `meta/llama-3.3-70b` 42.5 GB (tool-trained) | not run; would spill into system memory here |
+| Tier | Weights | Caller | Clean | Failed calls before the review | Seconds |
+| :-- | :-- | :-- | :-- | :-- | :-- |
+| Small | 3 to 9 GB | `google/gemma-4-12b` (7.6 GB) | 4 of 4 | none | 10 to 14 |
+| Moderate | 12 to 20 GB | `openai/gpt-oss-20b` (12.1 GB) | 4 of 4 | none | 9 to 19 |
+| Moderate | | `qwen/qwen3.8-27b` (17.7 GB) | 4 of 4 | none | 10 to 13 |
+| Moderate | | `meta/muse-glimmer` (18.2 GB) | 4 of 4 | none | 18 to 26 |
+| Moderate | | `qwen2.5-32b-instruct` (19.9 GB) | 4 of 4 | none | 12 to 13 |
+| Large | 40 GB and up | none measured | | | no model of this size fits this GPU |
 
 ## What this showed that the orchestrator will need
 
