@@ -508,6 +508,20 @@ class DockerCommandTests(unittest.TestCase):
         self.assertEqual(server["env"]["REVIEWERS_FILE"], f"{d.C_CONFIG}/reviewers.json")
         self.assertEqual(server["env"]["CLAUDE_RUNWAY_LMSTUDIO_URL"], "http://host.docker.internal:1234/v1")
 
+    def test_the_mcp_file_leaves_both_timeouts_to_their_own_defaults_unless_asked(self):
+        server = d.mcp_file("http://h:1234/v1")["mcpServers"][d.MCP_SERVER_NAME]
+        self.assertNotIn("timeout", server)
+        self.assertNotIn("CLAUDE_RUNWAY_LMSTUDIO_TIMEOUT_SECONDS", server["env"])
+
+    def test_each_timeout_goes_where_the_program_that_enforces_it_reads_it(self):
+        # Pi reads `timeout` (seconds) off the server entry; the reviewer reads its own limit from its environment.
+        server = d.mcp_file("http://h:1234/v1", mcp_timeout=300)["mcpServers"][d.MCP_SERVER_NAME]
+        self.assertEqual(server["timeout"], 300)
+        self.assertNotIn("CLAUDE_RUNWAY_LMSTUDIO_TIMEOUT_SECONDS", server["env"])
+        server = d.mcp_file("http://h:1234/v1", lmstudio_timeout=120)["mcpServers"][d.MCP_SERVER_NAME]
+        self.assertNotIn("timeout", server)
+        self.assertEqual(server["env"]["CLAUDE_RUNWAY_LMSTUDIO_TIMEOUT_SECONDS"], "120")
+
     def test_display_url_hides_a_user_name_and_password_and_nothing_else(self):
         self.assertEqual(d.display_url("http://alice:s3cret@host.docker.internal:1234/v1"), "http://***@host.docker.internal:1234/v1")
         self.assertEqual(d.display_url("http://alice@h:1/v1"), "http://***@h:1/v1")
@@ -777,10 +791,26 @@ class MainTests(unittest.TestCase):
         self.assertEqual(set(Path(tempfile.gettempdir()).glob("claude-runway-pi-*")), before)
 
     def test_an_unknown_case_and_a_nonpositive_cap_are_usage_errors(self):
-        for extra in (["--case", "nope"], ["--max-turns", "0"], ["--timeout", "0"]):
+        for extra in (["--case", "nope"], ["--max-turns", "0"], ["--timeout", "0"], ["--mcp-timeout", "0"],
+                      ["--lmstudio-timeout", "-1"]):
             completed = subprocess.run([sys.executable, "-I", str(PI_DIR / "pi_driver.py"), "--dry-run", "--model", "m", *extra],
                                        capture_output=True, text=True, timeout=60)
             self.assertEqual(completed.returncode, 2, extra)
+
+    def test_the_timeout_flags_reach_the_mcp_file_the_container_is_given(self):
+        written = {}
+
+        def keep_then_remove(directory):
+            written.update(json.loads((directory / "agent" / "mcp.json").read_text(encoding="utf-8")))
+            remove(directory)
+
+        remove = d._remove_tree
+        with mock.patch.object(d, "_remove_tree", keep_then_remove), contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            code = d.main(["--dry-run", "--model", "m", "--mcp-timeout", "300", "--lmstudio-timeout", "120"])
+        self.assertEqual(code, 0)
+        server = written["mcpServers"][d.MCP_SERVER_NAME]
+        self.assertEqual((server["timeout"], server["env"]["CLAUDE_RUNWAY_LMSTUDIO_TIMEOUT_SECONDS"]), (300, "120"))
 
     def test_config_cannot_be_combined_with_a_reviewer_model(self):
         config = REPO_ROOT / "harness" / "live-tests" / "configs" / "reasoning-gguf-seed-coder-8b.json"

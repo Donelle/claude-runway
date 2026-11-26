@@ -369,25 +369,31 @@ def pi_arguments(model: str, prompt: str) -> list:
     ]
 
 
-def mcp_file(lmstudio_url: str) -> dict:
+def mcp_file(lmstudio_url: str, mcp_timeout: Optional[int] = None, lmstudio_timeout: Optional[int] = None) -> dict:
     """Pi's mcp.json, registering the reviewer MCP server: the file `pi mcp add` would write, in the same shape.
 
     The driver writes it into the agent scratch folder instead of running `pi mcp add` in the container, so the LM Studio
-    URL, which can carry a user name and password, is never on a command line (host `ps`, `docker inspect`, --dry-run)."""
-    return {
-        "mcpServers": {
-            MCP_SERVER_NAME: {
-                "command": C_VENV_PYTHON,
-                "args": [f"{C_REVIEWER}/mcpservers/codebase_reviewer_mcp_server.py"],
-                "env": {
-                    "REVIEWERS_FILE": f"{C_CONFIG}/reviewers.json",
-                    "CLAUDE_RUNWAY_CODEBASE_REVIEWER_DB": f"{C_STATE}/codebase-reviewer.db",
-                    "CLAUDE_RUNWAY_LMSTUDIO_URL": lmstudio_url,
-                },
-                "exposure": "direct",
-            }
-        }
+    URL, which can carry a user name and password, is never on a command line (host `ps`, `docker inspect`, --dry-run).
+
+    Two different limits, each left out when None so its own default holds (60 seconds for both): `mcp_timeout` is Pi's
+    `timeout` for one request to this server, which a whole `review` call must fit in while the server sends no progress;
+    `lmstudio_timeout` is the reviewer's limit for one completion request to LM Studio."""
+    env = {
+        "REVIEWERS_FILE": f"{C_CONFIG}/reviewers.json",
+        "CLAUDE_RUNWAY_CODEBASE_REVIEWER_DB": f"{C_STATE}/codebase-reviewer.db",
+        "CLAUDE_RUNWAY_LMSTUDIO_URL": lmstudio_url,
     }
+    if lmstudio_timeout is not None:
+        env["CLAUDE_RUNWAY_LMSTUDIO_TIMEOUT_SECONDS"] = str(lmstudio_timeout)
+    server = {
+        "command": C_VENV_PYTHON,
+        "args": [f"{C_REVIEWER}/mcpservers/codebase_reviewer_mcp_server.py"],
+        "env": env,
+        "exposure": "direct",
+    }
+    if mcp_timeout is not None:
+        server["timeout"] = mcp_timeout
+    return {"mcpServers": {MCP_SERVER_NAME: server}}
 
 
 def display_url(url: str) -> str:
@@ -601,7 +607,8 @@ def import_harness():
     return harness_lib, cases
 
 
-def prepare_scratch(scratch: Path, case_name: str, model: str, reviewers: dict, context_length: int, lmstudio_url: str) -> tuple:
+def prepare_scratch(scratch: Path, case_name: str, model: str, reviewers: dict, context_length: int, lmstudio_url: str,
+                    mcp_timeout: Optional[int] = None, lmstudio_timeout: Optional[int] = None) -> tuple:
     """Fills `scratch` with everything the container mounts. Returns (Mounts, base_ref, head_ref)."""
     harness_lib, cases = import_harness()
     case = cases.ALL_CASES[case_name]
@@ -612,7 +619,7 @@ def prepare_scratch(scratch: Path, case_name: str, model: str, reviewers: dict, 
         directory.mkdir()
     (config / "reviewers.json").write_text(json.dumps(reviewers, indent=2), encoding="utf-8")
     (agent / "models.json").write_text(json.dumps(models_file(model, context_length, lmstudio_url), indent=2), encoding="utf-8")
-    (agent / "mcp.json").write_text(json.dumps(mcp_file(lmstudio_url), indent=2), encoding="utf-8")
+    (agent / "mcp.json").write_text(json.dumps(mcp_file(lmstudio_url, mcp_timeout, lmstudio_timeout), indent=2), encoding="utf-8")
     return Mounts(REPO_ROOT / "libs", REPO_ROOT / "mcpservers", repo, config, agent, state), base, head
 
 
@@ -647,6 +654,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-turns", type=int, default=DEFAULT_MAX_TURNS)
     p.add_argument("--max-tool-calls", type=int, default=DEFAULT_MAX_TOOL_CALLS)
     p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SECONDS, help="wall-clock seconds for the whole run")
+    p.add_argument("--mcp-timeout", type=int, help="seconds Pi waits for one request to the reviewer server, so for a whole "
+                   "`review` call (default: not set, which is Pi's 60). --timeout still bounds the run")
+    p.add_argument("--lmstudio-timeout", type=int, help="seconds the reviewer waits for one completion request to LM Studio "
+                   "(default: not set, which is the reviewer's 60)")
     p.add_argument("--image", default=DEFAULT_IMAGE)
     p.add_argument("--build", action="store_true", help="build the image from harness/pi/Dockerfile first")
     p.add_argument("--docker", default="docker", help="the docker executable")
@@ -668,6 +679,9 @@ def main(argv: Optional[list] = None) -> int:
         return 2
     if min(args.max_turns, args.max_tool_calls, args.timeout) < 1:
         print("error: --max-turns, --max-tool-calls and --timeout must each be 1 or more", file=sys.stderr)
+        return 2
+    if any(value is not None and value < 1 for value in (args.mcp_timeout, args.lmstudio_timeout)):
+        print("error: --mcp-timeout and --lmstudio-timeout must each be 1 or more", file=sys.stderr)
         return 2
     if args.log:
         problem = unsafe_log(args.log, Path.home())
@@ -711,7 +725,8 @@ def main(argv: Optional[list] = None) -> int:
 
     scratch = Path(tempfile.mkdtemp(prefix="claude-runway-pi-"))
     try:
-        mounts, _base, _head = prepare_scratch(scratch, args.case, args.model, reviewers, args.context_length, lmstudio_in_container)
+        mounts, _base, _head = prepare_scratch(scratch, args.case, args.model, reviewers, args.context_length, lmstudio_in_container,
+                                               args.mcp_timeout, args.lmstudio_timeout)
         problems = unsafe_mounts(mounts, Path.home(), REPO_ROOT)
         if problems:
             print("error: refusing to start, a mount would expose the host:\n  " + "\n  ".join(problems), file=sys.stderr)
