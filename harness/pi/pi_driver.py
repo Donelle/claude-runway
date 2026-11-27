@@ -339,11 +339,12 @@ def reviewers_from_config(path: Path) -> dict:
         validate_reviewers(reviewers, path=str(path))
     except ConfigError as exc:
         raise ValueError(str(exc)) from exc
-    # The driver always asks for review type "reasoning", and every review type begins with the reasoning stage, so a
-    # config with no active reasoning reviewer (a verifier-only or classifier-only one) would be refused by the server.
+    # The driver always asks for review type "reasoning" (it passes no findings file, the only way a verifier or classifier review
+    # starts without the reasoning stage), so a config with no active reasoning reviewer (a verifier-only or classifier-only one)
+    # would be refused by the server.
     if not any(r.get("active", True) and "reasoning" in r["type"] for r in reviewers["reviewers"]):
-        raise ValueError(f"{path} has no active reasoning reviewer: the review tool would refuse it, because every review "
-                         "type starts with the reasoning stage")
+        raise ValueError(f"{path} has no active reasoning reviewer: the review tool would refuse it, because the reasoning "
+                         "review this driver asks for needs one")
     return reviewers
 
 

@@ -1036,6 +1036,66 @@ class RunReasoningReview(unittest.TestCase):
         self.assertIn("a.py:3-7 [one] a claim", text)
         self.assertIn("failing input: a b", text)
 
+    def _counts(self, result):
+        return {o.reviewer.name: (o.value.counts.requests, o.value.counts.replies, o.value.counts.readable) for o in result.outcomes
+                if o.error is None}
+
+    def _run_one_chunk(self, config, replies):
+        """`_run` over a diff of one file, so each reviewer is asked once (the shared fixture diff has two files: two chunks)."""
+        return self._run(config, replies, diff=file_diff("a.py", [["+one"]]))
+
+    def test_a_reviewers_requests_replies_and_readable_replies_are_counted(self):
+        big = file_diff("big.py", [[f"+line {h}-{i}" for i in range(20)] for h in range(8)])
+
+        def replies(model, system, content):
+            # The reviewer is asked about several chunks: one reply is not in the format, one request got no reply at all.
+            number = replies.seen = getattr(replies, "seen", 0) + 1
+            return None if number == 1 else ("this is no JSON" if number == 2 else reply())
+
+        config = cfg(rv("one", "model-a"))
+        result, stub, _ = self._run(config, replies, diff=big, chunk_chars=1000, max_reviewers=1)
+        asked = len(stub.calls)
+        self.assertGreater(asked, 3)
+        self.assertEqual(self._counts(result), {"one": (asked, asked - 1, asked - 2)})
+        self.assertEqual(result.outcomes[0].value.counts.unreadable, 1)
+        self.assertEqual(result.outcomes[0].value.chunks, asked)
+
+    def test_a_reviewer_that_found_nothing_is_told_apart_from_one_whose_replies_could_not_be_read(self):
+        config = cfg(rv("quiet", "model-a"), rv("garbled", "model-b"))
+        result, _, _ = self._run_one_chunk(config, lambda model, system, content: reply() if model == "model-a" else "not json")
+        self.assertEqual(self._counts(result), {"quiet": (1, 1, 1), "garbled": (1, 1, 0)})
+        self.assertEqual(result.finding_count, 0)
+
+    def test_a_reply_with_findings_where_only_one_item_is_skipped_still_counts_as_readable(self):
+        # An item without a claim is skipped (a problem), but the reply itself was read.
+        result, _, _ = self._run_one_chunk(cfg(rv("one", "model-a")), lambda *a: reply(finding(), {"file": "a.py"}))
+        self.assertEqual(self._counts(result), {"one": (1, 1, 1)})
+        self.assertEqual(len(result.errors), 1)
+
+    def test_a_reply_whose_every_item_is_skipped_says_nothing_so_it_is_not_readable(self):
+        result, _, _ = self._run_one_chunk(cfg(rv("one", "model-a")), lambda *a: reply({"file": "a.py"}))
+        self.assertEqual(self._counts(result), {"one": (1, 1, 0)})
+
+    def test_a_reviewer_whose_every_request_failed_has_an_error_and_no_counts(self):
+        result, _, _ = self._run_one_chunk(cfg(rv("down", "model-a"), rv("up", "model-b")), lambda model, *a: None if model == "model-a" else reply())
+        self.assertEqual(self._counts(result), {"up": (1, 1, 1)})
+        (failed,) = [o for o in result.outcomes if o.error is not None]
+        self.assertEqual(failed.reviewer.name, "down")
+        self.assertIn("every request failed", failed.error)
+
+    def test_the_review_keeps_each_reviewers_own_findings_before_they_are_merged(self):
+        config = cfg(rv("one", "model-a"), rv("two", "model-b"))
+        result, _, _ = self._run_one_chunk(config, lambda *a: reply(finding(claim="the same claim")))
+        self.assertEqual(result.finding_count, 1)  # merged: one finding raised by both
+        self.assertEqual([(o.reviewer.name, [f.reviewers for f in o.value.findings]) for o in result.outcomes],
+                         [("one", [("one",)]), ("two", [("two",)])])
+
+    def test_a_translators_failure_is_an_unreadable_reply(self):
+        script = self.root / "broken.py"
+        script.write_text("import sys\nsys.exit(3)\n", encoding="utf-8")
+        result, _, _ = self._run_one_chunk(cfg(rv("one", "model-a", translator=str(script))), lambda *a: "anything")
+        self.assertEqual(self._counts(result), {"one": (1, 1, 0)})
+
 
 class ReasoningModelReplies(unittest.TestCase):
     """DeepSeek-R1-style models write `<think>...</think>` first; its braces must not be mistaken for the answer."""

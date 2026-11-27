@@ -535,6 +535,19 @@ class VerifierLoop(unittest.TestCase):
         self.assertIn("kept asking for more context after the round limit", item.note)
         self.assertEqual(result.errors, [])  # asking is not a problem
 
+    def test_a_request_for_lookups_is_a_reply_the_reader_could_read_and_the_verifier_that_gave_up_is_listed(self):
+        # The counts behind "how many replies were readable": a lookup request is read as one, and a verifier that kept asking
+        # after the round limit (which gives no vote) is named by the position of the finding.
+        executor = StubExecutor()
+        result, script = verify(reviewer(), [ask(("grep", {"pattern": "run("})), verdict()], executor)
+        counts = result.outcomes[0].value.counts
+        self.assertEqual((counts.requests, counts.replies, counts.readable), (2, 2, 2))
+        self.assertEqual(result.outcomes[0].value.limit_hit, set())
+        result, script = verify(reviewer(), [ask(("grep", {"pattern": "a"}))], StubExecutor())
+        counts = result.outcomes[0].value.counts
+        self.assertEqual((counts.requests, counts.replies, counts.readable), (need.MAX_NEED_ROUNDS + 1,) * 3)
+        self.assertEqual(result.outcomes[0].value.limit_hit, {0})
+
     def test_a_request_for_a_tool_off_the_menu_runs_nothing_and_is_answered_with_an_error(self):
         executor = StubExecutor()
         result, script = verify(reviewer(tools=("read_file",)), [ask(("grep", {"pattern": "a"})), verdict("rejected")], executor)

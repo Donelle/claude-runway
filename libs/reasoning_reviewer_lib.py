@@ -120,6 +120,24 @@ class FindingGroup:
 
 
 @dataclass
+class ReplyCount:
+    """How one reviewer's requests went, in every stage: how many it sent, how many got a reply, and how many of those replies
+    the reader could not read (a reply that is not in the stage's format, a translator that failed, a verdict that does not meet
+    the standard, no usable probability). A reply that asks for a lookup (`need:`) is read as such, so it counts as readable.
+    The readable ones are `replies - unreadable`. It is what the structured results file reports as "how many replies were
+    readable" (`libs/reviewer_files_lib.py`), so a reviewer that answered but whose answers could not be read is told apart from
+    one that found nothing."""
+
+    requests: int = 0
+    replies: int = 0
+    unreadable: int = 0
+
+    @property
+    def readable(self) -> int:
+        return self.replies - self.unreadable
+
+
+@dataclass
 class ReviewerResult:
     """What one reviewer produced across all of its chunks."""
 
@@ -132,6 +150,7 @@ class ReviewerResult:
     # `tools` that ran without them.
     warnings: list = field(default_factory=list)
     chunks: int = 0
+    counts: ReplyCount = field(default_factory=ReplyCount)
 
 
 @dataclass
@@ -142,6 +161,10 @@ class ReasoningReview:
     warnings: list = field(default_factory=list)
     reviewers_run: list = field(default_factory=list)
     chunks: int = 0
+    # The scheduler's outcome for every reasoning reviewer that was asked, in the order they ran (`ReviewerOutcome`: the reviewer,
+    # its `ReviewerResult` or the error that stopped it). `groups` are the findings after merging; this keeps each reviewer's own
+    # findings, which the structured results file saves so that a process can merge several reviewers' results itself.
+    outcomes: list = field(default_factory=list)
 
     @property
     def finding_count(self) -> int:
@@ -1128,6 +1151,7 @@ def _review_one(
                 prompt_chars=len(system) + len(message), reply_format=reviewer.reply_format, translator=reviewer.translator,
                 prompt_hash=prompt_hash,
             ) as req:
+                result.counts.requests += 1
                 reply = complete(client, reviewer.model, system, message)
                 finish_request(req, reply)
                 if reply is None:
@@ -1136,6 +1160,7 @@ def _review_one(
                     result.problems.append(f"reviewer {reviewer.name!r}: chunk {number}/{len(chunks)}: {last_failure}")
                     req.problem(last_failure)
                     continue
+                result.counts.replies += 1
                 if session is not None:
                     outcome = session.read(reply, req)
                     if outcome == ASKED:
@@ -1151,6 +1176,7 @@ def _review_one(
                         reply = translate(reply, reviewer.translator)
                     except TranslatorError as exc:
                         # No fallback to the raw reply: the translator is what makes it readable.
+                        result.counts.unreadable += 1
                         result.problems.append(f"reviewer {reviewer.name!r}: chunk {number}/{len(chunks)}: the translator {exc}")
                         req.problem(f"the translator {exc.brief}")
                         # The caller's result keeps what the translator printed; the session log's copy of it must not.
@@ -1160,6 +1186,8 @@ def _review_one(
                 if found or not problems:  # a reply that could not be read says nothing about what it found
                     req.note(f"raised {len(found)} finding(s)" if found else "raised no finding",
                              detail=tuple(line for f in found for line in describe_finding(f)))
+                else:
+                    result.counts.unreadable += 1
                 result.findings.extend(found)
                 result.problems.extend(f"chunk {number}/{len(chunks)}: {p}" for p in problems)
                 for problem in problems:
@@ -1222,7 +1250,7 @@ def run_reasoning_review(
         return _review_one(reviewer, chunks_for, client, complete_fn, instructions, lessons, recorder, executor)
 
     report = run_stages(config, loader, run_reviewer, max_reviewers, roles=("reasoning",), recorder=recorder)
-    review = ReasoningReview(warnings=list(report.warnings))
+    review = ReasoningReview(warnings=list(report.warnings), outcomes=list(report.outcomes))
     unsent = [section.path for section in sections if not _render_section(section)[1]]
     if unsent:
         shown = ", ".join(unsent[:10]) + (f" and {len(unsent) - 10} more" if len(unsent) > 10 else "")
@@ -1324,6 +1352,7 @@ __all__ = [
     "DiffSection",
     "Finding",
     "FindingGroup",
+    "ReplyCount",
     "ReviewerResult",
     "ReasoningReview",
     "split_diff",

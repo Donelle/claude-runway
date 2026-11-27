@@ -2,7 +2,7 @@
 
 The `codebase-reviewer` MCP server is an opt-in, standalone server that runs local models on LM Studio to review a change before Copilot does. It shares nothing with the other servers except `libs/`, so you can install it or leave it out on its own.
 
-What exists today: configuration, the reviewers file, model loading, staged scheduling, the reasoning, verifier and classifier stages, and a database of what every review cost. It has three tools. `list_reviewers` validates your setup and shows what a review would run. `review(type, params)` runs a review; its types are `"reasoning"` (see [Running a review](#running-a-review)), `"verifier"` (see [Verifying findings](#verifying-findings)) and `"classifier"` (see [Classifying findings](#classifying-findings)). `review_report` reads the database (see [What every review records](#what-every-review-records)).
+What exists today: configuration, the reviewers file, model loading, staged scheduling, the reasoning, verifier and classifier stages, and a database of what every review cost. It has three tools. `list_reviewers` validates your setup and shows what a review would run. `review(type, params)` runs a review; its types are `"reasoning"` (see [Running a review](#running-a-review)), `"verifier"` (see [Verifying findings](#verifying-findings)) and `"classifier"` (see [Classifying findings](#classifying-findings)); the last two can also run alone on findings read from a file (see [Running one stage from a findings file](#running-one-stage-from-a-findings-file)). `review_report` reads the database (see [What every review records](#what-every-review-records)).
 
 ## Turning it on
 
@@ -23,8 +23,10 @@ python tools/setup_project.py init /path/to/project --codebase-reviewer --review
 | `MAX_REVIEW_ROUNDS` | `3` | The most rounds of Copilot feedback an unattended run goes through before a human is brought in. |
 | `QDRANT_URL`, `QDRANT_API_KEY` | `http://localhost:6333`, none | For the scoring database, a later piece of work. |
 | `CLAUDE_RUNWAY_CODEBASE_REVIEWER_DB` | `~/.claude/claude-runway/codebase-reviewer.db` | Where the server records every review run (see [What every review records](#what-every-review-records)). Inherited from the shell like `CLAUDE_RUNWAY_LMSTUDIO_URL` unless you put it in the block's `env`. |
+| `REVIEW_ID` | none | An ID that groups the runs of one review, stored in each run's record as `settings.review_id` and named in the results file. Printable text of at most 200 characters. See [Saving complete results and a review ID](#saving-complete-results-and-a-review-id). |
+| `REVIEW_OUTPUT_DIR` | none | A folder: each review also saves its complete structured results there, one file per review. Created if missing; a folder that cannot be written to refuses the review before any model runs. See [Saving complete results and a review ID](#saving-complete-results-and-a-review-id). |
 
-`CLAUDE_RUNWAY_LMSTUDIO_URL` is inherited from the shell like the other servers' (see [Environment variables](environment-variables.md)). A `MAX_REVIEWERS` or `MAX_REVIEW_ROUNDS` that is not a whole number of 1 or more is an error, not a silent default.
+`CLAUDE_RUNWAY_LMSTUDIO_URL` is inherited from the shell like the other servers' (see [Environment variables](environment-variables.md)). A `MAX_REVIEWERS` or `MAX_REVIEW_ROUNDS` that is not a whole number of 1 or more is an error, not a silent default. `REVIEW_ID` and `REVIEW_OUTPUT_DIR` are for whatever runs each reviewer in its own session, such as a test harness: `init` never writes them, and a blank value counts as unset.
 
 ## The reviewers file
 
@@ -102,9 +104,9 @@ How the prompt is built, per reviewer: its own prompt, then the `.github/instruc
 
 ### How a review runs: steps, a policy, and the loop
 
-A review is a sequence of steps over one run's state (kept in memory for the one `review` call): `reason` (the reasoning reviewers read the diff), `ground` (findings whose quoted code is not in the file are dropped; no model), `verify` (the verifiers confirm or reject what is left), `classify` (the classifiers match what still stands against the rubric) and `finish` (format the result, close the run's record). A policy chooses the next step; today's only policy is the rules policy, which runs each type in the order it always ran: `reasoning` is reason; `verifier` is reason, ground, verify; `classifier` is reason, ground, verify, classify. So a review returns what it returned before this split.
+A review is a sequence of steps over one run's state (kept in memory for the one `review` call): `reason` (the reasoning reviewers read the diff), `ground` (findings whose quoted code is not in the file are dropped; no model), `verify` (the verifiers confirm or reject what is left), `classify` (the classifiers match what still stands against the rubric) and `finish` (format the result, close the run's record). A policy chooses the next step; today's only policy is the rules policy, which runs each type in the order it always ran: `reasoning` is reason; `verifier` is reason, ground, verify; `classifier` is reason, ground, verify, classify. So a review returns what it returned before this split. A run that starts from a findings file (see [Running one stage from a findings file](#running-one-stage-from-a-findings-file)) lists the steps the file stands in for as supplied: the rules policy skips them, and the loop counts them as done where a step needs one before it.
 
-The loop, not the policy, enforces what must always hold. Each step runs at most once, and in order: `ground` only after `reason`, `verify` only after `ground` (and only on grounded findings), `classify` only after `verify` (and only on findings the verifiers did not reject). An action that breaks a rule is recorded in the run's notes (stage `orchestrator`), replaced by `finish`, and shown in the result's warnings. A run that takes more than eight steps stops with a note, and the run always finishes: its record is closed as `finished`, `refused` or `errored` whichever way it ends. Reviewers' resident models are checked before the first step, the classifier's first, so a model that is not loaded is reported at once and not after minutes of reasoning. The code is in `libs/reviewer_orchestrator_lib.py`.
+The loop, not the policy, enforces what must always hold. Each step runs at most once, and in order: `ground` only after `reason`, `verify` only after `ground` (and only on grounded findings), `classify` only after `verify` (and only on findings the verifiers did not reject). An action that breaks a rule is recorded in the run's notes (stage `orchestrator`), replaced by `finish`, and shown in the result's warnings. A run that takes more than eight steps stops with a note, and the run always finishes: its record is closed as `finished`, `refused` or `errored` whichever way it ends. Reviewers' resident models are checked before the first step, the classifier's first, so a model that is not loaded is reported at once and not after minutes of reasoning. (A run that starts from a findings file has no reasoning to wait for, so it checks only the models of the stage it runs, before that stage's first request.) The code is in `libs/reviewer_orchestrator_lib.py`.
 
 ### A `promptFile` replaces the reply instructions
 
@@ -132,7 +134,7 @@ What a reviewer finds depends mostly on how much its prompt asks it to cover at 
 
 ## Verifying findings
 
-`review(type="verifier", params={"repo_path": "/path/to/repo", "base_ref": "origin/main"})` takes the same params as `"reasoning"` and does more with the result. On the server it runs the reasoning stage, then **grounds** each finding, then has every active **verifier** reviewer check what is left. Only the outcome comes back to Claude.
+`review(type="verifier", params={"repo_path": "/path/to/repo", "base_ref": "origin/main"})` takes the same params as `"reasoning"` and does more with the result. On the server it runs the reasoning stage, then **grounds** each finding, then has every active **verifier** reviewer check what is left. Only the outcome comes back to Claude. (With the one extra key `findings_file` it runs the last two steps alone, on findings read from a file: see [Running one stage from a findings file](#running-one-stage-from-a-findings-file).)
 
 **Grounding (no model).** The reasoning stage asks each reviewer to copy a `quote` with every finding: the exact line of code the claim is about. Before any model reads a finding, the quote is looked up in the cited file as it is at `head_ref`, resolved once to a commit before the diff is cut so a checkout or commit made while the models run does not change what is read (whitespace is ignored, so indentation and wrapping do not matter; a short span of lines is fine). Only files of the change can be read, so a finding cannot name its way to another file.
 
@@ -183,7 +185,7 @@ What is recorded is in [What every review records](#what-every-review-records): 
 
 ## Classifying findings
 
-`review(type="classifier", params={"repo_path": "/path/to/repo", "base_ref": "origin/main"})` takes the same params as `"reasoning"` and `"verifier"` and goes one stage further. On the server it runs the verifier review, then has every active **classifier** reviewer check each finding that is left standing against your rubric. The findings that stand are everything the verifiers did not reject: confirmed, disputed and unchecked ones. Findings dropped as rejected or ungrounded are not sent to a classifier. Only the outcome comes back to Claude.
+`review(type="classifier", params={"repo_path": "/path/to/repo", "base_ref": "origin/main"})` takes the same params as `"reasoning"` and `"verifier"` and goes one stage further. (With the one extra key `findings_file` it runs the classifiers alone, on findings that already stand after verification: see [Running one stage from a findings file](#running-one-stage-from-a-findings-file).) On the server it runs the verifier review, then has every active **classifier** reviewer check each finding that is left standing against your rubric. The findings that stand are everything the verifiers did not reject: confirmed, disputed and unchecked ones. Findings dropped as rejected or ungrounded are not sent to a classifier. Only the outcome comes back to Claude.
 
 **The question.** For every (finding, rubric entry) pair a classifier answers one yes/no question: does this finding fall under this entry's definition? It sees the entry's `name`, `level` and `definition` (plus the text of its `definitionFile`) and one finding at a time: where it is, its class, the claim, the failing input the reporter gave and the code it quotes. It reads no code beyond that quote and runs nothing. You decide what a level means by what you write in the definitions. It does **not** see an entry's `score`: the score is the server's cut-off, and a model told the cut-off can learn to answer to it.
 
@@ -206,11 +208,79 @@ The run's `review` event in the shared `metrics.db` carries the counts only: fin
 
 **Limits.** At most 100 findings are classified per review (each costs one request per rubric entry per classifier, each of one token); the rest come back without a rubric level and with a warning.
 
+## Running one stage from a findings file
+
+By default `"verifier"` runs the reasoning stage first and `"classifier"` runs both earlier stages. Running each reviewer in its own session needs the opposite: one stage, on findings that an earlier run produced. So `"verifier"` and `"classifier"` take one more key. (`"reasoning"` has no earlier stage, so it refuses the key as an unknown one.)
+
+| Key | Meaning |
+|---|---|
+| `findings_file` | The path of a findings file (a leading `~` is expanded; a relative path is the server's working directory's). With it, only the stage the type is named after runs, on the findings in the file. Without it nothing changes: the type runs every stage up to its own. |
+
+**The caller passes the path, never the findings.** A model that called `review` would have to retype them, and the text a review returns leaves out each finding's quote, which grounding needs (a finding with no quote is dropped as ungrounded). The server reads the file itself.
+
+*   **`"verifier"` with a findings file** runs no reasoning stage. It grounds the findings (the same no-model check as in a full review: a finding whose quote is not in the file is dropped as ungrounded, and the lines of the others are corrected to where the quote is), and then every active verifier checks what is left. `repo_path` and `base_ref` are still required: grounding reads the cited files at the commit `head_ref` names, and only the files of the change `base_ref...head_ref` can be read. No reasoning reviewer needs to be active, so a reviewers file with a single verifier is enough.
+*   **`"classifier"` with a findings file** runs only the classifiers, on findings that already stand after verification: no reasoning, no grounding and no verifier. `repo_path` and `base_ref` are still required, so the run is recorded against a range and the range is checked, but nothing is read from it.
+*   `chunk_chars` has no effect with a findings file, since it only cuts the diff for the reasoning stage. The findings are used exactly as given: nothing is merged, corrected or dropped before the stage runs, except by the verifier stage's own grounding.
+*   The result is the text a full review of that type returns, with a warning saying that the findings were read from a findings file and which stages did not run. A classified review whose findings came with their statuses says that, in place of saying that no verifier ran.
+*   The run's record has only the stages that ran, the number of findings read and no diff size: no model read the diff, so there is no savings record either.
+
+### The findings file
+
+A JSON object with one key, `findings`, a list of findings:
+
+```json
+{
+  "findings": [
+    {
+      "file": "app/pricing.py",
+      "line_start": 12,
+      "line_end": 14,
+      "class": "off-by-one",
+      "claim": "the loop stops one item early",
+      "failing_input": "items = [a, b]",
+      "quote": "for i in range(len(items) - 1):",
+      "reviewers": ["boundaries"],
+      "verification": "confirmed"
+    }
+  ]
+}
+```
+
+| Key | Meaning |
+|---|---|
+| `file` | The file, as the change names it. A name that is not a file of the change is dropped as ungrounded by the verifier stage. |
+| `line_start`, `line_end` | The lines. `line_end` is optional and defaults to `line_start`; `0` means no line number. Grounding corrects them to where the quote is. |
+| `class` | The reporter's own label for the kind of defect (not a rubric entry). |
+| `claim` | What is wrong. |
+| `failing_input` | The concrete input that shows it; `""` when there is none. |
+| `quote` | The exact code the claim is about. `""` is accepted, and grounding then drops the finding as having no quote. |
+| `reviewers` | A non-empty list of the names of the reviewers who raised it. |
+| `alternates` | Verifier only, optional: the other claims at overlapping lines that were merged into this finding (each has `line_start`, `line_end`, `claim`, `failing_input`, `quote`, `reviewers`). Grounding checks each as a finding of its own, as in a full review. The classifier refuses the key, because it would classify only the first claim and silently lose the rest: list each alternate as a finding of its own. |
+| `verification` | Classifier only, required: what the verifiers made of the finding, `confirmed`, `disputed` or `unchecked`. A rejected finding is never classified, so a file that holds one is refused. The verifier stage ignores the key. |
+
+The reader reports **every** problem in one `Error:` that names the path: a file that is missing, is not a regular file, is over 8 MiB, is not UTF-8 JSON, or has a finding with a missing key, a value of the wrong type or an unknown key (a misspelt `quote` would otherwise mean "no quote"). It never repeats a value from the file in a message, only key names (cut short) and types, because the path comes from a model and can name any file the server can read. `libs/reviewer_files_lib.py` has `findings_document(findings, statuses)`, which builds the content of such a file from `Finding` objects, and `finding_to_dict` and `finding_from_dict`; the same dict describes a finding in the results file below.
+
+## Saving complete results and a review ID
+
+**The results file.** With `REVIEW_OUTPUT_DIR` set, every review, of any type, also writes its complete structured results to `<review type>-<run id>.json` in that folder. The run id is the one in the run's record, so a file joins to its record, and reviews that share a folder never overwrite each other. The text the caller gets is unchanged and never names the file: the model that calls `review` does not handle it, a process that combines the results of several single-reviewer runs does. It is written whole (to a temporary name, then renamed), so a process that lists the folder never meets half a file. The folder is created and checked before any model runs. A review that is refused or fails writes no results file (the `Error:` text and the run's record say why). A results file that cannot be written, a full disk say, leaves the review's text as it was, with a note saying that the results were not saved.
+
+The file is a JSON object: `version` (1), `type`, `run_id`, `review_id` (only when `REVIEW_ID` is set), `head` (the commit the review read), `steps` (the steps that really ran) and one section for each stage that ran in it: `reasoning`, `verifier` and `classifier`. A stage whose findings came from a findings file has no section. Each section has `errors` and `warnings` (what the result text lists under "Problems" and "Warnings") and a `reviewers` list with one entry per reviewer that was asked, in the order they ran:
+
+| Section | What it holds | The existing function that combines it |
+|---|---|---|
+| `reasoning` | `chunks`; per reviewer, its **own findings before any merging** (`findings`, each as in a findings file) and its `chunks` | `collect_findings` over every reviewer's findings, in the order the reviewers ran, gives the merged findings that a full review reports |
+| `verifier` | `findings`: the findings that were grounded (lines corrected), in the order that every `finding` position refers to; `ungrounded`: each finding dropped before any model saw it, with its `reason`; per verifier, `decisions` (the `finding` position, `verdict`, `failing_input`, `wrong_result` and `reasoning`) and `gave_up` (the positions it kept asking about after the round limit) | `combine` over the decisions of every verifier for one position gives that finding's status |
+| `classifier` | `findings`: what was put to the classifiers, each with the `verification` it arrived with, in the order that every `finding` position refers to; per classifier, `answers` (the `finding` position and its `probabilities`: one `entry` and `probability` for every rubric entry, at full precision) | `classify_answers` over the answers of every classifier for one position, with the rubric, gives that finding's outcome |
+
+Every reviewer entry also has `requests` (how many requests it sent), `replies` (how many got a reply) and `readable` (how many of those replies the reader could read). A reply that is not in the stage's format, a translator that failed, a verdict that is not accepted, and an answer with no usable probability are not readable; a reply that asks for a lookup is. So a reviewer that found nothing (every reply readable, no findings) is told apart from one whose answers could not be read. A reviewer that failed has an `error` instead, and no counts. `reasoning_findings`, `verifier_decisions` and `classifier_answers` in `libs/reviewer_files_lib.py` turn one reviewer's entry back into the objects those functions take. Combining the results of single-reviewer runs with them gives the same outcome as one run with those reviewers: every verifier or classifier run from the same findings file sees the same findings in the same positions, and the reasoning findings are combined in the order the reviewers would have run.
+
+**The review ID.** `REVIEW_ID` is stored in the run's record: `runs.settings`, the existing column that holds the settings that change the cost, gets one more key, `review_id`, and only when the setting is present (there is no table change, and a run without it is recorded exactly as before). Runs that share an ID belong to one review. The records keep `source` `mcp`.
+
 ## What every review records
 
 Choosing models by guesswork does not work once reviews take minutes, so every review run, from the `review` tool and from the test harness alike, is recorded in the server's own SQLite database, `~/.claude/claude-runway/codebase-reviewer.db` (override with `CLAUDE_RUNWAY_CODEBASE_REVIEWER_DB`). The harness records into a throwaway database under the system temp folder instead, unless you set that variable (see [Where a run is recorded](../harness/README.md#where-a-run-is-recorded)), so test runs stay out of this history. The server owns it, so it works whether or not the analytics server is installed. It is built to hold everything the reviewer records over time, and today it holds the performance data:
 
-- **Per run:** start, end and wall time; the review type; the repository, the diff range, the branch of `head_ref` and the pull request when you pass `pr`; the number of chunks, findings and confirmed findings; the settings that change the cost (`MAX_REVIEWERS`, `chunk_chars`, `context_lines`); and how it ended (`finished`; `incomplete`, when the review returned but some stage got no answer from any reviewer because every request failed, its model never loaded, or every reviewer failed before sending a request (a diff too big for it); `refused`, for a configuration, a range or a model the run could not start with; `errored`). A run that fails or times out part-way is still recorded.
+- **Per run:** start, end and wall time; the review type; the repository, the diff range, the branch of `head_ref` and the pull request when you pass `pr`; the number of chunks, findings and confirmed findings; the settings that change the cost (`MAX_REVIEWERS`, `chunk_chars`, `context_lines`) and, when `REVIEW_ID` is set, the review ID; and how it ended (`finished`; `incomplete`, when the review returned but some stage got no answer from any reviewer because every request failed, its model never loaded, or every reviewer failed before sending a request (a diff too big for it); `refused`, for a configuration, a range or a model the run could not start with; `errored`). A run that fails or times out part-way is still recorded.
 - **Per stage:** start and end. The stage is a value, not a column, so a stage added later records and reports with no change.
 - **Per request:** start and end, reviewer, model, role, what it was about (a diff chunk for reasoning, a finding for the verifier and the classifier), prompt and reply size in characters, prompt and reply tokens, the latency, the time to first token and the average time between tokens (see [Timing and tokens](#timing-and-tokens)), how many problems the reply produced with a one-line summary of them, and whether it was `answered`, `timed_out`, `refused` (HTTP 400) or `failed`.
 - **Per lookup** (a reviewer with `tools`): which round of the loop each request was (`requests.need_round`, 0 for the first ask) and whether it ended the loop by still asking after the round limit (`need_limit_hit`); and, in `tool_calls`, each lookup it asked for: the request, the round, the tool's name, the size of the result (`result_chars`), how much of it reached the model (`shown_chars`), whether the tool cut it (`truncated`) and whether it was an error. `truncated` is the tool's own cut; a result the reference budget cut or never showed is told apart by `shown_chars` being below `result_chars`. Never the arguments the model wrote, never what came back, and never a tool name the model made up (stored as `(not on the menu)`): the database holds no model-written text.

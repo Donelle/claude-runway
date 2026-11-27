@@ -12,6 +12,7 @@ import importlib.util
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -27,7 +28,8 @@ sys.path.insert(0, str(REPO_ROOT / "tests"))
 import openai_lib  # noqa: E402
 from fake_lmstudio import FakeLmStudio  # noqa: E402
 from lmstudio_model_loader_lib import ModelLoader  # noqa: E402
-from reasoning_reviewer_lib import split_diff  # noqa: E402
+from reasoning_reviewer_lib import Finding, split_diff  # noqa: E402
+from reviewer_files_lib import findings_document  # noqa: E402
 
 SERVER_PATH = REPO_ROOT / "mcpservers" / "codebase_reviewer_mcp_server.py"
 
@@ -304,7 +306,10 @@ class ReviewTool(unittest.TestCase):
         self.assertIn("known types: reasoning, verifier, classifier", out)
 
     def test_the_classifier_type_takes_the_same_keys_as_the_other_two_and_shows_its_help_without_params(self):
-        self.assertEqual(self.mod.REVIEW_TYPES["classifier"].params, self.mod.REVIEW_TYPES["reasoning"].params)
+        # The keys that describe the diff are the same for all three types; the classifier adds only the path of a findings file.
+        shared = self.mod.REVIEW_TYPES["reasoning"].params
+        self.assertEqual(self.mod.REVIEW_TYPES["classifier"].params[: len(shared)], shared)
+        self.assertEqual([p.name for p in self.mod.REVIEW_TYPES["classifier"].params[len(shared):]], ["findings_file"])
         out = self.mod.review("classifier", {})
         self.assertFalse(out.startswith("Error:"))
         self.assertIn("review type 'classifier'", out)
@@ -312,7 +317,10 @@ class ReviewTool(unittest.TestCase):
             self.assertIn(key, out)
 
     def test_the_verifier_type_takes_the_same_keys_as_reasoning_and_shows_its_help_without_params(self):
-        self.assertEqual(self.mod.REVIEW_TYPES["verifier"].params, self.mod.REVIEW_TYPES["reasoning"].params)
+        # The keys that describe the diff are the same for all three types; the verifier adds only the path of a findings file.
+        shared = self.mod.REVIEW_TYPES["reasoning"].params
+        self.assertEqual(self.mod.REVIEW_TYPES["verifier"].params[: len(shared)], shared)
+        self.assertEqual([p.name for p in self.mod.REVIEW_TYPES["verifier"].params[len(shared):]], ["findings_file"])
         out = self.mod.review("verifier", {})
         self.assertFalse(out.startswith("Error:"))
         self.assertIn("review type 'verifier'", out)
@@ -680,6 +688,324 @@ class ReviewTool(unittest.TestCase):
         resolve.assert_called_once_with(str(self.dir), "HEAD")
         self.assertEqual(captured, {"base": "origin/main", "head": "0" * 40, "context": 20})
         self.assertEqual(out, "Error: stop here")
+
+
+def _feature_repo(root: Path) -> Path:
+    """A repository whose `feature` branch changes `app.py` (its second line becomes `os.system(cmd)`), to review against `main`."""
+    repo = root / "repo"
+    repo.mkdir()
+    env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull, "GIT_AUTHOR_NAME": "t",
+           "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+
+    def git(*args):
+        subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, env=env)
+
+    git("init", "-q", "-b", "main")
+    (repo / "app.py").write_text("print('one')\nprint('two')\n", encoding="utf-8")
+    git("add", ".")
+    git("commit", "-q", "-m", "base")
+    git("checkout", "-q", "-b", "feature")
+    (repo / "app.py").write_text("print('one')\nos.system(cmd)\n", encoding="utf-8")
+    git("commit", "-q", "-am", "change")
+    return repo
+
+
+REAL = Finding("app.py", 1, 1, "injection", "shell injection", "cmd='a; b'", ("finder",), (), "os.system(cmd)")
+INVENTED = Finding("app.py", 1, 1, "style", "made up", "x", ("finder",), (), "this line does not exist")
+
+
+@unittest.skipUnless(shutil.which("git"), "needs git")
+class ServerRunWithStubbedModels(unittest.TestCase):
+    """Base of the tests that run `review` end to end over a real git repository with stubbed models. The reviewers file has a
+    verifier and a classifier and NO reasoning reviewer, so a request for the reasoning stage could only come from a bug; `requests`
+    lists the stage each model request was for."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = Path(self._tmp.name)
+        self.mod = _load_server()
+        self.repo = _feature_repo(self.dir)
+        self.db = self.dir / "reviewer.db"
+        self.results = self.dir / "results"
+        isolate = mock.patch.dict(os.environ, {
+            "CLAUDE_RUNWAY_CODEBASE_REVIEWER_DB": str(self.db), "CLAUDE_RUNWAY_METRICS_DB": str(self.dir / "metrics.db"),
+            "CLAUDE_RUNWAY_SAVINGS_DB": str(self.dir / "savings.db"), "CLAUDE_RUNWAY_TRACK_SAVINGS": "",
+        })
+        isolate.start()
+        self.addCleanup(isolate.stop)
+        self.requests: list = []
+        self.reviewers = self.reviewers_file()
+
+    def reviewers_file(self, finder=False, name="reviewers.json") -> str:
+        data = {
+            "rubric": [{"name": "injection", "level": "high", "score": 0.6, "definition": "input reaches a shell"}],
+            "reviewers": [
+                {"name": "checker", "model": "model-b", "prompt": "check", "active": True, "type": ["verifier"], "loadOnDemand": False},
+                {"name": "sorter", "model": "model-c", "prompt": "sort", "active": True, "type": ["classifier"], "loadOnDemand": False},
+            ],
+        }
+        if finder:
+            data["reviewers"].insert(0, {"name": "finder", "model": "model-a", "prompt": "look", "active": True, "type": ["reasoning"],
+                                         "loadOnDemand": False, "replyFormat": "json"})
+        path = self.dir / name
+        path.write_text(json.dumps(data), encoding="utf-8")
+        return str(path)
+
+    def write_findings(self, content, name="findings.json") -> str:
+        path = self.dir / name
+        path.write_text(content if isinstance(content, str) else json.dumps(content), encoding="utf-8")
+        return str(path)
+
+    def findings_file(self, findings, statuses=None) -> str:
+        return self.write_findings(findings_document(findings, statuses))
+
+    def complete(self, client, model, system, content):
+        if "checking ONE reported defect" in system:
+            self.requests.append("verifier")
+            return json.dumps({"verdict": "confirmed", "failing_input": "cmd='a; b'", "wrong_result": "runs b", "reasoning": "traced"})
+        self.requests.append("reasoning")
+        return json.dumps({"findings": [{"file": "app.py", "line_start": 2, "line_end": 2, "class": "injection", "claim": "shell injection",
+                                         "failing_input": "cmd='a; b'", "quote": "os.system(cmd)"}]})
+
+    def probability(self, client, model, system, content):
+        self.requests.append("classifier")
+        return 0.8
+
+    def env(self, **env):
+        base = {k: v for k, v in os.environ.items() if k not in ("REVIEWERS_FILE", "MAX_REVIEWERS", "MAX_REVIEW_ROUNDS", "REVIEW_ID",
+                                                                 "REVIEW_OUTPUT_DIR")}
+        base.update(env)
+        return mock.patch.dict(os.environ, base, clear=True)
+
+    def review(self, review_type, params=None, *, reviewers=None, loaded=("model-b", "model-c"), **env) -> str:
+        fake = FakeLmStudio(loaded=list(loaded))
+        with self.env(REVIEWERS_FILE=reviewers or self.reviewers, **env), mock.patch.object(
+            self.mod, "ModelLoader", lambda url, **kw: ModelLoader(url, http=fake, **kw)
+        ), mock.patch.object(self.mod, "new_client", return_value=object()), mock.patch.object(
+            self.mod, "new_probability_client", return_value=object()
+        ), mock.patch.object(openai_lib, "complete", self.complete), mock.patch.object(openai_lib, "yes_probability", self.probability):
+            return self.mod.review(review_type, {"repo_path": str(self.repo), "base_ref": "main", "head_ref": "feature", **(params or {})})
+
+    def runs(self) -> list:
+        conn = sqlite3.connect(self.db)
+        conn.row_factory = sqlite3.Row
+        try:
+            return conn.execute("SELECT * FROM runs ORDER BY started_at, rowid").fetchall()
+        finally:
+            conn.close()
+
+    def head(self) -> str:
+        return subprocess.run(["git", "-C", str(self.repo), "rev-parse", "feature"], check=True, capture_output=True, text=True).stdout.strip()
+
+
+class OneStageFromAFindingsFile(ServerRunWithStubbedModels):
+    def test_the_verifier_alone_grounds_the_findings_in_the_file_and_asks_only_its_verifiers(self):
+        out = self.review("verifier", {"findings_file": self.findings_file([REAL, INVENTED])})
+        self.assertFalse(out.startswith("Error:"), out)
+        self.assertEqual(self.requests, ["verifier"])  # no reasoning request, and the invented finding never reached a model
+        self.assertIn("1 confirmed, 0 disputed, 0 unchecked; dropped 0 rejected and 1 ungrounded", out)
+        self.assertIn("app.py:2 [injection] [finder] shell injection", out)  # the file said line 1; the quote is on line 2
+        self.assertIn("ungrounded: its quote is not in app.py", out)
+        self.assertIn("The findings were read from a findings file: the reasoning stage did not run.", out)
+        run = self.runs()[0]
+        self.assertEqual((run["review_type"], run["outcome"], run["findings"], run["chunks"], run["confirmed"]), ("verifier", "finished", 2, 0, 1))
+
+    def test_without_the_file_the_same_reviewers_file_is_still_refused_for_having_no_reasoning_reviewer(self):
+        out = self.review("verifier")
+        self.assertTrue(out.startswith("Error:"), out)
+        self.assertIn("no active reasoning reviewer", out)
+        self.assertEqual(self.requests, [])
+
+    def test_the_classifier_alone_asks_only_its_classifiers_about_findings_that_already_stand(self):
+        out = self.review("classifier", {"findings_file": self.findings_file([REAL], ["disputed"])})
+        self.assertFalse(out.startswith("Error:"), out)
+        self.assertEqual(self.requests, ["classifier"])  # no reasoning, no verifier request, and no grounding of the quote
+        self.assertIn("1 classified, 0 without a rubric level", out)
+        self.assertIn("shell injection (verifier: disputed)", out)
+        self.assertIn("injection [high], average probability 0.80 over 1 classifier(s)", out)
+        self.assertIn("Each finding's verification status is the one its findings file gave: no verifier ran in this review.", out)
+        self.assertIn("the reasoning and verifier stages did not run", out)
+
+    def test_the_classifier_does_not_need_the_verifiers_model_to_be_loaded(self):
+        out = self.review("classifier", {"findings_file": self.findings_file([REAL], ["confirmed"])},
+                          reviewers=self.reviewers_file(finder=True), loaded=("model-c",))
+        self.assertFalse(out.startswith("Error:"), out)
+        self.assertEqual(self.requests, ["classifier"])
+
+    def test_chunk_chars_is_accepted_and_has_no_effect_with_a_findings_file(self):
+        out = self.review("verifier", {"findings_file": self.findings_file([REAL]), "chunk_chars": 10})
+        self.assertFalse(out.startswith("Error:"), out)
+        self.assertEqual(self.requests, ["verifier"])
+
+    def test_the_findings_are_not_merged_or_changed_before_the_stage_runs(self):
+        twin = Finding("app.py", 2, 2, "injection", "the same place, said differently", "", ("finder",), (), "os.system(cmd)")
+        out = self.review("verifier", {"findings_file": self.findings_file([REAL, twin])})
+        self.assertEqual(self.requests, ["verifier", "verifier"])  # two findings on one line stay two: merging is the reasoning stage's job
+        self.assertIn("2 confirmed", out)
+
+    def test_a_findings_file_that_is_wrong_is_an_error_naming_it_with_every_problem_and_no_model_runs(self):
+        path = self.write_findings({"findings": [{"file": "app.py"}, "not an object"]})
+        out = self.review("verifier", {"findings_file": path})
+        self.assertTrue(out.startswith("Error:"), out)
+        self.assertIn(repr(path), out)
+        self.assertIn("findings[0]: missing 'line_start'", out)
+        self.assertIn("findings[1]: must be an object (got str)", out)
+        self.assertEqual(self.requests, [])
+        run = self.runs()[0]
+        self.assertEqual(run["outcome"], "refused")
+        self.assertIn("is not usable", run["error"])
+
+    def test_a_findings_file_that_is_not_there_is_an_error_not_a_traceback(self):
+        out = self.review("classifier", {"findings_file": str(self.dir / "absent.json")})
+        self.assertTrue(out.startswith("Error:") and "is not a file" in out, out)
+        self.assertEqual(self.runs()[0]["outcome"], "refused")
+
+    def test_a_classifier_file_with_a_rejected_finding_is_refused(self):
+        path = self.write_findings({"findings": [dict(findings_document([REAL])["findings"][0], verification="rejected")]})
+        out = self.review("classifier", {"findings_file": path})
+        self.assertIn("the verifiers rejected it", out)
+        self.assertEqual(self.requests, [])
+
+    def test_the_reasoning_type_has_no_earlier_stage_and_refuses_the_key(self):
+        out = self.mod.review("reasoning", {"repo_path": ".", "base_ref": "main", "findings_file": "x.json"})
+        self.assertTrue(out.startswith("Error:"))
+        self.assertIn("unknown key 'findings_file'", out)
+
+    def test_a_blank_or_non_string_findings_file_is_refused_with_the_other_problems(self):
+        out = self.mod.review("verifier", {"repo_path": ".", "base_ref": 5, "findings_file": "  "})
+        self.assertIn("'findings_file' must not be blank", out)
+        self.assertIn("'base_ref' must be a str (got 5)", out)
+        self.assertIn("'findings_file' must be a str (got 3)", self.mod.review("classifier", {"repo_path": ".", "base_ref": "m", "findings_file": 3}))
+
+    def test_the_tool_describes_the_new_key_for_the_two_types_that_take_it(self):
+        for review_type in ("verifier", "classifier"):
+            help_text = self.mod.review(review_type, {})
+            self.assertIn("findings_file (str, optional)", help_text)
+            self.assertIn("only the", help_text)
+        self.assertNotIn("findings_file", self.mod.review("reasoning", {}))
+        description = " ".join({t.name: t for t in self.mod.mcp._tool_manager.list_tools()}["review"].description.split())
+        self.assertIn("findings_file", description)
+        self.assertIn("PATH of a findings file, never the findings themselves", description)
+
+    def test_a_run_from_a_findings_file_writes_no_savings_record_because_no_model_read_the_diff(self):
+        import savings_ledger
+
+        with mock.patch.dict(os.environ, {"CLAUDE_RUNWAY_TRACK_SAVINGS": "1"}), mock.patch.object(
+            savings_ledger, "current_session_id", return_value="live"
+        ):
+            self.review("verifier", {"findings_file": self.findings_file([REAL])})
+        self.assertEqual(list((self.dir / "sessions").glob("*.jsonl")), [])
+
+
+class ResultsFileAndReviewId(ServerRunWithStubbedModels):
+    def setUp(self):
+        super().setUp()
+        self.supplied = self.findings_file([REAL, INVENTED])
+
+    def test_with_an_output_folder_a_review_saves_its_complete_results_and_returns_the_same_text(self):
+        plain = self.review("verifier", {"findings_file": self.supplied})
+        saved = self.review("verifier", {"findings_file": self.supplied}, REVIEW_OUTPUT_DIR=str(self.results), REVIEW_ID="review-7")
+        self.assertEqual(saved, plain)  # the caller's text is unchanged, and never names the file or the folder
+        self.assertNotIn(str(self.results), saved)
+        (path,) = list(self.results.glob("*.json"))
+        run = self.runs()[-1]
+        self.assertEqual(path.name, f"verifier-{run['id']}.json")  # the run's own id, so a file joins to its record
+        data = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual((data["version"], data["type"], data["run_id"], data["review_id"], data["head"], data["steps"]),
+                         (1, "verifier", run["id"], "review-7", self.head(), ["ground", "verify"]))
+        self.assertEqual([k for k in data if k in ("reasoning", "verifier", "classifier")], ["verifier"])
+        self.assertEqual([f["claim"] for f in data["verifier"]["findings"]], ["shell injection"])
+        self.assertEqual(data["verifier"]["findings"][0]["quote"], "os.system(cmd)")  # what the text leaves out
+        self.assertEqual([u["reason"] for u in data["verifier"]["ungrounded"]], ["its quote is not in app.py"])
+        (checker,) = data["verifier"]["reviewers"]
+        self.assertEqual((checker["name"], checker["requests"], checker["replies"], checker["readable"]), ("checker", 1, 1, 1))
+        self.assertEqual(checker["decisions"][0]["finding"], 0)
+        self.assertEqual(list(self.results.glob(".*")), [])  # no temporary file is left behind
+
+    def test_every_review_type_saves_its_own_stages(self):
+        reviewers = self.reviewers_file(finder=True)
+        self.review("reasoning", reviewers=reviewers, loaded=("model-a", "model-b", "model-c"), REVIEW_OUTPUT_DIR=str(self.results))
+        self.review("classifier", {"findings_file": self.findings_file([REAL], ["confirmed"])}, REVIEW_OUTPUT_DIR=str(self.results))
+        sections = {p.name.split("-")[0]: [k for k in json.loads(p.read_text(encoding="utf-8")) if k in ("reasoning", "verifier", "classifier")]
+                    for p in self.results.glob("*.json")}
+        self.assertEqual(sections, {"reasoning": ["reasoning"], "classifier": ["classifier"]})
+
+    def test_without_the_settings_nothing_is_written_and_the_record_is_exactly_what_it_was(self):
+        self.review("verifier", {"findings_file": self.supplied})
+        self.assertFalse(self.results.exists())
+        run = self.runs()[0]
+        self.assertEqual(json.loads(run["settings"]), {"chunk_chars": None, "context_lines": 20, "max_reviewers": 3})
+        self.assertEqual(run["source"], "mcp")
+
+    def test_the_review_id_is_stored_in_the_runs_settings_and_the_rest_of_the_record_is_unchanged(self):
+        self.review("verifier", {"findings_file": self.supplied}, REVIEW_ID="  review-7  ")
+        run = self.runs()[0]
+        self.assertEqual(json.loads(run["settings"]), {"chunk_chars": None, "context_lines": 20, "max_reviewers": 3, "review_id": "review-7"})
+        self.assertEqual((run["source"], run["outcome"]), ("mcp", "finished"))
+
+    def test_every_run_of_one_review_carries_the_same_id(self):
+        self.review("verifier", {"findings_file": self.supplied}, REVIEW_ID="review-7")
+        self.review("classifier", {"findings_file": self.findings_file([REAL], ["confirmed"])}, REVIEW_ID="review-7")
+        self.assertEqual({json.loads(r["settings"])["review_id"] for r in self.runs()}, {"review-7"})
+        self.assertEqual(len(self.runs()), 2)
+
+    def test_a_review_refused_by_a_bad_reviewers_file_still_carries_its_review_id(self):
+        bad = self.dir / "broken.json"
+        bad.write_text("{not json", encoding="utf-8")
+        out = self.review("verifier", {"findings_file": self.supplied}, reviewers=str(bad), REVIEW_ID="review-7")
+        self.assertTrue(out.startswith("Error:"), out)
+        run = self.runs()[0]
+        self.assertEqual(run["outcome"], "refused")
+        self.assertEqual(json.loads(run["settings"])["review_id"], "review-7")
+
+    def test_a_review_id_that_is_not_printable_text_is_refused_before_anything_runs(self):
+        for bad in ("two\nlines", "x" * 201):
+            with self.subTest(bad=bad[:10]):
+                out = self.review("verifier", {"findings_file": self.supplied}, REVIEW_ID=bad)
+                self.assertTrue(out.startswith("Error: Invalid codebase-reviewer settings: REVIEW_ID must be printable text"), out)
+                self.assertEqual(self.requests, [])
+
+    def test_an_output_folder_that_cannot_be_used_refuses_the_review_before_any_model_runs(self):
+        blocker = self.dir / "a-file"
+        blocker.write_text("x", encoding="utf-8")
+        out = self.review("verifier", {"findings_file": self.supplied}, REVIEW_OUTPUT_DIR=str(blocker))
+        self.assertTrue(out.startswith("Error: REVIEW_OUTPUT_DIR"), out)
+        self.assertEqual(self.requests, [])
+        self.assertEqual(self.runs()[0]["outcome"], "refused")
+
+    def test_results_that_cannot_be_written_leave_the_findings_in_the_text_with_a_note_and_the_run_finished(self):
+        plain = self.review("verifier", {"findings_file": self.supplied})
+        with mock.patch.object(self.mod, "write_results", side_effect=OSError(28, "No space left on device")), mock.patch("sys.stderr"):
+            out = self.review("verifier", {"findings_file": self.supplied}, REVIEW_OUTPUT_DIR=str(self.results))
+        self.assertEqual(out, plain + "\n\nNote: the structured results could not be saved (OSError); the findings above are complete.")
+        self.assertNotIn(str(self.results), out)
+        self.assertEqual([r["outcome"] for r in self.runs()], ["finished", "finished"])
+
+    def test_a_review_that_is_refused_writes_no_results_file(self):
+        out = self.review("verifier", {"findings_file": self.supplied}, loaded=("model-c",), REVIEW_OUTPUT_DIR=str(self.results))
+        self.assertTrue(out.startswith("Error:") and "'model-b'" in out, out)
+        self.assertEqual(list(self.results.glob("*.json")), [])
+
+    def test_a_results_file_names_a_run_that_failed_part_way_with_its_error(self):
+        # The only verifier's model fails every request: the review still finishes (incomplete), and the file says which reviewer failed.
+        def failing(client, model, system, content):
+            return None
+
+        fake = FakeLmStudio(loaded=["model-b", "model-c"])
+        with self.env(REVIEWERS_FILE=self.reviewers, REVIEW_OUTPUT_DIR=str(self.results)), mock.patch.object(
+            self.mod, "ModelLoader", lambda url, **kw: ModelLoader(url, http=fake, **kw)
+        ), mock.patch.object(self.mod, "new_client", return_value=object()), mock.patch.object(openai_lib, "complete", failing):
+            out = self.mod.review("verifier", {"repo_path": str(self.repo), "base_ref": "main", "head_ref": "feature",
+                                               "findings_file": self.supplied})
+        self.assertIn("INCOMPLETE REVIEW", out)
+        (path,) = list(self.results.glob("*.json"))
+        section = json.loads(path.read_text(encoding="utf-8"))["verifier"]
+        (checker,) = section["reviewers"]
+        self.assertIn("every request failed", checker["error"])
+        self.assertNotIn("requests", checker)
+        self.assertTrue(any("'checker'" in e for e in section["errors"]))
+        self.assertEqual(self.runs()[0]["outcome"], "incomplete")
 
 
 if __name__ == "__main__":

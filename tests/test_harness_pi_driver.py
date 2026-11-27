@@ -738,7 +738,7 @@ class ConfigTests(unittest.TestCase):
                 d.reviewers_from_config(path)
 
     def test_a_config_with_no_active_reasoning_reviewer_is_refused(self):
-        # The driver asks for review type "reasoning" and every type starts with that stage, so the server would refuse it
+        # The driver asks for review type "reasoning", which needs a reasoning reviewer, so the server would refuse it
         # with a plain "Error:" result, which a run would then have reported as a pass.
         for reviewers in ([{**self.REVIEWER, "type": ["verifier"]}], [{**self.REVIEWER, "active": False}]):
             with self.subTest(reviewers=reviewers), self.assertRaisesRegex(ValueError, "no active reasoning reviewer"):

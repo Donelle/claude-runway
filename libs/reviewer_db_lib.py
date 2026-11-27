@@ -15,7 +15,8 @@ chunk, a finding, a finding and a rubric entry). A stage added later records and
 through the same calls with no change to this file or to the reports.
 
 What is recorded, per run: start, end and outcome; the review type; the repository and diff range; the
-number of chunks and findings; the settings that change the cost; the machine; and the model combination.
+number of chunks and findings; the settings that change the cost, and the review ID when `REVIEW_ID` is set (the runs of one
+review share it); the machine; and the model combination.
 Per classified finding (the classifier stage): which rubric entry and level it took, the average probability (`confidence`), any overlap, and each
 classifier's own probability for every entry, in the `classifications` table (never the claim text: this database holds no model-written text).
 Per `need:` lookup a reviewer or verifier asked for: the request it was asked in, the round, the tool's name, the size

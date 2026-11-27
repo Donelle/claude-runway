@@ -93,6 +93,8 @@ DEFAULT_REPLY_FORMAT = "lines"
 
 DEFAULT_MAX_REVIEWERS = 3
 DEFAULT_MAX_REVIEW_ROUNDS = 3
+# The longest `REVIEW_ID` accepted: it is written into every run record and log line of the review.
+MAX_REVIEW_ID_CHARS = 200
 
 # The tools a reviewer may be given with `tools`: the names `reviewer_tools_lib.TOOL_NAMES` runs. Spelled out
 # here because that module imports the reasoning stage, which imports this one; a test keeps the two lists equal.
@@ -183,6 +185,11 @@ class ReviewerSettings:
     max_review_rounds: int = DEFAULT_MAX_REVIEW_ROUNDS
     qdrant_url: str = ""
     qdrant_api_key: str = ""
+    # The ID that groups the runs of one review (a harness that runs each reviewer in its own session sets the same one for all of
+    # them); "" when unset. Stored in the run record's `settings`.
+    review_id: str = ""
+    # The folder a review's structured results file is written to; "" (the default) writes none.
+    results_dir: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -212,7 +219,15 @@ def read_settings(env: Mapping[str, str]) -> ReviewerSettings:
     rest. `MAX_REVIEWERS` and `MAX_REVIEW_ROUNDS` default when unset or blank;
     a present value that is not a positive whole number is an error rather than
     a silent fallback, since "3" misspelt as "three" quietly running 3 would
-    hide the mistake. Every bad setting is reported together."""
+    hide the mistake. Every bad setting is reported together.
+
+    `REVIEW_ID` (the ID that groups the runs of one review) and `REVIEW_OUTPUT_DIR`
+    (the folder a review's structured results file goes to) have no default: unset
+    or blank, each is the empty string and the feature is off. A `REVIEW_ID` that is
+    not printable text of at most `MAX_REVIEW_ID_CHARS` characters is an error. The
+    folder is only read here, not checked: whether it can be used is checked where
+    a review writes to it (`reviewer_files_lib.prepare_results_folder`), so a caller
+    that only reads settings, such as `doctor`, never touches the file system."""
     problems: list = []
     max_reviewers = DEFAULT_MAX_REVIEWERS
     raw = env.get("MAX_REVIEWERS", "")
@@ -226,6 +241,10 @@ def read_settings(env: Mapping[str, str]) -> ReviewerSettings:
         parsed = _parse_positive_int(raw, "MAX_REVIEW_ROUNDS", problems)
         if parsed is not None:
             max_rounds = parsed
+    review_id = env.get("REVIEW_ID", "").strip()
+    if len(review_id) > MAX_REVIEW_ID_CHARS or not review_id.isprintable():
+        problems.append(f"REVIEW_ID must be printable text of at most {MAX_REVIEW_ID_CHARS} characters")
+        review_id = ""
     if problems:
         raise ConfigError("Invalid codebase-reviewer settings: " + "; ".join(problems), problems)
     return ReviewerSettings(
@@ -234,6 +253,8 @@ def read_settings(env: Mapping[str, str]) -> ReviewerSettings:
         max_review_rounds=max_rounds,
         qdrant_url=env.get("QDRANT_URL", ""),
         qdrant_api_key=env.get("QDRANT_API_KEY", ""),
+        review_id=review_id,
+        results_dir=env.get("REVIEW_OUTPUT_DIR", "").strip(),
     )
 
 
