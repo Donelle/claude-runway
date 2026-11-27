@@ -218,7 +218,7 @@ class AutoPickExclusionContentRequirements(unittest.TestCase):
 
 class KnownLimitationsContentRequirements(unittest.TestCase):
     """Pin the Known limitations bullet. The bullet lives in
-    docs/known-limitations.md (the README keeps only a short list and a pointer);
+    docs/known-limitations.md (the README only links to it);
     docs prose carries no ticket numbers, so these tests key on the bullet's own
     wording."""
 
