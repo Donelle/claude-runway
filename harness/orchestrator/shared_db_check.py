@@ -218,6 +218,19 @@ def _discard(folder: Path) -> None:
         print(f"warning: could not delete {folder}: {exc}", file=sys.stderr)
 
 
+def _trial_in_new_folder(parent: Path, **trial) -> tuple:
+    """`(folder, result)` of one trial in a new folder under `parent`; `trial` is what `run_trial` takes. A trial that gives no
+    result (it could not be made, or was interrupted, Ctrl+C included) takes its folder with it, since nothing was checked in
+    it. `run_trial` has ended its containers by then."""
+    parent.mkdir(parents=True, exist_ok=True)
+    folder = Path(tempfile.mkdtemp(prefix="db-check-", dir=parent))
+    try:
+        return folder, run_trial(folder / "db", **trial)
+    except BaseException:
+        _discard(folder)
+        raise
+
+
 def main(argv: Optional[list] = None, *, spawn: Callable = _spawn) -> int:
     parser = argparse.ArgumentParser(description="Check that containers can record into one shared reviewer database.")
     parser.add_argument("--writers", type=int, default=DEFAULT_WRITERS, help=f"containers writing at once (default {DEFAULT_WRITERS})")
@@ -235,20 +248,12 @@ def main(argv: Optional[list] = None, *, spawn: Callable = _spawn) -> int:
     print(f"shared database check: {args.writers} containers x {args.records} records, {args.trials} trial(s), in {parent}")
     passed = 0
     for number in range(1, args.trials + 1):
-        folder = result = None
         try:
-            parent.mkdir(parents=True, exist_ok=True)
-            folder = Path(tempfile.mkdtemp(prefix="db-check-", dir=parent))
-            result = run_trial(folder / "db", writers=args.writers, records=args.records, timeout=args.timeout,
-                               docker=args.docker, image=args.image, spawn=spawn)
+            folder, result = _trial_in_new_folder(parent, writers=args.writers, records=args.records, timeout=args.timeout,
+                                                  docker=args.docker, image=args.image, spawn=spawn)
         except (CannotRun, OSError) as exc:
             print(f"error: the check could not run: {exc}", file=sys.stderr)
             return 2
-        finally:
-            # No result: the trial could not be made or was interrupted (Ctrl+C included, which is not caught above). By now
-            # `run_trial` has ended its containers.
-            if folder is not None and result is None:
-                _discard(folder)
         print(describe(number, args.trials, result), flush=True)
         if result.passed:
             passed += 1
