@@ -59,9 +59,10 @@ Project-scoped to this repo (hardcodes `Donelle/claude-runway`, `.venv`-based te
    **If this invocation named an explicit list of tickets** (e.g. `/cr-gh-autowork 45 52 61`), also track a **remaining queue**: the given numbers, **de-duplicated while preserving first-seen order** (e.g. `45 52 45` builds the queue `[45, 52]`, not `[45, 52, 45]`) — without this, a repeated number would still be sitting in the queue after its first occurrence already merged/closed the ticket, and re-picking it later would hit Step 7's "state is CLOSED → report BLOCKED" check and abort the whole run, contradicting the very guarantee this paragraph makes. This is separate from `attempted` — `attempted` is bookkeeping for Step 0's auto-pick exclusion (irrelevant in list mode, since every ticket here is explicitly named, never auto-picked) plus the final summary; the queue is what Step 2c below actually advances through to pick the next `{ISSUE_NUMBER}`. Remove a ticket from the queue once its own Agent call in Step 2 returns, regardless of outcome — it should never be worked twice in the same run.
 
 2. **Loop, one subagent call per ticket:**
-   a. Before calling, note which model this Agent call will run as (an explicit `model`
-      param on this call, or the harness default this conversation is itself running as,
-      if none is set) and the current time to the second (e.g. `date +%H%M%S`) — both
+   a. Before calling, note which model this Agent call will run as (`claude-sonnet-5-5`,
+      the `model` pinned in `.claude/agents/autowork-ticket.md`; this call passes no `model`
+      of its own, so that file is the one place to change it, and the session's own model
+      never applies) and the current time to the second (e.g. `date +%H%M%S`) — both
       needed for the metrics logging in 2b below, and cheapest to capture right here since
       the orchestrator already knows/can get them at call time. Call the **Agent** tool,
       `subagent_type: "autowork-ticket"`, `isolation: "worktree"`, with the template below
@@ -219,7 +220,9 @@ If the follow-up reports `MERGED` and the user's authorization covered keeping t
 
 Every subagent this skill starts uses the agent definition in `.claude/agents/autowork-ticket.md`. Its `tools` allow-list holds only what the template below uses: `Bash`, `Read`, `Edit`, `Write` (the procedure's commands, files and plans), `Glob` and `Grep` (cheap and harmless), `ToolSearch` (the only way to load deferred tools such as MCP tools), and the MCP tools the template or the project's CLAUDE.md names (`cb_indexer_sync_repo` in Step 1, plus the other index, search, compression and recall tools). It omits the Agent tool and the Artifact tools, which cost a `general-purpose` subagent about 13,300 to 15,300 tokens of tool definitions at request 0 and about 19,000 tokens per request from request 1 on (the agent list joins at request 1). If an edit to the template starts using a tool, add it to that file's allow-list in the same commit; `tests/test_cr_gh_autowork_skill.py` fails when a tool the template names is missing from it.
 
-**Fallback.** Claude Code finds agent definitions when a session starts, so a session begun before that file existed (or before an upgrade copied it in) does not know the type, and the `Agent` call fails with an unknown-agent-type error before any work starts. In that case, and only that case, repeat the same call with `subagent_type: "general-purpose"` for this run and tell the user the allow-list was not applied; restarting the session fixes it. Never fall back on any other error.
+The same file pins `model: claude-sonnet-5-5` and `effort: max`. Without them a subagent runs on whatever model and effort the orchestrating session uses, so a run started from an Opus session worked every ticket on Opus; each ticket's plan, code and review loop is long, and its result is already checked by the Opus `code-reviewer` and `pr-feedback` agents.
+
+**Fallback.** Claude Code finds agent definitions when a session starts, so a session begun before that file existed (or before an upgrade copied it in) does not know the type, and the `Agent` call fails with an unknown-agent-type error before any work starts. In that case, and only that case, repeat the same call with `subagent_type: "general-purpose"`, `model: "sonnet"` and `effort: "max"` for this run (that type pins no model, so without them the retry would run on the session's model) and tell the user the allow-list was not applied; restarting the session fixes it. Never fall back on any other error.
 
 ## Subagent Prompt Template
 
