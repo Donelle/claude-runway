@@ -26,7 +26,7 @@ their fixtures without LM Studio; without it they run the stage.
 
 ## Through Pi, in a container: `pi/`
 
-`pi/pi_driver.py` runs Pi (a coding agent) in a throwaway Docker container, gives it the reviewer's MCP server and asks it to call the `review` tool, so the path a real caller takes is tested and not only the libraries. It caps turns, tool calls and time, and leaves the checkout, `~/.claude` and `~/.pi` untouched. See [pi/README.md](pi/README.md).
+`pi/pi_driver.py` runs Pi (a coding agent) in a throwaway Docker container, gives it the reviewer's MCP server and asks it to call the `review` tool on a change of the `harness-live-tests` branch (below), so the path a real caller takes is tested and not only the libraries. It caps turns, tool calls and time, and leaves the checkout, `~/.claude` and `~/.pi` untouched. `pi/score_run.py` scores its output against the branch's answer key. See [pi/README.md](pi/README.md).
 
 ## Checks to run: `live-tests/`
 
@@ -89,7 +89,7 @@ real size, with bugs seeded into real modules. Most of them can only be judged b
   `mcpservers/`, `tools/`, `hooks/`, `tests/`, `claude_runway/`, `scripts/`, `templates/`, the packaging files and the repository's own review
   rules (`.github/instructions/`). It drops `harness/`, `docs/`, `skills/`, `.claude/`, `.githooks/`, the workflows, every other markdown
   file and the harness tests, because the tool executor reads every tracked file at the commit and a model must not be able to grep this
-  answer key (or the older cases' answers) out of the tree. **The answer key is this section, on `main`'s side, never on the branch.**
+  answer key (or the older cases' answers) out of the tree. **The answer key is this section and `live-tests/answer_key.json`, on `main`'s side, never on the branch.**
 - It is never merged or rebased. `main` moves on; this does not.
 - Each change is ONE commit whose parent is the base, tagged `harness-live-tests/change-N`. Review `base...change-N`
   (`git diff harness-live-tests/base harness-live-tests/change-N`): the diff holds only that change's seeded edits, and the rest of the tree
@@ -105,8 +105,11 @@ it. The verifier and classifier scripts run fixtures built from `cases.py` and h
 A live run takes `--config` and reads what it is scored against from the sidecar beside it, `<config>.baselines.json`, whose `runType` is
 `live` and whose `metadata.tags` names each tag and, for each, the bugs and decoys (file, line, class, claim, evidence kind); the format is
 in [live-tests/README.md](live-tests/README.md). The sidecar is on `main`; nothing is written on the branch. **The table below is a
-separate copy for people, and no code reads it**: change an answer in both places. `--repo PATH` names a checkout that has the tags (default:
-this one); before any model loads, a missing tag stops the run with the `git fetch` command above. The run reviews `base...<tag>` for
+separate copy for people, and no code reads it.** The same key is also `live-tests/answer_key.json`, one file with the shape of a
+sidecar's `metadata`, which `pi/score_run.py` and the Pi driver read: change an answer in the table, in the key and in each live sidecar
+(`tests/test_harness_live_scoring.py` fails when the key and a sidecar differ; the sidecars go with the runners that read them).
+`--repo PATH` names a checkout that has the tags (default: this one); before any model loads, a missing
+tag stops the run with the `git fetch` command above. The run reviews `base...<tag>` for
 each tag in the sidecar and prints one block per tag, then one line per evidence kind (bugs found, decoy alarms) and one for the clean
 control, which is how to tell whether a model whose proof lies in another file asks for it:
 
@@ -115,8 +118,10 @@ control, which is how to tell whether a model whose proof lies in another file a
 .venv/bin/python harness/live_all_reviewers.py --config my-pipeline.json --run-type live   # reasoning, then the verifier and classifier, per tag
 ```
 
-**Scoring rules.** A finding at a bug's line (or one that names the same defect) is a hit. A finding that matches a decoy's claim is a false
-positive. A finding on `change-5` is a false positive (it is the clean control). **A finding that matches nothing below is unscored, not
+**Scoring rules** (`live_scoring_lib.py`, which depends on nothing else in the harness). A finding is matched by file and nearby line only;
+what the model called the defect, or how it worded it, is never compared. A finding within three lines of a bug's line, in that file, is a
+hit. One within three lines of a decoy's line is a false positive (a false alarm); a finding as near a bug as a decoy is credited to the
+bug. A finding on `change-5` is a false positive (it is the clean control). **A finding that matches nothing below is unscored, not
 wrong**: the code is real and may have real bugs nobody has listed. Do not count unscored findings against a model.
 
 **Evidence kinds**, by where the proof lies, because that decides whether a reviewer must ask for more code:
@@ -168,8 +173,9 @@ behaviour at all: `except Exception as e` becomes `as exc` in both retry functio
 **Adding to it.** Never move or re-create a tag: that changes what a recorded score was measured on. To add a change, commit it on the
 base in a scratch worktree, tag it `change-N+1`, push the tag, and add its rows and hash here in the same commit on `main`.
 
-**Not built yet.** A loader that scores a run against these rows, and a live config for it. Today the table is read by a person: run a
-review of a tag, then compare. When the loader exists it should read the table's facts from a data file, not from this prose.
+**Where the code reads the answers.** Not from this prose but from data files: the `live_*.py` runners from a sidecar's `metadata.tags`, and
+the Pi scorer from `live-tests/answer_key.json`. The Pi driver reviews one change of the branch at a time (`--change`, default `change-6`)
+and `pi/score_run.py` scores its output against the key, with no flag to say which change; see [pi/README.md](pi/README.md).
 
 ## Parity with Copilot: replay history, never ask for a review
 

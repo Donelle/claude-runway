@@ -1,12 +1,13 @@
 # Testing the codebase-reviewer through Pi, in a container
 
-`pi_driver.py` runs [Pi](https://pi.dev) (a coding agent) in a throwaway Docker container, gives it the reviewer's MCP server, and asks it to call the `review` tool on a small scratch repository. It tests the path a real caller takes, finding the tool over MCP and calling it, which the `live_*.py` scripts never do: they call the reviewer's libraries directly.
+`pi_driver.py` runs [Pi](https://pi.dev) (a coding agent) in a throwaway Docker container, gives it the reviewer's MCP server, and asks it to call the `review` tool on a change of the `harness-live-tests` branch: real code with a seeded bug and a decoy (see [the harness README](../README.md#a-real-repository-with-seeded-bugs-the-harness-live-tests-branch)). It tests the path a real caller takes, finding the tool over MCP and calling it, which the `live_*.py` scripts never do: they call the reviewer's libraries directly. `score_run.py` scores the output against the branch's answer key.
 
-A development tool, not product code. CI does not run it (it needs Docker, LM Studio and real models); the driver's logic is covered by `tests/test_harness_pi_driver.py` with a fake `docker`.
+A development tool, not product code. CI does not run it (it needs Docker, LM Studio and real models); the driver's logic is covered by `tests/test_harness_pi_driver.py` with a fake `docker`, and the scorer's by `tests/test_harness_pi_score_run.py`.
 
 ## Run it
 
 ```
+git fetch origin harness-live-tests 'refs/tags/harness-live-tests/*:refs/tags/harness-live-tests/*'   # once: the branch's tags (a normal clone lacks them)
 docker build -t claude-runway-pi:dev harness/pi          # once; or add --build below
 .venv/bin/python harness/pi/pi_driver.py \
     --model <caller model> \
@@ -15,8 +16,9 @@ docker build -t claude-runway-pi:dev harness/pi          # once; or add --build 
 
 - `--model` is the model **Pi** calls the tool with (the caller). It must be one LM Studio lists (`lms ls`) and it must make tool calls reliably. Load it first, with the context you pass to `--context-length` (default 16384); see "Before and after" below.
 - `--config` is a `harness/live-tests/configs/*.json` file; its reviewers become the reviewer's `REVIEWERS_FILE`, so the reviewer models and contexts come from where the harness already records them. Without it, one reasoning reviewer is built from `--model` (`--reviewer-model` changes it). A config that uses `promptFile` or `translator` is refused: the container does not have those files.
+- `--change` is the change of the `harness-live-tests` branch the reviewer is asked to review, named as in the answer key (default `change-6`: two lines added and two removed in one file, one bug and one decoy, both judgeable from the diff). `--repo PATH` is a checkout that has the branch's tags (default: this one). The driver fetches just the base and that change from it into an empty scratch repository and checks the change out, so the repository holds those two commits and nothing else, and it is that repository the container is given, not the checkout. A checkout without the tags stops at once, before a model is asked or an image built, with the `git fetch` above.
 - The reviewer model is loaded by the reviewer server when its reviewer has `loadOnDemand: true` (the config says), and unloaded again afterwards. The driver loads nothing.
-- Other options: `--case` (a case from `harness/cases.py`, default `seeded-three`), `--log FILE` (every event Pi emitted, written to a new file: an existing file, or any path under `~/.claude` or `~/.pi`, is refused), `--dry-run` (print the `docker run` command and stop), `--build` and `--image` (build or name the image), and the container's limits `--memory` (default `4g`), `--cpus` (`2`) and `--pids-limit` (`256`).
+- Other options: `--prompt` (what Pi is asked; `{repo}`, `{base}` and `{head}` are filled in with the repository's path in the container and the two tags it holds), `--log FILE` (every event Pi emitted, written to a new file: an existing file, or any path under `~/.claude` or `~/.pi`, is refused), `--dry-run` (print the `docker run` command and stop), `--build` and `--image` (build or name the image), and the container's limits `--memory` (default `4g`), `--cpus` (`2`) and `--pids-limit` (`256`).
 - The caps are `--max-turns` (default 10), `--max-tool-calls` (30) and `--timeout` (600 seconds for the whole run).
 - `--mcp-timeout` and `--lmstudio-timeout` (seconds) raise the two 60-second limits on a long review. Neither is set unless you pass it; see "A review has to finish within Pi's MCP timeout" below.
 
@@ -34,20 +36,20 @@ lms load <each model that lms ps showed>            # restore what was loaded be
 
 The reviewer's model is not part of this: a reviewer with `loadOnDemand: true` is loaded by the reviewer server when it runs and unloaded again afterwards, except when the run is stopped during the review (Ctrl+C, or a cap or timeout that kills the container): the server dies before it can unload, so check `lms ps` and unload the reviewer model yourself. If the caller and the reviewer are the same model, load it once. Both models need room at the same time, so check `lms ps` against your GPU memory first (the sizes are in the tier table below).
 
-Output: one progress line per turn and tool call on stderr, then a JSON summary on stdout. Read **`review_text`**, the reviewer tool's own result; `final_text` is the caller's summary of it, which varies from run to run and can leave most of it out.
+Output: one progress line per turn and tool call on stderr, then a JSON summary on stdout. It names the **`change`** that was reviewed, so `score_run.py` needs no flag to find its answers. Read **`review_text`**, the reviewer tool's own result; `final_text` is the caller's summary of it, which varies from run to run and can leave most of it out.
 
 | Exit code | Meaning |
 | :-- | :-- |
 | 0 | Pi finished and the reviewer returned a result |
 | 1 | it finished without calling `review`, every call to it errored (an error result, or the tool's own `Error: ...` refusal, which it returns as plain text), Pi aborted (`stopped_by: aborted`), or the container failed, including a nonzero exit after Pi had settled, or Pi's output ended without it settling, whatever the exit code (`stopped_by: error`) |
-| 2 | a bad argument, a model the preflight could not find, or `docker` could not be started (nothing was run) |
+| 2 | a bad argument (an unknown `--change` among them), a model the preflight could not find, a checkout without the branch's tags, or `docker` could not be started (nothing was run) |
 | 3 | a cap stopped it (`stopped_by` says `turns`, `tool_calls` or `timeout`) |
 
 ## What keeps it contained
 
 Pi has no turn or tool-call limit of its own, so the driver reads Pi's JSON event stream (split on LF only, as Pi's docs require) and runs `docker kill` when a cap is reached. A turn cap alone would not stop a flood of tool calls inside one turn, hence the three caps. The container is also killed if the driver itself stops for any other reason (Ctrl+C, an error; the `docker` client is stopped first, so a container that is not created yet never is) and if the output ends without Pi having settled (a `docker` client that died leaves its container running), and `docker kill` itself gives up after 30 seconds. It runs with `--init` so Pi, as the container's first process, receives stop signals.
 
-The container sees only: the reviewer's `libs/` and `mcpservers/` (read-only), a scratch case repository (read-only), the reviewers file (read-only), and two scratch folders (Pi's agent directory and the reviewer's database and logs). It never sees the checkout, `~/.claude`, `~/.pi`, Qdrant or the memory bank, and the driver refuses to start if a mount would overlap one, or if `libs/` or `mcpservers/` is not the checkout's own folder (a symlink in its place is refused, wherever it points). `~/.pi/agent` is Pi's own folder, where it keeps credentials, settings, extensions and sessions; the container gets a scratch one through `PI_CODING_AGENT_DIR` instead. Pi runs with its read-only tools plus the reviewer's, never `bash`, `edit` or `write`. Memory, CPU and process limits are set, and capabilities are dropped.
+The container sees only: the reviewer's `libs/` and `mcpservers/` (read-only), a scratch repository holding the branch's base and the chosen change (read-only), the reviewers file (read-only), and two scratch folders (Pi's agent directory and the reviewer's database and logs). It never sees the checkout, `~/.claude`, `~/.pi`, Qdrant or the memory bank, and **never the answer key**: the key is `harness/live-tests/answer_key.json` in the checkout, which is not mounted, and the scratch repository is fetched from the branch's two tags only, which have no `harness/` and no history but the base and the change. `tests/test_harness_pi_driver.py` checks that the repository holds nothing else and that no mount reaches the key. The driver refuses to start if a mount would overlap the checkout, `~/.claude` or `~/.pi`, or if `libs/` or `mcpservers/` is not the checkout's own folder (a symlink in its place is refused, wherever it points). `~/.pi/agent` is Pi's own folder, where it keeps credentials, settings, extensions and sessions; the container gets a scratch one through `PI_CODING_AGENT_DIR` instead. Pi runs with its read-only tools plus the reviewer's, never `bash`, `edit` or `write`. Memory, CPU and process limits are set, and capabilities are dropped.
 
 The limits that remain: the container runs as root on Windows (as your user on Linux and macOS) and has open outbound network access, so it is a sandbox for files and not an egress barrier.
 
@@ -66,7 +68,7 @@ Which reviewer model to use is not a question for this kit: `harness/README.md` 
 
 ### Callers, measured on the Mac (Apple M5 Max, 48 GB)
 
-`seeded-three`, 4 runs per pair, so this is a first measurement, not a ranking. Every model was loaded beforehand at 16384 context (no on-demand load), with the default prompt, caps of 10 turns, 30 tool calls and 240 seconds, and Pi's own sampling (the driver sets no caller temperature). A run is **clean** when the driver exited 0 and a review actually ran. Seconds include the reviewer's time. The reviewer is held to a model that answers well inside Pi's 60-second MCP timeout (`qwen3-coder-30b-a3b-instruct-mlx`, 6 to 7 seconds when it calls itself), so that a failure is the caller's; a few runs use another reviewer.
+**Historical.** Measured on `seeded-three`, a made-up case from `harness/cases.py` that the driver no longer reviews: these runs used other test code and are not comparable with runs on `change-6`. 4 runs per pair, so this is a first measurement, not a ranking. Every model was loaded beforehand at 16384 context (no on-demand load), with the default prompt, caps of 10 turns, 30 tool calls and 240 seconds, and Pi's own sampling (the driver sets no caller temperature). A run is **clean** when the driver exited 0 and a review actually ran. Seconds include the reviewer's time. The reviewer is held to a model that answers well inside Pi's 60-second MCP timeout (`qwen3-coder-30b-a3b-instruct-mlx`, 6 to 7 seconds when it calls itself), so that a failure is the caller's; a few runs use another reviewer.
 
 | Tier | Weights | Caller | Clean | Failed calls before the review | Seconds |
 | :-- | :-- | :-- | :-- | :-- | :-- |
@@ -77,20 +79,9 @@ Which reviewer model to use is not a question for this kit: `harness/README.md` 
 | Large | 40 GB and up | none measured | | | no model of this size fits this Mac |
 
 
-### Scoring more callers
-
-`score_run.py` turns one run's JSON summary into one row, so every caller is scored the same way. The reviewer's text is matched to the case's seeded bugs by file and line, and a result that is not a review at all (Pi's `Validation failed for tool ...`, `MCP request timed out`) is marked `no review ran` instead of being scored as an empty review:
-
-```
-.venv/bin/python harness/pi/pi_driver.py --model <caller> --reviewer-model <reviewer> > run.json
-.venv/bin/python harness/pi/score_run.py run.json
-```
-
-The row reads `stopped_by=completed readable=yes found=3/3 findings=3 review_calls=1 review_errors=0 turns=2 tool_calls=1 seconds=9.5 caller_repeated=3/3`. For a caller, the columns that matter are `readable`, `review_calls` against `review_errors` (failed calls before the review) and `turns`. `found` says the reviewer worked, not the caller, and `caller_repeated` is how many of the findings the caller's final message repeats. Run each caller 4 times, with the same reviewer, and record it as a row of the table above.
-
 ### Callers, measured on Windows (NVIDIA RTX 5090, 32 GB VRAM)
 
-`seeded-three`, 4 runs per caller, so this is a first measurement, not a ranking. Every model is a GGUF build, loaded beforehand at 16384 context with full GPU offload, with the default prompt, caps of 10 turns, 30 tool calls and 240 seconds, and Pi's own sampling. The reviewer is `seed-coder-8b-instruct` (`reasoning-gguf-seed-coder-8b.json`). A run is **clean** when the driver exited 0 and a review actually ran. Seconds include the reviewer's time.
+**Historical.** Measured on `seeded-three`, a made-up case from `harness/cases.py` that the driver no longer reviews: these runs used other test code and are not comparable with runs on `change-6`. 4 runs per caller, so this is a first measurement, not a ranking. Every model is a GGUF build, loaded beforehand at 16384 context with full GPU offload, with the default prompt, caps of 10 turns, 30 tool calls and 240 seconds, and Pi's own sampling. The reviewer is `seed-coder-8b-instruct` (`reasoning-gguf-seed-coder-8b.json`). A run is **clean** when the driver exited 0 and a review actually ran. Seconds include the reviewer's time.
 
 | Tier | Weights | Caller | Clean | Failed calls before the review | Seconds |
 | :-- | :-- | :-- | :-- | :-- | :-- |
@@ -102,6 +93,24 @@ The row reads `stopped_by=completed readable=yes found=3/3 findings=3 review_cal
 | Moderate | | `meta/muse-glimmer` (18.2 GB) | 4 of 4 | none | 18 to 26 |
 | Moderate | | `qwen2.5-32b-instruct` (19.9 GB) | 4 of 4 | none | 12 to 13 |
 | Large | 40 GB and up | none measured | | | no model of this size fits this GPU |
+
+### Scoring more callers
+
+To compare calling models, run the driver on **`change-6`** (the default: two lines added and two removed in `libs/version_lib.py`; one bug, `B7`, and one decoy, `D4`, both judgeable from the diff) with the **same reviewer settings** for every caller: the same `--config`, or the same `--reviewer-model`, and the same `--context-length`. `score_run.py` turns one run's JSON summary into one row, so every caller is scored the same way. It reads the change from the summary and scores the reviewer's text against that change's entry in the answer key (`harness/live-tests/answer_key.json`, the key the harness shares), by file and nearby line only:
+
+- a finding near a bug's line is **found**;
+- a finding at a decoy's line is a **decoy alarm**, a false alarm;
+- any finding on `change-5`, the clean control that changes no behaviour, is a **clean false alarm**;
+- anything else is **unscored**: shown, and never counted against the model, because the code is real and may have real bugs nobody has listed.
+
+A result that is not a review at all (Pi's `Validation failed for tool ...`, `MCP request timed out`) is marked `no review ran` instead of being scored as an empty review:
+
+```
+.venv/bin/python harness/pi/pi_driver.py --model <caller> --config <config> > run.json
+.venv/bin/python harness/pi/score_run.py run.json
+```
+
+The row reads `change=change-6 stopped_by=completed readable=yes found=1/1 decoy_alarms=0 clean_false_alarms=0 unscored=0 findings=2 review_calls=1 review_errors=0 turns=2 tool_calls=1 seconds=10.8 caller_repeated=0/2`. That is a real run on the Windows machine above: the caller `google/gemma-4-12b`, already loaded (262144 context), and the reviewer `seed-coder-8b-instruct` (`reasoning-gguf-seed-coder-8b.json`), which the reviewer server loaded on demand at 8192 and unloaded afterwards. For a caller, the columns that matter are `readable`, `review_calls` against `review_errors` (failed calls before the review) and `turns`. `found`, `decoy_alarms` and `unscored` say how the reviewer did, not the caller, and `caller_repeated` is how many of the findings the caller's final message repeats. `score_run.py` exits 2 when the summary names no change (the output of an older driver, which ran a case from `harness/cases.py`) or one the key does not list. Run each caller 4 times, with the same reviewer, and record the rows in a new table of runs on `change-6`, beside the historical ones above.
 
 ## What this showed that the orchestrator will need
 

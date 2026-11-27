@@ -7,14 +7,21 @@ container so the host checkout, `~/.claude` and `~/.pi` are never touched (the c
 file the driver itself writes, is refused under `~/.claude` and `~/.pi` and never overwrites a file). Pi has no turn or tool-call limit of its own,
 so the driver enforces them: it reads Pi's JSON event stream and runs `docker kill` when a cap is reached.
 
+What Pi is asked to review is a change from the `harness-live-tests` branch (`--change`, default `change-6`; see harness/README.md,
+"A real repository with seeded bugs"): real code with a seeded bug and a decoy, not a made-up case. The container is given a
+scratch repository that holds only the branch's base and that change, fetched from a checkout that has the tags (`--repo`,
+default this one). The checkout is not mounted (of this one, only the reviewer's own `libs/` and `mcpservers/` are, read-only, as
+before), and neither is the answer key, which sits in it under `harness/live-tests/`. The JSON summary names the change, so
+`score_run.py` can score it against the key without being told.
+
 A development tool, not product code (CI does not lint or type-check `harness/`; the logic here is covered by
 `tests/test_harness_pi_driver.py` with a fake `docker`, no Docker needed). See harness/pi/README.md.
 
     .venv/bin/python harness/pi/pi_driver.py --build --model <lm-studio-id>
 
 Standard library only. Exit code: 0 = Pi finished and the reviewer returned a result; 1 = it finished without calling the
-reviewer, every call to it errored, Pi aborted, or the container failed; 2 = a bad argument, a failed preflight or docker could not be
-started (nothing was run); 3 = a cap stopped the run.
+reviewer, every call to it errored, Pi aborted, or the container failed; 2 = a bad argument, a failed preflight, a checkout
+without the branch's tags or docker could not be started (nothing was run); 3 = a cap stopped the run.
 """
 
 import argparse
@@ -30,12 +37,23 @@ import tempfile
 import threading
 import time
 import urllib.parse
+import urllib.request
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PI_DIR = Path(__file__).resolve().parent
+
+# `libs/` (the reviewer's config validator, `runway_defaults`, the LM Studio helpers) and `harness/` (the live scoring module) are
+# imported by bare name, as everywhere in this repository. The only harness module used is `live_scoring_lib`, which depends on
+# nothing else there: neither `cases.py` nor `harness_lib.py` is imported, here or through it, since the branch is the only test
+# code and `cases.py` is on its way out.
+for _directory in (REPO_ROOT / "libs", REPO_ROOT / "harness"):
+    if str(_directory) not in sys.path:
+        sys.path.insert(0, str(_directory))
+
+import live_scoring_lib as scoring  # noqa: E402
 
 DEFAULT_IMAGE = "claude-runway-pi:dev"
 # What the container calls the host. Docker Desktop provides the name; on Linux `--add-host ...:host-gateway` does.
@@ -50,12 +68,18 @@ DEFAULT_MAX_TURNS = 10
 DEFAULT_MAX_TOOL_CALLS = 30
 DEFAULT_TIMEOUT_SECONDS = 600
 
-DEFAULT_CASE = "seeded-three"
+# The change to review when `--change` is not given: two lines added and two removed in one file, one bug and one decoy, both
+# judgeable from the diff alone (see harness/README.md), so a run measures whether the CALLER can drive the review tool, with
+# a result small enough to read by eye. A bigger change from the branch is one `--change` away.
+DEFAULT_CHANGE = "change-6"
 DEFAULT_CONTEXT_LENGTH = 16384
+# The most one `git` call on the checkout or the scratch repository may take. A local fetch of two small commits takes well under a
+# second, so this only ends a call that is stuck (a lock, a prompt); it is not a tuning knob.
+GIT_TIMEOUT_SECONDS = 120
 
 # Where things are inside the container. Nothing here is a host path.
 C_REVIEWER = "/opt/reviewer"  # `libs/` and `mcpservers/` of this checkout, read-only
-C_REPO = "/work/repo"  # the scratch case repository, read-only
+C_REPO = "/work/repo"  # the scratch repository (the branch's base and one change), read-only
 C_CONFIG = "/config"  # the reviewers file, read-only
 C_AGENT = "/agent"  # PI_CODING_AGENT_DIR: Pi's settings, models.json and mcp.json for this run only
 C_STATE = "/state"  # the reviewer's database and logs for this run only
@@ -71,10 +95,11 @@ REVIEW_REFUSAL_PREFIX = "Error:"
 # Pi's own read-only tools. Never `bash`, `edit` or `write`: the run needs to look, not change.
 READ_ONLY_TOOLS = ("read", "grep", "find", "ls")
 
-# {repo} is replaced with the repository's path inside the container (plain replace, so the JSON braces need no escaping).
+# {repo} is replaced with the repository's path inside the container, {base} and {head} with the two tags it holds (plain
+# replace, so the JSON braces need no escaping).
 DEFAULT_PROMPT = (
     "An MCP tool named review is available. Call it once with type \"reasoning\" and params "
-    '{"repo_path": "{repo}", "base_ref": "main", "head_ref": "feature"}. '
+    '{"repo_path": "{repo}", "base_ref": "{base}", "head_ref": "{head}"}. '
     "Then list the findings it returns, one per line. Do not edit any file."
 )
 
@@ -213,6 +238,7 @@ class CapTracker:
 
 @dataclass
 class RunResult:
+    change: str = ""  # the branch change that was reviewed (`change-6`): what score_run.py reads the answers for
     stopped_by: str = "completed"  # completed | turns | tool_calls | timeout | aborted | error
     turns: int = 0
     tool_calls: int = 0
@@ -308,8 +334,7 @@ def reviewers_from_config(path: Path) -> dict:
             if isinstance(entry, dict) and "definitionFile" in entry:
                 raise ValueError(f"{path}: a rubric entry uses definitionFile, a file the container does not have")
     reviewers = {"rubric": rubric, "reviewers": data["reviewers"]}
-    import_harness()  # puts libs/ on sys.path, so this works when called on its own and not only from main()
-    from codebase_reviewer_config_lib import ConfigError, validate_reviewers
+    from codebase_reviewer_config_lib import ConfigError, validate_reviewers  # libs/ is on sys.path since this module was imported
     try:
         validate_reviewers(reviewers, path=str(path))
     except ConfigError as exc:
@@ -597,36 +622,113 @@ def _remove_tree(directory: Path) -> None:
     shutil.rmtree(directory, onexc=retry)
 
 
-def import_harness():
-    """`harness_lib` and `cases` (the scratch repositories), found the way the harness's own tests find them."""
-    for directory in (REPO_ROOT / "libs", REPO_ROOT / "harness"):
-        if str(directory) not in sys.path:
-            sys.path.insert(0, str(directory))
-    import cases
-    import harness_lib
-    return harness_lib, cases
+class ChangeRepoError(Exception):
+    """The repository of a change could not be built: no such checkout, a tag it lacks, or a `git` that failed. Nothing ran, so it
+    is a usage error (exit 2), not a failed run."""
 
 
-def prepare_scratch(scratch: Path, case_name: str, model: str, reviewers: dict, context_length: int, lmstudio_url: str,
-                    mcp_timeout: Optional[int] = None, lmstudio_timeout: Optional[int] = None) -> tuple:
-    """Fills `scratch` with everything the container mounts. Returns (Mounts, base_ref, head_ref)."""
-    harness_lib, cases = import_harness()
-    case = cases.ALL_CASES[case_name]
-    repo, base, head = harness_lib.build_repo(scratch, case)
-    # The repo's directory carries the case's name; the container always sees it at one fixed path.
+def _git(repo: Path, *args: str) -> subprocess.CompletedProcess:
+    """`git -C repo ...` with the user's own git configuration left out. Raises ChangeRepoError only when git could not run at all
+    (missing, timed out); a nonzero exit is the caller's to read.
+
+    Left out (`GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`) because this builds a repository meant to hold two commits and nothing
+    else, and it is read by a container: a global `core.hooksPath` would run a hook on the checkout, `core.autocrlf` would
+    rewrite the files the reviewer reads, and `init.templateDir` would add files. `GIT_TERMINAL_PROMPT=0`: never ask a person."""
+    env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull, "GIT_TERMINAL_PROMPT": "0"}
+    try:
+        return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, encoding="utf-8", errors="replace",
+                              check=False, timeout=GIT_TIMEOUT_SECONDS, env=env)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ChangeRepoError(f"could not run git ({type(exc).__name__}: {exc})") from exc
+
+
+def _first_line(done: subprocess.CompletedProcess) -> str:
+    """The first line git said, from stderr (where its errors go), else stdout; a fixed phrase when it said nothing."""
+    lines = (done.stderr.strip() or done.stdout.strip()).splitlines()
+    return lines[0] if lines else "no message"
+
+
+def change_tag(change: str, key_path: Optional[Path] = None):
+    """The answer key's `LiveTag` for `change` (`change-6`, written without the branch's prefix).
+
+    The key is read here, on the host, only to learn which changes exist; it is never copied or mounted (see `unsafe_mounts` and
+    `build_change_repo`). Raises ValueError naming the known changes for one that is not listed, and `LiveMetadataError` (also a
+    ValueError) when the key itself cannot be read."""
+    tags = scoring.load_answer_key(key_path)
+    tag = next((t for t in tags if t.tag_id == change), None)
+    if tag is None:
+        raise ValueError(f"unknown change {change!r}; the answer key lists {', '.join(t.tag_id for t in tags)}")
+    return tag
+
+
+def check_checkout(checkout: Path, tag) -> None:
+    """Raises ChangeRepoError unless `checkout` is a git repository that has the branch's base and `tag` as commits.
+
+    Run before anything slow (the model preflight, `--build`), so a clone that does not carry the live branch stops at once with
+    the exact `git fetch` that gets it, as the other harness runners do."""
+    probe = _git(checkout, "rev-parse", "--git-dir")
+    if probe.returncode != 0:
+        raise ChangeRepoError(f"{checkout} cannot be used as the checkout that has the {scoring.PREFIX}* tags (--repo): {_first_line(probe)}")
+    try:
+        missing = scoring.missing_refs(checkout, (tag,))
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ChangeRepoError(f"could not run git ({type(exc).__name__}: {exc})") from exc
+    if missing:
+        raise ChangeRepoError(scoring.missing_refs_message(checkout, missing))
+
+
+def build_change_repo(parent: Path, checkout: Path, tag) -> Path:
+    """A repository at `parent / "repo"` that holds the branch's base and `tag`'s change, and nothing else of `checkout`.
+
+    `git fetch` of just the two tags into an empty repository brings only the commits reachable from them (the base, and the one
+    commit on it) with their files. The rest of the checkout's history, its branches, its other tags and every file that is not on
+    the branch never reach the folder the container is given: the answer key, which sits in `harness/` and not on the branch,
+    least of all. The change is then checked out (detached), so the repository is a real checkout of that change: the reviewer
+    reads the repository's own review rules (`.github/instructions/`) from the working tree, as it does in any checkout it is
+    pointed at, and Pi's read-only tools see the files. Raises ChangeRepoError."""
+    check_checkout(checkout, tag)
+    repo = parent / "repo"
+    repo.mkdir()
+    for args in (
+        ("init", "-q"),
+        # --no-tags: only the two refs named, not any other tag that happens to point at what they bring.
+        ("fetch", "-q", "--no-tags", str(checkout), *(f"refs/tags/{ref}:refs/tags/{ref}" for ref in (scoring.BASE_REF, tag.head))),
+        ("checkout", "-q", "--detach", f"refs/tags/{tag.head}"),
+    ):
+        done = _git(repo, *args)
+        if done.returncode != 0:
+            raise ChangeRepoError(f"git {args[0]} failed while building the repository of {tag.head} from {checkout}: {_first_line(done)}")
+    return repo
+
+
+def prepare_scratch(scratch: Path, checkout: Path, tag, model: str, reviewers: dict, context_length: int, lmstudio_url: str,
+                    mcp_timeout: Optional[int] = None, lmstudio_timeout: Optional[int] = None) -> Mounts:
+    """Fills `scratch` with everything the container mounts and returns the Mounts. Raises ChangeRepoError."""
+    repo = build_change_repo(scratch, checkout, tag)
     config, agent, state = scratch / "config", scratch / "agent", scratch / "state"
     for directory in (config, agent, state):
         directory.mkdir()
     (config / "reviewers.json").write_text(json.dumps(reviewers, indent=2), encoding="utf-8")
     (agent / "models.json").write_text(json.dumps(models_file(model, context_length, lmstudio_url), indent=2), encoding="utf-8")
     (agent / "mcp.json").write_text(json.dumps(mcp_file(lmstudio_url, mcp_timeout, lmstudio_timeout), indent=2), encoding="utf-8")
-    return Mounts(REPO_ROOT / "libs", REPO_ROOT / "mcpservers", repo, config, agent, state), base, head
+    return Mounts(REPO_ROOT / "libs", REPO_ROOT / "mcpservers", repo, config, agent, state)
+
+
+def model_known(base_url: str, model: str) -> Optional[bool]:
+    """True/False when LM Studio lists/does not list `model`; None when it cannot be asked.
+
+    LM Studio's own REST API is served at the server root, not under the OpenAI-compatible `/v1` (`rest_root` drops it)."""
+    from lmstudio_model_loader_lib import rest_root  # libs/ is on sys.path since this module was imported
+    try:
+        with urllib.request.urlopen(f"{rest_root(base_url)}/api/v0/models", timeout=10) as response:
+            return model in {m["id"] for m in json.load(response)["data"]}
+    except (OSError, ValueError, KeyError):
+        return None
 
 
 def host_model_check(host_url: str, model: str) -> Optional[str]:
     """A problem with `model` on the host's LM Studio, or None. Not being able to ask is not a problem: it only warns."""
-    harness_lib, _cases = import_harness()
-    known = harness_lib.model_known(host_url, model)
+    known = model_known(host_url, model)
     if known is False:
         return f"LM Studio at {display_url(host_url)} does not list a model named {model!r} (`lms ls` shows the ids)"
     if known is None:
@@ -645,8 +747,15 @@ def build_parser() -> argparse.ArgumentParser:
                    "match what LM Studio loaded. A --config carries its own reviewer contexts")
     p.add_argument("--load-on-demand", action="store_true",
                    help="the reviewer built from the arguments may ask LM Studio to load its model (default: it must already be loaded)")
-    p.add_argument("--case", default=DEFAULT_CASE, help=f"a case from harness/cases.py (default {DEFAULT_CASE})")
-    p.add_argument("--prompt", help="what Pi is asked; {repo} is replaced by the repository's path in the container")
+    p.add_argument("--change", default=DEFAULT_CHANGE,
+                   help="the change of the harness-live-tests branch the reviewer is asked to review, named as in the answer key "
+                   f"(default {DEFAULT_CHANGE}: two lines added, two removed; one bug and one decoy, both judgeable from the diff)")
+    p.add_argument("--repo", type=Path, metavar="PATH",
+                   help="a checkout that has the harness-live-tests tags (default: this one). Only the base and the change are fetched "
+                   "from it into a scratch repository, and that repository is what the container sees, not the checkout. One without the "
+                   "tags is refused with the `git fetch` that gets them")
+    p.add_argument("--prompt", help="what Pi is asked; {repo} is replaced by the repository's path in the container, "
+                   "{base} and {head} by the two tags it holds (the branch's base and the change)")
     p.add_argument("--host-lmstudio-url", help="LM Studio as this machine sees it, for the preflight check "
                    "(default: CLAUDE_RUNWAY_LMSTUDIO_URL, else LM Studio's own default)")
     p.add_argument("--lmstudio-url", help="LM Studio as the container sees it "
@@ -673,10 +782,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[list] = None) -> int:
     args = build_parser().parse_args(argv)
-    _harness_lib, cases = import_harness()
-    if args.case not in cases.ALL_CASES:
-        print(f"error: unknown case {args.case!r}; known: {', '.join(cases.ALL_CASES)}", file=sys.stderr)
-        return 2
     if min(args.max_turns, args.max_tool_calls, args.timeout) < 1:
         print("error: --max-turns, --max-tool-calls and --timeout must each be 1 or more", file=sys.stderr)
         return 2
@@ -699,12 +804,21 @@ def main(argv: Optional[list] = None) -> int:
             return 2
     else:
         reviewers = reviewers_file(args.reviewer_model or args.model, args.context_length, args.load_on_demand)
-    from runway_defaults import LMSTUDIO_URL  # libs/ is on sys.path since import_harness()
+    from runway_defaults import LMSTUDIO_URL  # libs/ is on sys.path since this module was imported
     host_url = args.host_lmstudio_url or LMSTUDIO_URL
     try:
         lmstudio_in_container = args.lmstudio_url or container_url(host_url)
     except ValueError as exc:  # a port that is not a number
         print(f"error: LM Studio URL: {exc}", file=sys.stderr)
+        return 2
+    # The change and the checkout that has it are settled before anything slow (the model preflight, `--build`): a clone without the
+    # branch's tags is told so, with the `git fetch` that gets them, in the first second and not after an image build.
+    try:
+        tag = change_tag(args.change)
+        checkout = args.repo.expanduser().resolve() if args.repo else REPO_ROOT
+        check_checkout(checkout, tag)
+    except (ValueError, ChangeRepoError) as exc:  # a change the answer key lacks, an unreadable key (LiveMetadataError), a bad checkout
+        print(f"error: {exc}", file=sys.stderr)
         return 2
     if not args.no_preflight and not args.dry_run:
         for model in dict.fromkeys([args.model, *models_in(reviewers)]):
@@ -725,13 +839,17 @@ def main(argv: Optional[list] = None) -> int:
 
     scratch = Path(tempfile.mkdtemp(prefix="claude-runway-pi-"))
     try:
-        mounts, _base, _head = prepare_scratch(scratch, args.case, args.model, reviewers, args.context_length, lmstudio_in_container,
-                                               args.mcp_timeout, args.lmstudio_timeout)
+        try:
+            mounts = prepare_scratch(scratch, checkout, tag, args.model, reviewers, args.context_length, lmstudio_in_container,
+                                     args.mcp_timeout, args.lmstudio_timeout)
+        except ChangeRepoError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
         problems = unsafe_mounts(mounts, Path.home(), REPO_ROOT)
         if problems:
             print("error: refusing to start, a mount would expose the host:\n  " + "\n  ".join(problems), file=sys.stderr)
             return 2
-        prompt = (args.prompt or DEFAULT_PROMPT).replace("{repo}", C_REPO)
+        prompt = (args.prompt or DEFAULT_PROMPT).replace("{repo}", C_REPO).replace("{base}", scoring.BASE_REF).replace("{head}", tag.head)
         name = f"claude-runway-pi-{os.getpid()}-{int(time.time())}"
         command = docker_run_command(
             docker=args.docker, image=args.image, name=name, mounts=mounts, model=args.model, prompt=prompt,
@@ -780,6 +898,7 @@ def main(argv: Optional[list] = None) -> int:
         finally:
             if log_file:
                 log_file.close()
+        result.change = tag.tag_id  # names what was reviewed, so score_run.py needs no flag to find its answers
         print(json.dumps(asdict(result), indent=2))
         return result.exit_status()
     finally:
