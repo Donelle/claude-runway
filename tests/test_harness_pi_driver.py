@@ -12,15 +12,18 @@ Stdlib-only (unittest, no pytest).
 """
 
 import contextlib
+import dataclasses
 import io
 import json
 import os
 import queue
 import re
 import shlex
+import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import urllib.error
 from pathlib import Path
@@ -34,6 +37,7 @@ for _directory in (PI_DIR, REPO_ROOT / "libs", REPO_ROOT / "harness"):
 
 import live_scoring_lib as scoring  # noqa: E402
 import pi_driver as d  # noqa: E402
+import reviewer_db_lib  # noqa: E402
 import score_run  # noqa: E402
 
 # What stands in for the answer key's text, and for another change's own text. Neither may ever reach the container's repository.
@@ -170,6 +174,104 @@ class Recorder:
     def __call__(self) -> None:
         self.calls += 1
         self.process.stdout.close_stream()
+
+
+FINDINGS = {"findings": [{"file": "libs/version_lib.py", "line_start": 35, "line_end": 35, "class": "logic",
+                          "claim": "the success test is inverted", "failing_input": "returncode 0", "quote": "if x:",
+                          "reviewers": ["general"]}]}
+RUBRIC = [{"name": "wrong-result", "level": "moderate", "score": 0.5, "definition": "Wrong data for valid input."}]
+
+
+def reviewer(role: str = "reasoning", **changes) -> dict:
+    return {"name": role, "model": f"{role}-model", "prompt": "p", "active": True, "type": [role], "loadOnDemand": False, **changes}
+
+
+def reviewers_for(role: str) -> dict:
+    return {"rubric": RUBRIC if role == "classifier" else [], "reviewers": [reviewer(role)]}
+
+
+def review_args(review_type: str = "reasoning", head: str = "harness-live-tests/change-6", findings=None, **params) -> dict:
+    """The arguments of the `review` call a session is for; `params` replaces or adds keys of its params."""
+    sent = {"repo_path": d.C_REPO, "base_ref": scoring.BASE_REF, "head_ref": head, **params}
+    if findings is not None:
+        sent.setdefault("findings_file", findings)
+    return {"type": review_type, "params": sent}
+
+
+def review_call(args: dict, *, ran: bool = True, text: str = "Reasoning review: 0 finding(s)", error: bool = False,
+                call_id: str = "c1") -> bytes:
+    """A `review` call as Pi emits it. Pi sends the start record before it checks the arguments; the end record carries
+    `durationMs` only when the tool ran."""
+    end = {"toolCallId": call_id, "toolName": d.REVIEW_TOOL, "isError": error or not ran,
+           "result": {"content": [{"type": "text", "text": text}]}}
+    if ran:
+        end["durationMs"] = 1200
+    return event("tool_execution_start", toolCallId=call_id, toolName=d.REVIEW_TOOL, args=args) + event("tool_execution_end", **end)
+
+
+def mount_source(command: list, target: str):
+    """The host folder `command` mounts at `target`, or None."""
+    for spec in (command[i + 1] for i, part in enumerate(command) if part == "--mount"):
+        fields = dict(part.split("=", 1) for part in spec.split(",") if "=" in part)
+        if fields["target"] == target:
+            return Path(fields["source"])
+    return None
+
+
+class FakeContainer:
+    """Stands in for `docker run` in a whole session: it keeps what the container was given (read while the folders exist),
+    leaves results files in the results mount as the review tool does, and plays Pi's events."""
+
+    def __init__(self, calls, *, results=("reasoning",), hang: bool = False, returncode: int = 0) -> None:
+        self.calls, self.results, self.hang, self.returncode = calls, results, hang, returncode
+        self.runs = 0
+
+    def __call__(self, command, stderr_file) -> FakeProcess:
+        self.runs += 1
+        self.command = command
+        self.targets = [re.search(r"target=([^,]+)", command[i + 1]).group(1) for i, part in enumerate(command) if part == "--mount"]
+        config, agent = mount_source(command, d.C_CONFIG), mount_source(command, d.C_AGENT)
+        self.scratch = config.parent
+        self.reviewers = json.loads((config / "reviewers.json").read_text(encoding="utf-8"))
+        self.prompt_files = {p.name: p.read_text(encoding="utf-8") for p in sorted((config / "prompts").glob("*"))}
+        self.server = json.loads((agent / "mcp.json").read_text(encoding="utf-8"))["mcpServers"][d.MCP_SERVER_NAME]
+        findings = mount_source(command, d.C_FINDINGS)
+        self.findings = {p.name: p.read_text(encoding="utf-8") for p in findings.iterdir()} if findings else None
+        database = mount_source(command, d.C_DB)
+        self.database_existed = (database / d.DB_FILE_NAME).is_file()
+        for number, kind in enumerate(self.results):
+            (mount_source(command, d.C_RESULTS) / f"{kind}-{number}.json").write_text(
+                json.dumps({"type": kind, "run_id": f"run{number}", "review_id": "r"}), encoding="utf-8")
+        chunks = [event("turn_start"), *self.calls, event("turn_end"), event("agent_settled", aborted=False)]
+        return FakeProcess(chunks[:2] if self.hang else chunks, self.hang, self.returncode)
+
+
+class FakeDocker:
+    """Stands in for `_docker` (`kill`, `rm`, `ps`): records each command; `ps` lists the container `listed` more times."""
+
+    def __init__(self, listed: int = 0, log=None) -> None:
+        self.commands, self.listed, self.log = [], listed, log
+
+    def __call__(self, docker, *args):
+        self.commands.append(args)
+        if self.log is not None:
+            self.log.append(args[0])
+        out = b""
+        if args[0] == "ps" and self.listed > 0:
+            self.listed, out = self.listed - 1, b"abc123\n"
+        return subprocess.CompletedProcess(args, 0, stdout=out, stderr=b"")
+
+
+@contextlib.contextmanager
+def fake_root():
+    """A stand-in for this checkout (`REPO_ROOT`). A session mounts its `libs/` and `mcpservers/` and keeps the harness database
+    under it, so a test that runs a session never creates a database in the real checkout. No real docker command runs either."""
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        root = Path(tmp).resolve() / "root"
+        for name in ("libs", "mcpservers"):
+            (root / name).mkdir(parents=True)
+        with mock.patch.object(d, "REPO_ROOT", root), mock.patch.object(d, "_docker", FakeDocker()):
+            yield root
 
 
 def run(chunks, *, max_turns=10, max_tool_calls=30, timeout=600, hang=False, clock=None, returncode=0):
@@ -516,15 +618,16 @@ class RunCappedTests(unittest.TestCase):
 
 
 def mounts_in(root: Path) -> d.Mounts:
-    paths = {name: root / name for name in ("repo", "config", "agent", "state")}
+    paths = {name: root / name for name in ("repo", "config", "agent", "results")}
     for path in paths.values():
         path.mkdir()
-    return d.Mounts(d.REPO_ROOT / "libs", d.REPO_ROOT / "mcpservers", **paths)
+    return d.Mounts(d.REPO_ROOT / "libs", d.REPO_ROOT / "mcpservers", db=d.harness_db_dir(d.REPO_ROOT), **paths)
 
 
 def command_for(mounts: d.Mounts) -> list:
     return d.docker_run_command(
         docker="docker", image="img", name="n", mounts=mounts, model="m", prompt="p", memory="4g", cpus="2", pids_limit=256,
+        time_limit_seconds=615,
     )
 
 
@@ -538,11 +641,19 @@ class DockerCommandTests(unittest.TestCase):
     def mount_specs(self) -> list:
         return [self.command[i + 1] for i, part in enumerate(self.command) if part == "--mount"]
 
-    def test_the_reviewer_code_the_repo_and_the_config_are_read_only_and_only_two_mounts_are_writable(self):
+    def test_the_reviewer_code_the_repo_and_the_config_are_read_only_and_only_three_mounts_are_writable(self):
         specs = self.mount_specs()
-        self.assertEqual(len(specs), 6)
+        self.assertEqual(len(specs), 7)
         writable = [spec for spec in specs if not spec.endswith(",readonly")]
-        self.assertEqual(sorted(re.search(r"target=([^,]+)", s).group(1) for s in writable), [d.C_AGENT, d.C_STATE])
+        self.assertEqual(sorted(re.search(r"target=([^,]+)", s).group(1) for s in writable), [d.C_AGENT, d.C_DB, d.C_RESULTS])
+
+    def test_a_findings_folder_is_one_more_mount_and_read_only(self):
+        self.mounts.findings = Path(self._tmp.name) / "findings"
+        self.command = command_for(self.mounts)
+        specs = self.mount_specs()
+        self.assertEqual(len(specs), 8)
+        (spec,) = [s for s in specs if f"target={d.C_FINDINGS}," in s]
+        self.assertTrue(spec.endswith(",readonly"), spec)
 
     def test_mounts_use_the_mount_flag_never_v_so_a_windows_path_cannot_be_misread(self):
         self.assertNotIn("-v", self.command)
@@ -563,7 +674,7 @@ class DockerCommandTests(unittest.TestCase):
     def test_the_prompt_is_one_argument_after_the_double_dash_not_text_in_a_shell_string(self):
         prompt = 'it\'s "quoted"; rm -rf /'
         command = d.docker_run_command(docker="docker", image="img", name="n", mounts=self.mounts, model="m", prompt=prompt,
-                                       memory="4g", cpus="2", pids_limit=1)
+                                       memory="4g", cpus="2", pids_limit=1, time_limit_seconds=615)
         self.assertNotIn("sh", command[command.index("--entrypoint") + 1])  # no shell to splice it into...
         self.assertEqual(command.count(prompt), 1)
         self.assertEqual(command[-1], prompt)  # ...and handed over whole, as the last argument after "--"
@@ -573,9 +684,13 @@ class DockerCommandTests(unittest.TestCase):
         server = d.mcp_file("http://host.docker.internal:1234/v1")["mcpServers"][d.MCP_SERVER_NAME]
         self.assertEqual(server["command"], d.C_VENV_PYTHON)
         self.assertEqual(server["exposure"], "direct")
-        self.assertEqual(server["env"]["CLAUDE_RUNWAY_CODEBASE_REVIEWER_DB"], f"{d.C_STATE}/codebase-reviewer.db")
+        self.assertEqual(server["env"]["CLAUDE_RUNWAY_CODEBASE_REVIEWER_DB"], f"{d.C_DB}/codebase-reviewer.db")
+        self.assertEqual(server["env"]["REVIEW_OUTPUT_DIR"], d.C_RESULTS)
         self.assertEqual(server["env"]["REVIEWERS_FILE"], f"{d.C_CONFIG}/reviewers.json")
         self.assertEqual(server["env"]["CLAUDE_RUNWAY_LMSTUDIO_URL"], "http://host.docker.internal:1234/v1")
+        self.assertNotIn("REVIEW_ID", server["env"])
+        server = d.mcp_file("http://h:1234/v1", review_id="run-7")["mcpServers"][d.MCP_SERVER_NAME]
+        self.assertEqual(server["env"]["REVIEW_ID"], "run-7")
 
     def test_the_mcp_file_leaves_both_timeouts_to_their_own_defaults_unless_asked(self):
         server = d.mcp_file("http://h:1234/v1")["mcpServers"][d.MCP_SERVER_NAME]
@@ -628,7 +743,7 @@ class UnsafeMountsTests(unittest.TestCase):
 
     def test_a_folder_that_contains_the_checkout_is_refused(self):
         mounts = self.fresh_mounts()
-        mounts.state = d.REPO_ROOT.parent
+        mounts.results = d.REPO_ROOT.parent
         self.assertTrue(d.unsafe_mounts(mounts, self.home, d.REPO_ROOT))
 
     def test_only_libs_and_mcpservers_may_come_from_inside_the_checkout_and_only_read_only(self):
@@ -648,7 +763,7 @@ class UnsafeMountsTests(unittest.TestCase):
 
     def test_a_folder_that_contains_the_home_claude_folder_is_refused(self):
         mounts = self.fresh_mounts()
-        mounts.state = self.home
+        mounts.results = self.home
         self.assertTrue(d.unsafe_mounts(mounts, self.home, d.REPO_ROOT))
 
     def fake_checkout(self) -> Path:
@@ -659,9 +774,55 @@ class UnsafeMountsTests(unittest.TestCase):
 
     def test_the_reviewer_code_of_a_real_checkout_is_accepted(self):
         checkout = self.fake_checkout()
+        self.assertEqual(d.unsafe_mounts(self.mounts_of(checkout), self.home, checkout), [])
+
+    def mounts_of(self, checkout: Path) -> d.Mounts:
         mounts = self.fresh_mounts()
         mounts.libs, mounts.mcpservers = checkout / "libs", checkout / "mcpservers"
-        self.assertEqual(d.unsafe_mounts(mounts, self.home, checkout), [])
+        mounts.db = d.harness_db_dir(checkout)
+        return mounts
+
+    def problems_with(self, field_name: str, folder: Path, checkout: Path) -> list:
+        mounts = self.mounts_of(checkout)
+        setattr(mounts, field_name, folder)
+        return d.unsafe_mounts(mounts, self.home, checkout)
+
+    def test_the_database_folder_is_the_only_writable_part_of_the_checkout_and_only_as_the_database_mount(self):
+        checkout = self.fake_checkout()
+        database = d.harness_db_dir(checkout)
+        database.mkdir(parents=True)
+        self.assertEqual(self.problems_with("db", database, checkout), [])
+        # The same folder as any other mount, the folders above it, and a folder inside it are all refused.
+        for field_name in ("repo", "config", "agent", "results", "findings"):
+            with self.subTest(field=field_name):
+                self.assertTrue(self.problems_with(field_name, database, checkout))
+        for folder in (database.parent, database.parent.parent, checkout, database / "inner", database.parent / "db2"):
+            with self.subTest(db=str(folder.relative_to(checkout.parent))):
+                self.assertTrue(self.problems_with("db", folder, checkout))
+
+    def test_a_database_folder_that_is_a_symlink_or_sits_below_one_is_refused(self):
+        outside = Path(tempfile.mkdtemp(dir=self.root))
+        (outside / "db").mkdir()
+        for linked in ("db", "logs"):
+            with self.subTest(linked=linked):
+                checkout = self.fake_checkout()
+                database = d.harness_db_dir(checkout)
+                link = database if linked == "db" else database.parent
+                link.parent.mkdir(parents=True)
+                try:
+                    link.symlink_to(outside / "db" if linked == "db" else outside, target_is_directory=True)
+                except OSError as error:  # Windows without the symlink privilege
+                    self.skipTest(f"cannot create a symlink here: {error}")
+                problems = d.unsafe_mounts(self.mounts_of(checkout), self.home, checkout)
+                self.assertTrue(any("own harness database folder" in p for p in problems), problems)
+
+    def test_a_database_folder_under_the_home_claude_folder_is_still_refused(self):
+        # The exception is for "inside the checkout" alone: it does not excuse an overlap with ~/.claude or ~/.pi.
+        checkout = self.home / ".claude" / "checkout"
+        for name in ("libs", "mcpservers"):
+            (checkout / name).mkdir(parents=True)
+        problems = d.unsafe_mounts(self.mounts_of(checkout), self.home, checkout)
+        self.assertTrue(any("~/.claude" in p and "db" in p for p in problems), problems)
 
     def test_a_symlinked_reviewer_folder_is_refused_wherever_it_points(self):
         # Without this check a link to an unrelated folder (say ~/.ssh) passed: it overlaps none of the three roots.
@@ -732,10 +893,38 @@ class ConfigTests(unittest.TestCase):
                 self.assertTrue(d.models_in(d.reviewers_from_config(config)))
 
     def test_a_config_using_a_file_the_container_lacks_is_refused(self):
-        for key in ("promptFile", "translator"):
-            path = self.write({"reviewers": [{**self.REVIEWER, key: "x.md"}]})
-            with self.assertRaisesRegex(ValueError, key):
-                d.reviewers_from_config(path)
+        with self.assertRaisesRegex(ValueError, "translator"):
+            d.reviewers_from_config(self.write({"reviewers": [{**self.REVIEWER, "translator": "x.py"}]}))
+        entry = {"name": "r", "level": "low", "score": 0.5, "definition": "d", "definitionFile": "x.md"}
+        with self.assertRaisesRegex(ValueError, "definitionFile"):
+            d.reviewers_from_config(self.write({"rubric": [entry], "reviewers": [self.REVIEWER]}))
+
+    def test_a_verifier_or_classifier_alone_is_accepted_for_its_own_type_only(self):
+        rubric = [{"name": "r", "level": "low", "score": 0.5, "definition": "d"}]
+        for role in ("verifier", "classifier"):
+            path = self.write({"rubric": rubric, "reviewers": [{**self.REVIEWER, "type": [role]}]})
+            with self.subTest(role=role):
+                self.assertEqual(d.reviewers_from_config(path, role)["reviewers"][0]["type"], [role])
+                other = "classifier" if role == "verifier" else "verifier"
+                with self.assertRaisesRegex(ValueError, f"no active {other} reviewer"):
+                    d.reviewers_from_config(path, other)
+
+    def test_every_real_config_converts_for_each_type_it_has_a_reviewer_of(self):
+        configs = [c for c in sorted((REPO_ROOT / "harness" / "live-tests" / "configs").glob("*.json")) if ".baselines." not in c.name]
+        self.assertTrue(configs)
+        seen: set = set()
+        for config in configs:
+            data = json.loads(config.read_text(encoding="utf-8"))
+            roles = {role for r in data["reviewers"] if r.get("active", True) for role in r["type"]}
+            for role in sorted(roles):
+                with self.subTest(config=config.name, role=role):
+                    d.reviewers_from_config(config, role)
+                    seen.add(role)
+        self.assertEqual(seen, {"reasoning", "verifier", "classifier"})
+
+    def test_models_in_can_be_narrowed_to_one_type(self):
+        data = {"reviewers": [{**self.REVIEWER, "model": "a"}, {**self.REVIEWER, "model": "b", "type": ["verifier"]}]}
+        self.assertEqual((d.models_in(data, "verifier"), d.models_in(data, "reasoning")), (["b"], ["a"]))
 
     def test_a_config_with_no_active_reasoning_reviewer_is_refused(self):
         # The driver asks for review type "reasoning", which needs a reasoning reviewer, so the server would refuse it
@@ -940,12 +1129,22 @@ class FailurePathTests(unittest.TestCase):
         return set(Path(tempfile.gettempdir()).glob("claude-runway-pi-*"))
 
     def test_a_docker_that_cannot_be_started_is_a_usage_error_not_a_traceback(self):
+        # In this process, on a stand-in root: a run that gets as far as docker has created the harness database.
         before = self.scratch_dirs()
-        completed = self.run_driver("--docker", "no-such-docker-xyz")
-        self.assertEqual(completed.returncode, 2, completed.stderr)
-        self.assertIn("could not start", completed.stderr)
-        self.assertNotIn("Traceback", completed.stderr)
+        err = io.StringIO()
+        with fake_root(), contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            code = d.main(["--model", "m", "--no-preflight", "--repo", str(checkout()), "--docker", "no-such-docker-xyz"])
+        self.assertEqual(code, 2, err.getvalue())
+        self.assertIn("could not start", err.getvalue())
         self.assertEqual(self.scratch_dirs(), before)  # the scratch folder is removed on this path too
+
+    def test_a_session_that_cannot_start_leaves_no_empty_log_to_get_in_the_way_of_a_retry(self):
+        with tempfile.TemporaryDirectory() as tmp, fake_root(), contextlib.redirect_stderr(io.StringIO()), \
+                contextlib.redirect_stdout(io.StringIO()):
+            log = Path(tmp) / "events.jsonl"
+            code = d.main(["--model", "m", "--no-preflight", "--repo", str(checkout()), "--log", str(log),
+                           "--docker", "no-such-docker-xyz"])
+            self.assertEqual((code, log.exists()), (2, False))
 
     def test_spawning_a_missing_executable_raises_launch_error(self):
         with tempfile.TemporaryFile() as stderr_file, self.assertRaises(d.LaunchError):
@@ -1169,10 +1368,9 @@ class NoMountReachesTheAnswerKey(unittest.TestCase):
                 self.assertNotIn(resolved, key.parents)
 
     def test_the_same_holds_for_the_sources_on_the_command_line_the_container_is_started_with(self):
-        command = d.docker_run_command(docker="docker", image="img", name="n", mounts=self.mounts, model="m", prompt="p",
-                                       memory="4g", cpus="2", pids_limit=1)
+        command = command_for(self.mounts)
         sources = [re.search(r"source=([^,]+)", command[i + 1]).group(1) for i, part in enumerate(command) if part == "--mount"]
-        self.assertEqual(len(sources), 6)
+        self.assertEqual(len(sources), 7)
         key = scoring.ANSWER_KEY_PATH.resolve()
         for source in sources:
             with self.subTest(source=source):
@@ -1190,7 +1388,7 @@ class NoMountReachesTheAnswerKey(unittest.TestCase):
         home = self.root / "home"
         key = scoring.ANSWER_KEY_PATH
         for folder in (key, key.parent, key.parent.parent, REPO_ROOT / "harness" / "pi"):
-            for field_name in ("repo", "state"):  # a read-only mount and a writable one
+            for field_name in ("repo", "results", "db"):  # a read-only mount, a writable one and the database's
                 mounts = mounts_in(Path(tempfile.mkdtemp(dir=self.root)))
                 setattr(mounts, field_name, folder)
                 with self.subTest(folder=str(folder), mount=field_name):
@@ -1291,17 +1489,10 @@ class ChangeInTheSummaryTests(unittest.TestCase):
               "These findings are not verified.\n\n## logic (1)\n- libs/version_lib.py:35 [general] the success test is inverted\n")
 
     def run_driver(self, *extra, review=REVIEW):
-        chunks = [
-            event("turn_start"),
-            event("tool_execution_start", toolCallId="c", toolName=d.REVIEW_TOOL, args={}),
-            event("tool_execution_end", toolCallId="c", toolName=d.REVIEW_TOOL, result={"content": [{"type": "text", "text": review}]}, isError=False),
-            event("turn_end", message={"role": "assistant", "content": []}, toolResults=[]),
-            final_message("one finding"),
-            event("agent_settled", aborted=False),
-        ]
-        process = FakeProcess(chunks)
+        change = extra[extra.index("--change") + 1] if "--change" in extra else "change-6"
+        container = FakeContainer([review_call(review_args(head=f"harness-live-tests/{change}"), text=review)])
         out, err = io.StringIO(), io.StringIO()
-        with mock.patch.object(d, "_spawn", lambda command, stderr_file: process), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        with fake_root(), mock.patch.object(d, "_spawn", container), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = d.main(["--model", "m", "--no-preflight", "--repo", str(checkout()), *extra])
         return code, json.loads(out.getvalue())
 
@@ -1347,6 +1538,585 @@ class NeitherCasesNorHarnessLibTests(unittest.TestCase):
             source = (PI_DIR / name).read_text(encoding="utf-8")
             with self.subTest(file=name):
                 self.assertNotRegex(source, r"(?m)^\s*(import|from)\s+(cases|harness_lib|live_branch_lib)\b")
+
+
+class PromptTests(unittest.TestCase):
+    def test_the_reasoning_prompt_is_the_one_earlier_runs_used(self):
+        self.assertEqual(d.default_prompt("reasoning"), d.DEFAULT_PROMPT)
+
+    def test_each_type_is_named_and_only_a_verifier_or_classifier_is_given_a_findings_file(self):
+        for role in ("reasoning", "verifier", "classifier"):
+            with self.subTest(role=role):
+                findings = None if role == "reasoning" else d.C_FINDINGS_FILE
+                prompt = d.fill_prompt(d.default_prompt(role), "harness-live-tests/change-6", findings)
+                self.assertIn(f'type "{role}"', prompt)
+                params = json.loads(re.search(r"params (\{.*?\})\. ", prompt).group(1))
+                # What the prompt asks for is exactly the call the session accepts.
+                expected = d.ExpectedCall(role, "harness-live-tests/change-6", findings)
+                self.assertEqual(expected.mismatches({"type": role, "params": params}), [])
+                self.assertNotRegex(prompt, r"\{(type|repo|base|head|findings)\}")
+
+    def test_a_custom_prompt_may_name_the_findings_file(self):
+        self.assertEqual(d.fill_prompt("read {findings}", "h", d.C_FINDINGS_FILE), f"read {d.C_FINDINGS_FILE}")
+
+
+class ExpectedCallTests(unittest.TestCase):
+    HEAD = "harness-live-tests/change-6"
+
+    def mismatches(self, args, role="reasoning", findings=None):
+        return d.ExpectedCall(role, self.HEAD, findings).mismatches(args)
+
+    def test_the_sessions_call_has_no_mismatch(self):
+        self.assertEqual(self.mismatches(review_args()), [])
+        self.assertEqual(self.mismatches(review_args("verifier", findings=d.C_FINDINGS_FILE), "verifier", d.C_FINDINGS_FILE), [])
+
+    def test_a_wrong_type_is_one(self):
+        (problem,) = self.mismatches(review_args("verifier"))
+        self.assertIn("type was 'verifier', not 'reasoning'", problem)
+
+    def test_swapped_refs_are_caught(self):
+        problems = self.mismatches(review_args(base_ref=self.HEAD, head_ref=scoring.BASE_REF))
+        self.assertEqual([p.split()[0] for p in problems], ["base_ref", "head_ref"])
+
+    def test_another_repository_is_caught_and_a_trailing_slash_is_not_another(self):
+        self.assertTrue(self.mismatches(review_args(repo_path="/work")))
+        self.assertTrue(self.mismatches(review_args(repo_path=None)))
+        self.assertEqual(self.mismatches(review_args(repo_path=d.C_REPO + "/")), [])
+
+    def test_head_ref_may_be_left_out_or_be_head_because_the_change_is_checked_out(self):
+        args = review_args()
+        del args["params"]["head_ref"]
+        self.assertEqual(self.mismatches(args), [])
+        self.assertEqual(self.mismatches(review_args(head_ref="HEAD")), [])
+        self.assertTrue(self.mismatches(review_args(head_ref=None)))
+        self.assertTrue(self.mismatches(review_args(head_ref="harness-live-tests/change-5")))
+
+    def test_the_findings_file_must_be_exactly_the_sessions(self):
+        good = d.C_FINDINGS_FILE
+        self.assertTrue(self.mismatches(review_args("verifier"), "verifier", good))  # left out: the earlier stages would run
+        self.assertTrue(self.mismatches(review_args("verifier", findings="/findings/other.json"), "verifier", good))
+        self.assertTrue(self.mismatches(review_args(findings=good)))  # a reasoning session takes none
+        self.assertTrue(self.mismatches(review_args(findings="")))
+
+    def test_other_params_are_the_callers_choice(self):
+        self.assertEqual(self.mismatches(review_args(context_lines=5, chunk_chars=900)), [])
+
+    def test_arguments_that_are_not_objects_are_mismatches_not_a_crash(self):
+        for args in (None, "text", [], {"type": "reasoning"}, {"type": "reasoning", "params": "{}"}):
+            with self.subTest(args=args):
+                self.assertTrue(self.mismatches(args))
+
+    def test_a_long_value_from_the_model_is_cut_in_the_message(self):
+        (problem,) = self.mismatches(review_args(repo_path="x" * 5000))
+        self.assertLess(len(problem), 300)
+
+
+class CallCheckTests(unittest.TestCase):
+    """Which `review` calls are judged: the ones that RAN, which only the end record's `durationMs` tells."""
+
+    def tracked(self, *chunks):
+        tracker = d.CapTracker(10, 30, 600, FakeClock(), d.ExpectedCall("reasoning", "harness-live-tests/change-6"))
+        for line in b"".join(chunks).decode("utf-8").splitlines():
+            tracker.observe(json.loads(line))
+        return tracker
+
+    def test_a_call_that_ran_with_the_sessions_arguments_is_good(self):
+        tracker = self.tracked(review_call(review_args()))
+        self.assertEqual((tracker.good_calls, tracker.call_errors), (1, []))
+
+    def test_a_call_that_ran_with_another_type_is_an_error_even_when_a_good_one_follows(self):
+        tracker = self.tracked(review_call(review_args("classifier"), call_id="a"), review_call(review_args(), call_id="b"))
+        self.assertEqual((tracker.good_calls, len(tracker.call_errors)), (1, 1))
+        self.assertIn("classifier", tracker.call_errors[0])
+
+    def test_a_refused_tool_call_that_ran_with_a_wrong_findings_file_is_still_an_error(self):
+        # The tool ran and answered "Error: ..." itself: it was asked for something this session is not.
+        tracker = self.tracked(review_call(review_args(findings="/etc/passwd"), text="Error: not usable"))
+        self.assertEqual((tracker.good_calls, len(tracker.call_errors)), (0, 1))
+
+    def test_a_call_pi_refused_before_running_followed_by_a_good_retry_is_not_a_failure(self):
+        refused = review_call({"type": "reasoning", "params": "{}"}, ran=False, text="Validation failed for tool", call_id="a")
+        tracker = self.tracked(refused, review_call(review_args(), call_id="b"))
+        self.assertEqual((tracker.good_calls, tracker.call_errors, tracker.review_calls, tracker.review_errors), (1, [], 2, 1))
+
+    def test_a_right_call_that_errored_is_neither_good_nor_a_wrong_call(self):
+        tracker = self.tracked(review_call(review_args(), text="Error: model 'x' is not loaded"))
+        self.assertEqual((tracker.good_calls, tracker.call_errors), (0, []))
+
+    def test_with_no_duration_on_any_call_nothing_counts_as_good_so_the_session_cannot_pass(self):
+        # What a later Pi that dropped `durationMs` would look like: it fails closed.
+        tracker = self.tracked(review_call(review_args(), ran=False))
+        self.assertEqual(tracker.good_calls, 0)
+        self.assertTrue(d.session_failures(tracker, [{"type": "reasoning"}], "reasoning"))
+
+    def test_an_end_with_no_start_has_unknown_arguments_and_is_an_error(self):
+        end = event("tool_execution_end", toolCallId="z", toolName=d.REVIEW_TOOL, isError=False, durationMs=3, result={})
+        self.assertEqual(len(self.tracked(end).call_errors), 1)
+
+    def test_calls_that_share_an_id_must_all_be_right(self):
+        starts = event("tool_execution_start", toolCallId="s", toolName=d.REVIEW_TOOL, args=review_args("verifier"))
+        starts += event("tool_execution_start", toolCallId="s", toolName=d.REVIEW_TOOL, args=review_args())
+        end = event("tool_execution_end", toolCallId="s", toolName=d.REVIEW_TOOL, isError=False, durationMs=3, result={})
+        tracker = self.tracked(starts, end, end)
+        self.assertTrue(tracker.call_errors)
+
+    def test_a_call_error_fails_a_run_that_otherwise_completed(self):
+        self.assertEqual(d.RunResult(stopped_by="completed", review_calls=1, call_errors=["x"]).exit_status(), 1)
+        self.assertEqual(d.RunResult(stopped_by="completed", review_calls=1, failures=["x"]).exit_status(), 1)
+        self.assertEqual(d.RunResult(stopped_by="timeout", review_calls=1, failures=["x"]).exit_status(), 3)
+
+
+class SessionTests(unittest.TestCase):
+    """A whole session through `run_session`, with a fake in place of the container."""
+
+    HEAD = "harness-live-tests/change-6"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.folder = Path(self._tmp.name)
+        root = fake_root()
+        self.root = root.__enter__()
+        self.addCleanup(root.__exit__, None, None, None)
+
+    def findings_file(self, data=None, name="findings.json") -> Path:
+        path = self.folder / name
+        path.write_text(json.dumps(data if data is not None else FINDINGS), encoding="utf-8")
+        return path
+
+    def spec(self, role="reasoning", **changes) -> "d.SessionSpec":
+        values = {"model": "caller", "reviewers": reviewers_for(role), "lmstudio_url": "http://host.docker.internal:1234/v1",
+                  "review_type": role, "checkout": checkout()}
+        if role != "reasoning":
+            data = FINDINGS
+            if role == "classifier":
+                data = {"findings": [{**FINDINGS["findings"][0], "verification": "confirmed"}]}
+            values["findings_file"] = self.findings_file(data)
+        values.update(changes)
+        return d.SessionSpec(**values)
+
+    def container_for(self, role="reasoning", **changes) -> FakeContainer:
+        findings = None if role == "reasoning" else d.C_FINDINGS_FILE
+        values = {"calls": [review_call(review_args(role, findings=findings))], "results": (role,)}
+        values.update(changes)
+        return FakeContainer(values.pop("calls"), **values)
+
+    def test_each_type_runs_alone_and_returns_its_results(self):
+        for role in ("reasoning", "verifier", "classifier"):
+            with self.subTest(role=role):
+                spec, container = self.spec(role, review_id="review-1"), self.container_for(role)
+                result = d.run_session(spec, spawn=container)
+                self.assertEqual((result.stopped_by, result.exit_status()), ("completed", 0), result)
+                self.assertEqual((result.review_type, result.review_id, result.change), (role, "review-1", "change-6"))
+                self.assertEqual([r["type"] for r in result.results], [role])
+                self.assertEqual(container.server["env"]["REVIEW_ID"], "review-1")
+                self.assertEqual(container.server["env"]["REVIEW_OUTPUT_DIR"], d.C_RESULTS)
+                self.assertIn(f'type "{role}"', container.command[-1])
+                self.assertFalse(container.scratch.exists())  # the results were read before the folders went
+
+    def test_a_verifier_gets_only_a_copy_of_its_findings_file_read_only(self):
+        spec = self.spec("verifier")
+        (self.folder / "neighbour.log").write_text(KEY_MARKER, encoding="utf-8")
+        container = self.container_for("verifier")
+        d.run_session(spec, spawn=container)
+        self.assertEqual(list(container.findings), ["findings.json"])
+        self.assertEqual(json.loads(container.findings["findings.json"]), FINDINGS)
+        (mount,) = [part for part in container.command if f"target={d.C_FINDINGS}," in part]
+        self.assertTrue(mount.endswith(",readonly"))
+        self.assertNotIn(str(spec.findings_file.parent), mount)
+
+    def test_a_reasoning_session_has_no_findings_mount(self):
+        container = self.container_for()
+        d.run_session(self.spec(), spawn=container)
+        self.assertNotIn(d.C_FINDINGS, container.targets)
+
+    def test_a_call_of_the_wrong_type_fails_the_session(self):
+        container = self.container_for("verifier", calls=[review_call(review_args())], results=("reasoning",))
+        result = d.run_session(self.spec("verifier"), spawn=container)
+        self.assertEqual((result.stopped_by, result.exit_status()), ("completed", 1))
+        self.assertIn("type was 'reasoning'", result.call_errors[0])
+        self.assertTrue(any("another review type" in f for f in result.failures), result.failures)
+
+    def test_a_wrong_findings_file_fails_the_session(self):
+        calls = [review_call(review_args("verifier", findings="/findings/else.json"))]
+        result = d.run_session(self.spec("verifier"), spawn=self.container_for("verifier", calls=calls))
+        self.assertEqual(result.exit_status(), 1)
+        self.assertIn("findings_file", result.call_errors[0])
+
+    def test_a_refused_call_and_a_good_retry_pass(self):
+        calls = [review_call({"type": "reasoning", "params": "x"}, ran=False, text="Validation failed", call_id="a"),
+                 review_call(review_args(), call_id="b")]
+        result = d.run_session(self.spec(), spawn=self.container_for(calls=calls))
+        self.assertEqual((result.exit_status(), result.call_errors, result.failures), (0, [], []))
+
+    def test_a_session_whose_results_never_arrive_fails(self):
+        result = d.run_session(self.spec(), spawn=self.container_for(results=()))
+        self.assertEqual(result.exit_status(), 1)
+        self.assertIn("no results file of the reasoning review came back", result.failures)
+
+    def test_a_session_with_no_review_call_fails_and_says_so(self):
+        result = d.run_session(self.spec(), spawn=self.container_for(calls=[], results=()))
+        self.assertEqual(result.exit_status(), 1)
+        self.assertTrue(any("no review call" in f for f in result.failures))
+
+    def test_a_run_that_did_not_finish_is_not_also_blamed_for_its_missing_results(self):
+        result = d.run_session(self.spec(), spawn=self.container_for(returncode=1, results=()))
+        self.assertEqual((result.stopped_by, result.failures), ("error", []))
+
+    def test_the_database_exists_before_the_container_starts_holds_no_record_and_is_kept(self):
+        container = self.container_for()
+        d.run_session(self.spec(), spawn=container)
+        self.assertTrue(container.database_existed)
+        path = d.harness_db_dir(self.root) / d.DB_FILE_NAME
+        self.assertEqual(mount_source(container.command, d.C_DB), path.parent)
+        with contextlib.closing(sqlite3.connect(path)) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM runs").fetchone(), (0,))
+
+    def test_both_request_limits_are_the_sessions_limit_unless_given(self):
+        container = self.container_for()
+        d.run_session(self.spec(timeout=900), spawn=container)
+        self.assertEqual((container.server["timeout"], container.server["env"]["CLAUDE_RUNWAY_LMSTUDIO_TIMEOUT_SECONDS"]), (900, "900"))
+        d.run_session(self.spec(timeout=900, mcp_timeout=100, lmstudio_timeout=50), spawn=container)
+        self.assertEqual((container.server["timeout"], container.server["env"]["CLAUDE_RUNWAY_LMSTUDIO_TIMEOUT_SECONDS"]), (100, "50"))
+
+    def test_pi_runs_under_timeout_with_a_margin_after_the_sessions_own_limit(self):
+        container = self.container_for()
+        d.run_session(self.spec(timeout=100), spawn=container)
+        at = container.command.index("--entrypoint")
+        self.assertEqual(container.command[at + 1], "/usr/bin/timeout")
+        self.assertEqual(container.command[at + 3:at + 6], [f"--kill-after={d.KILL_AFTER_SECONDS}", str(100 + d.BACKSTOP_MARGIN_SECONDS), "pi"])
+
+    def test_two_sessions_never_share_a_container_name(self):
+        names = set()
+        for _ in range(2):
+            with mock.patch.object(d.time, "time", return_value=1000.0), d.prepared_session(self.spec()) as session:
+                names.add(session.name)
+        self.assertEqual(len(names), 2)
+
+    def test_a_spec_that_cannot_be_a_session_runs_nothing(self):
+        bad = (
+            ({"review_type": "reasoning", "findings_file": self.findings_file()}, "takes no findings file"),
+            ({"review_type": "verifier"}, "needs a findings file"),
+            ({"review_type": "summary"}, "unknown review type"),
+            ({"review_id": "a\nb"}, "REVIEW_ID"),
+            ({"timeout": 0}, "1 or more"),
+            ({"mcp_timeout": 0}, "1 or more"),
+            ({"change": "change-9"}, "unknown change"),
+            ({"reviewers": reviewers_for("verifier")}, "no active reasoning reviewer"),
+            ({"reviewers": {"rubric": [], "reviewers": [reviewer(translator="x.py")]}}, "translator"),
+        )
+        for changes, message in bad:
+            with self.subTest(changes=list(changes)):
+                container = self.container_for()
+                values = {"model": "c", "reviewers": reviewers_for("reasoning"), "lmstudio_url": "http://h:1/v1", "checkout": checkout()}
+                values.update(changes)
+                with self.assertRaisesRegex(d.SessionError, message):
+                    d.run_session(d.SessionSpec(**values), spawn=container)
+                self.assertEqual(container.runs, 0)
+
+    def test_a_file_that_is_not_a_findings_file_never_reaches_a_container(self):
+        key_like = {"changes": [{"id": "change-6", "bugs": [KEY_MARKER]}]}
+        for data, name in ((key_like, "answer_key.json"), ({"findings": [{"labels": KEY_MARKER}]}, "labelled.json")):
+            with self.subTest(name=name):
+                container = self.container_for("verifier")
+                path = self.findings_file(data, name)
+                with self.assertRaises(d.SessionError) as caught:
+                    d.run_session(self.spec("verifier", findings_file=path), spawn=container)
+                self.assertIn(name, str(caught.exception))  # the user's own path, not the scratch copy's
+                self.assertNotIn(KEY_MARKER, str(caught.exception))
+                self.assertEqual(container.runs, 0)
+
+    def test_a_classifier_needs_findings_that_carry_their_verification(self):
+        spec = self.spec("classifier")
+        unverified = self.findings_file(FINDINGS, "unverified.json")  # its own name: spec() writes a verified findings.json
+        with self.assertRaisesRegex(d.SessionError, "verification"):
+            d.run_session(dataclasses.replace(spec, findings_file=unverified), spawn=self.container_for("classifier"))
+
+    def test_a_missing_findings_file_says_which(self):
+        with self.assertRaisesRegex(d.SessionError, "nowhere.json"):
+            d.run_session(self.spec("verifier", findings_file=self.folder / "nowhere.json"), spawn=self.container_for("verifier"))
+
+    def test_a_stop_that_is_already_set_starts_no_container(self):
+        stop = threading.Event()
+        stop.set()
+        container = self.container_for()
+        result = d.run_session(self.spec(), stop=stop, spawn=container)
+        self.assertEqual((container.runs, result.stopped_by, result.exit_status()), (0, "stopped", 3))
+
+    def test_a_stop_during_a_silent_run_ends_it_and_removes_that_container(self):
+        stop = threading.Event()
+        docker = FakeDocker()
+        container = self.container_for(hang=True, results=())
+        # The stop arrives from another thread, as an orchestrator's would, once the container is up and while Pi says nothing.
+        def spawn(command, stderr_file):
+            process = container(command, stderr_file)
+            threading.Timer(0.2, stop.set).start()
+            return process
+
+        with mock.patch.object(d, "_docker", docker):
+            result = d.run_session(self.spec(), stop=stop, spawn=spawn)
+        self.assertEqual((result.stopped_by, result.exit_status(), result.failures), ("stopped", 3, []))
+        self.assertIsNone(result.exit_code)
+        name = container.command[container.command.index("--name") + 1]
+        self.assertEqual(docker.commands, [("kill", name), ("rm", "--force", name), ("ps", "--all", "--quiet", "--filter", f"name={name}")])
+
+    def test_a_container_that_may_be_left_is_reported_in_the_result(self):
+        stop = threading.Event()
+        container = self.container_for(hang=True, results=())
+        with mock.patch.object(d, "_docker", FakeDocker(listed=99)), mock.patch.object(d, "REMOVE_PAUSE_SECONDS", 0), \
+                contextlib.redirect_stderr(io.StringIO()):
+            result = d.run_session(self.spec(), stop=stop, spawn=container, on_event=lambda e, t: stop.set())
+        self.assertEqual(result.stopped_by, "stopped")
+        self.assertIn("docker ps -a", result.failures[0])
+
+
+class CleanUpTests(unittest.TestCase):
+    def test_the_client_goes_first_then_the_container_is_killed_then_removed(self):
+        order = []
+
+        class Process(FakeProcess):
+            def kill(self):
+                order.append("client")
+                self.stdout.close_stream()
+
+        stop = threading.Event()
+        with tempfile.TemporaryDirectory() as tmp:
+            result = d.run_capped(["docker"], d.CapTracker(10, 30, 600, FakeClock()), spawn=lambda c, e: Process([turn()], hang=True),
+                                  kill_container=lambda: order.append("kill"), remove_container=lambda: order.append("remove"),
+                                  stderr_path=Path(tmp) / "e.log", stop=stop, on_event=lambda e: stop.set())
+        self.assertEqual((order, result.stopped_by), (["client", "kill", "remove"], "stopped"))
+
+    def test_a_clean_run_removes_nothing(self):
+        removed = []
+        process = FakeProcess([event("agent_settled", aborted=False)])
+        with tempfile.TemporaryDirectory() as tmp:
+            d.run_capped(["docker"], d.CapTracker(10, 30, 600, FakeClock()), spawn=lambda c, e: process, kill_container=Recorder(process),
+                         remove_container=lambda: removed.append(True), stderr_path=Path(tmp) / "e.log")
+        self.assertEqual(removed, [])
+
+    def test_an_exit_from_the_containers_own_timeout_is_a_timeout(self):
+        result, _, _ = run([turn()], returncode=d.TIMEOUT_EXIT_CODE)
+        self.assertEqual((result.stopped_by, result.exit_status()), ("timeout", 3))
+
+    def test_a_removal_is_checked_and_retried_until_the_container_is_gone(self):
+        docker, waits = FakeDocker(listed=1), []
+        with mock.patch.object(d, "_docker", docker):
+            self.assertIsNone(d.remove_container("docker", "box", sleep=waits.append))
+        self.assertEqual(([c[0] for c in docker.commands], len(waits)), (["rm", "ps", "rm", "ps"], 1))
+
+    def test_a_docker_that_cannot_say_is_not_taken_as_gone(self):
+        with mock.patch.object(d, "_docker", return_value=None):
+            self.assertIn("box", d.remove_container("docker", "box", sleep=lambda s: None))
+
+
+class PromptFileTests(unittest.TestCase):
+    """A `promptFile` is copied into the container, so where it may come from guards what the container can read."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.folder = Path(self._tmp.name).resolve()
+        self.home = self.folder / "home"
+        self.root = self.folder / "checkout"
+        for sub in ("harness/prompts", "harness/live-tests/prompts", "harness/live-tests/logs"):
+            (self.root / sub).mkdir(parents=True)
+
+    def file(self, relative: str, text: str = "You verify.", under=None) -> Path:
+        path = (under or self.root) / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def problem(self, path: Path):
+        return d.prompt_file_problem(path, self.home, (self.root,))
+
+    def test_a_markdown_file_in_a_prompt_folder_or_outside_the_checkout_is_allowed(self):
+        for path in (self.file("harness/prompts/a.md"), self.file("harness/live-tests/prompts/b.md"),
+                     self.file("mine/c.md", under=self.folder)):
+            self.assertIsNone(self.problem(path), path)
+
+    def test_everything_else_in_the_checkout_is_refused(self):
+        for relative in ("harness/README.md", "harness/live-tests/logs/run.md", "harness/live-tests/logs/db/x.md", "notes.md"):
+            with self.subTest(relative=relative):
+                self.assertIn("not under", self.problem(self.file(relative)))
+
+    def test_a_file_that_is_not_markdown_is_refused_wherever_it_is(self):
+        for path in (self.file("harness/prompts/key.json"), self.file("key.json", under=self.folder)):
+            self.assertEqual(self.problem(path), "is not a .md file")
+
+    def test_the_claude_and_pi_folders_are_refused(self):
+        for sub in (".claude", ".pi"):
+            self.assertEqual(self.problem(self.file(f"{sub}/x.md", under=self.home)), f"is under ~/{sub}")
+
+    def test_dot_dot_and_a_symlink_do_not_get_around_it(self):
+        secret = self.file("harness/live-tests/logs/secret.md", KEY_MARKER)
+        self.assertTrue(self.problem(self.root / "harness" / "prompts" / ".." / "live-tests" / "logs" / "secret.md"))
+        link = self.root / "harness" / "prompts" / "innocent.md"
+        try:
+            link.symlink_to(secret)
+        except OSError as error:
+            self.skipTest(f"cannot create a symlink here: {error}")
+        self.assertTrue(self.problem(link))
+
+    def config(self, prompt_file: str, where: str = "harness/live-tests/configs/c.json") -> Path:
+        return self.file(where, json.dumps({"reviewers": [reviewer(promptFile=prompt_file)]}))
+
+    def test_a_relative_path_is_the_configs_folders_not_the_working_directorys(self):
+        source = self.file("harness/live-tests/prompts/p.md")
+        with mock.patch.object(d, "REPO_ROOT", self.root):
+            converted = d.reviewers_from_config(self.config("../prompts/p.md"))
+        self.assertEqual(converted["reviewers"][0]["promptFile"], str(source))
+
+    def test_a_config_naming_a_refused_prompt_file_is_refused(self):
+        self.file("harness/README.md")
+        with mock.patch.object(d, "REPO_ROOT", self.root), self.assertRaisesRegex(ValueError, "promptFile .* not under"):
+            d.reviewers_from_config(self.config("../../README.md"))
+
+    def test_the_container_gets_a_copy_and_a_path_to_the_copy(self):
+        source = self.file("harness/prompts/p.md", "Reply in lines.")
+        before = {"rubric": [], "reviewers": [reviewer(promptFile=str(source), replyFormat="lines"), reviewer(name="two")]}
+        config_dir = self.folder / "config"
+        config_dir.mkdir()
+        after = d.copy_prompt_files(before, config_dir, (self.root,))
+        self.assertEqual(after["reviewers"][0]["promptFile"], "prompts/0.md")
+        self.assertEqual((config_dir / "prompts" / "0.md").read_text(encoding="utf-8"), "Reply in lines.")
+        self.assertEqual(after["reviewers"][0]["replyFormat"], "lines")  # the per-reviewer choice passes through
+        self.assertEqual(before["reviewers"][0]["promptFile"], str(source))  # the caller's own dict is left alone
+
+    def test_a_session_built_by_hand_is_checked_where_the_copy_is_made(self):
+        for value, message in ((str(self.file("harness/README.md")), "not under"), ("prompts/p.md", "relative"),
+                               (str(self.root / "harness" / "prompts" / "gone.md"), "cannot copy")):
+            with self.subTest(value=value), self.assertRaisesRegex(d.SessionError, message):
+                d.copy_prompt_files({"reviewers": [reviewer(promptFile=value)]}, self.folder, (self.root,))
+
+    def test_a_session_with_a_prompt_file_puts_it_in_the_container(self):
+        with fake_root() as root:
+            source = root / "harness" / "prompts" / "p.md"
+            source.parent.mkdir(parents=True)
+            source.write_text("You review.", encoding="utf-8")
+            spec = d.SessionSpec(model="c", lmstudio_url="http://h:1/v1", checkout=checkout(),
+                                 reviewers={"rubric": [], "reviewers": [reviewer(promptFile=str(source))]})
+            container = FakeContainer([review_call(review_args())])
+            result = d.run_session(spec, spawn=container)
+        self.assertEqual(result.exit_status(), 0, result)
+        self.assertEqual(container.prompt_files, {"0.md": "You review."})
+        self.assertEqual(container.reviewers["reviewers"][0]["promptFile"], "prompts/0.md")
+
+
+class HarnessDatabaseTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self._tmp.cleanup)
+        self.folder = Path(self._tmp.name) / "db"
+
+    def test_it_is_created_with_the_schema_and_no_record(self):
+        path = d.ensure_harness_db(self.folder)
+        with contextlib.closing(sqlite3.connect(path)) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM runs").fetchone(), (0,))
+
+    def test_one_that_is_there_is_not_opened_at_all(self):
+        # A container of another session may be writing it, and the host must then not touch it.
+        self.folder.mkdir()
+        path = self.folder / d.DB_FILE_NAME
+        path.write_bytes(b"not even a database")
+        with mock.patch.object(reviewer_db_lib, "connect", side_effect=AssertionError("it was opened")), \
+                mock.patch.object(d.sqlite3, "connect", side_effect=AssertionError("it was opened")):
+            self.assertEqual(d.ensure_harness_db(self.folder), path)
+        self.assertEqual(path.read_bytes(), b"not even a database")
+
+    def test_one_that_cannot_be_created_is_a_session_error(self):
+        self.folder.write_text("a file where the folder goes", encoding="utf-8")
+        with self.assertRaisesRegex(d.SessionError, "cannot create the harness database"):
+            d.ensure_harness_db(self.folder)
+
+    def test_it_lives_in_a_folder_git_ignores(self):
+        ignored = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8").split()
+        self.assertIn("/".join(d.HARNESS_DB_SUBDIR[:-1]) + "/", ignored)
+
+
+class ReadResultsTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.folder = Path(self._tmp.name) / "results"
+        self.folder.mkdir()
+
+    def test_finished_files_are_read_and_a_temporary_one_is_not(self):
+        (self.folder / "reasoning-1.json").write_text('{"type": "reasoning"}', encoding="utf-8")
+        (self.folder / ".reasoning-2.json.9.ab.tmp").write_text("{half", encoding="utf-8")
+        self.assertEqual(d.read_results(self.folder), ([{"type": "reasoning"}], []))
+
+    def test_a_file_that_cannot_be_read_is_reported(self):
+        (self.folder / "a.json").write_text("{half", encoding="utf-8")
+        (self.folder / "b.json").write_text("[1]", encoding="utf-8")
+        results, problems = d.read_results(self.folder)
+        self.assertEqual((results, len(problems)), ([], 2))
+
+    def test_a_link_in_the_folder_is_not_followed(self):
+        outside = Path(self._tmp.name) / "outside.json"
+        outside.write_text(json.dumps({"type": "reasoning", "secret": KEY_MARKER}), encoding="utf-8")
+        try:
+            (self.folder / "reasoning-1.json").symlink_to(outside)
+        except OSError as error:
+            self.skipTest(f"cannot create a symlink here: {error}")
+        results, problems = d.read_results(self.folder)
+        self.assertEqual((results, len(problems)), ([], 1))
+
+
+class TypeOptionTests(unittest.TestCase):
+    """`--type` and `--findings-file` through `main`."""
+
+    def run_main(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = d.main(["--dry-run", "--model", "m", "--repo", str(checkout()), *argv])
+        return code, out.getvalue(), err.getvalue()
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.findings = Path(self._tmp.name) / "f.json"
+        self.findings.write_text(json.dumps(FINDINGS), encoding="utf-8")
+        self.config = Path(self._tmp.name) / "c.json"
+        self.config.write_text(json.dumps({"reviewers": [reviewer("verifier")]}), encoding="utf-8")
+
+    def test_a_verifier_session_is_printed_with_its_findings_mount_and_prompt(self):
+        code, out, err = self.run_main("--type", "verifier", "--findings-file", str(self.findings), "--config", str(self.config))
+        self.assertEqual(code, 0, err)
+        command = shlex.split(out)
+        self.assertIsNotNone(mount_source(command, d.C_FINDINGS))
+        self.assertIn(f'"findings_file": "{d.C_FINDINGS_FILE}"', command[-1])
+
+    def test_the_flags_that_do_not_go_together_are_usage_errors(self):
+        for argv in (["--type", "verifier"], ["--type", "verifier", "--findings-file", str(self.findings)],
+                     ["--type", "verifier", "--config", str(self.config)], ["--findings-file", str(self.findings)],
+                     ["--type", "classifier", "--findings-file", str(self.findings), "--config", str(self.config)]):
+            with self.subTest(argv=argv):
+                self.assertEqual(self.run_main(*argv)[0], 2)
+
+    def test_a_bad_findings_file_is_refused_before_anything_slow(self):
+        self.findings.write_text('{"nope": 1}', encoding="utf-8")
+        with mock.patch.object(d, "host_model_check", side_effect=AssertionError("the preflight ran first")), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            code = d.main(["--model", "m", "--repo", str(checkout()), "--type", "verifier", "--findings-file", str(self.findings),
+                           "--config", str(self.config)])
+        self.assertEqual(code, 2)
+        self.assertIn("not usable", err.getvalue())
+
+    def test_the_preflight_asks_about_the_caller_and_this_types_reviewers_only(self):
+        self.config.write_text(json.dumps({"reviewers": [reviewer("reasoning"), reviewer("verifier")]}), encoding="utf-8")
+        asked = []
+        with mock.patch.object(d, "host_model_check", side_effect=lambda url, model: asked.append(model) or "stop here"), \
+                contextlib.redirect_stderr(io.StringIO()):
+            d.main(["--model", "m", "--repo", str(checkout()), "--type", "verifier", "--findings-file", str(self.findings),
+                    "--config", str(self.config)])
+        self.assertEqual(asked, ["m"])  # the first problem ends the run
+        asked.clear()
+        with mock.patch.object(d, "host_model_check", side_effect=lambda url, model: asked.append(model)), \
+                mock.patch.object(d, "run_session", side_effect=d.SessionError("not run")), contextlib.redirect_stderr(io.StringIO()):
+            d.main(["--model", "m", "--repo", str(checkout()), "--type", "verifier", "--findings-file", str(self.findings),
+                    "--config", str(self.config)])
+        self.assertEqual(asked, ["m", "verifier-model"])
 
 
 class ModelKnownTests(unittest.TestCase):

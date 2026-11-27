@@ -26,7 +26,7 @@ their fixtures without LM Studio; without it they run the stage.
 
 ## Through Pi, in a container: `pi/`
 
-`pi/pi_driver.py` runs Pi (a coding agent) in a throwaway Docker container, gives it the reviewer's MCP server and asks it to call the `review` tool on a change of the `harness-live-tests` branch (below), so the path a real caller takes is tested and not only the libraries. It caps turns, tool calls and time, and leaves the checkout, `~/.claude` and `~/.pi` untouched. `pi/score_run.py` scores its output against the branch's answer key. See [pi/README.md](pi/README.md).
+`pi/pi_driver.py` runs Pi (a coding agent) in a throwaway Docker container, gives it the reviewer's MCP server and asks it to call the `review` tool on a change of the `harness-live-tests` branch (below), so the path a real caller takes is tested and not only the libraries. One run is one session of one review type (reasoning, verifier or classifier). It caps turns, tool calls and time, leaves `~/.claude` and `~/.pi` untouched, and writes nothing in the checkout except the harness database, `live-tests/logs/db/` (and a `--log` file you ask for). `pi/score_run.py` scores a reasoning run's output against the branch's answer key. `orchestrator/shared_db_check.py` checks that containers can share that database on this machine. See [pi/README.md](pi/README.md).
 
 ## Checks to run: `live-tests/`
 
