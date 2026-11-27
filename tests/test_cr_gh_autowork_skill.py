@@ -756,8 +756,10 @@ class RunLessonsContentRequirements(unittest.TestCase):
         self.assertIn("git push origin HEAD:<branch>", section)
         # Design/ambiguity BLOCKEDs are excluded -- only the round cap qualifies.
         self.assertIn("does **not** apply to a `BLOCKED` for a design question", section)
-        # Model is the orchestrator's call, not hard-coded.
-        self.assertIn("Model choice is the orchestrator's call", section)
+        # The follow-up runs on the agent file's pinned model; another model needs an explicit
+        # `model` on that call, and that model is the one recorded in the metrics.
+        self.assertIn("The follow-up runs on the model pinned in `.claude/agents/autowork-ticket.md`", section)
+        self.assertIn("record that model, not the pinned one, in Step 2b's metrics", section)
 
     def test_continuation_overrides_the_new_pr_assumptions_of_the_review_loop(self):
         # Copilot review round 1: Step 4 starts seen_ids empty, Step 22
@@ -885,6 +887,26 @@ class AutoworkAgentTypeTests(unittest.TestCase):
         self.assertEqual(self.fields["name"], "autowork-ticket")
         self.assertIn('`subagent_type: "autowork-ticket"`, `isolation: "worktree"`', self.content)
 
+    def test_pins_sonnet_5_5_at_max_effort(self):
+        # Without a pinned model the subagent inherits the orchestrating session's model,
+        # so a run started from an Opus session worked every ticket on Opus.
+        self.assertEqual(self.fields["model"], "claude-sonnet-5-5")
+        self.assertEqual(self.fields["effort"], "max")
+        self.assertRegex(self.fields["model"], r"^[A-Za-z0-9._-]+$")
+
+    def test_metrics_step_records_the_pinned_model_not_the_session_default(self):
+        section = _normalized(self.content)
+        self.assertIn("the `model` pinned in `.claude/agents/autowork-ticket.md`", section)
+        self.assertNotIn("the harness default this conversation is itself running as", section)
+        # The BLOCKED follow-up launches the same agent type with no `model`, so it runs on the
+        # pinned model too; the old "Model choice is the orchestrator's call" line said otherwise.
+        self.assertIn("The follow-up runs on the model pinned in `.claude/agents/autowork-ticket.md`", section)
+        self.assertNotIn("Model choice is the orchestrator's call", section)
+        # Copilot review round 1: the fallback passes `model: "sonnet"`, so a
+        # `record_metric` row must not carry the pinned id for a fallback run.
+        self.assertIn("was taken, note `sonnet`, the model that retry passes, instead", section)
+        self.assertIn("record `sonnet`, not the pinned `claude-sonnet-5-5`, as the model in Step 2b's metrics", section)
+
     def test_allow_list_covers_the_basics_the_procedure_uses(self):
         # Bash (git/gh/uv/tests), Read/Edit/Write (files and plans), ToolSearch (the only way
         # to load deferred MCP tools), and cb_indexer_sync_repo (Step 1).
@@ -914,7 +936,9 @@ class AutoworkAgentTypeTests(unittest.TestCase):
     def test_fallback_is_only_for_an_unknown_agent_type(self):
         section = _normalized(self.content)
         self.assertIn("unknown-agent-type error", section)
-        self.assertIn('`subagent_type: "general-purpose"` for this run', section)
+        self.assertIn(
+            '`subagent_type: "general-purpose"`, `model: "sonnet"` and `effort: "max"` for this run', section
+        )
         self.assertIn("Never fall back on any other error", section)
 
     def test_no_other_place_launches_general_purpose(self):
