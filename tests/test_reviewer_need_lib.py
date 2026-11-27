@@ -321,6 +321,12 @@ class Instructions(unittest.TestCase):
         self.assertIn("Do not report a defect you cannot support", text)
         self.assertNotIn('{"need"', text)
 
+    def test_both_menus_say_which_regex_syntax_grep_takes(self):
+        for fmt in ("json", "lines"):
+            self.assertIn("Perl-compatible regular expression", need.need_instructions(("grep",), fmt, "reasoning"), fmt)
+        # Two backslashes in the text the model reads, since one would decode to a backspace.
+        self.assertIn(r'"\\bname\\b"', need.need_instructions(("grep",), "json", "verifier"))
+
     def test_the_menu_shows_only_the_tools_the_reviewer_may_use(self):
         text = need.need_instructions(("grep",), "json", "verifier")
         self.assertIn('grep: "pattern"', text)

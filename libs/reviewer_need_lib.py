@@ -108,8 +108,12 @@ _TOOLS = {
     },
     "grep": {
         "lines": "need: grep <pattern> [-- <path glob>]",
-        "json": 'grep: "pattern" (an extended regular expression), optional "path_glob" (such as "libs/*.py")',
-        "gives": "the lines of the repository that match, as path:line:text",
+        "json": (
+            'grep: "pattern" (a Perl-compatible regular expression; inside JSON write each backslash twice, as in '
+            '"\\\\bname\\\\b"), optional "path_glob" (such as "libs/*.py")'
+        ),
+        # The syntax is said here too: `gives` is the part the `lines` menu shows as well.
+        "gives": "the lines of the repository that match the Perl-compatible regular expression, as path:line:text",
     },
 }
 
