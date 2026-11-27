@@ -902,6 +902,10 @@ class AutoworkAgentTypeTests(unittest.TestCase):
         # pinned model too; the old "Model choice is the orchestrator's call" line said otherwise.
         self.assertIn("The follow-up runs on the model pinned in `.claude/agents/autowork-ticket.md`", section)
         self.assertNotIn("Model choice is the orchestrator's call", section)
+        # Copilot review round 1: the fallback passes `model: "sonnet"`, so a
+        # `record_metric` row must not carry the pinned id for a fallback run.
+        self.assertIn("was taken, note `sonnet`, the model that retry passes, instead", section)
+        self.assertIn("record `sonnet`, not the pinned `claude-sonnet-5-5`, as the model in Step 2b's metrics", section)
 
     def test_allow_list_covers_the_basics_the_procedure_uses(self):
         # Bash (git/gh/uv/tests), Read/Edit/Write (files and plans), ToolSearch (the only way

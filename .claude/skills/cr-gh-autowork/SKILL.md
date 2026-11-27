@@ -62,7 +62,10 @@ Project-scoped to this repo (hardcodes `Donelle/claude-runway`, `.venv`-based te
    a. Before calling, note which model this Agent call will run as (`claude-sonnet-5-5`,
       the `model` pinned in `.claude/agents/autowork-ticket.md`; this call passes no `model`
       of its own, so that file is the one place to change it, and the session's own model
-      never applies) and the current time to the second (e.g. `date +%H%M%S`) — both
+      never applies; if the **Fallback** under "The `autowork-ticket` agent type" was
+      taken, note `sonnet`, the model that retry passes, instead. This note feeds only
+      2b's `record_metric` row: `tools/autowork_cost.py record` reads the model that
+      actually ran from the subagent's transcript) and the current time to the second (e.g. `date +%H%M%S`) — both
       needed for the metrics logging in 2b below, and cheapest to capture right here since
       the orchestrator already knows/can get them at call time. Call the **Agent** tool,
       `subagent_type: "autowork-ticket"`, `isolation: "worktree"`, with the template below
@@ -222,7 +225,7 @@ Every subagent this skill starts uses the agent definition in `.claude/agents/au
 
 The same file pins `model: claude-sonnet-5-5` and `effort: max`. Without them a subagent runs on whatever model and effort the orchestrating session uses, so a run started from an Opus session would work every ticket on Opus, and each ticket's plan, code and review loop is long. What checks a ticket's result is the same with either model: the subagent's own pre-push self-review, the required checks, and Copilot's review with the verify-before-fix loop. The `code-reviewer` and `pr-feedback` agents take no part in an autowork run.
 
-**Fallback.** Claude Code finds agent definitions when a session starts, so a session begun before that file existed (or before an upgrade copied it in) does not know the type, and the `Agent` call fails with an unknown-agent-type error before any work starts. In that case, and only that case, repeat the same call with `subagent_type: "general-purpose"`, `model: "sonnet"` and `effort: "max"` for this run (that type pins no model, so without them the retry would run on the session's model) and tell the user the allow-list was not applied; restarting the session fixes it. Never fall back on any other error.
+**Fallback.** Claude Code finds agent definitions when a session starts, so a session begun before that file existed (or before an upgrade copied it in) does not know the type, and the `Agent` call fails with an unknown-agent-type error before any work starts. In that case, and only that case, repeat the same call with `subagent_type: "general-purpose"`, `model: "sonnet"` and `effort: "max"` for this run (that type pins no model, so without them the retry would run on the session's model), record `sonnet`, not the pinned `claude-sonnet-5-5`, as the model in Step 2b's metrics, and tell the user the allow-list was not applied; restarting the session fixes it. Never fall back on any other error.
 
 ## Subagent Prompt Template
 
