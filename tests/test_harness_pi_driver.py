@@ -2007,6 +2007,46 @@ class PromptFileTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaisesRegex(d.SessionError, message):
                 d.copy_prompt_files({"reviewers": [reviewer(promptFile=value)]}, self.folder, (self.root,))
 
+    def test_something_that_is_not_a_regular_file_is_refused_before_it_is_read(self):
+        folder = self.root / "harness" / "prompts" / "folder.md"
+        folder.mkdir()
+        self.assertEqual(self.problem(folder), "is not a regular file")
+        with self.assertRaisesRegex(d.SessionError, "not a regular file"):
+            d.copy_prompt_files({"reviewers": [reviewer(promptFile=str(folder))]}, self.folder, (self.root,))
+        with self.assertRaisesRegex(ValueError, "not a regular file"):
+            d.reviewers_from_config(folder)  # as the config itself
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "this system has no named pipes in the file system")
+    def test_a_named_pipe_is_refused_and_never_waited_on(self):
+        pipe = self.root / "harness" / "prompts" / "pipe.md"
+        os.mkfifo(pipe)
+        config = self.config("../../prompts/pipe.md")
+
+        def with_the_checkout(config_path):
+            with mock.patch.object(d, "REPO_ROOT", self.root):
+                d.reviewers_from_config(config_path)
+
+        for name, call in (("promptFile in a config", lambda: with_the_checkout(config)),
+                           ("promptFile in a session", lambda: d.copy_prompt_files(
+                               {"reviewers": [reviewer(promptFile=str(pipe))]}, self.folder, (self.root,))),
+                           ("the config", lambda: with_the_checkout(pipe))):
+            with self.subTest(name):
+                raised: list = []
+
+                def run(call=call, raised=raised):
+                    try:
+                        call()
+                    except (ValueError, d.SessionError) as error:
+                        raised.append(str(error))
+
+                # A daemon thread with a limit: a read of the pipe would never return, and must fail this test, not hang it.
+                worker = threading.Thread(target=run, daemon=True)
+                worker.start()
+                worker.join(10)
+                self.assertFalse(worker.is_alive(), "it is waiting on the pipe")
+                self.assertEqual(len(raised), 1)
+                self.assertIn("not a regular file", raised[0])
+
     def test_a_session_with_a_prompt_file_puts_it_in_the_container(self):
         with fake_root() as root:
             source = root / "harness" / "prompts" / "p.md"

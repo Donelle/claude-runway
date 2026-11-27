@@ -16,8 +16,10 @@ What it holds to, as a real run must:
 
 It uses a throwaway folder under `harness/live-tests/logs/`, so the same file sharing as the harness database, and never
 that database itself. A passing folder is deleted; a failing one is kept and named. The folder of a trial that could not be
-made, or was interrupted, is deleted too, since nothing was checked in it. Run it once on each machine whose harness
-database containers will share (it was designed on Windows with Docker Desktop; macOS has to be run too):
+made, or was interrupted, is deleted too, since nothing was checked in it. When a container cannot be confirmed gone, the
+script says so, does not read the database and keeps the folder, which that container may still be using. Run it once on
+each machine whose harness database containers will share (it was designed on Windows with Docker Desktop; macOS has to be
+run too):
 
     .venv/bin/python harness/orchestrator/shared_db_check.py            # .venv/Scripts/python.exe on Windows
 
@@ -139,11 +141,23 @@ def read_back(path: Path) -> tuple:
 
 def run_trial(
     database_dir: Path, *, writers: int, records: int, timeout: int, docker: str, image: str, spawn: Callable = _spawn,
-    remove: Optional[Callable[[str], object]] = None,
+    remove: Optional[Callable[[str], Optional[str]]] = None, unaccounted: Optional[dict] = None,
 ) -> TrialResult:
     """One trial in `database_dir`, which must not hold a database yet. `spawn(command, stderr_file)` returns an object with
-    `wait(timeout)` and `kill()`. Raises CannotRun."""
+    `wait(timeout)` and `kill()`; `remove(name)` removes a container, returning None when it is gone, else what to tell the
+    user. `unaccounted` is filled with the containers not known to be gone, each with what to tell the user. It is empty when
+    every one has ended or been removed, however the trial ends, and while it is not, one may still be writing: the database
+    is not read. Raises CannotRun."""
     remove = remove or (lambda name: pi_driver.remove_container(docker, name))
+    unaccounted = {} if unaccounted is None else unaccounted
+
+    def remove_and_note(name: str) -> None:
+        problem = remove(name)
+        if problem:
+            unaccounted[name] = problem
+        else:
+            unaccounted.pop(name, None)
+
     try:
         # Before any container starts, and closed again at once: the host does not hold it open while they write.
         database = pi_driver.ensure_harness_db(database_dir)
@@ -166,20 +180,23 @@ def run_trial(
                     stderr_file.close()
                     raise
                 running.append((name, process, stderr_file))
+                # Until its client ends or it is removed. Noted now, so that a cleanup that is itself interrupted leaves it here.
+                unaccounted[name] = f"the container {name} was not confirmed gone; check `docker ps -a`"
             for name, process, _stderr in running:
                 try:
                     # The container's own `timeout` fires first; this only covers a docker client that does not end.
                     result.exit_codes.append(process.wait(timeout=timeout + pi_driver.DOCKER_COMMAND_TIMEOUT_SECONDS))
+                    unaccounted.pop(name, None)
                 except subprocess.TimeoutExpired:
                     process.kill()
-                    remove(name)
+                    remove_and_note(name)
                     result.exit_codes.append(None)
         except BaseException:
-            # Ctrl+C or a writer that could not start: no container is left writing into a folder that may be deleted.
+            # Ctrl+C or a writer that could not start: remove every container, so that none is left writing into the folder.
             for name, process, _stderr in running:
                 with contextlib.suppress(OSError):
                     process.kill()
-                remove(name)
+                remove_and_note(name)
                 with contextlib.suppress(subprocess.TimeoutExpired):
                     process.wait(timeout=10)  # Windows keeps a file open until the process that has it is gone
             raise
@@ -191,6 +208,10 @@ def run_trial(
     if any(code in DOCKER_COULD_NOT_RUN for code in result.exit_codes):
         said = result.writer_errors[0] if result.writer_errors else "no message"
         raise CannotRun(f"docker could not run a writer container: {said}")
+    if unaccounted:
+        result.problem = ("the database was not read, since a container may still be writing it: "
+                          + "; ".join(unaccounted.values()))
+        return result
     # Every container has exited, so the host may open the database again.
     try:
         result.saved, result.integrity = read_back(database)
@@ -201,7 +222,9 @@ def run_trial(
 
 def describe(number: int, trials: int, result: TrialResult) -> str:
     exited = sum(1 for code in result.exit_codes if code == 0)
-    text = (f"trial {number}/{trials}: {result.saved} of {result.expected} records saved, integrity {result.integrity or 'unknown'}, "
+    # With no integrity answer the database was never read, so there is no count to report.
+    saved = f"{result.saved} of {result.expected} records saved" if result.integrity else "records not counted"
+    text = (f"trial {number}/{trials}: {saved}, integrity {result.integrity or 'unknown'}, "
             f"{exited} of {len(result.exit_codes)} writers exited 0: {'PASS' if result.passed else 'FAIL'}")
     if result.problem:
         text += f"\n  {result.problem}"
@@ -221,13 +244,19 @@ def _discard(folder: Path) -> None:
 def _trial_in_new_folder(parent: Path, **trial) -> tuple:
     """`(folder, result)` of one trial in a new folder under `parent`; `trial` is what `run_trial` takes. A trial that gives no
     result (it could not be made, or was interrupted, Ctrl+C included) takes its folder with it, since nothing was checked in
-    it. `run_trial` has ended its containers by then."""
+    it. Unless a container could not be confirmed gone: it may have the folder mounted, so the folder is kept and named."""
     parent.mkdir(parents=True, exist_ok=True)
     folder = Path(tempfile.mkdtemp(prefix="db-check-", dir=parent))
+    unaccounted: dict = {}
     try:
-        return folder, run_trial(folder / "db", **trial)
+        return folder, run_trial(folder / "db", unaccounted=unaccounted, **trial)
     except BaseException:
-        _discard(folder)
+        if unaccounted:
+            for said in unaccounted.values():
+                print(f"warning: {said}", file=sys.stderr)
+            print(f"warning: kept {folder}, which a container may still be using", file=sys.stderr)
+        else:
+            _discard(folder)
         raise
 
 

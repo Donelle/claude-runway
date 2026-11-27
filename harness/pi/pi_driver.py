@@ -488,7 +488,15 @@ def prompt_file_problem(source: Path, home: Path, checkouts: tuple) -> Optional[
         if _within(resolved, root) and not any(_within(resolved, root.joinpath(*parts)) for parts in PROMPT_SUBDIRS):
             allowed = " or ".join("/".join(parts) + "/" for parts in PROMPT_SUBDIRS)
             return f"is in the checkout {root} but not under {allowed}"
+    if _is_not_a_regular_file(resolved):
+        return "is not a regular file"
     return None
+
+
+def _is_not_a_regular_file(path: Path) -> bool:
+    """Whether something is at `path` that is not a plain file: asked BEFORE reading, because reading a named pipe waits for a
+    writer, possibly for ever, and a `stop` signal is not watched yet. A missing file is left to whoever reads it."""
+    return path.exists() and not path.is_file()
 
 
 def _container_lacks(reviewers: object, rubric: object, where: str) -> None:
@@ -514,6 +522,8 @@ def reviewers_from_config(path: Path, review_type: str = "reasoning") -> dict:
     to be copied into the container with the session; `translator` and `definitionFile` name files the driver does not copy, so
     a config that uses one is refused rather than run half-configured. The config needs an active reviewer of `review_type`;
     its other reviewers are passed on as they are (choosing among them is the caller's job). Raises ValueError with the reason."""
+    if _is_not_a_regular_file(Path(path)):
+        raise ValueError(f"cannot read {path}: it is not a regular file")
     try:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:

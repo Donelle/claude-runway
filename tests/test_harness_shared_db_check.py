@@ -181,6 +181,105 @@ class TrialTests(Base):
         self.assertEqual(len(removed), 2)
 
 
+SAID = "could not confirm that the container X is gone; check `docker ps -a`"
+
+
+class FakeWriter:
+    """A `docker run` client that ends with 0, or never ends on its own (`hangs`)."""
+
+    def __init__(self, hangs: bool = False) -> None:
+        self.hangs = hangs
+
+    def wait(self, timeout=None):
+        if self.hangs:
+            raise subprocess.TimeoutExpired("docker", timeout or 0)
+        return 0
+
+    def kill(self) -> None:
+        pass
+
+
+def hanging(command, stderr_file):
+    return FakeWriter(hangs=True)
+
+
+def interrupted_at_the_second_writer():
+    """A `spawn` that starts one writer and is interrupted (Ctrl+C) on the way to the next."""
+    started: list = []
+
+    def spawn(command, stderr_file):
+        if started:
+            raise KeyboardInterrupt
+        started.append(command)
+        return FakeWriter()
+
+    return spawn
+
+
+class ContainerThatCannotBeRemovedTests(Base):
+    """While a container may still be writing, the database is not opened and its folder is not deleted."""
+
+    def run_main(self, spawn, removal):
+        """`(exit code or None for Ctrl+C, stdout and stderr, trial folders left)`; every removal answers `removal`."""
+        out, err = io.StringIO(), io.StringIO()
+        logs = self.folder / "logs"
+        with mock.patch.object(check.pi_driver, "remove_container", removal), contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(err):
+            try:
+                code = check.main(["--folder", str(logs), "--writers", "2", "--records", "2", "--trials", "1"], spawn=spawn)
+            except KeyboardInterrupt:
+                code = None
+        return code, out.getvalue() + err.getvalue(), list(logs.iterdir())
+
+    def test_a_timed_out_writer_that_stays_fails_the_trial_without_reading_the_database(self):
+        with mock.patch.object(check, "read_back", side_effect=AssertionError("the database was read")):
+            result = self.trial(hanging, writers=2, remove=lambda name: SAID)
+        self.assertEqual((result.passed, result.exit_codes), (False, [None, None]))
+        self.assertIn("not read", result.problem)
+        self.assertIn(SAID, result.problem)
+        text = check.describe(1, 1, result)
+        self.assertIn("records not counted, integrity unknown", text)
+        self.assertIn("docker ps -a", text)
+
+    def test_a_timed_out_writer_that_is_removed_still_has_the_database_read(self):
+        result = self.trial(hanging, writers=2, remove=lambda name: None)
+        self.assertEqual((result.passed, result.integrity, result.problem), (False, "ok", ""))
+
+    def test_the_command_line_names_the_container_and_keeps_the_folder_after_a_timeout(self):
+        code, said, left = self.run_main(hanging, mock.Mock(return_value=SAID))
+        self.assertEqual((code, len(left)), (1, 1))
+        self.assertIn("docker ps -a", said)
+        self.assertIn(f"kept for inspection: {left[0]}", said)
+
+    def test_an_interrupt_keeps_and_names_the_folder_when_a_container_stays(self):
+        code, said, left = self.run_main(interrupted_at_the_second_writer(), mock.Mock(return_value=SAID))
+        self.assertEqual((code, len(left)), (None, 1))
+        self.assertIn(f"warning: {SAID}", said)
+        self.assertIn(f"kept {left[0]}", said)
+
+    def test_a_second_interrupt_during_the_cleanup_keeps_the_folder(self):
+        code, said, left = self.run_main(interrupted_at_the_second_writer(), mock.Mock(side_effect=KeyboardInterrupt))
+        self.assertEqual((code, len(left)), (None, 1))
+        self.assertIn("docker ps -a", said)
+
+    def test_an_interrupt_deletes_the_folder_when_every_container_is_removed(self):
+        code, said, left = self.run_main(interrupted_at_the_second_writer(), mock.Mock(return_value=None))
+        self.assertEqual((code, left), (None, []))
+        self.assertNotIn("warning", said)
+
+    def test_a_check_that_could_not_run_keeps_the_folder_when_a_container_stays(self):
+        def refused_then_stuck(command, stderr_file):
+            if command[-3] == "0":
+                return FakeWriter(hangs=True)
+            refused = FakeWriter()
+            refused.wait = lambda timeout=None: 125
+            return refused
+
+        code, said, left = self.run_main(refused_then_stuck, mock.Mock(return_value=SAID))
+        self.assertEqual((code, len(left)), (2, 1))
+        self.assertIn(f"warning: {SAID}", said)
+
+
 class MainTests(Base):
     def run_main(self, *argv, spawn=None):
         out, err = io.StringIO(), io.StringIO()
