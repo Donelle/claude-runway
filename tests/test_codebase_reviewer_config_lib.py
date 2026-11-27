@@ -21,6 +21,7 @@ sys.path.insert(0, str(REPO_ROOT / "libs"))
 from codebase_reviewer_config_lib import (  # noqa: E402
     DEFAULT_REPLY_FORMAT,
     LEVELS,
+    MAX_REVIEW_ID_CHARS,
     REPLY_FORMATS,
     ROLES,
     ConfigError,
@@ -446,6 +447,34 @@ class Settings(unittest.TestCase):
         # Whether it is set is checked where the file is loaded, so a caller that
         # wants only the numbers (or doctor reporting a blank value) can read them.
         self.assertEqual(read_settings({}).reviewers_file, "")
+
+
+class ReviewIdAndOutputFolder(unittest.TestCase):
+    """`REVIEW_ID` groups the runs of one review and `REVIEW_OUTPUT_DIR` names the folder results are saved to; both are off by default."""
+
+    def test_both_are_off_when_unset_or_blank(self):
+        for env in ({}, {"REVIEW_ID": "", "REVIEW_OUTPUT_DIR": ""}, {"REVIEW_ID": "  ", "REVIEW_OUTPUT_DIR": " \t "}):
+            with self.subTest(env=env):
+                settings = read_settings(env)
+                self.assertEqual((settings.review_id, settings.results_dir), ("", ""))
+
+    def test_the_values_are_read_without_the_whitespace_around_them(self):
+        settings = read_settings({"REVIEW_ID": " 2026-11-27-all-1 ", "REVIEW_OUTPUT_DIR": " ~/results "})
+        self.assertEqual((settings.review_id, settings.results_dir), ("2026-11-27-all-1", "~/results"))
+
+    def test_the_folder_is_only_read_here_never_checked_so_doctor_touches_no_file_system(self):
+        self.assertEqual(read_settings({"REVIEW_OUTPUT_DIR": "/no/such/folder/anywhere"}).results_dir, "/no/such/folder/anywhere")
+
+    def test_an_id_that_is_not_printable_text_or_is_too_long_is_an_error_with_the_other_bad_settings(self):
+        for bad in ("two\nlines", "tab\there", "bell\a", "x" * (MAX_REVIEW_ID_CHARS + 1)):
+            with self.subTest(review_id=bad[:12]):
+                with self.assertRaises(ConfigError) as ctx:
+                    read_settings({"REVIEW_ID": bad, "MAX_REVIEWERS": "many"})
+                self.assertEqual(len(ctx.exception.problems), 2)
+                self.assertIn("REVIEW_ID must be printable text of at most 200 characters", str(ctx.exception))
+
+    def test_an_id_of_the_longest_allowed_length_is_accepted(self):
+        self.assertEqual(read_settings({"REVIEW_ID": "x" * MAX_REVIEW_ID_CHARS}).review_id, "x" * MAX_REVIEW_ID_CHARS)
 
 
 class PromptSources(unittest.TestCase):

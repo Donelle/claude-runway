@@ -44,6 +44,7 @@ from reasoning_reviewer_lib import (
     MIN_QUOTE_CHARS,
     Finding,
     ReasoningReview,
+    ReplyCount,
     ReviewError,
     _extract_json,
     chunk_chars_for,
@@ -115,6 +116,13 @@ class VerificationReview:
     errors: list = field(default_factory=list)
     warnings: list = field(default_factory=list)
     verifiers_run: list = field(default_factory=list)
+    # The scheduler's outcome for every verifier that was asked, in the order they ran (`ReviewerOutcome`: the verifier, its
+    # `VerifierResult` or the error that stopped it). `verified` holds each finding's combined outcome; this keeps each verifier's own
+    # decisions, which the structured results file saves so that a process can combine several verifiers' results itself.
+    outcomes: list = field(default_factory=list)
+    # True when the verifier stage did not run in this review: the statuses in `verified` came with the findings the caller supplied
+    # (a findings file given to the classifier stage), so the result must not say that no verifier looked at them.
+    supplied: bool = False
 
     def with_status(self, status: str) -> list:
         return [v for v in self.verified if v.status == status]
@@ -458,6 +466,7 @@ class VerifierResult:
     warnings: list = field(default_factory=list)
     # Positions of the findings it kept asking about after the round limit, and so gave no answer on.
     limit_hit: set = field(default_factory=set)
+    counts: ReplyCount = field(default_factory=ReplyCount)
 
 
 def _failure_text() -> str:
@@ -509,6 +518,7 @@ def _verify_one(
                 reviewer=reviewer.name, role="verifier", model=reviewer.model, subject=("finding", index + 1),
                 prompt_chars=len(system) + len(message), reply_format="json", translator=None, prompt_hash=prompt_hash,
             ) as req:
+                result.counts.requests += 1
                 reply = complete(client, reviewer.model, system, message)
                 finish_request(req, reply)
                 if reply is None:
@@ -517,6 +527,7 @@ def _verify_one(
                     result.problems.append(f"reviewer {reviewer.name!r}: finding {index + 1}/{len(findings)}: {last_failure}")
                     req.problem(last_failure)
                     continue
+                result.counts.replies += 1
                 if session is not None:
                     outcome = session.read(reply, req)
                     if outcome == ASKED:
@@ -537,6 +548,7 @@ def _verify_one(
                     req.note(f"{decision.verdict}: {decision.reasoning}" if decision.reasoning else decision.verdict, detail=tuple(detail))
                     result.decisions[index] = decision
                 elif problem is not None:
+                    result.counts.unreadable += 1
                     result.problems.append(f"finding {index + 1}/{len(findings)}: {problem}")
                     req.problem(problem)
         if session is not None:
@@ -601,6 +613,7 @@ def verify_step(
         return _verify_one(reviewer, checked, read, client, complete_fn, recorder, executor)
 
     report = run_stages(config, loader, run_verifier, max_reviewers, roles=("verifier",), recorder=recorder)
+    review.outcomes = list(report.outcomes)
     review.warnings.extend(report.warnings)
     answers: dict = {index: [] for index in range(len(checked))}
     gave_up: set = set()  # positions of findings some verifier kept asking about after the round limit

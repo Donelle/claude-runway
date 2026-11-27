@@ -554,6 +554,45 @@ class VerifyFindings(unittest.TestCase):
             verify_findings(config, ModelLoader(BASE, http=FakeLmStudio(loaded=())), object(), [fnd()], reader(self.FILES), 3, complete=stub)
         self.assertEqual(stub.calls, [])
 
+    def _counts(self, result):
+        return {o.reviewer.name: (o.value.counts.requests, o.value.counts.replies, o.value.counts.readable) for o in result.outcomes
+                if o.error is None}
+
+    def test_a_verifiers_requests_replies_and_readable_replies_are_counted(self):
+        findings = [fnd(claim="readable"), fnd(claim="garbled"), fnd(claim="no reply"), fnd(claim="unaccepted")]
+
+        def replies(model, system, content):
+            if "Claim: garbled" in content:
+                return "this is no JSON"
+            if "Claim: no reply" in content:
+                return None
+            if "Claim: unaccepted" in content:
+                return verdict("confirmed", failing="")  # a confirmation without a failing input is not accepted
+            return verdict()
+
+        result, _, _ = self._verify(cfg(rv("v1", "model-a")), replies, findings)
+        self.assertEqual(self._counts(result), {"v1": (4, 3, 1)})
+        self.assertEqual(len(result.outcomes[0].value.decisions), 1)
+
+    def test_a_verifier_that_answered_nothing_readable_is_told_apart_from_one_that_rejected_everything(self):
+        result, _, _ = self._verify(cfg(rv("quiet", "model-a"), rv("garbled", "model-b")),
+                                    lambda model, *a: verdict("rejected", "", "", "fine") if model == "model-a" else "not json", [fnd()])
+        self.assertEqual(self._counts(result), {"quiet": (1, 1, 1), "garbled": (1, 1, 0)})
+
+    def test_every_verifier_that_was_asked_is_kept_with_its_own_result_or_its_error(self):
+        def replies(model, system, content):
+            return None if model == "model-a" else verdict("confirmed")
+
+        result, _, _ = self._verify(cfg(rv("v1", "model-a"), rv("v2", "model-b")), replies, [fnd()])
+        self.assertEqual([(o.reviewer.name, o.error is None) for o in result.outcomes], [("v1", False), ("v2", True)])
+        self.assertIn("every request failed", result.outcomes[0].error)
+        self.assertEqual({0: "confirmed"}, {n: d.verdict for n, d in result.outcomes[1].value.decisions.items()})
+        # Without a verifier there is nothing to keep, and without a grounded finding nothing was asked.
+        none_active, _, _ = self._verify(cfg(rv("r", roles=("reasoning",))), replies, [fnd()])
+        self.assertEqual(none_active.outcomes, [])
+        nothing_grounded, _, _ = self._verify(cfg(rv("v1", "model-a")), replies, [fnd(quote="not in the file")])
+        self.assertEqual(nothing_grounded.outcomes, [])
+
 
 class RunVerifiedReview(unittest.TestCase):
     DIFF = (

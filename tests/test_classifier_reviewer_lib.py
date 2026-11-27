@@ -611,5 +611,44 @@ class EveryRequestFails(unittest.TestCase):
         self.assertTrue(any("'c1'" in e and "every request failed" in e for e in review.errors))
 
 
+class RepliesCounted(unittest.TestCase):
+    """How many requests a classifier sent, how many got a reply and how many of those it could read: a request that got no
+    reply at all (a timeout, a refusal) is told apart from a reply that was no yes or no (a model without token probabilities)."""
+
+    def counts(self, values, findings=None, reviewers=None):
+        review = classify_findings(cfg(*(reviewers or [rv("c1")])), ModelLoader(BASE, http=FakeLmStudio(loaded=["model-a", "model-b"])), object(),
+                                   findings or [fnd()], 1, probability=StubProbability(values))
+        return review, {o.reviewer.name: (o.value.counts.requests, o.value.counts.replies, o.value.counts.readable)
+                        for o in review.outcomes if o.error is None}
+
+    def test_every_request_that_got_a_probability_is_a_readable_reply(self):
+        review, counts = self.counts(probs(injection=0.9))
+        self.assertEqual(counts, {"c1": (len(RUBRIC), len(RUBRIC), len(RUBRIC))})
+        self.assertEqual(sorted(review.outcomes[0].value.answers), [0])
+
+    def test_a_request_with_no_reply_is_not_a_reply_and_a_reply_that_is_no_yes_or_no_is_not_readable(self):
+        def values(model, system, content):
+            entry = entry_of(content)
+            if entry == "crash":
+                return None  # no failure kind recorded: the request got no reply at all
+            if entry == "wrong-result":
+                openai_lib._failure_state.kind = "no_probabilities"  # a reply came back, with nothing the reader can use
+            if entry == "style":
+                openai_lib._failure_state.kind = "no_answer"
+            return None if entry in ("wrong-result", "style") else 0.9
+
+        review, counts = self.counts(values)
+        # Four rubric entries: one answered, one with no reply, two replies that could not be read.
+        self.assertEqual(counts, {"c1": (4, 3, 1)})
+        self.assertEqual(review.outcomes[0].value.answers, {})  # an answer needs a probability for every entry
+
+    def test_a_classifier_that_failed_has_an_error_and_every_asked_classifier_is_kept(self):
+        review, counts = self.counts(lambda model, system, content: None if model == "model-a" else 0.9,
+                                     reviewers=[rv("c1", "model-a"), rv("c2", "model-b")])
+        self.assertEqual(counts, {"c2": (4, 4, 4)})
+        self.assertEqual([(o.reviewer.name, o.error is None) for o in review.outcomes], [("c1", False), ("c2", True)])
+        self.assertIn("every request failed", review.outcomes[0].error)
+
+
 if __name__ == "__main__":
     unittest.main()

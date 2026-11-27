@@ -12,7 +12,9 @@ a check that each finding's quoted code is really in the file, then the verifier
 reviewers confirming or rejecting what is left) and "classifier" (the same again,
 then the classifier reviewers matching each finding that stands to the rubric).
 Each stage is its own type on the same tool, so its schema stays one entry however
-many stages exist. `review_report` reads the database every review run
+many stages exist. The "verifier" and "classifier" types can instead run alone on
+findings read from a findings file (`findings_file` in `params`), and a review can save its
+complete results as a file (see REVIEW_OUTPUT_DIR below). `review_report` reads the database every review run
 writes (libs/reviewer_db_lib.py): response time per model, review time per model
 combination, and which combinations finish under a target time.
 
@@ -41,6 +43,15 @@ Configuration (the server's `env` block in .mcp.json):
                       This server's own database of review runs (default
                       ~/.claude/claude-runway/codebase-reviewer.db); its per-run
                       logs go in a codebase-reviewer-logs folder beside it.
+  REVIEW_ID           Optional, unset by default. An ID that groups the runs of one
+                      review (a harness that runs each reviewer in its own session
+                      sets the same one for all of them). It is stored in the run
+                      record's `settings` and named in the results file.
+  REVIEW_OUTPUT_DIR   Optional, unset by default. A folder: each review also saves
+                      its complete structured results there, one file per review
+                      (libs/reviewer_files_lib.py). The caller never sees the
+                      file or its name. A folder that cannot be used refuses the
+                      review before any model runs.
 
 Model loading is in libs/lmstudio_model_loader_lib.py, scheduling in
 libs/reviewer_scheduler_lib.py.
@@ -71,7 +82,8 @@ from lmstudio_client import DEFAULT_BASE_URL, LMStudioClient, build_client
 from lmstudio_model_loader_lib import ModelLoader, ModelLoadError, reviewer_api_url
 from reasoning_reviewer_lib import ReviewError
 from reviewer_db_lib import RunRecorder, new_run_recorder
-from reviewer_orchestrator_lib import RulesPolicy, RunState, run_orchestrated
+from reviewer_files_lib import prepare_results_folder, read_findings_file, write_results
+from reviewer_orchestrator_lib import RulesPolicy, RunState, results_of, run_orchestrated, supply_findings
 from reviewer_report_lib import ReportError, report as reviewer_report
 from reviewer_scheduler_lib import describe_plan, plan_stages
 
@@ -224,8 +236,12 @@ def _recorder_for(review_type: str, values: dict) -> RunRecorder:
 
 def _configured(recorder: RunRecorder) -> tuple:
     """`(settings, reviewers config)` for one review, read inside its recorded body (a ConfigError is then
-    recorded as refused). The setting that changes the cost is added to the run's record."""
+    recorded as refused). The setting that changes the cost is added to the run's record, and so is the review ID
+    when one is set (`REVIEW_ID`: the record then says which review the run belongs to)."""
     settings = read_settings(os.environ)
+    # Before the reviewers file is read, so a run refused by a bad reviewers file still carries its review ID.
+    if settings.review_id:
+        recorder.settings["review_id"] = settings.review_id
     config = load_reviewers_file(settings.reviewers_file)
     recorder.settings["max_reviewers"] = settings.max_reviewers
     return settings, config
@@ -248,14 +264,34 @@ def _recorded(recorder: RunRecorder, body: Callable[[], str]) -> str:
     return text
 
 
+def _save_results(folder: Path, state: RunState, review_type: str, recorder: RunRecorder, review_id: str) -> str:
+    """Writes a finished run's structured results into `folder`; `""` when it did, else the note to add to the result text.
+
+    Never raises: the review has finished and its findings are in the text, so a results file that cannot be written (a full disk, a
+    value JSON cannot hold) must not lose them. The note names the kind of failure and not the file: the calling model never handles it."""
+    try:
+        write_results(folder, results_of(state, review_type=review_type, run_id=recorder.run_id, review_id=review_id))
+    except Exception as exc:
+        print(f"codebase-reviewer: could not write the results file ({type(exc).__name__}: {exc})", file=sys.stderr)
+        return f"\n\nNote: the structured results could not be saved ({type(exc).__name__}); the findings above are complete."
+    return ""
+
+
 def _run_review(review_type: str, values: dict) -> str:
     """One review of any type, run by the orchestrator with the rules policy (today's order for the type). The head
     commit is pinned for EVERY type, so the diff and every later read of a cited file see the same code even when `HEAD`
-    or a branch moves during a run that takes minutes."""
+    or a branch moves during a run that takes minutes.
+
+    With `findings_file` (the verifier and classifier types) the review starts from the findings in that file and only the type's
+    own stage runs (`supply_findings`). With `REVIEW_OUTPUT_DIR` set, the finished review's structured results are saved there."""
     recorder = _recorder_for(review_type, values)
 
     def body() -> str:
         settings, config = _configured(recorder)
+        # Both are checked before git or any model runs, so a results folder or a findings file that cannot be used refuses the
+        # review at once, instead of after minutes of model time.
+        folder = prepare_results_folder(settings.results_dir) if settings.results_dir else None
+        supplied = read_findings_file(values["findings_file"], review_type) if "findings_file" in values else None
         head = _resolve_commit(values["repo_path"], values["head_ref"])
         diff = _git_diff(values["repo_path"], values["base_ref"], head, values["context_lines"])
         state = RunState(
@@ -271,7 +307,12 @@ def _run_review(review_type: str, values: dict) -> str:
             probability_client=new_probability_client() if review_type == "classifier" else None,
             recorder=recorder,
         )
-        return run_orchestrated(state, RulesPolicy(review_type))
+        if supplied is not None:
+            supply_findings(state, supplied, review_type)
+        text = run_orchestrated(state, RulesPolicy(review_type))
+        if folder is not None:
+            text += _save_results(folder, state, review_type, recorder, settings.review_id)
+        return text
 
     return _recorded(recorder, body)
 
@@ -298,6 +339,19 @@ DIFF_PARAMS = (
     Param("pr", int, "the pull request number being reviewed, recorded with the run's timing so it can be joined to PR metrics", minimum=1),
 )
 
+# The one key only the verifier and classifier types take: the path of a findings file. The caller passes the path and never the
+# findings (it would have to retype them, and the text a review returns leaves out the quote that grounding needs).
+FINDINGS_FILE_FOR_VERIFIER = Param(
+    "findings_file", str,
+    "path of a findings file: only the verifier stage runs, on the findings in it and with no reasoning stage (grounding, then the "
+    "verifiers); chunk_chars then has no effect",
+)
+FINDINGS_FILE_FOR_CLASSIFIER = Param(
+    "findings_file", str,
+    "path of a findings file of findings that already stand after verification, each with its verification status: only the "
+    "classifier stage runs, on those, with no reasoning or verifier stage; chunk_chars then has no effect",
+)
+
 REVIEW_TYPES = {
     "reasoning": ReviewType(
         summary=(
@@ -313,9 +367,10 @@ REVIEW_TYPES = {
             "file (ungrounded), then has every active verifier reviewer confirm each remaining finding with a concrete failing "
             "input or reject it. Returns the confirmed findings, the disputed ones (verifiers disagreed, with each one's "
             "reasoning), the unchecked ones, and one line each for what was dropped. With no verifier active the findings are "
-            "grounded but not verified, and the result says so."
+            "grounded but not verified, and the result says so. With findings_file the reasoning stage does not run: the "
+            "findings are read from that file and only grounding and verification run."
         ),
-        params=DIFF_PARAMS,
+        params=DIFF_PARAMS + (FINDINGS_FILE_FOR_VERIFIER,),
         run=_run_verifier,
     ),
     "classifier": ReviewType(
@@ -327,9 +382,10 @@ REVIEW_TYPES = {
             "a finding that fits several entries takes the highest level; one that matches no entry is dropped as unclassified. "
             "Returns the findings grouped by class with entry, level and average probability, the findings with no rubric level, "
             "and one line each for what was dropped. With no classifier active the findings carry no rubric level, and the result "
-            "says so."
+            "says so. With findings_file the reasoning and verifier stages do not run: the findings are read from that file, each "
+            "with the status the verifiers gave it, and only classification runs."
         ),
-        params=DIFF_PARAMS,
+        params=DIFF_PARAMS + (FINDINGS_FILE_FOR_CLASSIFIER,),
         run=_run_classifier,
     ),
 }
@@ -396,7 +452,9 @@ def review(type: str, params: Optional[dict] = None) -> str:
         reasoning is shown), what was left unchecked, and one line each for what
         was dropped. Use it instead of "reasoning" when verifier reviewers are
         configured; with none active the findings are grounded but not verified,
-        and the result says so.
+        and the result says so. With findings_file the reasoning stage does not
+        run: the findings are read from that file, and only grounding and
+        verification run.
       "classifier": the verifier review, then every active classifier reviewer
         checks each finding that was not rejected against every entry of the
         user's rubric (does it fall under the entry's definition?), as the
@@ -407,7 +465,10 @@ def review(type: str, params: Optional[dict] = None) -> str:
         grouped by class with the entry, level and average probability, and one
         line each for what was dropped. Use it instead of
         "verifier" when classifier reviewers are configured; with none active the
-        findings carry no rubric level, and the result says so.
+        findings carry no rubric level, and the result says so. With findings_file
+        the reasoning and verifier stages do not run: the findings are read from
+        that file, each with the status the verifiers gave it, and only
+        classification runs.
     params: that type's arguments, as a dict.
       "reasoning", "verifier" and "classifier": repo_path (str, required), base_ref (str,
         required, e.g. "origin/main"), head_ref (str, default "HEAD"),
@@ -415,6 +476,9 @@ def review(type: str, params: Optional[dict] = None) -> str:
         change), chunk_chars (int, optional: characters of diff per request; the
         default comes from each reviewer's contextLength), pr (int, optional: the
         pull request number, recorded with the run's timing).
+      "verifier" and "classifier" also take findings_file (str, optional): the PATH
+        of a findings file, never the findings themselves. Without it the type runs
+        every stage up to its own, as above. chunk_chars has no effect with it.
 
     Call it with an empty params to get the keys, defaults and an example for a
     type. An unknown type, unknown or missing keys and wrong types come back as

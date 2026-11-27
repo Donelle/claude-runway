@@ -5,8 +5,8 @@ the next step and a loop that enforces what no policy may break.
 Why it exists. Before this module the pipeline was fixed code: `run_classified_review` called `run_verified_review`,
 which called `run_reasoning_review`, so nothing chose the next step at run time. Splitting the stages out as steps that
 read and update one `RunState` lets a policy (rules in code first, a local model later) pick the next action, while the
-loop, not the policy, keeps the invariants. This module changes no behaviour: `RulesPolicy` reproduces today's order
-for each review type, and every step calls the same stage functions the `run_*` wrappers call.
+loop, not the policy, keeps the invariants. With nothing supplied (below) this module changes no behaviour: `RulesPolicy`
+reproduces today's order for each review type, and every step calls the same stage functions the `run_*` wrappers call.
 
 What is here:
 
@@ -26,6 +26,12 @@ Invariants the loop enforces (an action that breaks one is recorded and replaced
   * a step cap per run (`MAX_STEPS`); at the cap the run ends with a note in the result.
   * the run always finishes and the recorder always closes, also when a step raises (the exception propagates
     unchanged after the close, so the `review` tool's `Error:` text is the same as before).
+
+A run can also start from findings the caller supplied (a findings file, `libs/reviewer_files_lib.py`) instead of from the reasoning
+stage: `supply_findings` fills the state in as if the steps before the requested stage had run and lists them in `RunState.supplied`.
+The rules policy then skips them, and the loop counts them as done where a step needs one before it, so `verifier` runs only
+`ground` and `verify`, and `classifier` only `classify`. `results_of` turns a finished run into the structured results the server
+saves when it is asked to.
 
 Standard library only, apart from the sibling libs. The model clients are passed in, so tests run with stubs.
 """
@@ -53,6 +59,14 @@ from reasoning_reviewer_lib import (
 )
 import verifier_reviewer_lib
 from reviewer_db_lib import NULL_RECORDER
+from reviewer_files_lib import (
+    RESULTS_VERSION,
+    FindingsInput,
+    classifier_section,
+    reasoning_section,
+    supplied_reasoning,
+    verifier_section,
+)
 from reviewer_tools_lib import ToolExecutor
 from verifier_reviewer_lib import (
     UNCHECKED,
@@ -122,6 +136,10 @@ class RunState:
     # The tool executor reviewers with `tools` ask for lookups through. Built once, on first use, from `repo_root` and
     # `head` and only when an active reviewer has `tools`, so a run with none never starts one; a test may set it to a stub.
     executor: object = None
+    # The steps whose result the caller supplied instead of running them (a findings file; `supply_findings` sets it with what
+    # those steps would have produced). The rules policy skips them, `refusal` counts them as done where a step needs one before it,
+    # and they are never in `done`, which lists only the steps that really ran.
+    supplied: tuple = ()
 
     # What the steps produce.
     reasoning: Optional[ReasoningReview] = None
@@ -208,6 +226,8 @@ def finish(state: RunState, action: Action) -> None:
             verified=[Verified(f, UNCHECKED, note="the run ended before the verifiers were asked") for f in state.grounded],
             ungrounded=state.ungrounded,
         )
+        # Kept on the state, so the structured results hold what grounding decided too.
+        state.verification = verification
     # Warnings go on the last result that exists, where the formatter for that kind of review reads them.
     (classification or verification or reasoning).warnings.extend(state.notes)
     if verification is not None and classification is not None:
@@ -220,7 +240,9 @@ def finish(state: RunState, action: Action) -> None:
     if verification is not None:
         counts["confirmed"] = len(verification.confirmed)
     state.recorder.set_counts(**counts)
-    state.recorder.set_sizes(len(state.diff), len(text))
+    # The savings record compares the diff the local models read with what comes back. A run that started from supplied findings
+    # never sent the diff to a model (it was cut only to name the files of the change), so it claims no saving.
+    state.recorder.set_sizes(len(state.diff) if REASON in state.done else None, len(text))
     state.recorder.set_result_text(text)
     state.result = text
 
@@ -243,7 +265,8 @@ _RULES: dict = {
 
 class RulesPolicy(Policy):
     """Today's order for a review type: `reasoning` is reason; `verifier` is reason, ground, verify; `classifier` is
-    reason, ground, verify, classify; each then `finish`."""
+    reason, ground, verify, classify; each then `finish`. A step whose result the caller supplied (`RunState.supplied`) is
+    skipped."""
 
     def __init__(self, review_type: str):
         if review_type not in _RULES:
@@ -254,7 +277,7 @@ class RulesPolicy(Policy):
     @override
     def next_action(self, state: RunState) -> Action:
         for name in self.plan:
-            if name not in state.done:
+            if name not in state.done and name not in state.supplied:
                 return Action(name)
         return Action(FINISH)
 
@@ -294,9 +317,11 @@ def refusal(state: RunState, action: object) -> Optional[str]:
         return f"unknown action {name!r} (steps: {', '.join(STEPS)}, or {FINISH})"
     if name in state.done:
         return f"{name} already ran; each step runs at most once"
+    if name in state.supplied:
+        return f"{name} is not run: its result came with the findings the caller supplied"
     if name in _NEEDS:
         needed, why = _NEEDS[name]
-        if needed not in state.done:
+        if needed not in state.done and needed not in state.supplied:
             return f"{name} before {needed} is not allowed: {why}"
     if action.targets is None:
         return None
@@ -312,7 +337,9 @@ def refusal(state: RunState, action: object) -> Optional[str]:
 
 
 def _drive(state: RunState, policy: Policy, max_steps: int) -> str:
-    for role in getattr(policy, "preflight_roles", ()):
+    # The preflight exists to report a model that is not loaded before minutes of reasoning. A run that starts from supplied findings
+    # has no reasoning to wait for, and the stage that does run checks its own resident models (`run_stages`) before any request.
+    for role in () if REASON in state.supplied else getattr(policy, "preflight_roles", ()):
         preflight_models(state.config, state.loader, (role,))
     steps = 0
     while True:
@@ -354,6 +381,55 @@ def run_orchestrated(state: RunState, policy: Policy, *, max_steps: int = MAX_ST
     return text
 
 
+# ---------------------------------------------------------------------------
+# Starting from supplied findings, and saving the results
+# ---------------------------------------------------------------------------
+
+# The steps whose results a findings file supplies, for each review type that accepts one: the file stands in for everything before
+# the stage the type is named after (the verifier's own grounding is part of that stage: it needs the repository, not a model).
+_SUPPLIED_BY_FINDINGS = {"verifier": (REASON,), "classifier": (REASON, GROUND, VERIFY)}
+
+
+def supply_findings(state: RunState, supplied: FindingsInput, review_type: str) -> None:
+    """Starts `state` from the findings the caller supplied (a findings file) instead of from the stages before `review_type`'s own,
+    so the type's own stage runs alone: `verifier` takes the findings in place of the reasoning stage's (grounding and the verifiers
+    still run), `classifier` takes them as findings that already stand after verification, each with the status the verifier gave it.
+
+    What the skipped steps would have left behind is filled in: the findings, a `ReasoningReview` that says where they came from (it
+    is what the result text's header and the recorded counts read) and, for the classifier, a `VerificationReview` of the supplied
+    statuses. The findings are used as given: nothing is merged, corrected or dropped here. Raises `ValueError` for a review type that
+    takes no findings file (`reasoning` has no earlier stage to replace)."""
+    if review_type not in _SUPPLIED_BY_FINDINGS:
+        raise ValueError(f"a {review_type!r} review takes no findings file; the types that do: {', '.join(_SUPPLIED_BY_FINDINGS)}")
+    findings = list(supplied.findings)
+    state.supplied = _SUPPLIED_BY_FINDINGS[review_type]
+    state.findings = findings
+    state.reasoning = supplied_reasoning(findings, review_type)
+    if review_type == "classifier":
+        state.verification = VerificationReview(
+            verified=[Verified(finding, status) for finding, status in zip(findings, supplied.statuses, strict=True)], supplied=True
+        )
+
+
+def results_of(state: RunState, *, review_type: str, run_id: str, review_id: str = "") -> dict:
+    """The structured results of a finished run, as the server saves them (see `libs/reviewer_files_lib.py` for what each section
+    holds): which review it was (`type`, `run_id`, and the `review_id` that groups the runs of one review when one is set), the commit
+    it read (`head`), the steps that ran, and one section for each stage that really ran in it. A stage whose result was supplied
+    has no section: its findings are the input, not something this run produced."""
+    results: dict = {"version": RESULTS_VERSION, "type": review_type, "run_id": run_id}
+    if review_id:
+        results["review_id"] = review_id
+    results["head"] = state.head
+    results["steps"] = list(state.done)
+    if REASON in state.done and state.reasoning is not None:
+        results["reasoning"] = reasoning_section(state.reasoning)
+    if (GROUND in state.done or VERIFY in state.done) and state.verification is not None:
+        results["verifier"] = verifier_section(state.verification)
+    if CLASSIFY in state.done and state.classification is not None:
+        results["classifier"] = classifier_section(state.classification)
+    return results
+
+
 __all__ = [
     "MAX_STEPS",
     "REASON",
@@ -372,5 +448,7 @@ __all__ = [
     "classify",
     "finish",
     "refusal",
+    "supply_findings",
+    "results_of",
     "run_orchestrated",
 ]

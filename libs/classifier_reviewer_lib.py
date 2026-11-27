@@ -41,6 +41,7 @@ from codebase_reviewer_config_lib import LEVELS, Reviewer, ReviewersConfig, Rubr
 from lmstudio_model_loader_lib import ModelLoader
 from reasoning_reviewer_lib import (
     Finding,
+    ReplyCount,
     ReviewError,
     chunk_chars_for,
     describe_finding,
@@ -128,6 +129,10 @@ class ClassificationReview:
     errors: list = field(default_factory=list)
     warnings: list = field(default_factory=list)
     classifiers_run: list = field(default_factory=list)
+    # The scheduler's outcome for every classifier that was asked, in the order they ran (`ReviewerOutcome`: the classifier, its
+    # `ClassifierResult` or the error that stopped it). `classified` holds each finding's combined outcome; this keeps each classifier's
+    # own probabilities, which the structured results file saves so that a process can average several classifiers' results itself.
+    outcomes: list = field(default_factory=list)
 
     def with_status(self, status: str) -> list:
         return [c for c in self.classified if c.status == status]
@@ -260,6 +265,12 @@ class ClassifierResult:
     reviewer: str
     answers: dict = field(default_factory=dict)
     problems: list = field(default_factory=list)
+    counts: ReplyCount = field(default_factory=ReplyCount)
+
+
+# The failure kinds (`openai_lib.take_failure`) of a request that DID get a reply which the reader then could not use. Every other
+# failure (a timeout, a refusal, a connection that never opened) is a request with no reply at all.
+_UNREADABLE_REPLY_KINDS = ("no_probabilities", "no_answer")
 
 
 def _failure_text(model: str) -> tuple:
@@ -318,6 +329,7 @@ def _classify_one(
         for entry in rubric:
             message = build_classifier_message(finding, entry)
             requests += 1
+            result.counts.requests += 1
             with recorder.request(
                 reviewer=reviewer.name, role="classifier", model=reviewer.model, subject=("finding", index + 1),
                 prompt_chars=len(system) + len(message), reply_format="probability", translator=None, prompt_hash=prompt_hash,
@@ -326,11 +338,16 @@ def _classify_one(
                 finish_request(req, None if value is None else _probability(value))
                 if value is None:
                     failed += 1
+                    # Read before `_failure_text` takes (and so clears) the failure's kind.
+                    if openai_lib.peek_failure()[0] in _UNREADABLE_REPLY_KINDS:
+                        result.counts.replies += 1
+                        result.counts.unreadable += 1
                     last_failure, recorded, withheld = _failure_text(reviewer.model)
                     recorder.withhold(withheld)
                     missing.append(entry.name)
                     req.problem(recorded)
                     continue
+                result.counts.replies += 1
                 req.note(f"{entry.name} {_probability(value)}", detail=tuple(describe_finding(finding)))
                 ratings.append(Rating(entry.name, value))
         if missing:
@@ -413,6 +430,7 @@ def classify_findings(
             return _classify_one(reviewer, checked, rubric, probability_client or client, probability_fn, recorder)
 
         report = run_stages(config, loader, run_classifier, max_reviewers, roles=("classifier",), recorder=recorder)
+        review.outcomes = list(report.outcomes)
         review.warnings.extend(report.warnings)
         answers: dict = {index: [] for index in range(len(checked))}
         for outcome in report.outcomes:
@@ -542,6 +560,8 @@ def format_classified_review(result: ClassifiedReview) -> str:
         lines.append("No classifier ran.")
     if verification.verifiers_run:
         lines.append(f"Verifiers: {', '.join(verification.verifiers_run)}.")
+    elif verification.supplied:
+        lines.append("Each finding's verification status is the one its findings file gave: no verifier ran in this review.")
     elif verification.verified:
         lines.append("No verifier ran, so the findings are grounded (the code each one quotes is in the file) but not verified.")
     matched = _ordered(review.matched)
