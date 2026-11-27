@@ -1889,20 +1889,58 @@ class SessionTests(unittest.TestCase):
 
 
 class CleanUpTests(unittest.TestCase):
-    def test_the_client_goes_first_then_the_container_is_killed_then_removed(self):
+    def stopped_run(self, process, order) -> "d.RunResult":
+        """A run stopped at its first event, with `order` recording the container's `kill` and `remove`."""
+        stop = threading.Event()
+        with tempfile.TemporaryDirectory() as tmp:
+            return d.run_capped(["docker"], d.CapTracker(10, 30, 600, FakeClock()), spawn=lambda c, e: process,
+                                kill_container=lambda: order.append("kill"), remove_container=lambda: order.append("remove"),
+                                stderr_path=Path(tmp) / "e.log", stop=stop, on_event=lambda e: stop.set())
+
+    def test_the_client_is_killed_and_has_exited_before_the_container_is_killed_then_removed(self):
+        # `kill()` only asks. A client that is still alive could create the container after a removal found nothing.
         order = []
 
         class Process(FakeProcess):
             def kill(self):
-                order.append("client")
+                order.append("client killed")
                 self.stdout.close_stream()
 
-        stop = threading.Event()
-        with tempfile.TemporaryDirectory() as tmp:
-            result = d.run_capped(["docker"], d.CapTracker(10, 30, 600, FakeClock()), spawn=lambda c, e: Process([turn()], hang=True),
-                                  kill_container=lambda: order.append("kill"), remove_container=lambda: order.append("remove"),
-                                  stderr_path=Path(tmp) / "e.log", stop=stop, on_event=lambda e: stop.set())
-        self.assertEqual((order, result.stopped_by), (["client", "kill", "remove"], "stopped"))
+            def wait(self, timeout=None):
+                order.append("client exited")
+                return super().wait(timeout)
+
+        result = self.stopped_run(Process([turn()], hang=True), order)
+        self.assertEqual(order[:4], ["client killed", "client exited", "kill", "remove"])
+        self.assertEqual((result.stopped_by, result.failures), ("stopped", []))
+
+    def test_a_client_that_does_not_exit_is_a_failure_and_its_container_is_still_removed(self):
+        order = []
+
+        class Process(FakeProcess):
+            def kill(self):
+                self.stdout.close_stream()
+
+        with contextlib.redirect_stderr(io.StringIO()) as said:
+            result = self.stopped_run(Process([turn()], hang=True, wait_times_out=True), order)
+        self.assertEqual(order, ["kill", "remove"])
+        (failure,) = result.failures
+        self.assertIn("did not exit", failure)
+        self.assertIn("docker ps -a", said.getvalue())
+
+    def test_a_second_ctrl_c_while_waiting_for_the_client_still_kills_and_removes_the_container(self):
+        order = []
+
+        class Process(FakeProcess):
+            def kill(self):
+                self.stdout.close_stream()
+
+            def wait(self, timeout=None):
+                raise KeyboardInterrupt
+
+        with self.assertRaises(KeyboardInterrupt):
+            self.stopped_run(Process([turn()], hang=True), order)
+        self.assertEqual(order[:2], ["kill", "remove"])
 
     def test_a_clean_run_removes_nothing(self):
         removed = []

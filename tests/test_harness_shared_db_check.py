@@ -190,25 +190,30 @@ SAID = "could not confirm that the container X is gone; check `docker ps -a`"
 
 
 class FakeWriter:
-    """A `docker run` client that ends with `code`, or never ends on its own (`hangs`)."""
+    """A `docker run` client that ends with `code`, or never ends on its own (`hangs`) until it is killed. `survives_kill`: not
+    even then. `events`, when given, records its kills and exits."""
 
-    def __init__(self, hangs: bool = False, code: int = 0) -> None:
-        self.hangs, self.code = hangs, code
+    def __init__(self, hangs: bool = False, code: int = 0, survives_kill: bool = False, events=None) -> None:
+        self.hangs, self.code, self.survives_kill = hangs or survives_kill, code, survives_kill
+        self.events = events if events is not None else []
 
     def wait(self, timeout=None):
         if self.hangs:
             raise subprocess.TimeoutExpired("docker", timeout or 0)
+        self.events.append("client exited")
         return self.code
 
     def kill(self) -> None:
-        pass
+        self.events.append("client killed")
+        if self.hangs and not self.survives_kill:
+            self.hangs, self.code = False, -9
 
 
 class InterruptedWriter(FakeWriter):
     """Ctrl+C arrives while the script waits for this one."""
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, events=None) -> None:
+        super().__init__(events=events)
         self.interrupted = False
 
     def wait(self, timeout=None):
@@ -267,6 +272,35 @@ class ContainerThatCannotBeRemovedTests(Base):
     def test_a_timed_out_writer_that_is_removed_still_has_the_database_read(self):
         result = self.trial(hanging, writers=2, remove=lambda name: None)
         self.assertEqual((result.passed, result.integrity, result.problem), (False, "ok", ""))
+
+    def test_a_timed_out_client_has_exited_before_its_container_is_removed(self):
+        # `kill()` only asks, and a client that is still alive could create the container after the removal looked.
+        events: list = []
+        self.trial(lambda command, err: FakeWriter(hangs=True, events=events), writers=1,
+                   remove=lambda name: events.append("removal"))
+        self.assertEqual(events, ["client killed", "client exited", "removal"])
+
+    def test_after_an_interrupt_every_client_has_exited_before_the_first_removal(self):
+        events: list = []
+
+        def spawn(command, stderr_file):
+            return InterruptedWriter(events=events) if writer_index(command) == 1 else FakeWriter(hangs=True, events=events)
+
+        def remove(name):
+            events.append("removal")
+
+        # Writer 0 runs on, and the interrupt lands in the wait for writer 1, after writer 0 timed out.
+        with self.assertRaises(KeyboardInterrupt):
+            self.trial(spawn, writers=2, remove=remove)
+        after_the_first_removal = events[events.index("removal") + 1:]  # writer 0's own, from its timeout
+        self.assertLess(after_the_first_removal.index("client exited"), after_the_first_removal.index("removal"))
+
+    def test_a_client_that_does_not_exit_leaves_the_database_unread_even_when_the_removal_succeeds(self):
+        with mock.patch.object(check, "read_back", side_effect=AssertionError("the database was read")):
+            result = self.trial(lambda command, err: FakeWriter(survives_kill=True), writers=1, remove=lambda name: None)
+        self.assertFalse(result.passed)
+        self.assertIn("did not exit", result.problem)
+        self.assertIn("docker ps -a", result.problem)
 
     def test_the_command_line_names_the_container_and_keeps_the_folder_after_a_timeout(self):
         code, said, left = self.run_main(hanging, mock.Mock(return_value=SAID))

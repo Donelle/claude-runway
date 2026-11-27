@@ -123,6 +123,7 @@ PROMPT_SUBDIRS = (("harness", "prompts"), ("harness", "live-tests", "prompts"))
 DOCKER_COMMAND_TIMEOUT_SECONDS = 30
 REMOVE_ATTEMPTS = 3
 REMOVE_PAUSE_SECONDS = 1.0
+CLIENT_EXIT_SECONDS = 10  # how long a killed `docker` client is given to be gone (it takes milliseconds)
 
 PROVIDER = "lmstudio"
 MCP_SERVER_NAME = "reviewer"
@@ -764,18 +765,23 @@ def run_capped(
         stopped_by: Optional[str] = None
 
         def clean_up() -> None:
-            """After a run that did not end cleanly. The client goes first, so that one the daemon has not been asked by yet
-            never creates the container; then the container; then whatever the client left behind, because `docker kill` fails
-            on a container that does not exist yet and does nothing to one that was created and never started."""
+            """After a run that did not end cleanly. The client goes first, and is waited for, so that one the daemon has not
+            been asked by yet never creates the container; then the container; then whatever the client left behind, because
+            `docker kill` fails on a container that does not exist yet and does nothing to one that was created and never
+            started. What the client asked for before it exited is out of reach here (see `stop_client`)."""
+            problems: list = []
             try:
-                process.kill()
-            except OSError:
-                pass
-            kill_container()
-            problem = remove_container()
-            if problem and problem not in result.failures:
-                print(f"warning: {problem}", file=sys.stderr)
-                result.failures.append(problem)
+                if not stop_client(process):
+                    problems.append(f"the docker client did not exit within {CLIENT_EXIT_SECONDS} s of being killed, so it may "
+                                    "still start the container; check `docker ps -a`")
+            finally:
+                # In a `finally`: a second Ctrl+C that ends the wait must not leave the container running.
+                kill_container()
+                problems.append(remove_container())
+                for problem in problems:
+                    if problem and problem not in result.failures:
+                        print(f"warning: {problem}", file=sys.stderr)
+                        result.failures.append(problem)
 
         # Everything from here to the end of the wait is one protected block: the container must stop on EVERY way out, not
         # only when a cap trips (see the `except` below). Starting it straight after `spawn` leaves no gap before it.
@@ -871,6 +877,21 @@ def _docker(docker: str, *args: str) -> Optional[subprocess.CompletedProcess]:
         return subprocess.run([docker, *args], capture_output=True, check=False, timeout=DOCKER_COMMAND_TIMEOUT_SECONDS)
     except (OSError, subprocess.TimeoutExpired):
         return None
+
+
+def stop_client(process) -> bool:
+    """Kills the `docker` client `process` (an object with `kill()` and `wait(timeout)`) and waits until it has exited; False
+    when it has not within CLIENT_EXIT_SECONDS. Do it BEFORE removing the client's container: `kill()` returns while the
+    client may still be alive, and a live one can still ask the daemon to create or start the container after a removal has
+    looked and found nothing. What it asked for before it exited the daemon still carries out: a create sent just before the
+    kill can leave a container that is never started, which can appear after a removal has looked."""
+    with contextlib.suppress(OSError):
+        process.kill()
+    try:
+        process.wait(timeout=CLIENT_EXIT_SECONDS)
+    except subprocess.TimeoutExpired:
+        return False
+    return True
 
 
 def kill_container(docker: str, name: str) -> None:

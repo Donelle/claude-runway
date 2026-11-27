@@ -145,14 +145,21 @@ def run_trial(
 ) -> TrialResult:
     """One trial in `database_dir`, which must not hold a database yet. `spawn(command, stderr_file)` returns an object with
     `wait(timeout)` and `kill()`, and raises CannotRun when it starts nothing; `remove(name)` removes a container, returning
-    None when it is gone, else what to tell the user. A container is known to be gone only when its client ended with 0 or its
-    removal was confirmed. `unaccounted` holds the others, each with what to tell the user, from before its client starts: while
-    it holds any, one may still be writing, and the database is not read. Raises CannotRun."""
+    None when it is gone, else what to tell the user. A container is known to be gone only when its client ended with 0, or its
+    removal was confirmed and a client that had to be killed has exited. `unaccounted` holds the others, each with what to tell
+    the user, from before its client starts: while it holds any, one may still be writing, and the database is not read.
+    (A removal is a look at one moment: see `pi_driver.stop_client` for what can appear after it.) Raises CannotRun."""
     remove = remove or (lambda name: pi_driver.remove_container(docker, name))
     unaccounted = {} if unaccounted is None else unaccounted
+    unstopped: dict = {}  # containers whose client would not exit, each with what to tell the user: no removal settles one
+
+    def stop_client(name: str, process) -> None:
+        if not pi_driver.stop_client(process):
+            unstopped[name] = (f"the docker client of {name} did not exit when killed, so it may still start the container; "
+                               "check `docker ps -a`")
 
     def remove_and_note(name: str) -> None:
-        problem = remove(name)
+        problem = remove(name) or unstopped.get(name)
         if problem:
             unaccounted[name] = problem
         else:
@@ -189,7 +196,7 @@ def run_trial(
                     # The container's own `timeout` fires first; this only covers a docker client that does not end.
                     code = process.wait(timeout=timeout + pi_driver.DOCKER_COMMAND_TIMEOUT_SECONDS)
                 except subprocess.TimeoutExpired:
-                    process.kill()
+                    stop_client(name, process)
                     code = None
                 result.exit_codes.append(code)
                 if code == 0:
@@ -198,18 +205,16 @@ def run_trial(
                     # A client can fail, or be killed, while its container goes on, so only a removal says that one is gone.
                     remove_and_note(name)
         except BaseException:
-            # Ctrl+C or a writer that could not start. The clients go first, so that none creates a container after its removal;
-            # then every container not known to be gone, so that none is left writing into the folder. One limit: an interrupt
-            # inside `spawn` can leave a client that is not in `running`, so it cannot be stopped here. Its container is removed
-            # like the others, but a removal that finished before that client had created it would not see it.
-            for _name, process, _stderr in running:
-                with contextlib.suppress(OSError):
-                    process.kill()
+            # Ctrl+C or a writer that could not start. The clients go first, each waited for, so that none creates a container
+            # after its removal; then every container not known to be gone, so that none is left writing into the folder.
+            # (The wait also frees the log files, which Windows keeps open until the process that has one is gone.) One limit:
+            # an interrupt inside `spawn` can leave a client that is not in `running`, so it cannot be stopped here. Its
+            # container is removed like the others, but a removal that finished before that client had created it would not
+            # see it.
+            for name, process, _stderr in running:
+                stop_client(name, process)
             for name in list(unaccounted):
                 remove_and_note(name)
-            for _name, process, _stderr in running:
-                with contextlib.suppress(subprocess.TimeoutExpired):
-                    process.wait(timeout=10)  # Windows keeps a file open until the process that has it is gone
             raise
         finally:
             for _name, _process, stderr_file in running:
