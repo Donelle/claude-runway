@@ -756,8 +756,10 @@ class RunLessonsContentRequirements(unittest.TestCase):
         self.assertIn("git push origin HEAD:<branch>", section)
         # Design/ambiguity BLOCKEDs are excluded -- only the round cap qualifies.
         self.assertIn("does **not** apply to a `BLOCKED` for a design question", section)
-        # Model is the orchestrator's call, not hard-coded.
-        self.assertIn("Model choice is the orchestrator's call", section)
+        # The follow-up runs on the agent file's pinned model; another model needs an explicit
+        # `model` on that call, and that model is the one recorded in the metrics.
+        self.assertIn("The follow-up runs on the model pinned in `.claude/agents/autowork-ticket.md`", section)
+        self.assertIn("record that model, not the pinned one, in Step 2b's metrics", section)
 
     def test_continuation_overrides_the_new_pr_assumptions_of_the_review_loop(self):
         # Copilot review round 1: Step 4 starts seen_ids empty, Step 22
