@@ -39,6 +39,11 @@ for _directory in (REPO_ROOT / "libs", Path(__file__).resolve().parent):
         sys.path.insert(0, str(_directory))
 
 from cases import Case, bug_line, line_of  # noqa: E402
+# The matching rules (a finding is credited to the nearest bug or decoy within LINE_TOLERANCE lines) live in one place, the
+# live scoring module, which depends on nothing here, so a tool that only scores a review need not import this file or
+# `cases.py`. This file no longer reads `LINE_TOLERANCE` itself; it stays importable as `harness_lib.LINE_TOLERANCE` because
+# tests/test_harness_cases.py reads it there.
+from live_scoring_lib import LINE_TOLERANCE, nearest_anchor  # noqa: E402, F401
 
 # The development model for reviewers and verifiers (see harness/README.md, "Codebase-reviewer models"): the -Instruct build,
 # since the base build never ends its turn.
@@ -52,8 +57,6 @@ DEFAULT_LENS = (
 DEFAULT_VERIFIER_LENS = "You confirm a reported defect with a concrete failing input, or reject it."
 DEFAULT_CLASSIFIER_LENS = "You check whether a reported defect falls under a category's definition."
 DEFAULT_STAGE_LENSES = {"verifier": DEFAULT_VERIFIER_LENS, "classifier": DEFAULT_CLASSIFIER_LENS}
-# Reported lines are the model's reading of a diff, and drift by a few lines.
-LINE_TOLERANCE = 3
 
 # The variables that decide where a recorded run goes. libs/reviewer_db_lib.py reads the first and owns the real default
 # (~/.claude/claude-runway/codebase-reviewer.db); closing a run also writes a summary event to libs/metrics_lib.py's database and,
@@ -257,33 +260,6 @@ class Score:
     total: int = 0
 
 
-def _distance(finding, file: str, line: int) -> Optional[int]:
-    """Lines between the finding's range and `line` (0 when inside it); None when another file, beyond LINE_TOLERANCE,
-    or the finding has no known start line (the parser records a missing or invalid line number as 0, which is not a place)."""
-    same_file = finding.file == file or finding.file.endswith("/" + file) or file.endswith("/" + finding.file)
-    if not same_file or finding.line_start <= 0:
-        return None
-    gap = max(finding.line_start - line, line - max(finding.line_end, finding.line_start), 0)
-    return gap if gap <= LINE_TOLERANCE else None
-
-
-def _nearest(finding, anchors: dict, taken: frozenset = frozenset()) -> Optional[tuple]:
-    """`(anchor id, distance)` of the anchor `finding` sits nearest to, or None. Two defects a few lines apart must
-    not be credited to whichever happens to come first, or an exact hit on the second reads as a miss.
-
-    When several anchors are equally near, the first listed wins, EXCEPT among anchors at the very same file and
-    line as that first one (two Copilot comments on one line): there, one not yet credited in `taken` is preferred,
-    so two claims at that line are matched one to one. Anchors merely at the same distance from a wide range are
-    different places, and a claim there must not be credited with one it did not report."""
-    gaps = {anchor_id: _distance(finding, file, line) for anchor_id, (file, line) in anchors.items()}
-    near = {anchor_id: gap for anchor_id, gap in gaps.items() if gap is not None}
-    if not near:
-        return None
-    lead = min(near, key=lambda anchor_id: near[anchor_id])  # min() keeps the first listed of equals
-    same_place = [anchor_id for anchor_id in near if near[anchor_id] == near[lead] and anchors[anchor_id] == anchors[lead]]
-    return next((anchor_id for anchor_id in same_place if anchor_id not in taken), lead), near[lead]
-
-
 @dataclass(frozen=True)
 class Claim:
     """One reported claim to score, with its own lines and the reviewers who made it."""
@@ -348,8 +324,8 @@ def score(findings: list, case: Case) -> Score:
     for finding in findings:
         # The nearer of the best bug and the best decoy: a false alarm that sits exactly on a decoy must not be
         # credited as a bug three lines away. A tie goes to the bug.
-        bug = _nearest(finding, bug_lines, frozenset(found))
-        decoy = _nearest(finding, decoy_lines)
+        bug = nearest_anchor(finding, bug_lines, frozenset(found))
+        decoy = nearest_anchor(finding, decoy_lines)
         if bug is not None and (decoy is None or bug[1] <= decoy[1]):
             found.add(bug[0])
             continue

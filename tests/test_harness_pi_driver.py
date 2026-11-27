@@ -17,10 +17,12 @@ import json
 import os
 import queue
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -30,7 +32,74 @@ for _directory in (PI_DIR, REPO_ROOT / "libs", REPO_ROOT / "harness"):
     if str(_directory) not in sys.path:
         sys.path.insert(0, str(_directory))
 
+import live_scoring_lib as scoring  # noqa: E402
 import pi_driver as d  # noqa: E402
+import score_run  # noqa: E402
+
+# What stands in for the answer key's text, and for another change's own text. Neither may ever reach the container's repository.
+KEY_MARKER = "ANSWER-KEY-MARKER-4f9d1c"
+OTHER_CHANGE_MARKER = "CHANGE-5-ONLY-8a2e7b"
+BASE_FILES = {
+    "libs/version_lib.py": "base\n",
+    ".github/instructions/rules.instructions.md": '---\napplyTo: "**/*.py"\n---\nA rule.\n',
+}
+
+
+def checkout_git(repo: Path, *args: str) -> str:
+    """git in a fixture repository, with the user's own configuration left out (a signing key or hook of theirs must not matter)."""
+    env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}
+    done = subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false", *args],
+                          check=True, capture_output=True, text=True, errors="replace", env=env)
+    return done.stdout
+
+
+def make_checkout(parent: Path, change_ids=("change-5", "change-6")) -> Path:
+    """A throwaway checkout shaped like the real one. `main` holds a file where the answer key is
+    (`harness/live-tests/answer_key.json`, with a marker for its text). The branch's tags sit on a history that shares nothing with
+    `main`: an orphan base, then one commit per change on top of the base, each changing `libs/version_lib.py`, as the real branch
+    does. Back on `main` at the end, as a person's checkout is."""
+    repo = parent / "checkout"
+    repo.mkdir()
+    checkout_git(repo, "init", "-q", "-b", "main")
+    key = repo / "harness" / "live-tests" / "answer_key.json"
+    key.parent.mkdir(parents=True)
+    key.write_text(KEY_MARKER + "\n", encoding="utf-8")
+    checkout_git(repo, "add", "-A")
+    checkout_git(repo, "commit", "-q", "-m", "main")
+    checkout_git(repo, "checkout", "-q", "--orphan", "snapshot")
+    checkout_git(repo, "rm", "-rfq", ".")
+    for relative, text in BASE_FILES.items():
+        path = repo / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    checkout_git(repo, "add", "-A")
+    checkout_git(repo, "commit", "-q", "-m", "base")
+    checkout_git(repo, "tag", scoring.BASE_REF)
+    for change in change_ids:
+        checkout_git(repo, "checkout", "-q", "--detach", scoring.BASE_REF)
+        (repo / "libs" / "version_lib.py").write_text(f"{change}\n" + (OTHER_CHANGE_MARKER + "\n" if change == "change-5" else ""), encoding="utf-8")
+        checkout_git(repo, "commit", "-q", "-am", change)
+        checkout_git(repo, "tag", scoring.PREFIX + change)
+    checkout_git(repo, "checkout", "-q", "main")
+    return repo
+
+
+# One checkout for the whole module: the driver only reads from it, and building it takes a dozen git calls.
+_FIXTURE: dict = {}
+
+
+def setUpModule():
+    tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)  # git's object files are read-only, which Windows will not delete
+    _FIXTURE["tmp"] = tmp
+    _FIXTURE["checkout"] = make_checkout(Path(tmp.name))
+
+
+def tearDownModule():
+    _FIXTURE.pop("tmp").cleanup()
+
+
+def checkout() -> Path:
+    return _FIXTURE["checkout"]
 
 
 def event(kind: str, **fields) -> bytes:
@@ -746,7 +815,8 @@ class LmStudioUrlTests(unittest.TestCase):
 
     def test_a_dry_run_follows_the_environment_variable(self):
         environment = {**os.environ, "CLAUDE_RUNWAY_LMSTUDIO_URL": "http://localhost:5555/v1"}
-        completed = subprocess.run([sys.executable, "-I", str(PI_DIR / "pi_driver.py"), "--dry-run", "--model", "m"],
+        completed = subprocess.run([sys.executable, "-I", str(PI_DIR / "pi_driver.py"), "--dry-run", "--model", "m",
+                                    "--repo", str(checkout())],
                                    capture_output=True, text=True, timeout=60, env=environment)
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("http://host.docker.internal:5555/v1", completed.stderr)
@@ -754,24 +824,25 @@ class LmStudioUrlTests(unittest.TestCase):
     def test_a_password_in_the_url_reaches_neither_the_command_nor_any_output(self):
         # The URL goes into files in the agent scratch folder; the command line is visible to `ps` and `docker inspect`.
         environment = {**os.environ, "CLAUDE_RUNWAY_LMSTUDIO_URL": "http://alice:s3cret@localhost:5555/v1"}
-        completed = subprocess.run([sys.executable, "-I", str(PI_DIR / "pi_driver.py"), "--dry-run", "--model", "m"],
+        completed = subprocess.run([sys.executable, "-I", str(PI_DIR / "pi_driver.py"), "--dry-run", "--model", "m",
+                                    "--repo", str(checkout())],
                                    capture_output=True, text=True, timeout=60, env=environment)
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertNotIn("s3cret", completed.stdout + completed.stderr)
         self.assertIn("http://***@host.docker.internal:5555/v1", completed.stderr)
 
     def test_the_preflight_messages_hide_a_password_in_the_url(self):
-        harness_lib, _ = d.import_harness()
         url = "http://alice:s3cret@127.0.0.1:1/v1"
         for known in (False, None):
-            with mock.patch.object(harness_lib, "model_known", return_value=known), \
+            with mock.patch.object(d, "model_known", return_value=known), \
                     mock.patch("sys.stderr", new_callable=io.StringIO) as stderr:
                 problem = d.host_model_check(url, "m") or ""
             self.assertNotIn("s3cret", problem + stderr.getvalue(), known)
 
     def test_a_bad_port_in_the_environment_is_a_usage_error_not_a_traceback(self):
         environment = {**os.environ, "CLAUDE_RUNWAY_LMSTUDIO_URL": "http://localhost:abc/v1"}
-        completed = subprocess.run([sys.executable, "-I", str(PI_DIR / "pi_driver.py"), "--dry-run", "--model", "m"],
+        completed = subprocess.run([sys.executable, "-I", str(PI_DIR / "pi_driver.py"), "--dry-run", "--model", "m",
+                                    "--repo", str(checkout())],
                                    capture_output=True, text=True, timeout=60, env=environment)
         self.assertEqual(completed.returncode, 2)
         self.assertIn("LM Studio URL", completed.stderr)
@@ -782,7 +853,7 @@ class MainTests(unittest.TestCase):
     def test_a_dry_run_prints_the_command_and_leaves_no_scratch_directory(self):
         before = set(Path(tempfile.gettempdir()).glob("claude-runway-pi-*"))
         completed = subprocess.run(
-            [sys.executable, "-I", str(PI_DIR / "pi_driver.py"), "--dry-run", "--model", "m"],
+            [sys.executable, "-I", str(PI_DIR / "pi_driver.py"), "--dry-run", "--model", "m", "--repo", str(checkout())],
             capture_output=True, text=True, timeout=60,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
@@ -790,10 +861,11 @@ class MainTests(unittest.TestCase):
         self.assertIn("--mount", completed.stdout)
         self.assertEqual(set(Path(tempfile.gettempdir()).glob("claude-runway-pi-*")), before)
 
-    def test_an_unknown_case_and_a_nonpositive_cap_are_usage_errors(self):
-        for extra in (["--case", "nope"], ["--max-turns", "0"], ["--timeout", "0"], ["--mcp-timeout", "0"],
+    def test_an_unknown_change_and_a_nonpositive_cap_are_usage_errors(self):
+        for extra in (["--change", "nope"], ["--max-turns", "0"], ["--timeout", "0"], ["--mcp-timeout", "0"],
                       ["--lmstudio-timeout", "-1"]):
-            completed = subprocess.run([sys.executable, "-I", str(PI_DIR / "pi_driver.py"), "--dry-run", "--model", "m", *extra],
+            completed = subprocess.run([sys.executable, "-I", str(PI_DIR / "pi_driver.py"), "--dry-run", "--model", "m",
+                                        "--repo", str(checkout()), *extra],
                                        capture_output=True, text=True, timeout=60)
             self.assertEqual(completed.returncode, 2, extra)
 
@@ -807,7 +879,7 @@ class MainTests(unittest.TestCase):
         remove = d._remove_tree
         with mock.patch.object(d, "_remove_tree", keep_then_remove), contextlib.redirect_stdout(io.StringIO()), \
                 contextlib.redirect_stderr(io.StringIO()):
-            code = d.main(["--dry-run", "--model", "m", "--mcp-timeout", "300", "--lmstudio-timeout", "120"])
+            code = d.main(["--dry-run", "--model", "m", "--repo", str(checkout()), "--mcp-timeout", "300", "--lmstudio-timeout", "120"])
         self.assertEqual(code, 0)
         server = written["mcpServers"][d.MCP_SERVER_NAME]
         self.assertEqual((server["timeout"], server["env"]["CLAUDE_RUNWAY_LMSTUDIO_TIMEOUT_SECONDS"]), (300, "120"))
@@ -860,7 +932,8 @@ class FailurePathTests(unittest.TestCase):
     """What happens when something outside the run is wrong: no docker, a bad log path, a model LM Studio lacks."""
 
     def run_driver(self, *extra):
-        return subprocess.run([sys.executable, "-I", str(PI_DIR / "pi_driver.py"), "--model", "m", "--no-preflight", *extra],
+        return subprocess.run([sys.executable, "-I", str(PI_DIR / "pi_driver.py"), "--model", "m", "--no-preflight",
+                               "--repo", str(checkout()), *extra],
                               capture_output=True, text=True, timeout=120)
 
     def scratch_dirs(self) -> set:
@@ -910,23 +983,389 @@ class FailurePathTests(unittest.TestCase):
         self.assertFalse(directory.exists())
 
     def test_a_model_lm_studio_does_not_list_is_a_preflight_problem(self):
-        import harness_lib
-        with mock.patch.object(harness_lib, "model_known", return_value=False):
+        with mock.patch.object(d, "model_known", return_value=False):
             problem = d.host_model_check("http://h:1/v1", "ghost-model")
         self.assertIn("ghost-model", problem)
 
     def test_when_lm_studio_cannot_be_asked_the_run_goes_on_with_a_warning(self):
-        import harness_lib
         err = io.StringIO()
-        with mock.patch.object(harness_lib, "model_known", return_value=None), contextlib.redirect_stderr(err):
+        with mock.patch.object(d, "model_known", return_value=None), contextlib.redirect_stderr(err):
             problem = d.host_model_check("http://h:1/v1", "some-model")
         self.assertIsNone(problem)
         self.assertIn("could not ask", err.getvalue())
 
     def test_a_known_model_is_no_problem(self):
-        import harness_lib
-        with mock.patch.object(harness_lib, "model_known", return_value=True):
+        with mock.patch.object(d, "model_known", return_value=True):
             self.assertIsNone(d.host_model_check("http://h:1/v1", "m"))
+
+
+class ChangeRepositoryTests(unittest.TestCase):
+    """The repository the container reviews: only the branch's base and the chosen change, fetched from a checkout."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self._tmp.cleanup)
+        self.scratch = Path(self._tmp.name)
+        self.tag = d.change_tag("change-6")
+        self.repo = d.build_change_repo(self.scratch, checkout(), self.tag)
+
+    def git(self, *args: str) -> str:
+        return checkout_git(self.repo, *args)
+
+    def commit_of(self, ref: str) -> str:
+        return checkout_git(checkout(), "rev-parse", f"{ref}^{{commit}}").strip()
+
+    def test_it_holds_the_base_and_the_change_and_nothing_else(self):
+        base, change = self.commit_of(scoring.BASE_REF), self.commit_of("harness-live-tests/change-6")
+        self.assertEqual(sorted(self.git("rev-list", "--all").split()), sorted([base, change]))
+        self.assertEqual(sorted(self.git("for-each-ref", "--format=%(refname)").split()),
+                         ["refs/tags/harness-live-tests/base", "refs/tags/harness-live-tests/change-6"])
+        # Every object in the store is reachable from those two tags: no stray history, no other change's files.
+        stored = set(self.git("cat-file", "--batch-all-objects", "--batch-check=%(objectname)").split())
+        reachable = {line.split()[0] for line in self.git("rev-list", "--objects", "--all").splitlines() if line.strip()}
+        self.assertEqual(stored, reachable)
+        # Copied, not borrowed: nothing in it points back at the checkout it came from.
+        self.assertFalse((self.repo / ".git" / "objects" / "info" / "alternates").exists())
+
+    def test_the_change_is_checked_out_so_the_working_tree_is_the_change(self):
+        self.assertEqual(self.git("rev-parse", "HEAD").strip(), self.commit_of("harness-live-tests/change-6"))
+        self.assertEqual(self.git("rev-parse", "--abbrev-ref", "HEAD").strip(), "HEAD")  # detached
+        self.assertEqual(self.git("status", "--porcelain"), "")
+        self.assertEqual((self.repo / "libs" / "version_lib.py").read_text(encoding="utf-8"), "change-6\n")
+        # The repository's own review rules are in the working tree, where the reviewer reads them from.
+        self.assertTrue((self.repo / ".github" / "instructions" / "rules.instructions.md").is_file())
+
+    def test_the_reviewer_finds_the_repositorys_own_review_rules_in_it(self):
+        # Why the change is checked out and not only fetched: the reviewer reads `.github/instructions/` from the working tree, so a
+        # repository with no files would have been reviewed with no rules, unlike the real checkout it stands in for.
+        import reasoning_reviewer_lib
+        rules = reasoning_reviewer_lib.instruction_files_for(self.repo, ["libs/version_lib.py"])
+        self.assertEqual([name for name, _text in rules], [".github/instructions/rules.instructions.md"])
+
+    def test_the_diff_to_review_is_the_base_against_the_change(self):
+        diff = self.git("diff", "--name-only", f"{scoring.BASE_REF}...harness-live-tests/change-6")
+        self.assertEqual(diff.split(), ["libs/version_lib.py"])
+
+    def test_nothing_from_main_or_from_another_change_is_anywhere_in_it(self):
+        # The text that stands in for the answer key, and another change's own text, looked for in every object the repository
+        # has (loose or packed) and in every file of its working tree.
+        everything = self.git("cat-file", "--batch-all-objects", "--batch")
+        files = "".join(p.read_text(encoding="utf-8", errors="replace") for p in self.repo.rglob("*") if p.is_file() and ".git" not in p.parts)
+        for marker in (KEY_MARKER, OTHER_CHANGE_MARKER):
+            with self.subTest(marker=marker):
+                self.assertNotIn(marker, everything)
+                self.assertNotIn(marker, files)
+        self.assertFalse((self.repo / "harness").exists())
+        for commit in (self.commit_of(scoring.BASE_REF), self.commit_of("harness-live-tests/change-6")):
+            self.assertNotIn("answer_key.json", self.git("ls-tree", "-r", "--name-only", commit))
+
+    def test_another_change_gets_its_own_repository(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            repo = d.build_change_repo(Path(tmp), checkout(), d.change_tag("change-5"))
+            self.assertEqual((repo / "libs" / "version_lib.py").read_text(encoding="utf-8"), f"change-5\n{OTHER_CHANGE_MARKER}\n")
+            refs = checkout_git(repo, "for-each-ref", "--format=%(refname)").split()
+            self.assertEqual(sorted(refs), ["refs/tags/harness-live-tests/base", "refs/tags/harness-live-tests/change-5"])
+
+    def test_a_tag_the_checkout_lacks_stops_with_the_exact_fetch_command_and_builds_nothing(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            short = make_checkout(Path(tmp), change_ids=("change-5",))  # has the base and change-5, not change-6
+            scratch = Path(tmp) / "scratch"
+            scratch.mkdir()
+            with self.assertRaises(d.ChangeRepoError) as caught:
+                d.build_change_repo(scratch, short, self.tag)
+            self.assertEqual(list(scratch.iterdir()), [])
+        message = str(caught.exception)
+        self.assertIn("harness-live-tests/change-6", message)
+        self.assertNotIn("harness-live-tests/change-5", message)  # present, so not named as missing
+        self.assertIn(scoring.FETCH_COMMAND, message)
+        self.assertIn(str(short), message)
+
+    def test_a_checkout_with_no_branch_at_all_names_the_base_too(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            bare = Path(tmp) / "plain-clone"
+            bare.mkdir()
+            checkout_git(bare, "init", "-q")
+            with self.assertRaises(d.ChangeRepoError) as caught:
+                d.check_checkout(bare, self.tag)
+        self.assertIn("harness-live-tests/base, harness-live-tests/change-6", str(caught.exception))
+
+    def test_a_folder_that_is_not_a_repository_is_refused_with_gits_own_reason(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            # Do not let git climb out of the temporary folder into some repository the machine happens to keep above it.
+            with mock.patch.dict(os.environ, {"GIT_CEILING_DIRECTORIES": str(Path(tmp).parent)}), self.assertRaises(d.ChangeRepoError) as caught:
+                d.check_checkout(Path(tmp), self.tag)
+        self.assertIn(f"{tmp} cannot be used as the checkout that has the harness-live-tests/* tags", str(caught.exception))
+        self.assertIn("not a git repository", str(caught.exception))
+
+    def test_a_path_that_does_not_exist_is_refused(self):
+        with self.assertRaises(d.ChangeRepoError) as caught:
+            d.check_checkout(self.scratch / "no-such-folder", self.tag)
+        self.assertIn("no-such-folder", str(caught.exception))
+
+    def test_a_git_that_cannot_run_or_hangs_is_a_clean_error_not_a_traceback(self):
+        for failure in (FileNotFoundError("git"), subprocess.TimeoutExpired("git", 1)):
+            with self.subTest(failure=type(failure).__name__), mock.patch.object(d.subprocess, "run", side_effect=failure), \
+                    self.assertRaises(d.ChangeRepoError) as caught:
+                d.check_checkout(checkout(), self.tag)
+            self.assertIn("could not run git", str(caught.exception))
+        # The tag check goes through the scoring module's own git call.
+        with mock.patch.object(d.scoring, "missing_refs", side_effect=FileNotFoundError("git")), self.assertRaises(d.ChangeRepoError) as caught:
+            d.check_checkout(checkout(), self.tag)
+        self.assertIn("could not run git", str(caught.exception))
+
+    def test_a_fetch_that_fails_says_which_step_and_what_git_said(self):
+        real = d._git
+
+        def failing_fetch(repo, *args):
+            if args[0] == "fetch":
+                return subprocess.CompletedProcess(args, 128, stdout="", stderr="fatal: the remote hung up\nhint: more\n")
+            return real(repo, *args)
+
+        parent = self.scratch / "again"
+        parent.mkdir()
+        with mock.patch.object(d, "_git", failing_fetch), self.assertRaises(d.ChangeRepoError) as caught:
+            d.build_change_repo(parent, checkout(), self.tag)
+        message = str(caught.exception)
+        self.assertIn("git fetch failed", message)
+        self.assertIn("fatal: the remote hung up", message)
+        self.assertNotIn("hint: more", message)  # the first line only
+
+    def test_the_users_git_configuration_does_not_reach_the_repository(self):
+        # A global autocrlf would rewrite the files the reviewer reads, and a global hooks path would run a hook on the checkout.
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            hooks = Path(tmp) / "hooks"
+            hooks.mkdir()
+            ran = Path(tmp) / "hook-ran"
+            hook = hooks / "post-checkout"
+            hook.write_text(f"#!/bin/sh\ntouch '{ran}'\n", encoding="utf-8")
+            hook.chmod(0o755)
+            config = Path(tmp) / "gitconfig"
+            config.write_text(f"[core]\n\tautocrlf = true\n\thooksPath = {hooks.as_posix()}\n", encoding="utf-8")
+            target = Path(tmp) / "target"
+            target.mkdir()
+            with mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(config)}):
+                repo = d.build_change_repo(target, checkout(), self.tag)
+            self.assertNotIn(b"\r", (repo / "libs" / "version_lib.py").read_bytes())
+            self.assertFalse(ran.exists())
+
+
+class NoMountReachesTheAnswerKey(unittest.TestCase):
+    """The answer key is in this checkout under `harness/live-tests/`; the container may see `libs/`, `mcpservers/` and scratch folders."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.mounts = d.prepare_scratch(self.root, checkout(), d.change_tag("change-6"), "m", d.reviewers_file("m", 8192, False), 8192,
+                                        "http://host.docker.internal:1234/v1")
+
+    def test_no_folder_the_container_is_given_holds_the_key(self):
+        key = scoring.ANSWER_KEY_PATH.resolve()
+        self.assertTrue(key.is_file())
+        for host, inside, _writable in self.mounts.as_list():
+            with self.subTest(mount=inside):
+                resolved = host.resolve()
+                self.assertNotEqual(resolved, key)
+                self.assertNotIn(resolved, key.parents)
+
+    def test_the_same_holds_for_the_sources_on_the_command_line_the_container_is_started_with(self):
+        command = d.docker_run_command(docker="docker", image="img", name="n", mounts=self.mounts, model="m", prompt="p",
+                                       memory="4g", cpus="2", pids_limit=1)
+        sources = [re.search(r"source=([^,]+)", command[i + 1]).group(1) for i, part in enumerate(command) if part == "--mount"]
+        self.assertEqual(len(sources), 6)
+        key = scoring.ANSWER_KEY_PATH.resolve()
+        for source in sources:
+            with self.subTest(source=source):
+                self.assertNotIn(Path(source).resolve(), [key, *key.parents])
+
+    def test_the_checkout_the_repository_came_from_is_not_mounted_either(self):
+        source = checkout().resolve()
+        for host, inside, _writable in self.mounts.as_list():
+            with self.subTest(mount=inside):
+                resolved = host.resolve()
+                self.assertNotIn(resolved, [source, *source.parents])  # not the checkout, and not a folder above it
+                self.assertNotIn(source, resolved.parents)  # not something inside it
+
+    def test_a_mount_of_the_key_or_of_a_folder_it_is_in_is_refused(self):
+        home = self.root / "home"
+        key = scoring.ANSWER_KEY_PATH
+        for folder in (key, key.parent, key.parent.parent, REPO_ROOT / "harness" / "pi"):
+            for field_name in ("repo", "state"):  # a read-only mount and a writable one
+                mounts = mounts_in(Path(tempfile.mkdtemp(dir=self.root)))
+                setattr(mounts, field_name, folder)
+                with self.subTest(folder=str(folder), mount=field_name):
+                    self.assertTrue(d.unsafe_mounts(mounts, home, d.REPO_ROOT))
+
+    def test_the_key_is_in_harness_and_neither_of_the_two_folders_of_this_checkout_that_are_mounted(self):
+        key = scoring.ANSWER_KEY_PATH.resolve()
+        self.assertIn((REPO_ROOT / "harness").resolve(), key.parents)
+        for mounted in (self.mounts.libs, self.mounts.mcpservers):
+            self.assertNotIn(mounted.resolve(), key.parents)
+
+
+class ChangeOptionTests(unittest.TestCase):
+    """`--change` and `--repo` through `main`, in this process."""
+
+    def run_main(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = d.main(list(argv))
+        return code, out.getvalue(), err.getvalue()
+
+    def scratch_dirs(self) -> set:
+        return set(Path(tempfile.gettempdir()).glob("claude-runway-pi-*"))
+
+    def test_the_default_change_is_change_6_and_the_prompt_names_its_two_tags(self):
+        self.assertEqual(d.DEFAULT_CHANGE, "change-6")
+        code, out, _err = self.run_main("--dry-run", "--model", "m", "--repo", str(checkout()))
+        self.assertEqual(code, 0)
+        prompt = shlex.split(out)[-1]
+        self.assertIn('"repo_path": "/work/repo"', prompt)
+        self.assertIn('"base_ref": "harness-live-tests/base"', prompt)
+        self.assertIn('"head_ref": "harness-live-tests/change-6"', prompt)
+        for placeholder in ("{repo}", "{base}", "{head}"):
+            self.assertNotIn(placeholder, prompt)  # none is left unfilled
+
+    def test_change_picks_the_change_and_a_custom_prompt_may_use_the_placeholders(self):
+        code, out, _err = self.run_main("--dry-run", "--model", "m", "--repo", str(checkout()), "--change", "change-5",
+                                        "--prompt", "review {base}..{head} in {repo}")
+        self.assertEqual(code, 0)
+        self.assertEqual(shlex.split(out)[-1], "review harness-live-tests/base..harness-live-tests/change-5 in /work/repo")
+
+    def test_an_unknown_change_is_a_usage_error_that_names_the_known_ones_and_runs_nothing(self):
+        before = self.scratch_dirs()
+        code, out, err = self.run_main("--dry-run", "--model", "m", "--repo", str(checkout()), "--change", "change-9")
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn("unknown change 'change-9'", err)
+        self.assertIn("change-1, change-2, change-3, change-4, change-5, change-6", err)
+        self.assertEqual(self.scratch_dirs(), before)
+
+    def test_a_change_written_with_the_branch_prefix_is_not_one(self):
+        code, _out, err = self.run_main("--dry-run", "--model", "m", "--repo", str(checkout()), "--change", "harness-live-tests/change-6")
+        self.assertEqual(code, 2)
+        self.assertIn("unknown change", err)
+
+    def test_a_checkout_without_the_tags_is_stopped_with_the_fetch_command_before_anything_slow(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            plain = Path(tmp) / "plain-clone"
+            plain.mkdir()
+            checkout_git(plain, "init", "-q")
+            before = self.scratch_dirs()
+            # Neither the model preflight nor the image build may run first: with `--build` and a `docker` that does not exist,
+            # a late check would end with "could not start", and a late preflight would call the patched function.
+            with mock.patch.object(d, "host_model_check", side_effect=AssertionError("the preflight ran first")):
+                code, out, err = self.run_main("--model", "m", "--repo", str(plain), "--build", "--docker", "no-such-docker-xyz")
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn(scoring.FETCH_COMMAND, err)
+        self.assertNotIn("could not start", err)
+        self.assertEqual(self.scratch_dirs(), before)
+
+    def test_a_bad_port_is_still_reported_when_the_checkout_would_be_refused_too(self):
+        # Arguments are checked before the checkout is: the cheaper check goes first.
+        code, _out, err = self.run_main("--dry-run", "--model", "m", "--repo", "/no/such/checkout", "--host-lmstudio-url", "http://localhost:abc/v1")
+        self.assertEqual(code, 2)
+        self.assertIn("LM Studio URL", err)
+
+    def test_a_missing_default_checkout_is_a_clean_message_naming_the_fetch(self):
+        # Without --repo the checkout is this one; stand in for a clone that lacks the tags by pointing the default somewhere without them.
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            plain = Path(tmp) / "clone"
+            plain.mkdir()
+            checkout_git(plain, "init", "-q")
+            with mock.patch.object(d, "REPO_ROOT", plain):
+                code, _out, err = self.run_main("--dry-run", "--model", "m")
+        self.assertEqual(code, 2)
+        self.assertIn(f"Run this in {plain}:", err)
+        self.assertIn(scoring.FETCH_COMMAND, err)
+
+    def test_the_old_case_flag_is_gone(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
+            d.build_parser().parse_args(["--model", "m", "--case", "seeded-three"])
+        self.assertEqual(caught.exception.code, 2)
+
+
+class ChangeInTheSummaryTests(unittest.TestCase):
+    """A driver run on a change is scored by score_run.py against the key, with a fake Pi in place of the container."""
+
+    REVIEW = ("Reasoning review: 1 finding(s) in 1 class(es) from 1 reviewer(s) (general), up to 1 diff chunk(s) each.\n"
+              "These findings are not verified.\n\n## logic (1)\n- libs/version_lib.py:35 [general] the success test is inverted\n")
+
+    def run_driver(self, *extra, review=REVIEW):
+        chunks = [
+            event("turn_start"),
+            event("tool_execution_start", toolCallId="c", toolName=d.REVIEW_TOOL, args={}),
+            event("tool_execution_end", toolCallId="c", toolName=d.REVIEW_TOOL, result={"content": [{"type": "text", "text": review}]}, isError=False),
+            event("turn_end", message={"role": "assistant", "content": []}, toolResults=[]),
+            final_message("one finding"),
+            event("agent_settled", aborted=False),
+        ]
+        process = FakeProcess(chunks)
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(d, "_spawn", lambda command, stderr_file: process), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = d.main(["--model", "m", "--no-preflight", "--repo", str(checkout()), *extra])
+        return code, json.loads(out.getvalue())
+
+    def test_the_summary_names_the_change_that_was_reviewed(self):
+        code, summary = self.run_driver()
+        self.assertEqual((code, summary["change"], summary["stopped_by"]), (0, "change-6", "completed"))
+        self.assertEqual(self.run_driver("--change", "change-5")[1]["change"], "change-5")
+
+    def test_the_change_leads_the_json_so_a_person_reading_it_sees_what_was_reviewed(self):
+        _code, summary = self.run_driver()
+        self.assertEqual(next(iter(summary)), "change")
+
+    def test_score_run_scores_it_against_the_keys_answers_with_no_flag(self):
+        _code, summary = self.run_driver()
+        score = score_run.score_summary(summary)
+        self.assertEqual((score.change, score.readable, score.found, score.missed, score.on_decoys), ("change-6", True, ["B7"], [], []))
+        self.assertIn("change=change-6", score_run.one_line(summary, score))
+
+    def test_the_same_run_on_the_clean_change_is_all_false_alarms(self):
+        _code, summary = self.run_driver("--change", "change-5", review=self.REVIEW.replace("libs/version_lib.py", "libs/qdrant_retry.py"))
+        score = score_run.score_summary(summary)
+        self.assertEqual((score.change, len(score.clean_false_alarms), score.found, score.missed), ("change-5", 1, [], []))
+
+
+class NeitherCasesNorHarnessLibTests(unittest.TestCase):
+    def test_running_the_driver_and_the_scorer_imports_neither_cases_nor_harness_lib(self):
+        # In a new interpreter: this process has long since imported both for the other harness tests. A dry run goes through every
+        # step before docker, including building the repository from the tags; scoring goes through the key.
+        program = (
+            "import sys\n"
+            f"sys.path.insert(0, {str(PI_DIR)!r})\n"
+            "import pi_driver, score_run\n"
+            f"code = pi_driver.main(['--dry-run', '--model', 'm', '--no-preflight', '--repo', {str(checkout())!r}])\n"
+            "score_run.score_summary({'change': 'change-6', 'review_text': 'Reasoning review: 0 finding(s)\\n'})\n"
+            "print('RESULT', code, sorted(m for m in ('cases', 'harness_lib', 'live_branch_lib') if m in sys.modules))\n"
+        )
+        completed = subprocess.run([sys.executable, "-I", "-c", program], capture_output=True, text=True, timeout=120)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip().splitlines()[-1], "RESULT 0 []")
+
+    def test_neither_source_names_either_module_in_an_import(self):
+        for name in ("pi_driver.py", "score_run.py"):
+            source = (PI_DIR / name).read_text(encoding="utf-8")
+            with self.subTest(file=name):
+                self.assertNotRegex(source, r"(?m)^\s*(import|from)\s+(cases|harness_lib|live_branch_lib)\b")
+
+
+class ModelKnownTests(unittest.TestCase):
+    def listing(self, *ids) -> io.BytesIO:
+        return io.BytesIO(json.dumps({"data": [{"id": model} for model in ids]}).encode("utf-8"))
+
+    def test_a_listed_model_is_known_and_an_unlisted_one_is_not(self):
+        with mock.patch.object(d.urllib.request, "urlopen", return_value=self.listing("a", "b")) as opened:
+            self.assertIs(d.model_known("http://host:1234/v1", "a"), True)
+        self.assertEqual(opened.call_args.args[0], "http://host:1234/api/v0/models")  # the REST API is at the root, not under /v1
+        with mock.patch.object(d.urllib.request, "urlopen", return_value=self.listing("a")):
+            self.assertIs(d.model_known("http://host:1234/v1/", "z"), False)
+
+    def test_a_server_that_cannot_be_asked_or_answers_oddly_is_unknown_not_a_no(self):
+        for outcome in (urllib.error.URLError("refused"), TimeoutError("slow"), io.BytesIO(b"not json"), io.BytesIO(b'{"nodata": 1}')):
+            with self.subTest(outcome=repr(outcome)[:30]):
+                kwargs = {"side_effect": outcome} if isinstance(outcome, Exception) else {"return_value": outcome}
+                with mock.patch.object(d.urllib.request, "urlopen", **kwargs):
+                    self.assertIsNone(d.model_known("http://host:1234/v1", "a"))
 
 
 class DockerfileTests(unittest.TestCase):

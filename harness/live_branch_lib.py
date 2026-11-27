@@ -2,179 +2,55 @@
 
 A `synthetic` run reviews mock scenarios from `cases.py`, whose answers sit in the code. A `live` run reviews real
 changes on the `harness-live-tests` branch (tags `harness-live-tests/change-N` on top of `harness-live-tests/base`).
-The answer key is deliberately not on that branch (a model must not be able to grep it), so it lives in the config's
-`<config>.baselines.json`, in `metadata.tags`: for each tag, the bugs and decoys a run is scored against. See
-`harness/README.md`, "A real repository with seeded bugs", for the same key in a table for people.
+The answer key is deliberately not on that branch (a model must not be able to grep it), so for these runners it lives in the
+config's `<config>.baselines.json`, in `metadata.tags`: for each tag, the bugs and decoys a run is scored against. See
+`harness/README.md`, "A real repository with seeded bugs", for the same key in a table for people. The same key, once, is
+`harness/live-tests/answer_key.json`, which the Pi scorer reads; the sidecar copies go when these runners do.
 
-Scoring (the issue's rules): a finding within `LINE_TOLERANCE` lines of a bug's line, in that file, is a hit; one at a
-decoy's line is a false positive; any finding on a clean tag is a false positive; anything else is UNSCORED, reported
-but never counted against a model, because the code is real and may have real bugs nobody has listed. A tie between a
-bug and a decoy goes to the bug, as in `harness_lib.score`.
+The answer key's data model and parser, the scoring rules (a finding near a bug's line is a hit, at a decoy's line a false
+positive, on a clean tag a false positive, anything else UNSCORED and never counted against a model), the per-evidence-kind
+totals and the branch's ref names are in `live_scoring_lib.py`, which depends on nothing else in the harness. They are imported
+here, so a runner reaches them as `live_branch_lib.<name>` as before. What stays here is what only these runners need: reading
+the sidecar, finding the tags in a checkout, and the report they print.
 
 Results are reported per evidence kind (`diff`, `same-file`, `other-file`), because that is the point of a live run:
 whether a model whose proof is in another file asks for it (the `need:` loop).
 """
 
 import json
-import subprocess
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 import harness_lib as h
+# Re-exported on purpose: the runners and their tests use these as `lb.<name>` (a name imported here only for that is marked).
+from live_scoring_lib import (  # noqa: F401
+    BASE_REF,
+    EVIDENCE_KINDS,
+    FETCH_COMMAND,
+    PREFIX,
+    LiveBug,
+    LiveDecoy,
+    LiveMetadataError,
+    LiveTag,
+    TagScore,
+    kind_totals,
+    missing_refs,
+    missing_refs_message,
+    parse_live_metadata,
+    score_tag,
+)
 
-PREFIX = "harness-live-tests/"
-BASE_REF = PREFIX + "base"
-EVIDENCE_KINDS = ("diff", "same-file", "other-file")
 BASELINES_SUFFIX = ".baselines.json"
 # Printed by live_all_reviewers.py around its two reports when a verifier runs; `run_live_tests.py` reads the bars from after the second.
 # Not `===== before verification`: that is the synthetic marker, and a substring search for it must not find these.
 LIVE_BEFORE_MARK = "===== live before verification"
 LIVE_AFTER_MARK = "===== live after verification (everything not rejected)"
-# What to run when a tag is missing: the README's own command, so a person can paste it.
-FETCH_COMMAND = "git fetch origin harness-live-tests 'refs/tags/harness-live-tests/*:refs/tags/harness-live-tests/*'"
 
 # `expect` keys a live sidecar may carry: one bar per evidence kind for bugs found and for decoys alarmed, and one for the
 # clean control. Written with underscores (a JSON key), where the kind itself has hyphens.
 BAR_KEYS = tuple([f"min_{kind.replace('-', '_')}_found" for kind in EVIDENCE_KINDS]
                  + [f"max_{kind.replace('-', '_')}_decoy_alarms" for kind in EVIDENCE_KINDS]
                  + ["max_clean_false_positives"])
-
-
-class LiveMetadataError(ValueError):
-    """A live sidecar's `metadata` that cannot be used; the message names the key."""
-
-
-@dataclass(frozen=True)
-class LiveBug:
-    id: str
-    file: str
-    line: int
-    cls: str
-    claim: str
-    evidence: str
-
-
-@dataclass(frozen=True)
-class LiveDecoy:
-    id: str
-    file: str
-    line: int
-    claim: str
-    evidence: str
-
-
-@dataclass(frozen=True)
-class LiveTag:
-    tag_id: str  # `change-1`, without the `harness-live-tests/` prefix
-    bugs: tuple = ()
-    decoys: tuple = ()
-    clean: bool = False  # the control: no change in behaviour, so any finding is a false positive
-
-    @property
-    def head(self) -> str:
-        return PREFIX + self.tag_id
-
-
-@dataclass
-class TagScore:
-    """One run's findings against one tag."""
-
-    found: list = field(default_factory=list)  # bug ids hit
-    missed: list = field(default_factory=list)
-    on_decoys: list = field(default_factory=list)  # decoy ids alarmed
-    clean_false_positives: list = field(default_factory=list)  # findings on a clean tag
-    unscored: list = field(default_factory=list)  # matched nothing: reported, never counted against a model
-
-
-# ---------------------------------------------------------------------------
-# metadata
-# ---------------------------------------------------------------------------
-
-
-def _string(where: str, data: dict, key: str) -> str:
-    value = data.get(key)
-    if not isinstance(value, str) or not value.strip():
-        raise LiveMetadataError(f"{where}: '{key}' must be a non-empty string")
-    return value
-
-
-def _line(where: str, data: dict) -> int:
-    value = data.get("line")
-    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-        raise LiveMetadataError(f"{where}: 'line' must be a whole number from 1")
-    return value
-
-
-def _evidence(where: str, data: dict) -> str:
-    value = data.get("evidence")
-    if value not in EVIDENCE_KINDS:
-        raise LiveMetadataError(f"{where}: 'evidence' is {value!r}, which is none of {list(EVIDENCE_KINDS)}")
-    return value
-
-
-def _only(where: str, data: dict, allowed: tuple) -> None:
-    extra = sorted(set(data) - set(allowed))
-    if extra:
-        raise LiveMetadataError(f"{where}: unknown key(s) {extra} (allowed: {list(allowed)}); a misspelt key would otherwise be ignored")
-
-
-def parse_live_metadata(metadata) -> tuple:
-    """The `LiveTag`s a live sidecar's `metadata` names, or `LiveMetadataError` naming what is wrong.
-
-    Strict on purpose: a typo in an answer key (a misspelt `line`, a bug left out of a tag) would change a score
-    without anything saying so."""
-    if not isinstance(metadata, dict) or not isinstance(metadata.get("tags"), list) or not metadata["tags"]:
-        raise LiveMetadataError("a live run's 'metadata' needs 'tags': a non-empty list, one entry per tag the run is against")
-    _only("metadata", metadata, ("tags",))
-    tags: list = []
-    seen_tags: set = set()
-    seen_ids: set = set()
-    for position, raw in enumerate(metadata["tags"]):
-        where = f"metadata.tags[{position}]"
-        if not isinstance(raw, dict):
-            raise LiveMetadataError(f"{where} must be an object")
-        _only(where, raw, ("tagId", "clean", "bugs", "decoys"))
-        tag_id = _string(where, raw, "tagId")
-        if "/" in tag_id:
-            raise LiveMetadataError(f"{where}: 'tagId' is {tag_id!r}; write it without the '{PREFIX}' prefix (for example 'change-1')")
-        if tag_id == "base":
-            raise LiveMetadataError(f"{where}: 'base' is what every tag is compared with, not a tag to review")
-        if tag_id in seen_tags:
-            raise LiveMetadataError(f"{where}: tag {tag_id!r} is listed twice")
-        seen_tags.add(tag_id)
-        where = f"metadata.tags[{tag_id}]"
-        clean = raw.get("clean", False)
-        if not isinstance(clean, bool):
-            raise LiveMetadataError(f"{where}: 'clean' must be true or false")
-        for key in ("bugs", "decoys"):
-            if not isinstance(raw.get(key), list):
-                raise LiveMetadataError(f"{where}: '{key}' must be a list (empty when the tag has none)")
-        bugs, decoys = [], []
-        for entry in raw["bugs"]:
-            at = f"{where}.bugs"
-            if not isinstance(entry, dict):
-                raise LiveMetadataError(f"{at}: each entry must be an object")
-            _only(at, entry, ("id", "file", "line", "class", "claim", "evidence"))
-            bugs.append(LiveBug(_string(at, entry, "id"), _string(at, entry, "file"), _line(at, entry), _string(at, entry, "class"),
-                                _string(at, entry, "claim"), _evidence(at, entry)))
-        for entry in raw["decoys"]:
-            at = f"{where}.decoys"
-            if not isinstance(entry, dict):
-                raise LiveMetadataError(f"{at}: each entry must be an object")
-            _only(at, entry, ("id", "file", "line", "claim", "evidence"))
-            decoys.append(LiveDecoy(_string(at, entry, "id"), _string(at, entry, "file"), _line(at, entry), _string(at, entry, "claim"),
-                                    _evidence(at, entry)))
-        for item_id in [*(b.id for b in bugs), *(d.id for d in decoys)]:
-            if item_id in seen_ids:
-                raise LiveMetadataError(f"{where}: id {item_id!r} is used twice (ids are unique across the whole file)")
-            seen_ids.add(item_id)
-        if clean and (bugs or decoys):
-            raise LiveMetadataError(f"{where}: 'clean' is true but it lists bugs or decoys; a clean control has none")
-        if not clean and not bugs and not decoys:
-            raise LiveMetadataError(f"{where}: lists no bugs and no decoys; if it is the clean control say \"clean\": true, so an empty tag is never an accident")
-        tags.append(LiveTag(tag_id, tuple(bugs), tuple(decoys), clean))
-    return tuple(tags)
 
 
 def check_bars(expect: dict) -> Optional[str]:
@@ -193,24 +69,11 @@ def check_bars(expect: dict) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 
-def missing_refs(repo: Path, tags: tuple) -> list:
-    """The refs among `base` and `tags` that `repo` does not have as commits."""
-    missing = []
-    for ref in (BASE_REF, *(tag.head for tag in tags)):
-        found = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
-                               capture_output=True, text=True, check=False)
-        if found.returncode != 0:
-            missing.append(ref)
-    return missing
-
-
 def require_refs(repo: Path, tags: tuple) -> None:
     """Stop with the exact `git fetch` command when a tag is missing, before any model is loaded."""
     missing = missing_refs(repo, tags)
     if missing:
-        # The README's own command, verbatim, so it can be pasted; it names the place to run it instead of using `git -C`.
-        raise SystemExit(f"{repo} does not have {', '.join(missing)}. A single-branch clone does not carry the live branch. "
-                         f"Run this in {repo}:\n  {FETCH_COMMAND}")
+        raise SystemExit(missing_refs_message(repo, missing))
 
 
 def sidecar_path(config: str) -> Path:
@@ -249,37 +112,8 @@ def live_target(args) -> tuple:
 
 
 # ---------------------------------------------------------------------------
-# scoring and reporting
+# reporting
 # ---------------------------------------------------------------------------
-
-
-def _text(finding) -> str:
-    return f"{finding.file}:{finding.line_start}-{finding.line_end} [{finding.cls}] {finding.claim[:90]}"
-
-
-def score_tag(findings: list, tag: LiveTag) -> TagScore:
-    """Score one run's findings (as `harness_lib.distinct_claims` gives them) against one tag."""
-    result = TagScore()
-    bug_at = {bug.id: (bug.file, bug.line) for bug in tag.bugs}
-    decoy_at = {decoy.id: (decoy.file, decoy.line) for decoy in tag.decoys}
-    found: set = set()
-    alarmed: set = set()
-    for finding in findings:
-        if tag.clean:
-            result.clean_false_positives.append(_text(finding))
-            continue
-        bug = h._nearest(finding, bug_at, frozenset(found))
-        decoy = h._nearest(finding, decoy_at)
-        if bug is not None and (decoy is None or bug[1] <= decoy[1]):
-            found.add(bug[0])
-        elif decoy is not None:
-            alarmed.add(decoy[0])
-        else:
-            result.unscored.append(_text(finding))
-    result.found = [bug.id for bug in tag.bugs if bug.id in found]
-    result.missed = [bug.id for bug in tag.bugs if bug.id not in found]
-    result.on_decoys = [decoy.id for decoy in tag.decoys if decoy.id in alarmed]
-    return result
 
 
 def format_tag(tag: LiveTag, scores: list) -> str:
@@ -300,22 +134,6 @@ def format_tag(tag: LiveTag, scores: list) -> str:
     lines.append(f"  unscored findings: {len(unscored)} over {runs} run(s) (matched no listed bug or decoy; not counted against the model)")
     lines.extend(f"    - {text}" for text in dict.fromkeys(unscored))
     return "\n".join(lines)
-
-
-def kind_totals(tags: tuple, scores_by_tag: dict) -> dict:
-    """`{kind: (bugs, found per run, decoys, alarms per run)}`, the per-run values averaged over the runs."""
-    runs = len(next(iter(scores_by_tag.values()))) if scores_by_tag else 0
-    totals = {}
-    for kind in EVIDENCE_KINDS:
-        bugs = sum(1 for t in tags for b in t.bugs if b.evidence == kind)
-        decoys = sum(1 for t in tags for d in t.decoys if d.evidence == kind)
-        found = alarms = 0
-        for tag in tags:
-            for score in scores_by_tag.get(tag.tag_id, []):
-                found += sum(1 for b in tag.bugs if b.evidence == kind and b.id in score.found)
-                alarms += sum(1 for d in tag.decoys if d.evidence == kind and d.id in score.on_decoys)
-        totals[kind] = (bugs, found / runs if runs else 0.0, decoys, alarms / runs if runs else 0.0)
-    return totals
 
 
 def _num(value: float) -> str:

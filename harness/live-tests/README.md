@@ -132,7 +132,7 @@ Two kinds of check apply to each:
     all of them (2 runs, 38 bugs); spelled out, a case added to `cases.py` later does not change what they claim.
   - **A live sidecar** (`"runType": "live"`) is the answer key for a run of the `harness-live-tests` branch, so its `metadata`
     names the `tags` the numbers were counted on and, for each, the bugs and decoys a run is scored against
-    (`harness/live_branch_lib.py`; the scoring rules and the table of the real branch are in [../README.md](../README.md)):
+    (`harness/live_scoring_lib.py` reads and scores it; the scoring rules and the table of the real branch are in [../README.md](../README.md)):
 
     ```json
     {"measured": "2026-11-08", "model": "some-model", "runType": "live",
@@ -154,6 +154,12 @@ Two kinds of check apply to each:
     mode, so a live sidecar on a verifier-only or classifier-only config is listed as not runnable. The runner fails the run
     when the tags the output reports are not the ones the sidecar names, and, with a verifier, applies the bars to what is
     left standing after it.
+
+    The same key, once, is [`answer_key.json`](answer_key.json) in this folder: exactly the `metadata` above (`{"tags": [...]}`),
+    tied to no config. The Pi scorer and the Pi driver read it ([../pi/README.md](../pi/README.md)). It is never on the branch and
+    never given to a container: the driver mounts `libs/` and `mcpservers/` of this checkout and nothing else of it. Until the
+    runners that read the sidecars are removed, an answer is changed in the key, in every live sidecar and in the table in
+    [../README.md](../README.md), and `tests/test_harness_live_scoring.py` fails when the key differs from a sidecar's `metadata`.
 
 | Kind (script) | `expect` key | Meaning |
 | :--- | :--- | :--- |
