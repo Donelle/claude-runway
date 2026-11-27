@@ -896,6 +896,10 @@ class AutoworkAgentTypeTests(unittest.TestCase):
         section = _normalized(self.content)
         self.assertIn("the `model` pinned in `.claude/agents/autowork-ticket.md`", section)
         self.assertNotIn("the harness default this conversation is itself running as", section)
+        # The BLOCKED follow-up launches the same agent type with no `model`, so it runs on the
+        # pinned model too; the old "Model choice is the orchestrator's call" line said otherwise.
+        self.assertIn("The follow-up runs on the model pinned in `.claude/agents/autowork-ticket.md`", section)
+        self.assertNotIn("Model choice is the orchestrator's call", section)
 
     def test_allow_list_covers_the_basics_the_procedure_uses(self):
         # Bash (git/gh/uv/tests), Read/Edit/Write (files and plans), ToolSearch (the only way
