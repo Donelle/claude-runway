@@ -7,6 +7,7 @@ Stdlib-only (unittest), no network. The tools run against a real throwaway git r
     .venv/bin/python -m unittest discover -s tests
 """
 
+import json
 import os
 import sys
 import tempfile
@@ -177,6 +178,123 @@ class OnlyTheHeadsTrackedFilesAreVisible(RepoCase):
             result = tools.ToolExecutor(root, git(root, "rev-parse", "HEAD")).run("grep", {"pattern": "^hit"})
             self.assertTrue(result.truncated)
             self.assertLessEqual(result.text.count("\n") + 1, tools.GREP_MAX_LINES + 1)
+
+
+class RegexSyntax(unittest.TestCase):
+    """The shorthands must mean the same on every platform, and a pattern that would not be read as meant must be an error:
+    `git grep -E` said "no matches" for `\\b` on macOS, which tells a verifier the symbol is not there."""
+
+    FILE = "def total_price(items):\n    count = 1234\n    kinds = List<int>\n    path = a\\sb\n"
+    # git's own words, from a build without PCRE2.
+    NO_PCRE = b"fatal: cannot use Perl-compatible regexes when not compiled with USE_LIBPCRE\n"
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        self.ex = tools.ToolExecutor(root, build_repo_with(root, {"m.py": self.FILE}))
+
+    def without_pcre(self):
+        """Makes the executor's git refuse `-P` as a build without PCRE2 does; returns the modes it was asked to run."""
+        modes: list = []
+        real = self.ex._git_limited
+
+        def fake(args, max_bytes):
+            if args[0] == "grep":
+                modes.append("-P" if "-P" in args else "-E")
+                if "-P" in args:
+                    return tools._Limited(128, b"", self.NO_PCRE, False)
+            return real(args, max_bytes)
+
+        self.ex._git_limited = fake
+        return modes
+
+    def assert_line(self, pattern, number):
+        result = self.ex.run("grep", {"pattern": pattern})
+        self.assertFalse(result.error, f"{pattern!r}: {result.text}")
+        self.assertIn(f"m.py:{number}:", result.text, pattern)
+
+    def assert_refused(self, pattern, *needles):
+        result = self.ex.run("grep", {"pattern": pattern})
+        self.assertTrue(result.error, f"{pattern!r}: {result.text}")
+        self.assertNotEqual(result.text, "no matches")
+        for needle in needles:
+            self.assertIn(needle, result.text)
+
+    def test_each_shorthand_matches_a_known_line(self):
+        for pattern, number in ((r"\bdef total_price\b", 1), (r"def\stotal_price", 1), (r"def \w+\(", 1), (r"= \d{4}", 2)):
+            self.assert_line(pattern, number)
+
+    def test_extended_regular_expression_forms_still_match(self):
+        for pattern, number in (
+            ("def (other|total_price)", 1),
+            (r"total_price\(items\)", 1),
+            ("def[[:space:]]+total", 1),
+            ("count = [0-9]{4}", 2),
+            (r"a\\sb", 4),
+            ("List<int>", 3),
+        ):
+            self.assert_line(pattern, number)
+
+    def test_a_shorthand_that_matches_nothing_is_still_no_matches(self):
+        result = self.ex.run("grep", {"pattern": r"\bzzz_not_anywhere\b"})
+        self.assertFalse(result.error, result.text)
+        self.assertEqual(result.text, "no matches")
+
+    def test_posix_word_boundaries_in_angle_brackets_are_refused_not_read_as_characters(self):
+        for pattern in (r"\<total_price", r"total_price\>"):
+            self.assert_refused(pattern, r"use \b")
+
+    def test_a_backspace_from_a_single_backslash_in_json_is_refused(self):
+        pattern = json.loads('{"pattern": "\\btotal_price"}')["pattern"]
+        self.assertEqual(pattern[0], "\b")
+        self.assert_refused(pattern, "backspace", "two backslashes")
+
+    def test_a_repeat_with_no_lower_bound_is_refused(self):
+        for pattern in ("= 1{,3}", "= 1{ , 3 }"):
+            self.assert_refused(pattern, "{0,n}")
+        self.assert_line("count = [0-9]{0,4}", 2)
+
+    def test_a_brace_and_comma_that_are_not_a_repeat_are_searched_for(self):
+        for pattern in ("count[ {,]", r"zzz\{,3}"):
+            result = self.ex.run("grep", {"pattern": pattern})
+            self.assertFalse(result.error, f"{pattern!r}: {result.text}")
+
+    def test_a_bad_pattern_holding_gits_build_flag_does_not_switch_pcre_off(self):
+        # git repeats a pattern that does not compile in its error, so the words are there on a git that has PCRE2.
+        self.assert_refused("(USE_LIBPCRE", "grep failed")
+        self.assert_line(r"\bcount\b", 2)
+
+    def test_without_pcre_a_plain_pattern_still_matches_and_pcre_is_not_tried_again(self):
+        modes = self.without_pcre()
+        self.assert_line("def (other|total_price)", 1)
+        self.assert_line("def[[:space:]]+total", 1)
+        # The first -P is the search, the second the check with a fixed pattern.
+        self.assertEqual(modes, ["-P", "-P", "-E", "-E"])
+
+    def test_without_pcre_a_shorthand_is_refused_by_name_and_never_run(self):
+        modes = self.without_pcre()
+        for shorthand in (r"\b", r"\B", r"\w", r"\W", r"\s", r"\S", r"\d", r"\D", r"\t", r"\1", r"\`", r"\'"):
+            self.assert_refused(f"total{shorthand}price", "without PCRE", shorthand)
+        self.assertNotIn("-E", modes)
+
+    def test_without_pcre_an_escaped_backslash_or_punctuation_is_not_a_shorthand(self):
+        self.without_pcre()
+        self.assert_line(r"a\\sb", 4)
+        self.assert_line(r"total_price\(items\)", 1)
+
+    def test_another_pcre_error_is_reported_and_does_not_switch_modes(self):
+        modes: list = []
+        real = self.ex._git_limited
+
+        def spy(args, max_bytes):
+            modes.extend(a for a in args if a in ("-P", "-E"))
+            return real(args, max_bytes)
+
+        self.ex._git_limited = spy
+        self.assert_refused("(unclosed", "grep failed")
+        self.assert_line(r"\bcount\b", 2)
+        self.assertEqual(modes, ["-P", "-P"])
 
 
 class FoundByTheReview(unittest.TestCase):

@@ -27,8 +27,24 @@ The contract, which every caller relies on:
   * **A cut or a failure is never silent.** A result that was shortened says where, in its text, and sets `truncated`; a
     line that was clipped says how much; a failure is an error result, never an empty answer.
 
-The tools: `read_file(path, start_line, end_line)` and `grep(pattern, path_glob)` (an extended regular expression, matched by
-`git grep`, so the same for every language).
+The tools: `read_file(path, start_line, end_line)` and `grep(pattern, path_glob)` (a Perl-compatible regular expression,
+matched by `git grep -P`, so the same for every language).
+
+**Which regex syntax `grep` takes, and why it is Perl's.** `git grep -E` uses the platform's POSIX regex library: glibc
+accepts `\\b`, `\\w` and `\\s`, while macOS's reads them as plain letters, so the same pattern found a definition on Linux and
+said "no matches" on macOS. A wrong "no matches" tells a verifier a symbol is absent, so the rule is that a pattern that
+would not be read as meant is an error, never an empty answer:
+
+  * `-P` (PCRE2) reads those shorthands the same wherever git has it. Only when git says it was built without it
+    (`USE_LIBPCRE` in its error, for a fixed pattern too: git repeats a bad pattern in its error, so those words alone may
+    be the model's own) does the executor use `-E`, and then it REFUSES a pattern with a shorthand (a backslash before a
+    letter, a digit, a backquote or a quote) instead of rewriting it: a wrong rewrite would be the same silent miss.
+  * `\\<` and `\\>` are refused in both: PCRE reads them as a literal `<` and `>`.
+  * `{,n}` is refused in both: not every regex library reads it as a repeat, and one that does not looks for the text.
+  * A backspace character is refused: it is what a single-backslash `\\b` in a JSON request decodes to.
+
+One limit: whether `\\w`, `\\b`, `\\d` and `\\s` count a character outside ASCII depends on the locale of the process that
+runs git.
 
 Standard library only, apart from `ReviewError` from the reasoning stage.
 """
@@ -61,6 +77,13 @@ MAX_GREP_OUTPUT_BYTES = 400_000
 TOOL_NAMES = ("read_file", "grep")
 
 _WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:")
+# A backslash and what it escapes. Matched left to right in pairs, so in `\\s` (a literal backslash, then `s`) the pair is
+# the two backslashes and the `s` is not read as escaped.
+_ESCAPE = re.compile(r"\\(.)")
+# git's own words when it was built without PCRE2. The part that names the build flag, so a translated message still matches.
+_NO_PCRE = b"USE_LIBPCRE"
+# A repeat count with no lower bound, `{,3}`. Only that whole shape: `[({,]` is an ordinary set of characters.
+_NO_LOWER_BOUND = re.compile(r"\{ *, *\d+ *\}")
 
 
 @dataclass(frozen=True)
@@ -138,6 +161,8 @@ class ToolExecutor:
         self.head = head
         self._tracked: Optional[frozenset] = None
         self._files: dict = {}
+        # Cleared the first time git says it has no PCRE2; how git was built does not change during a run.
+        self._pcre = True
         self._tools: dict = {
             "read_file": self._tool_read_file,
             "grep": self._tool_grep,
@@ -275,6 +300,12 @@ class ToolExecutor:
                 self._files[clean] = (done.stdout.decode("utf-8", errors="replace"), None)
         return self._files[clean]
 
+    def _git_lacks_pcre(self) -> bool:
+        """Whether git refuses `-P` for a pattern that is certainly valid. Asked before giving up on PCRE, because the
+        error for a pattern that does not compile repeats the pattern, which may itself hold the words looked for."""
+        probe = self._git_limited(["grep", "-q", "-P", "-e", "x", self.head, "--"], 1000)
+        return probe is not None and _says_no_pcre(probe)
+
     # -- the tools ------------------------------------------------------------------------------------------------------
 
     def _tool_read_file(self, args: dict) -> ToolResult:
@@ -323,10 +354,25 @@ class ToolExecutor:
         # A glob is a path pattern, nothing else: `:(...)` is git's own pathspec syntax and `..` leaves the repo.
         if glob.startswith((":", "/")) or ".." in glob.split("/") or _WINDOWS_DRIVE.match(glob):
             return _error(f"path_glob {glob!r} must be a plain pattern relative to the repository root, for example 'libs/*.py'")
-        command = ["grep", "-n", "-I", "-E", "--no-color", "-e", pattern, self.head, "--"]
-        if glob:
-            command.append(f":(glob){glob}")
-        done = self._git_limited(command, MAX_GREP_OUTPUT_BYTES)
+        problem = _misread_in_any_mode(pattern)
+        if problem:
+            return _error(problem)
+        paths = [f":(glob){glob}"] if glob else []
+
+        def search(mode: str) -> Optional[_Limited]:
+            command = ["grep", "-n", "-I", mode, "--no-color", "-e", pattern, self.head, "--", *paths]
+            return self._git_limited(command, MAX_GREP_OUTPUT_BYTES)
+
+        done = None
+        if self._pcre:
+            done = search("-P")
+            if done is not None and _says_no_pcre(done) and self._git_lacks_pcre():
+                self._pcre = False
+        if not self._pcre:
+            problem = _misread_without_pcre(pattern)
+            if problem:
+                return _error(problem)
+            done = search("-E")
         if done is None:
             return _error("grep timed out or git is not available")
         if done.returncode == 1:
@@ -348,6 +394,38 @@ class ToolExecutor:
 
 def _error(text: str) -> ToolResult:
     return ToolResult(text, error=True)
+
+
+def _says_no_pcre(done: _Limited) -> bool:
+    return done.returncode not in (0, 1) and _NO_PCRE in done.stderr
+
+
+def _misread_in_any_mode(pattern: str) -> Optional[str]:
+    """Why `pattern` would not be read as meant even by `git grep -P`, or None. Each of these would otherwise come back as
+    "no matches" on at least one platform."""
+    if "\b" in pattern:
+        return (
+            "the pattern holds a backspace character, which is what a single backslash before b means inside JSON; "
+            "for a word boundary write \\\\b in JSON (two backslashes)"
+        )
+    if any(escaped in "<>" for escaped in _ESCAPE.findall(pattern)):
+        return "grep does not take \\< or \\>: use \\b for a word boundary, or < and > with no backslash for the characters"
+    # Escapes are blanked first, so the literal text `\{,3}` is not taken for a repeat count.
+    if _NO_LOWER_BOUND.search(_ESCAPE.sub("_", pattern)):
+        return "grep does not take {,n}: write {0,n}"
+    return None
+
+
+def _misread_without_pcre(pattern: str) -> Optional[str]:
+    """Why `pattern` cannot be run with `git grep -E`, or None. What a backslash before a letter, a digit, a backquote or a
+    quote means differs between POSIX regex libraries, and one that does not know it matches the plain character."""
+    found = sorted({f"\\{c}" for c in _ESCAPE.findall(pattern) if c.isalnum() or c in "`'"})
+    if not found:
+        return None
+    return (
+        f"this git was built without PCRE, so grep cannot use {', '.join(found)}: write an extended regular expression "
+        "instead, for example [[:space:]] for a space, [[:alnum:]_] for a word character, [[:digit:]] for a digit"
+    )
 
 
 def _unexpected(args: dict, tool: str, allowed: set) -> Optional[str]:
