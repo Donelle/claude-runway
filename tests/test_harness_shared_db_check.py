@@ -85,6 +85,10 @@ class Base(unittest.TestCase):
         self.folder = Path(self._tmp.name).resolve()
         self.home = self.folder / "home"
         self.home.mkdir()
+        # These tests need no Docker: one that would reach it fails here, instead of running a real `docker rm`.
+        guard = mock.patch.object(pi_driver, "_docker", side_effect=AssertionError("a test reached docker"))
+        guard.start()
+        self.addCleanup(guard.stop)
 
     def trial(self, spawn, **changes) -> "check.TrialResult":
         values = {"writers": 3, "records": 4, "timeout": 120, "docker": "docker", "image": "img", "spawn": spawn,
@@ -178,25 +182,44 @@ class TrialTests(Base):
             self.trial(spawn, remove=removed.append)
         for process in writers.processes:
             process.communicate(timeout=30)
-        self.assertEqual(len(removed), 2)
+        # The two that started, and the one whose start was interrupted, which may have started a container too.
+        self.assertEqual(len(removed), 3)
 
 
 SAID = "could not confirm that the container X is gone; check `docker ps -a`"
 
 
 class FakeWriter:
-    """A `docker run` client that ends with 0, or never ends on its own (`hangs`)."""
+    """A `docker run` client that ends with `code`, or never ends on its own (`hangs`)."""
 
-    def __init__(self, hangs: bool = False) -> None:
-        self.hangs = hangs
+    def __init__(self, hangs: bool = False, code: int = 0) -> None:
+        self.hangs, self.code = hangs, code
 
     def wait(self, timeout=None):
         if self.hangs:
             raise subprocess.TimeoutExpired("docker", timeout or 0)
-        return 0
+        return self.code
 
     def kill(self) -> None:
         pass
+
+
+class InterruptedWriter(FakeWriter):
+    """Ctrl+C arrives while the script waits for this one."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.interrupted = False
+
+    def wait(self, timeout=None):
+        if not self.interrupted:
+            self.interrupted = True
+            raise KeyboardInterrupt
+        return super().wait(timeout)
+
+
+def writer_index(command: list) -> int:
+    return int(command[-3])
 
 
 def hanging(command, stderr_file):
@@ -268,22 +291,58 @@ class ContainerThatCannotBeRemovedTests(Base):
         self.assertNotIn("warning", said)
 
     def test_a_check_that_could_not_run_keeps_the_folder_when_a_container_stays(self):
-        def refused_then_stuck(command, stderr_file):
-            if command[-3] == "0":
-                return FakeWriter(hangs=True)
-            refused = FakeWriter()
-            refused.wait = lambda timeout=None: 125
-            return refused
+        def stuck_then_refused(command, stderr_file):
+            return FakeWriter(hangs=True) if writer_index(command) == 0 else FakeWriter(code=125)
 
-        code, said, left = self.run_main(refused_then_stuck, mock.Mock(return_value=SAID))
+        code, said, left = self.run_main(stuck_then_refused, mock.Mock(return_value=SAID))
         self.assertEqual((code, len(left)), (2, 1))
         self.assertIn(f"warning: {SAID}", said)
+
+    def removed_names(self, answer=None) -> tuple:
+        """`(a `remove` that records the writer's number, the list it records in)`."""
+        removed: list = []
+
+        def remove(name):
+            removed.append(int(name.rsplit("-", 1)[1]))
+            return answer
+
+        return remove, removed
+
+    def test_a_client_that_fails_does_not_show_that_its_container_is_gone(self):
+        # A client that is killed, or loses the daemon, exits with an error while its container goes on writing.
+        remove, removed = self.removed_names(SAID)
+        with mock.patch.object(check, "read_back", side_effect=AssertionError("the database was read")):
+            result = self.trial(lambda command, err: FakeWriter(code=1 if writer_index(command) == 0 else 0),
+                                writers=2, remove=remove)
+        self.assertEqual((removed, result.exit_codes, result.passed), ([0], [1, 0], False))
+        self.assertIn("not read", result.problem)
+
+    def test_a_client_that_fails_has_the_database_read_once_its_container_is_removed(self):
+        remove, removed = self.removed_names()
+        result = self.trial(lambda command, err: FakeWriter(code=1), writers=2, remove=remove)
+        self.assertEqual((removed, result.integrity, result.problem, result.passed), ([0, 1], "ok", "", False))
+
+    def test_an_interrupt_just_after_a_client_started_still_removes_its_container(self):
+        remove, removed = self.removed_names()
+        with self.assertRaises(KeyboardInterrupt):
+            self.trial(interrupted_at_the_second_writer(), writers=2, remove=remove)
+        self.assertEqual(removed, [0, 1])
+
+    def test_an_interrupt_leaves_alone_a_writer_that_already_ended_with_0(self):
+        # Removing it again would, with a daemon that does not answer, wait on it and name it for nothing.
+        remove, removed = self.removed_names()
+        with self.assertRaises(KeyboardInterrupt):
+            self.trial(lambda command, err: InterruptedWriter() if writer_index(command) == 1 else FakeWriter(),
+                       writers=3, remove=remove)
+        self.assertEqual(removed, [1, 2])
 
 
 class MainTests(Base):
     def run_main(self, *argv, spawn=None):
         out, err = io.StringIO(), io.StringIO()
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        # A writer that does not exit 0 has its container removed; here every removal succeeds.
+        with mock.patch.object(check.pi_driver, "remove_container", return_value=None), contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(err):
             code = check.main(["--folder", str(self.folder / "logs"), "--writers", "2", "--records", "2", *argv],
                               spawn=spawn or HostWriters(self.home))
         return code, out.getvalue(), err.getvalue()

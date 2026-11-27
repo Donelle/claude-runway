@@ -144,10 +144,10 @@ def run_trial(
     remove: Optional[Callable[[str], Optional[str]]] = None, unaccounted: Optional[dict] = None,
 ) -> TrialResult:
     """One trial in `database_dir`, which must not hold a database yet. `spawn(command, stderr_file)` returns an object with
-    `wait(timeout)` and `kill()`; `remove(name)` removes a container, returning None when it is gone, else what to tell the
-    user. `unaccounted` is filled with the containers not known to be gone, each with what to tell the user. It is empty when
-    every one has ended or been removed, however the trial ends, and while it is not, one may still be writing: the database
-    is not read. Raises CannotRun."""
+    `wait(timeout)` and `kill()`, and raises CannotRun when it starts nothing; `remove(name)` removes a container, returning
+    None when it is gone, else what to tell the user. A container is known to be gone only when its client ended with 0 or its
+    removal was confirmed. `unaccounted` holds the others, each with what to tell the user, from before its client starts: while
+    it holds any, one may still be writing, and the database is not read. Raises CannotRun."""
     remove = remove or (lambda name: pi_driver.remove_container(docker, name))
     unaccounted = {} if unaccounted is None else unaccounted
 
@@ -174,29 +174,40 @@ def run_trial(
                 command = writer_command(docker=docker, image=image, name=name, libs=REPO_ROOT / "libs", database_dir=database_dir,
                                          index=index, writers=writers, records=records, timeout=timeout)
                 stderr_file = open(Path(logs) / f"{index}.log", "w+b")
+                # Noted BEFORE its client starts, so that an interrupt at any point from here on leaves it noted.
+                unaccounted[name] = f"the container {name} was not confirmed gone; check `docker ps -a`"
                 try:
                     process = spawn(command, stderr_file)
-                except BaseException:
+                except BaseException as exc:
                     stderr_file.close()
+                    if isinstance(exc, CannotRun):
+                        del unaccounted[name]  # no client started, so there is no container
                     raise
                 running.append((name, process, stderr_file))
-                # Until its client ends or it is removed. Noted now, so that a cleanup that is itself interrupted leaves it here.
-                unaccounted[name] = f"the container {name} was not confirmed gone; check `docker ps -a`"
             for name, process, _stderr in running:
                 try:
                     # The container's own `timeout` fires first; this only covers a docker client that does not end.
-                    result.exit_codes.append(process.wait(timeout=timeout + pi_driver.DOCKER_COMMAND_TIMEOUT_SECONDS))
-                    unaccounted.pop(name, None)
+                    code = process.wait(timeout=timeout + pi_driver.DOCKER_COMMAND_TIMEOUT_SECONDS)
                 except subprocess.TimeoutExpired:
                     process.kill()
+                    code = None
+                result.exit_codes.append(code)
+                if code == 0:
+                    unaccounted.pop(name, None)
+                else:
+                    # A client can fail, or be killed, while its container goes on, so only a removal says that one is gone.
                     remove_and_note(name)
-                    result.exit_codes.append(None)
         except BaseException:
-            # Ctrl+C or a writer that could not start: remove every container, so that none is left writing into the folder.
-            for name, process, _stderr in running:
+            # Ctrl+C or a writer that could not start. The clients go first, so that none creates a container after its removal;
+            # then every container not known to be gone, so that none is left writing into the folder. One limit: an interrupt
+            # inside `spawn` can leave a client that is not in `running`, so it cannot be stopped here. Its container is removed
+            # like the others, but a removal that finished before that client had created it would not see it.
+            for _name, process, _stderr in running:
                 with contextlib.suppress(OSError):
                     process.kill()
+            for name in list(unaccounted):
                 remove_and_note(name)
+            for _name, process, _stderr in running:
                 with contextlib.suppress(subprocess.TimeoutExpired):
                     process.wait(timeout=10)  # Windows keeps a file open until the process that has it is gone
             raise
