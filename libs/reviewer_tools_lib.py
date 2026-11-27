@@ -36,12 +36,15 @@ said "no matches" on macOS. A wrong "no matches" tells a verifier a symbol is ab
 would not be read as meant is an error, never an empty answer:
 
   * `-P` (PCRE2) reads those shorthands the same wherever git has it. Only when git says it was built without it
-    (`USE_LIBPCRE` in its error) does the executor use `-E`, and then it REFUSES a pattern with a shorthand (a backslash
-    before a letter, a digit, a backquote or a quote) instead of rewriting it: a wrong rewrite would be the same silent miss.
+    (`USE_LIBPCRE` in its error, for a fixed pattern too: git repeats a bad pattern in its error, so those words alone may
+    be the model's own) does the executor use `-E`, and then it REFUSES a pattern with a shorthand (a backslash before a
+    letter, a digit, a backquote or a quote) instead of rewriting it: a wrong rewrite would be the same silent miss.
   * `\\<` and `\\>` are refused in both: PCRE reads them as a literal `<` and `>`.
+  * `{,n}` is refused in both: not every regex library reads it as a repeat, and one that does not looks for the text.
   * A backspace character is refused: it is what a single-backslash `\\b` in a JSON request decodes to.
 
-One limit: whether `\\w` and `\\b` count a letter outside ASCII depends on the locale of the process that runs git.
+One limit: whether `\\w`, `\\b`, `\\d` and `\\s` count a character outside ASCII depends on the locale of the process that
+runs git.
 
 Standard library only, apart from `ReviewError` from the reasoning stage.
 """
@@ -79,6 +82,8 @@ _WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:")
 _ESCAPE = re.compile(r"\\(.)")
 # git's own words when it was built without PCRE2. The part that names the build flag, so a translated message still matches.
 _NO_PCRE = b"USE_LIBPCRE"
+# A repeat count with no lower bound, `{,3}`. Only that whole shape: `[({,]` is an ordinary set of characters.
+_NO_LOWER_BOUND = re.compile(r"\{ *, *\d+ *\}")
 
 
 @dataclass(frozen=True)
@@ -295,6 +300,12 @@ class ToolExecutor:
                 self._files[clean] = (done.stdout.decode("utf-8", errors="replace"), None)
         return self._files[clean]
 
+    def _git_lacks_pcre(self) -> bool:
+        """Whether git refuses `-P` for a pattern that is certainly valid. Asked before giving up on PCRE, because the
+        error for a pattern that does not compile repeats the pattern, which may itself hold the words looked for."""
+        probe = self._git_limited(["grep", "-q", "-P", "-e", "x", self.head, "--"], 1000)
+        return probe is not None and _says_no_pcre(probe)
+
     # -- the tools ------------------------------------------------------------------------------------------------------
 
     def _tool_read_file(self, args: dict) -> ToolResult:
@@ -355,7 +366,7 @@ class ToolExecutor:
         done = None
         if self._pcre:
             done = search("-P")
-            if done is not None and done.returncode not in (0, 1) and _NO_PCRE in done.stderr:
+            if done is not None and _says_no_pcre(done) and self._git_lacks_pcre():
                 self._pcre = False
         if not self._pcre:
             problem = _misread_without_pcre(pattern)
@@ -385,6 +396,10 @@ def _error(text: str) -> ToolResult:
     return ToolResult(text, error=True)
 
 
+def _says_no_pcre(done: _Limited) -> bool:
+    return done.returncode not in (0, 1) and _NO_PCRE in done.stderr
+
+
 def _misread_in_any_mode(pattern: str) -> Optional[str]:
     """Why `pattern` would not be read as meant even by `git grep -P`, or None. Each of these would otherwise come back as
     "no matches" on at least one platform."""
@@ -395,6 +410,9 @@ def _misread_in_any_mode(pattern: str) -> Optional[str]:
         )
     if any(escaped in "<>" for escaped in _ESCAPE.findall(pattern)):
         return "grep does not take \\< or \\>: use \\b for a word boundary, or < and > with no backslash for the characters"
+    # Escapes are blanked first, so the literal text `\{,3}` is not taken for a repeat count.
+    if _NO_LOWER_BOUND.search(_ESCAPE.sub("_", pattern)):
+        return "grep does not take {,n}: write {0,n}"
     return None
 
 

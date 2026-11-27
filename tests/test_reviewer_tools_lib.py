@@ -250,11 +250,27 @@ class RegexSyntax(unittest.TestCase):
         self.assertEqual(pattern[0], "\b")
         self.assert_refused(pattern, "backspace", "two backslashes")
 
-    def test_without_pcre_a_plain_pattern_still_matches_and_pcre_is_tried_once(self):
+    def test_a_repeat_with_no_lower_bound_is_refused(self):
+        for pattern in ("= 1{,3}", "= 1{ , 3 }"):
+            self.assert_refused(pattern, "{0,n}")
+        self.assert_line("count = [0-9]{0,4}", 2)
+
+    def test_a_brace_and_comma_that_are_not_a_repeat_are_searched_for(self):
+        for pattern in ("count[ {,]", r"zzz\{,3}"):
+            result = self.ex.run("grep", {"pattern": pattern})
+            self.assertFalse(result.error, f"{pattern!r}: {result.text}")
+
+    def test_a_bad_pattern_holding_gits_build_flag_does_not_switch_pcre_off(self):
+        # git repeats a pattern that does not compile in its error, so the words are there on a git that has PCRE2.
+        self.assert_refused("(USE_LIBPCRE", "grep failed")
+        self.assert_line(r"\bcount\b", 2)
+
+    def test_without_pcre_a_plain_pattern_still_matches_and_pcre_is_not_tried_again(self):
         modes = self.without_pcre()
         self.assert_line("def (other|total_price)", 1)
         self.assert_line("def[[:space:]]+total", 1)
-        self.assertEqual(modes, ["-P", "-E", "-E"])
+        # The first -P is the search, the second the check with a fixed pattern.
+        self.assertEqual(modes, ["-P", "-P", "-E", "-E"])
 
     def test_without_pcre_a_shorthand_is_refused_by_name_and_never_run(self):
         modes = self.without_pcre()
