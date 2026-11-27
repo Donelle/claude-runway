@@ -1660,6 +1660,24 @@ class CallCheckTests(unittest.TestCase):
         tracker = self.tracked(starts, end, end)
         self.assertTrue(tracker.call_errors)
 
+    def test_a_refused_call_after_the_review_does_not_replace_its_text(self):
+        # The session passes, so the text it reports has to be the review and not Pi's complaint about the extra call.
+        tracker = self.tracked(review_call(review_args(), text="THE REVIEW", call_id="a"),
+                               review_call({}, ran=False, text="Validation failed for tool", call_id="b"))
+        self.assertEqual((tracker.good_calls, tracker.call_errors, tracker.review_text), (1, [], "THE REVIEW"))
+
+    def test_the_review_text_is_the_last_call_that_ran(self):
+        refused = review_call({}, ran=False, text="Validation failed for tool", call_id="a")
+        first = review_call(review_args(), text="FIRST", call_id="b")
+        second = review_call(review_args(), text="SECOND", call_id="c")
+        self.assertEqual(self.tracked(refused, first).review_text, "FIRST")
+        self.assertEqual(self.tracked(first, second).review_text, "SECOND")
+
+    def test_when_no_call_ran_the_review_text_says_why_the_last_one_was_refused(self):
+        tracker = self.tracked(review_call({}, ran=False, text="refused once", call_id="a"),
+                               review_call({}, ran=False, text="refused again", call_id="b"))
+        self.assertEqual(tracker.review_text, "refused again")
+
     def test_a_call_error_fails_a_run_that_otherwise_completed(self):
         self.assertEqual(d.RunResult(stopped_by="completed", review_calls=1, call_errors=["x"]).exit_status(), 1)
         self.assertEqual(d.RunResult(stopped_by="completed", review_calls=1, failures=["x"]).exit_status(), 1)

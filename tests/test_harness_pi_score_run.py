@@ -168,6 +168,30 @@ class ScoreTests(unittest.TestCase):
         self.assertEqual(score.found, ["B7"])
         self.assertIn("INCOMPLETE REVIEW", score.note)
 
+    def test_a_run_whose_review_call_was_the_wrong_one_is_scored_but_not_readable(self):
+        # With the refs swapped, say, the text still looks like a review, so only the driver's list tells the two apart.
+        score = s.score_summary(summary(BUG_ONLY, call_errors=["a review call that ran was not this session's: base_ref"], failures=[]))
+        self.assertEqual((score.readable, score.found, score.findings), (False, ["B7"], 1))
+        self.assertEqual(score.note, "FAILED SESSION: a review call that ran was not this session's: base_ref")
+
+    def test_a_run_with_failures_is_not_readable_and_says_how_many_more_reasons_there_are(self):
+        score = s.score_summary(summary(BUG_ONLY, call_errors=["wrong call"], failures=["no results file", "container left"]))
+        self.assertFalse(score.readable)
+        self.assertEqual(score.note, "FAILED SESSION: wrong call (+2 more)")
+        self.assertEqual(s.score_summary(summary(NOTHING, failures=["no results file"])).note, "FAILED SESSION: no results file")
+
+    def test_an_incomplete_review_in_a_failed_session_says_both(self):
+        text = "INCOMPLETE REVIEW: 1 problem(s)\n" + BUG_ONLY
+        score = s.score_summary(summary(text, failures=["no results file"]))
+        self.assertIn("INCOMPLETE REVIEW", score.note)
+        self.assertIn("FAILED SESSION: no results file", score.note)
+
+    def test_empty_lists_and_values_that_are_not_lists_do_not_fail_a_row(self):
+        for more in ({"call_errors": [], "failures": []}, {"call_errors": None, "failures": "text"}, {}):
+            with self.subTest(more=more):
+                score = s.score_summary(summary(BUG_ONLY, **more))
+                self.assertEqual((score.readable, score.note), (True, ""))
+
     def test_a_summary_that_names_no_change_is_refused_saying_so(self):
         for named in ({}, {"change": ""}, {"change": None}, {"change": 6}):
             with self.subTest(named=named), self.assertRaises(ValueError) as caught:

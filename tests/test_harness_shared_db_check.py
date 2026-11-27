@@ -207,6 +207,33 @@ class MainTests(Base):
             code = check.main(["--folder", str(self.folder / "logs"), "--docker", "no-such-docker-xyz", "--trials", "1"])
         self.assertEqual(code, 2, out.getvalue())
         self.assertIn("could not start", err.getvalue())
+        self.assertEqual(list((self.folder / "logs").iterdir()), [])
+
+    def test_a_trial_docker_refuses_leaves_no_folder_behind(self):
+        refusing = HostWriters(self.home, script="import sys; print('no such image', file=sys.stderr); sys.exit(125)")
+        code, _out, err = self.run_main("--trials", "1", spawn=refusing)
+        self.assertEqual(code, 2)
+        self.assertIn("no such image", err)
+        self.assertEqual(list((self.folder / "logs").iterdir()), [])
+
+    def test_an_interrupted_trial_leaves_no_folder_behind(self):
+        seen: list = []
+
+        def interrupted(database_dir, **kwargs):
+            pi_driver.ensure_harness_db(database_dir)  # as far as a trial gets before its first container
+            seen.append(database_dir)
+            raise KeyboardInterrupt
+
+        with mock.patch.object(check, "run_trial", interrupted), self.assertRaises(KeyboardInterrupt):
+            self.run_main("--trials", "1")
+        self.assertFalse(seen[0].parent.exists())
+
+    def test_a_folder_that_cannot_be_deleted_is_named(self):
+        with mock.patch.object(check.pi_driver, "_remove_tree", side_effect=OSError("in use")):
+            code, _out, err = self.run_main("--trials", "1")
+        (kept,) = (self.folder / "logs").iterdir()
+        self.assertEqual(code, 0)
+        self.assertIn(str(kept), err)
 
     def test_a_count_below_one_is_exit_2(self):
         self.assertEqual(self.run_main("--trials", "0")[0], 2)

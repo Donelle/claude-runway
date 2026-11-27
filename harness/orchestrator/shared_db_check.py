@@ -15,8 +15,9 @@ What it holds to, as a real run must:
   * The folder is mounted, never the single file.
 
 It uses a throwaway folder under `harness/live-tests/logs/`, so the same file sharing as the harness database, and never
-that database itself. A passing folder is deleted; a failing one is kept and named. Run it once on each machine whose
-harness database containers will share (it was designed on Windows with Docker Desktop; macOS has to be run too):
+that database itself. A passing folder is deleted; a failing one is kept and named. The folder of a trial that could not be
+made, or was interrupted, is deleted too, since nothing was checked in it. Run it once on each machine whose harness
+database containers will share (it was designed on Windows with Docker Desktop; macOS has to be run too):
 
     .venv/bin/python harness/orchestrator/shared_db_check.py            # .venv/Scripts/python.exe on Windows
 
@@ -209,6 +210,14 @@ def describe(number: int, trials: int, result: TrialResult) -> str:
     return text
 
 
+def _discard(folder: Path) -> None:
+    """Deletes a throwaway folder there is no reason to keep, and names it when it cannot."""
+    try:
+        pi_driver._remove_tree(folder)
+    except OSError as exc:
+        print(f"warning: could not delete {folder}: {exc}", file=sys.stderr)
+
+
 def main(argv: Optional[list] = None, *, spawn: Callable = _spawn) -> int:
     parser = argparse.ArgumentParser(description="Check that containers can record into one shared reviewer database.")
     parser.add_argument("--writers", type=int, default=DEFAULT_WRITERS, help=f"containers writing at once (default {DEFAULT_WRITERS})")
@@ -226,6 +235,7 @@ def main(argv: Optional[list] = None, *, spawn: Callable = _spawn) -> int:
     print(f"shared database check: {args.writers} containers x {args.records} records, {args.trials} trial(s), in {parent}")
     passed = 0
     for number in range(1, args.trials + 1):
+        folder = result = None
         try:
             parent.mkdir(parents=True, exist_ok=True)
             folder = Path(tempfile.mkdtemp(prefix="db-check-", dir=parent))
@@ -234,13 +244,15 @@ def main(argv: Optional[list] = None, *, spawn: Callable = _spawn) -> int:
         except (CannotRun, OSError) as exc:
             print(f"error: the check could not run: {exc}", file=sys.stderr)
             return 2
+        finally:
+            # No result: the trial could not be made or was interrupted (Ctrl+C included, which is not caught above). By now
+            # `run_trial` has ended its containers.
+            if folder is not None and result is None:
+                _discard(folder)
         print(describe(number, args.trials, result), flush=True)
         if result.passed:
             passed += 1
-            try:
-                pi_driver._remove_tree(folder)
-            except OSError as exc:
-                print(f"warning: could not delete {folder}: {exc}", file=sys.stderr)
+            _discard(folder)
         else:
             print(f"  kept for inspection: {folder}")
     print(f"result on {sys.platform}: {passed} of {args.trials} trial(s) passed")

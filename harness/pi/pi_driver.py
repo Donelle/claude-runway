@@ -3,9 +3,11 @@
 
 Why this exists: the harness scripts call the reviewer's libraries directly, so they never exercise the path an agent
 takes: finding the `review` tool over MCP and calling it. This does, with Pi as the agent, and it keeps the whole run in a
-container so the host checkout, `~/.claude` and `~/.pi` are never touched (the container never sees them, and `--log`, the one
-file the driver itself writes, is refused under `~/.claude` and `~/.pi` and never overwrites a file). Pi has no turn or tool-call limit of its own,
-so the driver enforces them: it reads Pi's JSON event stream and runs `docker kill` when a cap is reached.
+container: it never sees `~/.claude` or `~/.pi`, and the only thing of the host checkout it can write is the harness database
+folder (`harness/live-tests/logs/db/`, ignored by Git). On the host the driver itself writes a temporary scratch folder that
+it deletes, that database when it is missing, and the `--log` file, which is refused under `~/.claude` and `~/.pi` and never
+overwrites a file. Pi has no turn or tool-call limit of its own, so the driver enforces them: it reads Pi's JSON event stream
+and runs `docker kill` when a cap is reached.
 
 What Pi is asked to review is a change from the `harness-live-tests` branch (`--change`, default `change-6`; see harness/README.md,
 "A real repository with seeded bugs"): real code with a seeded bug and a decoy, not a made-up case. The container is given a
@@ -298,6 +300,7 @@ class CapTracker:
         self.aborted = False  # Pi settled because the run was aborted, which is not a finished run
         self.final_text = ""
         self.review_text = ""
+        self._review_ran = False  # whether `review_text` came from a call that ran
 
     def elapsed(self) -> float:
         return self._clock() - self._started
@@ -326,9 +329,14 @@ class CapTracker:
                 return "tool_calls"
         elif kind == "tool_execution_end":
             if event.get("toolName") == REVIEW_TOOL:
-                # What the reviewer itself returned, kept because the caller's own summary of it can drop most of it.
+                # What the reviewer itself returned, kept because the caller's own summary of it can drop most of it. What Pi
+                # says about a call it refused is kept only until a call runs, so a stray refused call after the review cannot
+                # replace the review (`_check_call` says how the two are told apart).
                 text = tool_result_text(event)
-                self.review_text = text
+                ran = "durationMs" in event
+                if ran or not self._review_ran:
+                    self.review_text = text
+                    self._review_ran = ran
                 # The review tool reports its own refusals (a bad reviewers file, nothing to run) as ordinary text that
                 # starts with "Error:" and an isError of false, so a refused review would otherwise read as a success.
                 errored = bool(event.get("isError")) or text.lstrip().startswith(REVIEW_REFUSAL_PREFIX)
@@ -650,8 +658,8 @@ def docker_run_command(
 
     It carries no LM Studio URL: that is in the models.json and mcp.json the driver wrote into the agent scratch folder."""
     command = [
-        # --init: Pi runs as PID 1, which the kernel gives no default signal handling, so a stop signal would never reach it;
-        # the small init process forwards signals and reaps children.
+        # --init: a small init process is PID 1, and it forwards signals and reaps children. Without it the entrypoint,
+        # `timeout`, would be PID 1, which the kernel gives no default signal handling.
         docker, "run", "--rm", "--init", "--name", name,
         "--memory", memory, "--cpus", cpus, "--pids-limit", str(pids_limit),
         "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
@@ -824,7 +832,10 @@ def run_capped(
     # Nor is a settle followed by a failing container (Pi settles before it shuts its MCP server down, so an OOM kill or a
     # crash during that shutdown still ends nonzero): only a settle and a clean container exit count as completed. A stream
     # that ends without a settle is an error even when the container exits 0, since Pi never said it had finished. An exit
-    # with the `timeout` command's code is the backstop in the container ending a run that outlived its limit.
+    # with the `timeout` command's code is the backstop in the container ending a run that outlived its limit. A Pi that
+    # ignores the backstop's first signal is killed KILL_AFTER_SECONDS later, and the exit is then 137, which stays `error`
+    # on purpose: an out-of-memory kill gives 137 too. The driver's own time cap is due BACKSTOP_MARGIN_SECONDS before the
+    # backstop, so while the driver is running its cap is what should end a run that is out of time.
     result.stopped_by = stopped_by or (
         "timeout" if result.exit_code == TIMEOUT_EXIT_CODE
         else "aborted" if tracker.aborted

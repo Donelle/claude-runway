@@ -40,7 +40,7 @@ lms load <each model that lms ps showed>            # restore what was loaded be
 
 The reviewer's model is not part of this: a reviewer with `loadOnDemand: true` is loaded by the reviewer server when it runs and unloaded again afterwards, except when the run is stopped during the review (Ctrl+C, or a cap or timeout that kills the container): the server dies before it can unload, so check `lms ps` and unload the reviewer model yourself. If the caller and the reviewer are the same model, load it once. Both models need room at the same time, so check `lms ps` against your GPU memory first (the sizes are in the tier table below).
 
-Output: one progress line per turn and tool call on stderr, then a JSON summary on stdout. It names the **`change`** that was reviewed, so `score_run.py` needs no flag to find its answers, and the session's `review_type` and `review_id`. **`results`** holds the review tool's structured results (complete findings, each verifier's verdicts, each classifier's probabilities, how many replies were readable, errors), as `libs/reviewer_files_lib.py` writes them. **`review_text`** is the reviewer tool's own text; `final_text` is the caller's summary of it, which varies from run to run and can leave most of it out. `call_errors` and `failures` say why a run that finished did not pass.
+Output: one progress line per turn and tool call on stderr, then a JSON summary on stdout. It names the **`change`** that was reviewed, so `score_run.py` needs no flag to find its answers, and the session's `review_type` and `review_id`. **`results`** holds the review tool's structured results (complete findings, each verifier's verdicts, each classifier's probabilities, how many replies were readable, errors), as `libs/reviewer_files_lib.py` writes them. **`review_text`** is the reviewer tool's own text, from the last `review` call that ran (when none ran, what Pi said about the last one it refused); `final_text` is the caller's summary of it, which varies from run to run and can leave most of it out. `call_errors` and `failures` say why a run that finished did not pass.
 
 | Exit code | Meaning |
 | :-- | :-- |
@@ -132,7 +132,7 @@ To compare calling models, run the driver on **`change-6`** (the default: two li
 - any finding on `change-5`, the clean control that changes no behaviour, is a **clean false alarm**;
 - anything else is **unscored**: shown, and never counted against the model, because the code is real and may have real bugs nobody has listed.
 
-A result that is not a review at all (Pi's `Validation failed for tool ...`, `MCP request timed out`) is marked `no review ran` instead of being scored as an empty review:
+A result that is not a review at all (Pi's `Validation failed for tool ...`, `MCP request timed out`) is marked `no review ran` instead of being scored as an empty review. A run the driver says did not pass (`call_errors` or `failures`) is still scored, but its row says `readable=NO` and `FAILED SESSION:` with the first reason:
 
 ```
 .venv/bin/python harness/pi/pi_driver.py --model <caller> --config <config> > run.json
