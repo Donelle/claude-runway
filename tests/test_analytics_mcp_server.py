@@ -13,6 +13,7 @@ coverage below is that server's old test classes for them, retargeted.
 import importlib.util
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -96,6 +97,47 @@ class SavingsToolsReportTrackingOff(unittest.TestCase):
             mod = _load_analytics_mcp_server()
             self.assertIn("unrecognised format", mod.savings_summary(format="xml"))
             self.assertIn("unrecognised bucket", mod.savings_trend(bucket="month"))
+
+
+class SavingsToolsReportAReadFailure(unittest.TestCase):
+    """A failed read names the real error and the database, and does not guess
+    at corruption: the failure may well be a schema one."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._db_path = Path(self._tmpdir.name) / "savings.db"
+        self._env_patch = mock.patch.dict(
+            os.environ,
+            {"CLAUDE_RUNWAY_TRACK_SAVINGS": "1", "CLAUDE_RUNWAY_SAVINGS_DB": str(self._db_path)},
+        )
+        self._env_patch.start()
+
+    def tearDown(self):
+        self._env_patch.stop()
+        self._tmpdir.cleanup()
+
+    def test_each_savings_tool_reports_the_error_and_the_database_path(self):
+        mod = _load_analytics_mcp_server()
+        failure = sqlite3.OperationalError("no such column: raw_chars_sum")
+        # current_session_id is stubbed so no live session on this machine is read.
+        with mock.patch.object(mod.savings_ledger, "current_session_id", return_value=None), \
+             mock.patch.object(mod.savings_ledger, "query_project_summary", side_effect=failure), \
+             mock.patch.object(mod.savings_ledger, "query_trend", side_effect=failure):
+            for tool in (mod.savings_summary, mod.savings_detail, mod.savings_trend):
+                with self.subTest(tool=tool.__name__):
+                    self.assertEqual(
+                        tool(project="p"),
+                        "Error: could not read savings data (OperationalError: no such column: raw_chars_sum). "
+                        f"Database: {self._db_path}. This doesn't affect anything else.",
+                    )
+
+    def test_a_file_that_is_not_a_database_keeps_sqlites_own_wording(self):
+        self._db_path.write_bytes(b"this is not a sqlite database" * 100)
+        mod = _load_analytics_mcp_server()
+        with mock.patch.object(mod.savings_ledger, "current_session_id", return_value=None):
+            result = mod.savings_trend(project="p")
+        self.assertIn("DatabaseError: file is not a database", result)
+        self.assertIn(str(self._db_path), result)
 
 
 class RecordMetricAcceptsDictOrJsonStringMetadata(unittest.TestCase):
