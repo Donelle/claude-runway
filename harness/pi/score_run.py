@@ -15,6 +15,9 @@ libs/reasoning_reviewer_lib.py: `- file:start[-end] [reviewers] claim`) and scor
 file and nearby line only: a finding near a bug's line is a hit; at a decoy's line it is a false alarm; any finding on the clean
 change (`change-5`) is a false alarm; anything else is unscored, shown and never counted against the model. Standard library only.
 
+A run the driver says did not pass (`call_errors`: a `review` call that ran was not the session's, so its text may review
+another diff; or `failures`) is still scored, but its row says `readable=NO` and `FAILED SESSION:` with the first reason.
+
 Exit code: 0 = scored; 2 = the input could not be read, names no change or one the answer key does not list, or the key
 itself could not be read.
 """
@@ -84,7 +87,7 @@ def parse_review_text(text: str) -> list:
 
 @dataclass
 class RunScore:
-    readable: bool  # the review text is a result, not a refusal, a failure or nothing
+    readable: bool  # the score can be taken as it stands; when False, `note` says why
     change: str = ""  # the change the run reviewed, as the driver named it
     found: list = field(default_factory=list)  # bug ids a finding sits at
     missed: list = field(default_factory=list)  # bug ids no finding sits at (all of them when the review is not readable)
@@ -100,6 +103,20 @@ class RunScore:
 def final_repeats(final_text: str, findings: list) -> int:
     """Findings whose `file:line` (the start line alone is enough) the caller's final message names again."""
     return sum(1 for f in findings if f.line_start > 0 and re.search(rf"{re.escape(f.file)}:{f.line_start}\b", final_text or ""))
+
+
+def session_problem(summary: dict) -> str:
+    """The note for a run the driver says did not pass, with its first reason and how many more there are; "" when it gives
+    none. A summary from a driver that reported neither list, or a hand-edited one holding something else there, gives none."""
+    reasons: list = []
+    for key in ("call_errors", "failures"):
+        value = summary.get(key)
+        if isinstance(value, list):
+            reasons += [str(item) for item in value]
+    if not reasons:
+        return ""
+    more = f" (+{len(reasons) - 1} more)" if len(reasons) > 1 else ""
+    return f"FAILED SESSION: {reasons[0]}{more}"
 
 
 def score_summary(summary: dict, tags: Optional[tuple] = None) -> RunScore:
@@ -135,7 +152,8 @@ def score_summary(summary: dict, tags: Optional[tuple] = None) -> RunScore:
     findings = parse_review_text(text)
     scored = scoring.score_tag(findings, tag)
     # An INCOMPLETE REVIEW header means a reviewer's reply was unreadable or failed: any bug missing may be that, not the model's eye.
-    note = "INCOMPLETE REVIEW: a reviewer reported a problem, so a missed bug may be a failed reply" if stripped.startswith(INCOMPLETE_PREFIX) else ""
+    incomplete = "INCOMPLETE REVIEW: a reviewer reported a problem, so a missed bug may be a failed reply" if stripped.startswith(INCOMPLETE_PREFIX) else ""
+    note = "; ".join(part for part in (incomplete, session_problem(summary)) if part)
     return RunScore(
         readable=not note, change=change, found=scored.found, missed=scored.missed, on_decoys=scored.on_decoys,
         clean_false_alarms=scored.clean_false_positives, unscored=scored.unscored, findings=len(findings),
