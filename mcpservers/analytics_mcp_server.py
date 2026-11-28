@@ -77,6 +77,17 @@ def _require_savings_tracking() -> Optional[str]:
     return None
 
 
+def _savings_read_error(error: Exception) -> str:
+    """What a savings tool returns when reading fails. It names the exception
+    and the file without guessing at a cause: a schema problem is not
+    corruption, and SQLite's own message already says when a file is."""
+    assert savings_ledger is not None  # only reached after _require_savings_tracking()
+    return (
+        f"Error: could not read savings data ({type(error).__name__}: {error}). "
+        f"Database: {savings_ledger.resolve_db_path()}. This doesn't affect anything else."
+    )
+
+
 @mcp.tool()
 def savings_summary(project: Optional[str] = None, format: str = "text") -> str:
     """
@@ -111,7 +122,7 @@ def savings_summary(project: Optional[str] = None, format: str = "text") -> str:
     assert savings_ledger is not None  # _require_savings_tracking() returning None implies this
     # Validate before any DB access so a bad argument produces a clear input
     # error and never reaches the generic except handler below, which would
-    # misleadingly report the issue as database corruption.
+    # misleadingly report it as a failure to read the data.
     if format not in ("text", "json", "csv"):
         return f"Error: unrecognised format {format!r}. Valid values: 'text', 'json', 'csv'."
     try:
@@ -139,10 +150,11 @@ def savings_summary(project: Optional[str] = None, format: str = "text") -> str:
             return savings_ledger.format_csv(session_agg, project_summary, [], [], [], table="session")
         return savings_ledger.format_simple_view(session_agg, project_summary)
     except Exception as e:
-        # This is an opt-in, best-effort feature -- a corrupted/locked/missing
-        # savings DB must not fail the whole tool call (or worse, the server
-        # process). Return a readable error instead of letting it raise.
-        return f"Error: could not read savings data ({e}). The savings database may be corrupted or inaccessible; this doesn't affect anything else."
+        # This is an opt-in, best-effort feature -- an unreadable savings DB
+        # (corrupted, locked, missing, or a failed schema upgrade) must not fail
+        # the whole tool call (or worse, the server process). Return a readable
+        # error instead of letting it raise.
+        return _savings_read_error(e)
 
 
 @mcp.tool()
@@ -176,7 +188,7 @@ def savings_detail(project: Optional[str] = None, format: str = "text", csv_tabl
     # Validate both enum parameters before any DB access so bad arguments
     # produce clear input errors rather than silently returning text or
     # hitting the generic except handler below (which would misleadingly
-    # report the issue as database corruption).
+    # report them as a failure to read the data).
     if format not in ("text", "json", "csv"):
         return f"Error: unrecognised format {format!r}. Valid values: 'text', 'json', 'csv'."
     if format == "csv" and csv_table not in ("session", "tools", "projects"):
@@ -231,7 +243,7 @@ def savings_detail(project: Optional[str] = None, format: str = "text", csv_tabl
     except Exception as e:
         # Same reasoning as savings_summary's try/except -- best-effort feature,
         # must not fail the tool call over a DB problem.
-        return f"Error: could not read savings data ({e}). The savings database may be corrupted or inaccessible; this doesn't affect anything else."
+        return _savings_read_error(e)
 
 
 @mcp.tool()
@@ -269,7 +281,7 @@ def savings_trend(project: Optional[str] = None, bucket: str = "week", n: int = 
     except Exception as e:
         # Same reasoning as savings_summary's try/except -- best-effort feature,
         # must not fail the tool call over a DB problem.
-        return f"Error: could not read savings data ({e}). The savings database may be corrupted or inaccessible; this doesn't affect anything else."
+        return _savings_read_error(e)
 
 
 @mcp.tool()

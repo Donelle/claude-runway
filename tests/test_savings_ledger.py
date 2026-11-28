@@ -3376,5 +3376,122 @@ class SchemaOverheadRemovedV8(SavingsLedgerTestCase):
         self.assertFalse(hasattr(L, "get_schema_overhead_tokens"))
 
 
+class Version6WithoutCharacterColumns(SavingsLedgerTestCase):
+    """A database stamped user_version 6 by a build whose version 6 added
+    `sessions.est_cost_usd` instead of the character columns. _run_migrations
+    trusts the version number, so this repo's own v6 step is never run for it."""
+
+    _TABLES = ("sessions", "session_tools", "session_agents")
+
+    def _make_db(self):
+        conn = sqlite3.connect(str(L.resolve_db_path()))
+        conn.execute(
+            "CREATE TABLE sessions (session_id TEXT PRIMARY KEY, project TEXT NOT NULL, ended_at TEXT NOT NULL, "
+            "credited_saved_tokens INTEGER NOT NULL, raw_tokens_sum INTEGER NOT NULL DEFAULT 0, "
+            "out_tokens_sum INTEGER NOT NULL DEFAULT 0, event_count INTEGER NOT NULL, fetch_url_count INTEGER NOT NULL, "
+            "overhead_tokens INTEGER NOT NULL DEFAULT 0, actual_input_tokens INTEGER NOT NULL DEFAULT 0, "
+            "actual_output_tokens INTEGER NOT NULL DEFAULT 0, actual_cache_read_tokens INTEGER NOT NULL DEFAULT 0, "
+            "actual_cache_write_tokens INTEGER NOT NULL DEFAULT 0, est_cost_usd REAL NOT NULL DEFAULT 0)")
+        conn.execute(
+            "CREATE TABLE session_tools (session_id TEXT NOT NULL, tool TEXT NOT NULL, event_count INTEGER NOT NULL, "
+            "saved_tokens INTEGER NOT NULL, raw_tokens_sum INTEGER NOT NULL DEFAULT 0, "
+            "out_tokens_sum INTEGER NOT NULL DEFAULT 0, credited_event_count INTEGER NOT NULL DEFAULT 0, "
+            "PRIMARY KEY (session_id, tool))")
+        conn.execute(
+            "CREATE TABLE session_agents (session_id TEXT NOT NULL, is_subagent INTEGER NOT NULL, "
+            "agent_type TEXT NOT NULL DEFAULT '', event_count INTEGER NOT NULL, saved_tokens INTEGER NOT NULL, "
+            "raw_tokens_sum INTEGER NOT NULL DEFAULT 0, out_tokens_sum INTEGER NOT NULL DEFAULT 0, "
+            "credited_event_count INTEGER NOT NULL DEFAULT 0, "
+            "PRIMARY KEY (session_id, is_subagent, agent_type))")
+        # Present and empty in a real affected file: _ensure_schema creates
+        # missing tables outside the migration transaction.
+        conn.execute(L._SESSION_MODELS_DDL.format(name="session_models"))
+        conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.execute("INSERT INTO meta VALUES ('schema_overhead_tokens', '7839')")
+        # 'sized': 100 -> 20 tokens. Its stored saving (90) is deliberately not
+        # 100 - 20, so the upgrade's re-derived 280 characters can't be mistaken
+        # for the 315 a plain backfill gives. 'unsized' has no recorded sizes.
+        conn.execute(
+            "INSERT INTO sessions VALUES "
+            "('sized', 'p', '2026-09-01T00:00:00Z', 90, 100, 20, 2, 1, 7, 11, 12, 13, 14, 2.5), "
+            "('unsized', 'p', '2026-08-01T00:00:00Z', 42, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0)")
+        conn.execute(
+            "INSERT INTO session_tools VALUES "
+            "('sized', 'hook:Bash', 2, 90, 100, 20, 2), ('unsized', 'hook:Bash', 3, 42, 0, 0, 3)")
+        conn.execute("INSERT INTO session_agents VALUES ('sized', 0, '', 2, 90, 100, 20, 2)")
+        conn.execute("PRAGMA user_version = 6")
+        conn.commit()
+        conn.close()
+
+    @staticmethod
+    def _columns(conn, table):
+        return {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+    def test_the_upgrade_keeps_every_row_and_backfills_the_character_columns(self):
+        self._make_db()
+        conn = L._connect()
+        self.addCleanup(conn.close)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], L.SCHEMA_VERSION)
+        self.assertEqual(
+            conn.execute(
+                "SELECT session_id, raw_chars_sum, out_chars_sum, credited_saved_chars "
+                "FROM sessions ORDER BY session_id").fetchall(),
+            # tokens x 3.5; unknown sizes stay 0 while the saving is still backfilled
+            [("sized", 350, 70, 280), ("unsized", 0, 0, 147)])
+        self.assertEqual(
+            conn.execute(
+                "SELECT session_id, tool, raw_chars_sum, out_chars_sum, saved_chars "
+                "FROM session_tools ORDER BY session_id").fetchall(),
+            [("sized", "hook:Bash", 350, 70, 280), ("unsized", "hook:Bash", 0, 0, 147)])
+        self.assertEqual(
+            conn.execute("SELECT session_id, raw_chars_sum, out_chars_sum, saved_chars FROM session_agents").fetchall(),
+            [("sized", 350, 70, 280)])
+        self.assertEqual(
+            conn.execute(
+                "SELECT project, ended_at, event_count, fetch_url_count, actual_input_tokens, actual_output_tokens, "
+                "actual_cache_read_tokens, actual_cache_write_tokens FROM sessions WHERE session_id = 'sized'"
+            ).fetchone(),
+            ("p", "2026-09-01T00:00:00Z", 2, 1, 11, 12, 13, 14))
+        self.assertEqual(self._columns(conn, "sessions"), set(L._SESSIONS_COLUMNS))  # est_cost_usd is gone
+        self.assertIsNone(conn.execute("SELECT 1 FROM meta WHERE key = 'schema_overhead_tokens'").fetchone())
+        self.assertEqual(conn.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+
+    def test_a_later_failure_also_removes_the_added_columns(self):
+        self._make_db()
+
+        def _fail(conn):
+            raise RuntimeError("later migration failed")
+
+        with mock.patch.dict(L._MIGRATIONS, {8: _fail}):
+            with self.assertRaisesRegex(RuntimeError, "later migration failed"):
+                L._connect()
+        raw = sqlite3.connect(str(L.resolve_db_path()))
+        self.assertEqual(raw.execute("PRAGMA user_version").fetchone()[0], 6)
+        for table in self._TABLES:
+            columns = self._columns(raw, table)
+            self.assertIn("raw_tokens_sum", columns, table)
+            self.assertNotIn("raw_chars_sum", columns, table)
+        self.assertIn("est_cost_usd", self._columns(raw, "sessions"))
+        raw.close()
+        conn = L._connect()  # a retry finds nothing half-done
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], L.SCHEMA_VERSION)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0], 2)
+        conn.close()
+
+    def test_a_pending_ledger_is_saved_into_the_upgraded_database(self):
+        self._make_db()
+        L.record_event("pending", "hook:Bash", 1000, 100, True, "some cmd", project="p")
+        self.assertTrue(L.finalize_owned_session("pending", "p"))
+        conn = L._connect()
+        self.addCleanup(conn.close)
+        self.assertEqual(
+            conn.execute(
+                "SELECT raw_chars_sum, out_chars_sum, credited_saved_chars FROM sessions "
+                "WHERE session_id = 'pending'").fetchone(),
+            (1000, 100, 900))
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0], 3)
+        self.assertEqual(L._session_artifacts("pending"), [])
+
+
 if __name__ == "__main__":
     unittest.main()

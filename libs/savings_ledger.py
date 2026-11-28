@@ -551,7 +551,8 @@ def _migrate_to_v6(conn) -> None:
 
     Backfills only a column this call actually adds: a column already present
     (a DB whose CREATE TABLE already had it) may hold real exact counts that a
-    token-derived guess must never overwrite.
+    token-derived guess must never overwrite. That also makes it safe to call
+    twice, which _migrate_to_v7 relies on.
     """
     for table, char_col, token_col in _CHAR_COLUMNS:
         existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -640,12 +641,21 @@ def _migrate_to_v7(conn) -> None:
     Rebuilds each table (create side table, copy the kept columns, drop, rename)
     rather than ALTER TABLE ... DROP COLUMN, which needs SQLite 3.35+ -- older
     Python builds bundle older SQLite. Runs inside _run_migrations' transaction,
-    so a failure leaves the old tables untouched. The v6 backfill (which reads
-    the token columns) always ran before this, so the character columns hold the
-    best figure there is for older rows. Before the token columns go, a v6 row
-    whose tokens say more than its characters cover is reconstructed from them,
-    and every saving is re-derived -- see _v7_select.
+    so a failure leaves the old tables untouched.
+
+    Runs _migrate_to_v6 first. `user_version` 6 alone does not prove the
+    character columns exist: a database another build marked as 6 for a
+    different change has none, so _run_migrations skips our v6 step and the
+    copy below would fail on every open. On a database that has them this adds
+    and overwrites nothing. Either way the character columns then hold the best
+    figure there is for older rows. A column this version does not know, such
+    as that build's `sessions.est_cost_usd`, is not copied by the rebuild.
+
+    Before the token columns go, a v6 row whose tokens say more than its
+    characters cover is reconstructed from them, and every saving is re-derived
+    -- see _v7_select.
     """
+    _migrate_to_v6(conn)
     for table, ddl, columns, saved_col, count_col in _V7_REBUILDS:
         side = f"{table}_v7"
         existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
